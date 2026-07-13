@@ -2,7 +2,7 @@
 
 Portable, ephemeral, Dockerized GitHub Actions runner infrastructure for self-hosted environments.
 
-> Status: an inert ephemeral Docker runner prototype now builds in CI. It does not register a live runner and is not production-ready.
+> Status: the inert prototype builds in CI and the gated live-pilot package is ready. No live runner has been registered and the system is not production-ready.
 
 ## Goal
 
@@ -90,6 +90,8 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 - [Architecture](docs/ARCHITECTURE.md)
 - [Controller decision record](docs/adr/0001-actions-scale-set-client.md)
 - [Experimental deployment prototype](docs/DEPLOYMENT-PROTOTYPE.md)
+- [Live pilot runbook](docs/LIVE-PILOT.md)
+- [Host maintenance standard](docs/HOST-MAINTENANCE.md)
 - [Sanitized discovery summary](docs/DISCOVERY-SUMMARY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Secrets model](docs/SECRETS.md)
@@ -99,6 +101,7 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 ### Copyable examples
 
 - [Experimental read-only workflow](examples/workflows/experimental-smoke.yml.example)
+- [Private-repository live pilot workflow](examples/workflows/live-pilot.yml.example)
 - [Standard project entrypoint](examples/project/scripts/ci/run.sh)
 - [Isolated Compose project](examples/project/compose.ci.yaml)
 - [Node test image](examples/project/Dockerfile.test)
