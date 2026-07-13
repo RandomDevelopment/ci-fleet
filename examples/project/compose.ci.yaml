@@ -1,0 +1,35 @@
+name: "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME is required}"
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      CI: "true"
+      DATABASE_URL: "postgresql://ci:ci-only@database:5432/app"
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - ci
+
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: ci
+      POSTGRES_PASSWORD: ci-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ci -d app"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - ci
+
+networks:
+  ci:
+    internal: true
