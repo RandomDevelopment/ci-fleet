@@ -6,7 +6,30 @@ Status: design draft
 
 Provide a portable fleet of identical self-hosted GitHub Actions runners that can serve multiple explicitly authorized repositories. Each project owns its test environment; the fleet owns runner lifecycle, host maintenance, capacity, and common workflow behavior.
 
+## System topology
+
+```mermaid
+flowchart TD
+    A["GitHub Actions"] --> B["Organization runner group"]
+    B --> C["Fleet controller"]
+    C --> D["Docker host"]
+    C --> E["Additional host"]
+    D --> F["One-job runner"]
+    E --> G["One-job runner"]
+    F --> H["Project containers"]
+    G --> H
+```
+
+A host may run multiple runners when resource measurements and project isolation permit it. Runners sharing a Docker daemon share one security boundary.
+
 ## Responsibility boundaries
+
+```mermaid
+flowchart LR
+    A["ci-fleet"] --> B["Runner lifecycle"]
+    C["Project repo"] --> D["Test environment"]
+    E["Host config"] --> F["Secrets and capacity"]
+```
 
 ### Fleet repository
 
@@ -22,7 +45,7 @@ The fleet is responsible for:
 - safe garbage collection;
 - unattended security maintenance;
 - reusable workflow interfaces;
-- generic project onboarding documentation.
+- hard project CI rules and onboarding documentation.
 
 ### Project repositories
 
@@ -30,6 +53,7 @@ Each project is responsible for:
 
 - its test Dockerfile;
 - its service definitions;
+- the standard `scripts/ci/run.sh` entrypoint;
 - its fast, full, smoke, and integration commands;
 - test fixtures and migrations;
 - project-specific secrets;
@@ -51,7 +75,18 @@ Each installation is responsible for:
 
 Deployment-local values must not be committed to this public repository.
 
-## Target lifecycle
+## Target runner lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Requested
+    Requested --> Created
+    Created --> Idle
+    Idle --> Running
+    Running --> Diagnostics
+    Diagnostics --> Destroyed
+    Destroyed --> [*]
+```
 
 1. The controller authenticates to GitHub using a GitHub App.
 2. GitHub reports demand for the configured runner scale set.
@@ -64,11 +99,17 @@ Deployment-local values must not be committed to this public repository.
 9. The runner container and writable state are destroyed.
 10. Capacity is reconciled against current demand.
 
-## Security boundary
+## Job routing
 
-Multiple runner containers using one Docker daemon share a security boundary. Increasing runner replicas increases concurrency, not isolation.
+```mermaid
+flowchart TD
+    A["Workflow job"] --> B{"Privilege required?"}
+    B -->|No| C["Shared validation pool"]
+    B -->|Repository write| D["Release pool"]
+    B -->|Deploy or internal access| E["Restricted deployment pool"]
+```
 
-Workloads with different trust or network requirements must use separate runner groups and, when appropriate, separate Docker hosts or virtual machines.
+Project-controlled inputs must not allow an ordinary validation job to select a privileged runner group.
 
 ## Deployment shapes
 
@@ -85,14 +126,14 @@ Kubernetes is not an initial requirement. The architecture should not prevent a 
 
 ## Cleanup layers
 
-Cleanup is divided into:
+```mermaid
+flowchart TD
+    A["Project cleanup"] --> B["Runner destruction"]
+    B --> C["Host garbage collection"]
+    C --> D["Disk-pressure protection"]
+```
 
-1. project-scoped cleanup after each workflow run;
-2. destruction of the one-job runner;
-3. host-level age- and capacity-based Docker garbage collection;
-4. monitored emergency disk-pressure handling.
-
-Host-wide pruning must not run as an uncoordinated per-job operation.
+Host-wide pruning must not run as an uncoordinated per-job operation. Hard cancellation and host failure may bypass project traps, so resources must remain identifiable by run and age.
 
 ## Update layers
 
@@ -101,3 +142,7 @@ Host-wide pruning must not run as an uncoordinated per-job operation.
 - Host security updates are applied automatically.
 - Reboots drain runner capacity before interrupting the host.
 - Fleet updates use rolling replacement and an explicit rollback version.
+
+## Project adoption
+
+All projects must follow the [Project CI Standard](PROJECT-STANDARD.md). Existing workflows must use the staged process in [Migrating Existing CI](MIGRATING-EXISTING-CI.md).
