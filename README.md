@@ -2,7 +2,7 @@
 
 Portable, ephemeral, Dockerized GitHub Actions runner infrastructure for self-hosted environments.
 
-> Status: architecture and isolated proof-of-concept planning. This repository does not yet contain a production-ready runner deployment.
+> Status: an inert ephemeral Docker runner prototype now builds in CI. It does not register a live runner and is not production-ready.
 
 ## Goal
 
@@ -88,6 +88,8 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 ### Design and operations
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Controller decision record](docs/adr/0001-actions-scale-set-client.md)
+- [Experimental deployment prototype](docs/DEPLOYMENT-PROTOTYPE.md)
 - [Sanitized discovery summary](docs/DISCOVERY-SUMMARY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Secrets model](docs/SECRETS.md)
@@ -103,9 +105,9 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 
 Examples are starting points. Projects must replace placeholder action references and pin reviewed container images before production use.
 
-## First milestone
+## First live milestone
 
-The first proof of concept must:
+After the inert prototype passes validation, the first separately authorized live proof of concept must:
 
 1. register one runner under a new experimental label;
 2. accept exactly one manually triggered read-only job;
