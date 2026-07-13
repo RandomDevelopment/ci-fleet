@@ -35,7 +35,7 @@ case "$suite" in
     "${compose[@]}" run --rm --no-deps test ./scripts/test-fast.sh
     ;;
   full)
-    "${compose[@]}" up -d --wait
+    "${compose[@]}" up -d --wait database
     "${compose[@]}" run --rm test ./scripts/test-full.sh
     ;;
 esac
