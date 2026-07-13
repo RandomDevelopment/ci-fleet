@@ -1,0 +1,27 @@
+# Copy into a project as .github/workflows/ci-fleet-experimental.yml.
+# Replace CHECKOUT_COMMIT_SHA with a reviewed immutable commit SHA.
+
+name: CI Fleet Experimental
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-fleet-experimental-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Read-only Docker smoke
+    runs-on: [self-hosted, linux, x64, ci-fleet-experimental]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@CHECKOUT_COMMIT_SHA
+
+      - name: Run project CI contract
+        run: ./scripts/ci/run.sh fast
