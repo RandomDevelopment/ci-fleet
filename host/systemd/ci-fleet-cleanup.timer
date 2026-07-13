@@ -1,0 +1,11 @@
+[Unit]
+Description=Run scoped ci-fleet cleanup daily
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

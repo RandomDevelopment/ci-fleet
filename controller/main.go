@@ -44,7 +44,7 @@ func run(ctx context.Context) error {
 	}
 	set, err := client.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
 		Name: cfg.ScaleSetName, RunnerGroupID: runnerGroupID,
-		Labels: []scaleset.Label{{Name: cfg.ScaleSetName}},
+		Labels: cfg.buildLabels(),
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 	})
 	if err != nil { return fmt.Errorf("create runner scale set: %w", err) }

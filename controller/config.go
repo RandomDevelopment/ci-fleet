@@ -19,6 +19,7 @@ type Config struct {
 	RunnerGroup     string
 	RunnerImage     string
 	FleetInstance   string
+	Labels          []string
 	GitHubApp       scaleset.GitHubAppAuth
 	MaxRunners      int
 	MinRunners      int
@@ -60,12 +61,19 @@ func configFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("CI_FLEET_RUNNER_TTL: %w", err)
 	}
 
+	fleetInstance := strings.TrimSpace(os.Getenv("CI_FLEET_INSTANCE"))
+	scaleSetName := strings.TrimSpace(os.Getenv("CI_FLEET_SCALE_SET_NAME"))
+	if scaleSetName == "" && fleetInstance != "" {
+		scaleSetName = "docker-ci-" + fleetInstance
+	}
+
 	cfg := Config{
 		RegistrationURL: os.Getenv("CI_FLEET_GITHUB_URL"),
-		ScaleSetName:    getenv("CI_FLEET_SCALE_SET_NAME", "docker-ci-experimental"),
+		ScaleSetName:    scaleSetName,
 		RunnerGroup:     getenv("CI_FLEET_RUNNER_GROUP", scaleset.DefaultRunnerGroup),
 		RunnerImage:     os.Getenv("CI_FLEET_RUNNER_IMAGE"),
-		FleetInstance:   os.Getenv("CI_FLEET_INSTANCE"),
+		FleetInstance:   fleetInstance,
+		Labels:          splitCSV(getenv("CI_FLEET_LABELS", "docker-ci-experimental")),
 		GitHubApp: scaleset.GitHubAppAuth{
 			ClientID:       os.Getenv("CI_FLEET_GITHUB_APP_CLIENT_ID"),
 			InstallationID: installationID,
@@ -88,6 +96,14 @@ func (c Config) Validate() error {
 	}
 	if c.ScaleSetName == "" || c.RunnerImage == "" || c.FleetInstance == "" {
 		return fmt.Errorf("scale-set name, runner image, and fleet instance are required")
+	}
+	if len(c.Labels) == 0 {
+		return fmt.Errorf("at least one shared routing label is required")
+	}
+	for _, label := range c.Labels {
+		if strings.EqualFold(label, "self-hosted") || label == c.ScaleSetName {
+			return fmt.Errorf("routing labels must be shared capabilities, not %q", label)
+		}
 	}
 	if err := c.GitHubApp.Validate(); err != nil {
 		return fmt.Errorf("GitHub App credentials are incomplete: %w", err)
@@ -112,6 +128,16 @@ func getenv(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func splitCSV(raw string) []string {
+	var values []string
+	for _, value := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+	return values
 }
 
 func envInt(name string, fallback int) (int, error) {
@@ -144,4 +170,12 @@ func systemInfo(scaleSetID int) scaleset.SystemInfo {
 		System: "ci-fleet", Subsystem: "docker-controller", Version: version,
 		CommitSHA: commitSHA, ScaleSetID: scaleSetID,
 	}
+}
+
+func (c Config) buildLabels() []scaleset.Label {
+	labels := make([]scaleset.Label, 0, len(c.Labels))
+	for _, name := range c.Labels {
+		labels = append(labels, scaleset.Label{Name: name})
+	}
+	return labels
 }
