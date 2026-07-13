@@ -23,7 +23,8 @@ services:
       - ${CI_FLEET_DOCKER_GID:?set CI_FLEET_DOCKER_GID to the numeric group owning the Docker socket}
     environment:
       CI_FLEET_GITHUB_URL: ${CI_FLEET_GITHUB_URL:?set the organization or repository URL}
-      CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-docker-ci-experimental}
+      CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-}
+      CI_FLEET_LABELS: ${CI_FLEET_LABELS:-docker-ci-experimental}
       CI_FLEET_RUNNER_GROUP: ${CI_FLEET_RUNNER_GROUP:-Default}
       CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
       CI_FLEET_INSTANCE: ${CI_FLEET_INSTANCE:?set a unique stable host identifier}

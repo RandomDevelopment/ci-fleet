@@ -4,7 +4,7 @@ This is a reviewable deployment unit, not authorization to register a runner. Ph
 
 ## Host shape
 
-One Docker host may run one controller and many single-use runner containers, up to the configured CPU and memory capacity. Additional hosts use the identical Compose files with a unique `CI_FLEET_INSTANCE`.
+One Docker host may run one controller and many single-use runner containers, up to the configured CPU and memory capacity. Additional hosts use the identical Compose files with a unique `CI_FLEET_INSTANCE` and unique `CI_FLEET_SCALE_SET_NAME`; compatible hosts share `CI_FLEET_LABELS` so GitHub can route matching jobs across the fleet.
 
 ```mermaid
 flowchart LR
@@ -15,8 +15,10 @@ flowchart LR
   subgraph H2[Docker host vps-ci-01]
     C2[controller] --> R3[runner job C]
   end
-  Q[one GitHub scale-set queue] --> C1
-  Q --> C2
+  Q[shared routing label] --> S1[unique scale set home-ci-01]
+  Q --> S2[unique scale set vps-ci-01]
+  S1 --> C1
+  S2 --> C2
 ```
 
 Start conservatively with `MIN=0` and `MAX=1` on one isolated host. Raise concurrency only after observing CPU, memory, disk, network, port, and cache behavior.

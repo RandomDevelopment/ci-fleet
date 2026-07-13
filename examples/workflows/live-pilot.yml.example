@@ -1,0 +1,52 @@
+# Copy this file into one explicitly selected trusted private repository.
+# Do not enable the ci-fleet runner group for this public template repository.
+name: Experimental live runner pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experimental-live-runner-pilot
+  cancel-in-progress: false
+
+jobs:
+  pilot:
+    name: Read-only one-job lifecycle proof
+    runs-on: docker-ci-experimental
+    timeout-minutes: 10
+    steps:
+      - name: Check out without retaining credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify generic runner capabilities
+        run: |
+          set -Eeuo pipefail
+          docker version
+          docker compose version
+          git --version
+
+      - name: Prove run-scoped Docker cleanup
+        run: |
+          set -Eeuo pipefail
+          name="ci-fleet-pilot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            docker volume rm "$name" >/dev/null 2>&1 || true
+            docker network rm "$name" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker network create "$name"
+          docker volume create "$name"
+          docker run --name "$name" --network "$name" -v "$name:/proof" \
+            --entrypoint /bin/bash ci-fleet-runner:dev -c 'printf pilot-ok > /proof/result'
+          test "$(docker run --rm -v "$name:/proof:ro" --entrypoint /bin/bash ci-fleet-runner:dev -c 'cat /proof/result')" = pilot-ok
+          cleanup
+          trap - EXIT
+          test -z "$(docker ps -aq --filter "name=^/${name}$")"
+          test -z "$(docker volume ls -q --filter "name=^${name}$")"
+          test -z "$(docker network ls -q --filter "name=^${name}$")"
