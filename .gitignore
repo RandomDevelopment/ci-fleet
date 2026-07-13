@@ -1,0 +1,26 @@
+# Local deployment configuration
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+private/
+inventory/
+
+# Credentials and keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state
+_work/
+runner-data/
+logs/
+tmp/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
