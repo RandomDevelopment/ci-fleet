@@ -1,0 +1,58 @@
+name: ci-fleet
+
+services:
+  runner-image:
+    image: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+    build:
+      context: ../runner
+      args:
+        RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.335.1}
+    command: ["/bin/true"]
+    deploy:
+      replicas: 0
+
+  controller:
+    image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    build:
+      context: ../controller
+      args:
+        CI_FLEET_VERSION: ${CI_FLEET_VERSION:-dev}
+        CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
+    restart: unless-stopped
+    group_add:
+      - ${CI_FLEET_DOCKER_GID:?set CI_FLEET_DOCKER_GID to the numeric group owning the Docker socket}
+    environment:
+      CI_FLEET_GITHUB_URL: ${CI_FLEET_GITHUB_URL:?set the organization or repository URL}
+      CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-docker-ci-experimental}
+      CI_FLEET_RUNNER_GROUP: ${CI_FLEET_RUNNER_GROUP:-Default}
+      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+      CI_FLEET_INSTANCE: ${CI_FLEET_INSTANCE:?set a unique stable host identifier}
+      CI_FLEET_GITHUB_APP_CLIENT_ID: ${CI_FLEET_GITHUB_APP_CLIENT_ID:?set the GitHub App client ID}
+      CI_FLEET_GITHUB_APP_INSTALLATION_ID: ${CI_FLEET_GITHUB_APP_INSTALLATION_ID:?set the installation ID}
+      CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
+      CI_FLEET_MIN_RUNNERS: ${CI_FLEET_MIN_RUNNERS:-0}
+      CI_FLEET_MAX_RUNNERS: ${CI_FLEET_MAX_RUNNERS:-1}
+      CI_FLEET_RUNNER_CPUS: ${CI_FLEET_RUNNER_CPUS:-4}
+      CI_FLEET_RUNNER_MEMORY_MIB: ${CI_FLEET_RUNNER_MEMORY_MIB:-8192}
+      CI_FLEET_RUNNER_TTL: ${CI_FLEET_RUNNER_TTL:-6h}
+      CI_FLEET_DOCKER_GID: ${CI_FLEET_DOCKER_GID}
+    secrets:
+      - github_app_private_key
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  github_app_private_key:
+    file: ${CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE:?set the host path to the GitHub App PEM file}

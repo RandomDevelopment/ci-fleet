@@ -1,0 +1,6 @@
+This directory contains code adapted from the Docker scale-set example in
+actions/scaleset at commit 9b2803251ede77816509dcd90aadc0690dd80763.
+
+Copyright (c) GitHub, Inc. and contributors.
+Licensed under the MIT License. The upstream license is available at:
+https://github.com/actions/scaleset/blob/9b2803251ede77816509dcd90aadc0690dd80763/LICENSE
