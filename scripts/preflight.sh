@@ -35,8 +35,8 @@ for command in docker stat df awk; do
   command -v "$command" >/dev/null || fail "$command is unavailable"
 done
 if command -v docker >/dev/null; then
-  docker info >/dev/null 2>&1 && ok "Docker daemon is reachable" || fail "Docker daemon is unreachable"
-  docker compose version >/dev/null 2>&1 && ok "Docker Compose plugin is available" || fail "Docker Compose plugin is unavailable"
+  if docker info >/dev/null 2>&1; then ok "Docker daemon is reachable"; else fail "Docker daemon is unreachable"; fi
+  if docker compose version >/dev/null 2>&1; then ok "Docker Compose plugin is available"; else fail "Docker Compose plugin is unavailable"; fi
 fi
 
 socket_gid=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)
