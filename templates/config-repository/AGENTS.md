@@ -20,4 +20,6 @@ Before committing configuration changes, run:
 - CI runner hosts and application deployment hosts are separate roles.
 - Image promotion uses immutable digests; do not rebuild separately for production.
 - Reusable workflows must be pinned to a full reviewed commit SHA.
+- Keep ordinary task jobs at a five-minute hard ceiling and expected shard payload at four minutes or less.
+- Preserve deterministic task/shard isolation; Compose identity must include task and shard as well as run identity.
 - Update schema and validator together.

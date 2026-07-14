@@ -54,7 +54,7 @@ def main() -> int:
 
     config = {
         "$schema": str((ROOT / "fleet.schema.json").resolve()) if output.parent != ROOT else "./fleet.schema.json",
-        "schema_version": 1,
+        "schema_version": 2,
         "organization": {
             "slug": args.organization,
             "registry": registry,
@@ -92,9 +92,16 @@ def main() -> int:
                 "repository": repository,
                 "image": f"{registry}/{args.project}",
                 "ci_pool": "trusted-ci",
-                "ci_entrypoints": {
-                    "fast": "./scripts/ci/run.sh fast",
-                    "full": "./scripts/ci/run.sh full",
+                "ci_contract": {
+                    "runner_entrypoint": "./scripts/ci/run.sh",
+                    "task_plan": "./scripts/ci/plan.json",
+                    "aggregate_entrypoints": {
+                        "fast": "./scripts/ci/run.sh fast",
+                        "full": "./scripts/ci/run.sh full",
+                    },
+                    "target_wall_clock_minutes": 5,
+                    "max_job_minutes": 5,
+                    "shard_target_minutes": 4,
                 },
                 "deployments": ["development", "production"],
             }

@@ -30,7 +30,9 @@ Agents modifying this repository or adapting a project MUST apply these document
 - Prefer ephemeral, one-job runners.
 - Treat every group of runners sharing one Docker daemon as one security boundary.
 - Keep normal CI, release, deployment, repository-writing, and internal-network workloads separable.
-- Make cleanup concurrency-aware and scoped to a workflow run.
+- Make cleanup concurrency-aware and scoped to a workflow run, task, and shard.
+- Keep ordinary task-matrix jobs at a five-minute hard timeout and expected test payload at four minutes or less.
+- Preserve `fast` and `full` as aggregates, but schedule granular deterministic task shards on the fleet.
 - Do not use unrestricted global Docker pruning as per-job cleanup.
 - Pin production dependencies and container images to reviewed versions or digests.
 - Do not remove or weaken existing required CI until parallel validation and rollback verification are complete.
@@ -49,6 +51,8 @@ Runnable changes must eventually include:
 - cleanup verification after success, failure, cancellation, and timeout;
 - proof that long-lived controller credentials are unavailable to jobs;
 - proof that ordinary CI uses read-only permissions;
+- task-plan validation and deterministic matrix expansion;
+- measured shard duration and five-minute timeout enforcement;
 - comparison against the existing CI path during migration.
 
 ## Change policy

@@ -125,7 +125,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     if not validation.exact_keys(config, "$", required_top, {"$schema"}):
         return
 
-    validation.require(config.get("schema_version") == 1, "$.schema_version", "must equal 1")
+    validation.require(config.get("schema_version") == 2, "$.schema_version", "must equal 2")
 
     organization = config.get("organization")
     organization_keys = {"slug", "registry", "delivery_engine", "workflow_ref_policy"}
@@ -207,7 +207,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     for name, project in projects.items():
         path = f"$.projects.{name}"
         validation.require(bool(SLUG.fullmatch(name)), path, "project name must be a lowercase slug")
-        if not validation.exact_keys(project, path, {"repository", "image", "ci_pool", "ci_entrypoints", "deployments"}):
+        if not validation.exact_keys(project, path, {"repository", "image", "ci_pool", "ci_contract", "deployments"}):
             continue
         repository = project.get("repository")
         image = project.get("image")
@@ -217,10 +217,28 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(pool_name in pools, f"{path}.ci_pool", "must reference a declared runner pool")
         if pool_name in pools and isinstance(pools[pool_name].get("allowed_repositories"), list):
             validation.require(repository in pools[pool_name]["allowed_repositories"], f"{path}.repository", "must be explicitly allowed by its CI pool")
-        entrypoints = project.get("ci_entrypoints")
-        if validation.exact_keys(entrypoints, f"{path}.ci_entrypoints", {"fast", "full"}):
-            validation.require(entrypoints.get("fast") == "./scripts/ci/run.sh fast", f"{path}.ci_entrypoints.fast", "must use the standard fast entrypoint")
-            validation.require(entrypoints.get("full") == "./scripts/ci/run.sh full", f"{path}.ci_entrypoints.full", "must use the standard full entrypoint")
+        contract = project.get("ci_contract")
+        contract_path = f"{path}.ci_contract"
+        contract_keys = {
+            "runner_entrypoint",
+            "task_plan",
+            "aggregate_entrypoints",
+            "target_wall_clock_minutes",
+            "max_job_minutes",
+            "shard_target_minutes",
+        }
+        if validation.exact_keys(contract, contract_path, contract_keys):
+            validation.require(contract.get("runner_entrypoint") == "./scripts/ci/run.sh", f"{contract_path}.runner_entrypoint", "must use the standard task runner")
+            validation.require(contract.get("task_plan") == "./scripts/ci/plan.json", f"{contract_path}.task_plan", "must use the standard task-plan path")
+            validation.require(contract.get("target_wall_clock_minutes") == 5, f"{contract_path}.target_wall_clock_minutes", "must equal the five-minute fleet goal")
+            validation.require(contract.get("max_job_minutes") == 5, f"{contract_path}.max_job_minutes", "must enforce a five-minute hard job ceiling")
+            shard_target = contract.get("shard_target_minutes")
+            validation.require(type(shard_target) is int and 1 <= shard_target <= 4, f"{contract_path}.shard_target_minutes", "must be between one and four minutes to reserve startup time")
+            entrypoints = contract.get("aggregate_entrypoints")
+            aggregate_path = f"{contract_path}.aggregate_entrypoints"
+            if validation.exact_keys(entrypoints, aggregate_path, {"fast", "full"}):
+                validation.require(entrypoints.get("fast") == "./scripts/ci/run.sh fast", f"{aggregate_path}.fast", "must use the standard aggregate fast entrypoint")
+                validation.require(entrypoints.get("full") == "./scripts/ci/run.sh full", f"{aggregate_path}.full", "must use the standard aggregate full entrypoint")
         deployments = project.get("deployments")
         validation.require(isinstance(deployments, list) and bool(deployments), f"{path}.deployments", "must be a non-empty list")
         if isinstance(deployments, list):
