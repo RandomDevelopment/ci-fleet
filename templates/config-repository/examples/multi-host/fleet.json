@@ -1,0 +1,74 @@
+{
+  "$schema": "../../fleet.schema.json",
+  "schema_version": 1,
+  "organization": {
+    "slug": "sample-company",
+    "registry": "ghcr.io/sample-company",
+    "delivery_engine": "RandomDevelopment/ci-fleet",
+    "workflow_ref_policy": "immutable-commit"
+  },
+  "runner_pools": {
+    "trusted-ci": {
+      "routing_labels": ["docker-ci"],
+      "allowed_repositories": ["sample-company/api", "sample-company/web"],
+      "public_repositories": false,
+      "max_concurrent_jobs": 4
+    }
+  },
+  "host_groups": {
+    "development-east": {
+      "role": "deployment",
+      "environment_class": "development"
+    },
+    "staging-east": {
+      "role": "deployment",
+      "environment_class": "staging"
+    },
+    "production-primary": {
+      "role": "deployment",
+      "environment_class": "production"
+    }
+  },
+  "environments": {
+    "development": {
+      "host_group": "development-east",
+      "automatic": true,
+      "requires_approval": false,
+      "required_secret_names": ["DEPLOY_AUTH"]
+    },
+    "staging": {
+      "host_group": "staging-east",
+      "automatic": false,
+      "requires_approval": true,
+      "required_secret_names": ["DEPLOY_AUTH"]
+    },
+    "production": {
+      "host_group": "production-primary",
+      "automatic": false,
+      "requires_approval": true,
+      "required_secret_names": ["DEPLOY_AUTH"]
+    }
+  },
+  "projects": {
+    "api": {
+      "repository": "sample-company/api",
+      "image": "ghcr.io/sample-company/api",
+      "ci_pool": "trusted-ci",
+      "ci_entrypoints": {
+        "fast": "./scripts/ci/run.sh fast",
+        "full": "./scripts/ci/run.sh full"
+      },
+      "deployments": ["development", "staging", "production"]
+    },
+    "web": {
+      "repository": "sample-company/web",
+      "image": "ghcr.io/sample-company/web",
+      "ci_pool": "trusted-ci",
+      "ci_entrypoints": {
+        "fast": "./scripts/ci/run.sh fast",
+        "full": "./scripts/ci/run.sh full"
+      },
+      "deployments": ["development", "production"]
+    }
+  }
+}
