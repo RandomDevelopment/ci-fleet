@@ -24,7 +24,8 @@ flowchart TD
 ## Core model
 
 - The fleet supplies generic ephemeral GitHub runners.
-- Each runner accepts one job and is then destroyed.
+- Worker images and host configuration never contain repository allowlists or project-specific logic.
+- Each runner accepts one GitHub-assigned job and is then destroyed.
 - Each project supplies its own test Dockerfile, services, and commands.
 - Normal CI uses a shared organization-level runner pool.
 - Release, deployment, repository-writing, and internal-network jobs remain separated.
@@ -95,6 +96,8 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 - [Experimental deployment prototype](docs/DEPLOYMENT-PROTOTYPE.md)
 - [Live pilot runbook](docs/LIVE-PILOT.md)
 - [Host maintenance standard](docs/HOST-MAINTENANCE.md)
+- [How to add a fleet host](docs/ADDING-A-HOST.md)
+- [How to add a project](docs/ADDING-A-PROJECT.md)
 - [Sanitized discovery summary](docs/DISCOVERY-SUMMARY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Secrets model](docs/SECRETS.md)
@@ -119,6 +122,10 @@ The scaffold is validated in this repository before being published as the stand
 - [Node test image](examples/project/Dockerfile.test)
 
 Examples are starting points. Projects must replace placeholder action references and pin reviewed container images before production use.
+
+## Set-and-forget growth
+
+Enroll each Docker host once with a unique instance and scale-set name and the fleet's shared routing label. Adding a future project updates that project, private fleet policy, and GitHub runner-group access; it does not modify, rebuild, or re-register existing hosts or worker containers. Additional homes, buildings, physical machines, and VPS locations use the same host runbook and join the same compatible queue.
 
 ## First live milestone
 
