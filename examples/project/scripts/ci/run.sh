@@ -44,8 +44,10 @@ if (( shard_index > shard_total )); then
   exit 64
 fi
 
-repo_slug="${GITHUB_REPOSITORY#*/}"
-raw_name="ci-${repo_slug}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${task}-${shard_index}of${shard_total}"
+repository="${GITHUB_REPOSITORY:-local/project}"
+repo_component="$(printf '%s' "${repository#*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
+task_component="$(printf '%s' "$task" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
+raw_name="ci-${repo_component}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${task_component}-${shard_index}of${shard_total}"
 COMPOSE_PROJECT_NAME="$(printf '%s' "$raw_name" |
   tr '[:upper:]' '[:lower:]' |
   tr -cs 'a-z0-9_-' '-' |
@@ -73,6 +75,7 @@ esac
 # Replace these sample scripts with project-owned task implementations. A
 # sharding-aware test framework should receive both values deterministically.
 "${compose[@]}" run --rm \
+  -e "CI_FLEET_TASK=${task}" \
   -e "CI_FLEET_SHARD_INDEX=${shard_index}" \
   -e "CI_FLEET_SHARD_TOTAL=${shard_total}" \
   test "./scripts/test-${task}.sh" "$shard_index" "$shard_total"
