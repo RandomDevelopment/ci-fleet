@@ -1,0 +1,50 @@
+# Copy into a private project as .github/workflows/ci.yml.
+# Replace CI_FLEET_COMMIT_SHA with a reviewed immutable ci-fleet commit SHA.
+
+name: Parallel container CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check out project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - id: plan
+        name: Validate and expand project task plan
+        uses: RandomDevelopment/ci-fleet/.github/actions/plan@CI_FLEET_COMMIT_SHA
+        with:
+          group: full
+
+  test:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: [self-hosted, linux, x64, docker-ci]
+    timeout-minutes: 5
+    steps:
+      - name: Check out project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run isolated task shard
+        run: >-
+          ./scripts/ci/run.sh
+          "${{ matrix.task }}"
+          --shard "${{ matrix.shard }}/${{ matrix.shards }}"

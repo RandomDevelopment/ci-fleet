@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ci-fleet project task plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "target_wall_clock_minutes", "max_job_minutes", "shard_target_minutes", "tasks"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": 1},
+    "target_wall_clock_minutes": {"const": 5},
+    "max_job_minutes": {"const": 5},
+    "shard_target_minutes": {"type": "integer", "minimum": 1, "maximum": 4},
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "groups", "shards", "estimated_minutes_per_shard"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$", "not": {"enum": ["fast", "full"]}},
+          "groups": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["fast", "full"]}},
+          "shards": {"type": "integer", "minimum": 1, "maximum": 256},
+          "estimated_minutes_per_shard": {"type": "number", "exclusiveMinimum": 0, "maximum": 4}
+        }
+      }
+    }
+  }
+}
