@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+credentials/
+secrets/
+private/
+*.local.json
+__pycache__/
+*.pyc

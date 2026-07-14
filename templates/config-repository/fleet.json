@@ -1,0 +1,54 @@
+{
+  "$schema": "./fleet.schema.json",
+  "schema_version": 1,
+  "organization": {
+    "slug": "example-org",
+    "registry": "ghcr.io/example-org",
+    "delivery_engine": "RandomDevelopment/ci-fleet",
+    "workflow_ref_policy": "immutable-commit"
+  },
+  "runner_pools": {
+    "trusted-ci": {
+      "routing_labels": ["docker-ci"],
+      "allowed_repositories": ["example-org/example-app"],
+      "public_repositories": false,
+      "max_concurrent_jobs": 1
+    }
+  },
+  "host_groups": {
+    "development-apps": {
+      "role": "deployment",
+      "environment_class": "development"
+    },
+    "production-apps": {
+      "role": "deployment",
+      "environment_class": "production"
+    }
+  },
+  "environments": {
+    "development": {
+      "host_group": "development-apps",
+      "automatic": true,
+      "requires_approval": false,
+      "required_secret_names": ["DEPLOY_AUTH"]
+    },
+    "production": {
+      "host_group": "production-apps",
+      "automatic": false,
+      "requires_approval": true,
+      "required_secret_names": ["DEPLOY_AUTH"]
+    }
+  },
+  "projects": {
+    "example-app": {
+      "repository": "example-org/example-app",
+      "image": "ghcr.io/example-org/example-app",
+      "ci_pool": "trusted-ci",
+      "ci_entrypoints": {
+        "fast": "./scripts/ci/run.sh fast",
+        "full": "./scripts/ci/run.sh full"
+      },
+      "deployments": ["development", "production"]
+    }
+  }
+}
