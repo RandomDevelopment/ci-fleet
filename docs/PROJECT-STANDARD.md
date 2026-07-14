@@ -64,7 +64,7 @@ A project CI job:
 
 A project:
 
-- MUST use a unique Compose project name derived from repository, workflow run ID, and run attempt;
+- MUST use a unique Compose project name derived from repository, workflow run ID, run attempt, task, and shard;
 - MUST NOT set fixed `container_name` values;
 - MUST NOT publish fixed host ports;
 - SHOULD run tests against service names on an internal Compose network;
@@ -77,14 +77,12 @@ A project:
 Recommended project name construction:
 
 ```bash
-repo_slug="${GITHUB_REPOSITORY#*/}"
-task_slug="${CI_FLEET_TASK:-aggregate}"
-shard_slug="${CI_FLEET_SHARD_INDEX:-1}of${CI_FLEET_SHARD_TOTAL:-1}"
-raw_name="ci-${repo_slug}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${task_slug}-${shard_slug}"
-COMPOSE_PROJECT_NAME="$(printf '%s' "$raw_name" |
-  tr '[:upper:]' '[:lower:]' |
-  tr -cs 'a-z0-9_-' '-' |
-  cut -c1-63)"
+repository="${GITHUB_REPOSITORY:-local/project}"
+repo_component="$(printf '%s' "${repository#*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
+task_component="$(printf '%s' "${CI_FLEET_TASK:-aggregate}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
+shard_component="${CI_FLEET_SHARD_INDEX:-1}of${CI_FLEET_SHARD_TOTAL:-1}"
+raw_name="ci-${repo_component}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${task_component}-${shard_component}"
+COMPOSE_PROJECT_NAME="$(printf '%s' "$raw_name" | tr -cs 'a-z0-9_-' '-' | cut -c1-63)"
 export COMPOSE_PROJECT_NAME
 ```
 

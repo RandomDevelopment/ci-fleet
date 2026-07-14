@@ -75,7 +75,7 @@ Before using a shared host:
 - remove fixed `container_name` values;
 - remove fixed host port bindings;
 - use service DNS on internal Compose networks;
-- derive the Compose project name from the workflow run;
+- derive the Compose project name from the workflow run, attempt, task, and shard;
 - make caches explicitly namespaced;
 - ensure cleanup targets only the current run.
 
