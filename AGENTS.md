@@ -15,6 +15,8 @@ The project is in architecture definition and isolated proof-of-concept planning
 - `docs/COMPLIANCE-CHECKLIST.md`: cutover gate.
 - `docs/ARCHITECTURE.md`: fleet and trust boundaries.
 - `docs/SECRETS.md`: credential boundaries.
+- `docs/ADDING-A-HOST.md`: repeatable host and location enrollment.
+- `docs/ADDING-A-PROJECT.md`: project authorization without host changes.
 
 Agents modifying this repository or adapting a project MUST apply these documents. Do not create a project-specific exception silently. Record any necessary exception as an explicit design decision with risks and removal criteria.
 
@@ -37,6 +39,8 @@ Agents modifying this repository or adapting a project MUST apply these document
 - Pin production dependencies and container images to reviewed versions or digests.
 - Do not remove or weaken existing required CI until parallel validation and rollback verification are complete.
 - Do not install project language runtimes in the generic runner image.
+- Do not put repository names, project allowlists, or project-specific logic in runner images or host configuration.
+- Keep project workflows independent of host, site, instance, and scale-set names; route through shared capability labels.
 - Do not allow projects to select privileged runner groups through untrusted inputs.
 
 ## Verification expectations
