@@ -89,6 +89,7 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Controller decision record](docs/adr/0001-actions-scale-set-client.md)
+- [Public engine / private configuration decision](docs/adr/0002-public-engine-private-configuration.md)
 - [Experimental deployment prototype](docs/DEPLOYMENT-PROTOTYPE.md)
 - [Live pilot runbook](docs/LIVE-PILOT.md)
 - [Host maintenance standard](docs/HOST-MAINTENANCE.md)
@@ -97,6 +98,13 @@ Never commit credentials or real deployment configuration. See [SECURITY.md](SEC
 - [Secrets model](docs/SECRETS.md)
 - [Agent instructions](AGENTS.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+### Configuration template
+
+- [Public configuration-repository scaffold](templates/config-repository/README.md)
+- [Configuration-template milestone](https://github.com/RandomDevelopment/ci-fleet/issues/12)
+
+The scaffold is validated in this repository before being published as the standalone `ci-fleet-config-template` GitHub template. It contains fictional data only; generated organization configuration should normally be private.
 
 ### Copyable examples
 

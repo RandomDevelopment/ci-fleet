@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RandomDevelopment/ci-fleet-config-template/fleet.schema.json",
+  "title": "ci-fleet organization configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "organization", "runner_pools", "host_groups", "environments", "projects"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": 1},
+    "organization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "registry", "delivery_engine", "workflow_ref_policy"],
+      "properties": {
+        "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,38}$"},
+        "registry": {"type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9._/-]+$"},
+        "delivery_engine": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "workflow_ref_policy": {"const": "immutable-commit"}
+      }
+    },
+    "runner_pools": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/runner_pool"}
+    },
+    "host_groups": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/host_group"}
+    },
+    "environments": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/environment"}
+    },
+    "projects": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/project"}
+    }
+  },
+  "$defs": {
+    "runner_pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["routing_labels", "allowed_repositories", "public_repositories", "max_concurrent_jobs"],
+      "properties": {
+        "routing_labels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"}},
+        "allowed_repositories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}},
+        "public_repositories": {"const": false},
+        "max_concurrent_jobs": {"type": "integer", "minimum": 1}
+      }
+    },
+    "host_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "environment_class"],
+      "properties": {
+        "role": {"const": "deployment"},
+        "environment_class": {"enum": ["development", "staging", "production"]}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_group", "automatic", "requires_approval", "required_secret_names"],
+      "properties": {
+        "host_group": {"type": "string"},
+        "automatic": {"type": "boolean"},
+        "requires_approval": {"type": "boolean"},
+        "required_secret_names": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"}}
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "image", "ci_pool", "ci_entrypoints", "deployments"],
+      "properties": {
+        "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "image": {"type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9._/-]+$"},
+        "ci_pool": {"type": "string"},
+        "ci_entrypoints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fast", "full"],
+          "properties": {
+            "fast": {"const": "./scripts/ci/run.sh fast"},
+            "full": {"const": "./scripts/ci/run.sh full"}
+          }
+        },
+        "deployments": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+      }
+    }
+  }
+}
