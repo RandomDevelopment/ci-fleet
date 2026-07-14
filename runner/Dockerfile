@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.18
-FROM debian:13.1-slim
+FROM debian:13.6-slim
 
 ARG TARGETARCH
 ARG RUNNER_VERSION=2.335.1
