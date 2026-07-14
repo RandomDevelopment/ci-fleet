@@ -6,6 +6,16 @@ Status: design draft
 
 Provide a portable fleet of identical self-hosted GitHub Actions runners that can serve multiple explicitly authorized repositories. Each project owns its test environment; the fleet owns runner lifecycle, host maintenance, capacity, and common workflow behavior.
 
+## Set-and-forget invariants
+
+- A host is enrolled once with a unique instance and scale-set identity and a shared capability label.
+- Host configuration and worker images contain no repository names, allowlists, project runtimes, or project test logic.
+- GitHub runner-group policy authorizes repositories; private fleet configuration records intended organization policy.
+- Adding or removing a project never requires changing, rebuilding, restarting, or re-registering a compatible host.
+- Adding a location never requires changing a project workflow; GitHub routes its shared label to any healthy compatible scale set.
+- Losing or draining one site leaves compatible work available to other sites.
+- Privileged workloads remain on separate labels, groups, hosts, and network boundaries.
+
 ## System topology
 
 ```mermaid
@@ -145,4 +155,4 @@ Host-wide pruning must not run as an uncoordinated per-job operation. Hard cance
 
 ## Project adoption
 
-All projects must follow the [Project CI Standard](PROJECT-STANDARD.md). Existing workflows must use the staged process in [Migrating Existing CI](MIGRATING-EXISTING-CI.md).
+All projects must follow the [Project CI Standard](PROJECT-STANDARD.md). Existing workflows must use the staged process in [Migrating Existing CI](MIGRATING-EXISTING-CI.md). Operators use [How to add a fleet host](ADDING-A-HOST.md) and [How to add a project](ADDING-A-PROJECT.md) without introducing project-specific host state.
