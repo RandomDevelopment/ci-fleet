@@ -25,6 +25,10 @@ def errors_for(config: dict, *, strict: bool = False) -> list[str]:
     return validation.errors
 
 
+def first_project(config: dict) -> dict:
+    return next(iter(config["projects"].values()))
+
+
 class PolicyTests(unittest.TestCase):
     def assert_rejected(self, config: dict, expected: str, *, strict: bool = False) -> None:
         errors = errors_for(config, strict=strict)
@@ -64,26 +68,31 @@ class PolicyTests(unittest.TestCase):
         self.assert_rejected(config, "secret values are forbidden")
 
     def test_strict_mode_rejects_unchanged_example(self) -> None:
-        self.assert_rejected(reference_config(), "replace the example organization", strict=True)
+        config = copy.deepcopy(reference_config())
+        project = first_project(config)
+        config["organization"]["slug"] = "example-org"
+        config["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["example-org/example-app"]
+        project["repository"] = "example-org/example-app"
+        self.assert_rejected(config, "replace the example organization", strict=True)
 
     def test_nonstandard_ci_entrypoint_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
-        config["projects"]["example-app"]["ci_contract"]["aggregate_entrypoints"]["fast"] = "npm test"
+        first_project(config)["ci_contract"]["aggregate_entrypoints"]["fast"] = "npm test"
         self.assert_rejected(config, "standard aggregate fast entrypoint")
 
     def test_job_ceiling_above_five_minutes_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
-        config["projects"]["example-app"]["ci_contract"]["max_job_minutes"] = 10
+        first_project(config)["ci_contract"]["max_job_minutes"] = 10
         self.assert_rejected(config, "five-minute hard job ceiling")
 
     def test_shard_target_must_reserve_startup_time(self) -> None:
         config = copy.deepcopy(reference_config())
-        config["projects"]["example-app"]["ci_contract"]["shard_target_minutes"] = 5
+        first_project(config)["ci_contract"]["shard_target_minutes"] = 5
         self.assert_rejected(config, "reserve startup time")
 
     def test_standard_task_plan_path_is_required(self) -> None:
         config = copy.deepcopy(reference_config())
-        config["projects"]["example-app"]["ci_contract"]["task_plan"] = "ci/custom.json"
+        first_project(config)["ci_contract"]["task_plan"] = "ci/custom.json"
         self.assert_rejected(config, "standard task-plan path")
 
 
