@@ -6,28 +6,49 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, and **SHOULD NOT
 
 ## Required repository interface
 
-Every participating project MUST provide one executable entrypoint:
+Every participating project MUST provide:
 
 ```text
-scripts/ci/run.sh <suite>
+scripts/ci/plan.json
+scripts/ci/run.sh <task> --shard INDEX/TOTAL
 ```
 
-Supported suites SHOULD include:
+The task plan MUST declare named, independently runnable tasks, their `fast` and/or `full` group membership, deterministic shard counts, and expected minutes per shard. Task IDs MUST NOT use the reserved aggregate names `fast` or `full`.
 
-- `fast`: syntax, formatting, build, unit tests, and short smoke validation;
-- `full`: integration tests, migrations, database validation, and complete behavior tests.
+Projects MUST also preserve these aggregate developer interfaces:
 
-A project MAY support additional suites, but the shared fleet MUST NOT contain project-specific test logic.
+```bash
+./scripts/ci/run.sh fast
+./scripts/ci/run.sh full
+```
 
-Existing scripts do not need to be discarded. The standard entrypoint MAY delegate to an established project script.
+The fleet MUST schedule the named task shards, not the aggregate command. Aggregate commands exist for local reproduction, migration compatibility, and constrained environments with only one worker.
+
+Existing scripts do not need to be discarded. The standard entrypoint MAY delegate to established project scripts, but the shared fleet MUST NOT contain project-specific test logic.
 
 ```mermaid
 flowchart LR
-    A["Reusable workflow"] --> B["scripts/ci/run.sh"]
-    B --> C["Project Dockerfile"]
-    B --> D["Project services"]
-    B --> E["Project tests"]
+    A["plan.json"] --> B["GitHub matrix"]
+    B --> C["task A"]
+    B --> D["task B: shard 1/N"]
+    B --> E["task B: shard 2/N"]
+    C --> F["Project Docker environment"]
+    D --> F
+    E --> F
 ```
+
+## Five-minute scheduling objective
+
+Ordinary CI MUST target a wall-clock duration of five minutes or less when sufficient workers are available.
+
+- Every task-matrix job MUST set `timeout-minutes: 5`.
+- Expected test payload per shard MUST be four minutes or less, reserving time for checkout, container startup, and reporting.
+- Sharding MUST be deterministic: the same revision and `INDEX/TOTAL` pair select the same work.
+- Tasks and shards SHOULD be balanced using measured historical duration rather than test count.
+- Projects MUST split, optimize, or move any indivisible test that cannot fit the ordinary five-minute job ceiling.
+- A task plan MUST expand to no more than GitHub's 256-job matrix limit.
+
+Forty-five test-minutes divided among nine workers is a theoretical five-minute lower bound. Real plans generally need more than nine shards because job setup consumes part of the ceiling and test work is not perfectly balanced. Adding workers reduces wall-clock time only while runnable shards remain queued.
 
 ## Host independence
 
@@ -57,7 +78,9 @@ Recommended project name construction:
 
 ```bash
 repo_slug="${GITHUB_REPOSITORY#*/}"
-raw_name="ci-${repo_slug}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+task_slug="${CI_FLEET_TASK:-aggregate}"
+shard_slug="${CI_FLEET_SHARD_INDEX:-1}of${CI_FLEET_SHARD_TOTAL:-1}"
+raw_name="ci-${repo_slug}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-${task_slug}-${shard_slug}"
 COMPOSE_PROJECT_NAME="$(printf '%s' "$raw_name" |
   tr '[:upper:]' '[:lower:]' |
   tr -cs 'a-z0-9_-' '-' |
@@ -87,7 +110,7 @@ Ordinary CI:
 - MUST declare `permissions: contents: read`;
 - MUST NOT receive deployment, release, production, or internal-network credentials;
 - MUST NOT push branches, tags, releases, packages, or commits;
-- MUST set a job timeout;
+- MUST set `timeout-minutes: 5` on every ordinary task-matrix job;
 - SHOULD use concurrency controls appropriate to the project;
 - MUST treat pull-request code as untrusted unless repository policy explicitly establishes otherwise.
 
@@ -122,21 +145,25 @@ flowchart TD
 
 ## Reproducibility
 
-A project MUST document a local command that exercises the same entrypoint used by GitHub:
+A project MUST document both aggregate local commands and a representative direct shard:
 
 ```bash
 ./scripts/ci/run.sh fast
 ./scripts/ci/run.sh full
+./scripts/ci/run.sh unit --shard 1/4
 ```
 
-CI-only behavior SHOULD be limited to run identity, artifact upload, and GitHub status reporting.
+Local and CI execution MUST use the same project image and task implementation. CI-only behavior SHOULD be limited to matrix selection, run identity, artifact upload, and GitHub status reporting.
 
 ## Required verification before migration
 
 A project is not compliant until all of these pass:
 
-- fast suite locally through Docker;
-- full suite locally through Docker;
+- task plan validation and deterministic matrix expansion;
+- every declared task/shard through Docker;
+- fast aggregate locally through Docker;
+- full aggregate locally through Docker;
+- measured evidence that ordinary shards fit the five-minute ceiling;
 - manual experimental fleet run;
 - parallel old/new CI comparison;
 - forced failure cleanup;

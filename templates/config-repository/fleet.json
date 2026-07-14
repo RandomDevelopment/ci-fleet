@@ -1,6 +1,6 @@
 {
   "$schema": "./fleet.schema.json",
-  "schema_version": 1,
+  "schema_version": 2,
   "organization": {
     "slug": "example-org",
     "registry": "ghcr.io/example-org",
@@ -44,9 +44,16 @@
       "repository": "example-org/example-app",
       "image": "ghcr.io/example-org/example-app",
       "ci_pool": "trusted-ci",
-      "ci_entrypoints": {
-        "fast": "./scripts/ci/run.sh fast",
-        "full": "./scripts/ci/run.sh full"
+      "ci_contract": {
+        "runner_entrypoint": "./scripts/ci/run.sh",
+        "task_plan": "./scripts/ci/plan.json",
+        "aggregate_entrypoints": {
+          "fast": "./scripts/ci/run.sh fast",
+          "full": "./scripts/ci/run.sh full"
+        },
+        "target_wall_clock_minutes": 5,
+        "max_job_minutes": 5,
+        "shard_target_minutes": 4
       },
       "deployments": ["development", "production"]
     }

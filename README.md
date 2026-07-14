@@ -34,14 +34,16 @@ flowchart TD
 
 ## Project contract
 
-Every participating project must expose:
+Every participating project publishes a task plan and a sharding-aware Docker entrypoint:
 
 ```bash
-./scripts/ci/run.sh fast
-./scripts/ci/run.sh full
+./scripts/ci/run.sh unit --shard 1/4
+./scripts/ci/run.sh integration --shard 2/3
 ```
 
-Those commands must execute project validation inside project-owned containers. The fleet runner image does not carry project runtimes.
+The fleet expands `scripts/ci/plan.json` into one GitHub job per task shard. Ordinary jobs have a hard five-minute timeout and target no more than four minutes of test payload. With sufficient independent work and available workers, total wall-clock time approaches the slowest shard rather than the sum of all tests.
+
+`./scripts/ci/run.sh fast` and `full` remain aggregate local commands. All application validation still executes inside project-owned containers; the fleet runner image does not carry project runtimes.
 
 The mandatory rules are defined in the [Project CI Standard](docs/PROJECT-STANDARD.md). Existing projects follow [Migrating Existing CI](docs/MIGRATING-EXISTING-CI.md) and must complete the [Compliance Checklist](docs/COMPLIANCE-CHECKLIST.md).
 
@@ -109,6 +111,8 @@ The scaffold is validated in this repository before being published as the stand
 ### Copyable examples
 
 - [Experimental read-only workflow](examples/workflows/experimental-smoke.yml.example)
+- [Five-minute parallel matrix workflow](examples/workflows/parallel-ci.yml.example)
+- [Project task plan](examples/project/scripts/ci/plan.json)
 - [Private-repository live pilot workflow](examples/workflows/live-pilot.yml.example)
 - [Standard project entrypoint](examples/project/scripts/ci/run.sh)
 - [Isolated Compose project](examples/project/compose.ci.yaml)
