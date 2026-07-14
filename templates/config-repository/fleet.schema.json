@@ -7,7 +7,7 @@
   "required": ["schema_version", "organization", "runner_pools", "host_groups", "environments", "projects"],
   "properties": {
     "$schema": {"type": "string"},
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "organization": {
       "type": "object",
       "additionalProperties": false,
@@ -75,18 +75,30 @@
     "project": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "image", "ci_pool", "ci_entrypoints", "deployments"],
+      "required": ["repository", "image", "ci_pool", "ci_contract", "deployments"],
       "properties": {
         "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
         "image": {"type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9._/-]+$"},
         "ci_pool": {"type": "string"},
-        "ci_entrypoints": {
+        "ci_contract": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["fast", "full"],
+          "required": ["runner_entrypoint", "task_plan", "aggregate_entrypoints", "target_wall_clock_minutes", "max_job_minutes", "shard_target_minutes"],
           "properties": {
-            "fast": {"const": "./scripts/ci/run.sh fast"},
-            "full": {"const": "./scripts/ci/run.sh full"}
+            "runner_entrypoint": {"const": "./scripts/ci/run.sh"},
+            "task_plan": {"const": "./scripts/ci/plan.json"},
+            "aggregate_entrypoints": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fast", "full"],
+              "properties": {
+                "fast": {"const": "./scripts/ci/run.sh fast"},
+                "full": {"const": "./scripts/ci/run.sh full"}
+              }
+            },
+            "target_wall_clock_minutes": {"const": 5},
+            "max_job_minutes": {"const": 5},
+            "shard_target_minutes": {"type": "integer", "minimum": 1, "maximum": 4}
           }
         },
         "deployments": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}

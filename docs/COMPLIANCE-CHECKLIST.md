@@ -4,15 +4,20 @@ A project MUST complete this checklist before its existing required CI is moved 
 
 ## Project contract
 
-- [ ] `scripts/ci/run.sh fast` exists and is executable.
-- [ ] `scripts/ci/run.sh full` exists when the project has integration tests.
-- [ ] Both commands run project validation inside project-owned containers.
+- [ ] `scripts/ci/plan.json` declares every ordinary task and deterministic shard count.
+- [ ] `scripts/ci/run.sh <task> --shard INDEX/TOTAL` exists and is executable.
+- [ ] `scripts/ci/run.sh fast` and `full` remain working aggregate local commands.
+- [ ] Every task/shard runs project validation inside project-owned containers.
+- [ ] Every ordinary matrix job has `timeout-minutes: 5`.
+- [ ] Expected test payload per shard is four minutes or less.
+- [ ] Fast tasks are included in the full group.
+- [ ] Task IDs are unique and the expanded matrix stays within 256 jobs.
 - [ ] The runner host does not provide the project language runtime.
-- [ ] Local and CI execution use the same entrypoint.
+- [ ] Local aggregate and CI shard execution use the same task implementations.
 
 ## Isolation
 
-- [ ] Compose project names are unique per run and attempt.
+- [ ] Compose project names are unique per run, attempt, task, and shard.
 - [ ] No fixed `container_name` exists.
 - [ ] No fixed host port is published.
 - [ ] Tests use internal service DNS where possible.
@@ -49,7 +54,7 @@ A project MUST complete this checklist before its existing required CI is moved 
 - [ ] Manual experimental run passed.
 - [ ] Old and new CI ran on the same commits.
 - [ ] Results and artifacts matched.
-- [ ] Resource consumption was recorded.
+- [ ] Resource consumption, total test-minutes, shard durations, and wall-clock duration were recorded.
 - [ ] Forced failure cleanup passed.
 - [ ] Cancellation cleanup passed.
 - [ ] Existing required checks remained available during validation.

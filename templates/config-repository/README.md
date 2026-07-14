@@ -8,7 +8,7 @@ It does **not** contain runner registration tokens, deploy credentials, private 
 flowchart LR
   E[Public ci-fleet engine] -->|pinned reusable workflow| P[Private project repos]
   C[Private config created from this template] -->|logical policy| P
-  P -->|fast / full| R[Trusted Docker CI pool]
+  P -->|task matrix| R[Trusted Docker CI pool]
   P -->|approved image digest| D[Development hosts]
   P -->|manual approval + image digest| X[Production hosts]
   S[GitHub Environments / host secret store] -. secret values .-> P
@@ -42,7 +42,9 @@ The initializer refuses to replace a configured file unless `--force` is explici
 ## Hard rules
 
 - Public repositories never receive access to the trusted self-hosted runner pool.
-- Every project implements exactly `./scripts/ci/run.sh fast` and `./scripts/ci/run.sh full`; each command runs the project's own Docker-defined test environment.
+- Every project publishes `scripts/ci/plan.json` and implements `./scripts/ci/run.sh <task> --shard INDEX/TOTAL` in its own Docker-defined test environment.
+- `./scripts/ci/run.sh fast` and `full` remain aggregate developer commands; fleet scheduling expands their named tasks across available workers.
+- Every matrix job has a five-minute hard timeout, while expected test payload targets four minutes or less to reserve startup and reporting time.
 - CI runner pools and deployment host groups are separate trust roles.
 - Production deployment is manual and requires GitHub Environment approval.
 - Reusable workflows and third-party actions are pinned to immutable commits.
@@ -50,6 +52,22 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - Promoted artifacts are container image digests; production does not rebuild a different image.
 
 `fleet.schema.json` provides editor completion and structural documentation. `scripts/validate.py` is the authoritative dependency-free policy check, including relationships JSON Schema cannot express clearly.
+
+## Five-minute parallelism contract
+
+Projects divide their total test-minutes into independent named tasks and deterministic shards. Forty-five test-minutes require at least nine perfectly balanced five-minute jobs in theory. In practice, projects should create additional shards targeting four minutes of test payload so checkout, image preparation, and reporting remain inside the five-minute job ceiling.
+
+```mermaid
+flowchart LR
+  P[plan.json] --> M[GitHub matrix]
+  M --> A[lint]
+  M --> B[unit 1/4]
+  M --> C[unit 2/4]
+  M --> D[integration 1/3]
+  M --> E[other independent shards]
+```
+
+Adding workers reduces wall-clock time only while independent shards remain queued. A genuinely indivisible test longer than five minutes must be optimized, split, or moved into an explicitly slower scheduled class outside ordinary CI.
 
 ## Repository map
 

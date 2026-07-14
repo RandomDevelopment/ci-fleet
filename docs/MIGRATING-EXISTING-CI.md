@@ -51,16 +51,22 @@ Create or adapt the project's test image so the runner host no longer supplies t
 
 The runner host should not determine whether a project needs Node 22, PHP 8.4, PostgreSQL 16, or a future runtime. Those versions belong to the project.
 
-## Step 4: Add the standard adapter
+## Step 4: Add the task plan and standard adapter
 
 Add:
 
 ```text
+scripts/ci/plan.json
+scripts/ci/run.sh <task> --shard INDEX/TOTAL
 scripts/ci/run.sh fast
 scripts/ci/run.sh full
 ```
 
-The adapter may call existing scripts. This allows a mature Dockerized project to preserve working orchestration while presenting the same interface as a newly containerized project.
+Inventory the existing suite by test-minutes, then divide it into independently runnable tasks and deterministic shards. Begin with measured or conservative estimates. Each shard SHOULD target no more than four minutes of test payload and MUST run inside a five-minute job timeout.
+
+The aggregate `fast` and `full` commands may call existing scripts. Fleet workflows expand `plan.json` and execute individual task shards so additional workers reduce wall-clock time.
+
+Do not split solely by test count when durations differ materially. Use historical timing data as it becomes available and rebalance shards that repeatedly approach the ceiling.
 
 ## Step 5: Eliminate shared-host collisions
 
@@ -69,7 +75,7 @@ Before using a shared host:
 - remove fixed `container_name` values;
 - remove fixed host port bindings;
 - use service DNS on internal Compose networks;
-- derive the Compose project name from the workflow run;
+- derive the Compose project name from the workflow run, attempt, task, and shard;
 - make caches explicitly namespaced;
 - ensure cleanup targets only the current run.
 
@@ -81,7 +87,7 @@ The first workflow MUST:
 - use the experimental runner label;
 - declare `permissions: contents: read`;
 - set a timeout;
-- run one non-destructive suite;
+- run one non-destructive task shard inside the five-minute ceiling;
 - leave the existing required workflow unchanged.
 
 See [the experimental example](../examples/workflows/experimental-smoke.yml.example).
@@ -92,7 +98,8 @@ Run both paths on the same commits and compare:
 
 - pass/fail results;
 - generated artifacts;
-- suite duration;
+- total test-minutes, matrix job count, shard balance, and wall-clock duration;
+- any shard approaching or exceeding the five-minute ceiling;
 - CPU, memory, disk, and cache growth;
 - containers, networks, volumes, and workspaces remaining afterward;
 - behavior after cancellation and forced failure.

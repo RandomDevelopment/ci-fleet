@@ -1,0 +1,34 @@
+name: Expand ci-fleet task plan
+description: Validate a project CI plan and emit a deterministic GitHub Actions matrix.
+
+inputs:
+  plan-path:
+    description: Path to the project-owned CI task plan.
+    required: false
+    default: scripts/ci/plan.json
+  group:
+    description: Aggregate group to expand (fast or full).
+    required: false
+    default: fast
+
+outputs:
+  matrix:
+    description: GitHub Actions matrix containing one entry per task shard.
+    value: ${{ steps.expand.outputs.matrix }}
+  job-count:
+    description: Number of independently schedulable jobs.
+    value: ${{ steps.expand.outputs.job-count }}
+  estimated-test-minutes:
+    description: Sum of expected test payload across all emitted shards.
+    value: ${{ steps.expand.outputs.estimated-test-minutes }}
+
+runs:
+  using: composite
+  steps:
+    - id: expand
+      shell: bash
+      run: >-
+        python3 "${GITHUB_ACTION_PATH}/plan.py"
+        --plan "${{ inputs.plan-path }}"
+        --group "${{ inputs.group }}"
+        --github-output "${GITHUB_OUTPUT}"

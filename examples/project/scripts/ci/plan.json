@@ -1,0 +1,16 @@
+{
+  "$schema": "./plan.schema.json",
+  "schema_version": 1,
+  "target_wall_clock_minutes": 5,
+  "max_job_minutes": 5,
+  "shard_target_minutes": 4,
+  "tasks": [
+    {"id": "lint", "groups": ["fast", "full"], "shards": 1, "estimated_minutes_per_shard": 2},
+    {"id": "syntax", "groups": ["fast", "full"], "shards": 1, "estimated_minutes_per_shard": 2},
+    {"id": "unit", "groups": ["fast", "full"], "shards": 4, "estimated_minutes_per_shard": 4},
+    {"id": "integration", "groups": ["full"], "shards": 3, "estimated_minutes_per_shard": 4},
+    {"id": "database", "groups": ["full"], "shards": 2, "estimated_minutes_per_shard": 4},
+    {"id": "browser", "groups": ["full"], "shards": 1, "estimated_minutes_per_shard": 4},
+    {"id": "security", "groups": ["full"], "shards": 1, "estimated_minutes_per_shard": 1}
+  ]
+}
