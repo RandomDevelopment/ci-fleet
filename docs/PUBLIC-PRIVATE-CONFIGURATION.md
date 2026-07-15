@@ -20,7 +20,7 @@ flowchart LR
 | Private organization configuration | Repository mappings, logical host groups, environment policy, capacity, image names, and internal operating notes |
 | Secret manager, GitHub environment, or host-local protected file | Actual keys, tokens, passwords, and deployment credentials |
 
-Random Development uses [rd-delivery-config](https://github.com/RandomDevelopment/rd-delivery-config) as its private installation configuration. Other operators can generate their own private repository from the same public [configuration template](../templates/config-repository/README.md).
+Each organization generates its own private installation configuration from the public [configuration template](../templates/config-repository/README.md). The resulting private repository is an implementation detail of that organization and is not required to be accessible to users of the public project.
 
 ## Rules
 
