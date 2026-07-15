@@ -1,6 +1,6 @@
 # Documentation
 
-This is the documentation index for ci-fleet, the project that will become **delivery-fleet** after its live pilot. Repository Markdown is the authoritative source. Procedures are reviewed and versioned with the implementation they describe.
+Use this index to find ci-fleet concepts, requirements, examples, and step-by-step procedures. Repository Markdown is the authoritative documentation and is versioned with the implementation it describes.
 
 ## Start here
 
@@ -16,7 +16,7 @@ This is the documentation index for ci-fleet, the project that will become **del
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
-| Understand public code versus private configuration | [ADR 0002](adr/0002-public-engine-private-configuration.md) |
+| Understand public code versus private configuration | [Secrets model](SECRETS.md) and [configuration scaffold](../templates/config-repository/README.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
 | See what informed the design | [Discovery summary](DISCOVERY-SUMMARY.md) |
 
@@ -67,17 +67,6 @@ The accepted target is a single target-host command, `sudo ./setup.sh`. Until th
 - [Isolated Docker Compose configuration](../examples/project/compose.ci.yaml)
 
 Examples use fictional values and are starting points. Pin reviewed actions and images before production use.
-
-## Design records
-
-Architecture decision records explain why durable choices were made:
-
-- [ADR index](adr/README.md)
-- [Actions scale-set client](adr/0001-actions-scale-set-client.md)
-- [Public engine and private configuration](adr/0002-public-engine-private-configuration.md)
-- [Repository Markdown is canonical](adr/0003-repository-markdown-is-canonical.md)
-- [Adopt the delivery-fleet name](adr/0004-adopt-delivery-fleet-name.md)
-- [One-command target-host setup](adr/0005-one-command-target-host-setup.md)
 
 ## Documentation rules
 
