@@ -17,7 +17,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
-| Understand public code versus private configuration | [Public engine and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
+| Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
 | See what informed the design | [Discovery summary](DISCOVERY-SUMMARY.md) |
 
@@ -39,7 +39,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 - [System architecture](ARCHITECTURE.md)
 - [Runner controller design](CONTROLLER-DESIGN.md)
-- [Public engine and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
+- [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)
 
