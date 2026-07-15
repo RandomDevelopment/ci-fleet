@@ -42,7 +42,7 @@ jobs:
           trap cleanup EXIT
           docker network create "$name"
           docker volume create "$name"
-          docker run --name "$name" --network "$name" -v "$name:/proof" \
+          docker run --user 0 --name "$name" --network "$name" -v "$name:/proof" \
             --entrypoint /bin/bash ci-fleet-runner:dev -c 'printf pilot-ok > /proof/result'
           test "$(docker run --rm -v "$name:/proof:ro" --entrypoint /bin/bash ci-fleet-runner:dev -c 'cat /proof/result')" = pilot-ok
           cleanup
