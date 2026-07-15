@@ -24,20 +24,26 @@ Self-hosted CI often grows one project at a time:
 
 ci-fleet replaces that pattern with generic Docker hosts and single-job runner containers. GitHub routes work from authorized repositories to any compatible host with available capacity. The selected project then starts its own pinned Docker test environment.
 
-## In plain English
+## What runs where?
 
-A fleet host does **not** need PHP, Composer, Node.js, Python, PostgreSQL, MySQL, or your application installed.
+A fleet host stays generic. Its operating system provides Linux, Docker, and the fleet controller. Application runtimes and services are still required, but each project supplies them through its own Docker images and Compose configuration.
 
-It needs Linux, Docker, the fleet controller, and access to an explicitly restricted GitHub runner group. When a job arrives:
+| Layer | Examples |
+| --- | --- |
+| Fleet host | Linux, Docker Engine, fleet controller, monitoring and maintenance |
+| Ephemeral runner | GitHub Actions agent, repository checkout, and Docker job orchestration |
+| Project-owned containers | PHP, Composer, Node.js, Python, PostgreSQL, MySQL, application code, and tests |
+
+When a job arrives:
 
 1. the controller creates a fresh GitHub Actions runner container;
 2. the runner checks out the selected repository;
-3. the repository builds or starts its own test containers;
+3. the repository builds or starts its project-owned containers;
 4. tests run inside the project-defined environment;
 5. job-owned resources and the runner are destroyed;
 6. the host returns to the shared idle pool.
 
-One host can run one worker. A larger host can run several. Ten hosts in different locations can advertise the same capability without projects knowing which machine will accept the job.
+One host can run one worker. A larger host can run several. Hosts in different locations can advertise the same capability without projects knowing which machine will accept the job.
 
 ## Is this for you?
 
