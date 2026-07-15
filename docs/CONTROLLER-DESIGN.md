@@ -49,7 +49,7 @@ The GitHub App private key exists only as a file-mounted controller secret. A ru
 | Third-party Docker runner managers | Not selected for the first implementation |
 | One disposable VM per job | Retained as a future stronger-isolation tier |
 
-The experimental controller pins the official `actions/scaleset` client to an immutable revision. Updates require an reviewed build and live validation before rollout.
+The experimental controller pins the official `actions/scaleset` client to an immutable revision. Updates require a reviewed build and live validation before rollout.
 
 ## Operations and rollback
 
