@@ -75,11 +75,9 @@ Architecture decision records explain why durable choices were made:
 - [ADR index](adr/README.md)
 - [Actions scale-set client](adr/0001-actions-scale-set-client.md)
 - [Public engine and private configuration](adr/0002-public-engine-private-configuration.md)
-- [Repository Markdown is canonical](adr/0001-repository-markdown-is-canonical.md)
-- [Adopt the delivery-fleet name](adr/0002-adopt-delivery-fleet-name.md)
-- [One-command target-host setup](adr/0003-one-command-target-host-setup.md)
-
-Existing ADR filenames predate the numbered index introduced in 2026. A future documentation cleanup should assign globally unique ADR numbers without breaking inbound links.
+- [Repository Markdown is canonical](adr/0003-repository-markdown-is-canonical.md)
+- [Adopt the delivery-fleet name](adr/0004-adopt-delivery-fleet-name.md)
+- [One-command target-host setup](adr/0005-one-command-target-host-setup.md)
 
 ## Documentation rules
 
