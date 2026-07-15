@@ -43,7 +43,7 @@ One host can run one worker. A larger host can run several. Ten hosts in differe
 
 ci-fleet is intended for people and organizations that:
 
-- maintain multiple trusted private repositories;
+- maintain multiple trusted private repositories or public projects with private delivery control;
 - want self-hosted GitHub Actions runners without project-specific host images;
 - already use Docker or want reproducible Dockerized CI;
 - have spare servers, Proxmox capacity, workstations, remote-site computers, or VPS instances;
@@ -88,6 +88,8 @@ GitHub runner-group policy decides which repositories may schedule work. A share
 | Public fleet repository | Runner image, controller, lifecycle, setup, health checks, scoped cleanup, standards, examples | Real credentials, private host inventory, production configuration |
 | Project repository | Test Dockerfile, services, fixtures, migrations, test plan, `scripts/ci/run.sh` | Fleet controller credentials or host-specific setup |
 | Private installation configuration | Organization settings, repository authorization, host capacity, network policy, monitoring, secrets | Project runtime dependencies or test logic |
+
+A public application can use the same fleet indirectly. Its public repository keeps pull-request validation unprivileged, while a separate private delivery repository checks out an approved immutable commit and performs protected CI, release, or deployment work. The public repository itself never receives privileged runner-group access or fleet credentials. See [Public projects, private delivery, and private configuration](docs/PUBLIC-PRIVATE-CONFIGURATION.md).
 
 ## What makes it different?
 
@@ -167,7 +169,7 @@ Supported deployment shapes include Proxmox VMs, dedicated physical machines, ho
 | Verify project compliance | [Compliance checklist](docs/COMPLIANCE-CHECKLIST.md) |
 | Configure upgrades, cleanup, draining, and rebooting | [Host maintenance](docs/HOST-MAINTENANCE.md) |
 | Understand secret storage and injection | [Secrets model](docs/SECRETS.md) |
-| Separate public code from private installation data | [Public engine and private configuration](docs/PUBLIC-PRIVATE-CONFIGURATION.md) |
+| Use private fleet workers for a public project | [Public projects and private delivery](docs/PUBLIC-PRIVATE-CONFIGURATION.md) |
 | See planned work | [Roadmap](docs/ROADMAP.md) |
 
 ## Project contract
