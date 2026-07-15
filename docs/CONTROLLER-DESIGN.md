@@ -38,18 +38,20 @@ Docker socket access is host-root-equivalent. This pool is therefore limited to 
 
 The GitHub App private key exists only as a file-mounted controller secret. A runner receives only its short-lived registration configuration. Project secrets remain in GitHub repository or environment settings and are supplied only to jobs that explicitly require them.
 
-## Why this design
+## Choosing a runner model
 
-| Option | Result |
-| --- | --- |
-| Persistent runner services on every VM | Rejected as the target because state persists and idle capacity is fragmented |
-| Multiple repository-specific runner services per host | Rejected because scheduling and resource contention become ambiguous |
-| Official GitHub scale-set client inside a small Docker controller | Selected for the experimental implementation |
-| Actions Runner Controller on Kubernetes | Deferred because Kubernetes is not required for the current infrastructure |
-| Third-party Docker runner managers | Not selected for the first implementation |
-| One disposable VM per job | Retained as a future stronger-isolation tier |
+ci-fleet is optimized for organizations that already operate Linux and Docker hosts, trust the repositories using the pool, and want idle capacity shared across projects. Other runner models may fit different requirements.
 
-The experimental controller pins the official `actions/scaleset` client to an immutable revision. Updates require a reviewed build and live validation before rollout.
+| Runner model | Good fit | Important tradeoff |
+| --- | --- | --- |
+| Persistent self-hosted runner | A small setup with one trusted repository and minimal orchestration | Workspaces and process state can survive between jobs, and idle capacity stays tied to that runner |
+| Repository-specific runners sharing one host | Projects that require distinct GitHub registration or routing | Multiple services may compete for the same CPU, memory, disk, ports, and Docker daemon |
+| Ephemeral Docker runners with ci-fleet | Multiple trusted repositories sharing Linux or Docker capacity across one or many locations | Runners are disposable, but jobs sharing a Docker daemon remain inside one host security boundary |
+| Actions Runner Controller on Kubernetes | Organizations that already operate Kubernetes and want Kubernetes-native scaling | Requires a Kubernetes control plane and its associated operations |
+| Disposable VM per job | Higher-isolation or higher-risk workloads | Stronger separation costs more startup time, storage, and provisioning infrastructure |
+| GitHub-hosted runners | Teams that prefer managed capacity and do not require self-hosted resources or networks | Provides less control over hardware, locality, caching, and private infrastructure access |
+
+The current controller uses the official `actions/scaleset` client at a pinned revision. Updates require a reviewed build and live validation before rollout.
 
 ## Operations and rollback
 
