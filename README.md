@@ -8,7 +8,7 @@
 
 Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, Proxmox VMs, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
 
-> **Name and maturity:** the project is currently named `ci-fleet`. The accepted future umbrella name is **delivery-fleet**, covering separated worker, tester, and deployer components. The rename is intentionally deferred until the live runner pilot passes. The implementation is experimental and not production-ready.
+> **Status:** Experimental. The first controller host is deployed, and the first manually dispatched runner pilot is pending. The project is not production-ready.
 
 ## What problem does this solve?
 
@@ -167,7 +167,6 @@ Supported deployment shapes include Proxmox VMs, dedicated physical machines, ho
 | Configure upgrades, cleanup, draining, and rebooting | [Host maintenance](docs/HOST-MAINTENANCE.md) |
 | Understand secret storage and injection | [Secrets model](docs/SECRETS.md) |
 | Review private configuration boundaries | [Configuration scaffold](templates/config-repository/README.md) |
-| Follow project decisions and rationale | [Architecture decision records](docs/adr/README.md) |
 | See planned work | [Roadmap](docs/ROADMAP.md) |
 
 ## Project contract
@@ -260,7 +259,7 @@ This project is relevant to searches for **GitHub Actions self-hosted runners**,
 
 The project is public so other operators can study, reuse, and improve the system. Open an issue for a use case, deployment shape, documentation gap, or safely redacted failure report. Never include credentials, private network details, or active vulnerability information in a public issue.
 
-Architecture and operational changes should include matching documentation and preserve the public-engine/private-configuration boundary. See [AGENTS.md](AGENTS.md) for repository-specific engineering rules.
+Infrastructure and operational changes should include matching documentation and preserve the boundary between public reusable code and private installation configuration. See [AGENTS.md](AGENTS.md) for repository-specific engineering rules.
 
 ## License
 
