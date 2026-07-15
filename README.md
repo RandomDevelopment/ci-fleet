@@ -6,7 +6,7 @@
 
 **A portable, self-hosted software delivery fleet for ephemeral GitHub Actions runners and project-owned Docker test environments.**
 
-Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, Proxmox VMs, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
+Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, virtual machines, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
 
 > **Status:** Experimental. The first controller host is deployed, and the first manually dispatched runner pilot is pending. The project is not production-ready.
 
@@ -46,7 +46,7 @@ ci-fleet is intended for people and organizations that:
 - maintain multiple trusted private repositories or public projects with private delivery control;
 - want self-hosted GitHub Actions runners without project-specific host images;
 - already use Docker or want reproducible Dockerized CI;
-- have spare servers, Proxmox capacity, workstations, remote-site computers, or VPS instances;
+- have spare servers, virtual machine capacity, workstations, remote-site computers, or VPS instances;
 - want idle hardware shared across projects;
 - need horizontal test sharding and short feedback times;
 - want documented cleanup, automatic host security updates, health checks, and recovery;
@@ -152,7 +152,7 @@ A fleet installation currently assumes:
 - host-local or externally managed secrets;
 - project tests that can run inside project-owned Docker containers.
 
-Supported deployment shapes include Proxmox VMs, dedicated physical machines, home-lab servers, remote buildings, and VPS hosts. Kubernetes is not required.
+Supported deployment shapes include virtual machines, dedicated physical machines, home-lab servers, remote buildings, and VPS hosts. Kubernetes is not required.
 
 ## Choose your path
 
@@ -256,7 +256,7 @@ Examples contain fictional values. Replace placeholders and pin reviewed actions
 
 ## Discoverability and related concepts
 
-This project is relevant to searches for **GitHub Actions self-hosted runners**, **ephemeral Actions runners**, **autoscaling Docker runners**, **Dockerized CI**, **multi-repository CI**, **organization runner groups**, **GitHub App runner authentication**, **Proxmox CI workers**, **home-lab CI**, **bare-metal runners**, **distributed CI workers**, **test sharding**, **parallel test execution**, **staging environments**, and **Docker production deployment**.
+This project is relevant to searches for **GitHub Actions self-hosted runners**, **ephemeral Actions runners**, **autoscaling Docker runners**, **Dockerized CI**, **multi-repository CI**, **organization runner groups**, **GitHub App runner authentication**, **virtual-machine CI workers**, **home-lab CI**, **bare-metal runners**, **distributed CI workers**, **test sharding**, **parallel test execution**, **staging environments**, and **Docker production deployment**.
 
 ## Contributing
 
