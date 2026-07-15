@@ -6,7 +6,8 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 | I want to… | Read |
 | --- | --- |
-| Understand the system | [Architecture](ARCHITECTURE.md) |
+| Understand the whole system | [Architecture](ARCHITECTURE.md) |
+| Understand how ephemeral runners are created | [Runner controller design](CONTROLLER-DESIGN.md) |
 | Decide whether it fits my infrastructure | [Architecture](ARCHITECTURE.md) and the root [README](../README.md) |
 | Try the experimental implementation safely | [Live pilot runbook](LIVE-PILOT.md) |
 | Add another Docker host, VM, computer, or VPS | [Adding a host](ADDING-A-HOST.md) |
@@ -16,7 +17,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
-| Understand public code versus private configuration | [Secrets model](SECRETS.md) and [configuration scaffold](../templates/config-repository/README.md) |
+| Understand public code versus private configuration | [Public engine and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
 | See what informed the design | [Discovery summary](DISCOVERY-SUMMARY.md) |
 
@@ -33,6 +34,14 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Shared routing label | The stable `runs-on` capability used by compatible projects, regardless of which physical host accepts the job. |
 | Test shard | One bounded slice of a larger test suite, designed to run independently and usually finish within five minutes. |
 | Private delivery configuration | Organization names, repository allowlists, host inventory, capacity, network policy, and credentials kept outside this public repository. |
+
+## Design and boundaries
+
+- [System architecture](ARCHITECTURE.md)
+- [Runner controller design](CONTROLLER-DESIGN.md)
+- [Public engine and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
+- [Secrets model](SECRETS.md)
+- [Security policy](../SECURITY.md)
 
 ## Standards and contracts
 
