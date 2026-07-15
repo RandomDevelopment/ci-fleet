@@ -157,6 +157,7 @@ Supported deployment shapes include Proxmox VMs, dedicated physical machines, ho
 | If you want to… | Start here |
 | --- | --- |
 | Understand the architecture and trust boundaries | [Architecture](docs/ARCHITECTURE.md) |
+| Understand how runners are created and destroyed | [Runner controller design](docs/CONTROLLER-DESIGN.md) |
 | Browse every guide, concept, standard, and example | [Documentation index](docs/README.md) |
 | Evaluate the current prototype safely | [Live pilot runbook](docs/LIVE-PILOT.md) |
 | Add another Docker host or location | [How to add a host](docs/ADDING-A-HOST.md) |
@@ -166,7 +167,7 @@ Supported deployment shapes include Proxmox VMs, dedicated physical machines, ho
 | Verify project compliance | [Compliance checklist](docs/COMPLIANCE-CHECKLIST.md) |
 | Configure upgrades, cleanup, draining, and rebooting | [Host maintenance](docs/HOST-MAINTENANCE.md) |
 | Understand secret storage and injection | [Secrets model](docs/SECRETS.md) |
-| Review private configuration boundaries | [Configuration scaffold](templates/config-repository/README.md) |
+| Separate public code from private installation data | [Public engine and private configuration](docs/PUBLIC-PRIVATE-CONFIGURATION.md) |
 | See planned work | [Roadmap](docs/ROADMAP.md) |
 
 ## Project contract
