@@ -238,6 +238,7 @@ for term in backup force-recreate --no-deps healthcheck retain restore rollback;
   grep -Fqi -- "$term" "$repo_root/docs/CAPACITY-PROMOTION.md" || fail "capacity procedure is missing $term"
 done
 grep -Fq 'env -i' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity procedure does not isolate Compose interpolation from stale shell values'
+grep -Fq 'exec scripts/preflight.sh' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'rollback does not run pilot preflight from a clean restored environment'
 grep -Fq 'scripts/capacity-preflight.sh' "$repo_root/docs/ADDING-A-HOST.md" || fail 'host guide does not link the capacity procedure'
 if grep -Riq --exclude='test-capacity-preflight.sh' 'docker system prune' "$repo_root/scripts"; then fail 'unrestricted prune exists in scripts'; fi
 

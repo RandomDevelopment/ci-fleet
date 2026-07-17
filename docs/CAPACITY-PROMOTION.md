@@ -147,4 +147,13 @@ env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/r
   up -d --no-deps --force-recreate --timeout 60 controller
 ```
 
-Verify a sanitized ready record with `MIN=0`, `MAX=1`, then run `scripts/preflight.sh`, `scripts/healthcheck.sh`, and the instance-scoped cleanup dry-run. Require zero runners, zero jobs, one intended scale set, no duplicate controller, and no residue before reopening dispatch.
+Verify a sanitized ready record with `MIN=0`, `MAX=1`, then run the pilot preflight and healthcheck from clean processes that source only the restored file:
+
+```bash
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  bash -c 'set -a; . /etc/ci-fleet/ci-fleet.env; set +a; exec scripts/preflight.sh'
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  bash -c 'set -a; . /etc/ci-fleet/ci-fleet.env; set +a; exec scripts/healthcheck.sh'
+```
+
+Run the instance-scoped cleanup dry-run. Require zero runners, zero jobs, one intended scale set, no duplicate controller, and no residue before reopening dispatch.
