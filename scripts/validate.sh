@@ -9,6 +9,7 @@ python3 -m py_compile .github/actions/plan/plan.py .github/actions/plan/test_pla
 python3 .github/actions/plan/test_plan.py
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
+scripts/test-capacity-preflight.sh
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT

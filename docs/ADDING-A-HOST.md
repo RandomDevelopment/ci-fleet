@@ -151,6 +151,8 @@ The steady-state host should need no project-specific edits. Adding a project ch
 
 Raise `CI_FLEET_MAX_RUNNERS` only after measuring CPU, memory, disk, network, cache growth, collisions, cancellation, and cleanup. Keep explicit per-runner limits.
 
+Keep the one-runner pilot preflight unchanged. For any later increase, follow [Post-pilot capacity promotion](CAPACITY-PROMOTION.md), run `scripts/capacity-preflight.sh` before and after the controller-only recreation, and retain the new maximum only when the separately authorized workload and cleanup proof satisfy the predeclared resource policy.
+
 Use another host or location when it improves failure tolerance. Give every added host a new instance and scale-set name while retaining the shared routing label.
 
 ## 10. Drain, replace, or remove a host
