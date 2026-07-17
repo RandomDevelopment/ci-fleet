@@ -172,6 +172,9 @@ expect_failure 'explicit --target-max is required' "$repo_root/scripts/capacity-
 for malformed in 0 -1 2x 1.5; do
   expect_failure 'target MAX must be a positive integer' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max "$malformed"
 done
+reset_fixture
+FAKE_TOTAL_CPUS=32 FAKE_TOTAL_MEMORY_MIB=65536 FAKE_AVAILABLE_MEMORY_MIB=60000 \
+  expect_failure 'target MAX must be exactly 2' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 3
 
 reset_fixture
 CI_FLEET_MAX_RUNNERS=2 FAKE_EFFECTIVE_MAX=2 expect_success "$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 >/dev/null
@@ -181,6 +184,8 @@ reset_fixture
 CI_FLEET_MAX_RUNNERS=2 FAKE_EFFECTIVE_MAX=2
 secret_output=$("$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 2>&1) || fail 'secret-output fixture unexpectedly failed'
 if grep -Fq 'CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT' <<<"$secret_output"; then fail 'capacity preflight printed an unrelated environment value'; fi
+xtrace_output=$(bash -x "$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 2>&1) || fail 'xtrace secret-output fixture unexpectedly failed'
+if grep -Fq 'CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT' <<<"$xtrace_output"; then fail 'capacity preflight exposed controller environment through inherited xtrace'; fi
 
 for term in backup force-recreate --no-deps healthcheck retain restore rollback; do
   grep -Fqi -- "$term" "$repo_root/docs/CAPACITY-PROMOTION.md" || fail "capacity procedure is missing $term"

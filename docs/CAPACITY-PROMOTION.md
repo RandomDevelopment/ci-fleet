@@ -8,7 +8,7 @@ Use this procedure only after the strict one-runner pilot has passed. It validat
 
 Declare the policy before observing a larger workload:
 
-- requested MAX is explicit, positive, and bounded;
+- requested MAX is explicitly and exclusively two for this first post-pilot procedure; any other target is rejected;
 - `MIN` remains zero;
 - the configured instance, scale set, routing label, runner group, Docker socket group, and per-runner limits must equal the running controller's effective values;
 - no managed runner, project job resource, unrelated running container, controller OOM, or current-boot kernel OOM evidence may exist;
