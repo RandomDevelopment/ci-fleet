@@ -37,7 +37,11 @@ case "${1:-}" in
         "CI_FLEET_DOCKER_GID=${CI_FLEET_DOCKER_GID}" \
         "UNRELATED_SECRET=${FAKE_SECRET_VALUE:-CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT}"
     elif [[ "$args" == *'com.docker.compose.project'* ]]; then
-      printf '%s\n' "${FAKE_COMPOSE_PROJECT:-ci-fleet}"
+      printf '%s\n' "${FAKE_COMPOSE_CONTAINER_PROJECT:-${FAKE_COMPOSE_PROJECT:-ci-fleet}}"
+    elif [[ "$args" == *'com.docker.compose.service'* ]]; then
+      printf '%s\n' "${FAKE_COMPOSE_SERVICE:-controller}"
+    elif [[ "$args" == *'{{.Name}}'* ]]; then
+      printf '/%s\n' "${FAKE_COMPOSE_CONTAINER_NAME:-ci-fleet-controller-1}"
     else
       exit 1
     fi
@@ -58,7 +62,20 @@ case "${1:-}" in
   volume|network)
     kind=$1
     if [[ "${2:-}" == inspect ]]; then
-      printf '%s\n' "${FAKE_COMPOSE_PROJECT:-ci-fleet}"
+      args="$*"
+      if [[ "$args" == *'com.docker.compose.project'* ]]; then
+        if [[ "$kind" == volume ]]; then
+          printf '%s\n' "${FAKE_COMPOSE_VOLUME_PROJECT:-${FAKE_COMPOSE_PROJECT:-ci-fleet}}"
+        else
+          printf '%s\n' "${FAKE_COMPOSE_NETWORK_PROJECT:-${FAKE_COMPOSE_PROJECT:-ci-fleet}}"
+        fi
+      elif [[ "$args" == *'com.docker.compose.network'* ]]; then
+        printf '%s\n' "${FAKE_COMPOSE_NETWORK_LABEL:-default}"
+      elif [[ "$args" == *'{{.Name}}'* ]]; then
+        printf '%s\n' "${FAKE_COMPOSE_NETWORK_NAME:-ci-fleet_default}"
+      else
+        exit 1
+      fi
       exit 0
     fi
     [[ "${2:-}" == ls ]] || exit 1
@@ -146,7 +163,10 @@ reset_fixture() {
   export FAKE_EFFECTIVE_MIN=0 FAKE_EFFECTIVE_MAX=1
   export FAKE_TOTAL_CPUS=16 FAKE_TOTAL_MEMORY_MIB=32768 FAKE_AVAILABLE_MEMORY_MIB=30000 FAKE_DISK_USED=5
   export FAKE_MANAGED_RUNNERS=0 FAKE_ACTIVE_JOBS=0 FAKE_JOB_VOLUMES=0 FAKE_JOB_NETWORKS=0
-  export FAKE_COMPOSE_CONTAINERS=0 FAKE_COMPOSE_VOLUMES=0 FAKE_COMPOSE_NETWORKS=0 FAKE_COMPOSE_PROJECT=ci-fleet
+  export FAKE_COMPOSE_CONTAINERS=1 FAKE_COMPOSE_VOLUMES=0 FAKE_COMPOSE_NETWORKS=1 FAKE_COMPOSE_PROJECT=ci-fleet
+  export FAKE_COMPOSE_CONTAINER_PROJECT=ci-fleet FAKE_COMPOSE_VOLUME_PROJECT=ci-fleet FAKE_COMPOSE_NETWORK_PROJECT=ci-fleet
+  export FAKE_COMPOSE_SERVICE=controller FAKE_COMPOSE_CONTAINER_NAME=ci-fleet-controller-1
+  export FAKE_COMPOSE_NETWORK_LABEL=default FAKE_COMPOSE_NETWORK_NAME=ci-fleet_default
   export FAKE_CONTROLLER_STATE=running FAKE_CONTROLLER_OOM=false
   export FAKE_OOM_EVIDENCE=0 FAKE_UNRELATED_CONTAINER=
 }
@@ -176,11 +196,17 @@ FAKE_JOB_VOLUMES=1 expect_failure 'fleet job volume residue' "$repo_root/scripts
 reset_fixture
 FAKE_JOB_NETWORKS=1 expect_failure 'fleet job network residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
-FAKE_COMPOSE_CONTAINERS=1 FAKE_COMPOSE_PROJECT=project-run expect_failure 'foreign Compose container residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+FAKE_COMPOSE_NETWORKS=0 FAKE_COMPOSE_CONTAINER_PROJECT=project-run expect_failure 'foreign Compose container residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
-FAKE_COMPOSE_VOLUMES=1 FAKE_COMPOSE_PROJECT=project-run expect_failure 'foreign Compose volume residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+FAKE_COMPOSE_VOLUMES=1 FAKE_COMPOSE_NETWORKS=0 FAKE_COMPOSE_VOLUME_PROJECT=project-run expect_failure 'foreign Compose volume residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
-FAKE_COMPOSE_NETWORKS=1 FAKE_COMPOSE_PROJECT=project-run expect_failure 'foreign Compose network residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+FAKE_COMPOSE_NETWORK_PROJECT=project-run expect_failure 'foreign Compose network residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+reset_fixture
+FAKE_COMPOSE_CONTAINER_NAME=rogue FAKE_COMPOSE_SERVICE=task expect_failure 'unexpected Compose container residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+reset_fixture
+FAKE_COMPOSE_VOLUMES=1 expect_failure 'unexpected Compose volume residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+reset_fixture
+FAKE_COMPOSE_NETWORK_NAME=ci-fleet_extra expect_failure 'unexpected Compose network residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
 CI_FLEET_MIN_RUNNERS=1 FAKE_EFFECTIVE_MIN=1 expect_failure 'CI_FLEET_MIN_RUNNERS must be 0' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture

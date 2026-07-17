@@ -163,23 +163,39 @@ job_network_count=$(docker network ls -q --filter label=ci-fleet.repository | wc
 # Docker Compose always labels its resources even when a project omits optional
 # ci-fleet labels. Only the controller's committed Compose project may remain.
 compose_container_ids=$(docker ps -aq --filter label=com.docker.compose.project) || die 'Compose container residue could not be inspected'
+compose_controller_count=0
 while IFS= read -r id; do
   [[ -n "$id" ]] || continue
-  project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null) || die 'Compose container identity could not be inspected'
+  project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null) || die 'Compose container project could not be inspected'
   [[ "$project" == ci-fleet ]] || die 'foreign Compose container residue exists'
+  service=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$id" 2>/dev/null) || die 'Compose container service could not be inspected'
+  resource_name=$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null) || die 'Compose container name could not be inspected'
+  resource_name=${resource_name#/}
+  [[ "$service" == controller && "$resource_name" == "$controller" ]] || die 'unexpected Compose container residue exists'
+  compose_controller_count=$((compose_controller_count + 1))
 done <<<"$compose_container_ids"
+((compose_controller_count == 1)) || die 'committed controller Compose container is missing or duplicated'
+
 compose_volume_names=$(docker volume ls -q --filter label=com.docker.compose.project) || die 'Compose volume residue could not be inspected'
 while IFS= read -r name; do
   [[ -n "$name" ]] || continue
   project=$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$name" 2>/dev/null) || die 'Compose volume identity could not be inspected'
   [[ "$project" == ci-fleet ]] || die 'foreign Compose volume residue exists'
+  die 'unexpected Compose volume residue exists'
 done <<<"$compose_volume_names"
+
 compose_network_names=$(docker network ls -q --filter label=com.docker.compose.project) || die 'Compose network residue could not be inspected'
+compose_network_count=0
 while IFS= read -r name; do
   [[ -n "$name" ]] || continue
-  project=$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$name" 2>/dev/null) || die 'Compose network identity could not be inspected'
+  project=$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$name" 2>/dev/null) || die 'Compose network project could not be inspected'
   [[ "$project" == ci-fleet ]] || die 'foreign Compose network residue exists'
+  network_label=$(docker network inspect --format '{{index .Labels "com.docker.compose.network"}}' "$name" 2>/dev/null) || die 'Compose network label could not be inspected'
+  resource_name=$(docker network inspect --format '{{.Name}}' "$name" 2>/dev/null) || die 'Compose network name could not be inspected'
+  [[ "$network_label" == default && "$resource_name" == ci-fleet_default ]] || die 'unexpected Compose network residue exists'
+  compose_network_count=$((compose_network_count + 1))
 done <<<"$compose_network_names"
+((compose_network_count == 1)) || die 'committed controller Compose network is missing or duplicated'
 
 while IFS= read -r running_name; do
   [[ -z "$running_name" || "$running_name" == "$controller" ]] || die 'unrelated running Docker workload exists'
