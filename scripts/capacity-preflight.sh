@@ -108,7 +108,7 @@ controller_oom=$(docker inspect --format '{{.State.OOMKilled}}' "$controller" 2>
 
 controller_env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller" 2>/dev/null) || die 'effective controller configuration could not be inspected'
 effective_value() {
-  local wanted=$1 line key value= count=0
+  local wanted=$1 line key value='' count=0
   while IFS= read -r line; do
     key=${line%%=*}
     if [[ "$key" == "$wanted" ]]; then
@@ -151,8 +151,12 @@ managed_count=$(docker ps -aq \
   --filter label=io.randomdevelopment.ci-fleet.kind=runner \
   --filter "label=io.randomdevelopment.ci-fleet.instance=$CI_FLEET_INSTANCE" | wc -l | tr -d ' ')
 [[ "$managed_count" == 0 ]] || die 'active managed runner or runner residue exists'
-job_count=$(docker ps -aq --filter label=ci-fleet.repository | wc -l | tr -d ' ')
-[[ "$job_count" == 0 ]] || die 'active fleet job container or job residue exists'
+job_container_count=$(docker ps -aq --filter label=ci-fleet.repository | wc -l | tr -d ' ')
+[[ "$job_container_count" == 0 ]] || die 'active fleet job container or job residue exists'
+job_volume_count=$(docker volume ls -q --filter label=ci-fleet.repository | wc -l | tr -d ' ')
+[[ "$job_volume_count" == 0 ]] || die 'fleet job volume residue exists'
+job_network_count=$(docker network ls -q --filter label=ci-fleet.repository | wc -l | tr -d ' ')
+[[ "$job_network_count" == 0 ]] || die 'fleet job network residue exists'
 
 while IFS= read -r running_name; do
   [[ -z "$running_name" || "$running_name" == "$controller" ]] || die 'unrelated running Docker workload exists'

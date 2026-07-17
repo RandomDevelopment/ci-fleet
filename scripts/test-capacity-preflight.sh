@@ -51,6 +51,12 @@ case "${1:-}" in
       for ((i=0; i<${FAKE_MANAGED_RUNNERS:-0}; i++)); do printf 'runner-%s\n' "$i"; done
     fi
     ;;
+  volume|network)
+    kind=$1
+    [[ "${2:-}" == ls ]] || exit 1
+    if [[ "$kind" == volume ]]; then count=${FAKE_JOB_VOLUMES:-0}; else count=${FAKE_JOB_NETWORKS:-0}; fi
+    for ((i=0; i<count; i++)); do printf '%s-%s\n' "$kind" "$i"; done
+    ;;
   *) exit 1 ;;
 esac
 EOF
@@ -125,7 +131,8 @@ reset_fixture() {
   export CI_FLEET_MIN_RUNNERS=0 CI_FLEET_MAX_RUNNERS=1
   export FAKE_EFFECTIVE_MIN=0 FAKE_EFFECTIVE_MAX=1
   export FAKE_TOTAL_CPUS=16 FAKE_TOTAL_MEMORY_MIB=32768 FAKE_AVAILABLE_MEMORY_MIB=30000 FAKE_DISK_USED=5
-  export FAKE_MANAGED_RUNNERS=0 FAKE_ACTIVE_JOBS=0 FAKE_CONTROLLER_STATE=running FAKE_CONTROLLER_OOM=false
+  export FAKE_MANAGED_RUNNERS=0 FAKE_ACTIVE_JOBS=0 FAKE_JOB_VOLUMES=0 FAKE_JOB_NETWORKS=0
+  export FAKE_CONTROLLER_STATE=running FAKE_CONTROLLER_OOM=false
   export FAKE_OOM_EVIDENCE=0 FAKE_UNRELATED_CONTAINER=
 }
 
@@ -149,6 +156,10 @@ reset_fixture
 FAKE_MANAGED_RUNNERS=1 expect_failure 'active managed runner' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
 FAKE_ACTIVE_JOBS=1 expect_failure 'active fleet job container' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+reset_fixture
+FAKE_JOB_VOLUMES=1 expect_failure 'fleet job volume residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
+reset_fixture
+FAKE_JOB_NETWORKS=1 expect_failure 'fleet job network residue' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
 CI_FLEET_MIN_RUNNERS=1 FAKE_EFFECTIVE_MIN=1 expect_failure 'CI_FLEET_MIN_RUNNERS must be 0' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 2
 reset_fixture
@@ -174,6 +185,7 @@ if grep -Fq 'CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT' <<<"$secret_output"; then fa
 for term in backup force-recreate --no-deps healthcheck retain restore rollback; do
   grep -Fqi -- "$term" "$repo_root/docs/CAPACITY-PROMOTION.md" || fail "capacity procedure is missing $term"
 done
+grep -Fq 'env -i' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity procedure does not isolate Compose interpolation from stale shell values'
 grep -Fq 'scripts/capacity-preflight.sh' "$repo_root/docs/ADDING-A-HOST.md" || fail 'host guide does not link the capacity procedure'
 if grep -Riq --exclude='test-capacity-preflight.sh' 'docker system prune' "$repo_root/scripts"; then fail 'unrestricted prune exists in scripts'; fi
 

@@ -85,23 +85,26 @@ grep -qx 'CI_FLEET_MAX_RUNNERS=2' /etc/ci-fleet/ci-fleet.env
 cmp -s \
   <(grep -v '^CI_FLEET_MAX_RUNNERS=' "$backup") \
   <(grep -v '^CI_FLEET_MAX_RUNNERS=' /etc/ci-fleet/ci-fleet.env)
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
 ```
 
-Do not run the pilot preflight against MAX=2; it must continue to reject that value.
+Do not run the pilot preflight against MAX=2; it must continue to reject that value. Every Compose command below uses `env -i` so stale values exported when the pilot file was sourced cannot override the explicit `--env-file` during promotion or rollback.
 
 ## 5. Recreate only the controller
 
 Reconfirm zero runners and zero jobs immediately before stopping. Stop only the controller with enough grace for scale-set deletion:
 
 ```bash
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
 ```
 
 Verify the exact old scale set is absent and there is no runner before starting the replacement. Do not delete an apparent duplicate until ownership and zero active jobs are proven.
 
 ```bash
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
   up -d --no-deps --force-recreate --timeout 60 controller
 ```
 
@@ -133,11 +136,14 @@ Retain MAX=2 only when the authorized workload succeeds, actual two-way job and 
 On any failure, keep dispatch gated, wait for exact job termination, and restore the backup:
 
 ```bash
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
 install -o root -g root -m 0600 "$backup" /etc/ci-fleet/ci-fleet.env
 cmp -s "$backup" /etc/ci-fleet/ci-fleet.env
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
-docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
+env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
   up -d --no-deps --force-recreate --timeout 60 controller
 ```
 
