@@ -160,6 +160,27 @@ job_volume_count=$(docker volume ls -q --filter label=ci-fleet.repository | wc -
 job_network_count=$(docker network ls -q --filter label=ci-fleet.repository | wc -l | tr -d ' ')
 [[ "$job_network_count" == 0 ]] || die 'fleet job network residue exists'
 
+# Docker Compose always labels its resources even when a project omits optional
+# ci-fleet labels. Only the controller's committed Compose project may remain.
+compose_container_ids=$(docker ps -aq --filter label=com.docker.compose.project) || die 'Compose container residue could not be inspected'
+while IFS= read -r id; do
+  [[ -n "$id" ]] || continue
+  project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null) || die 'Compose container identity could not be inspected'
+  [[ "$project" == ci-fleet ]] || die 'foreign Compose container residue exists'
+done <<<"$compose_container_ids"
+compose_volume_names=$(docker volume ls -q --filter label=com.docker.compose.project) || die 'Compose volume residue could not be inspected'
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
+  project=$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$name" 2>/dev/null) || die 'Compose volume identity could not be inspected'
+  [[ "$project" == ci-fleet ]] || die 'foreign Compose volume residue exists'
+done <<<"$compose_volume_names"
+compose_network_names=$(docker network ls -q --filter label=com.docker.compose.project) || die 'Compose network residue could not be inspected'
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
+  project=$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "$name" 2>/dev/null) || die 'Compose network identity could not be inspected'
+  [[ "$project" == ci-fleet ]] || die 'foreign Compose network residue exists'
+done <<<"$compose_network_names"
+
 while IFS= read -r running_name; do
   [[ -z "$running_name" || "$running_name" == "$controller" ]] || die 'unrelated running Docker workload exists'
 done < <(docker ps --format '{{.Names}}')
