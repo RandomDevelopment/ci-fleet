@@ -5,11 +5,17 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 for script in scripts/*.sh examples/project/scripts/ci/*.sh; do bash -n "$script"; done
-python3 -m py_compile .github/actions/plan/plan.py .github/actions/plan/test_plan.py
+python3 -m py_compile \
+  .github/actions/plan/plan.py \
+  .github/actions/plan/test_plan.py \
+  scripts/desired_state.py \
+  scripts/test_desired_state.py
 python3 .github/actions/plan/test_plan.py
+python3 scripts/test_desired_state.py
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
+scripts/test-install-worker-controller.sh
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT

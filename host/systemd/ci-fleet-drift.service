@@ -1,0 +1,10 @@
+[Unit]
+Description=Check ci-fleet host against its pinned Git desired state
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ci-fleet/manager/current
+ExecStart=/opt/ci-fleet/manager/current/scripts/check-installed-state.sh

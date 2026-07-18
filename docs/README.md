@@ -11,6 +11,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Decide whether it fits my infrastructure | [Architecture](ARCHITECTURE.md) and the root [README](../README.md) |
 | Try the experimental implementation safely | [Live pilot runbook](LIVE-PILOT.md) |
 | Add another Docker host, VM, computer, or VPS | [Adding a host](ADDING-A-HOST.md) |
+| Manage controller configuration from Git | [Git-authored controller desired state](DESIRED-STATE.md) |
 | Add a private project to the shared runner pool | [Adding a project](ADDING-A-PROJECT.md) |
 | Convert an existing GitHub Actions workflow | [Migrating existing CI](MIGRATING-EXISTING-CI.md) |
 | Make a project compliant | [Project CI standard](PROJECT-STANDARD.md) and [compliance checklist](COMPLIANCE-CHECKLIST.md) |
@@ -33,7 +34,8 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Scale set | One controller's uniquely named runner capacity advertised to GitHub. |
 | Shared routing label | The stable `runs-on` capability used by compatible projects, regardless of which physical host accepts the job. |
 | Test shard | One bounded slice of a larger test suite, designed to run independently and usually finish within five minutes. |
-| Private delivery configuration | Organization names, repository allowlists, host inventory, capacity, network policy, and credentials kept outside this public repository. |
+| Private delivery configuration | Repository allowlists, logical controllers, capacity budgets, environment policy, and required secret names kept in a private but secret-free repository. |
+| Desired state | A reviewed schema-v3 declaration of runner pools and logical controllers stored in a private, secret-free Git repository. |
 
 ## Design and boundaries
 
@@ -51,6 +53,7 @@ These pages are normative for compatible projects and hosts:
 - [Migration procedure](MIGRATING-EXISTING-CI.md)
 - [Compliance checklist](COMPLIANCE-CHECKLIST.md)
 - [Host maintenance standard](HOST-MAINTENANCE.md)
+- [Git-authored controller desired state](DESIRED-STATE.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)
 
@@ -58,12 +61,13 @@ These pages are normative for compatible projects and hosts:
 
 - [Run the live pilot](LIVE-PILOT.md)
 - [Add a host](ADDING-A-HOST.md)
+- [Install, adopt, check, upgrade, roll back, or remove a controller](DESIRED-STATE.md)
 - [Add a project](ADDING-A-PROJECT.md)
 - [Deploy the current experimental prototype](DEPLOYMENT-PROTOTYPE.md)
 - [Maintain, drain, clean, update, and reboot hosts](HOST-MAINTENANCE.md)
 - [Use the public configuration-repository scaffold](../templates/config-repository/README.md)
 
-The accepted target is a single target-host command, `sudo ./setup.sh`. Until that installer is implemented and released, follow the versioned pilot and deployment procedures above rather than assuming the future interface exists.
+The schema-v3 worker-controller installer is implemented as `scripts/install-worker-controller.sh`. It remains experimental; use the [desired-state guide](DESIRED-STATE.md), pin both configuration and engine commits, and retain the manual pilot runbook for isolated first-job proof.
 
 ## Project integration examples
 

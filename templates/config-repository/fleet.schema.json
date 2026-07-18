@@ -4,10 +4,10 @@
   "title": "ci-fleet organization configuration",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "organization", "runner_pools", "host_groups", "environments", "projects"],
+  "required": ["schema_version", "organization", "runner_pools", "controllers", "host_groups", "environments", "projects"],
   "properties": {
     "$schema": {"type": "string"},
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "organization": {
       "type": "object",
       "additionalProperties": false,
@@ -22,34 +22,73 @@
     "runner_pools": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/runner_pool"}
+    },
+    "controllers": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/slug"},
+      "additionalProperties": {"$ref": "#/$defs/controller"}
     },
     "host_groups": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/host_group"}
     },
     "environments": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/environment"}
     },
     "projects": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/project"}
     }
   },
   "$defs": {
+    "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
     "runner_pool": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["routing_labels", "allowed_repositories", "public_repositories", "max_concurrent_jobs"],
+      "required": ["runner_group", "routing_labels", "allowed_repositories", "public_repositories", "capacity_budget", "job_submission_policy"],
       "properties": {
-        "routing_labels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"}},
-        "allowed_repositories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}},
+        "runner_group": {"$ref": "#/$defs/slug"},
+        "routing_labels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}},
+        "allowed_repositories": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/repository"}},
         "public_repositories": {"const": false},
-        "max_concurrent_jobs": {"type": "integer", "minimum": 1}
+        "capacity_budget": {"type": "integer", "minimum": 1},
+        "job_submission_policy": {"const": "all-independent-jobs"}
+      }
+    },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pool", "location", "state", "scale_set_name", "lifecycle", "engine_ref", "min_runners", "max_runners", "runner_resources"],
+      "properties": {
+        "pool": {"$ref": "#/$defs/slug"},
+        "location": {"$ref": "#/$defs/slug"},
+        "state": {"enum": ["active", "drained", "disabled"]},
+        "scale_set_name": {"$ref": "#/$defs/slug"},
+        "lifecycle": {"enum": ["experimental", "stable", "retiring"]},
+        "engine_ref": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "min_runners": {"type": "integer", "minimum": 0},
+        "max_runners": {"type": "integer", "minimum": 1},
+        "runner_resources": {"$ref": "#/$defs/runner_resources"}
+      }
+    },
+    "runner_resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_cores", "memory_mib"],
+      "properties": {
+        "cpu_cores": {"type": "integer", "minimum": 1},
+        "memory_mib": {"type": "integer", "minimum": 512}
       }
     },
     "host_group": {
@@ -77,7 +116,7 @@
       "additionalProperties": false,
       "required": ["repository", "image", "ci_pool", "ci_contract", "deployments"],
       "properties": {
-        "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "repository": {"$ref": "#/$defs/repository"},
         "image": {"type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9._/-]+$"},
         "ci_pool": {"type": "string"},
         "ci_contract": {

@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+set +x
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+mode=
+config_repo=
+config_ref=
+controller_id=
+host_config_arg=
+root_prefix=${CI_FLEET_ROOT_PREFIX:-}
+testing=${CI_FLEET_TESTING:-0}
+transaction_active=false
+checkpoint_dir=
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  install-worker-controller.sh --check|--install|--adopt|--upgrade \
+    --config-repo OWNER/REPOSITORY|PATH --ref FULL_COMMIT_SHA \
+    --controller CONTROLLER_ID [--host-config PATH]
+
+  install-worker-controller.sh --rollback
+  install-worker-controller.sh --uninstall
+
+Modes are mutually exclusive. Remote private repositories use the target host's
+preconfigured read-only Git credentials; credentials are never accepted in URLs
+or command-line arguments.
+EOF
+}
+
+note() { printf '%s\n' "$*"; }
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  if [[ ${transaction_active:-false} == true ]] && declare -F restore_checkpoint >/dev/null; then
+    restore_checkpoint || true
+    transaction_active=false
+  fi
+  exit 2
+}
+
+while (($#)); do
+  case "$1" in
+    --check|--install|--adopt|--upgrade|--rollback|--uninstall)
+      [[ -z "$mode" ]] || die 'select exactly one operating mode'
+      mode=${1#--}
+      shift
+      ;;
+    --config-repo)
+      (($# >= 2)) || die '--config-repo requires a value'
+      config_repo=$2
+      shift 2
+      ;;
+    --ref)
+      (($# >= 2)) || die '--ref requires a value'
+      config_ref=$2
+      shift 2
+      ;;
+    --controller)
+      (($# >= 2)) || die '--controller requires a value'
+      controller_id=$2
+      shift 2
+      ;;
+    --host-config)
+      (($# >= 2)) || die '--host-config requires a value'
+      host_config_arg=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$mode" ]] || { usage; die 'an explicit operating mode is required'; }
+if [[ -n "$root_prefix" && "$testing" != 1 ]]; then
+  die 'CI_FLEET_ROOT_PREFIX is test-only and requires CI_FLEET_TESTING=1'
+fi
+if [[ "$testing" != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then
+  die 'run this installer as root'
+fi
+
+root_path() { printf '%s%s' "$root_prefix" "$1"; }
+
+install_root=$(root_path /opt/ci-fleet)
+releases_dir=$install_root/releases
+current_link=$install_root/current
+manager_root=$install_root/manager
+manager_releases=$manager_root/releases
+manager_current=$manager_root/current
+etc_dir=$(root_path /etc/ci-fleet)
+rendered_env=$etc_dir/ci-fleet.env
+default_host_config=$etc_dir/host.env
+host_config=${host_config_arg:-$default_host_config}
+state_root=$(root_path /var/lib/ci-fleet)
+state_file=$state_root/install-state.json
+checkpoints_dir=$state_root/checkpoints
+systemd_dir=$(root_path /etc/systemd/system)
+
+temporary=$(mktemp -d)
+cleanup_temporary() { rm -rf "$temporary"; }
+trap cleanup_temporary EXIT
+
+require_commands() {
+  local command
+  for command in git python3 docker jq tar install cmp readlink systemctl stat awk grep date; do
+    command -v "$command" >/dev/null || die "$command is required"
+  done
+  docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+}
+
+validate_common_arguments() {
+  [[ -n "$config_repo" ]] || die '--config-repo is required for this mode'
+  [[ "$config_ref" =~ ^[0-9a-f]{40}$ ]] || die '--ref must be a full lowercase commit SHA'
+  [[ "$controller_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die '--controller must be a lowercase logical ID'
+  if [[ "$config_repo" == *://* || "$config_repo" == *@* ]]; then
+    die '--config-repo must not contain a URL or embedded credentials; use OWNER/REPOSITORY or a local path'
+  fi
+}
+
+resolve_config() {
+  local resolved checkout
+  candidate_config=$temporary/fleet.json
+  if [[ -d "$config_repo/.git" ]]; then
+    resolved=$(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
+    [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
+    git -C "$config_repo" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
+    config_identity=$config_repo
+    return
+  fi
+  [[ "$config_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-repo must be OWNER/REPOSITORY or a local Git checkout'
+  checkout=$temporary/config-repository
+  git init -q "$checkout"
+  git -C "$checkout" remote add origin "https://github.com/${config_repo}.git"
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$config_ref"; then
+    die 'configuration fetch failed; configure a read-only credential on this host or use a local pinned checkout'
+  fi
+  resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
+  [[ "$resolved" == "$config_ref" ]] || die 'fetched configuration commit does not match --ref'
+  git -C "$checkout" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
+  config_identity=$config_repo
+}
+
+prepare_host_config() {
+  effective_host_config=$host_config
+  if [[ -f "$host_config" ]]; then
+    return
+  fi
+  if [[ -f "$rendered_env" && ( "$mode" == adopt || "$mode" == check ) ]]; then
+    if [[ "$mode" == check ]]; then
+      effective_host_config=$temporary/host.env
+    else
+      install -d -m 0700 "$etc_dir"
+    fi
+    python3 "$repo_root/scripts/desired_state.py" extract-host-env \
+      --source "$rendered_env" --output "$effective_host_config"
+    return
+  fi
+  die "host-local GitHub App configuration is missing: $host_config"
+}
+
+verify_host_files() {
+  local mode_bits owner expected_owner key_file
+  mode_bits=$(stat -c '%a' "$effective_host_config")
+  [[ "$mode_bits" == 600 ]] || die "host configuration must have mode 0600: $effective_host_config"
+  key_file=$(awk -F= '$1 == "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE" {print substr($0, index($0, "=") + 1)}' "$effective_host_config")
+  [[ -n "$key_file" && -f "$key_file" ]] || die 'GitHub App PEM file is missing'
+  mode_bits=$(stat -c '%a' "$key_file")
+  owner=$(stat -c '%u' "$key_file")
+  expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  [[ "$mode_bits" == 600 && "$owner" == "$expected_owner" ]] || die 'GitHub App PEM must be owned by root and have mode 0600'
+}
+
+docker_gid() {
+  if [[ "$testing" == 1 && -n ${CI_FLEET_DOCKER_GID_OVERRIDE:-} ]]; then
+    printf '%s' "$CI_FLEET_DOCKER_GID_OVERRIDE"
+    return
+  fi
+  stat -c '%g' /var/run/docker.sock
+}
+
+render_candidate() {
+  candidate_env=$temporary/ci-fleet.env
+  candidate_metadata=$temporary/metadata.json
+  python3 "$repo_root/scripts/desired_state.py" render \
+    --config "$candidate_config" \
+    --controller "$controller_id" \
+    --host-config "$effective_host_config" \
+    --config-repository "$config_identity" \
+    --config-ref "$config_ref" \
+    --docker-gid "$(docker_gid)" \
+    --output "$candidate_env" \
+    --metadata-output "$candidate_metadata"
+  target_state=$(jq -r .controller_state "$candidate_metadata")
+  engine_ref=$(jq -r .engine_ref "$candidate_metadata")
+  engine_repository=$(jq -r .engine_repository "$candidate_metadata")
+  release_dir=$releases_dir/$engine_ref
+}
+
+compose() {
+  local release=$1 env=$2
+  shift 2
+  docker compose --env-file "$env" -f "$release/deploy/compose.yaml" "$@"
+}
+
+controller_status() {
+  docker inspect --format '{{.State.Status}}' ci-fleet-controller-1 2>/dev/null || true
+}
+
+current_runtime_release() {
+  if [[ -L "$current_link" ]]; then
+    readlink -f "$current_link"
+  elif [[ -f "$install_root/deploy/compose.yaml" ]]; then
+    printf '%s' "$install_root"
+  fi
+}
+
+managed_runner_count() {
+  docker ps -q \
+    --filter label=io.randomdevelopment.ci-fleet.managed=true \
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
+}
+
+runtime_matches() {
+  local expected=$1 status
+  status=$(controller_status)
+  if [[ "$expected" == active ]]; then
+    [[ "$status" == running ]]
+  else
+    [[ -z "$status" || "$status" == exited || "$status" == created ]]
+  fi
+}
+
+state_matches() {
+  [[ -f "$state_file" ]] || return 1
+  jq 'del(.installed_at)' "$state_file" >"$temporary/installed-metadata.json" || return 1
+  cmp -s "$candidate_metadata" "$temporary/installed-metadata.json"
+}
+
+release_matches() {
+  [[ -L "$current_link" ]] || return 1
+  [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
+}
+
+systemd_matches() {
+  [[ -L "$manager_current" ]] || return 1
+  [[ -f "$systemd_dir/ci-fleet-health.service" && -f "$systemd_dir/ci-fleet-cleanup.service" && -f "$systemd_dir/ci-fleet-drift.service" ]] || return 1
+  systemctl is-enabled --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer || return 1
+  systemctl is-active --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer
+}
+
+drift_count() {
+  local count=0
+  [[ -f "$rendered_env" ]] && cmp -s "$candidate_env" "$rendered_env" || { note 'DRIFT rendered_environment'; count=$((count + 1)); }
+  release_matches || { note 'DRIFT engine_release'; count=$((count + 1)); }
+  state_matches || { note 'DRIFT install_state'; count=$((count + 1)); }
+  runtime_matches "$target_state" || { note 'DRIFT controller_runtime'; count=$((count + 1)); }
+  systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
+  DRIFT_COUNT=$count
+}
+
+install_release() {
+  local archive marker_commit checkout resolved
+  if [[ -d "$release_dir" ]]; then
+    [[ -f "$release_dir/.ci-fleet-engine-ref" ]] || die "existing release has no engine marker: $release_dir"
+    marker_commit=$(<"$release_dir/.ci-fleet-engine-ref")
+    [[ "$marker_commit" == "$engine_ref" ]] || die "existing release marker does not match $engine_ref"
+    return
+  fi
+  install -d -m 0755 "$releases_dir" "$release_dir"
+  archive=$temporary/engine.tar
+  if [[ -d "$repo_root/.git" && $(git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$engine_ref" ]]; then
+    git -C "$repo_root" archive --format=tar --output "$archive" HEAD
+  else
+    [[ "$engine_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'delivery engine repository is invalid'
+    checkout=$temporary/engine-repository
+    git init -q "$checkout"
+    git -C "$checkout" remote add origin "https://github.com/${engine_repository}.git"
+    GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$engine_ref" || die 'pinned ci-fleet engine commit could not be fetched'
+    resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
+    [[ "$resolved" == "$engine_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
+    git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD
+  fi
+  tar -xf "$archive" -C "$release_dir"
+  printf '%s\n' "$engine_ref" >"$temporary/engine-ref"
+  install -m 0644 "$temporary/engine-ref" "$release_dir/.ci-fleet-engine-ref"
+}
+
+install_manager() {
+  local manager_commit manager_release archive marker
+  if [[ -f "$repo_root/.ci-fleet-engine-ref" ]]; then
+    manager_commit=$(<"$repo_root/.ci-fleet-engine-ref")
+  else
+    [[ -d "$repo_root/.git" ]] || die 'installer manager source is not a Git checkout or installed manager release'
+    manager_commit=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
+  fi
+  [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
+  manager_release=$manager_releases/$manager_commit
+  if [[ ! -d "$manager_release" ]]; then
+    [[ -d "$repo_root/.git" ]] || die 'a new installer manager release requires a Git checkout'
+    install -d -m 0755 "$manager_releases" "$manager_release"
+    archive=$temporary/manager.tar
+    git -C "$repo_root" archive --format=tar --output "$archive" HEAD
+    tar -xf "$archive" -C "$manager_release"
+    printf '%s\n' "$manager_commit" >"$temporary/manager-ref"
+    install -m 0644 "$temporary/manager-ref" "$manager_release/.ci-fleet-engine-ref"
+  else
+    marker=$(<"$manager_release/.ci-fleet-engine-ref")
+    [[ "$marker" == "$manager_commit" ]] || die 'existing installer manager marker is inconsistent'
+  fi
+  install -d -m 0755 "$manager_root"
+  ln -sfn "$manager_release" "$temporary/manager-current"
+  mv -Tf "$temporary/manager-current" "$manager_current"
+}
+
+run_candidate_preflight() {
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$candidate_env"
+    set +a
+    CI_FLEET_TESTING=$testing "$repo_root/scripts/preflight.sh" --managed
+  )
+}
+
+build_candidate() {
+  run_candidate_preflight
+  compose "$release_dir" "$candidate_env" config --quiet
+  [[ "$target_state" == disabled ]] || compose "$release_dir" "$candidate_env" build runner-image controller
+}
+
+make_checkpoint() {
+  local timestamp target
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  checkpoint_dir=$checkpoints_dir/${timestamp}-$$
+  install -d -m 0700 "$checkpoint_dir"
+  [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+  [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
+  target=$(current_runtime_release)
+  if [[ -n "$target" ]]; then
+    printf '%s\n' "$target" >"$temporary/release-target"
+    install -m 0600 "$temporary/release-target" "$checkpoint_dir/release-target"
+  fi
+  note "CHECKPOINT_CREATED path=$checkpoint_dir"
+}
+
+drain_current() {
+  local deadline count old_release status
+  status=$(controller_status)
+  [[ "$status" == running ]] || return 0
+  [[ -f "$rendered_env" ]] || die 'cannot safely drain a running controller without its rendered environment'
+  old_release=$(current_runtime_release)
+  [[ -n "$old_release" && -f "$old_release/deploy/compose.yaml" ]] || die 'cannot locate the running controller Compose release for safe adoption'
+  compose "$old_release" "$rendered_env" pause controller >/dev/null
+  deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
+  while :; do
+    count=$(managed_runner_count)
+    if [[ "$count" == 0 ]]; then
+      break
+    fi
+    if ((SECONDS >= deadline)); then
+      compose "$old_release" "$rendered_env" unpause controller >/dev/null || true
+      die "drain timed out with $count managed runner(s) still present"
+    fi
+    sleep 2
+  done
+  compose "$old_release" "$rendered_env" stop controller >/dev/null
+  note 'DRAIN_OK managed_runners=0'
+}
+
+install_systemd_units() {
+  install -d -m 0755 "$systemd_dir"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-health.service" "$systemd_dir/"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-health.timer" "$systemd_dir/"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
+  install -m 0644 "$repo_root/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
+  systemctl daemon-reload
+  systemctl enable --now ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer >/dev/null
+}
+
+activate_candidate() {
+  install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
+  install -m 0600 "$candidate_env" "$rendered_env"
+  ln -sfn "$release_dir" "$temporary/current"
+  mv -Tf "$temporary/current" "$current_link"
+  install_manager
+  install_systemd_units
+  if [[ "$target_state" == active ]]; then
+    compose "$release_dir" "$rendered_env" up -d --no-deps controller
+    sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
+    runtime_matches active || die 'controller did not remain running after activation'
+    if ! (
+      set -a
+      # shellcheck disable=SC1090
+      . "$rendered_env"
+      set +a
+      "$repo_root/scripts/healthcheck.sh"
+    ); then
+      die 'post-activation health check failed'
+    fi
+  else
+    compose "$release_dir" "$rendered_env" stop controller >/dev/null 2>&1 || true
+  fi
+  jq --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {installed_at: $installed_at}' \
+    "$candidate_metadata" >"$temporary/install-state.json"
+  install -m 0600 "$temporary/install-state.json" "$state_file"
+}
+
+restore_checkpoint() {
+  local target restored_state
+  [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
+  set +e
+  if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    install -m 0600 "$checkpoint_dir/ci-fleet.env" "$rendered_env"
+  else
+    rm -f "$rendered_env"
+  fi
+  if [[ -f "$checkpoint_dir/install-state.json" ]]; then
+    install -m 0600 "$checkpoint_dir/install-state.json" "$state_file"
+  else
+    rm -f "$state_file"
+  fi
+  if [[ -f "$checkpoint_dir/release-target" ]]; then
+    target=$(<"$checkpoint_dir/release-target")
+    if [[ -d "$target" ]]; then
+      ln -sfn "$target" "$temporary/rollback-current"
+      mv -Tf "$temporary/rollback-current" "$current_link"
+      release_dir=$target
+      install_systemd_units
+      if [[ -f "$rendered_env" ]]; then
+        restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env")
+        if [[ "$restored_state" == active ]]; then
+          compose "$release_dir" "$rendered_env" up -d --no-deps controller
+        fi
+      fi
+    fi
+  else
+    rm -f "$current_link"
+  fi
+  set -e
+  note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
+}
+
+on_error() {
+  local status=$?
+  if $transaction_active; then
+    restore_checkpoint || true
+  fi
+  exit "$status"
+}
+trap on_error ERR
+
+perform_check() {
+  local count
+  drift_count
+  count=$DRIFT_COUNT
+  if ((count > 0)); then
+    note "CHECK_FAILED drift=$count"
+    exit 3
+  fi
+  note "CHECK_OK controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
+}
+
+perform_converge() {
+  local count existing_status
+  if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
+    die '--upgrade requires an existing managed installation; use --install or --adopt'
+  fi
+  existing_status=$(controller_status)
+  if [[ "$mode" == adopt && ! -f "$rendered_env" && ! -f "$state_file" && -z "$existing_status" ]]; then
+    die '--adopt requires an existing controller or configuration; use --install for a fresh host'
+  fi
+  if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
+    die 'an unmanaged controller configuration exists; use --adopt'
+  fi
+  drift_count
+  count=$DRIFT_COUNT
+  if ((count == 0)); then
+    note "NO_CHANGE controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
+    return
+  fi
+  install_release
+  build_candidate
+  make_checkpoint
+  transaction_active=true
+  drain_current
+  activate_candidate
+  transaction_active=false
+  note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
+}
+
+latest_checkpoint() {
+  find "$checkpoints_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 {print $2}'
+}
+
+perform_rollback() {
+  checkpoint_dir=$(latest_checkpoint)
+  [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
+  drain_current
+  restore_checkpoint || die 'checkpoint restoration failed'
+  note "ROLLBACK_OK checkpoint=$checkpoint_dir"
+}
+
+perform_uninstall() {
+  local old_release=
+  [[ ! -L "$current_link" ]] || old_release=$(readlink -f "$current_link")
+  make_checkpoint
+  transaction_active=true
+  drain_current
+  if [[ -n "$old_release" && -f "$rendered_env" ]]; then
+    compose "$old_release" "$rendered_env" down --remove-orphans || true
+    (
+      set -a
+      # shellcheck disable=SC1090
+      . "$rendered_env"
+      set +a
+      "$old_release/scripts/cleanup.sh" --apply --instance "${CI_FLEET_INSTANCE:-}" || true
+    )
+  fi
+  systemctl disable --now ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer >/dev/null 2>&1 || true
+  rm -f \
+    "$systemd_dir/ci-fleet-health.service" "$systemd_dir/ci-fleet-health.timer" \
+    "$systemd_dir/ci-fleet-cleanup.service" "$systemd_dir/ci-fleet-cleanup.timer" \
+    "$systemd_dir/ci-fleet-drift.service" "$systemd_dir/ci-fleet-drift.timer"
+  systemctl daemon-reload
+  rm -f "$current_link" "$rendered_env" "$state_file"
+  rm -f "$manager_current"
+  transaction_active=false
+  note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"
+}
+
+require_commands
+case "$mode" in
+  check|install|adopt|upgrade)
+    validate_common_arguments
+    resolve_config
+    prepare_host_config
+    verify_host_files
+    render_candidate
+    if [[ "$mode" == check ]]; then perform_check; else perform_converge; fi
+    ;;
+  rollback)
+    perform_rollback
+    ;;
+  uninstall)
+    perform_uninstall
+    ;;
+esac

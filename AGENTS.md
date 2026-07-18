@@ -41,6 +41,8 @@ Agents modifying this repository or adapting a project MUST apply these document
 - Do not install project language runtimes in the generic runner image.
 - Do not put repository names, project allowlists, or project-specific logic in runner images or host configuration.
 - Keep project workflows independent of host, site, instance, and scale-set names; route through shared capability labels.
+- Keep worker capacity in reviewed private infrastructure configuration. Application workflows submit all independent jobs and must not use `max-parallel` to model fleet size.
+- Treat schema-v3 controller desired state as authoritative for routing, capacity, lifecycle, and engine revision; host-local files contain only rendered state and credentials.
 - Do not allow projects to select privileged runner groups through untrusted inputs.
 
 ## Verification expectations
