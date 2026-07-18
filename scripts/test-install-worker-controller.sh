@@ -121,6 +121,7 @@ base_args=(--config-repo "$config_repo" --controller example-ci-01)
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
