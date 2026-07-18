@@ -26,10 +26,12 @@ export CI_FLEET_GITHUB_APP_CLIENT_ID=validation
 export CI_FLEET_GITHUB_APP_INSTALLATION_ID=1
 export CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE="$tmp"
 export CI_FLEET_DOCKER_GID=999
+export CI_FLEET_RUNNER_IMAGE=${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+export CI_FLEET_CONTROLLER_IMAGE=${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
 docker compose -f deploy/compose.yaml config --quiet
 
 docker compose -f deploy/compose.yaml build runner-image controller
-docker run --rm --entrypoint /bin/bash ci-fleet-runner:dev -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
 CI_FLEET_INSTANCE=validation scripts/cleanup.sh
 
 if rg -n --hidden --glob '!*.example' --glob '!scripts/validate.sh' --glob '!docs/SECRETS.md' --glob '!SECURITY.md' '(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|github_pat_|ghp_[A-Za-z0-9]{20,})' .; then
