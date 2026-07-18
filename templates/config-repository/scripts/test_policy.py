@@ -58,14 +58,16 @@ class PolicyTests(unittest.TestCase):
 
     def test_capacity_overcommit_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
-        first_controller(config)["max_runners"] = 2
-        self.assert_rejected(config, "must cover 2 runners")
+        overcommit = config["runner_pools"]["trusted-ci"]["capacity_budget"] + 1
+        first_controller(config)["max_runners"] = overcommit
+        self.assert_rejected(config, f"must cover {overcommit} runners")
 
     def test_drained_capacity_remains_reserved(self) -> None:
         config = copy.deepcopy(reference_config())
+        overcommit = config["runner_pools"]["trusted-ci"]["capacity_budget"] + 1
         first_controller(config)["state"] = "drained"
-        first_controller(config)["max_runners"] = 2
-        self.assert_rejected(config, "must cover 2 runners")
+        first_controller(config)["max_runners"] = overcommit
+        self.assert_rejected(config, f"must cover {overcommit} runners")
 
     def test_disabled_capacity_is_not_reserved(self) -> None:
         config = copy.deepcopy(reference_config())
