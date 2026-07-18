@@ -131,12 +131,18 @@ printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
+prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
+cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
+ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
+
 ref_two=$(write_config active 2 2)
 export FAKE_FAIL_UP_ONCE=$tmp/fail-up-once
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
 unset FAKE_FAIL_UP_ONCE
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'failed activation did not restore capacity one'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'failed activation did not restore the prior manager release'
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'failed activation did not restore the prior controller runtime'
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >/dev/null
 grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade did not apply capacity two'
 
