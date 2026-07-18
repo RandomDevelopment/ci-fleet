@@ -258,7 +258,10 @@ systemd_matches() {
 
 drift_count() {
   local count=0
-  [[ -f "$rendered_env" ]] && cmp -s "$candidate_env" "$rendered_env" || { note 'DRIFT rendered_environment'; count=$((count + 1)); }
+  if [[ ! -f "$rendered_env" ]] || ! cmp -s "$candidate_env" "$rendered_env"; then
+    note 'DRIFT rendered_environment'
+    count=$((count + 1))
+  fi
   release_matches || { note 'DRIFT engine_release'; count=$((count + 1)); }
   state_matches || { note 'DRIFT install_state'; count=$((count + 1)); }
   runtime_matches "$target_state" || { note 'DRIFT controller_runtime'; count=$((count + 1)); }
