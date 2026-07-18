@@ -103,6 +103,7 @@ state_file=$state_root/install-state.json
 checkpoints_dir=$state_root/checkpoints
 systemd_dir=$(root_path /etc/systemd/system)
 lock_file=$(root_path /run/ci-fleet-installer.lock)
+controller_container=ci-fleet-controller-1
 unit_names=(
   ci-fleet-health.service ci-fleet-health.timer
   ci-fleet-cleanup.service ci-fleet-cleanup.timer
@@ -219,7 +220,7 @@ compose() {
 }
 
 controller_status() {
-  docker inspect --format '{{.State.Status}}' ci-fleet-controller-1 2>/dev/null || true
+  docker inspect --format '{{.State.Status}}' "$controller_container" 2>/dev/null || true
 }
 
 current_runtime_release() {
