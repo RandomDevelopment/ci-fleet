@@ -87,7 +87,7 @@ The installer:
 9. starts the controller only when its desired state is active;
 10. verifies runtime health and records a redacted installation state.
 
-A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement.
+A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. A successful engine upgrade advances both the runtime release and the maintenance installer-manager to the same pinned commit; rollback restores both.
 
 ## Adopt an existing controller
 

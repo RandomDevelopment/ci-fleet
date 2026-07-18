@@ -325,20 +325,17 @@ install_release() {
 }
 
 install_manager() {
-  local manager_commit manager_release archive marker staged_manager
-  if [[ -f "$repo_root/.ci-fleet-engine-ref" ]]; then
-    manager_commit=$(<"$repo_root/.ci-fleet-engine-ref")
-  else
-    is_git_checkout "$repo_root" || die 'installer manager source is not a Git checkout or installed manager release'
-    manager_commit=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
-  fi
+  local manager_commit manager_release archive marker staged_manager release_marker
+  manager_commit=$engine_ref
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
+  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" ]] || die 'desired engine release is unavailable for installer manager activation'
+  release_marker=$(<"$release_dir/.ci-fleet-engine-ref")
+  [[ "$release_marker" == "$manager_commit" ]] || die 'desired engine release marker is inconsistent'
   manager_release=$manager_releases/$manager_commit
   if [[ ! -d "$manager_release" ]]; then
-    is_git_checkout "$repo_root" || die 'a new installer manager release requires a Git checkout'
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
-    git -C "$repo_root" archive --format=tar --output "$archive" HEAD
+    tar -cf "$archive" -C "$release_dir" .
     staged_manager=$temporary/manager-release
     install -d -m 0755 "$staged_manager"
     tar -xf "$archive" -C "$staged_manager"
