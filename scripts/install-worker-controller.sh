@@ -117,7 +117,7 @@ trap cleanup_temporary EXIT
 
 require_commands() {
   local command
-  for command in git python3 docker jq tar install cmp readlink systemctl stat awk grep date flock; do
+  for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
@@ -196,6 +196,7 @@ docker_gid() {
 }
 
 render_candidate() {
+  local -a metadata_values
   candidate_env=$temporary/ci-fleet.env
   candidate_metadata=$temporary/metadata.json
   python3 "$repo_root/scripts/desired_state.py" render \
@@ -207,9 +208,18 @@ render_candidate() {
     --docker-gid "$(docker_gid)" \
     --output "$candidate_env" \
     --metadata-output "$candidate_metadata"
-  target_state=$(jq -r .controller_state "$candidate_metadata")
-  engine_ref=$(jq -r .engine_ref "$candidate_metadata")
-  engine_repository=$(jq -r .engine_repository "$candidate_metadata")
+  mapfile -t metadata_values < <(python3 - "$candidate_metadata" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("controller_state", "engine_ref", "engine_repository"):
+    print(value[key])
+PY
+  )
+  [[ ${#metadata_values[@]} == 3 ]] || die 'rendered controller metadata is incomplete'
+  target_state=${metadata_values[0]}
+  engine_ref=${metadata_values[1]}
+  engine_repository=${metadata_values[2]}
   release_dir=$releases_dir/$engine_ref
 }
 
@@ -249,8 +259,14 @@ runtime_matches() {
 
 state_matches() {
   [[ -f "$state_file" ]] || return 1
-  jq 'del(.installed_at)' "$state_file" >"$temporary/installed-metadata.json" || return 1
-  cmp -s "$candidate_metadata" "$temporary/installed-metadata.json"
+  python3 - "$state_file" "$candidate_metadata" <<'PY'
+import json
+import sys
+installed = json.load(open(sys.argv[1], encoding="utf-8"))
+installed.pop("installed_at", None)
+candidate = json.load(open(sys.argv[2], encoding="utf-8"))
+raise SystemExit(0 if installed == candidate else 1)
+PY
 }
 
 release_matches() {
@@ -470,8 +486,15 @@ activate_candidate() {
   else
     compose "$release_dir" "$rendered_env" stop controller >/dev/null 2>&1 || true
   fi
-  jq --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {installed_at: $installed_at}' \
-    "$candidate_metadata" >"$temporary/install-state.json"
+  python3 - "$candidate_metadata" "$temporary/install-state.json" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["installed_at"] = sys.argv[3]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
   install -m 0600 "$temporary/install-state.json" "$state_file"
 }
 
