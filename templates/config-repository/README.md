@@ -59,7 +59,7 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - its unique GitHub scale-set name;
 - an `experimental`, `stable`, or `retiring` lifecycle;
 - the full reviewed ci-fleet commit SHA it runs;
-- minimum and maximum runners;
+- a zero managed minimum and reviewed maximum runner capacity;
 - CPU and memory available to each ephemeral runner.
 
 The controller ID is how a target host selects its declaration. A location is a non-sensitive logical slug such as `primary-site` or `remote-site`, never an address. Runtime-generated configuration and credentials remain host-local.

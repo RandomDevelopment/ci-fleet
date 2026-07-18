@@ -31,10 +31,12 @@ Each controller has a unique object key and declares:
 - a unique scale-set name;
 - `experimental`, `stable`, or `retiring` lifecycle;
 - a full pinned ci-fleet engine commit;
-- minimum and maximum runners;
+- a zero managed minimum and reviewed maximum runner capacity;
 - CPU cores and memory per ephemeral runner.
 
 Active and drained controllers reserve their configured maximum against the pool budget. A drained controller has zero effective runtime capacity but keeps its reservation, so an undrain cannot silently overcommit the pool. Disabled controllers reserve no capacity.
+
+Managed prewarmed runners are not currently supported: `min_runners` is fixed at zero in schema, semantic validation, rendering, and preflight. This keeps idle privileged workers absent and prevents reviewed configuration from passing validation only to fail host adoption.
 
 The authoritative fictional contract is in [`templates/config-repository`](../templates/config-repository/README.md).
 
