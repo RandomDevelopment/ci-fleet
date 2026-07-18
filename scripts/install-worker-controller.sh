@@ -376,8 +376,8 @@ make_checkpoint() {
   : >"$temporary/enabled-timers"
   : >"$temporary/active-timers"
   for timer in "${timer_names[@]}"; do
-    systemctl is-enabled --quiet "$timer" 2>/dev/null && printf '%s\n' "$timer" >>"$temporary/enabled-timers" || true
-    systemctl is-active --quiet "$timer" 2>/dev/null && printf '%s\n' "$timer" >>"$temporary/active-timers" || true
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$temporary/enabled-timers"; fi
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$temporary/active-timers"; fi
   done
   install -m 0600 "$temporary/enabled-timers" "$checkpoint_dir/enabled-timers"
   install -m 0600 "$temporary/active-timers" "$checkpoint_dir/active-timers"
