@@ -86,6 +86,7 @@ if [[ "$testing" != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 root_path() { printf '%s%s' "$root_prefix" "$1"; }
+is_git_checkout() { git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
 
 install_root=$(root_path /opt/ci-fleet)
 releases_dir=$install_root/releases
@@ -101,6 +102,13 @@ state_root=$(root_path /var/lib/ci-fleet)
 state_file=$state_root/install-state.json
 checkpoints_dir=$state_root/checkpoints
 systemd_dir=$(root_path /etc/systemd/system)
+lock_file=$(root_path /run/ci-fleet-installer.lock)
+unit_names=(
+  ci-fleet-health.service ci-fleet-health.timer
+  ci-fleet-cleanup.service ci-fleet-cleanup.timer
+  ci-fleet-drift.service ci-fleet-drift.timer
+)
+timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
 
 temporary=$(mktemp -d)
 cleanup_temporary() { rm -rf "$temporary"; }
@@ -108,7 +116,7 @@ trap cleanup_temporary EXIT
 
 require_commands() {
   local command
-  for command in git python3 docker jq tar install cmp readlink systemctl stat awk grep date; do
+  for command in git python3 docker jq tar install cmp readlink systemctl stat awk grep date flock; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
@@ -127,7 +135,7 @@ validate_common_arguments() {
 resolve_config() {
   local resolved checkout
   candidate_config=$temporary/fleet.json
-  if [[ -d "$config_repo/.git" ]]; then
+  if is_git_checkout "$config_repo"; then
     resolved=$(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
     [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
     git -C "$config_repo" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
@@ -270,16 +278,16 @@ drift_count() {
 }
 
 install_release() {
-  local archive marker_commit checkout resolved
+  local archive marker_commit checkout resolved staged_release
   if [[ -d "$release_dir" ]]; then
     [[ -f "$release_dir/.ci-fleet-engine-ref" ]] || die "existing release has no engine marker: $release_dir"
     marker_commit=$(<"$release_dir/.ci-fleet-engine-ref")
     [[ "$marker_commit" == "$engine_ref" ]] || die "existing release marker does not match $engine_ref"
     return
   fi
-  install -d -m 0755 "$releases_dir" "$release_dir"
+  install -d -m 0755 "$releases_dir"
   archive=$temporary/engine.tar
-  if [[ -d "$repo_root/.git" && $(git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$engine_ref" ]]; then
+  if is_git_checkout "$repo_root" && [[ $(git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$engine_ref" ]]; then
     git -C "$repo_root" archive --format=tar --output "$archive" HEAD
   else
     [[ "$engine_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'delivery engine repository is invalid'
@@ -291,29 +299,35 @@ install_release() {
     [[ "$resolved" == "$engine_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
     git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD
   fi
-  tar -xf "$archive" -C "$release_dir"
-  printf '%s\n' "$engine_ref" >"$temporary/engine-ref"
-  install -m 0644 "$temporary/engine-ref" "$release_dir/.ci-fleet-engine-ref"
+  staged_release=$temporary/engine-release
+  install -d -m 0755 "$staged_release"
+  tar -xf "$archive" -C "$staged_release"
+  printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
+  chmod 0644 "$staged_release/.ci-fleet-engine-ref"
+  mv "$staged_release" "$release_dir"
 }
 
 install_manager() {
-  local manager_commit manager_release archive marker
+  local manager_commit manager_release archive marker staged_manager
   if [[ -f "$repo_root/.ci-fleet-engine-ref" ]]; then
     manager_commit=$(<"$repo_root/.ci-fleet-engine-ref")
   else
-    [[ -d "$repo_root/.git" ]] || die 'installer manager source is not a Git checkout or installed manager release'
+    is_git_checkout "$repo_root" || die 'installer manager source is not a Git checkout or installed manager release'
     manager_commit=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
   fi
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
   manager_release=$manager_releases/$manager_commit
   if [[ ! -d "$manager_release" ]]; then
-    [[ -d "$repo_root/.git" ]] || die 'a new installer manager release requires a Git checkout'
-    install -d -m 0755 "$manager_releases" "$manager_release"
+    is_git_checkout "$repo_root" || die 'a new installer manager release requires a Git checkout'
+    install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     git -C "$repo_root" archive --format=tar --output "$archive" HEAD
-    tar -xf "$archive" -C "$manager_release"
-    printf '%s\n' "$manager_commit" >"$temporary/manager-ref"
-    install -m 0644 "$temporary/manager-ref" "$manager_release/.ci-fleet-engine-ref"
+    staged_manager=$temporary/manager-release
+    install -d -m 0755 "$staged_manager"
+    tar -xf "$archive" -C "$staged_manager"
+    printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
+    chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
+    mv "$staged_manager" "$manager_release"
   else
     marker=$(<"$manager_release/.ci-fleet-engine-ref")
     [[ "$marker" == "$manager_commit" ]] || die 'existing installer manager marker is inconsistent'
@@ -340,10 +354,10 @@ build_candidate() {
 }
 
 make_checkpoint() {
-  local timestamp target
+  local timestamp target unit timer
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   checkpoint_dir=$checkpoints_dir/${timestamp}-$$
-  install -d -m 0700 "$checkpoint_dir"
+  install -d -m 0700 "$checkpoint_dir" "$checkpoint_dir/systemd"
   [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   target=$(current_runtime_release)
@@ -351,43 +365,71 @@ make_checkpoint() {
     printf '%s\n' "$target" >"$temporary/release-target"
     install -m 0600 "$temporary/release-target" "$checkpoint_dir/release-target"
   fi
+  if [[ -L "$manager_current" ]]; then
+    target=$(readlink -f "$manager_current")
+    printf '%s\n' "$target" >"$temporary/manager-target"
+    install -m 0600 "$temporary/manager-target" "$checkpoint_dir/manager-target"
+  fi
+  for unit in "${unit_names[@]}"; do
+    [[ ! -f "$systemd_dir/$unit" ]] || install -m 0644 "$systemd_dir/$unit" "$checkpoint_dir/systemd/$unit"
+  done
+  : >"$temporary/enabled-timers"
+  : >"$temporary/active-timers"
+  for timer in "${timer_names[@]}"; do
+    systemctl is-enabled --quiet "$timer" 2>/dev/null && printf '%s\n' "$timer" >>"$temporary/enabled-timers" || true
+    systemctl is-active --quiet "$timer" 2>/dev/null && printf '%s\n' "$timer" >>"$temporary/active-timers" || true
+  done
+  install -m 0600 "$temporary/enabled-timers" "$checkpoint_dir/enabled-timers"
+  install -m 0600 "$temporary/active-timers" "$checkpoint_dir/active-timers"
   note "CHECKPOINT_CREATED path=$checkpoint_dir"
 }
 
-drain_current() {
+try_drain_current() {
   local deadline count old_release status
+  drain_error=
   status=$(controller_status)
   [[ "$status" == running ]] || return 0
-  [[ -f "$rendered_env" ]] || die 'cannot safely drain a running controller without its rendered environment'
+  if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
   old_release=$(current_runtime_release)
-  [[ -n "$old_release" && -f "$old_release/deploy/compose.yaml" ]] || die 'cannot locate the running controller Compose release for safe adoption'
-  compose "$old_release" "$rendered_env" pause controller >/dev/null
+  if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
+  if ! compose "$old_release" "$rendered_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
   while :; do
     count=$(managed_runner_count)
-    if [[ "$count" == 0 ]]; then
-      break
-    fi
+    if [[ "$count" == 0 ]]; then break; fi
     if ((SECONDS >= deadline)); then
       compose "$old_release" "$rendered_env" unpause controller >/dev/null || true
-      die "drain timed out with $count managed runner(s) still present"
+      drain_error="drain timed out with $count managed runner(s) still present"
+      return 1
     fi
     sleep 2
   done
-  compose "$old_release" "$rendered_env" stop controller >/dev/null
+  if ! compose "$old_release" "$rendered_env" stop controller >/dev/null; then drain_error='could not stop the drained controller'; return 1; fi
   note 'DRAIN_OK managed_runners=0'
 }
 
+drain_current() {
+  try_drain_current || die "$drain_error"
+}
+
 install_systemd_units() {
+  local source=${1:-$repo_root}
   install -d -m 0755 "$systemd_dir"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-health.service" "$systemd_dir/"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-health.timer" "$systemd_dir/"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
-  install -m 0644 "$repo_root/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-health.service" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-health.timer" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
   systemctl daemon-reload
-  systemctl enable --now ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer >/dev/null
+  systemctl enable --now "${timer_names[@]}" >/dev/null
+}
+
+remove_systemd_units() {
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  local unit
+  for unit in "${unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
+  systemctl daemon-reload
 }
 
 activate_candidate() {
@@ -396,7 +438,7 @@ activate_candidate() {
   ln -sfn "$release_dir" "$temporary/current"
   mv -Tf "$temporary/current" "$current_link"
   install_manager
-  install_systemd_units
+  install_systemd_units "$(readlink -f "$manager_current")"
   if [[ "$target_state" == active ]]; then
     compose "$release_dir" "$rendered_env" up -d --no-deps controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
@@ -418,38 +460,88 @@ activate_candidate() {
   install -m 0600 "$temporary/install-state.json" "$state_file"
 }
 
+restore_systemd_snapshot() {
+  local unit timer failed=0
+  remove_systemd_units || failed=1
+  for unit in "${unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  done
+  systemctl daemon-reload || failed=1
+  for timer in "${timer_names[@]}"; do
+    if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
+    if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
+  done
+  return "$failed"
+}
+
 restore_checkpoint() {
-  local target restored_state
+  local target restored_state failed=0
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
+  if ! try_drain_current; then
+    note "ROLLBACK_FAILED reason=$drain_error"
+    return 1
+  fi
+  trap - ERR
   set +e
   if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
-    install -m 0600 "$checkpoint_dir/ci-fleet.env" "$rendered_env"
+    install -m 0600 "$checkpoint_dir/ci-fleet.env" "$rendered_env" || failed=1
   else
-    rm -f "$rendered_env"
+    rm -f "$rendered_env" || failed=1
   fi
   if [[ -f "$checkpoint_dir/install-state.json" ]]; then
-    install -m 0600 "$checkpoint_dir/install-state.json" "$state_file"
+    install -m 0600 "$checkpoint_dir/install-state.json" "$state_file" || failed=1
   else
-    rm -f "$state_file"
+    rm -f "$state_file" || failed=1
   fi
   if [[ -f "$checkpoint_dir/release-target" ]]; then
     target=$(<"$checkpoint_dir/release-target")
-    if [[ -d "$target" ]]; then
-      ln -sfn "$target" "$temporary/rollback-current"
-      mv -Tf "$temporary/rollback-current" "$current_link"
+    if [[ -d "$target" && -f "$target/deploy/compose.yaml" ]]; then
+      ln -sfn "$target" "$temporary/rollback-current" && mv -Tf "$temporary/rollback-current" "$current_link" || failed=1
       release_dir=$target
-      install_systemd_units
-      if [[ -f "$rendered_env" ]]; then
-        restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env")
-        if [[ "$restored_state" == active ]]; then
-          compose "$release_dir" "$rendered_env" up -d --no-deps controller
+    else
+      failed=1
+    fi
+  else
+    rm -f "$current_link" || failed=1
+    release_dir=
+  fi
+  if [[ -f "$checkpoint_dir/manager-target" ]]; then
+    target=$(<"$checkpoint_dir/manager-target")
+    if [[ "$target" == "$manager_releases/"* && -d "$target" ]]; then
+      ln -sfn "$target" "$temporary/rollback-manager" && mv -Tf "$temporary/rollback-manager" "$manager_current" || failed=1
+    else
+      failed=1
+    fi
+  else
+    rm -f "$manager_current" || failed=1
+  fi
+  restore_systemd_snapshot || failed=1
+  if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
+    restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
+    [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
+    if [[ "$restored_state" == active && "$failed" == 0 ]]; then
+      if [[ $(managed_runner_count) != 0 ]]; then
+        failed=1
+      else
+        compose "$release_dir" "$rendered_env" up -d --no-deps controller || failed=1
+        if ((failed == 0)); then
+          (
+            set -a
+            # shellcheck disable=SC1090
+            . "$rendered_env"
+            set +a
+            "$release_dir/scripts/healthcheck.sh"
+          ) || failed=1
         fi
       fi
     fi
-  else
-    rm -f "$current_link"
   fi
   set -e
+  trap on_error ERR
+  if ((failed != 0)); then
+    note "ROLLBACK_FAILED checkpoint=$checkpoint_dir"
+    return 1
+  fi
   note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
 }
 
@@ -529,12 +621,7 @@ perform_uninstall() {
       "$old_release/scripts/cleanup.sh" --apply --instance "${CI_FLEET_INSTANCE:-}" || true
     )
   fi
-  systemctl disable --now ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer >/dev/null 2>&1 || true
-  rm -f \
-    "$systemd_dir/ci-fleet-health.service" "$systemd_dir/ci-fleet-health.timer" \
-    "$systemd_dir/ci-fleet-cleanup.service" "$systemd_dir/ci-fleet-cleanup.timer" \
-    "$systemd_dir/ci-fleet-drift.service" "$systemd_dir/ci-fleet-drift.timer"
-  systemctl daemon-reload
+  remove_systemd_units
   rm -f "$current_link" "$rendered_env" "$state_file"
   rm -f "$manager_current"
   transaction_active=false
@@ -542,6 +629,9 @@ perform_uninstall() {
 }
 
 require_commands
+install -d -m 0755 "$(dirname "$lock_file")"
+exec 9>"$lock_file"
+flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 case "$mode" in
   check|install|adopt|upgrade)
     validate_common_arguments

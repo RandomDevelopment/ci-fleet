@@ -146,7 +146,7 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, and release target under `/var/lib/ci-fleet/checkpoints`. Build and validation happen before the active release changes. A failed activation or health check restores the latest known-good controller checkpoint.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Build and validation happen before the active release changes. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local `flock` prevents overlapping installer and drift-check processes.
 
 These controller checkpoints do not replace machine backups. Operators still create and verify VM snapshots, physical-host recovery media, or equivalent infrastructure backups according to their local policy.
 
