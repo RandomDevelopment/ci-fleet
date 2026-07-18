@@ -27,7 +27,7 @@ case "${1:-}" in
     if [[ "${2:-}" == version ]]; then exit 0; fi
     command=
     for argument in "$@"; do
-      case "$argument" in config|build|up|stop|pause|unpause|down|logs|rm) command=$argument ;; esac
+      case "$argument" in config|build|up|stop|pause|unpause|kill|down|logs|rm) command=$argument ;; esac
     done
     case "$command" in
       up)
@@ -38,7 +38,7 @@ case "${1:-}" in
         : >"$state"
         ;;
       stop|down|rm) rm -f "$state" ;;
-      config|build|pause|unpause|logs) ;;
+      config|build|pause|unpause|kill|logs) ;;
       *) exit 1 ;;
     esac
     ;;

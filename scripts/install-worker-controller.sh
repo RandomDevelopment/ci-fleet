@@ -404,7 +404,21 @@ try_drain_current() {
     fi
     sleep 2
   done
-  if ! compose "$old_release" "$rendered_env" stop controller >/dev/null; then drain_error='could not stop the drained controller'; return 1; fi
+  note 'DRAIN_READY managed_runners=0'
+  docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" kill --signal SIGTERM controller >/dev/null || {
+    drain_error='failed to signal the paused controller for graceful scale-set cleanup'
+    return 1
+  }
+  if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+    docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" unpause controller >/dev/null || {
+      drain_error='failed to unpause the signaled controller for graceful shutdown'
+      return 1
+    }
+  fi
+  docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" stop controller >/dev/null || {
+    drain_error='could not stop the drained controller'
+    return 1
+  }
   note 'DRAIN_OK managed_runners=0'
 }
 

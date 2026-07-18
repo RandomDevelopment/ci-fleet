@@ -103,11 +103,16 @@ class PolicyTests(unittest.TestCase):
         first_controller(config)["engine_ref"] = "0" * 40
         self.assert_rejected(config, "nonzero full lowercase commit SHA")
 
+    def test_active_controller_minimum_must_be_zero(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["min_runners"] = 1
+        self.assert_rejected(config, "managed prewarmed runners are not supported")
+
     def test_drained_controller_minimum_must_be_zero(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["state"] = "drained"
         first_controller(config)["min_runners"] = 1
-        self.assert_rejected(config, "must be zero while drained or disabled")
+        self.assert_rejected(config, "managed prewarmed runners are not supported")
 
     def test_application_capacity_control_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())

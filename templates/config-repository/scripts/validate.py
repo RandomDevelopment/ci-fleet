@@ -265,8 +265,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(type(maximum) is int and maximum > 0, f"{path}.max_runners", "must be a positive integer")
         if type(minimum) is int and type(maximum) is int:
             validation.require(minimum <= maximum, f"{path}.min_runners", "must not exceed max_runners")
-        if state in {"drained", "disabled"}:
-            validation.require(minimum == 0, f"{path}.min_runners", "must be zero while drained or disabled")
+        validation.require(minimum == 0, f"{path}.min_runners", "must be zero because managed prewarmed runners are not supported")
         resources = controller.get("runner_resources")
         if validation.exact_keys(resources, f"{path}.runner_resources", {"cpu_cores", "memory_mib"}):
             cpu = resources.get("cpu_cores")

@@ -77,7 +77,7 @@
         "scale_set_name": {"$ref": "#/$defs/slug"},
         "lifecycle": {"enum": ["experimental", "stable", "retiring"]},
         "engine_ref": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "min_runners": {"type": "integer", "minimum": 0},
+        "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
         "runner_resources": {"$ref": "#/$defs/runner_resources"}
       }
