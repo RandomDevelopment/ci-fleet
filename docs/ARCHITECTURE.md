@@ -38,7 +38,8 @@ A host may run multiple runners when resource measurements and project isolation
 flowchart LR
     A["ci-fleet"] --> B["Runner lifecycle"]
     C["Project repo"] --> D["Test environment"]
-    E["Host config"] --> F["Secrets and capacity"]
+    E["Private Git config"] --> F["Routing and capacity desired state"]
+    G["Host-local config"] --> H["Credentials and rendered runtime state"]
 ```
 
 ### Fleet repository
@@ -71,19 +72,19 @@ Each project is responsible for:
 - run-scoped cleanup;
 - release and deployment behavior.
 
-### Deployment-local configuration
+### Private installation configuration
 
 Each installation is responsible for:
 
 - real organization and runner-group names;
-- host capacity;
+- logical controller identities and capacity budgets;
+- pinned controller engine revisions;
 - private network rules;
-- secret provisioning;
-- host inventory;
+- required secret names;
 - monitoring destinations;
 - maintenance windows.
 
-Deployment-local values must not be committed to this public repository.
+These secret-free values belong in a reviewed private schema-v3 configuration repository. Machine addresses, VM IDs, storage and backup identifiers, credentials, secret values, and rendered runtime files remain host-local or in an external secret manager. See [Git-authored controller desired state](DESIRED-STATE.md).
 
 ## Target runner lifecycle
 
@@ -127,7 +128,7 @@ The same fleet interface should support:
 
 - one Docker host with one or more runners;
 - several Docker hosts with one or more runners each;
-- Proxmox virtual machines;
+- virtual machines;
 - dedicated physical computers;
 - remote-site computers;
 - VPS infrastructure.
@@ -152,6 +153,7 @@ Host-wide pruning must not run as an uncoordinated per-job operation. Hard cance
 - Host security updates are applied automatically.
 - Reboots drain runner capacity before interrupting the host.
 - Fleet updates use rolling replacement and an explicit rollback version.
+- Controller routing, capacity, lifecycle, and engine updates use reviewed full commits from private desired-state configuration; hosts never follow an unreviewed moving branch.
 
 ## Project adoption
 

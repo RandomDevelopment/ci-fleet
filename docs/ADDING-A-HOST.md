@@ -1,6 +1,6 @@
 # How to add a fleet host
 
-Use this runbook to add a Proxmox VM, physical computer, remote-site machine, or VPS to an existing ci-fleet installation.
+Use this runbook to add a virtual machine, physical computer, remote-site machine, or VPS to an existing ci-fleet installation.
 
 ## Outcome
 
@@ -73,62 +73,41 @@ Before placing credentials on the host:
 
 A remote site needs outbound connectivity; it does not need project-specific inbound access. If one location is offline, compatible jobs remain queued for another available host.
 
-## 4. Install a pinned ci-fleet checkout
+## 4. Declare the host in private Git configuration
 
-Use a reviewed immutable commit:
+Create or update one schema-v3 controller entry in the organization's private configuration repository. Give it a unique logical ID and scale-set name, assign its shared runner pool, start with reviewed capacity, and pin a full ci-fleet engine commit.
 
-```bash
-sudo install -d -m 0755 /opt/ci-fleet
-# Populate /opt/ci-fleet from a reviewed ci-fleet commit.
-git -C /opt/ci-fleet rev-parse HEAD
-```
+Run that repository's strict validator before merge. Do not put the machine's address, VM ID, storage, backup identifier, or credential in Git.
 
-Do not follow a moving branch for unattended controller updates. Fleet image changes use reviewed rolling replacement and keep the previous version available for rollback.
+See [Git-authored controller desired state](DESIRED-STATE.md) for the complete contract.
 
-## 5. Create host-local configuration
+## 5. Prepare host-local identity
 
-Start from `deploy/ci-fleet.env.example`:
+From a reviewed ci-fleet checkout:
 
 ```bash
 sudo install -d -m 0700 /etc/ci-fleet/secrets
-sudo install -m 0600 deploy/ci-fleet.env.example /etc/ci-fleet/ci-fleet.env
+sudo install -m 0600 host/host.env.example /etc/ci-fleet/host.env
+sudo install -m 0600 /secure/source/github-app.pem /etc/ci-fleet/secrets/github-app.pem
 ```
 
-Set:
+Edit `/etc/ci-fleet/host.env` locally. Prefer a separately generated GitHub App private key per host so one location can be revoked without replacing every host key. Never expose the key to runner or project containers.
 
-- a unique `CI_FLEET_INSTANCE`;
-- a unique `CI_FLEET_SCALE_SET_NAME`;
-- the fleet's shared `CI_FLEET_LABELS`;
-- the shared `CI_FLEET_RUNNER_GROUP`;
-- host-specific maximum concurrency and runner CPU/memory limits;
-- `CI_FLEET_MIN_RUNNERS=0` so idle runners do not persist.
-
-Repository names do not belong in this file.
-
-Provision the GitHub App private key directly into `/etc/ci-fleet/secrets/github-app.pem` with mode `0600`. Prefer a separately generated App private key per host so one location can be revoked without replacing every host key. Never expose the key to runner or project containers.
-
-## 6. Validate before starting
+## 6. Install or adopt with one command
 
 ```bash
-cd /opt/ci-fleet
-set -a
-. /etc/ci-fleet/ci-fleet.env
-set +a
-scripts/preflight.sh
-docker compose -f deploy/compose.yaml build runner-image controller
-scripts/preflight.sh
+sudo ./scripts/install-worker-controller.sh \
+  --install \
+  --config-repo example-org/example-fleet-config \
+  --ref 1111111111111111111111111111111111111111 \
+  --controller example-ci-01
 ```
 
-Continue only when preflight reports `PREFLIGHT_OK warnings=0`.
+Use `--adopt` when converting an existing manual controller. The installer validates the complete configuration, renders host-local runtime state, installs the pinned engine, creates a controller checkpoint, builds images, installs maintenance timers, and verifies health.
 
-## 7. Start at zero and prove one job
+The configuration repository credential, when required, must be read-only and host-side. Credentials are never accepted in command arguments.
 
-Start with maximum concurrency one even if the host will eventually run more:
-
-```bash
-docker compose -f deploy/compose.yaml up -d --no-deps controller
-docker compose -f deploy/compose.yaml logs --tail=100 controller
-```
+## 7. Prove one job
 
 Confirm no runner exists while idle. Dispatch one manual, read-only job from an authorized private project and verify:
 
@@ -141,15 +120,15 @@ Confirm no runner exists while idle. Dispatch one manual, read-only job from an 
 
 Follow [Live pilot](LIVE-PILOT.md) for the complete proof and rollback.
 
-## 8. Enable unattended operations
+## 8. Verify unattended operations
 
-Install the health and cleanup timers from [Host maintenance](HOST-MAINTENANCE.md). Monitor controller state, disk thresholds, Docker health, last successful job, cleanup failures, and pending reboot state.
+The installer enables health, scoped cleanup, and pinned desired-state drift timers. Run each service once and inspect its journal as described in [Host maintenance](HOST-MAINTENANCE.md). Monitor controller state, disk thresholds, Docker health, last successful job, cleanup failures, drift, and pending reboot state.
 
 The steady-state host should need no project-specific edits. Adding a project changes its repository, private fleet configuration, and GitHub runner-group policy—not this host.
 
-## 9. Increase capacity safely
+## 9. Increase capacity safely through Git
 
-Raise `CI_FLEET_MAX_RUNNERS` only after measuring CPU, memory, disk, network, cache growth, collisions, cancellation, and cleanup. Keep explicit per-runner limits.
+Raise the controller's schema-v3 `max_runners` and its pool `capacity_budget` through a reviewed private configuration change only after measuring CPU, memory, disk, network, cache growth, collisions, cancellation, and cleanup. Keep explicit per-runner limits.
 
 Keep the one-runner pilot preflight unchanged. For any later increase, follow [Post-pilot capacity promotion](CAPACITY-PROMOTION.md), run `scripts/capacity-preflight.sh` before and after the controller-only recreation, and retain the new maximum only when the separately authorized workload and cleanup proof satisfy the predeclared resource policy.
 
@@ -157,12 +136,13 @@ Use another host or location when it improves failure tolerance. Give every adde
 
 ## 10. Drain, replace, or remove a host
 
-1. Stop new capacity by setting maximum capacity to zero or stopping the controller.
-2. Confirm no managed runner is active.
-3. Run cleanup in dry-run mode, review candidates, then apply scoped cleanup.
-4. Verify the host's unique scale set is absent from GitHub.
-5. Revoke that host's GitHub App private key.
-6. Securely delete host-local credentials.
-7. Remove or restore the machine according to the site's recovery policy.
+1. Merge a private configuration change setting the controller to `drained`.
+2. Apply that exact commit with `install-worker-controller.sh --upgrade`.
+3. Confirm zero managed runners and run scoped cleanup.
+4. Run `install-worker-controller.sh --uninstall` when the host will not return.
+5. Verify the host's unique scale set is absent from GitHub.
+6. Revoke that host's GitHub App private key and explicitly remove preserved credentials.
+7. Set the controller to `disabled` or remove it from private configuration.
+8. Delete or repurpose the machine according to the site's recovery policy.
 
 Other hosts and project workflows continue using the shared routing label. Replacing one host must not require editing any project workflow.
