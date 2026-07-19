@@ -172,6 +172,8 @@ validate_candidate_config_commit() {
   git -C "$config_source_checkout" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
   python3 "$repo_root/templates/config-repository/scripts/validate.py" \
     --config "$candidate_config" --strict --tree-paths "$tree_paths" || die 'configuration commit validation failed'
+  python3 "$repo_root/scripts/scan_committed_secrets.py" \
+    --repository "$config_source_checkout" --commit "$config_ref" || die 'configuration commit secret scan failed'
 }
 
 prepare_host_config() {
@@ -437,12 +439,22 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release status paused=false
+  local deadline count old_release status paused=false force_nonterminal=${1:-false}
   drain_error=
   status=$(controller_status)
   case "$status" in
     running|''|exited|created|dead) ;;
-    *) drain_error="cannot safely drain controller in non-terminal state: $status"; return 1 ;;
+    *)
+      if [[ "$force_nonterminal" != true ]]; then
+        drain_error="cannot safely drain controller in non-terminal state: $status"
+        return 1
+      fi
+      [[ -f "$rendered_env" ]] || { drain_error='cannot stop a non-terminal candidate without its rendered environment'; return 1; }
+      old_release=$(current_runtime_release)
+      [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
+      compose "$old_release" "$rendered_env" stop controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
+      status=
+      ;;
   esac
   if [[ "$status" == running ]]; then
     if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
@@ -564,7 +576,7 @@ restore_systemd_snapshot() {
 restore_checkpoint() {
   local target restored_state failed=0
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
-  if ! try_drain_current; then
+  if ! try_drain_current true; then
     note "ROLLBACK_FAILED reason=$drain_error"
     return 1
   fi
