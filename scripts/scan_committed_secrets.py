@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
@@ -27,9 +28,23 @@ assert PATTERN.search(b"AKIA" + b"A" * 16)
 assert PATTERN.search(b"mysql://fixture-user:fixture-password@example.invalid/database")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository", type=Path, default=ROOT)
+    parser.add_argument("--commit", help="immutable commit whose blobs should be scanned")
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
+    repository = args.repository.resolve()
+    if args.commit is not None and not re.fullmatch(r"[0-9a-f]{40}", args.commit):
+        print("--commit must be a full lowercase commit SHA", file=sys.stderr)
+        return 2
+    listing = ["git", "-C", str(repository)]
+    listing += ["ls-tree", "-rz", "--name-only", args.commit] if args.commit else ["ls-files", "-z"]
     tracked = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        listing,
         check=True,
         stdout=subprocess.PIPE,
     ).stdout.split(b"\0")
@@ -38,9 +53,16 @@ def main() -> int:
         if not raw:
             continue
         relative = raw.decode("utf-8")
-        if relative in EXCLUDED:
+        if args.commit is None and relative in EXCLUDED:
             continue
-        data = (ROOT / relative).read_bytes()
+        if args.commit is None:
+            data = (repository / relative).read_bytes()
+        else:
+            data = subprocess.run(
+                ["git", "-C", str(repository), "cat-file", "blob", f"{args.commit}:{relative}"],
+                check=True,
+                stdout=subprocess.PIPE,
+            ).stdout
         for match in PATTERN.finditer(data):
             line = data.count(b"\n", 0, match.start()) + 1
             findings.append(f"{relative}:{line}")

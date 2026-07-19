@@ -13,11 +13,16 @@ cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
 state=${FAKE_DOCKER_STATE:?}
+status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 case "${1:-}" in
   info) exit 0 ;;
   inspect)
     [[ -f "$state" ]] || exit 1
-    if [[ "$*" == *'.State.Status'* ]]; then printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; else printf 'running\n'; fi
+    if [[ "$*" == *'.State.Status'* ]]; then
+      if [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
+    else
+      printf 'running\n'
+    fi
     ;;
   ps)
     if [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
@@ -46,8 +51,14 @@ case "${1:-}" in
           exit 42
         fi
         : >"$state"
+        if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
+          rm -f "$FAKE_RESTART_AFTER_UP"
+          printf 'restarting\n' >"$status_file"
+        elif [[ -n "$status_file" ]]; then
+          rm -f "$status_file"
+        fi
         ;;
-      stop|down|rm) rm -f "$state" ;;
+      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file" ;;
       pause)
         [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
         ;;
@@ -79,6 +90,7 @@ chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
+export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
 export CI_FLEET_TESTING=1
 export CI_FLEET_DOCKER_GID_OVERRIDE=998
 export CI_FLEET_STARTUP_WAIT_SECONDS=0
@@ -148,11 +160,17 @@ git -C "$config_repo" add -f .env
 git -C "$config_repo" commit -q -m 'forbidden config path fixture'
 forbidden_ref=$(git -C "$config_repo" rev-parse HEAD)
 git -C "$config_repo" reset -q --hard "$ref_one"
+printf 'ghp_%020d\n' 0 >"$config_repo/README.md"
+git -C "$config_repo" add README.md
+git -C "$config_repo" commit -q -m 'forbidden config content fixture'
+secret_ref=$(git -C "$config_repo" rev-parse HEAD)
+git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
 expect_failure 'no controller checkpoint is available' "$installer" --rollback
 expect_failure 'secret-bearing files are forbidden' "$installer" --check "${base_args[@]}" --ref "$forbidden_ref"
+expect_failure 'possible committed secret detected' "$installer" --check "${base_args[@]}" --ref "$secret_ref"
 export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
 expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 unset FAKE_WRONG_HOST_CONFIG_OWNER
@@ -216,6 +234,12 @@ unset FAKE_FAIL_UP_ONCE
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'failed activation did not restore capacity one'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'failed activation did not restore the prior manager release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'failed activation did not restore the prior controller runtime'
+export FAKE_RESTART_AFTER_UP=$tmp/restart-after-up
+: >"$FAKE_RESTART_AFTER_UP"
+expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
+unset FAKE_RESTART_AFTER_UP
+[[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'restarting candidate blocked checkpoint restoration'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'restarting candidate rollback did not restore capacity one'
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >/dev/null
 grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade did not apply capacity two'
 
