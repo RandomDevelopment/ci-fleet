@@ -415,33 +415,40 @@ build_candidate() {
 }
 
 make_checkpoint() {
-  local timestamp target unit timer
+  local timestamp target unit timer final_checkpoint staged_checkpoint
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-  checkpoint_dir=$checkpoints_dir/${timestamp}-$$
-  install -d -m 0700 "$checkpoint_dir" "$checkpoint_dir/systemd"
+  final_checkpoint=$checkpoints_dir/${timestamp}-$$
+  install -d -m 0700 "$checkpoints_dir"
+  staged_checkpoint=$(mktemp -d "$checkpoints_dir/.checkpoint.staging.XXXXXX")
+  staging_paths+=("$staged_checkpoint")
+  checkpoint_dir=$staged_checkpoint
+  install -d -m 0700 "$checkpoint_dir/systemd"
   [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   target=$(current_runtime_release)
   if [[ -n "$target" ]]; then
-    printf '%s\n' "$target" >"$temporary/release-target"
-    install -m 0600 "$temporary/release-target" "$checkpoint_dir/release-target"
+    printf '%s\n' "$target" >"$checkpoint_dir/release-target"
+    chmod 0600 "$checkpoint_dir/release-target"
   fi
   if [[ -L "$manager_current" ]]; then
     target=$(readlink -f "$manager_current")
-    printf '%s\n' "$target" >"$temporary/manager-target"
-    install -m 0600 "$temporary/manager-target" "$checkpoint_dir/manager-target"
+    printf '%s\n' "$target" >"$checkpoint_dir/manager-target"
+    chmod 0600 "$checkpoint_dir/manager-target"
   fi
   for unit in "${unit_names[@]}"; do
     [[ ! -f "$systemd_dir/$unit" ]] || install -m 0644 "$systemd_dir/$unit" "$checkpoint_dir/systemd/$unit"
   done
-  : >"$temporary/enabled-timers"
-  : >"$temporary/active-timers"
+  : >"$checkpoint_dir/enabled-timers"
+  : >"$checkpoint_dir/active-timers"
   for timer in "${timer_names[@]}"; do
-    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$temporary/enabled-timers"; fi
-    if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$temporary/active-timers"; fi
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/enabled-timers"; fi
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/active-timers"; fi
   done
-  install -m 0600 "$temporary/enabled-timers" "$checkpoint_dir/enabled-timers"
-  install -m 0600 "$temporary/active-timers" "$checkpoint_dir/active-timers"
+  chmod 0600 "$checkpoint_dir/enabled-timers" "$checkpoint_dir/active-timers"
+  : >"$checkpoint_dir/.complete"
+  chmod 0600 "$checkpoint_dir/.complete"
+  mv "$checkpoint_dir" "$final_checkpoint"
+  checkpoint_dir=$final_checkpoint
   note "CHECKPOINT_CREATED path=$checkpoint_dir"
 }
 
@@ -518,7 +525,6 @@ install_systemd_units() {
   install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
   systemctl daemon-reload
-  systemctl enable --now "${timer_names[@]}" >/dev/null
 }
 
 remove_systemd_units() {
@@ -565,6 +571,7 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
 PY
   chmod 0600 "$staged_state"
   mv -f "$staged_state" "$state_file"
+  systemctl enable --now "${timer_names[@]}" >/dev/null
 }
 
 restore_systemd_snapshot() {
@@ -702,13 +709,12 @@ perform_converge() {
 
 latest_checkpoint() {
   [[ -d "$checkpoints_dir" ]] || return 0
-  { find "$checkpoints_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null || true; } | sort -nr | awk 'NR == 1 {print $2}'
+  { find "$checkpoints_dir" -mindepth 2 -maxdepth 2 -type f -name .complete -printf '%T@ %h\n' 2>/dev/null || true; } | sort -nr | awk 'NR == 1 {print $2}'
 }
 
 perform_rollback() {
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
-  drain_current
   restore_checkpoint || die 'checkpoint restoration failed'
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
 }
