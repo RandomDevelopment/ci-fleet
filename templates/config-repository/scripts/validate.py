@@ -278,6 +278,13 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 
+    for pool_name, pool in pools.items():
+        labels = pool.get("routing_labels") if isinstance(pool, dict) else None
+        if isinstance(labels, list):
+            for index, label in enumerate(labels):
+                if isinstance(label, str):
+                    validation.require(label not in scale_sets, f"$.runner_pools.{pool_name}.routing_labels[{index}]", "must not equal a controller scale-set name")
+
     for name, reserved in reserved_capacity.items():
         budget = pool_capacity.get(name)
         if budget is not None:
