@@ -357,7 +357,7 @@ run_candidate_preflight() {
     # shellcheck disable=SC1090
     . "$candidate_env"
     set +a
-    CI_FLEET_TESTING=$testing "$repo_root/scripts/preflight.sh" --managed
+    CI_FLEET_TESTING=$testing "$release_dir/scripts/preflight.sh" --managed
   )
 }
 
@@ -476,7 +476,7 @@ activate_candidate() {
       # shellcheck disable=SC1090
       . "$rendered_env"
       set +a
-      "$repo_root/scripts/healthcheck.sh"
+      "$release_dir/scripts/healthcheck.sh"
     ); then
       die 'post-activation health check failed'
     fi
