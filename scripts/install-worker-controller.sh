@@ -12,6 +12,7 @@ root_prefix=${CI_FLEET_ROOT_PREFIX:-}
 testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
 checkpoint_dir=
+staging_paths=()
 
 usage() {
   cat >&2 <<'EOF'
@@ -112,7 +113,13 @@ unit_names=(
 timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
 
 temporary=$(mktemp -d)
-cleanup_temporary() { rm -rf "$temporary"; }
+cleanup_temporary() {
+  local path
+  rm -rf "$temporary"
+  for path in "${staging_paths[@]}"; do
+    [[ -z "$path" ]] || rm -rf -- "$path"
+  done
+}
 trap cleanup_temporary EXIT
 
 require_commands() {
@@ -176,14 +183,16 @@ prepare_host_config() {
 
 verify_host_files() {
   local mode_bits owner expected_owner key_file
+  expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   mode_bits=$(stat -c '%a' "$effective_host_config")
+  owner=$(stat -c '%u' "$effective_host_config")
   [[ "$mode_bits" == 600 ]] || die "host configuration must have mode 0600: $effective_host_config"
+  [[ "$owner" == "$expected_owner" ]] || die 'host configuration must be owned by root'
   key_file=$(awk -F= '$1 == "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE" {print substr($0, index($0, "=") + 1)}' "$effective_host_config")
   [[ -n "$key_file" && -f "$key_file" ]] || die 'GitHub App PEM file is missing'
   mode_bits=$(stat -c '%a' "$key_file")
   owner=$(stat -c '%u' "$key_file")
-  expected_owner=0
-  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   [[ "$mode_bits" == 600 && "$owner" == "$expected_owner" ]] || die 'GitHub App PEM must be owned by root and have mode 0600'
 }
 
@@ -270,12 +279,22 @@ PY
 }
 
 release_matches() {
+  local marker
+  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" ]] || return 1
+  marker=$(<"$release_dir/.ci-fleet-engine-ref")
+  [[ "$marker" == "$engine_ref" ]] || return 1
   [[ -L "$current_link" ]] || return 1
   [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
 }
 
 systemd_matches() {
+  local expected_manager marker
+  expected_manager=$manager_releases/$engine_ref
+  [[ -d "$expected_manager" && -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
+  marker=$(<"$expected_manager/.ci-fleet-engine-ref")
+  [[ "$marker" == "$engine_ref" ]] || return 1
   [[ -L "$manager_current" ]] || return 1
+  [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   [[ -f "$systemd_dir/ci-fleet-health.service" && -f "$systemd_dir/ci-fleet-cleanup.service" && -f "$systemd_dir/ci-fleet-drift.service" ]] || return 1
   systemctl is-enabled --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer || return 1
   systemctl is-active --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer
@@ -316,8 +335,9 @@ install_release() {
     [[ "$resolved" == "$engine_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
     git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD
   fi
-  staged_release=$temporary/engine-release
-  install -d -m 0755 "$staged_release"
+  staged_release=$(mktemp -d "$releases_dir/.${engine_ref}.staging.XXXXXX")
+  staging_paths+=("$staged_release")
+  chmod 0755 "$staged_release"
   tar -xf "$archive" -C "$staged_release"
   printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
@@ -336,8 +356,9 @@ install_manager() {
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     tar -cf "$archive" -C "$release_dir" .
-    staged_manager=$temporary/manager-release
-    install -d -m 0755 "$staged_manager"
+    staged_manager=$(mktemp -d "$manager_releases/.${manager_commit}.staging.XXXXXX")
+    staging_paths+=("$staged_manager")
+    chmod 0755 "$staged_manager"
     tar -xf "$archive" -C "$staged_manager"
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"

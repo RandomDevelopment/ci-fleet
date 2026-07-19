@@ -98,6 +98,9 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     ttl = values.get("CI_FLEET_RUNNER_TTL", "6h")
     if not SAFE_DURATION.fullmatch(ttl):
         raise DesiredStateError("runner TTL must be a positive duration ending in s, m, or h")
+    multiplier = {"s": 1, "m": 60, "h": 3600}[ttl[-1]]
+    if int(ttl[:-1]) * multiplier < 3600:
+        raise DesiredStateError("runner TTL must be at least one hour")
     return {
         "CI_FLEET_GITHUB_APP_CLIENT_ID": client_id,
         "CI_FLEET_GITHUB_APP_INSTALLATION_ID": installation_id,

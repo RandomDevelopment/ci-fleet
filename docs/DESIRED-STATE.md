@@ -56,7 +56,7 @@ sudo install -m 0600 host/host.env.example /etc/ci-fleet/host.env
 sudo install -m 0600 /secure/source/github-app.pem /etc/ci-fleet/secrets/github-app.pem
 ```
 
-Edit `/etc/ci-fleet/host.env` locally. It contains only the GitHub App client ID, installation ID, private-key path, and runner TTL. It is never committed. The PEM remains separate and is never printed by the installer.
+Edit `/etc/ci-fleet/host.env` locally. It contains only the GitHub App client ID, installation ID, private-key path, and runner TTL. Both the host environment and PEM must be root-owned mode `0600`, and the TTL must be at least one hour. Neither file is committed, and the PEM is never printed by the installer.
 
 GitHub App and runner-group creation remain the bootstrap responsibility tracked by [issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27). The installer fails closed when those prerequisites are absent.
 
@@ -132,7 +132,7 @@ No mode uses global Docker prune or removes unrelated workloads.
 
 ## Drift and reviewed updates
 
-`ci-fleet-drift.timer` checks the host every fifteen minutes against the exact configuration SHA recorded at installation. It detects host edits, missing releases, runtime-state mismatch, altered metadata, and missing maintenance timers without applying changes.
+`ci-fleet-drift.timer` checks the host every fifteen minutes against the exact configuration SHA recorded at installation. It detects host edits, missing or stale runtime and installer-manager releases, runtime-state mismatch, altered metadata, and missing maintenance timers without applying changes.
 
 The host does not automatically follow or execute a moving branch. A new configuration becomes effective only when an operator or authorized external controller supplies its reviewed full commit SHA to `--upgrade`. Automatic dispatchers may watch a protected branch and invoke that exact command after merge, using read-only repository contents permission; their identity must remain host-side and unavailable to job runners.
 
@@ -149,7 +149,7 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Build and validation happen before the active release changes. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local `flock` prevents overlapping installer and drift-check processes.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Build and validation happen before the active release changes. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
 
 These controller checkpoints do not replace machine backups. Operators still create and verify VM snapshots, physical-host recovery media, or equivalent infrastructure backups according to their local policy.
 

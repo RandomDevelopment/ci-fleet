@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -154,12 +156,20 @@ def main() -> int:
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-    subprocess.run(
-        [str(ROOT / "scripts" / "validate.sh"), "--strict", "--skip-path-scan", "--config", str(output)],
-        check=True,
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent, text=True)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(config, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        subprocess.run(
+            [str(ROOT / "scripts" / "validate.sh"), "--strict", "--skip-path-scan", "--config", str(temporary)],
+            check=True,
+        )
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
     print("Next: review controller capacity, configure GitHub policy, and keep every secret value outside Git.")
     return 0

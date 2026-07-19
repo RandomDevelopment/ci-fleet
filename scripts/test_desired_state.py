@@ -126,6 +126,12 @@ class DesiredStateTests(unittest.TestCase):
         with self.assertRaisesRegex(DesiredStateError, "absolute shell-safe"):
             validate_host_values(values)
 
+    def test_host_values_reject_sub_hour_ttl(self) -> None:
+        values = copy.deepcopy(host_values())
+        values["CI_FLEET_RUNNER_TTL"] = "30m"
+        with self.assertRaisesRegex(DesiredStateError, "at least one hour"):
+            validate_host_values(values)
+
     def test_shell_metacharacter_in_config_identity_is_rejected(self) -> None:
         with self.assertRaisesRegex(DesiredStateError, "must be shell-safe"):
             build_rendered_env(

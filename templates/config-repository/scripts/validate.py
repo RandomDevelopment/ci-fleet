@@ -254,6 +254,8 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(isinstance(location, str) and bool(SLUG.fullmatch(location)), f"{path}.location", "must be a logical location slug, never an address")
         validation.require(state in {"active", "drained", "disabled"}, f"{path}.state", "must be active, drained, or disabled")
         validation.require(isinstance(scale_set, str) and bool(SLUG.fullmatch(scale_set)), f"{path}.scale_set_name", "must be a lowercase scale-set slug")
+        if isinstance(scale_set, str) and isinstance(name, str):
+            validation.require(name in scale_set, f"{path}.scale_set_name", "must include the controller ID required by managed preflight")
         if isinstance(scale_set, str):
             if scale_set in scale_sets:
                 validation.errors.append(f"{path}.scale_set_name: must be unique; also used by {scale_sets[scale_set]}")
