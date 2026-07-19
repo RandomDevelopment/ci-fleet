@@ -137,10 +137,10 @@ resolve_config() {
   local resolved checkout
   candidate_config=$temporary/fleet.json
   if is_git_checkout "$config_repo"; then
-    resolved=$(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
+    config_identity=$(cd "$config_repo" && pwd -P)
+    resolved=$(git -C "$config_identity" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
     [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
-    git -C "$config_repo" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
-    config_identity=$(git -C "$config_repo" rev-parse --show-toplevel)
+    git -C "$config_identity" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
     return
   fi
   [[ "$config_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-repo must be OWNER/REPOSITORY or a local Git checkout'
@@ -357,7 +357,7 @@ run_candidate_preflight() {
     # shellcheck disable=SC1090
     . "$candidate_env"
     set +a
-    CI_FLEET_TESTING=$testing "$release_dir/scripts/preflight.sh" --managed
+    CI_FLEET_TESTING=$testing "$repo_root/scripts/preflight.sh" --managed
   )
 }
 
@@ -476,7 +476,7 @@ activate_candidate() {
       # shellcheck disable=SC1090
       . "$rendered_env"
       set +a
-      "$release_dir/scripts/healthcheck.sh"
+      "$repo_root/scripts/healthcheck.sh"
     ); then
       die 'post-activation health check failed'
     fi
