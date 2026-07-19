@@ -6,6 +6,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
+export REAL_STAT
+REAL_STAT=$(command -v stat)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -56,7 +58,16 @@ cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod 700 "$fake_bin/docker" "$fake_bin/systemctl"
+
+cat >"$fake_bin/stat" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_WRONG_HOST_CONFIG_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$FAKE_WRONG_HOST_CONFIG_OWNER" ]]; then
+  printf '99999\n'
+  exit 0
+fi
+exec "$REAL_STAT" "$@"
+EOF
+chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
@@ -124,6 +135,10 @@ ref_one=$(write_config active 1 1)
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
+export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
+expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+unset FAKE_WRONG_HOST_CONFIG_OWNER
+
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
@@ -133,6 +148,11 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+
+active_release=$(readlink -f "$root/opt/ci-fleet/current")
+mv "$active_release" "$active_release.saved"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+mv "$active_release.saved" "$active_release"
 
 relative=$(cd "$tmp" && expect_success "$installer" --install --config-repo config-repo --controller example-ci-01 --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$relative" || fail 'relative configuration path was not normalized before drift comparison'
@@ -145,6 +165,7 @@ expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/n
 prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
 cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
 ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
 ref_two=$(write_config active 2 2)
 export FAKE_RUNNER_STATE=$tmp/managed-runner-active

@@ -83,6 +83,11 @@ class PolicyTests(unittest.TestCase):
         config["runner_pools"]["trusted-ci"]["capacity_budget"] = 2
         self.assert_rejected(config, "scale_set_name: must be unique")
 
+    def test_scale_set_must_include_controller_id(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["scale_set_name"] = "other-scale"
+        self.assert_rejected(config, "must include the controller ID")
+
     def test_controller_pool_must_exist(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["pool"] = "missing-pool"
