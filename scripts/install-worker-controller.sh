@@ -241,8 +241,10 @@ controller_status() {
 }
 
 current_runtime_release() {
+  local target
   if [[ -L "$current_link" ]]; then
-    readlink -f "$current_link"
+    target=$(readlink -f "$current_link" 2>/dev/null || true)
+    [[ -z "$target" ]] || printf '%s' "$target"
   elif [[ -f "$install_root/deploy/compose.yaml" ]]; then
     printf '%s' "$install_root"
   fi
@@ -278,7 +280,7 @@ PY
 
 release_matches() {
   local marker
-  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" ]] || return 1
+  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/cleanup.sh" ]] || return 1
   marker=$(<"$release_dir/.ci-fleet-engine-ref")
   [[ "$marker" == "$engine_ref" ]] || return 1
   [[ -L "$current_link" ]] || return 1
@@ -289,6 +291,7 @@ systemd_matches() {
   local expected_manager marker unit
   expected_manager=$manager_releases/$engine_ref
   [[ -d "$expected_manager" && -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
+  [[ -x "$expected_manager/scripts/healthcheck.sh" && -x "$expected_manager/scripts/check-installed-state.sh" ]] || return 1
   marker=$(<"$expected_manager/.ci-fleet-engine-ref")
   [[ "$marker" == "$engine_ref" ]] || return 1
   [[ -L "$manager_current" ]] || return 1
@@ -319,7 +322,7 @@ drift_count() {
 install_release() {
   local archive marker_commit checkout resolved staged_release
   if [[ -d "$release_dir" ]]; then
-    [[ -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/preflight.sh" && -x "$release_dir/scripts/healthcheck.sh" ]] || die "existing release is incomplete: $release_dir"
+    [[ -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/preflight.sh" && -x "$release_dir/scripts/healthcheck.sh" && -x "$release_dir/scripts/cleanup.sh" ]] || die "existing release is incomplete: $release_dir"
     marker_commit=$(<"$release_dir/.ci-fleet-engine-ref")
     [[ "$marker_commit" == "$engine_ref" ]] || die "existing release marker does not match $engine_ref"
     return
@@ -367,7 +370,7 @@ install_manager() {
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
     mv "$staged_manager" "$manager_release"
   else
-    [[ -f "$manager_release/.ci-fleet-engine-ref" && -x "$manager_release/scripts/install-worker-controller.sh" ]] || die 'existing installer manager release is incomplete'
+    [[ -f "$manager_release/.ci-fleet-engine-ref" && -x "$manager_release/scripts/install-worker-controller.sh" && -x "$manager_release/scripts/healthcheck.sh" && -x "$manager_release/scripts/check-installed-state.sh" ]] || die 'existing installer manager release is incomplete'
     marker=$(<"$manager_release/.ci-fleet-engine-ref")
     [[ "$marker" == "$manager_commit" ]] || die 'existing installer manager marker is inconsistent'
   fi
@@ -427,6 +430,10 @@ try_drain_current() {
   local deadline count old_release status paused=false
   drain_error=
   status=$(controller_status)
+  case "$status" in
+    running|''|exited|created|dead) ;;
+    *) drain_error="cannot safely drain controller in non-terminal state: $status"; return 1 ;;
+  esac
   if [[ "$status" == running ]]; then
     if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
     old_release=$(current_runtime_release)
@@ -660,7 +667,8 @@ perform_converge() {
 }
 
 latest_checkpoint() {
-  find "$checkpoints_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 {print $2}'
+  [[ -d "$checkpoints_dir" ]] || return 0
+  { find "$checkpoints_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null || true; } | sort -nr | awk 'NR == 1 {print $2}'
 }
 
 perform_rollback() {
@@ -673,7 +681,7 @@ perform_rollback() {
 
 perform_uninstall() {
   local old_release=
-  [[ ! -L "$current_link" ]] || old_release=$(readlink -f "$current_link")
+  old_release=$(current_runtime_release)
   make_checkpoint
   transaction_active=true
   drain_current

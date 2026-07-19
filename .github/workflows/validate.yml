@@ -42,6 +42,14 @@ jobs:
           if templates/config-repository/scripts/init.sh \
             --organization test-company \
             --project test-app \
+            --output "${temporary_directory}/missing-engine.json"; then
+            echo 'initializer accepted a missing engine revision' >&2
+            exit 1
+          fi
+          test ! -e "${temporary_directory}/missing-engine.json"
+          if templates/config-repository/scripts/init.sh \
+            --organization test-company \
+            --project test-app \
             --registry BAD \
             --engine-ref "$(git rev-parse HEAD)" \
             --output "${temporary_directory}/invalid.json"; then

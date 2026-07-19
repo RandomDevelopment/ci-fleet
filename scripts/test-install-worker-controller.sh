@@ -17,7 +17,7 @@ case "${1:-}" in
   info) exit 0 ;;
   inspect)
     [[ -f "$state" ]] || exit 1
-    if [[ "$*" == *'.State.Status'* ]]; then printf 'running\n'; else printf 'running\n'; fi
+    if [[ "$*" == *'.State.Status'* ]]; then printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; else printf 'running\n'; fi
     ;;
   ps)
     if [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
@@ -143,6 +143,7 @@ ref_one=$(write_config active 1 1)
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
+expect_failure 'no controller checkpoint is available' "$installer" --rollback
 export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
 expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 unset FAKE_WRONG_HOST_CONFIG_OWNER
@@ -159,6 +160,10 @@ export FAKE_DISABLED_TIMER=ci-fleet-cleanup.timer
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 unset FAKE_DISABLED_TIMER
 
+export FAKE_CONTROLLER_STATUS=restarting
+expect_failure 'cannot safely drain controller in non-terminal state: restarting' "$installer" --uninstall
+unset FAKE_CONTROLLER_STATUS
+
 mv "$host_config" "$host_config.missing"
 expect_failure 'host-local GitHub App configuration is missing' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 mv "$host_config.missing" "$host_config"
@@ -168,6 +173,9 @@ grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 active_release=$(readlink -f "$root/opt/ci-fleet/current")
+mv "$active_release/scripts/cleanup.sh" "$active_release/scripts/cleanup.sh.missing"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+mv "$active_release/scripts/cleanup.sh.missing" "$active_release/scripts/cleanup.sh"
 mv "$active_release" "$active_release.saved"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 mv "$active_release.saved" "$active_release"
