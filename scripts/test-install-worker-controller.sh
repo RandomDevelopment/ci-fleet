@@ -14,12 +14,15 @@ cat >"$fake_bin/docker" <<'EOF'
 set -u
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
+paused_state=${FAKE_PAUSED_STATE:-}
 case "${1:-}" in
   info) exit 0 ;;
   inspect)
     [[ -f "$state" ]] || exit 1
     if [[ "$*" == *'.State.Status'* ]]; then
       if [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
+    elif [[ "$*" == *'.State.Paused'* ]]; then
+      if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'true\n'; else printf 'false\n'; fi
     else
       printf 'running\n'
     fi
@@ -40,6 +43,7 @@ case "${1:-}" in
     ;;
   compose)
     if [[ "${2:-}" == version ]]; then exit 0; fi
+    [[ -z "${COMPOSE_PROJECT_NAME:-}" && -z "${CI_FLEET_MAX_RUNNERS:-}" ]] || exit 44
     command=
     for argument in "$@"; do
       case "$argument" in config|build|up|stop|pause|unpause|kill|down|logs|rm) command=$argument ;; esac
@@ -58,11 +62,20 @@ case "${1:-}" in
           rm -f "$status_file"
         fi
         ;;
-      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file" ;;
+      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state" ;;
       pause)
+        [[ -z "$paused_state" ]] || : >"$paused_state"
         [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
         ;;
-      config|build|unpause|kill|logs) ;;
+      unpause) [[ -z "$paused_state" ]] || rm -f "$paused_state" ;;
+      kill)
+        if [[ -n "${FAKE_FAIL_KILL_ONCE:-}" && -f "$FAKE_FAIL_KILL_ONCE" ]]; then
+          rm -f "$FAKE_FAIL_KILL_ONCE"
+          exit 43
+        fi
+        [[ -z "$paused_state" ]] || rm -f "$paused_state"
+        ;;
+      config|build|logs) ;;
       *) exit 1 ;;
     esac
     ;;
@@ -91,10 +104,13 @@ chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
+export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
 export CI_FLEET_TESTING=1
 export CI_FLEET_DOCKER_GID_OVERRIDE=998
 export CI_FLEET_STARTUP_WAIT_SECONDS=0
 export CI_FLEET_DRAIN_TIMEOUT_SECONDS=2
+export COMPOSE_PROJECT_NAME=caller-controlled-project
+export CI_FLEET_MAX_RUNNERS=999
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 expect_success() {
@@ -223,6 +239,11 @@ ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
 ref_two=$(write_config active 2 2)
+export FAKE_FAIL_KILL_ONCE=$tmp/fail-kill-once
+: >"$FAKE_FAIL_KILL_ONCE"
+expect_failure 'failed to signal the paused controller' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
+unset FAKE_FAIL_KILL_ONCE
+[[ ! -f "$FAKE_PAUSED_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'failed drain left the prior controller paused'
 export FAKE_RUNNER_STATE=$tmp/managed-runner-active
 : >"$FAKE_RUNNER_STATE"
 export FAKE_FAIL_UP_ONCE=$tmp/fail-up-once

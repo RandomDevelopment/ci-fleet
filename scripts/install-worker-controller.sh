@@ -243,9 +243,16 @@ PY
 }
 
 compose() {
-  local release=$1 env=$2
+  local release=$1 env_file=$2 variable
+  local -a clean_environment=(env -i "PATH=$PATH" "HOME=${HOME:-/root}")
   shift 2
-  docker compose --env-file "$env" -f "$release/deploy/compose.yaml" "$@"
+  for variable in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG XDG_RUNTIME_DIR; do
+    [[ ! -v $variable ]] || clean_environment+=("$variable=${!variable}")
+  done
+  if [[ "$testing" == 1 ]]; then
+    for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done
+  fi
+  "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
 }
 
 controller_status() {
@@ -479,17 +486,18 @@ try_drain_current() {
     note 'DRAIN_OK managed_runners=0'
     return 0
   fi
-  docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" kill --signal SIGTERM controller >/dev/null || {
+  compose "$old_release" "$rendered_env" kill --signal SIGTERM controller >/dev/null || {
+    compose "$old_release" "$rendered_env" unpause controller >/dev/null 2>&1 || true
     drain_error='failed to signal the paused controller for graceful scale-set cleanup'
     return 1
   }
   if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
-    docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" unpause controller >/dev/null || {
+    compose "$old_release" "$rendered_env" unpause controller >/dev/null || {
       drain_error='failed to unpause the signaled controller for graceful shutdown'
       return 1
     }
   fi
-  docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" stop controller >/dev/null || {
+  compose "$old_release" "$rendered_env" stop controller >/dev/null || {
     drain_error='could not stop the drained controller'
     return 1
   }
