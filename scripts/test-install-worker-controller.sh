@@ -85,6 +85,9 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
+  exit 98
+fi
 if [[ -n "${FAKE_DISABLED_TIMER:-}" && ( "${1:-}" == is-enabled || "${1:-}" == is-active ) && $# == 3 && "${3:-}" == "$FAKE_DISABLED_TIMER" ]]; then
   exit 1
 fi
@@ -264,7 +267,10 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'res
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >/dev/null
 grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade did not apply capacity two'
 
+mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
+printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 expect_success "$installer" --rollback >/dev/null
+[[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
 
 ref_three=$(write_config drained 2 2)
