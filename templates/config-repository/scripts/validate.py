@@ -152,6 +152,27 @@ def scan_forbidden_paths(repo_root: Path, validation: Validation) -> None:
             validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
 
 
+def scan_tree_path_list(path_list: Path, validation: Validation) -> None:
+    try:
+        raw_paths = path_list.read_bytes().split(b"\0")
+    except OSError as error:
+        validation.errors.append(f"{path_list}: cannot read tree path list: {error}")
+        return
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        try:
+            relative_text = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            validation.errors.append("repository tree contains a non-UTF-8 path")
+            continue
+        parts = Path(relative_text).parts
+        if any(part.lower() in FORBIDDEN_DIRECTORIES for part in parts[:-1]):
+            validation.errors.append(f"{relative_text}: secret-bearing directory names are forbidden")
+        elif FORBIDDEN_FILENAMES.search(relative_text):
+            validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
+
+
 def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     required_top = {
         "schema_version",
@@ -378,6 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
+    parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
     return parser.parse_args()
 
 
@@ -391,7 +413,9 @@ def main() -> int:
     if config is not None:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
-    if not args.skip_path_scan:
+    if args.tree_paths is not None:
+        scan_tree_path_list(args.tree_paths, validation)
+    elif not args.skip_path_scan:
         scan_forbidden_paths(ROOT, validation)
 
     if validation.errors:

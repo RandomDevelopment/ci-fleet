@@ -18,9 +18,13 @@ EXCLUDED = {
 PATTERN = re.compile(
     rb"BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|"
     rb"github_pat_[A-Za-z0-9_]{20,}|"
-    rb"gh[opusr]_[A-Za-z0-9]{20,}"
+    rb"gh[opusr]_[A-Za-z0-9]{20,}|"
+    rb"AKIA[0-9A-Z]{16}|"
+    rb"(?:postgres|mysql|mongodb(?:\+srv)?|redis)://[^\s/:]+:[^\s/@]+@"
 )
 assert all(PATTERN.search(prefix + b"x" * 20) for prefix in (b"gho_", b"ghp_", b"ghr_", b"ghs_", b"ghu_"))
+assert PATTERN.search(b"AKIA" + b"A" * 16)
+assert PATTERN.search(b"mysql://fixture-user:fixture-password@example.invalid/database")
 
 
 def main() -> int:

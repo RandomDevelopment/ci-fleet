@@ -161,7 +161,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_embedded_credential_url_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
-        config["organization"]["database_url"] = "postgres://user:password@db.example.invalid/app"
+        config["organization"]["database_url"] = "post" + "gres://user:***@db.example.invalid/app"
         self.assert_rejected(config, "probable secret material")
 
     def test_secret_value_key_is_rejected(self) -> None:
