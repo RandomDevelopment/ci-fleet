@@ -8,6 +8,7 @@ config_repo=
 config_ref=
 controller_id=
 host_config_arg=
+config_source_checkout=
 root_prefix=${CI_FLEET_ROOT_PREFIX:-}
 testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
@@ -124,7 +125,7 @@ trap cleanup_temporary EXIT
 
 require_commands() {
   local command
-  for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock; do
+  for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock mktemp; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
@@ -146,6 +147,7 @@ resolve_config() {
   candidate_config=$temporary/fleet.json
   if is_git_checkout "$config_repo"; then
     config_identity=$(cd "$config_repo" && pwd -P)
+    config_source_checkout=$config_identity
     resolved=$(git -C "$config_identity" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
     [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
     git -C "$config_identity" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
@@ -153,15 +155,23 @@ resolve_config() {
   fi
   [[ "$config_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-repo must be OWNER/REPOSITORY or a local Git checkout'
   checkout=$temporary/config-repository
+  config_source_checkout=$checkout
   git init -q "$checkout"
   git -C "$checkout" remote add origin "https://github.com/${config_repo}.git"
-  if ! GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$config_ref"; then
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --filter=blob:none --depth=1 origin "$config_ref"; then
     die 'configuration fetch failed; configure a read-only credential on this host or use a local pinned checkout'
   fi
   resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
   [[ "$resolved" == "$config_ref" ]] || die 'fetched configuration commit does not match --ref'
   git -C "$checkout" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
   config_identity=$config_repo
+}
+
+validate_candidate_config_commit() {
+  local tree_paths=$temporary/config-tree-paths
+  git -C "$config_source_checkout" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
+  python3 "$repo_root/templates/config-repository/scripts/validate.py" \
+    --config "$candidate_config" --strict --tree-paths "$tree_paths" || die 'configuration commit validation failed'
 }
 
 prepare_host_config() {
@@ -499,6 +509,7 @@ remove_systemd_units() {
 }
 
 activate_candidate() {
+  local staged_state
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
   install -m 0600 "$candidate_env" "$rendered_env"
   ln -sfn "$release_dir" "$temporary/current"
@@ -521,7 +532,9 @@ activate_candidate() {
   else
     compose "$release_dir" "$rendered_env" stop controller >/dev/null 2>&1 || true
   fi
-  python3 - "$candidate_metadata" "$temporary/install-state.json" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+  staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
+  staging_paths+=("$staged_state")
+  python3 - "$candidate_metadata" "$staged_state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
 import json
 import sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -530,7 +543,8 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
-  install -m 0600 "$temporary/install-state.json" "$state_file"
+  chmod 0600 "$staged_state"
+  mv -f "$staged_state" "$state_file"
 }
 
 restore_systemd_snapshot() {
@@ -710,6 +724,7 @@ case "$mode" in
   check|install|adopt|upgrade)
     validate_common_arguments
     resolve_config
+    validate_candidate_config_commit
     prepare_host_config
     verify_host_files
     render_candidate

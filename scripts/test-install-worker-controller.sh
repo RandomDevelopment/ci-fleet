@@ -110,6 +110,9 @@ import json
 import sys
 source, target, engine_ref, state, maximum, budget = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
+value["organization"]["slug"] = "fixture-org"
+value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
+value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
 controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
@@ -140,10 +143,16 @@ printf '%s\n' \
 chmod 600 "$host_config"
 
 ref_one=$(write_config active 1 1)
+printf 'fixture only\n' >"$config_repo/.env"
+git -C "$config_repo" add -f .env
+git -C "$config_repo" commit -q -m 'forbidden config path fixture'
+forbidden_ref=$(git -C "$config_repo" rev-parse HEAD)
+git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
 expect_failure 'no controller checkpoint is available' "$installer" --rollback
+expect_failure 'secret-bearing files are forbidden' "$installer" --check "${base_args[@]}" --ref "$forbidden_ref"
 export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
 expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 unset FAKE_WRONG_HOST_CONFIG_OWNER
