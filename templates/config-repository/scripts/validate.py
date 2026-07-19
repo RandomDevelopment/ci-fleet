@@ -176,6 +176,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(isinstance(slug, str) and bool(ORG_SLUG.fullmatch(slug)), "$.organization.slug", "must be a lowercase GitHub organization slug")
         validation.require(isinstance(registry, str) and bool(IMAGE.fullmatch(registry)), "$.organization.registry", "must be a registry namespace such as ghcr.io/acme")
         validation.require(isinstance(engine, str) and bool(REPOSITORY.fullmatch(engine)), "$.organization.delivery_engine", "must be an owner/repository name")
+        validation.require(engine == "RandomDevelopment/ci-fleet", "$.organization.delivery_engine", "must use the fixed reviewed public engine repository")
         validation.require(organization.get("workflow_ref_policy") == "immutable-commit", "$.organization.workflow_ref_policy", "must equal immutable-commit")
         if strict:
             validation.require(slug != "example-org", "$.organization.slug", "replace the example organization before use")
@@ -250,7 +251,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         engine_ref = controller.get("engine_ref")
         minimum = controller.get("min_runners")
         maximum = controller.get("max_runners")
-        validation.require(pool_name in pools, f"{path}.pool", "must reference a declared runner pool")
+        validation.require(isinstance(pool_name, str) and pool_name in pools, f"{path}.pool", "must reference a declared runner pool")
         validation.require(isinstance(location, str) and bool(SLUG.fullmatch(location)), f"{path}.location", "must be a logical location slug, never an address")
         validation.require(state in {"active", "drained", "disabled"}, f"{path}.state", "must be active, drained, or disabled")
         validation.require(isinstance(scale_set, str) and bool(SLUG.fullmatch(scale_set)), f"{path}.scale_set_name", "must be a lowercase scale-set slug")
@@ -274,7 +275,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             memory = resources.get("memory_mib")
             validation.require(type(cpu) is int and cpu > 0, f"{path}.runner_resources.cpu_cores", "must be a positive integer")
             validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
-        if pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
+        if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 
     for name, reserved in reserved_capacity.items():
@@ -330,8 +331,8 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         pool_name = project.get("ci_pool")
         validation.require(isinstance(repository, str) and bool(REPOSITORY.fullmatch(repository)), f"{path}.repository", "must be owner/repository")
         validation.require(isinstance(image, str) and bool(IMAGE.fullmatch(image)), f"{path}.image", "must be a container image path without a mutable tag")
-        validation.require(pool_name in pools, f"{path}.ci_pool", "must reference a declared runner pool")
-        if pool_name in pools and isinstance(pools[pool_name].get("allowed_repositories"), list):
+        validation.require(isinstance(pool_name, str) and pool_name in pools, f"{path}.ci_pool", "must reference a declared runner pool")
+        if isinstance(pool_name, str) and pool_name in pools and isinstance(pools[pool_name].get("allowed_repositories"), list):
             validation.require(repository in pools[pool_name]["allowed_repositories"], f"{path}.repository", "must be explicitly allowed by its CI pool")
         contract = project.get("ci_contract")
         contract_path = f"{path}.ci_contract"

@@ -143,6 +143,7 @@ def build_rendered_env(
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
+        "CI_FLEET_COMMIT": engine_commit,
         "CI_FLEET_CONFIGURED_MAX_RUNNERS": str(configured_max),
         "CI_FLEET_CONFIG_REF": config_ref,
         "CI_FLEET_CONFIG_REPOSITORY": config_repository,

@@ -51,6 +51,7 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(environment["CI_FLEET_MAX_RUNNERS"], "1")
         self.assertEqual(environment["CI_FLEET_CONFIGURED_MAX_RUNNERS"], "1")
         self.assertEqual(environment["CI_FLEET_LABELS"], "docker-ci")
+        self.assertEqual(environment["CI_FLEET_COMMIT"], environment["CI_FLEET_ENGINE_REF"])
         self.assertEqual(metadata["controller_state"], "active")
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
