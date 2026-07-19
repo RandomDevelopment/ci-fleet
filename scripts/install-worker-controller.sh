@@ -140,7 +140,7 @@ resolve_config() {
     resolved=$(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
     [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
     git -C "$config_repo" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
-    config_identity=$config_repo
+    config_identity=$(git -C "$config_repo" rev-parse --show-toplevel)
     return
   fi
   [[ "$config_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-repo must be OWNER/REPOSITORY or a local Git checkout'
@@ -357,7 +357,7 @@ run_candidate_preflight() {
     # shellcheck disable=SC1090
     . "$candidate_env"
     set +a
-    CI_FLEET_TESTING=$testing "$repo_root/scripts/preflight.sh" --managed
+    CI_FLEET_TESTING=$testing "$release_dir/scripts/preflight.sh" --managed
   )
 }
 
@@ -476,7 +476,7 @@ activate_candidate() {
       # shellcheck disable=SC1090
       . "$rendered_env"
       set +a
-      "$repo_root/scripts/healthcheck.sh"
+      "$release_dir/scripts/healthcheck.sh"
     ); then
       die 'post-activation health check failed'
     fi
@@ -619,10 +619,10 @@ perform_converge() {
     return
   fi
   install_release
-  build_candidate
   make_checkpoint
   transaction_active=true
   drain_current
+  build_candidate
   activate_candidate
   transaction_active=false
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"

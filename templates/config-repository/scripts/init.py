@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ORG_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-DEFAULT_ENGINE_REF = "3d118432dce86d702fa1b78ecadcfcee750bfd9a"
+
 
 
 def positive_integer(value: str) -> int:
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-runners", type=positive_integer, default=1, help="initial controller maximum")
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
-    parser.add_argument("--engine-ref", default=DEFAULT_ENGINE_REF, help="reviewed full ci-fleet commit SHA")
+    parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
     parser.add_argument("--output", type=Path, default=ROOT / "fleet.json", help="output configuration path")
     parser.add_argument("--force", action="store_true", help="replace an existing non-example output file")
     return parser.parse_args()

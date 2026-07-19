@@ -81,11 +81,12 @@ The installer:
 3. selects exactly one logical controller;
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
-6. builds the pinned runner and controller images;
-7. creates a root-only controller checkpoint;
-8. installs health, cleanup, and pinned-state drift timers;
-9. starts the controller only when its desired state is active;
-10. verifies runtime health and records a redacted installation state.
+6. creates a root-only controller checkpoint;
+7. drains the current controller and waits for managed runners to finish;
+8. runs managed preflight and builds the pinned runner and controller images;
+9. installs health, cleanup, and pinned-state drift timers;
+10. starts the controller only when its desired state is active;
+11. verifies runtime health and records a redacted installation state.
 
 A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. A successful engine upgrade advances both the runtime release and the maintenance installer-manager to the same pinned commit; rollback restores both.
 

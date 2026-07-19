@@ -17,7 +17,13 @@ case "${1:-}" in
     [[ -f "$state" ]] || exit 1
     if [[ "$*" == *'.State.Status'* ]]; then printf 'running\n'; else printf 'running\n'; fi
     ;;
-  ps) exit 0 ;;
+  ps)
+    if [[ -n "${FAKE_ACTIVE_RUNNERS_ONCE:-}" && -f "$FAKE_ACTIVE_RUNNERS_ONCE" ]]; then
+      rm -f "$FAKE_ACTIVE_RUNNERS_ONCE"
+      printf 'fixture-runner\n'
+    fi
+    exit 0
+    ;;
   volume|network)
     [[ "${2:-}" == ls ]] && exit 0
     [[ "${2:-}" == inspect ]] && exit 1
@@ -127,6 +133,7 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+(cd "$tmp" && "$installer" --check --config-repo config-repo --controller example-ci-01 --ref "$ref_one" >/dev/null) || fail 'relative local config path was not persisted as an absolute checkout identity'
 
 printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -137,10 +144,13 @@ cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
 ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 
 ref_two=$(write_config active 2 2)
+export FAKE_ACTIVE_RUNNERS_ONCE=$tmp/active-runner-once
+: >"$FAKE_ACTIVE_RUNNERS_ONCE"
 export FAKE_FAIL_UP_ONCE=$tmp/fail-up-once
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
 unset FAKE_FAIL_UP_ONCE
+unset FAKE_ACTIVE_RUNNERS_ONCE
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'failed activation did not restore capacity one'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'failed activation did not restore the prior manager release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'failed activation did not restore the prior controller runtime'
