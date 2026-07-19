@@ -18,10 +18,7 @@ case "${1:-}" in
     if [[ "$*" == *'.State.Status'* ]]; then printf 'running\n'; else printf 'running\n'; fi
     ;;
   ps)
-    if [[ -n "${FAKE_ACTIVE_RUNNERS_ONCE:-}" && -f "$FAKE_ACTIVE_RUNNERS_ONCE" ]]; then
-      rm -f "$FAKE_ACTIVE_RUNNERS_ONCE"
-      printf 'fixture-runner\n'
-    fi
+    if [[ -n "${FAKE_RUNNER_STATE:-}" && -f "$FAKE_RUNNER_STATE" ]]; then printf 'managed-runner\n'; fi
     exit 0
     ;;
   volume|network)
@@ -44,7 +41,10 @@ case "${1:-}" in
         : >"$state"
         ;;
       stop|down|rm) rm -f "$state" ;;
-      config|build|pause|unpause|kill|logs) ;;
+      pause)
+        [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
+        ;;
+      config|build|unpause|kill|logs) ;;
       *) exit 1 ;;
     esac
     ;;
@@ -133,7 +133,10 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
-(cd "$tmp" && "$installer" --check --config-repo config-repo --controller example-ci-01 --ref "$ref_one" >/dev/null) || fail 'relative local config path was not persisted as an absolute checkout identity'
+
+relative=$(cd "$tmp" && expect_success "$installer" --install --config-repo config-repo --controller example-ci-01 --ref "$ref_one")
+grep -Fq 'NO_CHANGE' <<<"$relative" || fail 'relative configuration path was not normalized before drift comparison'
+grep -Fq "CI_FLEET_CONFIG_REPOSITORY=$config_repo" "$root/etc/ci-fleet/ci-fleet.env" || fail 'rendered configuration path is not absolute'
 
 printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -144,13 +147,14 @@ cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
 ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 
 ref_two=$(write_config active 2 2)
-export FAKE_ACTIVE_RUNNERS_ONCE=$tmp/active-runner-once
-: >"$FAKE_ACTIVE_RUNNERS_ONCE"
+export FAKE_RUNNER_STATE=$tmp/managed-runner-active
+: >"$FAKE_RUNNER_STATE"
 export FAKE_FAIL_UP_ONCE=$tmp/fail-up-once
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
+[[ ! -f "$FAKE_RUNNER_STATE" ]] || fail 'upgrade preflight ran before the active runner was drained'
+unset FAKE_RUNNER_STATE
 unset FAKE_FAIL_UP_ONCE
-unset FAKE_ACTIVE_RUNNERS_ONCE
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'failed activation did not restore capacity one'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'failed activation did not restore the prior manager release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'failed activation did not restore the prior controller runtime'
