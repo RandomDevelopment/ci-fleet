@@ -20,7 +20,12 @@ case "${1:-}" in
     if [[ "$*" == *'.State.Status'* ]]; then printf 'running\n'; else printf 'running\n'; fi
     ;;
   ps)
-    if [[ -n "${FAKE_RUNNER_STATE:-}" && -f "$FAKE_RUNNER_STATE" ]]; then printf 'managed-runner\n'; fi
+    if [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
+      rm -f "$FAKE_RUNNER_STATE_ONCE"
+      printf 'managed-runner\n'
+    elif [[ -n "${FAKE_RUNNER_STATE:-}" && -f "$FAKE_RUNNER_STATE" ]]; then
+      printf 'managed-runner\n'
+    fi
     exit 0
     ;;
   volume|network)
@@ -145,6 +150,10 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
+mv "$host_config" "$host_config.missing"
+expect_failure 'host-local GitHub App configuration is missing' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+mv "$host_config.missing" "$host_config"
+
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -159,7 +168,9 @@ grep -Fq 'NO_CHANGE' <<<"$relative" || fail 'relative configuration path was not
 grep -Fq "CI_FLEET_CONFIG_REPOSITORY=$config_repo" "$root/etc/ci-fleet/ci-fleet.env" || fail 'rendered configuration path is not absolute'
 
 printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
+printf '\n# drift\n' >>"$root/etc/systemd/system/ci-fleet-health.timer"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
@@ -191,7 +202,11 @@ grep -Fq 'CI_FLEET_CONTROLLER_STATE=drained' "$root/etc/ci-fleet/ci-fleet.env" |
 grep -Fq 'CI_FLEET_MAX_RUNNERS=0' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained controller retained effective capacity'
 [[ ! -f "$FAKE_DOCKER_STATE" ]] || fail 'drained controller remained running'
 
+export FAKE_RUNNER_STATE_ONCE=$tmp/orphaned-managed-runner
+: >"$FAKE_RUNNER_STATE_ONCE"
 expect_success "$installer" --uninstall >/dev/null
+[[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'uninstall did not wait for an orphaned managed runner'
+unset FAKE_RUNNER_STATE_ONCE
 [[ ! -e "$root/opt/ci-fleet/current" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'uninstall left active installation state'
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
 

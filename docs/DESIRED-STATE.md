@@ -1,6 +1,6 @@
 # Git-authored controller desired state
 
-Schema v3 makes a reviewed private configuration repository the authority for controller routing, capacity, lifecycle, and engine revision. The target host keeps credentials and rendered runtime state outside Git.
+Schema v3 makes a reviewed private configuration repository the authority for controller routing, capacity, lifecycle, and engine revision within the fixed `RandomDevelopment/ci-fleet` public engine repository. A configuration-only change cannot redirect root execution to another repository. The target host keeps credentials and rendered runtime state outside Git.
 
 ## Responsibility boundary
 
@@ -82,7 +82,7 @@ The installer:
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
 6. creates a root-only controller checkpoint;
-7. drains the current controller and waits for managed runners to finish;
+7. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
 8. runs managed preflight and builds the pinned runner and controller images;
 9. installs health, cleanup, and pinned-state drift timers;
 10. starts the controller only when its desired state is active;

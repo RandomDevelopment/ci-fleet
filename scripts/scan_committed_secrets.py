@@ -34,7 +34,7 @@ def main() -> int:
         if not raw:
             continue
         relative = raw.decode("utf-8")
-        if relative in EXCLUDED or relative.endswith(".example"):
+        if relative in EXCLUDED:
             continue
         data = (ROOT / relative).read_bytes()
         for match in PATTERN.finditer(data):

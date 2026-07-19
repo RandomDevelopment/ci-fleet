@@ -54,3 +54,4 @@ jobs:
             --project test-app \
             --engine-ref "$(git rev-parse HEAD)" \
             --output "${temporary_directory}/fleet.json"
+          test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644

@@ -168,12 +168,8 @@ prepare_host_config() {
   if [[ -f "$host_config" ]]; then
     return
   fi
-  if [[ -f "$rendered_env" && ( "$mode" == adopt || "$mode" == check ) ]]; then
-    if [[ "$mode" == check ]]; then
-      effective_host_config=$temporary/host.env
-    else
-      install -d -m 0700 "$etc_dir"
-    fi
+  if [[ -f "$rendered_env" && "$mode" == adopt ]]; then
+    install -d -m 0700 "$etc_dir"
     python3 "$repo_root/scripts/desired_state.py" extract-host-env \
       --source "$rendered_env" --output "$effective_host_config"
     return
@@ -229,6 +225,7 @@ PY
   target_state=${metadata_values[0]}
   engine_ref=${metadata_values[1]}
   engine_repository=${metadata_values[2]}
+  [[ "$engine_repository" == RandomDevelopment/ci-fleet ]] || die 'delivery engine repository is not the fixed reviewed public engine'
   release_dir=$releases_dir/$engine_ref
 }
 
@@ -288,14 +285,17 @@ release_matches() {
 }
 
 systemd_matches() {
-  local expected_manager marker
+  local expected_manager marker unit
   expected_manager=$manager_releases/$engine_ref
   [[ -d "$expected_manager" && -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
   marker=$(<"$expected_manager/.ci-fleet-engine-ref")
   [[ "$marker" == "$engine_ref" ]] || return 1
   [[ -L "$manager_current" ]] || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
-  [[ -f "$systemd_dir/ci-fleet-health.service" && -f "$systemd_dir/ci-fleet-cleanup.service" && -f "$systemd_dir/ci-fleet-drift.service" ]] || return 1
+  for unit in "${unit_names[@]}"; do
+    [[ -f "$systemd_dir/$unit" ]] || return 1
+    cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+  done
   systemctl is-enabled --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer || return 1
   systemctl is-active --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer
 }
@@ -316,7 +316,7 @@ drift_count() {
 install_release() {
   local archive marker_commit checkout resolved staged_release
   if [[ -d "$release_dir" ]]; then
-    [[ -f "$release_dir/.ci-fleet-engine-ref" ]] || die "existing release has no engine marker: $release_dir"
+    [[ -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/preflight.sh" && -x "$release_dir/scripts/healthcheck.sh" ]] || die "existing release is incomplete: $release_dir"
     marker_commit=$(<"$release_dir/.ci-fleet-engine-ref")
     [[ "$marker_commit" == "$engine_ref" ]] || die "existing release marker does not match $engine_ref"
     return
@@ -364,6 +364,7 @@ install_manager() {
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
     mv "$staged_manager" "$manager_release"
   else
+    [[ -f "$manager_release/.ci-fleet-engine-ref" && -x "$manager_release/scripts/install-worker-controller.sh" ]] || die 'existing installer manager release is incomplete'
     marker=$(<"$manager_release/.ci-fleet-engine-ref")
     [[ "$marker" == "$manager_commit" ]] || die 'existing installer manager marker is inconsistent'
   fi
@@ -420,26 +421,32 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release status
+  local deadline count old_release status paused=false
   drain_error=
   status=$(controller_status)
-  [[ "$status" == running ]] || return 0
-  if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
-  old_release=$(current_runtime_release)
-  if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-  if ! compose "$old_release" "$rendered_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
+  if [[ "$status" == running ]]; then
+    if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
+    old_release=$(current_runtime_release)
+    if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
+    if ! compose "$old_release" "$rendered_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
+    paused=true
+  fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
   while :; do
     count=$(managed_runner_count)
     if [[ "$count" == 0 ]]; then break; fi
     if ((SECONDS >= deadline)); then
-      compose "$old_release" "$rendered_env" unpause controller >/dev/null || true
+      if [[ "$paused" == true ]]; then compose "$old_release" "$rendered_env" unpause controller >/dev/null || true; fi
       drain_error="drain timed out with $count managed runner(s) still present"
       return 1
     fi
     sleep 2
   done
   note 'DRAIN_READY managed_runners=0'
+  if [[ "$status" != running ]]; then
+    note 'DRAIN_OK managed_runners=0'
+    return 0
+  fi
   docker compose --project-name ci-fleet --env-file "$rendered_env" -f "$old_release/deploy/compose.yaml" kill --signal SIGTERM controller >/dev/null || {
     drain_error='failed to signal the paused controller for graceful scale-set cleanup'
     return 1

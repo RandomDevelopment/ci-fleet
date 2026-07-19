@@ -167,6 +167,7 @@ def main() -> int:
             [str(ROOT / "scripts" / "validate.sh"), "--strict", "--skip-path-scan", "--config", str(temporary)],
             check=True,
         )
+        os.chmod(temporary, 0o644)
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)

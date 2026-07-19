@@ -90,8 +90,18 @@ class PolicyTests(unittest.TestCase):
 
     def test_controller_pool_must_exist(self) -> None:
         config = copy.deepcopy(reference_config())
-        first_controller(config)["pool"] = "missing-pool"
+        first_controller(config)["pool"] = "missing"
         self.assert_rejected(config, "must reference a declared runner pool")
+
+    def test_controller_pool_must_be_a_string(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["pool"] = ["trusted-ci"]
+        self.assert_rejected(config, "must reference a declared runner pool")
+
+    def test_delivery_engine_repository_is_fixed(self) -> None:
+        config = copy.deepcopy(reference_config())
+        config["organization"]["delivery_engine"] = "attacker/engine"
+        self.assert_rejected(config, "must use the fixed reviewed public engine repository")
 
     def test_controller_address_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
