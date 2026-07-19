@@ -61,6 +61,9 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_DISABLED_TIMER:-}" && ( "${1:-}" == is-enabled || "${1:-}" == is-active ) && $# == 3 && "${3:-}" == "$FAKE_DISABLED_TIMER" ]]; then
+  exit 1
+fi
 exit 0
 EOF
 
@@ -143,12 +146,18 @@ base_args=(--config-repo "$config_repo" --controller example-ci-01)
 export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
 expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 unset FAKE_WRONG_HOST_CONFIG_OWNER
+expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+expect_success env CI_FLEET_INSTALL_STATE_FILE="$root/var/lib/ci-fleet/install-state.json" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh" >/dev/null
+
+export FAKE_DISABLED_TIMER=ci-fleet-cleanup.timer
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+unset FAKE_DISABLED_TIMER
 
 mv "$host_config" "$host_config.missing"
 expect_failure 'host-local GitHub App configuration is missing' "$installer" --check "${base_args[@]}" --ref "$ref_one"

@@ -56,7 +56,7 @@ sudo install -m 0600 host/host.env.example /etc/ci-fleet/host.env
 sudo install -m 0600 /secure/source/github-app.pem /etc/ci-fleet/secrets/github-app.pem
 ```
 
-Edit `/etc/ci-fleet/host.env` locally. It contains only the GitHub App client ID, installation ID, private-key path, and runner TTL. Both the host environment and PEM must be root-owned mode `0600`, and the TTL must be at least one hour. Neither file is committed, and the PEM is never printed by the installer.
+Edit `/etc/ci-fleet/host.env` locally. Managed installs intentionally reject alternate host-config paths so scheduled drift checks always verify the same identity file. It contains only the GitHub App client ID, installation ID, private-key path, and runner TTL. Both the host environment and PEM must be root-owned mode `0600`, and the TTL must be at least one hour. Neither file is committed, and the PEM is never printed by the installer.
 
 GitHub App and runner-group creation remain the bootstrap responsibility tracked by [issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27). The installer fails closed when those prerequisites are absent.
 

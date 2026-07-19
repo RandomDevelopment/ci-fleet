@@ -88,6 +88,11 @@ class PolicyTests(unittest.TestCase):
         first_controller(config)["scale_set_name"] = "other-scale"
         self.assert_rejected(config, "must include the controller ID")
 
+    def test_routing_label_must_not_equal_scale_set(self) -> None:
+        config = copy.deepcopy(reference_config())
+        config["runner_pools"]["trusted-ci"]["routing_labels"] = [first_controller(config)["scale_set_name"]]
+        self.assert_rejected(config, "must not equal a controller scale-set name")
+
     def test_controller_pool_must_exist(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["pool"] = "missing"

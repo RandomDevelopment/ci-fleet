@@ -19,14 +19,14 @@ usage() {
 usage:
   install-worker-controller.sh --check|--install|--adopt|--upgrade \
     --config-repo OWNER/REPOSITORY|PATH --ref FULL_COMMIT_SHA \
-    --controller CONTROLLER_ID [--host-config PATH]
+    --controller CONTROLLER_ID
 
   install-worker-controller.sh --rollback
   install-worker-controller.sh --uninstall
 
 Modes are mutually exclusive. Remote private repositories use the target host's
 preconfigured read-only Git credentials; credentials are never accepted in URLs
-or command-line arguments.
+or command-line arguments. Managed installs always use /etc/ci-fleet/host.env.
 EOF
 }
 
@@ -135,6 +135,7 @@ validate_common_arguments() {
   [[ -n "$config_repo" ]] || die '--config-repo is required for this mode'
   [[ "$config_ref" =~ ^[0-9a-f]{40}$ ]] || die '--ref must be a full lowercase commit SHA'
   [[ "$controller_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die '--controller must be a lowercase logical ID'
+  [[ -z "$host_config_arg" || "$host_config" == "$default_host_config" ]] || die 'managed installs require the default /etc/ci-fleet/host.env path'
   if [[ "$config_repo" == *://* || "$config_repo" == *@* ]]; then
     die '--config-repo must not contain a URL or embedded credentials; use OWNER/REPOSITORY or a local path'
   fi
@@ -296,8 +297,10 @@ systemd_matches() {
     [[ -f "$systemd_dir/$unit" ]] || return 1
     cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
   done
-  systemctl is-enabled --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer || return 1
-  systemctl is-active --quiet ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer
+  for unit in "${timer_names[@]}"; do
+    systemctl is-enabled --quiet "$unit" || return 1
+    systemctl is-active --quiet "$unit" || return 1
+  done
 }
 
 drift_count() {
