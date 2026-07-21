@@ -275,11 +275,19 @@ managed_runner_count() {
     --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
 }
 
+managed_runner_total_count() {
+  docker ps --all -q \
+    --filter label=io.randomdevelopment.ci-fleet.managed=true \
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
+}
+
 runtime_matches() {
-  local expected=$1 status
+  local expected=$1 provenance status
   status=$(controller_status)
   if [[ "$expected" == active ]]; then
-    [[ "$status" == running ]]
+    [[ "$status" == running ]] || return 1
+    provenance=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) || return 1
+    [[ "$provenance" == "$engine_ref" ]]
   else
     [[ -z "$status" || "$status" == exited || "$status" == created ]]
   fi
@@ -356,7 +364,7 @@ drift_count() {
   release_matches || { note 'DRIFT engine_release'; count=$((count + 1)); }
   state_matches || { note 'DRIFT install_state'; count=$((count + 1)); }
   runtime_matches "$target_state" || { note 'DRIFT controller_runtime'; count=$((count + 1)); }
-  if [[ "$target_state" != active && $(managed_runner_count) != 0 ]]; then
+  if [[ "$target_state" != active && $(managed_runner_total_count) != 0 ]]; then
     note 'DRIFT managed_runners'
     count=$((count + 1))
   fi

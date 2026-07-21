@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate import Validation, load_json, scan_secret_material, validate_config
+from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -207,6 +207,20 @@ class PolicyTests(unittest.TestCase):
         config = copy.deepcopy(reference_config())
         config["environments"]["development"]["token"] = "not-a-real-token"
         self.assert_rejected(config, "secret values are forbidden")
+
+    def test_host_local_environment_paths_are_rejected(self) -> None:
+        validation = Validation()
+        with tempfile.TemporaryDirectory() as directory:
+            path_list = Path(directory) / "paths"
+            path_list.write_bytes(b"host.env\0ci-fleet.env\0nested/host.env\0nested/ci-fleet.env\0")
+            scan_tree_path_list(path_list, validation)
+        self.assertEqual(len(validation.errors), 4, validation.errors)
+        self.assertTrue(all("secret-bearing files are forbidden" in error for error in validation.errors), validation.errors)
+
+    def test_template_ci_scans_committed_file_contents(self) -> None:
+        self.assertTrue((ROOT / "scripts" / "scan_committed_secrets.py").is_file())
+        workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/scan_committed_secrets.py", workflow)
 
     def test_duplicate_json_controller_id_is_rejected(self) -> None:
         validation = Validation()

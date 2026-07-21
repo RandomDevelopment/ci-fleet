@@ -35,7 +35,9 @@ jobs:
 
       - name: Validate public configuration template
         run: |
+          cmp -s scripts/scan_committed_secrets.py templates/config-repository/scripts/scan_committed_secrets.py
           python3 templates/config-repository/scripts/test_policy.py
+          python3 templates/config-repository/scripts/scan_committed_secrets.py
           templates/config-repository/scripts/validate.sh
           templates/config-repository/scripts/validate.sh --config templates/config-repository/examples/multi-host/fleet.json
           temporary_directory="$(mktemp -d)"

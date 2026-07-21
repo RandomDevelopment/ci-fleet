@@ -21,7 +21,9 @@ case "${1:-}" in
   info) exit 0 ;;
   inspect)
     [[ -f "$state" ]] || exit 1
-    if [[ "$*" == *'.State.Status'* ]]; then
+    if [[ "$*" == *'org.opencontainers.image.revision'* ]]; then
+      if [[ -n "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" && -f "$FAKE_CONTROLLER_PROVENANCE_FILE" ]]; then cat "$FAKE_CONTROLLER_PROVENANCE_FILE"; else printf '%s\n' "${FAKE_ENGINE_REF:?}"; fi
+    elif [[ "$*" == *'.State.Status'* ]]; then
       if [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
     elif [[ "$*" == *'.State.Paused'* ]]; then
       if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'true\n'; else printf 'false\n'; fi
@@ -30,7 +32,9 @@ case "${1:-}" in
     fi
     ;;
   ps)
-    if [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
+    if [[ "$*" == *'--all'* && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
+      printf 'managed-runner-all-state\n'
+    elif [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
       rm -f "$FAKE_RUNNER_STATE_ONCE"
       printf 'managed-runner\n'
     elif [[ -n "${FAKE_RUNNER_STATE:-}" && -f "$FAKE_RUNNER_STATE" ]]; then
@@ -71,6 +75,7 @@ case "${1:-}" in
           exit 42
         fi
         : >"$state"
+        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
           printf 'restarting\n' >"$status_file"
@@ -78,7 +83,7 @@ case "${1:-}" in
           rm -f "$status_file"
         fi
         ;;
-      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state" ;;
+      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE" ;;
       pause)
         [[ -z "$paused_state" ]] || : >"$paused_state"
         [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
@@ -120,6 +125,10 @@ if [[ -n "${FAKE_WRONG_HOST_CONFIG_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u
   printf '99999\n'
   exit 0
 fi
+if [[ -n "${FAKE_WRONG_INSTALL_STATE_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$FAKE_WRONG_INSTALL_STATE_OWNER" ]]; then
+  printf '99999\n'
+  exit 0
+fi
 exec "$REAL_STAT" "$@"
 EOF
 chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
@@ -138,6 +147,7 @@ export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
 export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
+export FAKE_CONTROLLER_PROVENANCE_FILE=$tmp/docker-controller-provenance
 export CI_FLEET_TESTING=1
 export CI_FLEET_DOCKER_GID_OVERRIDE=998
 export CI_FLEET_STARTUP_WAIT_SECONDS=0
@@ -249,7 +259,14 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
-expect_success env CI_FLEET_INSTALL_STATE_FILE="$root/var/lib/ci-fleet/install-state.json" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh" >/dev/null
+install_state=$root/var/lib/ci-fleet/install-state.json
+chmod 644 "$install_state"
+expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
+chmod 600 "$install_state"
+export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
+expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
+unset FAKE_WRONG_INSTALL_STATE_OWNER
+expect_success env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh" >/dev/null
 
 export FAKE_DISABLED_TIMER=ci-fleet-cleanup.timer
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -266,6 +283,10 @@ mv "$host_config.missing" "$host_config"
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] || fail 'controller convergence did not restore running image provenance'
 
 rm -f "$FAKE_RUNNER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -384,6 +405,11 @@ export FAKE_RUNNER_STATE=$tmp/drained-managed-runner
 expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
 rm -f "$FAKE_RUNNER_STATE"
 unset FAKE_RUNNER_STATE
+export FAKE_ALL_RUNNER_STATE=$tmp/drained-exited-managed-runner
+: >"$FAKE_ALL_RUNNER_STATE"
+expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
+rm -f "$FAKE_ALL_RUNNER_STATE"
+unset FAKE_ALL_RUNNER_STATE
 
 ref_four=$(write_config disabled 2 2)
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_four" >/dev/null
