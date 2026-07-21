@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def reference_config() -> dict:
     return json.loads((ROOT / "fleet.json").read_text(encoding="utf-8"))
+
+
+def contract_schema() -> dict:
+    return json.loads((ROOT / "fleet.schema.json").read_text(encoding="utf-8"))
+
+
+def schema_accepts_engine_ref(value: str) -> bool:
+    pattern = contract_schema()["$defs"]["controller"]["properties"]["engine_ref"]["pattern"]
+    return re.fullmatch(pattern, value) is not None
+
+
+def schema_accepts_delivery_engine(value: str) -> bool:
+    contract = contract_schema()["properties"]["organization"]["properties"]["delivery_engine"]
+    return contract.get("const") == value
 
 
 def errors_for(config: dict, *, strict: bool = False) -> list[str]:
@@ -38,6 +53,18 @@ class PolicyTests(unittest.TestCase):
     def assert_rejected(self, config: dict, expected: str, *, strict: bool = False) -> None:
         errors = errors_for(config, strict=strict)
         self.assertTrue(any(expected in error for error in errors), errors)
+
+    def assert_engine_ref_contract(self, value: str, accepted: bool) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["engine_ref"] = value
+        self.assertEqual(schema_accepts_engine_ref(value), accepted)
+        self.assertEqual(errors_for(config) == [], accepted)
+
+    def assert_delivery_engine_contract(self, value: str, accepted: bool) -> None:
+        config = copy.deepcopy(reference_config())
+        config["organization"]["delivery_engine"] = value
+        self.assertEqual(schema_accepts_delivery_engine(value), accepted)
+        self.assertEqual(errors_for(config) == [], accepted)
 
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
@@ -103,25 +130,37 @@ class PolicyTests(unittest.TestCase):
         first_controller(config)["pool"] = ["trusted-ci"]
         self.assert_rejected(config, "must reference a declared runner pool")
 
-    def test_delivery_engine_repository_is_fixed(self) -> None:
-        config = copy.deepcopy(reference_config())
-        config["organization"]["delivery_engine"] = "attacker/engine"
-        self.assert_rejected(config, "must use the fixed reviewed public engine repository")
+    def test_delivery_engine_repository_is_fixed_in_schema_and_semantics(self) -> None:
+        self.assert_delivery_engine_contract("RandomDevelopment/ci-fleet", True)
+
+    def test_delivery_engine_rejects_another_repository(self) -> None:
+        self.assert_delivery_engine_contract("attacker/engine", False)
+
+    def test_delivery_engine_rejects_url_form(self) -> None:
+        self.assert_delivery_engine_contract("https://github.com/RandomDevelopment/ci-fleet", False)
+
+    def test_delivery_engine_rejects_credential_form(self) -> None:
+        self.assert_delivery_engine_contract("user:password@RandomDevelopment/ci-fleet", False)
 
     def test_controller_address_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["ip_address"] = "192.0.2.10"
         self.assert_rejected(config, "host-local infrastructure details are forbidden")
 
-    def test_unpinned_engine_ref_is_rejected(self) -> None:
-        config = copy.deepcopy(reference_config())
-        first_controller(config)["engine_ref"] = "main"
-        self.assert_rejected(config, "full lowercase commit SHA")
+    def test_full_lowercase_engine_ref_passes_schema_and_semantics(self) -> None:
+        self.assert_engine_ref_contract("1" * 40, True)
 
-    def test_zero_engine_ref_is_rejected(self) -> None:
-        config = copy.deepcopy(reference_config())
-        first_controller(config)["engine_ref"] = "0" * 40
-        self.assert_rejected(config, "nonzero full lowercase commit SHA")
+    def test_uppercase_engine_ref_fails_schema_and_semantics(self) -> None:
+        self.assert_engine_ref_contract("A" * 40, False)
+
+    def test_short_engine_ref_fails_schema_and_semantics(self) -> None:
+        self.assert_engine_ref_contract("1" * 39, False)
+
+    def test_malformed_engine_ref_fails_schema_and_semantics(self) -> None:
+        self.assert_engine_ref_contract("g" * 40, False)
+
+    def test_zero_engine_ref_fails_schema_and_semantics(self) -> None:
+        self.assert_engine_ref_contract("0" * 40, False)
 
     def test_active_controller_minimum_must_be_zero(self) -> None:
         config = copy.deepcopy(reference_config())
