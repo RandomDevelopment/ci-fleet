@@ -171,9 +171,9 @@ export FAKE_RUNNER_IMAGE_STATE=$tmp/runner-image-present
 export FAKE_CONTROLLER_IMAGE_STATE=$tmp/controller-image-present
 export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
 for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile"; do
-  grep -Fq 'LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}"' "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
+  grep -Fq "LABEL org.opencontainers.image.revision=\"\${CI_FLEET_COMMIT}\"" "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
 done
-grep -Fq 'CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}' "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
+grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
