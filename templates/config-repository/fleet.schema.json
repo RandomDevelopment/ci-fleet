@@ -15,7 +15,7 @@
       "properties": {
         "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,38}$"},
         "registry": {"type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9._/-]+$"},
-        "delivery_engine": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "delivery_engine": {"const": "RandomDevelopment/ci-fleet"},
         "workflow_ref_policy": {"const": "immutable-commit"}
       }
     },
@@ -76,7 +76,7 @@
         "state": {"enum": ["active", "drained", "disabled"]},
         "scale_set_name": {"$ref": "#/$defs/slug"},
         "lifecycle": {"enum": ["experimental", "stable", "retiring"]},
-        "engine_ref": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "engine_ref": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
         "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
         "runner_resources": {"$ref": "#/$defs/runner_resources"}
