@@ -24,7 +24,7 @@
       "state": "active",
       "scale_set_name": "sample-ci-primary",
       "lifecycle": "stable",
-      "engine_ref": "6d76f590b26649029d8e50b7a30d86d7aeba31b1",
+      "engine_ref": "a530c6abdc0245d818dd5fefe72a45189b5e6ab4",
       "min_runners": 0,
       "max_runners": 4,
       "runner_resources": {
@@ -38,7 +38,7 @@
       "state": "active",
       "scale_set_name": "sample-ci-remote",
       "lifecycle": "stable",
-      "engine_ref": "6d76f590b26649029d8e50b7a30d86d7aeba31b1",
+      "engine_ref": "a530c6abdc0245d818dd5fefe72a45189b5e6ab4",
       "min_runners": 0,
       "max_runners": 2,
       "runner_resources": {
