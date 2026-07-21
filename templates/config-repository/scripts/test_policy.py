@@ -6,6 +6,8 @@ from __future__ import annotations
 import copy
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -218,9 +220,27 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(all("secret-bearing files are forbidden" in error for error in validation.errors), validation.errors)
 
     def test_template_ci_scans_committed_file_contents(self) -> None:
-        self.assertTrue((ROOT / "scripts" / "scan_committed_secrets.py").is_file())
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        self.assertTrue(scanner.is_file())
         workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/scan_committed_secrets.py", workflow)
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            for relative in ("scripts/scan_committed_secrets.py", "scripts/validate.sh"):
+                path = repository / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("ghp_" + "x" * 20 + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--repository", str(repository)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scripts/scan_committed_secrets.py:1", result.stderr)
+        self.assertIn("scripts/validate.sh:1", result.stderr)
 
     def test_duplicate_json_controller_id_is_rejected(self) -> None:
         validation = Validation()

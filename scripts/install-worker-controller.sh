@@ -281,20 +281,47 @@ managed_runner_total_count() {
     --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
 }
 
+remove_inactive_managed_runners() {
+  local -a containers=()
+  mapfile -t containers < <(docker ps --all -q \
+    --filter label=io.randomdevelopment.ci-fleet.managed=true \
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner)
+  ((${#containers[@]} == 0)) || docker rm "${containers[@]}" >/dev/null
+}
+
+controller_environment_matches() {
+  local actual expected key live
+  live=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null) || return 1
+  for key in \
+    CI_FLEET_GITHUB_URL CI_FLEET_SCALE_SET_NAME CI_FLEET_LABELS CI_FLEET_RUNNER_GROUP \
+    CI_FLEET_RUNNER_IMAGE CI_FLEET_INSTANCE CI_FLEET_GITHUB_APP_CLIENT_ID \
+    CI_FLEET_GITHUB_APP_INSTALLATION_ID CI_FLEET_MIN_RUNNERS CI_FLEET_MAX_RUNNERS \
+    CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID; do
+    expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    [[ -n "$expected" ]] || return 1
+    actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' <<<"$live") || return 1
+    [[ "$actual" == "$expected" ]] || return 1
+  done
+}
+
 runtime_matches() {
   local expected=$1 provenance status
   status=$(controller_status)
   if [[ "$expected" == active ]]; then
     [[ "$status" == running ]] || return 1
     provenance=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) || return 1
-    [[ "$provenance" == "$engine_ref" ]]
+    [[ "$provenance" == "$engine_ref" ]] || return 1
+    controller_environment_matches
   else
     [[ -z "$status" || "$status" == exited || "$status" == created ]]
   fi
 }
 
 state_matches() {
+  local expected_owner=0
   [[ -f "$state_file" ]] || return 1
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  [[ $(stat -c %u "$state_file") == "$expected_owner" && $(stat -c %a "$state_file") == 600 ]] || return 1
   python3 - "$state_file" "$candidate_metadata" <<'PY'
 import json
 import sys
@@ -757,6 +784,7 @@ perform_converge() {
   make_checkpoint
   transaction_active=true
   drain_current
+  [[ "$target_state" == active ]] || remove_inactive_managed_runners
   build_candidate
   activate_candidate
   transaction_active=false
