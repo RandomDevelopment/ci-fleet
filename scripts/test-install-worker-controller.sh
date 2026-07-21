@@ -21,7 +21,10 @@ case "${1:-}" in
   info) exit 0 ;;
   inspect)
     [[ -f "$state" ]] || exit 1
-    if [[ "$*" == *'org.opencontainers.image.revision'* ]]; then
+    if [[ "$*" == *'.Config.Env'* ]]; then
+      [[ -n "${FAKE_CONTROLLER_ENV_FILE:-}" && -f "$FAKE_CONTROLLER_ENV_FILE" ]] || exit 1
+      cat "$FAKE_CONTROLLER_ENV_FILE"
+    elif [[ "$*" == *'org.opencontainers.image.revision'* ]]; then
       if [[ -n "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" && -f "$FAKE_CONTROLLER_PROVENANCE_FILE" ]]; then cat "$FAKE_CONTROLLER_PROVENANCE_FILE"; else printf '%s\n' "${FAKE_ENGINE_REF:?}"; fi
     elif [[ "$*" == *'.State.Status'* ]]; then
       if [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
@@ -56,6 +59,10 @@ case "${1:-}" in
     [[ -f "$image_state" ]] || exit 1
     cat "$image_state"
     ;;
+  rm)
+    (($# >= 2)) || exit 1
+    [[ -z "${FAKE_ALL_RUNNER_STATE:-}" ]] || rm -f "$FAKE_ALL_RUNNER_STATE"
+    ;;
   volume|network)
     [[ "${2:-}" == ls ]] && exit 0
     [[ "${2:-}" == inspect ]] && exit 1
@@ -64,9 +71,11 @@ case "${1:-}" in
   compose)
     if [[ "${2:-}" == version ]]; then exit 0; fi
     [[ -z "${COMPOSE_PROJECT_NAME:-}" && -z "${CI_FLEET_MAX_RUNNERS:-}" ]] || exit 44
-    command=
+    command= env_file= previous=
     for argument in "$@"; do
+      [[ "$previous" != --env-file ]] || env_file=$argument
       case "$argument" in config|build|up|stop|pause|unpause|kill|down|logs|rm) command=$argument ;; esac
+      previous=$argument
     done
     case "$command" in
       up)
@@ -76,6 +85,7 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+        [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
           printf 'restarting\n' >"$status_file"
@@ -83,7 +93,7 @@ case "${1:-}" in
           rm -f "$status_file"
         fi
         ;;
-      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE" ;;
+      stop|down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
         [[ -z "$paused_state" ]] || : >"$paused_state"
         [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
@@ -148,6 +158,7 @@ export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
 export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
 export FAKE_CONTROLLER_PROVENANCE_FILE=$tmp/docker-controller-provenance
+export FAKE_CONTROLLER_ENV_FILE=$tmp/docker-controller-env
 export CI_FLEET_TESTING=1
 export CI_FLEET_DOCKER_GID_OVERRIDE=998
 export CI_FLEET_STARTUP_WAIT_SECONDS=0
@@ -262,7 +273,9 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 install_state=$root/var/lib/ci-fleet/install-state.json
 chmod 644 "$install_state"
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
-chmod 600 "$install_state"
+expect_failure 'DRIFT install_state' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(stat -c %a "$install_state") == 600 ]] || fail 'convergence did not repair install-state mode'
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER
@@ -287,6 +300,11 @@ printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] || fail 'controller convergence did not restore running image provenance'
+python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_MAX_RUNNERS=1", "CI_FLEET_MAX_RUNNERS=9"))' "$FAKE_CONTROLLER_ENV_FILE"
+grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-environment fixture did not mutate'
+expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+grep -Fxq 'CI_FLEET_MAX_RUNNERS=1' "$FAKE_CONTROLLER_ENV_FILE" || fail 'controller convergence did not restore live environment'
 
 rm -f "$FAKE_RUNNER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -408,7 +426,8 @@ unset FAKE_RUNNER_STATE
 export FAKE_ALL_RUNNER_STATE=$tmp/drained-exited-managed-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
-rm -f "$FAKE_ALL_RUNNER_STATE"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_three" >/dev/null
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'non-active convergence did not remove stopped managed runners'
 unset FAKE_ALL_RUNNER_STATE
 
 ref_four=$(write_config disabled 2 2)
