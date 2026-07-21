@@ -24,7 +24,7 @@
       "state": "active",
       "scale_set_name": "example-ci-01",
       "lifecycle": "experimental",
-      "engine_ref": "a589eed48fb9d6664d5535dfbf5a9ecf5a147f67",
+      "engine_ref": "89d46b8ab9cc997577867d84ceee457aa50e1ac9",
       "min_runners": 0,
       "max_runners": 1,
       "runner_resources": {
