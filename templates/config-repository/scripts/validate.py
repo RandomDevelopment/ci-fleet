@@ -53,7 +53,7 @@ FORBIDDEN_INFRASTRUCTURE_KEYS = {
     "vm_id",
     "vmid",
 }
-FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)\.env(?:\..+)?$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
+FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\..+)?|host\.env|ci-fleet\.env)$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
 FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
 
 
