@@ -39,6 +39,7 @@ jobs:
       - name: Prove initialized configurations pass strict policy
         run: |
           temporary_directory="$(mktemp -d)"
+          engine_ref=$(python3 -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
           if ./scripts/init.sh \
             --organization test-company \
             --project test-app \
@@ -51,7 +52,7 @@ jobs:
             --organization test-company \
             --project test-app \
             --registry BAD \
-            --engine-ref "$(git rev-parse HEAD)" \
+            --engine-ref "${engine_ref}" \
             --output "${temporary_directory}/invalid.json"; then
             echo 'initializer accepted an invalid registry' >&2
             exit 1
@@ -60,6 +61,6 @@ jobs:
           ./scripts/init.sh \
             --organization test-company \
             --project test-app \
-            --engine-ref "$(git rev-parse HEAD)" \
+            --engine-ref "${engine_ref}" \
             --output "${temporary_directory}/fleet.json"
           test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644
