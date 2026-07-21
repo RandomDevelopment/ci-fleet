@@ -8,6 +8,8 @@ fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
 export REAL_STAT
 REAL_STAT=$(command -v stat)
+export REAL_TAR
+REAL_TAR=$(command -v tar)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -35,6 +37,17 @@ case "${1:-}" in
       printf 'managed-runner\n'
     fi
     exit 0
+    ;;
+  image)
+    [[ "${2:-}" == inspect && -n "${3:-}" ]] || exit 1
+    [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$3" >>"$FAKE_IMAGE_INSPECT_LOG"
+    if [[ "$3" == "${FAKE_RUNNER_IMAGE:-}" ]]; then
+      [[ -f "${FAKE_RUNNER_IMAGE_STATE:-}" ]]
+    elif [[ "$3" == "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
+      [[ -f "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]]
+    else
+      exit 1
+    fi
     ;;
   volume|network)
     [[ "${2:-}" == ls ]] && exit 0
@@ -75,7 +88,11 @@ case "${1:-}" in
         fi
         [[ -z "$paused_state" ]] || rm -f "$paused_state"
         ;;
-      config|build|logs) ;;
+      build)
+        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || : >"$FAKE_RUNNER_IMAGE_STATE"
+        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || : >"$FAKE_CONTROLLER_IMAGE_STATE"
+        ;;
+      config|logs) ;;
       *) exit 1 ;;
     esac
     ;;
@@ -104,6 +121,16 @@ exec "$REAL_STAT" "$@"
 EOF
 chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 
+cat >"$fake_bin/tar" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_FAIL_TAR_ONCE:-}" && -f "$FAKE_FAIL_TAR_ONCE" ]]; then
+  rm -f "$FAKE_FAIL_TAR_ONCE"
+  exit 45
+fi
+exec "$REAL_TAR" "$@"
+EOF
+chmod 700 "$fake_bin/tar"
+
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
@@ -127,8 +154,17 @@ expect_failure() {
   if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
   grep -Fq -- "$expected" <<<"$output" || fail "missing failure [$expected]: $output"
 }
+expect_command_failure() {
+  local output
+  if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+}
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
+export FAKE_RUNNER_IMAGE_STATE=$tmp/runner-image-present
+export FAKE_CONTROLLER_IMAGE_STATE=$tmp/controller-image-present
+export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
@@ -218,10 +254,56 @@ second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 
+rm -f "$FAKE_RUNNER_IMAGE_STATE"
+expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+image_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'CONVERGED mode=install' <<<"$image_repair" || fail 'missing runner image did not trigger convergence'
+[[ -f "$FAKE_RUNNER_IMAGE_STATE" && -f "$FAKE_CONTROLLER_IMAGE_STATE" ]] || fail 'candidate build did not restore both managed images'
+rm -f "$FAKE_CONTROLLER_IMAGE_STATE"
+expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$FAKE_RUNNER_IMAGE_STATE" && -f "$FAKE_CONTROLLER_IMAGE_STATE" ]] || fail 'candidate build did not restore the controller image'
+if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
+: >"$FAKE_IMAGE_INSPECT_LOG"
+expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+grep -Fxq "$FAKE_RUNNER_IMAGE" "$FAKE_IMAGE_INSPECT_LOG" || fail 'runner image was not inspected'
+grep -Fxq "$FAKE_CONTROLLER_IMAGE" "$FAKE_IMAGE_INSPECT_LOG" || fail 'controller image was not inspected'
+if grep -Fvx -e "$FAKE_RUNNER_IMAGE" -e "$FAKE_CONTROLLER_IMAGE" "$FAKE_IMAGE_INSPECT_LOG" >/dev/null; then fail 'an unrelated image was inspected'; fi
+
 active_release=$(readlink -f "$root/opt/ci-fleet/current")
-mv "$active_release/scripts/cleanup.sh" "$active_release/scripts/cleanup.sh.missing"
+unrelated_release=$root/opt/ci-fleet/releases/unrelated-release
+mkdir -p "$unrelated_release"
+: >"$unrelated_release/preserve"
+mv "$active_release/deploy/compose.yaml" "$active_release/deploy/compose.yaml.missing"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-mv "$active_release/scripts/cleanup.sh.missing" "$active_release/scripts/cleanup.sh"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$active_release/deploy/compose.yaml" && -f "$unrelated_release/preserve" ]] || fail 'Compose repair removed unrelated release state'
+rm -f "$active_release/scripts/preflight.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -x "$active_release/scripts/preflight.sh" ]] || fail 'required runtime script was not repaired'
+rm -f "$active_release/.ci-fleet-engine-ref"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(<"$active_release/.ci-fleet-engine-ref") == "$engine_ref" ]] || fail 'missing release marker was not repaired'
+if [[ ${engine_ref: -1} == 0 ]]; then bad_marker="${engine_ref%?}1"; else bad_marker="${engine_ref%?}0"; fi
+printf '%s\n' "$bad_marker" >"$active_release/.ci-fleet-engine-ref"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(<"$active_release/.ci-fleet-engine-ref") == "$engine_ref" ]] || fail 'bad release marker was not repaired'
+rm -f "$active_release/deploy/compose.yaml"
+export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
+: >"$FAKE_FAIL_TAR_ONCE"
+expect_command_failure "$installer" --install "${base_args[@]}" --ref "$ref_one"
+unset FAKE_FAIL_TAR_ONCE
+[[ ! -f "$active_release/deploy/compose.yaml" ]] || fail 'interrupted repair replaced the detectable prior state'
+if compgen -G "$root/opt/ci-fleet/releases/.${engine_ref}.staging.*" >/dev/null; then fail 'interrupted release staging was not cleaned'; fi
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+rm -f "$manager_release/scripts/check-installed-state.sh"
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -x "$manager_release/scripts/check-installed-state.sh" ]] || fail 'incomplete manager release was not repaired consistently'
 mv "$active_release" "$active_release.saved"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 mv "$active_release.saved" "$active_release"
@@ -234,7 +316,9 @@ printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
 printf '\n# drift\n' >>"$root/etc/systemd/system/ci-fleet-health.timer"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+complete_release_inode=$(stat -c '%i' "$active_release")
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(stat -c '%i' "$active_release") == "$complete_release_inode" ]] || fail 'complete immutable release was replaced instead of reused'
 
 prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
 cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"

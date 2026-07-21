@@ -297,22 +297,41 @@ raise SystemExit(0 if installed == candidate else 1)
 PY
 }
 
+runtime_release_complete() {
+  local path=$1 expected=$2 marker
+  [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/deploy/compose.yaml" ]] || return 1
+  [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
+  marker=$(<"$path/.ci-fleet-engine-ref")
+  [[ "$marker" == "$expected" ]]
+}
+
+manager_release_complete() {
+  local path=$1 expected=$2 marker unit
+  runtime_release_complete "$path" "$expected" || return 1
+  [[ -x "$path/scripts/install-worker-controller.sh" && -x "$path/scripts/check-installed-state.sh" ]] || return 1
+  for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
+  marker=$(<"$path/.ci-fleet-engine-ref")
+  [[ "$marker" == "$expected" ]]
+}
+
 release_matches() {
-  local marker
-  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/cleanup.sh" ]] || return 1
-  marker=$(<"$release_dir/.ci-fleet-engine-ref")
-  [[ "$marker" == "$engine_ref" ]] || return 1
+  runtime_release_complete "$release_dir" "$engine_ref" || return 1
   [[ -L "$current_link" ]] || return 1
   [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
 }
 
+managed_images_match() {
+  local image
+  local -a expected_images=()
+  mapfile -t expected_images < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" || $1 == "CI_FLEET_RUNNER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+  [[ ${#expected_images[@]} == 2 ]] || return 1
+  for image in "${expected_images[@]}"; do docker image inspect "$image" >/dev/null 2>&1 || return 1; done
+}
+
 systemd_matches() {
-  local expected_manager marker unit
+  local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
-  [[ -d "$expected_manager" && -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
-  [[ -x "$expected_manager/scripts/healthcheck.sh" && -x "$expected_manager/scripts/check-installed-state.sh" ]] || return 1
-  marker=$(<"$expected_manager/.ci-fleet-engine-ref")
-  [[ "$marker" == "$engine_ref" ]] || return 1
+  manager_release_complete "$expected_manager" "$engine_ref" || return 1
   [[ -L "$manager_current" ]] || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
@@ -334,16 +353,42 @@ drift_count() {
   release_matches || { note 'DRIFT engine_release'; count=$((count + 1)); }
   state_matches || { note 'DRIFT install_state'; count=$((count + 1)); }
   runtime_matches "$target_state" || { note 'DRIFT controller_runtime'; count=$((count + 1)); }
+  managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
   systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
   DRIFT_COUNT=$count
 }
 
+atomic_replace_directory() {
+  local replacement=$1 target=$2
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    mv "$replacement" "$target"
+    return
+  fi
+  python3 - "$replacement" "$target" <<'PY'
+import ctypes
+import os
+import sys
+
+replacement, target = map(os.fsencode, sys.argv[1:])
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = getattr(libc, "renameat2", None)
+if renameat2 is None:
+    raise OSError("atomic directory exchange is unavailable")
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+if renameat2(-100, replacement, -100, target, 2) != 0:  # AT_FDCWD, RENAME_EXCHANGE
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), os.fsdecode(target))
+parent = os.open(os.path.dirname(target), os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+}
+
 install_release() {
-  local archive marker_commit checkout resolved staged_release
-  if [[ -d "$release_dir" ]]; then
-    [[ -f "$release_dir/.ci-fleet-engine-ref" && -f "$release_dir/deploy/compose.yaml" && -x "$release_dir/scripts/preflight.sh" && -x "$release_dir/scripts/healthcheck.sh" && -x "$release_dir/scripts/cleanup.sh" ]] || die "existing release is incomplete: $release_dir"
-    marker_commit=$(<"$release_dir/.ci-fleet-engine-ref")
-    [[ "$marker_commit" == "$engine_ref" ]] || die "existing release marker does not match $engine_ref"
+  local archive checkout resolved staged_release
+  if runtime_release_complete "$release_dir" "$engine_ref"; then
     return
   fi
   install -d -m 0755 "$releases_dir"
@@ -366,18 +411,17 @@ install_release() {
   tar -xf "$archive" -C "$staged_release"
   printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
-  mv "$staged_release" "$release_dir"
+  runtime_release_complete "$staged_release" "$engine_ref" || die 'staged engine release is incomplete'
+  atomic_replace_directory "$staged_release" "$release_dir"
 }
 
 install_manager() {
-  local manager_commit manager_release archive marker staged_manager release_marker
+  local manager_commit manager_release archive staged_manager
   manager_commit=$engine_ref
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
-  [[ -d "$release_dir" && -f "$release_dir/.ci-fleet-engine-ref" ]] || die 'desired engine release is unavailable for installer manager activation'
-  release_marker=$(<"$release_dir/.ci-fleet-engine-ref")
-  [[ "$release_marker" == "$manager_commit" ]] || die 'desired engine release marker is inconsistent'
+  runtime_release_complete "$release_dir" "$manager_commit" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
-  if [[ ! -d "$manager_release" ]]; then
+  if ! manager_release_complete "$manager_release" "$manager_commit"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     tar -cf "$archive" -C "$release_dir" .
@@ -387,11 +431,8 @@ install_manager() {
     tar -xf "$archive" -C "$staged_manager"
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    mv "$staged_manager" "$manager_release"
-  else
-    [[ -f "$manager_release/.ci-fleet-engine-ref" && -x "$manager_release/scripts/install-worker-controller.sh" && -x "$manager_release/scripts/healthcheck.sh" && -x "$manager_release/scripts/check-installed-state.sh" ]] || die 'existing installer manager release is incomplete'
-    marker=$(<"$manager_release/.ci-fleet-engine-ref")
-    [[ "$marker" == "$manager_commit" ]] || die 'existing installer manager marker is inconsistent'
+    manager_release_complete "$staged_manager" "$manager_commit" || die 'staged installer manager release is incomplete'
+    atomic_replace_directory "$staged_manager" "$manager_release"
   fi
   install -d -m 0755 "$manager_root"
   ln -sfn "$manager_release" "$temporary/manager-current"
@@ -411,7 +452,7 @@ run_candidate_preflight() {
 build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
-  [[ "$target_state" == disabled ]] || compose "$release_dir" "$candidate_env" build runner-image controller
+  compose "$release_dir" "$candidate_env" build runner-image controller
 }
 
 make_checkpoint() {
