@@ -39,15 +39,18 @@ case "${1:-}" in
     exit 0
     ;;
   image)
-    [[ "${2:-}" == inspect && -n "${3:-}" ]] || exit 1
-    [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$3" >>"$FAKE_IMAGE_INSPECT_LOG"
-    if [[ "$3" == "${FAKE_RUNNER_IMAGE:-}" ]]; then
-      [[ -f "${FAKE_RUNNER_IMAGE_STATE:-}" ]]
-    elif [[ "$3" == "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
-      [[ -f "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]]
+    [[ "${2:-}" == inspect ]] || exit 1
+    image=${!#}
+    [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$image" >>"$FAKE_IMAGE_INSPECT_LOG"
+    if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" ]]; then
+      image_state=${FAKE_RUNNER_IMAGE_STATE:-}
+    elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
+      image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
     else
       exit 1
     fi
+    [[ -f "$image_state" ]] || exit 1
+    cat "$image_state"
     ;;
   volume|network)
     [[ "${2:-}" == ls ]] && exit 0
@@ -89,8 +92,8 @@ case "${1:-}" in
         [[ -z "$paused_state" ]] || rm -f "$paused_state"
         ;;
       build)
-        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || : >"$FAKE_RUNNER_IMAGE_STATE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || : >"$FAKE_CONTROLLER_IMAGE_STATE"
+        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
+        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
         ;;
       config|logs) ;;
       *) exit 1 ;;
@@ -160,11 +163,17 @@ expect_command_failure() {
 }
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
-export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
+export FAKE_ENGINE_REF=$engine_ref
+runner_image="ci-fleet-runner:${engine_ref:0:12}"
+export FAKE_RUNNER_IMAGE=$runner_image
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
 export FAKE_RUNNER_IMAGE_STATE=$tmp/runner-image-present
 export FAKE_CONTROLLER_IMAGE_STATE=$tmp/controller-image-present
 export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
+for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile"; do
+  grep -Fq 'LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}"' "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
+done
+grep -Fq 'CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}' "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
@@ -223,7 +232,11 @@ git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
+staged_checkpoint="$root/var/lib/ci-fleet/checkpoints/.checkpoint.staging.interrupted"
+mkdir -p "$staged_checkpoint"
+: >"$staged_checkpoint/.complete"
 expect_failure 'no controller checkpoint is available' "$installer" --rollback
+rm -rf "$staged_checkpoint"
 expect_failure 'secret-bearing files are forbidden' "$installer" --check "${base_args[@]}" --ref "$forbidden_ref"
 expect_failure 'possible committed secret detected' "$installer" --check "${base_args[@]}" --ref "$secret_ref"
 export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
@@ -263,6 +276,10 @@ rm -f "$FAKE_CONTROLLER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$FAKE_RUNNER_IMAGE_STATE" && -f "$FAKE_CONTROLLER_IMAGE_STATE" ]] || fail 'candidate build did not restore the controller image'
+printf '%040d\n' 0 >"$FAKE_RUNNER_IMAGE_STATE"
+expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(<"$FAKE_RUNNER_IMAGE_STATE") == "$engine_ref" && $(<"$FAKE_CONTROLLER_IMAGE_STATE") == "$engine_ref" ]] || fail 'candidate build did not restore managed image provenance'
 if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
 : >"$FAKE_IMAGE_INSPECT_LOG"
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -362,6 +379,20 @@ expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_three" >/dev
 grep -Fq 'CI_FLEET_CONTROLLER_STATE=drained' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained state was not rendered'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=0' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained controller retained effective capacity'
 [[ ! -f "$FAKE_DOCKER_STATE" ]] || fail 'drained controller remained running'
+export FAKE_RUNNER_STATE=$tmp/drained-managed-runner
+: >"$FAKE_RUNNER_STATE"
+expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
+rm -f "$FAKE_RUNNER_STATE"
+unset FAKE_RUNNER_STATE
+
+ref_four=$(write_config disabled 2 2)
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_four" >/dev/null
+grep -Fq 'CI_FLEET_CONTROLLER_STATE=disabled' "$root/etc/ci-fleet/ci-fleet.env" || fail 'disabled state was not rendered'
+export FAKE_RUNNER_STATE=$tmp/disabled-managed-runner
+: >"$FAKE_RUNNER_STATE"
+expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_four"
+rm -f "$FAKE_RUNNER_STATE"
+unset FAKE_RUNNER_STATE
 
 export FAKE_RUNNER_STATE_ONCE=$tmp/orphaned-managed-runner
 : >"$FAKE_RUNNER_STATE_ONCE"
