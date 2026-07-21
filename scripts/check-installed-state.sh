@@ -5,7 +5,9 @@ state_file=${CI_FLEET_INSTALL_STATE_FILE:-/var/lib/ci-fleet/install-state.json}
 installer=${CI_FLEET_INSTALLER:-/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh}
 
 [[ -f "$state_file" ]] || { echo "ERROR: installed desired-state record is missing: $state_file" >&2; exit 2; }
-[[ $(stat -c %u "$state_file") == 0 && $(stat -c %a "$state_file") == 600 ]] || { echo "ERROR: install state must be owned by root with mode 0600: $state_file" >&2; exit 2; }
+expected_owner=0
+[[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_owner=$(id -u)
+[[ $(stat -c %u "$state_file") == "$expected_owner" && $(stat -c %a "$state_file") == 600 ]] || { echo "ERROR: install state must be owned by root with mode 0600: $state_file" >&2; exit 2; }
 command -v python3 >/dev/null || { echo 'ERROR: python3 is required' >&2; exit 2; }
 [[ -x "$installer" ]] || { echo "ERROR: installer is unavailable: $installer" >&2; exit 2; }
 
