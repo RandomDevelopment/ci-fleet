@@ -15,6 +15,11 @@ EXCLUDED = {
     "docs/SECRETS.md",
     "scripts/scan_committed_secrets.py",
     "scripts/validate.sh",
+    "templates/config-repository/scripts/scan_committed_secrets.py",
+}
+SCANNER_PATHS = {
+    "scripts/scan_committed_secrets.py",
+    "templates/config-repository/scripts/scan_committed_secrets.py",
 }
 PATTERN = re.compile(
     rb"BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|"
@@ -53,7 +58,7 @@ def main() -> int:
         if not raw:
             continue
         relative = raw.decode("utf-8")
-        if args.commit is None and relative in EXCLUDED:
+        if relative in SCANNER_PATHS or (args.commit is None and relative in EXCLUDED):
             continue
         if args.commit is None:
             data = (repository / relative).read_bytes()
