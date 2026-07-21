@@ -321,11 +321,14 @@ release_matches() {
 }
 
 managed_images_match() {
-  local image
+  local image provenance
   local -a expected_images=()
   mapfile -t expected_images < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" || $1 == "CI_FLEET_RUNNER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
   [[ ${#expected_images[@]} == 2 ]] || return 1
-  for image in "${expected_images[@]}"; do docker image inspect "$image" >/dev/null 2>&1 || return 1; done
+  for image in "${expected_images[@]}"; do
+    provenance=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image" 2>/dev/null) || return 1
+    [[ "$provenance" == "$engine_ref" ]] || return 1
+  done
 }
 
 systemd_matches() {
@@ -353,6 +356,10 @@ drift_count() {
   release_matches || { note 'DRIFT engine_release'; count=$((count + 1)); }
   state_matches || { note 'DRIFT install_state'; count=$((count + 1)); }
   runtime_matches "$target_state" || { note 'DRIFT controller_runtime'; count=$((count + 1)); }
+  if [[ "$target_state" != active && $(managed_runner_count) != 0 ]]; then
+    note 'DRIFT managed_runners'
+    count=$((count + 1))
+  fi
   managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
   systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
   DRIFT_COUNT=$count
@@ -750,7 +757,7 @@ perform_converge() {
 
 latest_checkpoint() {
   [[ -d "$checkpoints_dir" ]] || return 0
-  { find "$checkpoints_dir" -mindepth 2 -maxdepth 2 -type f -name .complete -printf '%T@ %h\n' 2>/dev/null || true; } | sort -nr | awk 'NR == 1 {print $2}'
+  { find "$checkpoints_dir" -mindepth 2 -maxdepth 2 -type f -name .complete ! -path "$checkpoints_dir/.checkpoint.staging.*/*" -printf '%T@ %h\n' 2>/dev/null || true; } | sort -nr | awk 'NR == 1 {print $2}'
 }
 
 perform_rollback() {

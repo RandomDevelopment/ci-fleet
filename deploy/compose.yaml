@@ -6,6 +6,7 @@ services:
     build:
       context: ../runner
       args:
+        CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
         RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.335.1}
     command: ["/bin/true"]
     deploy:
