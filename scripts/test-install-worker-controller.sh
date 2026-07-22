@@ -84,7 +84,7 @@ case "${1:-}" in
     if [[ -n "${FAKE_COMPOSE_LOG:-}" ]]; then
       instance=
       [[ ! -f "$env_file" ]] || instance=$(awk -F= '$1 == "CI_FLEET_INSTANCE" {print $2}' "$env_file")
-      printf '%s|%s|%s\n' "$command" "$env_file" "$instance" >>"$FAKE_COMPOSE_LOG"
+      printf '%s|%s|%s|%s\n' "$command" "$env_file" "$instance" "$*" >>"$FAKE_COMPOSE_LOG"
     fi
     case "$command" in
       up)
@@ -317,6 +317,26 @@ mv "$host_config.missing" "$host_config"
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+python3 - "$install_state" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["controller"] = "legacy-ci-01"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle)
+    handle.write("\n")
+PY
+python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_INSTANCE=example-ci-01", "CI_FLEET_INSTANCE=legacy-ci-01"))' "$rendered_env"
+chmod 600 "$install_state" "$rendered_env"
+[[ $(stat -c '%u:%a' "$install_state") == "$(id -u):600" ]] || fail 'installed-identity fixture metadata is invalid'
+export FAKE_RUNNER_STATE_ONCE=$tmp/repeat-install-managed-runner
+: >"$FAKE_RUNNER_STATE_ONCE"
+: >"$FAKE_DOCKER_PS_LOG"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'repeat install did not drain the installed controller identity'
+grep -Fq 'CI_FLEET_INSTANCE=example-ci-01' "$rendered_env" || fail 'repeat install did not restore the desired controller identity'
+unset FAKE_RUNNER_STATE_ONCE
 printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -445,7 +465,11 @@ expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --re
 unset FAKE_RESTART_AFTER_UP
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'restarting candidate blocked checkpoint restoration'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'restarting candidate rollback did not restore capacity one'
+export FAKE_COMPOSE_LOG=$tmp/upgrade-compose.log
+: >"$FAKE_COMPOSE_LOG"
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >/dev/null
+grep -Eq 'stop\|.*\|example-ci-01\|.* stop --timeout 2 controller$' "$FAKE_COMPOSE_LOG" || fail 'controller stop did not use the explicit graceful-shutdown timeout'
+unset FAKE_COMPOSE_LOG
 grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade did not apply capacity two'
 
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
