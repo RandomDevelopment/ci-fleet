@@ -425,8 +425,12 @@ systemd_matches() {
 }
 
 drift_count() {
-  local count=0
-  if [[ ! -f "$rendered_env" ]] || ! cmp -s "$candidate_env" "$rendered_env"; then
+  local count=0 expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ ! -f "$rendered_env" ]] \
+    || [[ $(stat -c %u "$rendered_env") != "$expected_owner" ]] \
+    || [[ $(stat -c %a "$rendered_env") != 600 ]] \
+    || ! cmp -s "$candidate_env" "$rendered_env"; then
     note 'DRIFT rendered_environment'
     count=$((count + 1))
   fi
@@ -579,6 +583,7 @@ make_checkpoint() {
 
 try_drain_current() {
   local deadline count old_release status paused=false force_nonterminal=${1:-false}
+  local drain_env=${2:-$rendered_env} fallback_release=${3:-}
   drain_error=
   status=$(controller_status)
   case "$status" in
@@ -588,18 +593,20 @@ try_drain_current() {
         drain_error="cannot safely drain controller in non-terminal state: $status"
         return 1
       fi
-      [[ -f "$rendered_env" ]] || { drain_error='cannot stop a non-terminal candidate without its rendered environment'; return 1; }
+      [[ -f "$drain_env" ]] || { drain_error='cannot stop a non-terminal candidate without its rendered environment'; return 1; }
       old_release=$(current_runtime_release)
+      [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
-      compose "$old_release" "$rendered_env" stop controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
+      compose "$old_release" "$drain_env" stop controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
       status=
       ;;
   esac
   if [[ "$status" == running ]]; then
-    if [[ ! -f "$rendered_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
+    if [[ ! -f "$drain_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
     old_release=$(current_runtime_release)
+    [[ -n "$old_release" ]] || old_release=$fallback_release
     if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-    if ! compose "$old_release" "$rendered_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
+    if ! compose "$old_release" "$drain_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
     paused=true
   fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
@@ -607,7 +614,7 @@ try_drain_current() {
     count=$(managed_runner_count)
     if [[ "$count" == 0 ]]; then break; fi
     if ((SECONDS >= deadline)); then
-      if [[ "$paused" == true ]]; then compose "$old_release" "$rendered_env" unpause controller >/dev/null || true; fi
+      if [[ "$paused" == true ]]; then compose "$old_release" "$drain_env" unpause controller >/dev/null || true; fi
       drain_error="drain timed out with $count managed runner(s) still present"
       return 1
     fi
@@ -618,18 +625,18 @@ try_drain_current() {
     note 'DRAIN_OK managed_runners=0'
     return 0
   fi
-  compose "$old_release" "$rendered_env" kill --signal SIGTERM controller >/dev/null || {
-    compose "$old_release" "$rendered_env" unpause controller >/dev/null 2>&1 || true
+  compose "$old_release" "$drain_env" kill --signal SIGTERM controller >/dev/null || {
+    compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || true
     drain_error='failed to signal the paused controller for graceful scale-set cleanup'
     return 1
   }
   if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
-    compose "$old_release" "$rendered_env" unpause controller >/dev/null || {
+    compose "$old_release" "$drain_env" unpause controller >/dev/null || {
       drain_error='failed to unpause the signaled controller for graceful shutdown'
       return 1
     }
   fi
-  compose "$old_release" "$rendered_env" stop controller >/dev/null || {
+  compose "$old_release" "$drain_env" stop controller >/dev/null || {
     drain_error='could not stop the drained controller'
     return 1
   }
@@ -718,9 +725,13 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state failed=0
+  local target restored_state failed=0 checkpoint_release=
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
-  if ! try_drain_current true; then
+  if [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
+  fi
+  [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
+  if ! try_drain_current true "$checkpoint_dir/ci-fleet.env" "$checkpoint_release"; then
     note "ROLLBACK_FAILED reason=$drain_error"
     return 1
   fi
@@ -809,7 +820,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status
+  local count existing_status desired_controller_id=$controller_id
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -829,7 +840,12 @@ perform_converge() {
   install_release
   make_checkpoint
   transaction_active=true
+  if [[ "$mode" == adopt ]]; then
+    [[ -f "$state_file" || -f "$rendered_env" ]] || die '--adopt requires a trusted installed controller identity'
+    load_installed_controller_identity
+  fi
   drain_current
+  controller_id=$desired_controller_id
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
   build_candidate
   activate_candidate
@@ -845,7 +861,7 @@ latest_checkpoint() {
 perform_rollback() {
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
-  load_installed_controller_identity "$state_file" "$rendered_env"
+  load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
   restore_checkpoint || die 'checkpoint restoration failed'
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
 }

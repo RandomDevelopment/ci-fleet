@@ -6,7 +6,7 @@ This repository defines a portable, public, self-hosted GitHub Actions CI fleet 
 
 ## Current phase
 
-The project is in architecture definition and isolated proof-of-concept planning. Do not create or alter production deployment paths until the design decisions are recorded and the isolated proof of concept is approved.
+The isolated proof of concept is approved and the project is in controlled migration. The accepted scope and remaining gates are recorded in `docs/DESIGN-DECISIONS.md`. Managed ordinary-CI controller lifecycle is permitted only through reviewed schema-v3 desired state; production deployment paths remain separately gated.
 
 ## Sources of truth
 

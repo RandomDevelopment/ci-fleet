@@ -18,6 +18,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
+| Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
 | Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
 | See what informed the design | [Discovery summary](DISCOVERY-SUMMARY.md) |
@@ -41,6 +42,7 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 - [System architecture](ARCHITECTURE.md)
 - [Runner controller design](CONTROLLER-DESIGN.md)
+- [Accepted design decisions](DESIGN-DECISIONS.md)
 - [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)
@@ -67,7 +69,7 @@ These pages are normative for compatible projects and hosts:
 - [Maintain, drain, clean, update, and reboot hosts](HOST-MAINTENANCE.md)
 - [Use the public configuration-repository scaffold](../templates/config-repository/README.md)
 
-The schema-v3 worker-controller installer is implemented as `scripts/install-worker-controller.sh`. It remains experimental; use the [desired-state guide](DESIRED-STATE.md), pin both configuration and engine commits, and retain the manual pilot runbook for isolated first-job proof.
+The schema-v3 worker-controller installer is implemented as `scripts/install-worker-controller.sh`. Its accepted scope is isolated ordinary-CI fleet hosts under reviewed desired state; use the [desired-state guide](DESIRED-STATE.md), pin both configuration and engine commits, and retain the manual pilot runbook for each host's isolated first-job proof.
 
 ## Project integration examples
 

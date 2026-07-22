@@ -2,158 +2,108 @@
 
 Use this procedure only after the strict one-runner pilot has passed. It validates and changes one already isolated controller; it does not authorize a project workflow by itself.
 
-`scripts/preflight.sh` remains the initial pilot gate and accepts only `MIN=0`, `MAX=1`. `scripts/capacity-preflight.sh` is a separate, read-only post-pilot gate. It never edits host configuration.
+Schema-v3 private desired state owns capacity. Never edit `/etc/ci-fleet/ci-fleet.env` directly: it is rendered state and the drift checker will replace local changes.
 
 ## Capacity policy
 
 Declare the policy before observing a larger workload:
 
-- requested MAX is explicitly and exclusively two for this first post-pilot procedure; any other target is rejected;
+- requested MAX is exactly two for this first post-pilot procedure;
 - `MIN` remains zero;
-- the configured instance, scale set, routing label, runner group, Docker socket group, and per-runner limits must equal the running controller's effective values;
+- both the controller `max_runners` and pool `capacity_budget` change in one reviewed private configuration PR;
+- the configured instance, scale set, routing label, runner group, Docker socket group, and per-runner limits remain unchanged;
 - no managed runner, project job resource, unrelated running container, controller OOM, or current-boot kernel OOM evidence may exist;
-- Docker filesystem use must be below `CI_FLEET_DISK_WARN_PERCENT` (80 by default);
-- reserve the controller's Compose limit: 1 CPU and 512 MiB;
-- reserve 1 CPU and 1 GiB for Docker overhead;
-- reserve for the operating system the greater of 1 CPU or 15% of logical CPU capacity;
-- reserve for the operating system the greater of 2 GiB or 20% of physical memory;
-- admit `target MAX × CI_FLEET_RUNNER_CPUS` and `target MAX × CI_FLEET_RUNNER_MEMORY_MIB` only when those allocations plus all reserves fit;
+- Docker filesystem use stays below `CI_FLEET_DISK_WARN_PERCENT` (80 by default);
+- reserve 1 CPU and 512 MiB for the controller, 1 CPU and 1 GiB for Docker overhead, and the greater of 1 CPU/15% plus 2 GiB/20% for the operating system;
+- admit `target MAX × CI_FLEET_RUNNER_CPUS` and `target MAX × CI_FLEET_RUNNER_MEMORY_MIB` only when the allocation and reserves fit; and
 - require currently available memory to cover all target runners plus controller and Docker reservations.
 
-Runner limits are controller admission inputs. Project containers use the host Docker daemon as siblings of the runner container, so the separately authorized live proof must still observe whole-host CPU, memory, disk, collision, and cleanup behavior.
+Project containers use the host Docker daemon as siblings of the runner container. The separately authorized live proof must therefore observe whole-host CPU, memory, disk, collisions, and cleanup.
 
-During a live proof, retain the target only if every five-second sample keeps CPU busy below 85%, available memory at or above the greater of 2 GiB or 20% of total memory, and Docker filesystem use below 80%. Any OOM, unrelated workload, controller/Docker failure, third runner, observer gap, or cleanup residue requires restoration.
+During that proof, retain MAX=2 only if every five-second sample keeps CPU busy below 85%, available memory at or above the greater of 2 GiB or 20% of total memory, and Docker filesystem use below 80%. Any OOM, unrelated workload, controller/Docker failure, third runner, observer gap, or cleanup residue requires restoration.
 
-## 1. Verify idle pilot state
+## 1. Gate dispatch and verify the one-runner state
 
-Gate all dispatches that can target this controller. Confirm no queued, assigned, or running fleet job and no instance-owned runner in any state. Keep the dispatch gate closed until post-change verification completes.
+Block dispatches that can target this controller. Confirm no queued, assigned, or running fleet job and no instance-owned runner in any state. Keep dispatch gated through post-change verification.
 
-From the reviewed checkout, load the root-only host configuration without tracing or printing it:
-
-```bash
-set -Eeuo pipefail
-set +x
-cd /opt/ci-fleet
-set -a
-. /etc/ci-fleet/ci-fleet.env
-set +a
-scripts/preflight.sh
-```
-
-Require exactly `PREFLIGHT_OK warnings=0`. This proves the original `MIN=0`, `MAX=1` pilot contract remains valid.
+Run the current installed preflight and health checks from clean processes. Require the existing one-runner contract, controller health, and an empty instance-scoped cleanup dry-run.
 
 ## 2. Validate target capacity without changing it
+
+From the installed reviewed release, run:
 
 ```bash
 scripts/capacity-preflight.sh --phase pre-change --target-max 2
 ```
 
-Require `CAPACITY_PREFLIGHT_OK phase=pre-change target_max=2 configured_max=1 effective_max=1`. Record only the safe budget summaries.
+Require:
 
-## 3. Create one protected backup
-
-Use one UTC timestamp and refuse to overwrite an existing path:
-
-```bash
-backup_dir=/etc/ci-fleet/backups
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-backup="$backup_dir/ci-fleet.env.before-max2.$stamp"
-install -d -o root -g root -m 0700 "$backup_dir"
-test ! -e "$backup"
-install -o root -g root -m 0600 /etc/ci-fleet/ci-fleet.env "$backup"
-cmp -s /etc/ci-fleet/ci-fleet.env "$backup"
-sha256sum "$backup" | cut -d' ' -f1
+```text
+CAPACITY_PREFLIGHT_OK phase=pre-change target_max=2 configured_max=1 effective_max=1
 ```
 
-Record the path and checksum only. Never print or copy the backup contents, and do not delete the backup during the proof.
+Record only the safe budget summary.
 
-## 4. Change one exact setting
+## 3. Review and merge private desired state
 
-Before editing, require exactly one active assignment and the pilot value:
+In the secret-free private configuration repository:
 
-```bash
-test "$(grep -c '^CI_FLEET_MAX_RUNNERS=' /etc/ci-fleet/ci-fleet.env)" -eq 1
-grep -qx 'CI_FLEET_MAX_RUNNERS=1' /etc/ci-fleet/ci-fleet.env
-```
+1. raise only the selected controller's `max_runners` from one to two;
+2. raise its pool `capacity_budget` only as needed to admit that reviewed controller maximum;
+3. keep `min_runners`, runner resources, identity, lifecycle, routing, trust, and engine pin unchanged;
+4. run the complete strict validator, policy tests, and committed-secret scan;
+5. obtain the repository's configured exact-head review and CI gates; and
+6. merge normally.
 
-Edit only that line to `CI_FLEET_MAX_RUNNERS=2`. Then verify without printing a diff:
+Record the previous and new full private configuration commits. Do not edit a rendered host file or bypass the desired-state PR.
 
-```bash
-test "$(stat -c '%u:%g:%a' /etc/ci-fleet/ci-fleet.env)" = 0:0:600
-test "$(grep -c '^CI_FLEET_MAX_RUNNERS=' /etc/ci-fleet/ci-fleet.env)" -eq 1
-grep -qx 'CI_FLEET_MAX_RUNNERS=2' /etc/ci-fleet/ci-fleet.env
-cmp -s \
-  <(grep -v '^CI_FLEET_MAX_RUNNERS=' "$backup") \
-  <(grep -v '^CI_FLEET_MAX_RUNNERS=' /etc/ci-fleet/ci-fleet.env)
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
-```
+## 4. Apply the exact merged configuration
 
-Do not run the pilot preflight against MAX=2; it must continue to reject that value. Every Compose command below uses `env -i` so stale values exported when the pilot file was sourced cannot override the explicit `--env-file` during promotion or rollback.
-
-## 5. Recreate only the controller
-
-Reconfirm zero runners and zero jobs immediately before stopping. Stop only the controller with enough grace for scale-set deletion:
+Reconfirm the idle gates, then apply the exact merged private commit through the installed manager:
 
 ```bash
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
+sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
+  --upgrade \
+  --config-repo ORGANIZATION/PRIVATE-CONFIGURATION \
+  --ref NEW_PRIVATE_CONFIGURATION_COMMIT \
+  --controller CONTROLLER_ID
 ```
 
-Verify the exact old scale set is absent and there is no runner before starting the replacement. Do not delete an apparent duplicate until ownership and zero active jobs are proven.
+The installer must create a protected checkpoint, drain the selected instance, validate the managed target, change only the selected controller, start it, and pass health before reporting convergence. A failed activation must restore the checkpoint and keep dispatch closed.
 
-```bash
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
-  up -d --no-deps --force-recreate --timeout 60 controller
-```
+Do not recreate runner jobs, remove volumes, or touch unrelated Docker resources.
 
-Do not recreate `runner-image`, remove volumes, rebuild images, or touch unrelated resources.
+## 5. Verify effective state
 
-## 6. Verify effective state
+Require one running controller, restart count zero, one intended scale set, the unchanged routing label and runner group, no idle runner, and the exact reviewed MAX=2.
 
-Wait boundedly for one sanitized `controller ready` record reporting `minRunners=0` and `maxRunners=2`. Require one running controller, restart count zero, one intended scale set, the unchanged experimental routing label and runner group, and no idle runner.
-
-Reload the host configuration and run:
+Run:
 
 ```bash
 scripts/capacity-preflight.sh --phase post-change --target-max 2
 scripts/healthcheck.sh
 ```
 
-Require both to pass. The post-change preflight compares configured state with a filtered set of effective controller values and never prints arbitrary container environment entries.
+Require both to pass, plus a clean desired-state `--check` and empty instance-scoped cleanup dry-run.
 
-## 7. Run one separately authorized proof
+## 6. Run one separately authorized proof
 
 Start bounded runner, task-job, project-resource, and host-metric observers before dispatch. Dispatch exactly the approved workload once. Do not retry a failed proof and do not raise MAX above two.
 
-Observe runner creation/destruction, actual two-way overlap, no third runner, whole-host CPU/memory/disk thresholds, Docker/controller health, exact project identity, and automatic cleanup. Run the instance-scoped cleanup dry-run and healthcheck after all jobs terminate.
+Observe runner creation/destruction, actual two-way overlap, no third runner, whole-host resource thresholds, Docker/controller health, exact project identity, and automatic cleanup. Repeat health, drift, and cleanup dry-run checks after all jobs terminate.
 
-## 8. Retain or restore (rollback)
+## 7. Retain or restore
 
-Retain MAX=2 only when the authorized workload succeeds, actual two-way job and runner overlap is proven, every predeclared resource threshold passes, no manual cleanup is required, all runner/project residue is zero, post-change capacity preflight passes, cleanup dry-run is empty, and healthcheck passes.
+Retain MAX=2 only when every predeclared gate passes and no manual cleanup is required.
 
-On any failure, keep dispatch gated, wait for exact job termination, and restore the backup:
-
-```bash
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml stop -t 60 controller
-install -o root -g root -m 0600 "$backup" /etc/ci-fleet/ci-fleet.env
-cmp -s "$backup" /etc/ci-fleet/ci-fleet.env
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml config --quiet
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  docker compose --env-file /etc/ci-fleet/ci-fleet.env -f deploy/compose.yaml \
-  up -d --no-deps --force-recreate --timeout 60 controller
-```
-
-Verify a sanitized ready record with `MIN=0`, `MAX=1`, then run the pilot preflight and healthcheck from clean processes that source only the restored file:
+On any failure, keep dispatch gated and apply the recorded previous private configuration commit through the same reviewed `--upgrade` path:
 
 ```bash
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  bash -c 'set -a; . /etc/ci-fleet/ci-fleet.env; set +a; exec scripts/preflight.sh'
-env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-  bash -c 'set -a; . /etc/ci-fleet/ci-fleet.env; set +a; exec scripts/healthcheck.sh'
+sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
+  --upgrade \
+  --config-repo ORGANIZATION/PRIVATE-CONFIGURATION \
+  --ref PREVIOUS_PRIVATE_CONFIGURATION_COMMIT \
+  --controller CONTROLLER_ID
 ```
 
-Run the instance-scoped cleanup dry-run. Require zero runners, zero jobs, one intended scale set, no duplicate controller, and no residue before reopening dispatch.
+Require the restored MAX=1, clean desired-state check, health pass, zero runners/jobs/residue, one intended scale set, and empty instance-scoped cleanup dry-run before reopening dispatch. Preserve installer checkpoint and proof evidence without recording credential values.

@@ -234,11 +234,11 @@ if grep -Fq 'CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT' <<<"$secret_output"; then fa
 xtrace_output=$(bash -x "$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 2>&1) || fail 'xtrace secret-output fixture unexpectedly failed'
 if grep -Fq 'CAPACITY_TEST_SECRET_SHOULD_NOT_PRINT' <<<"$xtrace_output"; then fail 'capacity preflight exposed controller environment through inherited xtrace'; fi
 
-for term in backup force-recreate --no-deps healthcheck retain restore rollback; do
+for term in 'private desired state' --upgrade --config-repo --ref healthcheck retain restore checkpoint; do
   grep -Fqi -- "$term" "$repo_root/docs/CAPACITY-PROMOTION.md" || fail "capacity procedure is missing $term"
 done
-grep -Fq 'env -i' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity procedure does not isolate Compose interpolation from stale shell values'
-grep -Fq 'exec scripts/preflight.sh' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'rollback does not run pilot preflight from a clean restored environment'
+grep -Fq 'PREVIOUS_PRIVATE_CONFIGURATION_COMMIT' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity rollback does not apply the previous reviewed desired state'
+if grep -Eq 'Edit only|force-recreate|ci-fleet\.env\.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity procedure still edits rendered host state'; fi
 grep -Fq 'scripts/capacity-preflight.sh' "$repo_root/docs/ADDING-A-HOST.md" || fail 'host guide does not link the capacity procedure'
 if grep -Riq --exclude='test-capacity-preflight.sh' 'docker system prune' "$repo_root/scripts"; then fail 'unrestricted prune exists in scripts'; fi
 

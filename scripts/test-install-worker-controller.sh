@@ -287,6 +287,11 @@ expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET
 expect_failure 'DRIFT install_state' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c %a "$install_state") == 600 ]] || fail 'convergence did not repair install-state mode'
+rendered_env=$root/etc/ci-fleet/ci-fleet.env
+chmod 644 "$rendered_env"
+expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ $(stat -c %a "$rendered_env") == 600 ]] || fail 'convergence did not repair rendered-environment mode'
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER
@@ -432,6 +437,7 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upg
 
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
+rm -f "$root/var/lib/ci-fleet/install-state.json" "$root/etc/ci-fleet/ci-fleet.env"
 expect_success "$installer" --rollback >/dev/null
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
@@ -495,15 +501,25 @@ printf '%s\n' \
   'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
   'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
   "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$adopt_pem" \
-  'CI_FLEET_RUNNER_TTL=6h' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
+  'CI_FLEET_RUNNER_TTL=6h' \
+  'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 : >"$FAKE_DOCKER_STATE"
 chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 
+export FAKE_RUNNER_STATE_ONCE=$tmp/adopt-managed-runner
+: >"$FAKE_RUNNER_STATE_ONCE"
+: >"$FAKE_DOCKER_PS_LOG"
 adopt=$(expect_success "$installer" --adopt "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 [[ -f "$adopt_root/etc/ci-fleet/host.env" ]] || fail 'adoption did not separate host-local values'
+grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
+unset FAKE_RUNNER_STATE_ONCE
+
+grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
+if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi
+grep -Fq -- '--upgrade' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity runbook does not apply reviewed desired state through the installer'
 
 printf 'INSTALLER_TESTS_OK\n'
