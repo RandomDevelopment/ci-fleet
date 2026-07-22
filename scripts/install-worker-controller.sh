@@ -781,7 +781,7 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state failed=0 checkpoint_release= drain_env=$rendered_env drain_release=
+  local target restored_state failed=0 checkpoint_release='' drain_env=$rendered_env drain_release=''
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
   drain_release=$(current_runtime_release)
