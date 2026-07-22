@@ -207,6 +207,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.errors.append("$.runner_pools: must be a non-empty object")
         pools = {}
     pool_capacity: dict[str, int] = {}
+    runner_groups: dict[str, str] = {}
     for name, pool in pools.items():
         path = f"$.runner_pools.{name}"
         validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "pool name must be a lowercase slug")
@@ -224,6 +225,11 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         labels = pool.get("routing_labels")
         repos = pool.get("allowed_repositories")
         validation.require(isinstance(runner_group, str) and bool(SLUG.fullmatch(runner_group)), f"{path}.runner_group", "must be a lowercase logical runner-group slug")
+        if isinstance(runner_group, str) and SLUG.fullmatch(runner_group):
+            if runner_group in runner_groups:
+                validation.errors.append(f"{path}.runner_group: must be unique; also used by {runner_groups[runner_group]}")
+            else:
+                runner_groups[runner_group] = name
         validation.require(isinstance(labels, list) and bool(labels), f"{path}.routing_labels", "must be a non-empty list")
         if isinstance(labels, list):
             validation.require(len(labels) == len(set(labels)), f"{path}.routing_labels", "must contain unique labels")
