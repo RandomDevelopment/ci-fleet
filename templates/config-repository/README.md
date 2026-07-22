@@ -88,7 +88,7 @@ Use `--adopt` instead of `--install` to bring an existing controller under Git-a
 
 The command runs on the target Linux Docker machine. It validates the pinned configuration, renders host-local runtime state, preserves root-owned secrets, drains before disruptive changes, verifies a recoverable checkpoint, installs maintenance services, checks health, and reports drift without exposing credentials. OpenClaw or another agent may invoke it, but no agent is required.
 
-The engine-side implementation is `scripts/install-worker-controller.sh` in the parent ci-fleet repository and remains experimental. This configuration repository never installs a controller by itself.
+The engine-side implementation is `scripts/install-worker-controller.sh` in the parent ci-fleet repository. Its accepted scope is isolated ordinary-CI fleet hosts under reviewed schema-v3 desired state; this configuration repository never installs a controller by itself.
 
 ## Drain, retire, and delete a controller host
 
