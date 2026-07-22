@@ -177,11 +177,14 @@ validate_candidate_config_commit() {
 }
 
 prepare_host_config() {
+  local expected_owner=0
   effective_host_config=$host_config
   if [[ -f "$host_config" ]]; then
     return
   fi
   if [[ -f "$rendered_env" && "$mode" == adopt ]]; then
+    [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+    [[ $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $rendered_env"
     install -d -m 0700 "$etc_dir"
     python3 "$repo_root/scripts/desired_state.py" extract-host-env \
       --source "$rendered_env" --output "$effective_host_config"
@@ -203,6 +206,30 @@ verify_host_files() {
   mode_bits=$(stat -c '%a' "$key_file")
   owner=$(stat -c '%u' "$key_file")
   [[ "$mode_bits" == 600 && "$owner" == "$expected_owner" ]] || die 'GitHub App PEM must be owned by root and have mode 0600'
+}
+
+load_installed_controller_identity() {
+  local source_state=${1:-$state_file} source_env=${2:-$rendered_env} expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ -f "$source_state" ]]; then
+    [[ $(stat -c %u "$source_state") == "$expected_owner" && $(stat -c %a "$source_state") == 600 ]] || die "install state must be owned by root with mode 0600: $source_state"
+    controller_id=$(python3 - "$source_state" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))["controller"]
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(2)
+print(value)
+PY
+    ) || die "installed controller identity is invalid: $source_state"
+  elif [[ -f "$source_env" ]]; then
+    [[ $(stat -c %u "$source_env") == "$expected_owner" && $(stat -c %a "$source_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $source_env"
+    controller_id=$(awk -F= '$1 == "CI_FLEET_INSTANCE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$source_env") || die "installed controller identity is invalid: $source_env"
+  else
+    die 'installed controller identity is unavailable'
+  fi
+  [[ "$controller_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'installed controller identity is invalid'
 }
 
 docker_gid() {
@@ -272,20 +299,23 @@ current_runtime_release() {
 managed_runner_count() {
   docker ps -q \
     --filter label=io.randomdevelopment.ci-fleet.managed=true \
-    --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner \
+    --filter "label=io.randomdevelopment.ci-fleet.instance=$controller_id" | wc -l | tr -d ' '
 }
 
 managed_runner_total_count() {
   docker ps --all -q \
     --filter label=io.randomdevelopment.ci-fleet.managed=true \
-    --filter label=io.randomdevelopment.ci-fleet.kind=runner | wc -l | tr -d ' '
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner \
+    --filter "label=io.randomdevelopment.ci-fleet.instance=$controller_id" | wc -l | tr -d ' '
 }
 
 remove_inactive_managed_runners() {
   local -a containers=()
   mapfile -t containers < <(docker ps --all -q \
     --filter label=io.randomdevelopment.ci-fleet.managed=true \
-    --filter label=io.randomdevelopment.ci-fleet.kind=runner)
+    --filter label=io.randomdevelopment.ci-fleet.kind=runner \
+    --filter "label=io.randomdevelopment.ci-fleet.instance=$controller_id")
   ((${#containers[@]} == 0)) || docker rm "${containers[@]}" >/dev/null
 }
 
@@ -305,10 +335,15 @@ controller_environment_matches() {
 }
 
 runtime_matches() {
-  local expected=$1 provenance status
+  local expected=$1 expected_image expected_image_ref live_image provenance status
   status=$(controller_status)
   if [[ "$expected" == active ]]; then
     [[ "$status" == running ]] || return 1
+    expected_image_ref=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    [[ -n "$expected_image_ref" ]] || return 1
+    live_image=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null) || return 1
+    expected_image=$(docker image inspect --format '{{.Id}}' "$expected_image_ref" 2>/dev/null) || return 1
+    [[ "$live_image" == "$expected_image" ]] || return 1
     provenance=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) || return 1
     [[ "$provenance" == "$engine_ref" ]] || return 1
     controller_environment_matches
@@ -333,17 +368,24 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 marker
+  local path=$1 expected=$2 marker required
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
+  for required in controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
+    [[ -f "$path/$required" ]] || return 1
+  done
   marker=$(<"$path/.ci-fleet-engine-ref")
   [[ "$marker" == "$expected" ]]
 }
 
 manager_release_complete() {
-  local path=$1 expected=$2 marker unit
+  local path=$1 expected=$2 marker required unit
   runtime_release_complete "$path" "$expected" || return 1
   [[ -x "$path/scripts/install-worker-controller.sh" && -x "$path/scripts/check-installed-state.sh" ]] || return 1
+  for required in scripts/desired_state.py scripts/scan_committed_secrets.py templates/config-repository/fleet.schema.json templates/config-repository/scripts/validate.py; do
+    [[ -f "$path/$required" ]] || return 1
+  done
+  [[ -x "$path/templates/config-repository/scripts/validate.sh" ]] || return 1
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
   marker=$(<"$path/.ci-fleet-engine-ref")
   [[ "$marker" == "$expected" ]]
@@ -640,6 +682,10 @@ activate_candidate() {
     fi
   else
     compose "$release_dir" "$rendered_env" stop controller >/dev/null 2>&1 || true
+    if ! runtime_matches "$target_state"; then
+      compose "$release_dir" "$rendered_env" down --remove-orphans >/dev/null
+      runtime_matches "$target_state" || die 'controller did not reach the requested non-active state'
+    fi
   fi
   staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
   staging_paths+=("$staged_state")
@@ -799,16 +845,19 @@ latest_checkpoint() {
 perform_rollback() {
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
+  load_installed_controller_identity "$state_file" "$rendered_env"
   restore_checkpoint || die 'checkpoint restoration failed'
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
 }
 
 perform_uninstall() {
   local old_release=
+  load_installed_controller_identity
   old_release=$(current_runtime_release)
   make_checkpoint
   transaction_active=true
   drain_current
+  remove_inactive_managed_runners
   if [[ -n "$old_release" && -f "$rendered_env" ]]; then
     compose "$old_release" "$rendered_env" down --remove-orphans || true
     (
