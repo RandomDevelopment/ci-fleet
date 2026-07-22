@@ -81,6 +81,11 @@ case "${1:-}" in
       case "$argument" in config|build|up|stop|pause|unpause|kill|down|logs|rm) command=$argument ;; esac
       previous=$argument
     done
+    if [[ -n "${FAKE_COMPOSE_LOG:-}" ]]; then
+      instance=
+      [[ ! -f "$env_file" ]] || instance=$(awk -F= '$1 == "CI_FLEET_INSTANCE" {print $2}' "$env_file")
+      printf '%s|%s|%s\n' "$command" "$env_file" "$instance" >>"$FAKE_COMPOSE_LOG"
+    fi
     case "$command" in
       up)
         if [[ -n "${FAKE_FAIL_UP_ONCE:-}" && -f "$FAKE_FAIL_UP_ONCE" ]]; then
@@ -371,6 +376,10 @@ printf '%s\n' "$bad_marker" >"$active_release/.ci-fleet-engine-ref"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$active_release/.ci-fleet-engine-ref") == "$engine_ref" ]] || fail 'bad release marker was not repaired'
+printf '\n# tampered runtime fixture\n' >>"$active_release/scripts/preflight.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+if grep -Fq 'tampered runtime fixture' "$active_release/scripts/preflight.sh"; then fail 'modified runtime release was reused'; fi
 rm -f "$active_release/deploy/compose.yaml"
 export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
 : >"$FAKE_FAIL_TAR_ONCE"
@@ -380,6 +389,10 @@ unset FAKE_FAIL_TAR_ONCE
 if compgen -G "$root/opt/ci-fleet/releases/.${engine_ref}.staging.*" >/dev/null; then fail 'interrupted release staging was not cleaned'; fi
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+if grep -Fq 'tampered manager fixture' "$manager_release/scripts/check-installed-state.sh"; then fail 'modified manager release was reused'; fi
 rm -f "$manager_release/scripts/check-installed-state.sh"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -492,16 +505,19 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
 export FAKE_DOCKER_STATE=$tmp/adopt-controller-running
-mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/opt/ci-fleet/deploy"
+mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
 adopt_pem=$adopt_root/etc/ci-fleet/secrets/github-app.pem
 printf 'fixture only\n' >"$adopt_pem"
 chmod 600 "$adopt_pem"
 cp "$repo_root/deploy/compose.yaml" "$adopt_root/opt/ci-fleet/deploy/compose.yaml"
+cp "$repo_root/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
+chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
 printf '%s\n' \
   'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
   'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
   "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$adopt_pem" \
   'CI_FLEET_RUNNER_TTL=6h' \
+  'CI_FLEET_CONTROLLER_STATE=active' \
   'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 : >"$FAKE_DOCKER_STATE"
@@ -509,6 +525,15 @@ chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 
+export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
+: >"$FAKE_COMPOSE_LOG"
+export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
+: >"$FAKE_RESTART_AFTER_UP"
+expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+unset FAKE_RESTART_AFTER_UP
+grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
+grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
+: >"$FAKE_COMPOSE_LOG"
 export FAKE_RUNNER_STATE_ONCE=$tmp/adopt-managed-runner
 : >"$FAKE_RUNNER_STATE_ONCE"
 : >"$FAKE_DOCKER_PS_LOG"
@@ -516,7 +541,7 @@ adopt=$(expect_success "$installer" --adopt "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 [[ -f "$adopt_root/etc/ci-fleet/host.env" ]] || fail 'adoption did not separate host-local values'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
-unset FAKE_RUNNER_STATE_ONCE
+unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi
