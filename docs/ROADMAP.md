@@ -62,6 +62,8 @@ Exit condition: both projects pass on the new fleet without removing the old pat
 
 ## Phase 5: Distributed capacity
 
+- Manage runner pools and controllers through the schema-v3 private desired-state contract.
+- Enroll or adopt hosts with the idempotent worker-controller installer.
 - Add a second independently provisioned Docker host.
 - Verify identical deployment and recovery.
 - Add demand-based scaling.

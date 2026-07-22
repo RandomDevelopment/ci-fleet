@@ -6,6 +6,6 @@ Wants=docker.service
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/ci-fleet
+WorkingDirectory=/opt/ci-fleet/manager/current
 EnvironmentFile=/etc/ci-fleet/ci-fleet.env
-ExecStart=/opt/ci-fleet/scripts/healthcheck.sh
+ExecStart=/opt/ci-fleet/manager/current/scripts/healthcheck.sh

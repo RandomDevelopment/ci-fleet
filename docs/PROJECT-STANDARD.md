@@ -50,6 +50,12 @@ Ordinary CI MUST target a wall-clock duration of five minutes or less when suffi
 
 Forty-five test-minutes divided among nine workers is a theoretical five-minute lower bound. Real plans generally need more than nine shards because job setup consumes part of the ceiling and test work is not perfectly balanced. Adding workers reduces wall-clock time only while runnable shards remain queued.
 
+## Infrastructure-owned capacity
+
+Application workflows MUST submit every independent task and shard and MUST NOT use `strategy.max-parallel` to represent the number of available fleet workers. Excess jobs remain safely queued by GitHub. Pool budgets and controller maxima belong in the private schema-v3 infrastructure configuration described in [Git-authored controller desired state](DESIRED-STATE.md).
+
+A project MAY limit concurrency for a documented external-system restriction, such as an API rate limit or a single-writer fixture, only when that limit is independent of fleet size. Workflow-level concurrency groups MAY still cancel obsolete runs or serialize operations that are inherently unsafe to overlap.
+
 ## Host independence
 
 A project CI job:
@@ -109,7 +115,8 @@ Ordinary CI:
 - MUST NOT receive deployment, release, production, or internal-network credentials;
 - MUST NOT push branches, tags, releases, packages, or commits;
 - MUST set `timeout-minutes: 5` on every ordinary task-matrix job;
-- SHOULD use concurrency controls appropriate to the project;
+- SHOULD use concurrency groups to cancel obsolete runs or protect inherently single-writer operations;
+- MUST NOT use concurrency settings to encode current fleet capacity;
 - MUST treat pull-request code as untrusted unless repository policy explicitly establishes otherwise.
 
 A job requiring write permission is not ordinary CI. It MUST be a separate job or workflow routed to an appropriate privileged runner group.

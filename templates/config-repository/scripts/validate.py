@@ -17,6 +17,7 @@ ORG_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 IMAGE = re.compile(r"^[a-z0-9.-]+/[a-z0-9._/-]+$")
 SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 HIGH_CONFIDENCE_SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
@@ -36,7 +37,23 @@ FORBIDDEN_SECRET_KEYS = {
     "secret_value",
     "token",
 }
-FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)\.env(?:\..+)?$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
+FORBIDDEN_INFRASTRUCTURE_KEYS = {
+    "backup_id",
+    "backup_snapshot",
+    "backup_storage",
+    "disk_storage",
+    "host_address",
+    "hostname",
+    "ip",
+    "ip_address",
+    "proxmox_vmid",
+    "ssh_host",
+    "ssh_password",
+    "ssh_private_key",
+    "vm_id",
+    "vmid",
+}
+FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\..+)?|host\.env|ci-fleet\.env)$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
 FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
 
 
@@ -64,12 +81,22 @@ class Validation:
 
 
 def load_json(path: Path, validation: Validation) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError(f"duplicate object key: {key}")
+            value[key] = child
+        return value
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except FileNotFoundError:
         validation.errors.append(f"{path}: file not found")
     except json.JSONDecodeError as exc:
         validation.errors.append(f"{path}:{exc.lineno}:{exc.colno}: invalid JSON: {exc.msg}")
+    except ValueError as exc:
+        validation.errors.append(f"{path}: invalid JSON: {exc}")
     return None
 
 
@@ -88,9 +115,14 @@ def scan_secret_material(config: Any, validation: Validation) -> None:
     def scan_keys(value: Any, path: str = "$") -> None:
         if isinstance(value, dict):
             for key, child in value.items():
-                if key.lower() in FORBIDDEN_SECRET_KEYS:
+                normalized = key.lower()
+                if normalized in FORBIDDEN_SECRET_KEYS:
                     validation.errors.append(
                         f"{path}.{key}: secret values are forbidden; store only an uppercase secret name"
+                    )
+                if normalized in FORBIDDEN_INFRASTRUCTURE_KEYS:
+                    validation.errors.append(
+                        f"{path}.{key}: host-local infrastructure details are forbidden in Git-authored policy"
                     )
                 scan_keys(child, f"{path}.{key}")
         elif isinstance(value, list):
@@ -120,12 +152,41 @@ def scan_forbidden_paths(repo_root: Path, validation: Validation) -> None:
             validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
 
 
+def scan_tree_path_list(path_list: Path, validation: Validation) -> None:
+    try:
+        raw_paths = path_list.read_bytes().split(b"\0")
+    except OSError as error:
+        validation.errors.append(f"{path_list}: cannot read tree path list: {error}")
+        return
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        try:
+            relative_text = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            validation.errors.append("repository tree contains a non-UTF-8 path")
+            continue
+        parts = Path(relative_text).parts
+        if any(part.lower() in FORBIDDEN_DIRECTORIES for part in parts[:-1]):
+            validation.errors.append(f"{relative_text}: secret-bearing directory names are forbidden")
+        elif FORBIDDEN_FILENAMES.search(relative_text):
+            validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
+
+
 def validate_config(config: Any, validation: Validation, strict: bool) -> None:
-    required_top = {"schema_version", "organization", "runner_pools", "host_groups", "environments", "projects"}
+    required_top = {
+        "schema_version",
+        "organization",
+        "runner_pools",
+        "controllers",
+        "host_groups",
+        "environments",
+        "projects",
+    }
     if not validation.exact_keys(config, "$", required_top, {"$schema"}):
         return
 
-    validation.require(config.get("schema_version") == 2, "$.schema_version", "must equal 2")
+    validation.require(config.get("schema_version") == 3, "$.schema_version", "must equal 3")
 
     organization = config.get("organization")
     organization_keys = {"slug", "registry", "delivery_engine", "workflow_ref_policy"}
@@ -136,6 +197,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(isinstance(slug, str) and bool(ORG_SLUG.fullmatch(slug)), "$.organization.slug", "must be a lowercase GitHub organization slug")
         validation.require(isinstance(registry, str) and bool(IMAGE.fullmatch(registry)), "$.organization.registry", "must be a registry namespace such as ghcr.io/acme")
         validation.require(isinstance(engine, str) and bool(REPOSITORY.fullmatch(engine)), "$.organization.delivery_engine", "must be an owner/repository name")
+        validation.require(engine == "RandomDevelopment/ci-fleet", "$.organization.delivery_engine", "must use the fixed reviewed public engine repository")
         validation.require(organization.get("workflow_ref_policy") == "immutable-commit", "$.organization.workflow_ref_policy", "must equal immutable-commit")
         if strict:
             validation.require(slug != "example-org", "$.organization.slug", "replace the example organization before use")
@@ -144,13 +206,24 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     if not isinstance(pools, dict) or not pools:
         validation.errors.append("$.runner_pools: must be a non-empty object")
         pools = {}
+    pool_capacity: dict[str, int] = {}
     for name, pool in pools.items():
         path = f"$.runner_pools.{name}"
-        validation.require(bool(SLUG.fullmatch(name)), path, "pool name must be a lowercase slug")
-        if not validation.exact_keys(pool, path, {"routing_labels", "allowed_repositories", "public_repositories", "max_concurrent_jobs"}):
+        validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "pool name must be a lowercase slug")
+        pool_keys = {
+            "runner_group",
+            "routing_labels",
+            "allowed_repositories",
+            "public_repositories",
+            "capacity_budget",
+            "job_submission_policy",
+        }
+        if not validation.exact_keys(pool, path, pool_keys):
             continue
+        runner_group = pool.get("runner_group")
         labels = pool.get("routing_labels")
         repos = pool.get("allowed_repositories")
+        validation.require(isinstance(runner_group, str) and bool(SLUG.fullmatch(runner_group)), f"{path}.runner_group", "must be a lowercase logical runner-group slug")
         validation.require(isinstance(labels, list) and bool(labels), f"{path}.routing_labels", "must be a non-empty list")
         if isinstance(labels, list):
             validation.require(len(labels) == len(set(labels)), f"{path}.routing_labels", "must contain unique labels")
@@ -163,8 +236,80 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             for index, repository in enumerate(repos):
                 validation.require(isinstance(repository, str) and bool(REPOSITORY.fullmatch(repository)), f"{path}.allowed_repositories[{index}]", "must be owner/repository")
         validation.require(pool.get("public_repositories") is False, f"{path}.public_repositories", "must be false; this fleet is for trusted private repositories")
-        jobs = pool.get("max_concurrent_jobs")
-        validation.require(type(jobs) is int and jobs > 0, f"{path}.max_concurrent_jobs", "must be a positive integer")
+        budget = pool.get("capacity_budget")
+        validation.require(type(budget) is int and budget > 0, f"{path}.capacity_budget", "must be a positive infrastructure capacity budget")
+        if type(budget) is int and budget > 0:
+            pool_capacity[name] = budget
+        validation.require(pool.get("job_submission_policy") == "all-independent-jobs", f"{path}.job_submission_policy", "must submit every independent job and leave capacity control to infrastructure")
+
+    controllers = config.get("controllers")
+    if not isinstance(controllers, dict) or not controllers:
+        validation.errors.append("$.controllers: must be a non-empty object")
+        controllers = {}
+    reserved_capacity = {name: 0 for name in pools}
+    scale_sets: dict[str, str] = {}
+    controller_keys = {
+        "pool",
+        "location",
+        "state",
+        "scale_set_name",
+        "lifecycle",
+        "engine_ref",
+        "min_runners",
+        "max_runners",
+        "runner_resources",
+    }
+    for name, controller in controllers.items():
+        path = f"$.controllers.{name}"
+        validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "controller ID must be a unique lowercase slug")
+        if not validation.exact_keys(controller, path, controller_keys):
+            continue
+        pool_name = controller.get("pool")
+        location = controller.get("location")
+        state = controller.get("state")
+        scale_set = controller.get("scale_set_name")
+        lifecycle = controller.get("lifecycle")
+        engine_ref = controller.get("engine_ref")
+        minimum = controller.get("min_runners")
+        maximum = controller.get("max_runners")
+        validation.require(isinstance(pool_name, str) and pool_name in pools, f"{path}.pool", "must reference a declared runner pool")
+        validation.require(isinstance(location, str) and bool(SLUG.fullmatch(location)), f"{path}.location", "must be a logical location slug, never an address")
+        validation.require(state in {"active", "drained", "disabled"}, f"{path}.state", "must be active, drained, or disabled")
+        validation.require(isinstance(scale_set, str) and bool(SLUG.fullmatch(scale_set)), f"{path}.scale_set_name", "must be a lowercase scale-set slug")
+        if isinstance(scale_set, str) and isinstance(name, str):
+            validation.require(name in scale_set, f"{path}.scale_set_name", "must include the controller ID required by managed preflight")
+        if isinstance(scale_set, str):
+            if scale_set in scale_sets:
+                validation.errors.append(f"{path}.scale_set_name: must be unique; also used by {scale_sets[scale_set]}")
+            else:
+                scale_sets[scale_set] = name
+        validation.require(lifecycle in {"experimental", "stable", "retiring"}, f"{path}.lifecycle", "must be experimental, stable, or retiring")
+        validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
+        validation.require(type(minimum) is int and minimum >= 0, f"{path}.min_runners", "must be a non-negative integer")
+        validation.require(type(maximum) is int and maximum > 0, f"{path}.max_runners", "must be a positive integer")
+        if type(minimum) is int and type(maximum) is int:
+            validation.require(minimum <= maximum, f"{path}.min_runners", "must not exceed max_runners")
+        validation.require(minimum == 0, f"{path}.min_runners", "must be zero because managed prewarmed runners are not supported")
+        resources = controller.get("runner_resources")
+        if validation.exact_keys(resources, f"{path}.runner_resources", {"cpu_cores", "memory_mib"}):
+            cpu = resources.get("cpu_cores")
+            memory = resources.get("memory_mib")
+            validation.require(type(cpu) is int and cpu > 0, f"{path}.runner_resources.cpu_cores", "must be a positive integer")
+            validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
+        if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
+            reserved_capacity[pool_name] += maximum
+
+    for pool_name, pool in pools.items():
+        labels = pool.get("routing_labels") if isinstance(pool, dict) else None
+        if isinstance(labels, list):
+            for index, label in enumerate(labels):
+                if isinstance(label, str):
+                    validation.require(label not in scale_sets, f"$.runner_pools.{pool_name}.routing_labels[{index}]", "must not equal a controller scale-set name")
+
+    for name, reserved in reserved_capacity.items():
+        budget = pool_capacity.get(name)
+        if budget is not None:
+            validation.require(reserved <= budget, f"$.runner_pools.{name}.capacity_budget", f"must cover {reserved} runners reserved by active or drained controllers")
 
     groups = config.get("host_groups")
     if not isinstance(groups, dict) or not groups:
@@ -214,8 +359,8 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         pool_name = project.get("ci_pool")
         validation.require(isinstance(repository, str) and bool(REPOSITORY.fullmatch(repository)), f"{path}.repository", "must be owner/repository")
         validation.require(isinstance(image, str) and bool(IMAGE.fullmatch(image)), f"{path}.image", "must be a container image path without a mutable tag")
-        validation.require(pool_name in pools, f"{path}.ci_pool", "must reference a declared runner pool")
-        if pool_name in pools and isinstance(pools[pool_name].get("allowed_repositories"), list):
+        validation.require(isinstance(pool_name, str) and pool_name in pools, f"{path}.ci_pool", "must reference a declared runner pool")
+        if isinstance(pool_name, str) and pool_name in pools and isinstance(pools[pool_name].get("allowed_repositories"), list):
             validation.require(repository in pools[pool_name]["allowed_repositories"], f"{path}.repository", "must be explicitly allowed by its CI pool")
         contract = project.get("ci_contract")
         contract_path = f"{path}.ci_contract"
@@ -254,6 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
+    parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
     return parser.parse_args()
 
 
@@ -267,7 +413,9 @@ def main() -> int:
     if config is not None:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
-    if not args.skip_path_scan:
+    if args.tree_paths is not None:
+        scan_tree_path_list(args.tree_paths, validation)
+    elif not args.skip_path_scan:
         scan_forbidden_paths(ROOT, validation)
 
     if validation.errors:

@@ -18,22 +18,25 @@ Project test or integration secrets belong in GitHub repository or environment s
 
 Normal validation should use no secret when possible. Deployment credentials must not be available to the normal shared validation pool.
 
-### Host-local secrets
+### Host-local identity and secrets
 
 A single-host prototype may use root-owned files outside the repository checkout, for example:
 
 ```text
 /etc/ci-fleet/secrets/github-app.pem
+/etc/ci-fleet/host.env
 /etc/ci-fleet/ci-fleet.env
 ```
 
-Credential files should be owned by root, readable only by their intended service, and mounted only into the controller.
+`host.env` contains the App client ID, installation ID, private-key path, and runner TTL. `ci-fleet.env` is rendered from reviewed desired state plus those approved host fields. Neither contains the PEM or application secrets, but both remain root-owned mode `0600` because they describe the controller identity and private installation.
+
+Credential files should be owned by root, readable only by their intended service, and mounted only into the controller. The installer never accepts a private key, token, or Git credential in a command-line argument.
 
 For a distributed fleet, use a secret manager or encrypted configuration system with independently revocable host identities.
 
 ## Docker Compose pattern
 
-A future controller service may receive a host-local secret as a mounted file:
+The controller service receives its host-local private key as a mounted file:
 
 ```yaml
 services:

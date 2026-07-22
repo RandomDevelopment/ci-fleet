@@ -18,6 +18,8 @@ _work/
 runner-data/
 logs/
 tmp/
+__pycache__/
+*.pyc
 
 # Editors and operating systems
 .vscode/
