@@ -19,6 +19,8 @@ PATTERN = re.compile(
     rb"AKIA[0-9A-Z]{16}|"
     rb"(?:postgres|mysql|mongodb(?:\+srv)?|redis)://[^\s/:]+:[^\s/@]+@"
 )
+FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\..+)?|host\.env|ci-fleet\.env)$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
+FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
 assert all(PATTERN.search(b"BEGIN " + kind + b"PRIVATE KEY") for kind in (b"", b"RSA ", b"DSA ", b"EC ", b"OPENSSH ", b"ENCRYPTED "))
 assert all(PATTERN.search(prefix + b"x" * 20) for prefix in (b"gho_", b"ghp_", b"ghr_", b"ghs_", b"ghu_"))
 assert PATTERN.search(b"AKIA" + b"A" * 16)
@@ -72,6 +74,11 @@ def main() -> int:
             if not raw:
                 continue
             relative = raw.decode("utf-8")
+            prefix = f"{commit}:" if args.commit_range else ""
+            if FORBIDDEN_FILENAMES.search(relative) or any(
+                part.lower() in FORBIDDEN_DIRECTORIES for part in Path(relative).parts[:-1]
+            ):
+                findings.add(f"{prefix}{relative}: forbidden secret-bearing path")
             object_path = relative if git_prefix == "." else f"{git_prefix}/{relative}"
             revision = f"{commit}:{object_path}" if commit else f":{object_path}"
             data = subprocess.run(
@@ -81,7 +88,6 @@ def main() -> int:
             ).stdout
             for match in PATTERN.finditer(data):
                 line = data.count(b"\n", 0, match.start()) + 1
-                prefix = f"{commit}:" if args.commit_range else ""
                 findings.add(f"{prefix}{relative}:{line}")
             if commit is None:
                 working_path = repository / relative
