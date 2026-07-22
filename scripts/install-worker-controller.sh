@@ -367,15 +367,69 @@ raise SystemExit(0 if installed == candidate else 1)
 PY
 }
 
+release_tree_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+excluded = {".ci-fleet-engine-ref", ".ci-fleet-tree-sha256"}
+digest = hashlib.sha256()
+
+
+def add(kind, relative, mode, payload=b""):
+    digest.update(kind)
+    digest.update(b"\0")
+    digest.update(relative.encode("utf-8", "surrogateescape"))
+    digest.update(b"\0")
+    digest.update(f"{mode:o}".encode("ascii"))
+    digest.update(b"\0")
+    digest.update(payload)
+    digest.update(b"\0")
+
+
+def visit(directory):
+    for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+        relative = os.path.relpath(entry.path, root)
+        if relative in excluded:
+            continue
+        metadata = entry.stat(follow_symlinks=False)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            add(b"directory", relative, mode)
+            visit(entry.path)
+        elif stat.S_ISREG(metadata.st_mode):
+            content = hashlib.sha256()
+            with open(entry.path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    content.update(block)
+            add(b"file", relative, mode, content.digest())
+        elif stat.S_ISLNK(metadata.st_mode):
+            add(b"symlink", relative, mode, os.readlink(entry.path).encode("utf-8", "surrogateescape"))
+        else:
+            raise SystemExit(f"unsupported release entry: {relative}")
+
+
+visit(root)
+print(digest.hexdigest())
+PY
+}
+
 runtime_release_complete() {
-  local path=$1 expected=$2 marker required
-  [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/deploy/compose.yaml" ]] || return 1
+  local path=$1 expected=$2 marker required stored_digest actual_digest
+  [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
   for required in controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
     [[ -f "$path/$required" ]] || return 1
   done
   marker=$(<"$path/.ci-fleet-engine-ref")
-  [[ "$marker" == "$expected" ]]
+  [[ "$marker" == "$expected" ]] || return 1
+  stored_digest=$(<"$path/.ci-fleet-tree-sha256")
+  [[ "$stored_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual_digest=$(release_tree_digest "$path") || return 1
+  [[ "$actual_digest" == "$stored_digest" ]]
 }
 
 manager_release_complete() {
@@ -499,6 +553,8 @@ install_release() {
   tar -xf "$archive" -C "$staged_release"
   printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
+  release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
+  chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
   runtime_release_complete "$staged_release" "$engine_ref" || die 'staged engine release is incomplete'
   atomic_replace_directory "$staged_release" "$release_dir"
 }
@@ -725,15 +781,23 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state failed=0 checkpoint_release=
+  local target restored_state failed=0 checkpoint_release= drain_env=$rendered_env drain_release=
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
-  if [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
-    load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
-  fi
   [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
-  if ! try_drain_current true "$checkpoint_dir/ci-fleet.env" "$checkpoint_release"; then
+  drain_release=$(current_runtime_release)
+  if [[ -f "$rendered_env" ]]; then
+    load_installed_controller_identity "$temporary/no-install-state" "$rendered_env"
+  elif [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
+    drain_env=$checkpoint_dir/ci-fleet.env
+    [[ -n "$drain_release" ]] || drain_release=$checkpoint_release
+  fi
+  if ! try_drain_current true "$drain_env" "$drain_release"; then
     note "ROLLBACK_FAILED reason=$drain_error"
     return 1
+  fi
+  if [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
   fi
   trap - ERR
   set +e
