@@ -24,7 +24,16 @@ var (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx); err != nil {
+	var err error
+	switch {
+	case len(os.Args) == 1:
+		err = run(ctx)
+	case len(os.Args) == 2 && os.Args[1] == "--delete-idle-scale-set":
+		err = deleteIdleScaleSet(ctx)
+	default:
+		err = fmt.Errorf("unsupported arguments")
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
