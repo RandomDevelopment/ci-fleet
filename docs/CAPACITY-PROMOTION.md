@@ -33,7 +33,12 @@ Run the current installed preflight and health checks from clean processes. Requ
 From the installed reviewed release, run:
 
 ```bash
-scripts/capacity-preflight.sh --phase pre-change --target-max 2
+sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root bash -c '
+  set -a
+  . /etc/ci-fleet/ci-fleet.env
+  set +a
+  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase pre-change --target-max 2
+'
 ```
 
 Require:
@@ -80,8 +85,13 @@ Require one running controller, restart count zero, one intended scale set, the 
 Run:
 
 ```bash
-scripts/capacity-preflight.sh --phase post-change --target-max 2
-scripts/healthcheck.sh
+sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root bash -c '
+  set -a
+  . /etc/ci-fleet/ci-fleet.env
+  set +a
+  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase post-change --target-max 2
+  /opt/ci-fleet/current/scripts/healthcheck.sh
+'
 ```
 
 Require both to pass, plus a clean desired-state `--check` and empty instance-scoped cleanup dry-run.

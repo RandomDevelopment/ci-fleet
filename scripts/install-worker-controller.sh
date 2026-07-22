@@ -211,8 +211,7 @@ verify_host_files() {
 load_installed_controller_identity() {
   local source_state=${1:-$state_file} source_env=${2:-$rendered_env} expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
-  if [[ -f "$source_state" ]]; then
-    [[ $(stat -c %u "$source_state") == "$expected_owner" && $(stat -c %a "$source_state") == 600 ]] || die "install state must be owned by root with mode 0600: $source_state"
+  if [[ -f "$source_state" && $(stat -c %u "$source_state") == "$expected_owner" && $(stat -c %a "$source_state") == 600 ]]; then
     controller_id=$(python3 - "$source_state" <<'PY'
 import json
 import sys
@@ -226,6 +225,8 @@ PY
   elif [[ -f "$source_env" ]]; then
     [[ $(stat -c %u "$source_env") == "$expected_owner" && $(stat -c %a "$source_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $source_env"
     controller_id=$(awk -F= '$1 == "CI_FLEET_INSTANCE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$source_env") || die "installed controller identity is invalid: $source_env"
+  elif [[ -f "$source_state" ]]; then
+    die "install state must be owned by root with mode 0600: $source_state"
   else
     die 'installed controller identity is unavailable'
   fi
@@ -639,7 +640,7 @@ make_checkpoint() {
 
 try_drain_current() {
   local deadline count old_release status paused=false force_nonterminal=${1:-false}
-  local drain_env=${2:-$rendered_env} fallback_release=${3:-}
+  local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
   case "$status" in
@@ -653,7 +654,7 @@ try_drain_current() {
       old_release=$(current_runtime_release)
       [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
-      compose "$old_release" "$drain_env" stop controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
+      compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
       status=
       ;;
   esac
@@ -692,7 +693,7 @@ try_drain_current() {
       return 1
     }
   fi
-  compose "$old_release" "$drain_env" stop controller >/dev/null || {
+  compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null || {
     drain_error='could not stop the drained controller'
     return 1
   }
@@ -904,9 +905,10 @@ perform_converge() {
   install_release
   make_checkpoint
   transaction_active=true
-  if [[ "$mode" == adopt ]]; then
-    [[ -f "$state_file" || -f "$rendered_env" ]] || die '--adopt requires a trusted installed controller identity'
+  if [[ -f "$state_file" || -f "$rendered_env" ]]; then
     load_installed_controller_identity
+  elif [[ "$mode" == adopt ]]; then
+    die '--adopt requires a trusted installed controller identity'
   fi
   drain_current
   controller_id=$desired_controller_id
