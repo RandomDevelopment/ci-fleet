@@ -66,7 +66,9 @@ The controller ID is how a target host selects its declaration. A location is a 
 
 ### Pool capacity is infrastructure policy
 
-Each runner pool has a `capacity_budget`. The validator totals the maximum capacity of every active or drained controller assigned to the pool and rejects overcommit. Drained capacity remains reserved so an undrain cannot silently exceed the reviewed budget. Disabled controllers do not reserve capacity.
+Each runner pool has a `capacity_budget` and a runner group that must not be assigned to any other pool. Unique runner-group assignment keeps routing and repository authorization unambiguous. The semantic validator enforces this cross-object rule because JSON Schema cannot compare values stored in separate object properties.
+
+The validator totals the maximum capacity of every active or drained controller assigned to the pool and rejects overcommit. Drained capacity remains reserved so an undrain cannot silently exceed the reviewed budget. Disabled controllers do not reserve capacity.
 
 Application repositories do not encode the number of available workers. They submit all independent tasks and shards. Do not use GitHub Actions `strategy.max-parallel` to model fleet size; controllers and the private configuration decide how many jobs run simultaneously. An application may limit concurrency only for a separately documented external-system constraint, not worker availability.
 
@@ -110,6 +112,7 @@ Deleting one generic controller must not require application workflow changes. L
 - `./scripts/ci/run.sh fast` and `full` remain aggregate developer commands; fleet scheduling expands their named tasks across available workers.
 - Every matrix job has a five-minute hard timeout, while expected test payload targets four minutes or less to reserve startup and reporting time.
 - Application workflows submit all independent jobs; infrastructure configuration alone controls worker capacity.
+- A GitHub runner group is assigned to exactly one runner pool.
 - CI runner pools and deployment host groups are separate trust roles.
 - Production deployment is manual and requires GitHub Environment approval.
 - Controller engine revisions, reusable workflows, and third-party actions are pinned to immutable commits.

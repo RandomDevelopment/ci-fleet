@@ -23,6 +23,30 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Scan every proposed commit for secrets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          scanner=scripts/scan_committed_secrets.py
+          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
+            git show "$BASE_SHA:$scanner" >"$RUNNER_TEMP/trusted-secret-scanner.py"
+            scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
+          fi
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            mapfile -t commits < <(git rev-list --reverse "$HEAD_SHA")
+          else
+            mapfile -t commits < <(git rev-list --reverse "$BASE_SHA..$HEAD_SHA")
+          fi
+          if [[ ! " ${commits[*]} " == *" $HEAD_SHA "* ]]; then
+            commits+=("$HEAD_SHA")
+          fi
+          for commit in "${commits[@]}"; do
+            python3 "$scanner" --repository "$GITHUB_WORKSPACE" --commit "$commit"
+          done
 
       - name: Install static analysis tools
         run: sudo apt-get update && sudo apt-get install -y shellcheck

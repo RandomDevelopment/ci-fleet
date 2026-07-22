@@ -21,6 +21,7 @@
     },
     "runner_pools": {
       "type": "object",
+      "description": "Logical CI pools. Each runner_group value must be unique across pools; scripts/validate.py enforces this cross-object rule.",
       "minProperties": 1,
       "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/runner_pool"}
