@@ -26,10 +26,13 @@ jobs:
       - name: Validate shell and Python syntax
         run: |
           bash -n scripts/init.sh scripts/validate.sh
-          python3 -m py_compile scripts/init.py scripts/validate.py scripts/test_policy.py
+          python3 -m py_compile scripts/init.py scripts/validate.py scripts/test_policy.py scripts/scan_committed_secrets.py
 
       - name: Prove forbidden configurations fail closed
         run: python3 scripts/test_policy.py
+
+      - name: Scan committed file contents for secrets
+        run: python3 scripts/scan_committed_secrets.py
 
       - name: Validate reference configurations
         run: |
@@ -39,7 +42,28 @@ jobs:
       - name: Prove initialized configurations pass strict policy
         run: |
           temporary_directory="$(mktemp -d)"
+          engine_ref=$(python3 -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
+          if ./scripts/init.sh \
+            --organization test-company \
+            --project test-app \
+            --output "${temporary_directory}/missing-engine.json"; then
+            echo 'initializer accepted a missing engine revision' >&2
+            exit 1
+          fi
+          test ! -e "${temporary_directory}/missing-engine.json"
+          if ./scripts/init.sh \
+            --organization test-company \
+            --project test-app \
+            --registry BAD \
+            --engine-ref "${engine_ref}" \
+            --output "${temporary_directory}/invalid.json"; then
+            echo 'initializer accepted an invalid registry' >&2
+            exit 1
+          fi
+          test ! -e "${temporary_directory}/invalid.json"
           ./scripts/init.sh \
             --organization test-company \
             --project test-app \
+            --engine-ref "${engine_ref}" \
             --output "${temporary_directory}/fleet.json"
+          test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644

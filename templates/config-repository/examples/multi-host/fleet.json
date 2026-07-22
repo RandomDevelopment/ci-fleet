@@ -1,6 +1,6 @@
 {
   "$schema": "../../fleet.schema.json",
-  "schema_version": 2,
+  "schema_version": 3,
   "organization": {
     "slug": "sample-company",
     "registry": "ghcr.io/sample-company",
@@ -9,10 +9,42 @@
   },
   "runner_pools": {
     "trusted-ci": {
+      "runner_group": "sample-trusted-ci",
       "routing_labels": ["docker-ci"],
       "allowed_repositories": ["sample-company/api", "sample-company/web"],
       "public_repositories": false,
-      "max_concurrent_jobs": 4
+      "capacity_budget": 6,
+      "job_submission_policy": "all-independent-jobs"
+    }
+  },
+  "controllers": {
+    "sample-ci-primary": {
+      "pool": "trusted-ci",
+      "location": "primary-site",
+      "state": "active",
+      "scale_set_name": "sample-ci-primary",
+      "lifecycle": "stable",
+      "engine_ref": "254b98a10ea200e39f19bbe75ab9a822de2d5966",
+      "min_runners": 0,
+      "max_runners": 4,
+      "runner_resources": {
+        "cpu_cores": 4,
+        "memory_mib": 8192
+      }
+    },
+    "sample-ci-remote": {
+      "pool": "trusted-ci",
+      "location": "remote-site",
+      "state": "active",
+      "scale_set_name": "sample-ci-remote",
+      "lifecycle": "stable",
+      "engine_ref": "254b98a10ea200e39f19bbe75ab9a822de2d5966",
+      "min_runners": 0,
+      "max_runners": 2,
+      "runner_resources": {
+        "cpu_cores": 2,
+        "memory_mib": 4096
+      }
     }
   },
   "host_groups": {

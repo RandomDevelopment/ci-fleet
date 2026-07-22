@@ -6,7 +6,7 @@ This repository defines a portable, public, self-hosted GitHub Actions CI fleet 
 
 ## Current phase
 
-The project is in architecture definition and isolated proof-of-concept planning. Do not create or alter production deployment paths until the design decisions are recorded and the isolated proof of concept is approved.
+The isolated proof of concept is approved and the project is in controlled migration. The accepted scope and remaining gates are recorded in `docs/DESIGN-DECISIONS.md`. Managed ordinary-CI controller lifecycle is permitted only through reviewed schema-v3 desired state; production deployment paths remain separately gated.
 
 ## Sources of truth
 
@@ -41,6 +41,8 @@ Agents modifying this repository or adapting a project MUST apply these document
 - Do not install project language runtimes in the generic runner image.
 - Do not put repository names, project allowlists, or project-specific logic in runner images or host configuration.
 - Keep project workflows independent of host, site, instance, and scale-set names; route through shared capability labels.
+- Keep worker capacity in reviewed private infrastructure configuration. Application workflows submit all independent jobs and must not use `max-parallel` to model fleet size.
+- Treat schema-v3 controller desired state as authoritative for routing, capacity, lifecycle, and engine revision; host-local files contain only rendered state and credentials.
 - Do not allow projects to select privileged runner groups through untrusted inputs.
 
 ## Verification expectations

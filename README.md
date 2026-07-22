@@ -8,7 +8,7 @@
 
 Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, virtual machines, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
 
-> **Status:** Experimental. The first controller host is deployed, and the first manually dispatched runner pilot is pending. The project is not production-ready.
+> **Status:** Experimental. Ephemeral runner pilots and multi-job workloads have been proven, and the schema-v3 Git-authored controller installer is available for reviewed adoption testing. The project is not production-ready.
 
 ## What problem does this solve?
 
@@ -93,7 +93,7 @@ GitHub runner-group policy decides which repositories may schedule work. A share
 | --- | --- | --- |
 | Public fleet repository | Runner image, controller, lifecycle, setup, health checks, scoped cleanup, standards, examples | Real credentials, private host inventory, production configuration |
 | Project repository | Test Dockerfile, services, fixtures, migrations, test plan, `scripts/ci/run.sh` | Fleet controller credentials or host-specific setup |
-| Private installation configuration | Organization settings, repository authorization, host capacity, network policy, monitoring, secrets | Project runtime dependencies or test logic |
+| Private installation configuration | Organization settings, repository authorization, logical controller state, capacity budgets, network policy, and required secret names | Secret values, host addresses, project runtime dependencies, or test logic |
 
 A public application can use the same fleet indirectly. Its public repository keeps pull-request validation unprivileged, while a separate private delivery repository checks out an approved immutable commit and performs protected CI, release, or deployment work. The public repository itself never receives privileged runner-group access or fleet credentials. See [Public projects, private delivery, and private configuration](docs/PUBLIC-PRIVATE-CONFIGURATION.md).
 
@@ -137,9 +137,9 @@ Read-only validation, repository-writing releases, staging, production deploymen
 | Public architecture, standards, examples, and migration rules | Available |
 | Docker runner and controller prototype | Available |
 | First isolated controller host | Deployed |
-| First manually dispatched private-repository pilot job | Pending |
-| One-command `sudo ./setup.sh` installer | Accepted design; not implemented |
-| MailThisForMe migration | Planned after pilot |
+| First manually dispatched private-repository pilot job | Proven |
+| Schema-v3 worker-controller installer | Available for experimental install and adoption |
+| MailThisForMe migration | Parallel task-matrix validation in progress |
 | TF2 Recommendation Engine migration | Planned after pilot |
 | Reusable tester and deployer components | Planned |
 | Production-ready release | Not yet |
@@ -169,6 +169,7 @@ Supported deployment shapes include virtual machines, dedicated physical machine
 | Browse every guide, concept, standard, and example | [Documentation index](docs/README.md) |
 | Evaluate the current prototype safely | [Live pilot runbook](docs/LIVE-PILOT.md) |
 | Add another Docker host or location | [How to add a host](docs/ADDING-A-HOST.md) |
+| Install, adopt, check, upgrade, or remove a controller | [Git-authored controller desired state](docs/DESIRED-STATE.md) |
 | Add a trusted private repository | [How to add a project](docs/ADDING-A-PROJECT.md) |
 | Convert existing GitHub Actions CI | [Migrating existing CI](docs/MIGRATING-EXISTING-CI.md) |
 | Build a compatible project contract | [Project CI standard](docs/PROJECT-STANDARD.md) |
@@ -236,17 +237,21 @@ Use this fleet only for explicitly trusted repositories and workflows. Keep depl
 
 Read [SECURITY.md](SECURITY.md) and the [secrets model](docs/SECRETS.md) before registration or deployment.
 
-## Installation direction
+## Install or adopt a controller
 
-The accepted operator experience is:
+After creating the GitHub App/runner group and placing the host-local identity file, run one command on the target machine with a reviewed private configuration commit:
 
 ```bash
-sudo ./setup.sh
+sudo ./scripts/install-worker-controller.sh \
+  --install \
+  --config-repo example-org/example-fleet-config \
+  --ref 1111111111111111111111111111111111111111 \
+  --controller example-ci-01
 ```
 
-That command will eventually bootstrap or validate GitHub configuration, install the controller and maintenance services, verify health, and support safe reruns, repair, upgrades, and removal directly from the target host. Phone interaction should be limited to unavoidable, non-secret GitHub approval links.
+Use `--adopt` for an existing manually installed controller. The same script provides `--check`, `--upgrade`, `--rollback`, and `--uninstall`. It validates schema-v3 desired state, renders only non-secret host configuration, installs the pinned engine revision, drains before replacement, records a rollback checkpoint, and installs health, scoped-cleanup, and drift timers.
 
-**That installer is not implemented yet.** For the experimental version, follow the [live pilot runbook](docs/LIVE-PILOT.md) and [deployment prototype](docs/DEPLOYMENT-PROTOTYPE.md).
+The installer remains experimental and intentionally does not create GitHub credentials or broaden runner-group access. Phone-friendly GitHub bootstrap is tracked separately. Read [Git-authored controller desired state](docs/DESIRED-STATE.md) before using it on a live host; retain the [live pilot runbook](docs/LIVE-PILOT.md) for first-job proof.
 
 ## Examples
 

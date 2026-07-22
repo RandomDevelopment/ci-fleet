@@ -40,7 +40,7 @@ A private application repository may use the restricted runner group directly. A
 | Public application repository | Source code, public tests, public Dockerfiles, and unprivileged workflows |
 | Private application repository | Source code and workflows authorized to use an appropriate private runner group |
 | Private delivery repository for a public project | Approved source mappings, CI and deployment workflows, environment policy, promotion rules, and required secret names |
-| Private organization configuration | Repository mappings, logical host groups, environment policy, capacity, image names, and internal operating notes |
+| Private organization configuration | Repository mappings, logical controllers and host groups, environment policy, capacity budgets, pinned engine revisions, image names, and required secret names |
 | Secret manager, GitHub environment, or host-local protected file | Actual keys, tokens, passwords, and deployment credentials |
 
 Each organization generates its own private installation configuration from the public [configuration template](../templates/config-repository/README.md). The resulting private repository is an implementation detail of that organization and is not required to be accessible to users of the public project.
@@ -78,6 +78,7 @@ The private delivery repository is the authorized GitHub Actions identity. Fleet
 - Private configuration may declare required secret names but never their values.
 - GitHub App keys, tokens, project secrets, and deployment credentials stay outside Git history.
 - Real private configuration is validated against the same public schema used by examples.
+- Real machine addresses, VM IDs, storage/backup identifiers, credentials, and rendered runtime files remain outside both public and private Git history.
 - A host remains generic; adding a repository changes policy and project configuration, not every worker image.
 
 ## Secret locations
