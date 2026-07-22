@@ -27,14 +27,26 @@ jobs:
 
       - name: Scan every proposed commit for secrets
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-            python3 scripts/scan_committed_secrets.py --commit "$HEAD_SHA"
-          else
-            python3 scripts/scan_committed_secrets.py --commit-range "$BASE_SHA..$HEAD_SHA"
+          scanner=scripts/scan_committed_secrets.py
+          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
+            git show "$BASE_SHA:$scanner" >"$RUNNER_TEMP/trusted-secret-scanner.py"
+            scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
           fi
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            mapfile -t commits < <(git rev-list --reverse "$HEAD_SHA")
+          else
+            mapfile -t commits < <(git rev-list --reverse "$BASE_SHA..$HEAD_SHA")
+          fi
+          if [[ ! " ${commits[*]} " == *" $HEAD_SHA "* ]]; then
+            commits+=("$HEAD_SHA")
+          fi
+          for commit in "${commits[@]}"; do
+            python3 "$scanner" --repository "$GITHUB_WORKSPACE" --commit "$commit"
+          done
 
       - name: Install static analysis tools
         run: sudo apt-get update && sudo apt-get install -y shellcheck

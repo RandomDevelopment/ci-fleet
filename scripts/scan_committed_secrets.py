@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -47,8 +49,8 @@ def main() -> int:
     if args.commit is not None and not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         print("--commit must be a full lowercase commit SHA", file=sys.stderr)
         return 2
-    if args.commit_range is not None and not re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", args.commit_range):
-        print("--commit-range must be two full lowercase commit SHAs separated by ..", file=sys.stderr)
+    if args.commit_range is not None and not re.fullmatch(r"[0-9a-f]{40}(?:\.\.[0-9a-f]{40})?", args.commit_range):
+        print("--commit-range must be a full lowercase head SHA or two full SHAs separated by ..", file=sys.stderr)
         return 2
     commits: list[str | None] = [args.commit]
     if args.commit_range:
@@ -58,7 +60,10 @@ def main() -> int:
             stdout=subprocess.PIPE,
             text=True,
         ).stdout.splitlines()
-    findings: list[str] = []
+        selected_head = args.commit_range.rsplit("..", 1)[-1]
+        if selected_head not in commits:
+            commits.append(selected_head)
+    findings: set[str] = set()
     for commit in commits:
         listing = ["git", "-C", str(repository)]
         listing += ["ls-tree", "-rz", "--name-only", commit] if commit else ["ls-files", "-z"]
@@ -77,10 +82,25 @@ def main() -> int:
             for match in PATTERN.finditer(data):
                 line = data.count(b"\n", 0, match.start()) + 1
                 prefix = f"{commit}:" if args.commit_range else ""
-                findings.append(f"{prefix}{relative}:{line}")
+                findings.add(f"{prefix}{relative}:{line}")
+            if commit is None:
+                working_path = repository / relative
+                try:
+                    metadata = working_path.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(metadata.st_mode):
+                    working_data = os.readlink(working_path).encode("utf-8")
+                elif stat.S_ISREG(metadata.st_mode):
+                    working_data = working_path.read_bytes()
+                else:
+                    continue
+                for match in PATTERN.finditer(working_data):
+                    line = working_data.count(b"\n", 0, match.start()) + 1
+                    findings.add(f"{relative}:{line}")
     if findings:
         print("possible committed secret detected:", file=sys.stderr)
-        print("\n".join(findings), file=sys.stderr)
+        print("\n".join(sorted(findings)), file=sys.stderr)
         return 1
     print("OK: no high-confidence secret material in tracked files")
     return 0
