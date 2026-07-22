@@ -298,6 +298,34 @@ class PolicyTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("temporary-leak.txt:1", result.stderr)
 
+    def test_committed_secret_scanner_rejects_historical_forbidden_paths(self) -> None:
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Policy Test"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "policy@example.invalid"], check=True)
+            (repository / "README.md").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            forbidden = repository / ".env"
+            forbidden.write_text("MODE=test\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "add forbidden path"], check=True)
+            forbidden.unlink()
+            subprocess.run(["git", "-C", str(repository), "add", "-u"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "remove forbidden path"], check=True)
+            head = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--repository", str(repository), "--commit-range", f"{base}..{head}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env: forbidden secret-bearing path", result.stderr)
+
     def test_committed_secret_scanner_reads_nested_repository_prefix(self) -> None:
         scanner = ROOT / "scripts" / "scan_committed_secrets.py"
         with tempfile.TemporaryDirectory() as directory:
