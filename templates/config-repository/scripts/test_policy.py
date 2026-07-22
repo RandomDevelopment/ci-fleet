@@ -85,6 +85,13 @@ class PolicyTests(unittest.TestCase):
         config["runner_pools"]["trusted-ci"]["public_repositories"] = True
         self.assert_rejected(config, "trusted private repositories")
 
+    def test_duplicate_runner_group_is_rejected(self) -> None:
+        config = copy.deepcopy(reference_config())
+        duplicate = copy.deepcopy(config["runner_pools"]["trusted-ci"])
+        duplicate["routing_labels"] = ["other-ci"]
+        config["runner_pools"]["other-ci"] = duplicate
+        self.assert_rejected(config, "runner_group: must be unique")
+
     def test_capacity_overcommit_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
         overcommit = config["runner_pools"]["trusted-ci"]["capacity_budget"] + 1
@@ -223,7 +230,7 @@ class PolicyTests(unittest.TestCase):
         scanner = ROOT / "scripts" / "scan_committed_secrets.py"
         self.assertTrue(scanner.is_file())
         workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/scan_committed_secrets.py", workflow)
+        self.assertIn('python3 "$scanner" --repository "$GITHUB_WORKSPACE" --commit "$commit"', workflow)
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
             subprocess.run(["git", "init", "-q", str(repository)], check=True)
@@ -241,6 +248,103 @@ class PolicyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("scripts/scan_committed_secrets.py:1", result.stderr)
         self.assertIn("scripts/validate.sh:1", result.stderr)
+
+    def test_committed_secret_scanner_reads_symlink_blobs(self) -> None:
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            target = "ghp_" + "x" * 20
+            (repository / target).write_text("clean\n", encoding="utf-8")
+            (repository / "secret-link").symlink_to(target)
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--repository", str(repository)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secret-link:1", result.stderr)
+
+    def test_committed_secret_scanner_reads_every_commit_in_range(self) -> None:
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.name", "Policy Test"], check=True)
+            subprocess.run(["git", "-C", str(repository), "config", "user.email", "policy@example.invalid"], check=True)
+            (repository / "README.md").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            leak = repository / "temporary-leak.txt"
+            leak.write_text("ghp_" + "x" * 20 + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "add leak"], check=True)
+            leaked = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            leak.unlink()
+            subprocess.run(["git", "-C", str(repository), "add", "-u"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", "remove leak"], check=True)
+            head = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            for revision in (f"{base}..{head}", head, f"{head}..{leaked}"):
+                with self.subTest(revision=revision):
+                    result = subprocess.run(
+                        [sys.executable, str(scanner), "--repository", str(repository), "--commit-range", revision],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("temporary-leak.txt:1", result.stderr)
+
+    def test_committed_secret_scanner_reads_nested_repository_prefix(self) -> None:
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            nested = repository / "config"
+            nested.mkdir()
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            (nested / "fleet.json").write_text("ghp_" + "x" * 20 + "\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--repository", str(nested)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fleet.json:1", result.stderr)
+
+    def test_committed_secret_scanner_reads_unstaged_tracked_edits(self) -> None:
+        scanner = ROOT / "scripts" / "scan_committed_secrets.py"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            tracked = repository / "fleet.json"
+            tracked.write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            tracked.write_text("ghp_" + "x" * 20 + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--repository", str(repository)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fleet.json:1", result.stderr)
+
+    def test_workflow_uses_trusted_scanner_for_complete_history(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
+        for required in (
+            "fetch-depth: 0",
+            'git show "$BASE_SHA:$scanner"',
+            'git rev-list --reverse "$HEAD_SHA"',
+            'git rev-list --reverse "$BASE_SHA..$HEAD_SHA"',
+            'commits+=("$HEAD_SHA")',
+            '--commit "$commit"',
+        ):
+            self.assertIn(required, workflow)
 
     def test_duplicate_json_controller_id_is_rejected(self) -> None:
         validation = Validation()

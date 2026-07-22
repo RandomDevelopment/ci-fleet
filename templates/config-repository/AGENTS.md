@@ -18,6 +18,7 @@ Before committing configuration changes, run:
 - Never add addresses, VM IDs, storage identifiers, backup identifiers, SSH details, or rendered runtime configuration.
 - Do not weaken `public_repositories: false` for Docker-socket runner pools.
 - Infrastructure configuration owns capacity. Application workflows submit all independent jobs and do not use `max-parallel` to model fleet size.
+- Each GitHub runner group belongs to exactly one runner pool; do not create ambiguous cross-pool assignments.
 - The sum of active and drained controller maxima must not exceed the pool capacity budget.
 - Controller engine revisions and reusable workflows must be pinned to full reviewed commit SHAs.
 - Production environments must require approval and must not deploy automatically.
