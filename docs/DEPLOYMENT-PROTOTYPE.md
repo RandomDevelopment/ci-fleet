@@ -62,3 +62,14 @@ CI_FLEET_INSTANCE=HOST-ID scripts/cleanup.sh
 ```
 
 Inspect the dry-run. After confirming there is no active job, rerun with `--apply`. Do not delete unrelated Docker resources. Removal of the GitHub-side scale set is normally performed by the controller during graceful shutdown; verify it in GitHub before deleting the App installation.
+
+### Recover an orphaned idle scale set
+
+An unclean controller exit can leave its exact GitHub-side scale-set name behind and make the replacement fail with `already exists`. Use the controller's `--delete-idle-scale-set` administrative mode only after all of these are true:
+
+- the selected scale-set name and runner group come from trusted installed configuration;
+- no repository workflow targeting its label is queued or running;
+- local managed runner count and project-container residue are both zero;
+- the administrative controller image was built from a reviewed public commit.
+
+The command looks up only the configured runner group and exact scale-set name. It refuses deletion unless GitHub reports zero available, acquired, assigned, and running jobs and zero registered, busy, and idle runners. It prints no scale-set ID or credential data. After deletion, restart the previous controller first; recreating the same empty scale set and passing healthcheck is the rollback/recovery proof before desired-state adoption continues.
