@@ -20,6 +20,7 @@ services:
         CI_FLEET_VERSION: ${CI_FLEET_VERSION:-dev}
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
     restart: unless-stopped
+    user: "0:0"
     group_add:
       - ${CI_FLEET_DOCKER_GID:?set CI_FLEET_DOCKER_GID to the numeric group owning the Docker socket}
     environment:
