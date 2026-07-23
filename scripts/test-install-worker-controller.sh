@@ -211,6 +211,8 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
   grep -Fq "LABEL org.opencontainers.image.revision=\"\${CI_FLEET_COMMIT}\"" "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
   grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
+grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
+grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
@@ -323,6 +325,7 @@ second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
+[[ ! -d "$root/opt/ci-fleet/manager/releases/$engine_ref/templates/config-repository/scripts/__pycache__" ]] || fail 'manager validation wrote Python bytecode into the immutable release'
 python3 - "$install_state" <<'PY'
 import json
 import sys
