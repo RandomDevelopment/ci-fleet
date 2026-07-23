@@ -210,6 +210,7 @@ export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
 for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile"; do
   grep -Fq "LABEL org.opencontainers.image.revision=\"\${CI_FLEET_COMMIT}\"" "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
 done
+grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
