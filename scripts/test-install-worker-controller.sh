@@ -316,7 +316,8 @@ mv "$host_config.missing" "$host_config"
 
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
-expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
 python3 - "$install_state" <<'PY'
 import json
 import sys
@@ -516,6 +517,9 @@ export FAKE_RUNNER_STATE_ONCE=$tmp/orphaned-managed-runner
 : >"$FAKE_RUNNER_STATE_ONCE"
 export FAKE_ALL_RUNNER_STATE=$tmp/uninstall-stopped-managed-runner
 : >"$FAKE_ALL_RUNNER_STATE"
+: >"$root/etc/ci-fleet/monitoring.env"
+mkdir -p "$root/var/lib/ci-fleet/health"
+printf '{"status":"healthy"}\n' >"$root/var/lib/ci-fleet/health/latest.json"
 : >"$FAKE_DOCKER_PS_LOG"
 expect_success "$installer" --uninstall >/dev/null
 [[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'uninstall did not wait for an orphaned managed runner'
@@ -525,6 +529,8 @@ if grep -Eq 'label=io.randomdevelopment.ci-fleet.instance=$' "$FAKE_DOCKER_PS_LO
 unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 [[ ! -e "$root/opt/ci-fleet/current" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'uninstall left active installation state'
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
+[[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
+[[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
 
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
@@ -535,7 +541,9 @@ printf 'fixture only\n' >"$adopt_pem"
 chmod 600 "$adopt_pem"
 cp "$repo_root/deploy/compose.yaml" "$adopt_root/opt/ci-fleet/deploy/compose.yaml"
 cp "$repo_root/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
-chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
+cp "$repo_root/scripts/health.py" "$adopt_root/opt/ci-fleet/scripts/health.py"
+cp "$repo_root/scripts/cleanup.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
+chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
 printf '%s\n' \
   'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
   'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
@@ -544,6 +552,8 @@ printf '%s\n' \
   'CI_FLEET_CONTROLLER_STATE=active' \
   'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
+printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75\n' >"$adopt_root/etc/ci-fleet/monitoring.env"
+chmod 600 "$adopt_root/etc/ci-fleet/monitoring.env"
 : >"$FAKE_DOCKER_STATE"
 chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
@@ -554,6 +564,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'

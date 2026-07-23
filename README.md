@@ -175,6 +175,7 @@ Supported deployment shapes include virtual machines, dedicated physical machine
 | Build a compatible project contract | [Project CI standard](docs/PROJECT-STANDARD.md) |
 | Verify project compliance | [Compliance checklist](docs/COMPLIANCE-CHECKLIST.md) |
 | Configure upgrades, cleanup, draining, and rebooting | [Host maintenance](docs/HOST-MAINTENANCE.md) |
+| Configure host health and external missed-heartbeat detection | [Fleet health monitoring](docs/HEALTH-MONITORING.md) |
 | Understand secret storage and injection | [Secrets model](docs/SECRETS.md) |
 | Use private fleet workers for a public project | [Public projects and private delivery](docs/PUBLIC-PRIVATE-CONFIGURATION.md) |
 | See planned work | [Roadmap](docs/ROADMAP.md) |

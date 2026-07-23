@@ -102,6 +102,7 @@ default_host_config=$etc_dir/host.env
 host_config=${host_config_arg:-$default_host_config}
 state_root=$(root_path /var/lib/ci-fleet)
 state_file=$state_root/install-state.json
+health_report=$state_root/health/latest.json
 checkpoints_dir=$state_root/checkpoints
 systemd_dir=$(root_path /etc/systemd/system)
 lock_file=$(root_path /run/ci-fleet-installer.lock)
@@ -421,7 +422,7 @@ PY
 runtime_release_complete() {
   local path=$1 expected=$2 marker required stored_digest actual_digest
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
-  [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
+  [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" && -f "$path/scripts/health.py" ]] || return 1
   for required in controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
     [[ -f "$path/$required" ]] || return 1
   done
@@ -723,6 +724,44 @@ remove_systemd_units() {
   systemctl daemon-reload
 }
 
+run_health_check() {
+  local release=$1 environment=$2 bootstrap=${3:-false} result=0
+  (
+    local testing_value=${CI_FLEET_TESTING:-} root_value=${CI_FLEET_ROOT_PREFIX:-} variable
+    while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable CI_FLEET_)
+    [[ -z "$testing_value" ]] || export CI_FLEET_TESTING=$testing_value
+    [[ -z "$root_value" ]] || export CI_FLEET_ROOT_PREFIX=$root_value
+    set -a
+    # shellcheck disable=SC1090
+    . "$environment"
+    set +a
+    [[ "$bootstrap" != true ]] || export CI_FLEET_HEALTH_BOOTSTRAP=1
+    "$release/scripts/healthcheck.sh"
+  ) || result=$?
+  ((result < 2))
+}
+
+display_last_health() {
+  if [[ ! -f "$health_report" ]]; then
+    note 'HEALTH last=missing'
+    return
+  fi
+  python3 - "$health_report" <<'PY'
+import json
+import sys
+try:
+    report = json.load(open(sys.argv[1], encoding="utf-8"))
+    status = report["status"]
+    timestamp = int(report["timestamp"])
+    if status not in {"healthy", "warning", "unhealthy", "maintenance"}:
+        raise ValueError
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    print("HEALTH last=invalid")
+else:
+    print(f"HEALTH last={status} timestamp={timestamp}")
+PY
+}
+
 activate_candidate() {
   local staged_state
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
@@ -735,21 +774,15 @@ activate_candidate() {
     compose "$release_dir" "$rendered_env" up -d --no-deps controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
     runtime_matches active || die 'controller did not remain running after activation'
-    if ! (
-      set -a
-      # shellcheck disable=SC1090
-      . "$rendered_env"
-      set +a
-      "$release_dir/scripts/healthcheck.sh"
-    ); then
-      die 'post-activation health check failed'
-    fi
   else
     compose "$release_dir" "$rendered_env" stop controller >/dev/null 2>&1 || true
     if ! runtime_matches "$target_state"; then
       compose "$release_dir" "$rendered_env" down --remove-orphans >/dev/null
       runtime_matches "$target_state" || die 'controller did not reach the requested non-active state'
     fi
+  fi
+  if ! run_health_check "$release_dir" "$rendered_env" true; then
+    die 'post-activation health check failed'
   fi
   staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
   staging_paths+=("$staged_state")
@@ -843,15 +876,7 @@ restore_checkpoint() {
         failed=1
       else
         compose "$release_dir" "$rendered_env" up -d --no-deps controller || failed=1
-        if ((failed == 0)); then
-          (
-            set -a
-            # shellcheck disable=SC1090
-            . "$rendered_env"
-            set +a
-            "$release_dir/scripts/healthcheck.sh"
-          ) || failed=1
-        fi
+        if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" || failed=1; fi
       fi
     fi
   fi
@@ -875,6 +900,7 @@ trap on_error ERR
 
 perform_check() {
   local count
+  display_last_health
   drift_count
   count=$DRIFT_COUNT
   if ((count > 0)); then
@@ -952,6 +978,7 @@ perform_uninstall() {
   fi
   remove_systemd_units
   rm -f "$current_link" "$rendered_env" "$state_file"
+  rm -rf -- "$state_root/health"
   rm -f "$manager_current"
   transaction_active=false
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"

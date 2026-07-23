@@ -30,7 +30,7 @@ Review `/etc/apt/apt.conf.d/50unattended-upgrades` and confirm only the intended
 
 `scripts/install-worker-controller.sh` installs and enables all three timer pairs:
 
-- `ci-fleet-health.timer` checks Docker, disk, and the controller's desired runtime state;
+- `ci-fleet-health.timer` runs the complete [fleet health contract](HEALTH-MONITORING.md);
 - `ci-fleet-cleanup.timer` removes only expired inactive fleet-owned resources;
 - `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes.
 
