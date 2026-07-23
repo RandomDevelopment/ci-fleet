@@ -139,12 +139,18 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     encoded = json.dumps(matrix, separators=(",", ":"))
-    if args.github_output:
-        with args.github_output.open("a", encoding="utf-8") as output:
-            output.write(f"matrix={encoded}\n")
-            output.write(f"job-count={len(matrix['include'])}\n")
-            output.write(f"estimated-test-minutes={estimated_total}\n")
-    print(encoded)
+    output_lines = (
+        f"matrix={encoded}\n"
+        f"job-count={len(matrix['include'])}\n"
+        f"estimated-test-minutes={estimated_total}\n"
+    )
+    if args.github_output == Path("-"):
+        print(output_lines, end="")
+    else:
+        if args.github_output:
+            with args.github_output.open("a", encoding="utf-8") as output:
+                output.write(output_lines)
+        print(encoded)
     print(
         f"OK: {args.group} expands to {len(matrix['include'])} jobs "
         f"covering approximately {estimated_total} test-minutes",
