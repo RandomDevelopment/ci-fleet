@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -52,6 +54,38 @@ class PlanTests(unittest.TestCase):
         plan = sample_plan()
         plan["tasks"][0]["groups"] = ["fast"]
         self.assert_rejected(plan, "whenever it includes fast")
+
+    def test_action_runs_planner_in_pinned_runtime_container(self) -> None:
+        action = (ROOT / ".github/actions/plan/action.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7",
+            action,
+        )
+        self.assertIn("--network none", action)
+        self.assertIn("--read-only", action)
+        self.assertIn("--cap-drop all", action)
+        self.assertNotIn('python3 "${GITHUB_ACTION_PATH}/plan.py"', action)
+
+    def test_cli_can_emit_github_outputs_to_stdout(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / ".github/actions/plan/plan.py"),
+                "--plan",
+                str(ROOT / "examples/project/scripts/ci/plan.json"),
+                "--group",
+                "fast",
+                "--github-output",
+                "-",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.stdout.count("matrix="), 1)
+        self.assertIn("job-count=6\n", result.stdout)
+        self.assertIn("estimated-test-minutes=20\n", result.stdout)
+        self.assertNotIn("\n{", result.stdout)
 
     def test_matrix_limit_is_enforced(self) -> None:
         plan = sample_plan()
