@@ -122,7 +122,7 @@ Follow [Live pilot](LIVE-PILOT.md) for the complete proof and rollback.
 
 ## 8. Verify unattended operations
 
-The installer enables health, scoped cleanup, and pinned desired-state drift timers. Run each service once and inspect its journal as described in [Host maintenance](HOST-MAINTENANCE.md). Monitor controller state, disk thresholds, Docker health, last successful job, cleanup failures, drift, and pending reboot state.
+The installer enables health, scoped cleanup, and pinned desired-state drift timers. Run each service once and inspect its journal as described in [Host maintenance](HOST-MAINTENANCE.md). Configure redacted local checks and external missed-heartbeat detection as described in [Fleet health monitoring](HEALTH-MONITORING.md).
 
 The steady-state host should need no project-specific edits. Adding a project changes its repository, private fleet configuration, and GitHub runner-group policy—not this host.
 

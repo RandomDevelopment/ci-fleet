@@ -6,7 +6,8 @@ ARG CI_FLEET_COMMIT=unknown
 ARG RUNNER_VERSION=2.335.1
 ARG RUNNER_SHA256_AMD64=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
 ARG RUNNER_SHA256_ARM64=6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207
-LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}"
+LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
+      io.randomdevelopment.ci-fleet.managed="true"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update \

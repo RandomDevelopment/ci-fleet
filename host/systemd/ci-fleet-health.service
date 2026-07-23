@@ -9,3 +9,4 @@ User=root
 WorkingDirectory=/opt/ci-fleet/manager/current
 EnvironmentFile=/etc/ci-fleet/ci-fleet.env
 ExecStart=/opt/ci-fleet/manager/current/scripts/healthcheck.sh
+SuccessExitStatus=1
