@@ -218,7 +218,8 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$engine_ref" "$state" "$maximum" "$budget" <<'PY'
+  local desired_engine=${4:-$engine_ref}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" <<'PY'
 import json
 import sys
 source, target, engine_ref, state, maximum, budget = sys.argv[1:]
@@ -577,6 +578,14 @@ grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 [[ -f "$adopt_root/etc/ci-fleet/host.env" ]] || fail 'adoption did not separate host-local values'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
+
+legacy_engine_ref=$(git -C "$repo_root" rev-parse origin/main^{commit})
+legacy_ref=$(write_config active 1 1 "$legacy_engine_ref")
+export FAKE_ENGINE_REF=$legacy_engine_ref
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
+[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi

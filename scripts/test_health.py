@@ -117,6 +117,8 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
         warning = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": records["fresh"]}, now=1000, grace_seconds=60)
         self.assertEqual((warning["status"], warning["exit_code"]), ("warning", 1))
+        future = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"timestamp": 2000, "status": "healthy"}}, now=1000, grace_seconds=60)
+        self.assertEqual((future["status"], future["hosts"][0]["status"]), ("unhealthy", "missing"))
 
     def test_collector_uses_sustained_metrics_and_all_service_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -150,6 +152,7 @@ class HealthTests(unittest.TestCase):
 
     def test_threshold_overrides_validate_ordering(self) -> None:
         self.assertAlmostEqual(health._timespan_seconds("3d 1h 41min 40.5s"), 265300.5)
+        self.assertAlmostEqual(health._timespan_seconds("1y 2month 3w 4d 5h 6min 7.5s"), 365.25 * 86400 + 2 * 365.25 * 86400 / 12 + 3 * 7 * 86400 + 4 * 86400 + 5 * 3600 + 6 * 60 + 7.5)
         thresholds = health.thresholds_from({"CI_FLEET_HEALTH_DISK_WARN_PERCENT": "70", "CI_FLEET_HEALTH_DISK_CRITICAL_PERCENT": "85"})
         self.assertEqual((thresholds.disk_warn_percent, thresholds.disk_critical_percent), (70, 85))
         with self.assertRaisesRegex(ValueError, "disk thresholds"):
@@ -162,6 +165,20 @@ class HealthTests(unittest.TestCase):
         self.assertIn("HEALTHY controller=example-ci-01", output)
         self.assertNotIn("SHOULD_NOT_PRINT", output)
         self.assertEqual(health._send_heartbeat({"CI_FLEET_HEALTH_HEARTBEAT_URL": "http://unsafe.invalid"}, report), 2)
+
+    def test_probe_failures_are_results_and_missing_units_fail(self) -> None:
+        for error in (FileNotFoundError(), health.subprocess.TimeoutExpired(["probe"], 30)):
+            original = health.subprocess.run
+            health.subprocess.run = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+            try:
+                self.assertNotEqual(health._run(["probe"]).returncode, 0)
+            finally:
+                health.subprocess.run = original
+
+        def missing(args):
+            return health.subprocess.CompletedProcess(args, 1, "", "")
+
+        self.assertEqual(health._unit_state(missing, "missing.service"), "failed")
 
 
 if __name__ == "__main__":

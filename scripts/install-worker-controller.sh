@@ -422,7 +422,10 @@ PY
 runtime_release_complete() {
   local path=$1 expected=$2 marker required stored_digest actual_digest
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
-  [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" && -f "$path/scripts/health.py" ]] || return 1
+  [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
+  if grep -Fq 'scripts/health.py' "$path/scripts/healthcheck.sh"; then
+    [[ -f "$path/scripts/health.py" ]] || return 1
+  fi
   for required in controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
     [[ -f "$path/$required" ]] || return 1
   done

@@ -90,7 +90,7 @@ def evaluate_heartbeats(
                 reported = record["status"] if record else ""
             except (KeyError, TypeError, ValueError):
                 timestamp, reported = 0, ""
-            if now - timestamp > grace_seconds or reported not in {"healthy", "warning", "unhealthy"}:
+            if abs(now - timestamp) > grace_seconds or reported not in {"healthy", "warning", "unhealthy"}:
                 status = "missing"
                 rank = 2
             else:
@@ -169,7 +169,10 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=30)
+    try:
+        return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(args, 124 if isinstance(error, subprocess.TimeoutExpired) else 127, "", "")
 
 
 def _disk(path: str) -> dict[str, int]:
@@ -202,9 +205,11 @@ def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
 
 
 def _timespan_seconds(value: str) -> float | None:
-    units = {"d": 86400, "h": 3600, "min": 60, "s": 1, "ms": 0.001, "us": 0.000001}
-    tokens = re.findall(r"([0-9]+(?:\.[0-9]+)?)(d|h|min|ms|us|s)", value)
-    return sum(float(number) * units[unit] for number, unit in tokens) if tokens else None
+    units = {"y": 365.25 * 86400, "month": 365.25 * 86400 / 12, "w": 7 * 86400, "d": 86400, "h": 3600, "min": 60, "s": 1, "ms": 0.001, "us": 0.000001, "µs": 0.000001, "ns": 0.000000001}
+    matches = list(re.finditer(r"([0-9]+(?:\.[0-9]+)?)(month|min|ms|us|µs|ns|y|w|d|h|s)", value))
+    if not matches or "".join(match.group(0) for match in matches) != re.sub(r"\s+", "", value):
+        return None
+    return sum(float(match.group(1)) * units[match.group(2)] for match in matches)
 
 
 def _unit_state(run: Runner, unit: str, timer: bool = False, max_age_seconds: int = 0) -> str:
@@ -220,7 +225,7 @@ def _unit_state(run: Runner, unit: str, timer: bool = False, max_age_seconds: in
             if last.returncode != 0 or triggered is None or now - triggered > max_age_seconds:
                 return "stale"
     result = run(["systemctl", "show", unit, "--property=Result", "--value"])
-    return "failed" if result.returncode == 0 and result.stdout.strip() not in {"", "success"} else "ok"
+    return "failed" if result.returncode != 0 or result.stdout.strip() not in {"", "success"} else "ok"
 
 
 def _container(run: Runner, name: str) -> tuple[dict[str, Any], dict[str, int]]:
