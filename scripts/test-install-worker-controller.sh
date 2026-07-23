@@ -209,6 +209,7 @@ export FAKE_CONTROLLER_IMAGE_STATE=$tmp/controller-image-present
 export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
 for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile"; do
   grep -Fq "LABEL org.opencontainers.image.revision=\"\${CI_FLEET_COMMIT}\"" "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
+  grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
@@ -298,6 +299,9 @@ chmod 644 "$rendered_env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c %a "$rendered_env") == 600 ]] || fail 'convergence did not repair rendered-environment mode'
+manual_health_result=0
+"$repo_root/scripts/healthcheck.sh" >/dev/null || manual_health_result=$?
+((manual_health_result < 2)) || fail 'manual healthcheck did not source rendered capacity'
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER
@@ -579,7 +583,8 @@ grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 
-legacy_engine_ref=$(git -C "$repo_root" rev-parse origin/main^{commit})
+# Public pre-health engine fixture; do not depend on a local remote-tracking ref.
+legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
 legacy_ref=$(write_config active 1 1 "$legacy_engine_ref")
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}

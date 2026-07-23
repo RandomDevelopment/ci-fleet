@@ -102,8 +102,8 @@ class HealthTests(unittest.TestCase):
             "retired": {"state": "disabled", "lifecycle": "retiring"},
         }
         records = {
-            "fresh": {"timestamp": 980, "status": "warning"},
-            "stale": {"timestamp": 800, "status": "healthy"},
+            "fresh": {"controller": "fresh", "timestamp": 980, "status": "warning"},
+            "stale": {"controller": "stale", "timestamp": 800, "status": "healthy"},
         }
         report = health.evaluate_heartbeats(controllers, records, now=1000, grace_seconds=60)
         states = {host["controller"]: host["status"] for host in report["hosts"]}
@@ -117,8 +117,10 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
         warning = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": records["fresh"]}, now=1000, grace_seconds=60)
         self.assertEqual((warning["status"], warning["exit_code"]), ("warning", 1))
-        future = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"timestamp": 2000, "status": "healthy"}}, now=1000, grace_seconds=60)
+        future = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"controller": "fresh", "timestamp": 2000, "status": "healthy"}}, now=1000, grace_seconds=60)
         self.assertEqual((future["status"], future["hosts"][0]["status"]), ("unhealthy", "missing"))
+        wrong = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"controller": "other", "timestamp": 980, "status": "healthy"}}, now=1000, grace_seconds=60)
+        self.assertEqual((wrong["status"], wrong["hosts"][0]["status"]), ("unhealthy", "missing"))
 
     def test_collector_uses_sustained_metrics_and_all_service_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -142,7 +144,13 @@ class HealthTests(unittest.TestCase):
                     run=run,
                 )
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
-                self.assertEqual(set(snapshot["services"]), {"health", "cleanup", "drift", "updates"})
+                self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
+                self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                (root / "etc").mkdir()
+                (root / "etc/debian_version").write_text("13\n")
+                debian = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)
+                self.assertIn("updates", debian["services"])
+                self.assertIn("updates", debian["timers"])
                 pressure.write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n")
                 self.assertEqual(health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)["swap_used_percent"], 0)
                 pressure.unlink()
@@ -179,6 +187,23 @@ class HealthTests(unittest.TestCase):
             return health.subprocess.CompletedProcess(args, 1, "", "")
 
         self.assertEqual(health._unit_state(missing, "missing.service"), "failed")
+
+    def test_expired_active_resources_and_stopped_capacity_are_observable(self) -> None:
+        cleanup = "KEEP container runner state=running expired=1 (routine cleanup never removes active containers)\nWOULD_REMOVE volume old expired=1\n"
+        run = lambda args: health.subprocess.CompletedProcess(args, 0, cleanup, "")
+        self.assertEqual(health._stale_resources(run, "example"), {"containers": 1, "networks": 0, "volumes": 1})
+
+        def stopped(args):
+            outputs = {
+                "{{.State.Status}}": "exited\n",
+                "{{.State.OOMKilled}}": "false\n",
+                "{{.RestartCount}}": "0\n",
+                "{{range .Config.Env}}{{println .}}{{end}}": "CI_FLEET_MIN_RUNNERS=1\nCI_FLEET_MAX_RUNNERS=2\n",
+            }
+            return health.subprocess.CompletedProcess(args, 0, outputs.get(args[3], ""), "")
+
+        controller, capacity = health._container(stopped, "controller")
+        self.assertEqual((controller["state"], capacity), ("exited", {"min": 0, "max": 0}))
 
 
 if __name__ == "__main__":

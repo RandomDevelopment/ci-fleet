@@ -88,9 +88,10 @@ def evaluate_heartbeats(
             try:
                 timestamp = int(record["timestamp"]) if record else 0
                 reported = record["status"] if record else ""
+                reported_controller = record["controller"] if record else ""
             except (KeyError, TypeError, ValueError):
-                timestamp, reported = 0, ""
-            if abs(now - timestamp) > grace_seconds or reported not in {"healthy", "warning", "unhealthy"}:
+                timestamp, reported, reported_controller = 0, "", ""
+            if reported_controller != controller or abs(now - timestamp) > grace_seconds or reported not in {"healthy", "warning", "unhealthy"}:
                 status = "missing"
                 rank = 2
             else:
@@ -198,7 +199,7 @@ def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
     stale = {"containers": 0, "networks": 0, "volumes": 0}
     if result.returncode == 0:
         for line in result.stdout.splitlines():
-            match = re.match(r"WOULD_REMOVE (container|network|volume) ", line)
+            match = re.match(r"(?:WOULD_REMOVE|KEEP) (container|network|volume) ", line)
             if match:
                 stale[f"{match.group(1)}s"] += 1
     return stale
@@ -244,8 +245,11 @@ def _container(run: Runner, name: str) -> tuple[dict[str, Any], dict[str, int]]:
         restart_count = int(restarts.stdout.strip() or 0)
     except ValueError:
         restart_count = 0
+    controller_state = state.stdout.strip() or "missing"
+    if controller_state != "running":
+        capacity = {"min": 0, "max": 0}
     return {
-        "state": state.stdout.strip() or "missing",
+        "state": controller_state,
         "restart_count": restart_count,
         "oom_killed": oom.stdout.strip().lower() == "true",
     }, capacity
@@ -312,7 +316,14 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
     timers = {name: _unit_state(run, f"ci-fleet-{name}.timer", timer=True, max_age_seconds=age) for name, age in timer_ages.items()}
-    timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)
+    services = {name: _unit_state(run, unit) for name, unit in {
+        "cleanup": "ci-fleet-cleanup.service",
+        "drift": "ci-fleet-drift.service",
+    }.items()}
+    debian = (root / "etc/debian_version").exists()
+    if debian:
+        timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)
+        services["updates"] = _unit_state(run, "apt-daily-upgrade.service")
     if values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
         # ponytail: activation validates unit installation separately; scheduled runs verify live timers after enablement.
         timers = {name: "ok" for name in timers}
@@ -334,15 +345,10 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "effective_capacity": effective,
         "managed": managed,
         "stale": stale,
-        "services": {name: _unit_state(run, unit) for name, unit in {
-            "health": "ci-fleet-health.service",
-            "cleanup": "ci-fleet-cleanup.service",
-            "drift": "ci-fleet-drift.service",
-            "updates": "apt-daily-upgrade.service",
-        }.items()},
+        "services": services,
         "timers": timers,
         "pending_reboot": (root / "var/run/reboot-required").exists(),
-        "failed_packages": bool(run(["dpkg", "--audit"]).stdout.strip()),
+        "failed_packages": debian and bool(run(["dpkg", "--audit"]).stdout.strip()),
         "clock_synchronized": run(["timedatectl", "show", "--property=NTPSynchronized", "--value"]).stdout.strip() == "yes",
         "backup": _backup_state(values, run),
     }
