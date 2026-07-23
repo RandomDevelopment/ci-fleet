@@ -209,6 +209,7 @@ export FAKE_CONTROLLER_IMAGE_STATE=$tmp/controller-image-present
 export FAKE_IMAGE_INSPECT_LOG=$tmp/image-inspects
 for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile"; do
   grep -Fq "LABEL org.opencontainers.image.revision=\"\${CI_FLEET_COMMIT}\"" "$dockerfile" || fail "managed image lacks engine provenance label: $dockerfile"
+  grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
@@ -220,7 +221,8 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$engine_ref" "$state" "$maximum" "$budget" <<'PY'
+  local desired_engine=${4:-$engine_ref}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" <<'PY'
 import json
 import sys
 source, target, engine_ref, state, maximum, budget = sys.argv[1:]
@@ -299,6 +301,9 @@ chmod 644 "$rendered_env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c %a "$rendered_env") == 600 ]] || fail 'convergence did not repair rendered-environment mode'
+manual_health_result=0
+"$repo_root/scripts/healthcheck.sh" >/dev/null || manual_health_result=$?
+((manual_health_result < 2)) || fail 'manual healthcheck did not source rendered capacity'
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER
@@ -318,7 +323,8 @@ mv "$host_config.missing" "$host_config"
 
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
-expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
 [[ ! -d "$root/opt/ci-fleet/manager/releases/$engine_ref/templates/config-repository/scripts/__pycache__" ]] || fail 'manager validation wrote Python bytecode into the immutable release'
 python3 - "$install_state" <<'PY'
 import json
@@ -519,6 +525,9 @@ export FAKE_RUNNER_STATE_ONCE=$tmp/orphaned-managed-runner
 : >"$FAKE_RUNNER_STATE_ONCE"
 export FAKE_ALL_RUNNER_STATE=$tmp/uninstall-stopped-managed-runner
 : >"$FAKE_ALL_RUNNER_STATE"
+: >"$root/etc/ci-fleet/monitoring.env"
+mkdir -p "$root/var/lib/ci-fleet/health"
+printf '{"status":"healthy"}\n' >"$root/var/lib/ci-fleet/health/latest.json"
 : >"$FAKE_DOCKER_PS_LOG"
 expect_success "$installer" --uninstall >/dev/null
 [[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'uninstall did not wait for an orphaned managed runner'
@@ -528,6 +537,8 @@ if grep -Eq 'label=io.randomdevelopment.ci-fleet.instance=$' "$FAKE_DOCKER_PS_LO
 unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 [[ ! -e "$root/opt/ci-fleet/current" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'uninstall left active installation state'
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
+[[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
+[[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
 
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
@@ -538,7 +549,9 @@ printf 'fixture only\n' >"$adopt_pem"
 chmod 600 "$adopt_pem"
 cp "$repo_root/deploy/compose.yaml" "$adopt_root/opt/ci-fleet/deploy/compose.yaml"
 cp "$repo_root/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
-chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
+cp "$repo_root/scripts/health.py" "$adopt_root/opt/ci-fleet/scripts/health.py"
+cp "$repo_root/scripts/cleanup.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
+chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
 printf '%s\n' \
   'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
   'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
@@ -547,6 +560,8 @@ printf '%s\n' \
   'CI_FLEET_CONTROLLER_STATE=active' \
   'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
+printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75\n' >"$adopt_root/etc/ci-fleet/monitoring.env"
+chmod 600 "$adopt_root/etc/ci-fleet/monitoring.env"
 : >"$FAKE_DOCKER_STATE"
 chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
@@ -557,6 +572,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
@@ -569,6 +585,15 @@ grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 [[ -f "$adopt_root/etc/ci-fleet/host.env" ]] || fail 'adoption did not separate host-local values'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
+
+# Public pre-health engine fixture; do not depend on a local remote-tracking ref.
+legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
+legacy_ref=$(write_config active 1 1 "$legacy_engine_ref")
+export FAKE_ENGINE_REF=$legacy_engine_ref
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
+[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi

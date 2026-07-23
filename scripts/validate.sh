@@ -9,10 +9,13 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/health.py \
   scripts/scan_committed_secrets.py \
-  scripts/test_desired_state.py
+  scripts/test_desired_state.py \
+  scripts/test_health.py
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_health.py
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
