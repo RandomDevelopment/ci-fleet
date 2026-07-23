@@ -27,7 +27,7 @@ It reports but never prunes, restarts, or repairs resources. Project source, log
 
 ## Threshold overrides and hooks
 
-Defaults are intentionally conservative: disk and inode warning/critical at 80/90%, available memory warning/critical at 15/8%, swap warning/critical at 25/50%, per-CPU one-minute load warning/critical at 1.0/1.5, and controller restart warning at 3.
+Defaults are intentionally conservative: disk and inode warning/critical at 80/90%, available memory warning/critical at 15/8%, sustained swap use under five-minute memory pressure warning/critical at 25/50%, per-CPU fifteen-minute load warning/critical at 1.0/1.5, and controller restart warning at 3.
 
 Optional overrides belong in `/etc/ci-fleet/monitoring.env`, owned by root with mode `0600`:
 

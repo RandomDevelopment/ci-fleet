@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -116,6 +117,36 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
         warning = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": records["fresh"]}, now=1000, grace_seconds=60)
         self.assertEqual((warning["status"], warning["exit_code"]), ("warning", 1))
+
+    def test_collector_uses_sustained_metrics_and_all_service_units(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proc/pressure").mkdir(parents=True)
+            (root / "proc/meminfo").write_text(
+                "MemTotal: 100 kB\nMemAvailable: 75 kB\nSwapTotal: 100 kB\nSwapFree: 50 kB\n"
+            )
+            pressure = root / "proc/pressure/memory"
+            pressure.write_text("some avg10=0.00 avg60=0.05 avg300=0.20 total=1\n")
+            def run(args):
+                output = "yes\n" if args[0] == "timedatectl" else "success\n" if args[0] == "systemctl" else ""
+                return health.subprocess.CompletedProcess(args, 1 if args[:2] == ["docker", "info"] else 0, output, "")
+
+            original_load, original_cpus = health.os.getloadavg, health.os.cpu_count
+            health.os.getloadavg, health.os.cpu_count = lambda: (1.0, 2.0, 6.0), lambda: 2
+            try:
+                snapshot = health.collect_snapshot(
+                    {"CI_FLEET_INSTANCE": "example", "CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"},
+                    root=root,
+                    run=run,
+                )
+                self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
+                self.assertEqual(set(snapshot["services"]), {"health", "cleanup", "drift", "updates"})
+                pressure.write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n")
+                self.assertEqual(health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)["swap_used_percent"], 0)
+                pressure.unlink()
+                self.assertEqual(health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)["swap_used_percent"], 50)
+            finally:
+                health.os.getloadavg, health.os.cpu_count = original_load, original_cpus
 
     def test_threshold_overrides_validate_ordering(self) -> None:
         self.assertAlmostEqual(health._timespan_seconds("3d 1h 41min 40.5s"), 265300.5)

@@ -260,6 +260,17 @@ def _memory(root: Path) -> tuple[int, int]:
     return available, swap
 
 
+def _memory_pressure(root: Path) -> float | None:
+    try:
+        for line in (root / "proc/pressure/memory").read_text().splitlines():
+            if line.startswith("some "):
+                match = re.search(r"avg300=([0-9.]+)", line)
+                return float(match.group(1)) if match else None
+    except OSError:
+        pass
+    return None
+
+
 def _backup_state(values: dict[str, str], run: Runner) -> str:
     command = values.get("CI_FLEET_HEALTH_BACKUP_CHECK")
     if not command:
@@ -309,8 +320,8 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "desired_state": values.get("CI_FLEET_CONTROLLER_STATE", "active"),
         "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
         "memory_available_percent": available,
-        "load_per_cpu": os.getloadavg()[0] / max(os.cpu_count() or 1, 1),
-        "swap_used_percent": swap,
+        "load_per_cpu": os.getloadavg()[2] / max(os.cpu_count() or 1, 1),
+        "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,
         "recent_oom": oom.returncode == 0 and bool(oom.stdout.strip()),
         "docker_available": docker_ok,
         "controller": controller,
@@ -318,7 +329,12 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "effective_capacity": effective,
         "managed": managed,
         "stale": stale,
-        "services": {name: _unit_state(run, f"ci-fleet-{name}.service") for name in ("cleanup", "drift")},
+        "services": {name: _unit_state(run, unit) for name, unit in {
+            "health": "ci-fleet-health.service",
+            "cleanup": "ci-fleet-cleanup.service",
+            "drift": "ci-fleet-drift.service",
+            "updates": "apt-daily-upgrade.service",
+        }.items()},
         "timers": timers,
         "pending_reboot": (root / "var/run/reboot-required").exists(),
         "failed_packages": bool(run(["dpkg", "--audit"]).stdout.strip()),
