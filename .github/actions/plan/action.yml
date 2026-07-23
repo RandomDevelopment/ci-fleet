@@ -27,8 +27,26 @@ runs:
   steps:
     - id: expand
       shell: bash
-      run: >-
-        python3 "${GITHUB_ACTION_PATH}/plan.py"
-        --plan "${{ inputs.plan-path }}"
-        --group "${{ inputs.group }}"
-        --github-output "${GITHUB_OUTPUT}"
+      env:
+        CI_FLEET_PLAN_PATH: ${{ inputs.plan-path }}
+        CI_FLEET_PLAN_GROUP: ${{ inputs.group }}
+      run: |
+        set -Eeuo pipefail
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        cp -- "${GITHUB_ACTION_PATH}/plan.py" "$tmp/plan.py"
+        cp -- "$CI_FLEET_PLAN_PATH" "$tmp/plan.json"
+        tar -C "$tmp" -cf - plan.py plan.json |
+          docker run --rm -i \
+            --network none \
+            --read-only \
+            --cap-drop all \
+            --security-opt no-new-privileges \
+            --pids-limit 64 \
+            --memory 128m \
+            --cpus 0.5 \
+            --user 65534:65534 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=4m \
+            python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7 \
+            sh -c 'tar -xf - -C /tmp && python3 /tmp/plan.py --plan /tmp/plan.json --group "$1" --github-output -' \
+            sh "$CI_FLEET_PLAN_GROUP" >>"$GITHUB_OUTPUT"
