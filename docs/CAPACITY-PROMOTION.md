@@ -22,11 +22,11 @@ Project containers use the host Docker daemon as siblings of the runner containe
 
 During that proof, retain the requested MAX only if every five-second sample keeps CPU busy below 85%, available memory at or above the greater of 2 GiB or 20% of total memory, and Docker filesystem use below 80%. Any OOM, unrelated workload, controller/Docker failure, runner above the requested maximum, observer gap, or cleanup residue requires restoration.
 
-## 1. Gate dispatch and verify the one-runner state
+## 1. Gate dispatch and verify the current state
 
 Block dispatches that can target this controller. Confirm no queued, assigned, or running fleet job and no instance-owned runner in any state. Keep dispatch gated through post-change verification.
 
-Run the current installed preflight and health checks from clean processes. Require the existing one-runner contract, controller health, and an empty instance-scoped cleanup dry-run.
+Run the current installed health check from a clean process. Require the configured and effective current MAX to match, controller health, and an empty instance-scoped cleanup dry-run. The target-capacity check in the next step replaces the pilot-only preflight for later increases.
 
 ## 2. Validate target capacity without changing it
 
@@ -102,7 +102,7 @@ Require both to pass, plus a clean desired-state `--check` and empty instance-sc
 
 Start bounded runner, task-job, project-resource, and host-metric observers before dispatch. Dispatch exactly the approved workload once. Do not retry a failed proof or exceed the reviewed target MAX.
 
-Observe runner creation/destruction, actual requested concurrency, no runner above the requested maximum, whole-host resource thresholds, Docker/controller health, exact project identity, and automatic cleanup. Repeat health, drift, and cleanup dry-run checks after all jobs terminate.
+Observe runner creation/destruction, continuous target-way overlap, no runner above the requested maximum, whole-host resource thresholds, Docker/controller health, exact project identity, and automatic cleanup. A workload that never drives the full reviewed target does not qualify. Repeat health, drift, and cleanup dry-run checks after all jobs terminate.
 
 ## 7. Retain or restore
 
