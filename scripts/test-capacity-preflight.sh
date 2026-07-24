@@ -221,7 +221,7 @@ for malformed in 0 -1 2x 1.5; do
 done
 reset_fixture
 FAKE_TOTAL_CPUS=32 FAKE_TOTAL_MEMORY_MIB=65536 FAKE_AVAILABLE_MEMORY_MIB=60000 \
-  expect_failure 'target MAX must be exactly 2' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 3
+  expect_success "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 6 >/dev/null
 
 reset_fixture
 CI_FLEET_MAX_RUNNERS=2 FAKE_EFFECTIVE_MAX=2 expect_success "$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 >/dev/null
@@ -242,6 +242,9 @@ grep -Fq 'PREVIOUS_PRIVATE_CONFIGURATION_COMMIT' "$repo_root/docs/CAPACITY-PROMO
 grep -Fq 'env -i' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity procedure does not isolate preflight from the caller environment'
 if grep -Eq 'Edit only|force-recreate|ci-fleet\.env\.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity procedure still edits rendered host state'; fi
 grep -Fq 'scripts/capacity-preflight.sh' "$repo_root/docs/ADDING-A-HOST.md" || fail 'host guide does not link the capacity procedure'
+grep -Fq 'Require the restored PREVIOUS_MAX' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity rollback does not verify the previous reviewed maximum'
+if grep -Fq 'one-runner state' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'generic capacity procedure still requires the pilot state'; fi
+grep -Fq 'target-way overlap' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity proof does not require exercising the full reviewed target'
 if grep -Riq --exclude='test-capacity-preflight.sh' 'docker system prune' "$repo_root/scripts"; then fail 'unrestricted prune exists in scripts'; fi
 
 printf 'Capacity preflight tests passed.\n'

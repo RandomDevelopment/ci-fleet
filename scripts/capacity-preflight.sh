@@ -42,7 +42,6 @@ done
 [[ -n "$target_max" ]] || die 'explicit --target-max is required'
 [[ "$target_max" =~ ^[1-9][0-9]{0,3}$ ]] || die 'target MAX must be a positive integer'
 target_max=$((10#$target_max))
-((target_max == 2)) || die 'target MAX must be exactly 2 for this post-pilot procedure'
 
 required=(
   CI_FLEET_GITHUB_URL
