@@ -731,6 +731,7 @@ remove_systemd_units() {
 run_health_check() {
   local release=$1 environment=$2 bootstrap=${3:-false} result=0
   (
+    trap - ERR
     local testing_value=${CI_FLEET_TESTING:-} root_value=${CI_FLEET_ROOT_PREFIX:-} variable
     while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable CI_FLEET_)
     [[ -z "$testing_value" ]] || export CI_FLEET_TESTING=$testing_value
