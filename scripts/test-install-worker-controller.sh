@@ -216,6 +216,7 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
+grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
@@ -448,6 +449,18 @@ expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}"
 complete_release_inode=$(stat -c '%i' "$active_release")
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c '%i' "$active_release") == "$complete_release_inode" ]] || fail 'complete immutable release was replaced instead of reused'
+
+warning_ref=$(write_config active 1 2)
+printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=0\n' >"$root/etc/ci-fleet/monitoring.env"
+chmod 600 "$root/etc/ci-fleet/monitoring.env"
+warning_output=$tmp/warning-upgrade.out
+"$installer" --upgrade "${base_args[@]}" --ref "$warning_ref" >"$warning_output" 2>&1
+warning_upgrade=$(<"$warning_output")
+grep -Fq 'WARNING disk_root' <<<"$warning_upgrade" || fail 'warning health fixture did not produce a warning result'
+grep -Fq 'CONVERGED mode=upgrade' <<<"$warning_upgrade" || fail 'warning health result did not report convergence'
+grep -Fq "CI_FLEET_CONFIG_REF=$warning_ref" "$root/etc/ci-fleet/ci-fleet.env" || fail 'warning health result rolled back an otherwise healthy activation'
+rm -f "$root/etc/ci-fleet/monitoring.env"
+ref_one=$warning_ref
 
 prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
 cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
