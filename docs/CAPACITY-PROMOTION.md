@@ -8,7 +8,7 @@ Schema-v3 private desired state owns capacity. Never edit `/etc/ci-fleet/ci-flee
 
 Declare the policy before observing a larger workload:
 
-- requested MAX is exactly two for this first post-pilot procedure;
+- requested MAX is the exact reviewed controller `max_runners`;
 - `MIN` remains zero;
 - both the controller `max_runners` and pool `capacity_budget` change in one reviewed private configuration PR;
 - the configured instance, scale set, routing label, runner group, Docker socket group, and per-runner limits remain unchanged;
@@ -20,7 +20,7 @@ Declare the policy before observing a larger workload:
 
 Project containers use the host Docker daemon as siblings of the runner container. The separately authorized live proof must therefore observe whole-host CPU, memory, disk, collisions, and cleanup.
 
-During that proof, retain MAX=2 only if every five-second sample keeps CPU busy below 85%, available memory at or above the greater of 2 GiB or 20% of total memory, and Docker filesystem use below 80%. Any OOM, unrelated workload, controller/Docker failure, third runner, observer gap, or cleanup residue requires restoration.
+During that proof, retain the requested MAX only if every five-second sample keeps CPU busy below 85%, available memory at or above the greater of 2 GiB or 20% of total memory, and Docker filesystem use below 80%. Any OOM, unrelated workload, controller/Docker failure, runner above the requested maximum, observer gap, or cleanup residue requires restoration.
 
 ## 1. Gate dispatch and verify the one-runner state
 
@@ -33,18 +33,19 @@ Run the current installed preflight and health checks from clean processes. Requ
 From the installed reviewed release, run:
 
 ```bash
+TARGET_MAX=REVIEWED_CONTROLLER_MAX
 sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root bash -c '
   set -a
   . /etc/ci-fleet/ci-fleet.env
   set +a
-  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase pre-change --target-max 2
-'
+  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase pre-change --target-max "$1"
+' _ "$TARGET_MAX"
 ```
 
 Require:
 
 ```text
-CAPACITY_PREFLIGHT_OK phase=pre-change target_max=2 configured_max=1 effective_max=1
+CAPACITY_PREFLIGHT_OK phase=pre-change target_max=REVIEWED_CONTROLLER_MAX configured_max=PREVIOUS_MAX effective_max=PREVIOUS_MAX
 ```
 
 Record only the safe budget summary.
@@ -53,7 +54,7 @@ Record only the safe budget summary.
 
 In the secret-free private configuration repository:
 
-1. raise only the selected controller's `max_runners` from one to two;
+1. raise only the selected controller's `max_runners` to the reviewed target;
 2. raise its pool `capacity_budget` only as needed to admit that reviewed controller maximum;
 3. keep `min_runners`, runner resources, identity, lifecycle, routing, trust, and engine pin unchanged;
 4. run the complete strict validator, policy tests, and committed-secret scan;
@@ -80,31 +81,32 @@ Do not recreate runner jobs, remove volumes, or touch unrelated Docker resources
 
 ## 5. Verify effective state
 
-Require one running controller, restart count zero, one intended scale set, the unchanged routing label and runner group, no idle runner, and the exact reviewed MAX=2.
+Require one running controller, restart count zero, one intended scale set, the unchanged routing label and runner group, no idle runner, and the exact reviewed target MAX.
 
 Run:
 
 ```bash
+TARGET_MAX=REVIEWED_CONTROLLER_MAX
 sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root bash -c '
   set -a
   . /etc/ci-fleet/ci-fleet.env
   set +a
-  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase post-change --target-max 2
+  /opt/ci-fleet/current/scripts/capacity-preflight.sh --phase post-change --target-max "$1"
   /opt/ci-fleet/current/scripts/healthcheck.sh
-'
+' _ "$TARGET_MAX"
 ```
 
 Require both to pass, plus a clean desired-state `--check` and empty instance-scoped cleanup dry-run.
 
 ## 6. Run one separately authorized proof
 
-Start bounded runner, task-job, project-resource, and host-metric observers before dispatch. Dispatch exactly the approved workload once. Do not retry a failed proof and do not raise MAX above two.
+Start bounded runner, task-job, project-resource, and host-metric observers before dispatch. Dispatch exactly the approved workload once. Do not retry a failed proof or exceed the reviewed target MAX.
 
-Observe runner creation/destruction, actual two-way overlap, no third runner, whole-host resource thresholds, Docker/controller health, exact project identity, and automatic cleanup. Repeat health, drift, and cleanup dry-run checks after all jobs terminate.
+Observe runner creation/destruction, actual requested concurrency, no runner above the requested maximum, whole-host resource thresholds, Docker/controller health, exact project identity, and automatic cleanup. Repeat health, drift, and cleanup dry-run checks after all jobs terminate.
 
 ## 7. Retain or restore
 
-Retain MAX=2 only when every predeclared gate passes and no manual cleanup is required.
+Retain the requested MAX only when every predeclared gate passes and no manual cleanup is required.
 
 On any failure, keep dispatch gated and apply the recorded previous private configuration commit through the same reviewed `--upgrade` path:
 

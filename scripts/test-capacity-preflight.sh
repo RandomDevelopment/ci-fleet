@@ -221,7 +221,7 @@ for malformed in 0 -1 2x 1.5; do
 done
 reset_fixture
 FAKE_TOTAL_CPUS=32 FAKE_TOTAL_MEMORY_MIB=65536 FAKE_AVAILABLE_MEMORY_MIB=60000 \
-  expect_failure 'target MAX must be exactly 2' "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 3
+  expect_success "$repo_root/scripts/capacity-preflight.sh" --phase pre-change --target-max 6 >/dev/null
 
 reset_fixture
 CI_FLEET_MAX_RUNNERS=2 FAKE_EFFECTIVE_MAX=2 expect_success "$repo_root/scripts/capacity-preflight.sh" --phase post-change --target-max 2 >/dev/null
