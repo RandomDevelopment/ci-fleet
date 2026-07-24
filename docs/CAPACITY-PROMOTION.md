@@ -118,4 +118,4 @@ sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
   --controller CONTROLLER_ID
 ```
 
-Require the restored MAX=1, clean desired-state check, health pass, zero runners/jobs/residue, one intended scale set, and empty instance-scoped cleanup dry-run before reopening dispatch. Preserve installer checkpoint and proof evidence without recording credential values.
+Require the restored PREVIOUS_MAX, clean desired-state check, health pass, zero runners/jobs/residue, one intended scale set, and empty instance-scoped cleanup dry-run before reopening dispatch. Preserve installer checkpoint and proof evidence without recording credential values.

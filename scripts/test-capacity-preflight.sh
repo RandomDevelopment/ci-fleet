@@ -242,6 +242,7 @@ grep -Fq 'PREVIOUS_PRIVATE_CONFIGURATION_COMMIT' "$repo_root/docs/CAPACITY-PROMO
 grep -Fq 'env -i' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity procedure does not isolate preflight from the caller environment'
 if grep -Eq 'Edit only|force-recreate|ci-fleet\.env\.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity procedure still edits rendered host state'; fi
 grep -Fq 'scripts/capacity-preflight.sh' "$repo_root/docs/ADDING-A-HOST.md" || fail 'host guide does not link the capacity procedure'
+grep -Fq 'Require the restored PREVIOUS_MAX' "$repo_root/docs/CAPACITY-PROMOTION.md" || fail 'capacity rollback does not verify the previous reviewed maximum'
 if grep -Riq --exclude='test-capacity-preflight.sh' 'docker system prune' "$repo_root/scripts"; then fail 'unrestricted prune exists in scripts'; fi
 
 printf 'Capacity preflight tests passed.\n'
