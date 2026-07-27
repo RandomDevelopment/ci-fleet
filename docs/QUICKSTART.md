@@ -83,6 +83,10 @@ jobs through the Docker socket.
    git -C ci-fleet checkout PINNED_ENGINE_COMMIT
    cp -r ci-fleet/templates/config-repository my-fleet-config
    cd my-fleet-config
+   # Seed the vendored template on main so the initialization PR has a base:
+   git init -q -b main
+   git add -A && git commit -qm "Import ci-fleet configuration template"
+   git checkout -qb initialize-fleet
    ./scripts/init.sh \
      --organization YOUR-ORG \
      --project YOUR-APP-SLUG \
@@ -93,28 +97,17 @@ jobs through the Docker socket.
      --capacity-budget 1 \
      --max-runners 1 \
      --engine-ref PINNED_ENGINE_COMMIT
+   # Validate before committing so a rejected file or accidental value
+   # never enters branch history, then commit the initialized result:
+   ./scripts/validate.sh --strict
+   git add -A && git commit -qm "Initialize fleet configuration"
    ```
 
    `--project` is a logical lowercase slug; pass the real GitHub
    repository name separately with `--repository` so
-   `allowed_repositories` names a repository that exists. Commit the
-   initialized result, validate, push to a new **private** GitHub
-   repository, open a pull request, and **merge it**:
-
-   ```bash
-   ./scripts/validate.sh --strict
-   git init -q -b main
-   git add -A && git commit -qm "Import ci-fleet configuration template"
-   git checkout -qb initialize-fleet
-   git add -A && git commit -qm "Initialize fleet configuration" --allow-empty
-   ```
-
-   Validate **before** committing so a rejected file or accidental value
-   never enters branch history. Commit the vendored template to `main`
-   first, then commit the initialized `fleet.json` on a branch, so the
-   required pull request has a base to diff against. Pushing the only
-   commit directly would establish the default branch with no review.
-   Managed controller managed controller
+   `allowed_repositories` names a repository that exists. Push both
+   branches to a new **private** GitHub repository, open a pull request
+   from `initialize-fleet` to `main`, and **merge it**. Managed controller managed controller
    lifecycle is permitted only from a reviewed, merged private
    configuration commit. Resolve and record that merge commit SHA
    (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
