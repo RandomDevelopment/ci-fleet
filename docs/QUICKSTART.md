@@ -170,11 +170,12 @@ onboarding never touches a fleet host.
    in the pool's `allowed_repositories` (the initializer put it there;
    add it only if you skipped initialization), and validate with
    `./scripts/validate.sh --strict`. Immediately before authorization,
-   audit every queued Actions job for this repository. Cancel every queued job
-   whose complete `runs-on` expression could match the pool's shared label;
-   do not authorize until that matching queue is empty. If you cannot prove
-   that condition, use a dedicated empty proof repository and runner group
-   rather than exposing the pool to an unknown first job.
+   audit every queued Actions job across every repository already authorized
+   for the runner group and this repository. Cancel every queued job whose
+   complete `runs-on` expression could match the pool's shared label; do not
+   authorize until that matching queue is empty. If you cannot prove that
+   condition, use a dedicated empty proof repository and runner group rather
+   than exposing the pool to an unknown first job.
 3. Authorize the repository in the GitHub runner group.
 
 Full contract: [Adding a project](ADDING-A-PROJECT.md).

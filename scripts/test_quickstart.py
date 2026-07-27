@@ -7,6 +7,7 @@ quickstart = " ".join(raw_quickstart.split())
 required = (
     "host architecture must be `amd64` or `arm64`",
     "Cancel every queued job",
+    "across every repository already authorized for the runner group",
     "REPOSITORY=OWNER/REPOSITORY",
     "RUN_ATTEMPT=<dispatched-run-attempt>",
     'PROJECT_PREFIX="ci-${REPO_COMPONENT}-${RUN_ID}-${RUN_ATTEMPT}-"',
