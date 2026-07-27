@@ -40,7 +40,9 @@ jobs through the Docker socket.
    [Adding a host](ADDING-A-HOST.md) sections 1-3. The installer itself
    additionally requires a systemd-based host with `python3`, `tar`,
    `install`, `flock`, and standard coreutils — it fails closed with a
-   named missing command if one is absent.
+   named missing command if one is absent. The Docker host architecture
+   must be `amd64` or `arm64`; the runner image build rejects every other
+   architecture.
 2. On the **fleet host**, clone the public engine repository and check
    out the exact reviewed engine commit you intend to pin — later steps
    copy templates from it and run its installer as root, so it must be
@@ -107,7 +109,7 @@ jobs through the Docker socket.
    repository name separately with `--repository` so
    `allowed_repositories` names a repository that exists. Push both
    branches to a new **private** GitHub repository, open a pull request
-   from `initialize-fleet` to `main`, and **merge it**. Managed controller managed controller
+   from `initialize-fleet` to `main`, and **merge it**. Managed controller
    lifecycle is permitted only from a reviewed, merged private
    configuration commit. Resolve and record that merge commit SHA
    (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
@@ -167,7 +169,12 @@ onboarding never touches a fleet host.
 2. Confirm the repository you passed as `--repository` to `init.sh` is
    in the pool's `allowed_repositories` (the initializer put it there;
    add it only if you skipped initialization), and validate with
-   `./scripts/validate.sh --strict`.
+   `./scripts/validate.sh --strict`. Immediately before authorization,
+   audit every queued Actions job for this repository. Cancel every queued job
+   whose complete `runs-on` expression could match the pool's shared label;
+   do not authorize until that matching queue is empty. If you cannot prove
+   that condition, use a dedicated empty proof repository and runner group
+   rather than exposing the pool to an unknown first job.
 3. Authorize the repository in the GitHub runner group.
 
 Full contract: [Adding a project](ADDING-A-PROJECT.md).
@@ -180,8 +187,9 @@ Changes state: yes, transiently — the job creates a runner container and
 may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
-1. Dispatch the staged proof workflow and record its run ID from the
-   run URL (`GITHUB_RUN_ID` scopes the residue checks below). Its explicit
+1. Dispatch the staged proof workflow and record its repository, run ID,
+   and run attempt from the run metadata (`GITHUB_RUN_ID` and
+   `GITHUB_RUN_ATTEMPT` scope the residue checks below). Its explicit
    `permissions: contents: read` and `timeout-minutes: 5` keep the job
    from inheriting a read-write `GITHUB_TOKEN` default or occupying the
    single runner past the ordinary-CI ceiling. Do not copy a nested
@@ -211,10 +219,15 @@ verifies all of it is cleaned up.
    # and Docker prefixes container names with '/', so anchor accordingly
    # and scope to this run ID (host-wide queries would also match a
    # concurrent unrelated run):
+   REPOSITORY=OWNER/REPOSITORY
    RUN_ID=<dispatched-run-id>
-   sudo docker ps -a --filter "name=^/ci-.*-${RUN_ID}-" --format '{{.Names}}'
-   sudo docker network ls --filter "name=^ci-.*-${RUN_ID}-" --format '{{.Name}}'
-   sudo docker volume ls -q --filter "name=^ci-.*-${RUN_ID}-"
+   RUN_ATTEMPT=<dispatched-run-attempt>
+   REPO_COMPONENT="$(printf '%s' "${REPOSITORY#*/}" \
+     | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
+   PROJECT_PREFIX="ci-${REPO_COMPONENT}-${RUN_ID}-${RUN_ATTEMPT}-"
+   sudo docker ps -a --filter "name=^/${PROJECT_PREFIX}" --format '{{.Names}}'
+   sudo docker network ls --filter "name=^${PROJECT_PREFIX}" --format '{{.Name}}'
+   sudo docker volume ls -q --filter "name=^${PROJECT_PREFIX}"
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
    sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
