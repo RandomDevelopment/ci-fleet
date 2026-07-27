@@ -13,8 +13,10 @@ them for this path.
 ci-fleet runs your GitHub Actions jobs on your own Docker hosts using
 **ephemeral** runners: a small controller service on each host watches
 GitHub for queued jobs, starts a throwaway runner container for exactly
-one job, and destroys it afterward. Runners are secret-free — long-lived
-controller credentials are never exposed to jobs — but they are
+one job, and destroys it afterward. Long-lived controller credentials
+are never exposed to jobs — but runners do receive short-lived
+registration configuration, and a job can receive `GITHUB_TOKEN` or
+explicitly configured project secrets. Runners are also
 **host-privileged**: each job gets the host Docker socket, which is
 host-root-equivalent, so only trusted private repositories may ever be
 authorized. Projects bring their own toolchains in their own containers.
@@ -40,21 +42,30 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
    bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
    sections 2-3. Then place the host-local identity files (root-owned,
    mode `0600`) as in [Adding a host](ADDING-A-HOST.md) section 5.
-3. Declare one `controllers` entry in your private configuration
-   repository (created from the public
-   [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template))
-   with `min_runners: 0`, `max_runners: 1`, and a pinned engine commit.
+3. Create your private configuration repository from the public
+   [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template)
+   and initialize it completely: run its `./scripts/init.sh` so the
+   fictional `example-org`/`example-app` placeholders are replaced, then
+   declare one `controllers` entry with `min_runners: 0`,
+   `max_runners: 1`, and a pinned engine commit. Validate with
+   `./scripts/validate.sh --strict` before continuing.
 4. Give the host a way to read that private repository: either a
    narrowly scoped host-local read-only Git credential, or a temporary
    pinned Git bundle / local checkout transferred from your management
    machine (the installer accepts a local checkout path as
    `--config-repo`). Without one of these, the installer's
    noninteractive fetch fails closed.
-5. Apply it (`--install` for a fresh host; `--adopt` is only for
+5. Clone the public engine repository on the host and check out the
+   exact reviewed engine commit your private configuration pins — the
+   installer uses code and validators from that checkout and runs as
+   root, so it must be the reviewed commit, not a moving branch. Then
+   apply it (`--install` for a fresh host; `--adopt` is only for
    converting an existing manually installed controller):
 
    ```bash
-   sudo ./scripts/install-worker-controller.sh \
+   git clone https://github.com/RandomDevelopment/ci-fleet.git
+   git -C ci-fleet checkout PINNED_ENGINE_COMMIT
+   sudo ci-fleet/scripts/install-worker-controller.sh \
      --install \
      --config-repo OWNER/PRIVATE-CONFIG-REPO \
      --ref RESOLVED_CONFIG_COMMIT \
@@ -80,11 +91,18 @@ Full contract: [Adding a project](ADDING-A-PROJECT.md).
 
 ## Step 3: Run and verify one job
 
-Runs on: GitHub. Changes state: no (ordinary CI only).
+Runs on: dispatched from GitHub, but steps execute inside an ephemeral
+runner on your fleet host with host-root-equivalent Docker access.
+Changes state: yes, transiently — the job creates a runner container and
+may create Docker containers, networks, and volumes; the proof below
+verifies all of it is cleaned up.
 
-1. Trigger one trivial job — the fleet canary's
-   `Fleet concurrency canary` workflow with count `1`, or a one-step
-   project job — with `runs-on` set to the shared label.
+1. Trigger one trivial job with `runs-on` set to the shared label —
+   either the starter example in this repository at
+   `examples/workflows/live-pilot.yml.example`, or a one-step project
+   job. Declare `permissions: contents: read` (or another explicit
+   minimal set) on the workflow so the job never inherits a read-write
+   `GITHUB_TOKEN` default.
 2. Verify the job ran on your fleet: the Actions job metadata names the
    runner, and the controller host's logs show that runner was created
    by your scale set. (Runner names derive from the controller ID, not
