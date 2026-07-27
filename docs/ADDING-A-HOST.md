@@ -49,7 +49,7 @@ The host must:
 - use local or virtualized storage suitable for Docker's write load;
 - have reliable DNS, time synchronization, and outbound HTTPS access to GitHub and required registries;
 - permit local administration without requiring public inbound access;
-- be disposable or recoverable from a documented build and backup procedure.
+- declare its failure boundary: either **disposable** (rebuilt from reviewed Git-authored configuration and host-local identity re-provisioning, with no machine backup required) or **recoverable** (a documented build and backup procedure).
 
 Runners sharing one Docker daemon share a security boundary. Add a host instead of increasing same-host concurrency when projects need stronger separation or when one site's failure must not stop the fleet.
 
@@ -61,15 +61,14 @@ Do not install Node, PHP, Python, Java, Composer, npm, database clients, or othe
 
 Enable unattended security updates without automatic reboots. Configure Docker log rotation and host disk alerts. Follow [Host maintenance](HOST-MAINTENANCE.md).
 
-## 3. Record backup and network readiness
+## 3. Record recovery and network readiness
 
 Before placing credentials on the host:
 
 1. verify console or local recovery access;
 2. verify the host has a unique name and address;
-3. create a VM backup, snapshot, or equivalent recoverable baseline;
-4. record the backup destination and successful timestamp outside this public repository;
-5. verify the host can reach GitHub and required container/package registries.
+3. for a **recoverable** host, create a VM backup, snapshot, or equivalent recoverable baseline and record the backup destination and successful timestamp outside this public repository; for a **disposable** controller, record that recovery is rebuilding the host from reviewed Git-authored desired state — no machine backup, snapshot, or tar archive is required or expected;
+4. verify the host can reach GitHub and required container/package registries.
 
 A remote site needs outbound connectivity; it does not need project-specific inbound access. If one location is offline, compatible jobs remain queued for another available host.
 
