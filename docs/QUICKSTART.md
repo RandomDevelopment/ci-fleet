@@ -180,7 +180,8 @@ Changes state: yes, transiently — the job creates a runner container and
 may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
-1. Dispatch the staged proof workflow. Its explicit
+1. Dispatch the staged proof workflow and record its run ID from the
+   run URL (`GITHUB_RUN_ID` scopes the residue checks below). Its explicit
    `permissions: contents: read` and `timeout-minutes: 5` keep the job
    from inheriting a read-write `GITHUB_TOKEN` default or occupying the
    single runner past the ordinary-CI ceiling. Do not copy a nested
@@ -205,17 +206,15 @@ verifies all of it is cleaned up.
    sudo docker ps -aq \
      --filter label=io.randomdevelopment.ci-fleet.managed=true \
      --filter label=io.randomdevelopment.ci-fleet.kind=runner
-   # No run-owned project resources remain. Compliant jobs name Compose
-   # projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>; the
-   # controller's own persistent ci-fleet_* resources are expected and
-   # excluded (runner containers are already covered by the label filter
-   # above):
-   sudo docker ps -a --filter "name=^ci-" --format '{{.Names}}' | grep -vx 'ci-fleet-controller-1'
-   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -vx 'ci-fleet_default'
-   sudo docker volume ls -q --filter "name=^ci-"
-   # (No compliant job creates controller-prefixed volumes; the exact-name
-   # exclusions above avoid hiding project containers from a repository
-   # named 'fleet' or 'fleet-*', whose Compose names also start ci-fleet-.)
+   # No resources owned by the dispatched proof run remain. Compliant
+   # jobs name Compose projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>,
+   # and Docker prefixes container names with '/', so anchor accordingly
+   # and scope to this run ID (host-wide queries would also match a
+   # concurrent unrelated run):
+   RUN_ID=<dispatched-run-id>
+   sudo docker ps -a --filter "name=^/ci-.*-${RUN_ID}-" --format '{{.Names}}'
+   sudo docker network ls --filter "name=^ci-.*-${RUN_ID}-" --format '{{.Name}}'
+   sudo docker volume ls -q --filter "name=^ci-.*-${RUN_ID}-"
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
    sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
