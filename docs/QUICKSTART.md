@@ -60,7 +60,11 @@ jobs through the Docker socket.
    installed on the organization with organization-level
    **Self-hosted runners: Read and write** permission; the concrete
    bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
-   sections 2-3. Then, on the **fleet host**, place the host-local
+   sections 2-3, with one exception: create the runner group **without
+   selecting repositories** — repository authorization happens in Step 2
+   only after the proof workflow is staged, so no previously queued or
+   push-triggered job can become the first job. Then, on the
+   **fleet host**, place the host-local
    identity files (root-owned, mode `0600`) from the checked-out
    engine's templates as in [Adding a host](ADDING-A-HOST.md) section 5.
 4. On the **management workstation**, create your private configuration
@@ -208,9 +212,12 @@ verifies all of it is cleaned up.
    # controller's own persistent ci-fleet_* resources are expected and
    # excluded (runner containers are already covered by the label filter
    # above):
-   sudo docker ps -a --filter "name=^ci-" --format '{{.Names}}' | grep -v '^ci-fleet-'
-   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -v '^ci-fleet_'
-   sudo docker volume ls -q --filter "name=^ci-" | grep -v '^ci-fleet_'
+   sudo docker ps -a --filter "name=^ci-" --format '{{.Names}}' | grep -vx 'ci-fleet-controller-1'
+   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -vx 'ci-fleet_default'
+   sudo docker volume ls -q --filter "name=^ci-"
+   # (No compliant job creates controller-prefixed volumes; the exact-name
+   # exclusions above avoid hiding project containers from a repository
+   # named 'fleet' or 'fleet-*', whose Compose names also start ci-fleet-.)
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
    sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
