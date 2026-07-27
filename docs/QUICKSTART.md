@@ -13,10 +13,13 @@ them for this path.
 ci-fleet runs your GitHub Actions jobs on your own Docker hosts using
 **ephemeral** runners: a small controller service on each host watches
 GitHub for queued jobs, starts a throwaway runner container for exactly
-one job, and destroys it afterward. Runners are secret-free and
-unprivileged; projects bring their own toolchains in their own
-containers. Capacity (how many jobs run at once) lives in reviewed
-private Git configuration, never in application workflows.
+one job, and destroys it afterward. Runners are secret-free — long-lived
+controller credentials are never exposed to jobs — but they are
+**host-privileged**: each job gets the host Docker socket, which is
+host-root-equivalent, so only trusted private repositories may ever be
+authorized. Projects bring their own toolchains in their own containers.
+Capacity (how many jobs run at once) lives in reviewed private Git
+configuration, never in application workflows.
 
 One controller on one Docker host is a complete fleet.
 
@@ -27,25 +30,38 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
 1. Check the host qualifies: Docker, Compose v2, Git, Bash, outbound
    HTTPS to GitHub, no project workloads, and a declared failure
    boundary (disposable or recoverable). See
-   [Adding a host](ADDING-A-HOST.md) sections 1-3.
-2. Create the GitHub App and runner group the controller will use, and
-   place the host-local identity files (root-owned, mode `0600`) as in
-   [Adding a host](ADDING-A-HOST.md) section 5.
+   [Adding a host](ADDING-A-HOST.md) sections 1-3. The installer itself
+   additionally requires a systemd-based host with `python3`, `tar`,
+   `install`, `flock`, and standard coreutils — it fails closed with a
+   named missing command if one is absent.
+2. Create the GitHub App and runner group the controller will use. The
+   App must be installed on the organization with organization-level
+   **Self-hosted runners: Read and write** permission; the concrete
+   bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
+   sections 2-3. Then place the host-local identity files (root-owned,
+   mode `0600`) as in [Adding a host](ADDING-A-HOST.md) section 5.
 3. Declare one `controllers` entry in your private configuration
    repository (created from the public
    [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template))
    with `min_runners: 0`, `max_runners: 1`, and a pinned engine commit.
-4. Apply it:
+4. Give the host a way to read that private repository: either a
+   narrowly scoped host-local read-only Git credential, or a temporary
+   pinned Git bundle / local checkout transferred from your management
+   machine (the installer accepts a local checkout path as
+   `--config-repo`). Without one of these, the installer's
+   noninteractive fetch fails closed.
+5. Apply it (`--install` for a fresh host; `--adopt` is only for
+   converting an existing manually installed controller):
 
    ```bash
    sudo ./scripts/install-worker-controller.sh \
-     --adopt \
+     --install \
      --config-repo OWNER/PRIVATE-CONFIG-REPO \
      --ref RESOLVED_CONFIG_COMMIT \
      --controller YOUR-CONTROLLER-ID
    ```
 
-5. Verify: the same command with `--check` reports `CHECK_OK`, and the
+6. Verify: the same command with `--check` reports `CHECK_OK`, and the
    GitHub runner group shows the scale set idle at zero runners.
 
 ## Step 2: Connect one repository
@@ -69,10 +85,17 @@ Runs on: GitHub. Changes state: no (ordinary CI only).
 1. Trigger one trivial job — the fleet canary's
    `Fleet concurrency canary` workflow with count `1`, or a one-step
    project job — with `runs-on` set to the shared label.
-2. Verify from the job's metadata: it ran on your scale set
-   (runner name prefix matches the scale-set name), succeeded, and the
-   ephemeral runner disappeared afterward.
-3. Verify the controller returned to zero idle runners.
+2. Verify the job ran on your fleet: the Actions job metadata names the
+   runner, and the controller host's logs show that runner was created
+   by your scale set. (Runner names derive from the controller ID, not
+   necessarily the scale-set name, so use controller or scale-set
+   evidence rather than a name-prefix guess.)
+3. Complete the isolated first-job proof from
+   [Live pilot runbook](LIVE-PILOT.md): read-only job permissions,
+   controller health, scoped cleanup, and zero remaining job-owned
+   containers, networks, or volumes. Job success plus a returned-to-zero
+   runner count alone does not prove the host is clean.
+4. Verify the controller returned to zero idle runners.
 
 If the job stays queued: compare the job's complete `runs-on` expression
 against the scale set's configured routing label, then check runner-group
