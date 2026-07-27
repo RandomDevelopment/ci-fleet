@@ -98,13 +98,14 @@ jobs through the Docker socket.
    repository, open a pull request, and **merge it**:
 
    ```bash
-   git init -q && git add -A && git commit -qm "Initialize fleet configuration"
    ./scripts/validate.sh --strict
+   git init -q && git add -A && git commit -qm "Initialize fleet configuration"
    ```
 
-   The commit must contain the initialized `fleet.json`; validating the
-   working tree without committing it would push the untouched example
-   configuration. Managed controller managed controller
+   Validate **before** committing so a rejected file or accidental value
+   never enters branch history. The commit must contain the initialized
+   `fleet.json`; pushing the untouched example configuration would give
+   `RESOLVED_CONFIG_COMMIT` no controller to apply. Managed controller managed controller
    lifecycle is permitted only from a reviewed, merged private
    configuration commit. Resolve and record that merge commit SHA
    (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
@@ -142,7 +143,9 @@ private configuration). Changes state: yes, but no host changes —
 onboarding never touches a fleet host.
 
 1. Stage the proof workflow first: commit the dispatch-only job below
-   to the project repository as `.github/workflows/fleet-proof.yml`.
+   to the project repository's **default branch** as
+   `.github/workflows/fleet-proof.yml` (GitHub only offers
+   `workflow_dispatch` for workflows present on the default branch).
    Do this **before** authorization so the first eligible job is the
    controlled proof, never a push-triggered or previously queued job.
 
@@ -201,9 +204,11 @@ verifies all of it is cleaned up.
      --filter label=io.randomdevelopment.ci-fleet.managed=true \
      --filter label=io.randomdevelopment.ci-fleet.kind=runner
    # No run-owned project resources remain. Compliant jobs name Compose
-   # projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>:
-   sudo docker ps -aq --filter "name=^ci-"
-   sudo docker network ls -q --filter "name=^ci-"
+   # projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>; the
+   # controller's own persistent ci-fleet_default network is expected
+   # and excluded:
+   sudo docker ps -aq --filter "name=^ci-" | grep -vx "" || true
+   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -v '^ci-fleet_default$'
    sudo docker volume ls -q --filter "name=^ci-"
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
