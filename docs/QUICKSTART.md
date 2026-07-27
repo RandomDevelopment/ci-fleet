@@ -41,12 +41,13 @@ jobs through the Docker socket.
    additionally requires a systemd-based host with `python3`, `tar`,
    `install`, `flock`, and standard coreutils — it fails closed with a
    named missing command if one is absent.
-2. Clone the public engine repository and check out the exact reviewed
-   engine commit you intend to pin — later steps copy templates from it
-   and run its installer as root, so it must be the reviewed commit, not
-   a moving branch. The pin must be a commit merged into and reachable
-   from the engine's public default branch; never pin an unmerged local
-   branch tip.
+2. On the **fleet host**, clone the public engine repository and check
+   out the exact reviewed engine commit you intend to pin — later steps
+   copy templates from it and run its installer as root, so it must be
+   the reviewed commit, not a moving branch. The pin must be a commit
+   merged into and reachable from the engine's public default branch;
+   never pin an unmerged local branch tip. Cloning the public engine
+   needs no repository-writing credential.
 
    ```bash
    git clone https://github.com/RandomDevelopment/ci-fleet.git
@@ -54,23 +55,28 @@ jobs through the Docker socket.
    git -C ci-fleet merge-base --is-ancestor HEAD origin/main && echo merged
    ```
 
-3. Create the GitHub App and runner group the controller will use. The
-   App must be installed on the organization with organization-level
+3. On the **management workstation** (GitHub web UI), create the GitHub
+   App and runner group the controller will use. The App must be
+   installed on the organization with organization-level
    **Self-hosted runners: Read and write** permission; the concrete
    bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
-   sections 2-3. Then place the host-local identity files (root-owned,
-   mode `0600`) from the checked-out engine's templates as in
-   [Adding a host](ADDING-A-HOST.md) section 5.
-4. Create your private configuration repository from the public
-   [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template)
-   and initialize it completely — pass the runner group you just created,
-   your controller ID, and the pinned engine commit, so no fictional
-   `example-org`/`example-app` placeholders survive:
+   sections 2-3. Then, on the **fleet host**, place the host-local
+   identity files (root-owned, mode `0600`) from the checked-out
+   engine's templates as in [Adding a host](ADDING-A-HOST.md) section 5.
+4. On the **management workstation**, create your private configuration
+   repository from the configuration template **versioned inside the
+   pinned engine checkout** — the schema, initializer, and validator the
+   pinned engine actually enforces live under its
+   `templates/config-repository`, while the standalone public template
+   may have advanced past your engine pin:
 
    ```bash
+   cp -r ci-fleet/templates/config-repository my-fleet-config
+   cd my-fleet-config && git init -q && git add -A && git commit -qm init
    ./scripts/init.sh \
      --organization YOUR-ORG \
-     --project YOUR-APP \
+     --project YOUR-APP-SLUG \
+     --repository YOUR-ORG/ACTUAL-REPOSITORY-NAME \
      --controller YOUR-CONTROLLER-ID \
      --location primary-site \
      --runner-group YOUR-CREATED-RUNNER-GROUP \
@@ -79,22 +85,29 @@ jobs through the Docker socket.
      --engine-ref PINNED_ENGINE_COMMIT
    ```
 
-   Then validate with `./scripts/validate.sh --strict`, open a pull
-   request, and **merge it**: managed controller lifecycle is permitted
-   only from a reviewed, merged private configuration commit. Resolve
-   and record that merge commit SHA (`RESOLVED_CONFIG_COMMIT` below);
-   do not install from an unmerged branch.
-5. Give the host a way to read that private repository: either a
-   narrowly scoped host-local read-only Git credential, or a pinned
-   local checkout transferred from your management machine via a
-   temporary Git bundle (the installer accepts a local checkout path as
-   `--config-repo`). Without one of these, the installer's
-   noninteractive fetch fails closed. If you use the local-checkout
-   path, keep that checkout in place afterward — the recorded path is
-   reused by scheduled drift checks — and remove only the bundle.
-6. Apply the merged configuration from the reviewed engine checkout
-   (`--install` for a fresh host; `--adopt` is only for converting an
-   existing manually installed controller):
+   `--project` is a logical lowercase slug; pass the real GitHub
+   repository name separately with `--repository` so
+   `allowed_repositories` names a repository that exists. Validate with
+   `./scripts/validate.sh --strict`, push to a new **private** GitHub
+   repository, open a pull request, and **merge it**: managed controller
+   lifecycle is permitted only from a reviewed, merged private
+   configuration commit. Resolve and record that merge commit SHA
+   (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
+   branch.
+5. Give the fleet host a way to read that private repository **as
+   root**: the installer fetches under `sudo` and the recurring drift
+   check runs as `User=root`, so a credential in an operator's
+   user-scoped Git configuration is invisible to both. Either configure
+   a narrowly scoped read-only credential in root's Git configuration,
+   or transfer a pinned local checkout from your management workstation
+   via a temporary Git bundle (the installer accepts a local checkout
+   path as `--config-repo`). Without one of these, the noninteractive
+   fetch fails closed. If you use the local-checkout path, keep that
+   checkout in place afterward — the recorded path is reused by
+   scheduled drift checks — and remove only the bundle.
+6. On the **fleet host**, apply the merged configuration from the
+   reviewed engine checkout (`--install` for a fresh host; `--adopt` is
+   only for converting an existing manually installed controller):
 
    ```bash
    sudo ci-fleet/scripts/install-worker-controller.sh \
@@ -109,17 +122,19 @@ jobs through the Docker socket.
 
 ## Step 2: Connect one repository
 
-Runs on: GitHub + the project repository + private configuration.
-Changes state: yes, but no host changes — onboarding never touches a
-fleet host.
+Runs on: management workstation (GitHub + the project repository +
+private configuration). Changes state: yes, but no host changes —
+onboarding never touches a fleet host.
 
-1. Confirm the repository you passed as `--project` to `init.sh` is in
-   the pool's `allowed_repositories` (the initializer put it there; add
-   it only if you skipped initialization), and validate with
+1. Stage the proof workflow first: commit the trivial
+   `workflow_dispatch`-only job from Step 3 to the project repository.
+   Do this **before** authorization so the first eligible job is the
+   controlled proof, never a push-triggered or previously queued job.
+2. Confirm the repository you passed as `--repository` to `init.sh` is
+   in the pool's `allowed_repositories` (the initializer put it there;
+   add it only if you skipped initialization), and validate with
    `./scripts/validate.sh --strict`.
-2. Authorize the repository in the GitHub runner group.
-3. Give the project a workflow whose jobs use the pool's shared routing
-   label (for example `runs-on: docker-ci`).
+3. Authorize the repository in the GitHub runner group.
 
 Full contract: [Adding a project](ADDING-A-PROJECT.md).
 
@@ -131,14 +146,14 @@ Changes state: yes, transiently — the job creates a runner container and
 may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
-1. Trigger one trivial one-step project job with `runs-on` set to the
-   shared label, `permissions: contents: read` declared explicitly, and
-   `timeout-minutes: 5`, so the job never inherits a read-write
-   `GITHUB_TOKEN` default and cannot occupy the single runner past the
-   ordinary-CI ceiling. Do not copy a nested runner image reference into
-   the job: image tags derive from each controller's engine pin, and a
-   workflow hard-coding one host's tag can be routed to a host where
-   that image does not exist. (The older
+1. Dispatch the staged proof workflow. It should be one trivial job
+   with `runs-on` set to the shared label, `permissions: contents: read`
+   declared explicitly, and `timeout-minutes: 5`, so the job never
+   inherits a read-write `GITHUB_TOKEN` default and cannot occupy the
+   single runner past the ordinary-CI ceiling. Do not copy a nested
+   runner image reference into the job: image tags derive from each
+   controller's engine pin, and a workflow hard-coding one host's tag
+   can be routed to a host where that image does not exist. (The older
    `examples/workflows/live-pilot.yml.example` targets the experimental
    label and the `:dev` runner image and is not a managed-install
    starter.)
@@ -147,12 +162,29 @@ verifies all of it is cleaned up.
    by your scale set. (Runner names derive from the controller ID, not
    necessarily the scale-set name, so use controller or scale-set
    evidence rather than a name-prefix guess.)
-3. Complete the isolated first-job proof from
-   [Live pilot runbook](LIVE-PILOT.md): read-only job permissions,
-   controller health, scoped cleanup, and zero remaining job-owned
-   containers, networks, or volumes. Job success plus a returned-to-zero
-   runner count alone does not prove the host is clean.
-4. Verify the controller returned to zero idle runners.
+3. On the fleet host, prove cleanup and health explicitly — job success
+   plus a returned-to-zero runner count alone does not prove the host
+   is clean:
+
+   ```bash
+   # No fleet-managed containers remain:
+   sudo docker ps -aq \
+     --filter label=io.randomdevelopment.ci-fleet.managed=true
+   # No run-scoped networks or volumes remain (name prefix ci-fleet-<controller-id>-):
+   sudo docker network ls -q --filter "name=^ci-fleet-"
+   sudo docker volume ls -q --filter "name=^ci-fleet-"
+   # Controller is healthy and idle:
+   sudo systemctl status ci-fleet-health.service --no-pager
+   sudo ci-fleet/scripts/install-worker-controller.sh \
+     --check --config-repo OWNER/PRIVATE-CONFIG-REPO \
+     --ref RESOLVED_CONFIG_COMMIT --controller YOUR-CONTROLLER-ID
+   ```
+
+   Every listing above must be empty and the check must report
+   `CHECK_OK`. The [Live pilot runbook](LIVE-PILOT.md) documents the
+   full isolated first-job proof including read-only job permissions.
+4. Verify the controller returned to zero idle runners in the GitHub
+   runner group.
 
 If the job stays queued: compare the job's complete `runs-on` expression
 against the scale set's configured routing label, then check runner-group
