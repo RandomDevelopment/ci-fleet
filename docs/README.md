@@ -4,8 +4,11 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 ## Start here
 
+New operator? Follow the [Quickstart](QUICKSTART.md): what ci-fleet does, install one controller, connect one repository, run and verify one job. Everything below is reference.
+
 | I want to… | Read |
 | --- | --- |
+| Complete the beginner path end to end | [Quickstart](QUICKSTART.md) |
 | Understand the whole system | [Architecture](ARCHITECTURE.md) |
 | Understand how ephemeral runners are created | [Runner controller design](CONTROLLER-DESIGN.md) |
 | Decide whether it fits my infrastructure | [Architecture](ARCHITECTURE.md) and the root [README](../README.md) |
