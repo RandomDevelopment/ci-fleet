@@ -103,13 +103,18 @@ jobs through the Docker socket.
 
    ```bash
    ./scripts/validate.sh --strict
-   git init -q && git add -A && git commit -qm "Initialize fleet configuration"
+   git init -q -b main
+   git add -A && git commit -qm "Import ci-fleet configuration template"
+   git checkout -qb initialize-fleet
+   git add -A && git commit -qm "Initialize fleet configuration" --allow-empty
    ```
 
    Validate **before** committing so a rejected file or accidental value
-   never enters branch history. The commit must contain the initialized
-   `fleet.json`; pushing the untouched example configuration would give
-   `RESOLVED_CONFIG_COMMIT` no controller to apply. Managed controller managed controller
+   never enters branch history. Commit the vendored template to `main`
+   first, then commit the initialized `fleet.json` on a branch, so the
+   required pull request has a base to diff against. Pushing the only
+   commit directly would establish the default branch with no review.
+   Managed controller managed controller
    lifecycle is permitted only from a reviewed, merged private
    configuration commit. Resolve and record that merge commit SHA
    (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
