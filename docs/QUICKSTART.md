@@ -205,11 +205,12 @@ verifies all of it is cleaned up.
      --filter label=io.randomdevelopment.ci-fleet.kind=runner
    # No run-owned project resources remain. Compliant jobs name Compose
    # projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>; the
-   # controller's own persistent ci-fleet_default network is expected
-   # and excluded:
-   sudo docker ps -aq --filter "name=^ci-" | grep -vx "" || true
-   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -v '^ci-fleet_default$'
-   sudo docker volume ls -q --filter "name=^ci-"
+   # controller's own persistent ci-fleet_* resources are expected and
+   # excluded (runner containers are already covered by the label filter
+   # above):
+   sudo docker ps -a --filter "name=^ci-" --format '{{.Names}}' | grep -v '^ci-fleet-'
+   sudo docker network ls --filter "name=^ci-" --format '{{.Name}}' | grep -v '^ci-fleet_'
+   sudo docker volume ls -q --filter "name=^ci-" | grep -v '^ci-fleet_'
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
    sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
