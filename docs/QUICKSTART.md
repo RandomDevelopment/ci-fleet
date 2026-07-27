@@ -70,9 +70,15 @@ jobs through the Docker socket.
    `templates/config-repository`, while the standalone public template
    may have advanced past your engine pin:
 
+   On the management workstation, clone the same pinned engine commit
+   (the previous clone lives on the fleet host), then copy its vendored
+   template:
+
    ```bash
+   git clone -q https://github.com/RandomDevelopment/ci-fleet.git
+   git -C ci-fleet checkout PINNED_ENGINE_COMMIT
    cp -r ci-fleet/templates/config-repository my-fleet-config
-   cd my-fleet-config && git init -q && git add -A && git commit -qm init
+   cd my-fleet-config
    ./scripts/init.sh \
      --organization YOUR-ORG \
      --project YOUR-APP-SLUG \
@@ -87,9 +93,18 @@ jobs through the Docker socket.
 
    `--project` is a logical lowercase slug; pass the real GitHub
    repository name separately with `--repository` so
-   `allowed_repositories` names a repository that exists. Validate with
-   `./scripts/validate.sh --strict`, push to a new **private** GitHub
-   repository, open a pull request, and **merge it**: managed controller
+   `allowed_repositories` names a repository that exists. Commit the
+   initialized result, validate, push to a new **private** GitHub
+   repository, open a pull request, and **merge it**:
+
+   ```bash
+   git init -q && git add -A && git commit -qm "Initialize fleet configuration"
+   ./scripts/validate.sh --strict
+   ```
+
+   The commit must contain the initialized `fleet.json`; validating the
+   working tree without committing it would push the untouched example
+   configuration. Managed controller managed controller
    lifecycle is permitted only from a reviewed, merged private
    configuration commit. Resolve and record that merge commit SHA
    (`RESOLVED_CONFIG_COMMIT` below); do not install from an unmerged
@@ -126,10 +141,24 @@ Runs on: management workstation (GitHub + the project repository +
 private configuration). Changes state: yes, but no host changes —
 onboarding never touches a fleet host.
 
-1. Stage the proof workflow first: commit the trivial
-   `workflow_dispatch`-only job from Step 3 to the project repository.
+1. Stage the proof workflow first: commit the dispatch-only job below
+   to the project repository as `.github/workflows/fleet-proof.yml`.
    Do this **before** authorization so the first eligible job is the
    controlled proof, never a push-triggered or previously queued job.
+
+   ```yaml
+   name: Fleet first-job proof
+   on:
+     workflow_dispatch:
+   permissions:
+     contents: read
+   jobs:
+     proof:
+       runs-on: docker-ci   # your pool's shared routing label
+       timeout-minutes: 5
+       steps:
+         - run: echo "fleet proof on ${RUNNER_NAME:-unknown}"
+   ```
 2. Confirm the repository you passed as `--repository` to `init.sh` is
    in the pool's `allowed_repositories` (the initializer put it there;
    add it only if you skipped initialization), and validate with
@@ -146,12 +175,11 @@ Changes state: yes, transiently — the job creates a runner container and
 may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
-1. Dispatch the staged proof workflow. It should be one trivial job
-   with `runs-on` set to the shared label, `permissions: contents: read`
-   declared explicitly, and `timeout-minutes: 5`, so the job never
-   inherits a read-write `GITHUB_TOKEN` default and cannot occupy the
+1. Dispatch the staged proof workflow. Its explicit
+   `permissions: contents: read` and `timeout-minutes: 5` keep the job
+   from inheriting a read-write `GITHUB_TOKEN` default or occupying the
    single runner past the ordinary-CI ceiling. Do not copy a nested
-   runner image reference into the job: image tags derive from each
+   runner image reference into a job: image tags derive from each
    controller's engine pin, and a workflow hard-coding one host's tag
    can be routed to a host where that image does not exist. (The older
    `examples/workflows/live-pilot.yml.example` targets the experimental
@@ -167,22 +195,30 @@ verifies all of it is cleaned up.
    is clean:
 
    ```bash
-   # No fleet-managed containers remain:
+   # No ephemeral runner containers remain (the long-lived controller
+   # container is also fleet-managed, so filter by kind=runner):
    sudo docker ps -aq \
-     --filter label=io.randomdevelopment.ci-fleet.managed=true
-   # No run-scoped networks or volumes remain (name prefix ci-fleet-<controller-id>-):
-   sudo docker network ls -q --filter "name=^ci-fleet-"
-   sudo docker volume ls -q --filter "name=^ci-fleet-"
-   # Controller is healthy and idle:
-   sudo systemctl status ci-fleet-health.service --no-pager
+     --filter label=io.randomdevelopment.ci-fleet.managed=true \
+     --filter label=io.randomdevelopment.ci-fleet.kind=runner
+   # No run-owned project resources remain. Compliant jobs name Compose
+   # projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>:
+   sudo docker ps -aq --filter "name=^ci-"
+   sudo docker network ls -q --filter "name=^ci-"
+   sudo docker volume ls -q --filter "name=^ci-"
+   # Run a fresh health evaluation, then check installed state:
+   sudo systemctl start ci-fleet-health.service
+   sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
    sudo ci-fleet/scripts/install-worker-controller.sh \
      --check --config-repo OWNER/PRIVATE-CONFIG-REPO \
      --ref RESOLVED_CONFIG_COMMIT --controller YOUR-CONTROLLER-ID
    ```
 
-   Every listing above must be empty and the check must report
-   `CHECK_OK`. The [Live pilot runbook](LIVE-PILOT.md) documents the
-   full isolated first-job proof including read-only job permissions.
+   The health service is a timer-driven oneshot — `systemctl status`
+   alone only shows its previous run, so start it explicitly after the
+   proof job. Every resource listing above must be empty and the check
+   must report `CHECK_OK`. The [Live pilot runbook](LIVE-PILOT.md)
+   documents the full isolated first-job proof including read-only job
+   permissions.
 4. Verify the controller returned to zero idle runners in the GitHub
    runner group.
 
