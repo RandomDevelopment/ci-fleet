@@ -28,7 +28,11 @@ One controller on one Docker host is a complete fleet.
 
 ## Step 1: Install one controller
 
-Runs on: a fresh Linux Docker host. Changes state: yes.
+Runs on: split between a management workstation (Git and GitHub work)
+and the fresh Linux Docker host (installation only). Changes state: yes.
+Keep repository-writing credentials off the fleet host: anything with
+write access retained there is reachable by later host-root-equivalent
+jobs through the Docker socket.
 
 1. Check the host qualifies: Docker, Compose v2, Git, Bash, outbound
    HTTPS to GitHub, no project workloads, and a declared failure
@@ -40,11 +44,14 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
 2. Clone the public engine repository and check out the exact reviewed
    engine commit you intend to pin — later steps copy templates from it
    and run its installer as root, so it must be the reviewed commit, not
-   a moving branch:
+   a moving branch. The pin must be a commit merged into and reachable
+   from the engine's public default branch; never pin an unmerged local
+   branch tip.
 
    ```bash
    git clone https://github.com/RandomDevelopment/ci-fleet.git
    git -C ci-fleet checkout PINNED_ENGINE_COMMIT
+   git -C ci-fleet merge-base --is-ancestor HEAD origin/main && echo merged
    ```
 
 3. Create the GitHub App and runner group the controller will use. The
@@ -78,11 +85,13 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
    and record that merge commit SHA (`RESOLVED_CONFIG_COMMIT` below);
    do not install from an unmerged branch.
 4. Give the host a way to read that private repository: either a
-   narrowly scoped host-local read-only Git credential, or a temporary
-   pinned Git bundle / local checkout transferred from your management
-   machine (the installer accepts a local checkout path as
+   narrowly scoped host-local read-only Git credential, or a pinned
+   local checkout transferred from your management machine via a
+   temporary Git bundle (the installer accepts a local checkout path as
    `--config-repo`). Without one of these, the installer's
-   noninteractive fetch fails closed.
+   noninteractive fetch fails closed. If you use the local-checkout
+   path, keep that checkout in place afterward — the recorded path is
+   reused by scheduled drift checks — and remove only the bundle.
 5. Apply the merged configuration from the reviewed engine checkout
    (`--install` for a fresh host; `--adopt` is only for converting an
    existing manually installed controller):
@@ -104,8 +113,10 @@ Runs on: GitHub + the project repository + private configuration.
 Changes state: yes, but no host changes — onboarding never touches a
 fleet host.
 
-1. Add the repository to the pool's `allowed_repositories` in private
-   configuration and validate with `./scripts/validate.sh --strict`.
+1. Confirm the repository you passed as `--project` to `init.sh` is in
+   the pool's `allowed_repositories` (the initializer put it there; add
+   it only if you skipped initialization), and validate with
+   `./scripts/validate.sh --strict`.
 2. Authorize the repository in the GitHub runner group.
 3. Give the project a workflow whose jobs use the pool's shared routing
    label (for example `runs-on: docker-ci`).
@@ -121,12 +132,16 @@ may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
 1. Trigger one trivial one-step project job with `runs-on` set to the
-   shared label and `permissions: contents: read` declared explicitly,
-   so the job never inherits a read-write `GITHUB_TOKEN` default. (The
-   older `examples/workflows/live-pilot.yml.example` targets the
-   experimental label and the `:dev` runner image; on a managed install
-   use your pool's shared label and the controller-rendered image tag
-   instead of copying it unchanged.)
+   shared label, `permissions: contents: read` declared explicitly, and
+   `timeout-minutes: 5`, so the job never inherits a read-write
+   `GITHUB_TOKEN` default and cannot occupy the single runner past the
+   ordinary-CI ceiling. Do not copy a nested runner image reference into
+   the job: image tags derive from each controller's engine pin, and a
+   workflow hard-coding one host's tag can be routed to a host where
+   that image does not exist. (The older
+   `examples/workflows/live-pilot.yml.example` targets the experimental
+   label and the `:dev` runner image and is not a managed-install
+   starter.)
 2. Verify the job ran on your fleet: the Actions job metadata names the
    runner, and the controller host's logs show that runner was created
    by your scale set. (Runner names derive from the controller ID, not
