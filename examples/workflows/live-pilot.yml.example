@@ -1,6 +1,6 @@
 # Copy this file into one explicitly selected trusted private repository.
-# Do not enable the ci-fleet runner group for this public template repository.
-name: Experimental live runner pilot
+# Do not enable the ci-fleet runner group for this public repository.
+name: Fleet first-job lifecycle proof
 
 on:
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: experimental-live-runner-pilot
+  group: ci-fleet-first-job-proof
   cancel-in-progress: false
 
 jobs:
   pilot:
     name: Read-only one-job lifecycle proof
-    runs-on: docker-ci-experimental
+    runs-on: docker-ci
     timeout-minutes: 10
     steps:
       - name: Check out without retaining credentials
@@ -33,7 +33,7 @@ jobs:
       - name: Prove run-scoped Docker cleanup
         run: |
           set -Eeuo pipefail
-          name="ci-fleet-pilot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          name="ci-fleet-proof-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
             docker rm -f "$name" >/dev/null 2>&1 || true
             docker volume rm "$name" >/dev/null 2>&1 || true

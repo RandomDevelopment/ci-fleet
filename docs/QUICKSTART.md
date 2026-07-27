@@ -13,11 +13,12 @@ them for this path.
 ci-fleet runs your GitHub Actions jobs on your own Docker hosts using
 **ephemeral** runners: a small controller service on each host watches
 GitHub for queued jobs, starts a throwaway runner container for exactly
-one job, and destroys it afterward. Runners are secret-free — long-lived
-controller credentials are never exposed to jobs — but they are
-**host-privileged**: each job gets the host Docker socket, which is
-host-root-equivalent, so only trusted private repositories may ever be
-authorized. Projects bring their own toolchains in their own containers.
+one job, and destroys it afterward. Jobs never receive the controller's
+long-lived credential, but they can receive short-lived registration
+configuration, `GITHUB_TOKEN`, and explicitly configured project secrets.
+They are also **host-privileged**: each job gets the host Docker socket,
+which is host-root-equivalent, so only trusted private repositories may
+ever be authorized. Projects bring their own toolchains in their own containers.
 Capacity (how many jobs run at once) lives in reviewed private Git
 configuration, never in application workflows.
 
@@ -40,17 +41,23 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
    bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
    sections 2-3. Then place the host-local identity files (root-owned,
    mode `0600`) as in [Adding a host](ADDING-A-HOST.md) section 5.
-3. Declare one `controllers` entry in your private configuration
-   repository (created from the public
-   [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template))
-   with `min_runners: 0`, `max_runners: 1`, and a pinned engine commit.
+3. Create the private configuration repository from the public
+   [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template),
+   then run its `scripts/init.sh` as described in that repository's README.
+   Review the complete generated `fleet.json` and replace every fictional
+   organization, project, runner-group, and controller value; editing only
+   `controllers` leaves unsafe example mappings behind. Start with
+   `min_runners: 0`, `max_runners: 1`, and a pinned engine commit.
 4. Give the host a way to read that private repository: either a
    narrowly scoped host-local read-only Git credential, or a temporary
    pinned Git bundle / local checkout transferred from your management
    machine (the installer accepts a local checkout path as
    `--config-repo`). Without one of these, the installer's
    noninteractive fetch fails closed.
-5. Apply it (`--install` for a fresh host; `--adopt` is only for
+5. Check out the engine at the exact reviewed commit declared by the
+   private configuration and verify `git rev-parse HEAD` matches it. Do not
+   run the root installer from an unreviewed checkout or moving branch.
+6. Apply it (`--install` for a fresh host; `--adopt` is only for
    converting an existing manually installed controller):
 
    ```bash
@@ -61,7 +68,7 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
      --controller YOUR-CONTROLLER-ID
    ```
 
-6. Verify: the same command with `--check` reports `CHECK_OK`, and the
+7. Verify: the same command with `--check` reports `CHECK_OK`, and the
    GitHub runner group shows the scale set idle at zero runners.
 
 ## Step 2: Connect one repository
@@ -73,18 +80,23 @@ fleet host.
 1. Add the repository to the pool's `allowed_repositories` in private
    configuration and validate with `./scripts/validate.sh --strict`.
 2. Authorize the repository in the GitHub runner group.
-3. Give the project a workflow whose jobs use the pool's shared routing
-   label (for example `runs-on: docker-ci`).
+3. Copy `examples/workflows/live-pilot.yml.example` from the reviewed
+   engine checkout into the project, keep its explicit read-only
+   `permissions`, and set `runs-on` to the pool's shared routing label (for
+   example `docker-ci`). Do not rely on the repository's default token
+   permissions.
 
 Full contract: [Adding a project](ADDING-A-PROJECT.md).
 
 ## Step 3: Run and verify one job
 
-Runs on: GitHub. Changes state: no (ordinary CI only).
+Dispatched through: GitHub. Job steps run inside the ephemeral runner on
+the fleet Docker host with host-root-equivalent socket access. Changes
+state: yes — the controller creates a runner container and the proof job
+creates scoped Docker resources, all of which must be removed afterward.
 
-1. Trigger one trivial job — the fleet canary's
-   `Fleet concurrency canary` workflow with count `1`, or a one-step
-   project job — with `runs-on` set to the shared label.
+1. Dispatch the copied first-job lifecycle proof once with `runs-on` set
+   to the shared label.
 2. Verify the job ran on your fleet: the Actions job metadata names the
    runner, and the controller host's logs show that runner was created
    by your scale set. (Runner names derive from the controller ID, not
