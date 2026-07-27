@@ -8,15 +8,12 @@ required = (
     "host architecture must be `amd64` or `arm64`",
     "Cancel every queued job",
     "across every repository already authorized for the runner group",
-    "REPOSITORY=OWNER/REPOSITORY",
-    "RUN_ATTEMPT=<dispatched-run-attempt>",
-    'PROJECT_PREFIX="ci-${REPO_COMPONENT}-${RUN_ID}-${RUN_ATTEMPT}-"',
-    '--filter "name=^/${PROJECT_PREFIX}"',
-    '--filter "name=^${PROJECT_PREFIX}"',
+    "the only workflow that can target the shared label",
 )
 for text in required:
     assert text in quickstart, f"quickstart safety contract missing: {text}"
 
 assert quickstart.index("Cancel every queued job") < quickstart.index("3. Authorize the repository")
+assert "PROJECT_PREFIX=" not in raw_quickstart
 assert "managed controller managed controller" not in quickstart
 print("quickstart_contract=PASS")

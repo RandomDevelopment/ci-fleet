@@ -166,6 +166,11 @@ onboarding never touches a fleet host.
        steps:
          - run: echo "fleet proof on ${RUNNER_NAME:-unknown}"
    ```
+   This controlled-first-job path is valid only when the staged proof is
+   the only workflow that can target the shared label. If the repository is
+   active or has any other matching trigger, stop: use a dedicated empty
+   proof repository and runner group for Steps 1-3, then onboard the active
+   repository through [Adding a project](ADDING-A-PROJECT.md).
 2. Confirm the repository you passed as `--repository` to `init.sh` is
    in the pool's `allowed_repositories` (the initializer put it there;
    add it only if you skipped initialization), and validate with
@@ -185,12 +190,11 @@ Full contract: [Adding a project](ADDING-A-PROJECT.md).
 Runs on: dispatched from GitHub, but steps execute inside an ephemeral
 runner on your fleet host with host-root-equivalent Docker access.
 Changes state: yes, transiently — the job creates a runner container and
-may create Docker containers, networks, and volumes; the proof below
-verifies all of it is cleaned up.
+the proof below verifies that it is cleaned up. The supplied proof job does
+not invoke project Compose or create project containers, networks, or volumes.
 
-1. Dispatch the staged proof workflow and record its repository, run ID,
-   and run attempt from the run metadata (`GITHUB_RUN_ID` and
-   `GITHUB_RUN_ATTEMPT` scope the residue checks below). Its explicit
+1. Dispatch the staged proof workflow and record its run ID from the run
+   metadata. Its explicit
    `permissions: contents: read` and `timeout-minutes: 5` keep the job
    from inheriting a read-write `GITHUB_TOKEN` default or occupying the
    single runner past the ordinary-CI ceiling. Do not copy a nested
@@ -215,20 +219,6 @@ verifies all of it is cleaned up.
    sudo docker ps -aq \
      --filter label=io.randomdevelopment.ci-fleet.managed=true \
      --filter label=io.randomdevelopment.ci-fleet.kind=runner
-   # No resources owned by the dispatched proof run remain. Compliant
-   # jobs name Compose projects ci-<repo>-<run-id>-<attempt>-<task>-<shard>,
-   # and Docker prefixes container names with '/', so anchor accordingly
-   # and scope to this run ID (host-wide queries would also match a
-   # concurrent unrelated run):
-   REPOSITORY=OWNER/REPOSITORY
-   RUN_ID=<dispatched-run-id>
-   RUN_ATTEMPT=<dispatched-run-attempt>
-   REPO_COMPONENT="$(printf '%s' "${REPOSITORY#*/}" \
-     | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-' | cut -c1-12)"
-   PROJECT_PREFIX="ci-${REPO_COMPONENT}-${RUN_ID}-${RUN_ATTEMPT}-"
-   sudo docker ps -a --filter "name=^/${PROJECT_PREFIX}" --format '{{.Names}}'
-   sudo docker network ls --filter "name=^${PROJECT_PREFIX}" --format '{{.Name}}'
-   sudo docker volume ls -q --filter "name=^${PROJECT_PREFIX}"
    # Run a fresh health evaluation, then check installed state:
    sudo systemctl start ci-fleet-health.service
    sudo systemctl is-failed ci-fleet-health.service  # expect: inactive/failed must NOT be failed
@@ -239,7 +229,7 @@ verifies all of it is cleaned up.
 
    The health service is a timer-driven oneshot — `systemctl status`
    alone only shows its previous run, so start it explicitly after the
-   proof job. Every resource listing above must be empty and the check
+   proof job. The runner-container listing above must be empty and the check
    must report `CHECK_OK`. The [Live pilot runbook](LIVE-PILOT.md)
    documents the full isolated first-job proof including read-only job
    permissions.
