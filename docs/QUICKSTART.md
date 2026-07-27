@@ -13,13 +13,14 @@ them for this path.
 ci-fleet runs your GitHub Actions jobs on your own Docker hosts using
 **ephemeral** runners: a small controller service on each host watches
 GitHub for queued jobs, starts a throwaway runner container for exactly
-one job, and destroys it afterward. Long-lived controller credentials
-are never exposed to jobs — but runners do receive short-lived
-registration configuration, and a job can receive `GITHUB_TOKEN` or
-explicitly configured project secrets. Runners are also
-**host-privileged**: each job gets the host Docker socket, which is
-host-root-equivalent, so only trusted private repositories may ever be
-authorized. Projects bring their own toolchains in their own containers.
+one job, and destroys it afterward. Runners are **host-privileged**:
+each job gets the host Docker socket, which is host-root-equivalent. A
+compromised job can therefore reach everything on the host, including
+host-local controller credentials — this is why only trusted private
+repositories may ever be authorized, and why host-local identity files
+stay root-owned. Jobs also receive short-lived registration
+configuration and may receive `GITHUB_TOKEN` or explicitly configured
+project secrets. Projects bring their own toolchains in their own containers.
 Capacity (how many jobs run at once) lives in reviewed private Git
 configuration, never in application workflows.
 
@@ -36,35 +37,57 @@ Runs on: a fresh Linux Docker host. Changes state: yes.
    additionally requires a systemd-based host with `python3`, `tar`,
    `install`, `flock`, and standard coreutils — it fails closed with a
    named missing command if one is absent.
-2. Create the GitHub App and runner group the controller will use. The
+2. Clone the public engine repository and check out the exact reviewed
+   engine commit you intend to pin — later steps copy templates from it
+   and run its installer as root, so it must be the reviewed commit, not
+   a moving branch:
+
+   ```bash
+   git clone https://github.com/RandomDevelopment/ci-fleet.git
+   git -C ci-fleet checkout PINNED_ENGINE_COMMIT
+   ```
+
+3. Create the GitHub App and runner group the controller will use. The
    App must be installed on the organization with organization-level
    **Self-hosted runners: Read and write** permission; the concrete
    bootstrap settings are in [Live pilot runbook](LIVE-PILOT.md)
    sections 2-3. Then place the host-local identity files (root-owned,
-   mode `0600`) as in [Adding a host](ADDING-A-HOST.md) section 5.
-3. Create your private configuration repository from the public
+   mode `0600`) from the checked-out engine's templates as in
+   [Adding a host](ADDING-A-HOST.md) section 5.
+4. Create your private configuration repository from the public
    [configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template)
-   and initialize it completely: run its `./scripts/init.sh` so the
-   fictional `example-org`/`example-app` placeholders are replaced, then
-   declare one `controllers` entry with `min_runners: 0`,
-   `max_runners: 1`, and a pinned engine commit. Validate with
-   `./scripts/validate.sh --strict` before continuing.
+   and initialize it completely — pass the runner group you just created,
+   your controller ID, and the pinned engine commit, so no fictional
+   `example-org`/`example-app` placeholders survive:
+
+   ```bash
+   ./scripts/init.sh \
+     --organization YOUR-ORG \
+     --project YOUR-APP \
+     --controller YOUR-CONTROLLER-ID \
+     --location primary-site \
+     --runner-group YOUR-CREATED-RUNNER-GROUP \
+     --capacity-budget 1 \
+     --max-runners 1 \
+     --engine-ref PINNED_ENGINE_COMMIT
+   ```
+
+   Then validate with `./scripts/validate.sh --strict`, open a pull
+   request, and **merge it**: managed controller lifecycle is permitted
+   only from a reviewed, merged private configuration commit. Resolve
+   and record that merge commit SHA (`RESOLVED_CONFIG_COMMIT` below);
+   do not install from an unmerged branch.
 4. Give the host a way to read that private repository: either a
    narrowly scoped host-local read-only Git credential, or a temporary
    pinned Git bundle / local checkout transferred from your management
    machine (the installer accepts a local checkout path as
    `--config-repo`). Without one of these, the installer's
    noninteractive fetch fails closed.
-5. Clone the public engine repository on the host and check out the
-   exact reviewed engine commit your private configuration pins — the
-   installer uses code and validators from that checkout and runs as
-   root, so it must be the reviewed commit, not a moving branch. Then
-   apply it (`--install` for a fresh host; `--adopt` is only for
-   converting an existing manually installed controller):
+5. Apply the merged configuration from the reviewed engine checkout
+   (`--install` for a fresh host; `--adopt` is only for converting an
+   existing manually installed controller):
 
    ```bash
-   git clone https://github.com/RandomDevelopment/ci-fleet.git
-   git -C ci-fleet checkout PINNED_ENGINE_COMMIT
    sudo ci-fleet/scripts/install-worker-controller.sh \
      --install \
      --config-repo OWNER/PRIVATE-CONFIG-REPO \
@@ -97,12 +120,13 @@ Changes state: yes, transiently — the job creates a runner container and
 may create Docker containers, networks, and volumes; the proof below
 verifies all of it is cleaned up.
 
-1. Trigger one trivial job with `runs-on` set to the shared label —
-   either the starter example in this repository at
-   `examples/workflows/live-pilot.yml.example`, or a one-step project
-   job. Declare `permissions: contents: read` (or another explicit
-   minimal set) on the workflow so the job never inherits a read-write
-   `GITHUB_TOKEN` default.
+1. Trigger one trivial one-step project job with `runs-on` set to the
+   shared label and `permissions: contents: read` declared explicitly,
+   so the job never inherits a read-write `GITHUB_TOKEN` default. (The
+   older `examples/workflows/live-pilot.yml.example` targets the
+   experimental label and the `:dev` runner image; on a managed install
+   use your pool's shared label and the controller-rendered image tag
+   instead of copying it unchanged.)
 2. Verify the job ran on your fleet: the Actions job metadata names the
    runner, and the controller host's logs show that runner was created
    by your scale set. (Runner names derive from the controller ID, not
