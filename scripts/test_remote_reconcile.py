@@ -236,6 +236,15 @@ class TestRemoteReconcile(unittest.TestCase):
         subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
         self.assertEqual(json.loads(state_path.read_text())["last_success_at"], 777)
 
+    def test_no_op_does_not_advance_last_success_timestamp(self):
+        content = RECONCILE_SCRIPT.read_text()
+        no_op = content.split('if [[ "$no_op" == true ]]; then', 2)[2].split("exit 0", 1)[0]
+        self.assertNotIn("'no change, converged' true", no_op)
+        self.assertIn('if sys.argv[7] == "true":', content)
+        self.assertEqual(content.count("save_reconcile_state 'converged'"), 4)
+        self.assertEqual(content.count("'no change, converged' true"), 1)
+        self.assertEqual(content.count('"reconciled to ${desired_commit}" true'), 1)
+
     def test_validate_schema_output_no_secrets(self):
         """Sanitized log output must not contain actual key material or token values."""
         result = subprocess.run(

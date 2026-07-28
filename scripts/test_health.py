@@ -288,6 +288,7 @@ class HealthTests(unittest.TestCase):
                 "message": "token=SUPER_SECRET https://private.invalid/path",
             },
         })
+        snapshot["controller"]["state"] = "dead"
         for disk in snapshot["disks"].values():
             disk.update(total_bytes=4096, used_bytes=1024, inode_total=1000, inode_used=100)
         report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
@@ -295,6 +296,7 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["controller"]["ssh"], "disabled")
         self.assertEqual(report["configuration"], {"desired_commit": "2" * 40, "applied_commit": "3" * 40})
         self.assertEqual(report["runners"], {"current": 1, "busy": 1, "maximum": 6})
+        self.assertEqual(report["process"]["state"], "unknown")
         self.assertEqual(report["error"], {"code": "reconciliation_failed", "message": "reconciliation failed"})
         encoded = json.dumps(report)
         self.assertNotIn("SUPER_SECRET", encoded)
@@ -347,6 +349,7 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(health._send_status(values, report, now=1_000, nonce="b" * 32, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError())), 1)
                 self.assertEqual(report, original)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "http://unsafe.invalid"}, report), 1)
+                self.assertEqual(health._send_status({"CI_FLEET_HEALTH_HEARTBEAT_URL": "https://legacy.invalid"}, report), 1)
             finally:
                 if old is None:
                     os.environ.pop("CI_FLEET_TESTING", None)

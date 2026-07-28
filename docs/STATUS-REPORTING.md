@@ -40,11 +40,11 @@ Every report includes:
 - `X-CI-Fleet-Controller`;
 - `X-CI-Fleet-Timestamp`;
 - a 128-bit random `X-CI-Fleet-Nonce`;
-- `Authorization: CI-Fleet-HMAC-SHA256 <signature>`.
+- an `Authorization` header using the `CI-Fleet-HMAC-SHA256` scheme.
 
 The signature covers method, fixed path, controller ID, timestamp, nonce, and SHA-256 body digest. It is valid only within five minutes. The receiver selects the key from the claimed controller ID, requires the signed ID to equal the payload ID, and records nonces until their authentication window expires. A controller therefore cannot sign as another controller unless that controller's independent key is compromised.
 
-Rotate a controller key by replacing both copies atomically within one reporting interval. Keys are not GitHub credentials and must not be committed to desired state.
+Rotate a controller key by replacing the receiver-side copy, restarting the receiver so it reloads the `0600` auth configuration, and then replacing the controller-side copy within one reporting interval. Keys are not GitHub credentials and must not be committed to desired state.
 
 ## Receiver
 

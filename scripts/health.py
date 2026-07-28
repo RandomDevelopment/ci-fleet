@@ -195,6 +195,9 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
     error = {"code": error_code, "message": error_code.replace("_", " ")} if error_code else None
     timers = snapshot.get("timers", {})
     disks = snapshot["disks"]
+    process_state = snapshot["controller"].get("state", "unknown")
+    if process_state not in {"created", "exited", "missing", "paused", "restarting", "running"}:
+        process_state = "unknown"
     return {
         "schema_version": 1,
         "controller": {
@@ -210,7 +213,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         "reconciliation": {"state": state, "last_success_at": reconciliation.get("last_success_at")},
         "drift": {"state": snapshot.get("services", {}).get("drift", "unknown")},
         "process": {
-            "state": snapshot["controller"].get("state", "unknown"),
+            "state": process_state,
             "restart_count": snapshot["controller"].get("restart_count", 0),
         },
         "timers": {
@@ -568,7 +571,7 @@ def _send_status(
 ) -> int:
     url = values.get("CI_FLEET_HEALTH_STATUS_URL")
     if not url:
-        return 0
+        return 1 if values.get("CI_FLEET_HEALTH_HEARTBEAT_URL") else 0
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path != "/v1/status" or parsed.query or parsed.fragment:
         return 1

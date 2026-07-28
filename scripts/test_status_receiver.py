@@ -67,6 +67,7 @@ class StatusReceiverTests(unittest.TestCase):
             retention_seconds=3_600,
             min_interval_seconds=0,
         )
+        self.receiver._clock = lambda: 1_000
 
     def signed(self, report: dict, *, timestamp: int = 1_000, nonce: str = "a" * 32,
                controller: str = "example-ci-01", key: bytes | None = None) -> tuple[bytes, dict[str, str]]:
@@ -86,6 +87,31 @@ class StatusReceiverTests(unittest.TestCase):
         report = valid_report()
         self.submit(report)
         self.assertEqual(self.receiver.latest("example-ci-01", "reader-token"), report)
+
+    def test_concurrent_report_writes_are_serialized(self) -> None:
+        body, headers = self.signed(
+            valid_report("other-ci-01"), controller="other-ci-01", key=b"other-key"
+        )
+        finished = threading.Event()
+        errors = []
+
+        def submit() -> None:
+            try:
+                self.receiver.submit(body, headers, now=1_000)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        self.receiver._write_lock.acquire()
+        thread = threading.Thread(target=submit)
+        thread.start()
+        try:
+            self.assertFalse(finished.wait(0.05))
+        finally:
+            self.receiver._write_lock.release()
+        thread.join()
+        self.assertEqual(errors, [])
 
     def test_duplicate_controller_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unique"):
@@ -161,6 +187,29 @@ class StatusReceiverTests(unittest.TestCase):
 
         self.submit(valid_report(generated_at=5_000), timestamp=5_000, nonce="e" * 32)
         self.assertEqual([item["generated_at"] for item in self.receiver.history("example-ci-01", "reader-token")], [5_000])
+
+    def test_time_retention_is_enforced_on_read(self) -> None:
+        receiver = status_receiver.StatusReceiver(
+            Path(self.temporary.name) / "expiry.db", {"example-ci-01": self.key},
+            read_token="reader-token", retention_seconds=10, min_interval_seconds=0,
+        )
+        body, headers = self.signed(valid_report())
+        receiver.submit(body, headers, now=1_000)
+        receiver._clock = lambda: 1_011
+        self.assertIsNone(receiver.latest("example-ci-01", "reader-token"))
+
+    def test_receiver_restart_reloads_rotated_key(self) -> None:
+        directory = Path(self.temporary.name)
+        key_file, token_file, config_file = directory / "key", directory / "token", directory / "auth.json"
+        key_file.write_bytes(b"a" * 32)
+        token_file.write_bytes(b"r" * 32)
+        config_file.write_text(json.dumps({"controllers": {"example-ci-01": "key"}, "read_token_file": "token"}))
+        for path in (key_file, token_file, config_file):
+            path.chmod(0o600)
+        first, _ = status_receiver.load_auth_config(config_file)
+        key_file.write_bytes(b"b" * 32)
+        second, _ = status_receiver.load_auth_config(config_file)
+        self.assertEqual((first["example-ci-01"], second["example-ci-01"]), (b"a" * 32, b"b" * 32))
 
     def test_http_post_and_read_only_api(self) -> None:
         server = status_receiver.create_server("127.0.0.1", 0, self.receiver)

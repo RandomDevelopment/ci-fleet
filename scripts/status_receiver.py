@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Mapping
@@ -49,6 +51,9 @@ class StatusReceiver:
         self.min_interval_seconds = min_interval_seconds
         self.max_payload_bytes = max_payload_bytes
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        # ponytail: one receiver-wide lock; split by controller only if measured write contention warrants it.
+        self._write_lock = threading.Lock()
+        self._clock = time.time
         with self._connect() as connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS reports (
@@ -93,7 +98,7 @@ class StatusReceiver:
         if abs(now - generated_at) > self.max_clock_skew_seconds:
             raise StatusError(409, "report_time_stale")
         encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             try:
                 connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
             except sqlite3.IntegrityError as error:
@@ -113,6 +118,10 @@ class StatusReceiver:
                 (controller, controller, self.history_limit),
             )
             connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
+
+    def _expire(self, connection: sqlite3.Connection, now: int) -> None:
+        connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
+        connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
 
     @staticmethod
     def _validate_minimum(report: Any, controller: str) -> None:
@@ -199,7 +208,8 @@ class StatusReceiver:
 
     def latest(self, controller: str, read_token: str) -> dict[str, Any] | None:
         self._authorize_read(read_token)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
+            self._expire(connection, int(self._clock()))
             row = connection.execute(
                 "SELECT payload FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1", (controller,)
             ).fetchone()
@@ -208,7 +218,8 @@ class StatusReceiver:
     def history(self, controller: str, read_token: str, limit: int | None = None) -> list[dict[str, Any]]:
         self._authorize_read(read_token)
         count = min(max(limit or self.history_limit, 1), self.history_limit)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
+            self._expire(connection, int(self._clock()))
             rows = connection.execute(
                 "SELECT payload FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?", (controller, count)
             ).fetchall()
@@ -216,7 +227,8 @@ class StatusReceiver:
 
     def list_latest(self, read_token: str) -> list[dict[str, Any]]:
         self._authorize_read(read_token)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
+            self._expire(connection, int(self._clock()))
             rows = connection.execute("""
                 SELECT reports.payload FROM reports
                 JOIN (SELECT controller, MAX(generated_at) AS generated_at FROM reports GROUP BY controller) latest

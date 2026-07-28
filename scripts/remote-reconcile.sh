@@ -74,9 +74,9 @@ require_commands() {
 # --- State persistence ---
 
 save_reconcile_state() {
-  local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-}
+  local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-} mark_success=${6:-false}
   install -d -m 0700 "$reconcile_state_dir"
-  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" <<'PY' 2>/dev/null || true
+  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile
 
 path = sys.argv[1]
@@ -88,7 +88,7 @@ try:
         last_success_at = None
 except (OSError, ValueError, TypeError):
     last_success_at = None
-if sys.argv[2] == "converged":
+if sys.argv[7] == "true":
     last_success_at = now
 state = {
     "status": sys.argv[2],
@@ -398,7 +398,7 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
       note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
+      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged' true
       exit 0
     fi
   fi
@@ -462,7 +462,7 @@ if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
   health_status=$(run_health_check "$temp_dir/health.json")
 
-  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}"
+  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
