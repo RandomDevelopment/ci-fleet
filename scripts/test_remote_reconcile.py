@@ -283,6 +283,7 @@ class TestSystemdUnits(unittest.TestCase):
         content = RECONCILE_SCRIPT.read_text()
         health = content.split("run_health_check()", 1)[1].split("# --- Main ---", 1)[0]
         self.assertNotIn(") && python3", health)
+        self.assertIn('--output "$output" >/dev/null', health)
 
 
 if __name__ == "__main__":
