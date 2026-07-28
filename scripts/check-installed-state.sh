@@ -37,7 +37,7 @@ config_ref=${values[2]}
 
 if [[ "$config_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   [[ -x "$remote_reconciler" ]] || { echo "ERROR: remote reconciler is unavailable: $remote_reconciler" >&2; exit 2; }
-  CI_FLEET_REMOTE_STATE_FILE="$state_file" exec "$remote_reconciler" --check-only --desired-ref "$config_ref"
+  CI_FLEET_REMOTE_STATE_FILE="$state_file" exec "$remote_reconciler" --check-only --installed-ref
 fi
 
 exec "$installer" --check \

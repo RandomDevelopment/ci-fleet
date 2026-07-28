@@ -197,19 +197,23 @@ class TestRemoteReconcile(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("usage", result.stdout + result.stderr)
 
-    def test_desired_ref_is_full_sha_and_check_only(self):
-        invalid = subprocess.run(
-            [str(RECONCILE_SCRIPT), "--check-only", "--desired-ref", "main"],
-            capture_output=True, text=True, env=self.env,
-        )
+    def test_installed_ref_is_check_only(self):
         mutating = subprocess.run(
-            [str(RECONCILE_SCRIPT), "--desired-ref", "a" * 40],
+            [str(RECONCILE_SCRIPT), "--installed-ref"],
             capture_output=True, text=True, env=self.env,
         )
-        self.assertEqual(invalid.returncode, 2)
-        self.assertIn("full lowercase commit SHA", invalid.stderr)
         self.assertEqual(mutating.returncode, 2)
         self.assertIn("requires --check-only", mutating.stderr)
+
+    def test_installed_ref_rejects_symbolic_state_before_fetch(self):
+        self._write_state("RandomDevelopment/rd-delivery-config", "HEAD", "rd-ci-fleet-01")
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--check-only", "--installed-ref"],
+            capture_output=True, text=True, env=self.env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("full lowercase commit SHA", result.stderr)
+        self.assertNotIn("GENERATING_TOKEN", result.stdout)
 
     def test_reconcile_state_saved_on_failure(self):
         """State file is saved even when reconciliation fails."""
@@ -263,6 +267,9 @@ class TestSystemdUnits(unittest.TestCase):
         reconcile = RECONCILE_SCRIPT.read_text()
         installer = INSTALLER.read_text()
         self.assertNotIn("release_lock", reconcile)
+        self.assertIn('flock -w "$lock_wait_seconds" 9', reconcile)
+        self.assertLess(reconcile.index('flock -w "$lock_wait_seconds" 9'), reconcile.index("fetch_ref=HEAD"))
+        self.assertIn('fetch_ref=$installed_config_ref', reconcile)
         self.assertEqual(reconcile.count("CI_FLEET_INSTALLER_LOCK_FD=9"), 3)
         self.assertEqual(reconcile.count("--config-identity"), 3)
         self.assertIn("--config-identity)", installer)
