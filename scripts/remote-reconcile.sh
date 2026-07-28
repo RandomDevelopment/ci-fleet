@@ -240,16 +240,18 @@ PY
   fi
   git -C "$lkg_pinned" checkout -q FETCH_HEAD
 
+  release_lock
   "$installer" --upgrade \
     --config-repo "$lkg_pinned" \
     --ref "$lkg_ref" \
     --controller "$lkg_controller" 2>"$temp_dir/rollback_err" && {
+    acquire_lock
     # Fix the config_repository in the state file to the durable name
     fix_state_config_repo "$lkg_repo"
     log_json "WARN" "rollback" "restored last-known-good"
     return 0
   }
-
+  acquire_lock
   local err
   err=$(<"$temp_dir/rollback_err")
   log_json "ERROR" "rollback" "rollback failed: ${err}"
@@ -358,6 +360,9 @@ print(json.dumps({
 PY
 }
 
+release_lock() { flock -u 9 2>/dev/null || true; }
+acquire_lock() { flock -n 9 2>/dev/null || die "cannot re-acquire installer lock"; }
+
 # --- Health (with rendered env) ---
 
 run_health_check() {
@@ -434,14 +439,17 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
   # Run drift check using the fetched local checkout
   local_pinned=$temp_dir/config-repo
   if [[ -d "$local_pinned/.git" ]]; then
+    release_lock
     if "$installer" --check \
       --config-repo "$local_pinned" \
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
+      acquire_lock
       note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
       save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
       exit 0
     fi
+    acquire_lock
   fi
   # Same commit + drift = check controller health
   # If controller is unhealthy, reconcile; otherwise converge with drift note
@@ -499,15 +507,20 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
+release_lock
 if "$installer" --upgrade \
   --config-repo "$pinned_dir" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
+  acquire_lock
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
 
   # Fix config_repository in state file AND rendered env to the durable name
   fix_state_config_repo "$installed_config_repo"
   fix_rendered_env_config_repo "$installed_config_repo"
+
+  # Re-enable reconcile timer (may have been disabled during local-checkout upgrade)
+  systemctl enable --now ci-fleet-reconcile.timer >/dev/null 2>&1 || true
 
   # Save new LKG
   save_lkg "$fetch_dir" "$desired_commit"
@@ -519,6 +532,7 @@ if "$installer" --upgrade \
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
+  acquire_lock
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
 
