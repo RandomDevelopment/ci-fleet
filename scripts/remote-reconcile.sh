@@ -126,7 +126,8 @@ generate_token() {
     local err
     err=$(<"$temp_dir/token_err")
     [[ -n "$err" ]] || err="unknown error"
-    die "token generation failed: $err"
+    printf '%s' "$err" >"$temp_dir/last_token_err"
+    return 1
   }
 }
 
@@ -137,17 +138,19 @@ fetch_remote_config() {
   local fetch_dir=$temp_dir/config-repo
   mkdir -p "$fetch_dir"
   git init -q "$fetch_dir"
-  git -C "$fetch_dir" remote add origin "https://github.com/${repo}.git"
-
-  # Authenticate with x-access-token scheme (GitHub's standard for installation tokens)
+  # Use auth_url with embedded token for authenticated fetch
   local auth_url="https://x-access-token:${token}@github.com/${repo}.git"
   GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 origin HEAD 2>"$temp_dir/fetch_err" || {
     local err
-    err=$(<"$temp_dir/fetch_err")
-    [[ -n "$err" ]] || err="fetch failed"
-    die "configuration fetch failed: $err"
+    # Retry with auth_url if plain fetch failed (private repo needs auth)
+    GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 "$auth_url" HEAD 2>"$temp_dir/fetch_err" || {
+      local err
+      err=$(<"$temp_dir/fetch_err")
+      [[ -n "$err" ]] || err="fetch failed"
+      printf '%s' "$err" >"$temp_dir/last_fetch_err"
+      return 1
+    }
   }
-
   local resolved
   resolved=$(git -C "$fetch_dir" rev-parse 'FETCH_HEAD^{commit}') || die "cannot resolve FETCH_HEAD"
   printf '%s' "$resolved"
@@ -163,7 +166,7 @@ validate_config() {
     local err
     err=$(<"$temp_dir/validate_err")
     [[ -n "$err" ]] || err="validation failed"
-    log_json "ERROR" "validation" "config validation failed: ${err}"
+    log_json "ERROR" "validation" "config validation failed"
     return 1
   }
 
@@ -173,13 +176,15 @@ validate_config() {
     local err
     err=$(<"$temp_dir/scan_err")
     [[ -n "$err" ]] || err="secret scan failed"
-    log_json "ERROR" "secrets" "secret scan rejected: ${err}"
+    log_json "ERROR" "secrets" "secret scan rejected"
     return 1
   }
 
   return 0
 }
 
+# Restore LKG by re-applying the known-good config via the installer
+# with the durable config_repo identity, not a temp checkout path.
 apply_lkg() {
   note "ROLLING_BACK_TO_LKG"
   if [[ "$no_op" == true ]]; then
@@ -188,13 +193,6 @@ apply_lkg() {
   fi
 
   local lkg_ref lkg_repo lkg_controller
-  if ! python3 - "$lkg_dir/metadata.json" <<'PY' 2>/dev/null; then true; fi
-import json, sys
-d = json.load(open(sys.argv[1]))
-if d.get("config_ref"): print(d["config_ref"])
-if d.get("config_repository"): print(d["config_repository"])
-if d.get("controller"): print(d["controller"])
-PY
   mapfile -t lkg_vals <<<"$(python3 - "$lkg_dir/metadata.json" <<'PY' 2>/dev/null || true
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -210,13 +208,58 @@ PY
   local lkg_config=$lkg_dir/fleet.json
   [[ -f "$lkg_config" ]] || { log_json "ERROR" "rollback" "LKG fleet.json missing"; return 1; }
 
-  "$installer" --rollback 2>"$temp_dir/rollback_err" || {
-    local err
-    err=$(<"$temp_dir/rollback_err")
-    log_json "ERROR" "rollback" "rollback failed: ${err}"
-    return 1
+  # Re-apply the LKG ref via the installer, using the durable repo identity
+  # Create a local checkout pinned to the LKG ref for the installer
+  local lkg_pinned=$temp_dir/lkg-pinned
+  cp -a "$temp_dir/config-repo" "$lkg_pinned" 2>/dev/null || {
+    # Fallback: fresh fetch
+    mkdir -p "$lkg_pinned"
+    git init -q "$lkg_pinned"
+    local redo_url="https://github.com/${lkg_repo}.git"
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>/dev/null || {
+      log_json "ERROR" "rollback" "LKG fetch failed"
+      return 1
+    }
   }
-  log_json "WARN" "rollback" "rolled back to last-known-good"
+
+  "$installer" --upgrade \
+    --config-repo "$lkg_pinned" \
+    --ref "$lkg_ref" \
+    --controller "$lkg_controller" 2>"$temp_dir/rollback_err" && {
+    # Fix the config_repository in the state file to the durable name
+    fix_state_config_repo "$lkg_repo"
+    log_json "WARN" "rollback" "restored last-known-good"
+    return 0
+  }
+
+  local err
+  err=$(<"$temp_dir/rollback_err")
+  log_json "ERROR" "rollback" "rollback failed: ${err}"
+  return 1
+}
+
+fix_state_config_repo() {
+  local durable=$1
+  [[ -f "$state_file" ]] || return 0
+  python3 - "$state_file" "$durable" <<'PY' 2>/dev/null || true
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+durable = sys.argv[2]
+state = json.load(open(path, encoding="utf-8"))
+if state.get("config_repository") != durable:
+    state["config_repository"] = durable
+    fd, tmp = tempfile.mkstemp(prefix=".fix-state.", dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except:
+        os.unlink(tmp, missing_ok=True)
+        raise
+PY
 }
 
 save_lkg() {
@@ -247,17 +290,19 @@ PY
 }
 
 # --- Logging (sanitized, no secrets) ---
+# message passed via argv, never interpolated into Python source
 
 log_json() {
   local level=$1 component=$2 message=$3
-  python3 <<PY 2>/dev/null || true
+  python3 - "$level" "$component" "$message" "$installed_controller" <<'PY' 2>/dev/null || true
 import json, sys, time
+level, component, message, controller = sys.argv[1:]
 print(json.dumps({
     'time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'level': '$level',
-    'component': '$component',
-    'message': '$message',
-    'controller': '$installed_controller',
+    'level': level,
+    'component': component,
+    'message': message,
+    'controller': controller,
 }))
 PY
 }
@@ -284,9 +329,14 @@ attempt=0
 while ((attempt < max_attempts)); do
   attempt=$((attempt + 1))
 
-  # Generate token
+  # Generate token — retry on transient failure
   note "GENERATING_TOKEN attempt=${attempt}"
-  token=$(generate_token "$token_env") || die "token generation exhausted"
+  token=$(generate_token "$token_env") || {
+    err=$(<"$temp_dir/last_token_err" 2>/dev/null || echo "unknown")
+    note "TOKEN_FAILED attempt=${attempt} error=${err}"
+    ((attempt < max_attempts)) && { sleep 5; continue; }
+    die "token generation exhausted after ${max_attempts} attempts"
+  }
 
   # Fetch remote config
   note "FETCHING_CONFIG repo=${installed_config_repo}"
@@ -319,10 +369,8 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
     save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
     exit 0
   else
-    local drift_exit=$?
-    # Drift detected — reconcile
+    drift_exit=$?
     note "DRIFT detected (exit=${drift_exit}), attempting reconcile"
-    # Fall through to reconcile below with same config_ref
     if [[ "$mode" == check-only ]]; then
       save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' "drift detected (exit=${drift_exit})"
       exit 3
@@ -333,10 +381,9 @@ fi
 # New commit or drift — validate and reconcile
 fetch_dir=$temp_dir/config-repo
 if ! validate_config "$fetch_dir" "$desired_commit"; then
-  log_json "ERROR" "validation" "desired config commit ${desired_commit} rejected by validation"
+  log_json "ERROR" "validation" "desired config commit rejected by validation"
   note "INVALID_CONFIG commit=${desired_commit}"
   save_reconcile_state 'invalid' "$desired_commit" "$installed_config_ref" 'healthy' "config rejected at ${desired_commit}"
-  # Preserve last-known-good
   if [[ "$installed_config_ref" != "$desired_commit" ]]; then
     save_lkg "$fetch_dir" "$installed_config_ref"
   fi
@@ -360,7 +407,10 @@ fi
 # Save LKG before reconciling
 save_lkg "$fetch_dir" "$installed_config_ref"
 
-# Create a pinned local checkout for the installer
+# Create a pinned local checkout for the installer.
+# Pass the durable config_repo name so install-state.json records
+# the correct identity; the installer uses the local checkout path
+# for fleet.json resolution.
 pinned_dir=$temp_dir/pinned-config
 cp -a "$fetch_dir" "$pinned_dir"
 git -C "$pinned_dir" checkout -q "$desired_commit"
@@ -368,10 +418,14 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
 if "$installer" --upgrade \
-  --config-repo "$pinned_dir" \
+  --config-repo "$installed_config_repo" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
+
+  # Fix the config_repository in the state file to the durable name
+  fix_state_config_repo "$installed_config_repo"
+
   # Save new LKG
   save_lkg "$fetch_dir" "$desired_commit"
 
@@ -382,11 +436,11 @@ if "$installer" --upgrade \
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
-  local upg_err
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
 
-  # Rollback via existing checkpoint mechanism
+  # Rollback to LKG — reinstalls a checkpoint of this attempt was already created,
+  # or safely restores LKG config directly via the installer
   apply_lkg || die "rollback to last-known-good also failed"
   health_status=$(python3 "$repo_root/scripts/health.py" local --output "$temp_dir/health.json" 2>/dev/null && python3 -c "import json; print(json.load(open('$temp_dir/health.json'))['status'])" 2>/dev/null || echo "unknown")
   save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconciled failed, rolled back to ${installed_config_ref}"
