@@ -331,7 +331,7 @@ with open(path, "w") as output:
 PY
 expect_success env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" CI_FLEET_REMOTE_RECONCILER="$remote_reconciler" REMOTE_RECONCILER_LOG="$remote_reconciler_log" "$repo_root/scripts/check-installed-state.sh"
 mapfile -t remote_call <"$remote_reconciler_log"
-[[ ${remote_call[0]} == "--check-only --desired-ref $ref_one" && ${remote_call[1]} == "$install_state" ]] || fail 'remote drift check did not delegate the exact installed state to authenticated reconciliation'
+[[ ${remote_call[0]} == "--check-only --installed-ref" && ${remote_call[1]} == "$install_state" ]] || fail 'remote drift check did not delegate the exact installed state to authenticated reconciliation'
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 export FAKE_DISABLED_TIMER=ci-fleet-cleanup.timer
