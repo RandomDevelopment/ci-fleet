@@ -20,6 +20,7 @@ reconcile_state_dir=${CI_FLEET_RECONCILE_STATE_DIR:-/var/lib/ci-fleet/reconcile}
 reconcile_state_file=$reconcile_state_dir/state.json
 lkg_dir=${CI_FLEET_LKG_DIR:-/var/lib/ci-fleet/last-known-good}
 temp_dir=$(mktemp -d) || exit 2
+# shellcheck disable=SC2317 # cleanup_temp is invoked indirectly via trap
 cleanup_temp() { rm -rf "$temp_dir"; }
 trap cleanup_temp EXIT
 
@@ -215,7 +216,7 @@ PY
     # Fallback: fresh fetch
     mkdir -p "$lkg_pinned"
     git init -q "$lkg_pinned"
-    local redo_url="https://github.com/${lkg_repo}.git"
+    git -C "$lkg_pinned" remote add origin "https://github.com/${lkg_repo}.git"
     GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>/dev/null || {
       log_json "ERROR" "rollback" "LKG fetch failed"
       return 1
@@ -332,7 +333,7 @@ while ((attempt < max_attempts)); do
   # Generate token — retry on transient failure
   note "GENERATING_TOKEN attempt=${attempt}"
   token=$(generate_token "$token_env") || {
-    err=$(<"$temp_dir/last_token_err" 2>/dev/null || echo "unknown")
+    err=$(cat "$temp_dir/last_token_err" 2>/dev/null || echo "unknown")
     note "TOKEN_FAILED attempt=${attempt} error=${err}"
     ((attempt < max_attempts)) && { sleep 5; continue; }
     die "token generation exhausted after ${max_attempts} attempts"
