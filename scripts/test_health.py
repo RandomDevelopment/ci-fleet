@@ -93,6 +93,31 @@ class HealthTests(unittest.TestCase):
         report = health.evaluate(snapshot, health.Thresholds())
         self.assertEqual((report["status"], report["exit_code"]), ("maintenance", 0))
 
+    def test_remote_reconciliation_failure_is_unhealthy(self) -> None:
+        snapshot = healthy_snapshot()
+        snapshot["reconciliation"] = {
+            "status": "rolled_back",
+            "desired_commit": "1" * 40,
+            "applied_commit": "2" * 40,
+            "health": "healthy",
+        }
+        report = health.evaluate(snapshot, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
+        self.assertEqual(next(check for check in report["checks"] if check["id"] == "reconciliation")["status"], "critical")
+
+        snapshot["reconciliation"] = {"status": "missing", "desired_commit": "", "applied_commit": "", "health": ""}
+        report = health.evaluate(snapshot, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("warning", 1))
+
+    def test_malformed_reconciliation_state_is_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text('{"status":[],"health":{},"desired_commit":[],"applied_commit":null}\n')
+            self.assertEqual(
+                health._reconcile_state(path),
+                {"status": "invalid", "desired_commit": "invalid", "applied_commit": "invalid", "health": "invalid"},
+            )
+
     def test_external_heartbeats_detect_missing_and_stale_active_hosts(self) -> None:
         controllers = {
             "fresh": {"state": "active", "lifecycle": "stable"},
@@ -146,6 +171,20 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
                 self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
                 self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                (root / "var/lib/ci-fleet/reconcile").mkdir(parents=True)
+                (root / "var/lib/ci-fleet/reconcile/state.json").write_text('{"status":"rolled_back","desired_commit":"","applied_commit":"","health":"healthy"}\n')
+                remote = health.collect_snapshot(
+                    {
+                        "CI_FLEET_CONTROLLER_STATE": "disabled",
+                        "CI_FLEET_CONFIG_REPOSITORY": "example/config",
+                        "CI_FLEET_HEALTH_BOOTSTRAP": "1",
+                    },
+                    root=root,
+                    run=run,
+                )
+                self.assertEqual(set(remote["services"]), {"cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["timers"]), {"health", "cleanup", "drift", "reconcile"})
+                self.assertEqual(remote["reconciliation"]["status"], "bootstrap")
                 (root / "etc").mkdir()
                 (root / "etc/debian_version").write_text("13\n")
                 debian = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)

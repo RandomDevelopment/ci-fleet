@@ -140,6 +140,9 @@ cat >"$fake_bin/systemctl" <<'EOF'
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
 fi
+if [[ -n "${FAKE_FAIL_TIMER_ENABLE:-}" && "${1:-}" == enable && "${2:-}" == --now && "$*" == *ci-fleet-reconcile.timer* ]]; then
+  exit 97
+fi
 if [[ -n "${FAKE_DISABLED_TIMER:-}" && ( "${1:-}" == is-enabled || "${1:-}" == is-active ) && $# == 3 && "${3:-}" == "$FAKE_DISABLED_TIMER" ]]; then
   exit 1
 fi
@@ -441,6 +444,22 @@ mv "$active_release.saved" "$active_release"
 relative=$(cd "$tmp" && expect_success "$installer" --install --config-repo config-repo --controller example-ci-01 --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$relative" || fail 'relative configuration path was not normalized before drift comparison'
 grep -Fq "CI_FLEET_CONFIG_REPOSITORY=$config_repo" "$root/etc/ci-fleet/ci-fleet.env" || fail 'rendered configuration path is not absolute'
+
+remote_args=(--config-repo "$config_repo" --config-identity fixture-org/fleet-config --controller example-ci-01 --ref "$ref_one")
+export FAKE_FAIL_TIMER_ENABLE=1
+expect_command_failure "$installer" --install "${remote_args[@]}"
+unset FAKE_FAIL_TIMER_ENABLE
+grep -Fq "CI_FLEET_CONFIG_REPOSITORY=$config_repo" "$root/etc/ci-fleet/ci-fleet.env" || fail 'timer activation failure did not restore the local identity'
+expect_success "$installer" --install "${remote_args[@]}" >/dev/null
+grep -Fq 'CI_FLEET_CONFIG_REPOSITORY=fixture-org/fleet-config' "$root/etc/ci-fleet/ci-fleet.env" || fail 'local checkout did not retain its durable repository identity'
+grep -Fq '"config_repository": "fixture-org/fleet-config"' "$install_state" || fail 'install state did not retain the durable repository identity'
+custom_lock=$root/run/custom-installer.lock
+exec 9>"$custom_lock"
+flock -n 9 || fail 'fixture could not acquire installer lock'
+expect_success env CI_FLEET_INSTALLER_LOCK="$custom_lock" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --check "${remote_args[@]}" >/dev/null
+flock -u 9
+exec 9>&-
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 printf '\n' >>"$root/etc/ci-fleet/ci-fleet.env"
 printf '\n# drift\n' >>"$root/etc/systemd/system/ci-fleet-health.timer"
