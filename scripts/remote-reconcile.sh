@@ -28,7 +28,6 @@ mode=reconcile  # reconcile or check-only
 no_op=false
 installed_ref=false
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
-lock_wait_seconds=${CI_FLEET_RECONCILE_LOCK_WAIT_SECONDS:-300}
 
 usage() {
   cat >&2 <<'EOF'
@@ -322,10 +321,11 @@ require_commands
 lock_file=${CI_FLEET_INSTALLER_LOCK:-/run/ci-fleet-installer.lock}
 install -d -m 0755 "$(dirname "$lock_file")"
 exec 9>"$lock_file"
-flock -w "$lock_wait_seconds" 9 || die "timed out waiting for another reconcile or installer"
+flock 9
 
 # Load installed state
 load_installed_state || die "no installed state found at $state_file"
+[[ "$installed_config_ref" =~ ^[0-9a-f]{40}$ ]] || die "installed config ref is not a full lowercase commit SHA"
 fetch_ref=HEAD
 [[ "$installed_ref" == false ]] || fetch_ref=$installed_config_ref
 note "INSTALLED controller=${installed_controller} config_repo=${installed_config_repo} config_ref=${installed_config_ref}"
