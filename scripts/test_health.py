@@ -105,6 +105,19 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
         self.assertEqual(next(check for check in report["checks"] if check["id"] == "reconciliation")["status"], "critical")
 
+        snapshot["reconciliation"] = {"status": "missing", "desired_commit": "", "applied_commit": "", "health": ""}
+        report = health.evaluate(snapshot, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("warning", 1))
+
+    def test_malformed_reconciliation_state_is_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text('{"status":[],"health":{},"desired_commit":[],"applied_commit":null}\n')
+            self.assertEqual(
+                health._reconcile_state(path),
+                {"status": "invalid", "desired_commit": "invalid", "applied_commit": "invalid", "health": "invalid"},
+            )
+
     def test_external_heartbeats_detect_missing_and_stale_active_hosts(self) -> None:
         controllers = {
             "fresh": {"state": "active", "lifecycle": "stable"},

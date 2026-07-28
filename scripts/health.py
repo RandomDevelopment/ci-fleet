@@ -153,9 +153,14 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     add("backup", "warning" if backup == "failed" else "ok", state=backup)
     reconciliation = snapshot.get("reconciliation")
     if reconciliation:
+        reconciliation_severity = (
+            "ok" if reconciliation["status"] in {"converged", "bootstrap"}
+            else "warning" if reconciliation["status"] in {"missing", "pending", "reconciling"}
+            else "critical"
+        )
         add(
             "reconciliation",
-            "ok" if reconciliation["status"] in {"converged", "bootstrap"} else "critical",
+            reconciliation_severity,
             state=reconciliation["status"],
             desired_commit=reconciliation["desired_commit"],
             applied_commit=reconciliation["applied_commit"],
@@ -312,12 +317,12 @@ def _reconcile_state(path: Path) -> dict[str, str]:
     if not isinstance(value, dict):
         return {"status": "invalid", "desired_commit": "", "applied_commit": "", "health": ""}
     status = value.get("status", "")
-    if status not in {"converged", "drift", "invalid", "pending", "rolled_back", "failed"}:
+    if not isinstance(status, str) or status not in {"converged", "drift", "invalid", "pending", "reconciling", "rolled_back", "failed"}:
         status = "invalid"
     commits = [value.get(name, "") for name in ("desired_commit", "applied_commit")]
     commits = [commit if isinstance(commit, str) and (not commit or re.fullmatch(r"[0-9a-f]{40}", commit)) else "invalid" for commit in commits]
     reported_health = value.get("health", "")
-    if reported_health not in {"", "healthy", "warning", "unhealthy", "maintenance", "drift", "unknown"}:
+    if not isinstance(reported_health, str) or reported_health not in {"", "healthy", "warning", "unhealthy", "maintenance", "drift", "unknown"}:
         reported_health = "invalid"
     return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health}
 

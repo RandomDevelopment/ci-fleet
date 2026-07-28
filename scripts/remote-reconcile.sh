@@ -427,6 +427,7 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
+save_reconcile_state 'reconciling' "$desired_commit" "$installed_config_ref" 'unknown' "reconciling to ${desired_commit}"
 if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   --config-repo "$pinned_dir" \
   --config-identity "$installed_config_repo" \
@@ -438,6 +439,7 @@ if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   save_lkg "$desired_commit"
 
   # Run health check
+  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
   health_status=$(run_health_check "$temp_dir/health.json")
 
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}"
