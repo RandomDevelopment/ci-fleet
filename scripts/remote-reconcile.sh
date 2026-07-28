@@ -6,7 +6,7 @@
 # validates the configuration, checks for drift, and reconciles if needed.
 #
 # Usage:
-#   remote-reconcile.sh [--check-only] [--desired-ref SHA] [--no-op]
+#   remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
 set -Eeuo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,20 +26,20 @@ trap cleanup_temp EXIT
 
 mode=reconcile  # reconcile or check-only
 no_op=false
-desired_ref=
+installed_ref=false
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
 lock_wait_seconds=${CI_FLEET_RECONCILE_LOCK_WAIT_SECONDS:-300}
 
 usage() {
   cat >&2 <<'EOF'
 usage:
-  remote-reconcile.sh [--check-only] [--desired-ref SHA] [--no-op]
+  remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
 
   Fetches the desired-state repository at the current default-branch HEAD,
   validates it, and reconciles the controller if a newer commit is available.
 
   --check-only  Validate and report without reconciling.
-  --desired-ref Check this exact commit instead of remote HEAD (check-only only).
+  --installed-ref Check the locked installation's commit (check-only only).
   --no-op       Log what would be done without side effects.
 EOF
 }
@@ -47,15 +47,14 @@ EOF
 while (($#)); do
   case "$1" in
     --check-only) mode=check-only ;;
-    --desired-ref) shift; (($#)) || { echo 'ERROR: --desired-ref requires a commit' >&2; exit 2; }; desired_ref=$1 ;;
+    --installed-ref) installed_ref=true ;;
     --no-op) no_op=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
   shift
 done
-[[ -z "$desired_ref" || "$mode" == check-only ]] || { echo 'ERROR: --desired-ref requires --check-only' >&2; exit 2; }
-[[ -z "$desired_ref" || "$desired_ref" =~ ^[0-9a-f]{40}$ ]] || { echo 'ERROR: --desired-ref must be a full lowercase commit SHA' >&2; exit 2; }
+[[ "$installed_ref" == false || "$mode" == check-only ]] || { echo 'ERROR: --installed-ref requires --check-only' >&2; exit 2; }
 
 note() { printf 'RECONCILE %s\n' "$*"; }
 die() {
@@ -327,6 +326,8 @@ flock -w "$lock_wait_seconds" 9 || die "timed out waiting for another reconcile 
 
 # Load installed state
 load_installed_state || die "no installed state found at $state_file"
+fetch_ref=HEAD
+[[ "$installed_ref" == false ]] || fetch_ref=$installed_config_ref
 note "INSTALLED controller=${installed_controller} config_repo=${installed_config_repo} config_ref=${installed_config_ref}"
 
 # Prefer host.env for token generation; fall back to rendered_env
@@ -355,7 +356,7 @@ while ((attempt < max_attempts)); do
 
   # Fetch remote config
   note "FETCHING_CONFIG repo=${installed_config_repo}"
-  desired_commit=$(fetch_remote_config "$installed_config_repo" "$token" "${desired_ref:-HEAD}") || {
+  desired_commit=$(fetch_remote_config "$installed_config_repo" "$token" "$fetch_ref") || {
     note "FETCH_FAILED attempt=${attempt}"
     ((attempt < max_attempts)) && { sleep 5; continue; }
     die "fetch exhausted after ${max_attempts} attempts"
