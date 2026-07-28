@@ -6,6 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode=
 config_repo=
+config_identity_arg=
 config_ref=
 controller_id=
 host_config_arg=
@@ -21,7 +22,7 @@ usage() {
 usage:
   install-worker-controller.sh --check|--install|--adopt|--upgrade \
     --config-repo OWNER/REPOSITORY|PATH --ref FULL_COMMIT_SHA \
-    --controller CONTROLLER_ID
+    --controller CONTROLLER_ID [--config-identity OWNER/REPOSITORY]
 
   install-worker-controller.sh --rollback
   install-worker-controller.sh --uninstall
@@ -52,6 +53,11 @@ while (($#)); do
     --config-repo)
       (($# >= 2)) || die '--config-repo requires a value'
       config_repo=$2
+      shift 2
+      ;;
+    --config-identity)
+      (($# >= 2)) || die '--config-identity requires a value'
+      config_identity_arg=$2
       shift 2
       ;;
     --ref)
@@ -145,19 +151,21 @@ validate_common_arguments() {
   if [[ "$config_repo" == *://* || "$config_repo" == *@* ]]; then
     die '--config-repo must not contain a URL or embedded credentials; use OWNER/REPOSITORY or a local path'
   fi
+  [[ -z "$config_identity_arg" || "$config_identity_arg" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-identity must be OWNER/REPOSITORY'
 }
 
 resolve_config() {
   local resolved checkout
   candidate_config=$temporary/fleet.json
   if is_git_checkout "$config_repo"; then
-    config_identity=$(cd "$config_repo" && pwd -P)
-    config_source_checkout=$config_identity
-    resolved=$(git -C "$config_identity" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
+    config_source_checkout=$(cd "$config_repo" && pwd -P)
+    config_identity=${config_identity_arg:-$config_source_checkout}
+    resolved=$(git -C "$config_source_checkout" rev-parse "$config_ref^{commit}" 2>/dev/null || true)
     [[ "$resolved" == "$config_ref" ]] || die 'local configuration repository does not contain the requested commit'
-    git -C "$config_identity" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
+    git -C "$config_source_checkout" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
     return
   fi
+  [[ -z "$config_identity_arg" ]] || die '--config-identity is valid only with a local Git checkout'
   [[ "$config_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die '--config-repo must be OWNER/REPOSITORY or a local Git checkout'
   checkout=$temporary/config-repository
   config_source_checkout=$checkout
@@ -826,10 +834,10 @@ PY
       # Only enable remote reconciliation timers when config is
       # identified as an OWNER/REPO (not a local checkout path)
       if [[ "$config_identity" == *"/"* && "$config_identity" != "/"* ]]; then
-        systemctl enable --now "$opt_timer" >/dev/null 2>&1 || true
+        systemctl enable --now "$opt_timer" >/dev/null
       else
         # Local checkout path — disable and stop any previously enabled timer
-        systemctl disable --now "$opt_timer" >/dev/null 2>&1 || true
+        systemctl disable --now "$opt_timer" >/dev/null
       fi
     ;; esac
   done
@@ -1030,9 +1038,15 @@ perform_uninstall() {
 }
 
 require_commands
-install -d -m 0755 "$(dirname "$lock_file")"
-exec 9>"$lock_file"
-flock -n 9 || die 'another ci-fleet installer or drift check is already running'
+if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
+  [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
+  [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
+  flock -n 9 || die 'inherited installer lock is unavailable'
+else
+  install -d -m 0755 "$(dirname "$lock_file")"
+  exec 9>"$lock_file"
+  flock -n 9 || die 'another ci-fleet installer or drift check is already running'
+fi
 case "$mode" in
   check|install|adopt|upgrade)
     validate_common_arguments

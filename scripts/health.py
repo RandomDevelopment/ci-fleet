@@ -315,11 +315,17 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
+    if remote_config:
+        timer_ages["reconcile"] = 900
     timers = {name: _unit_state(run, f"ci-fleet-{name}.timer", timer=True, max_age_seconds=age) for name, age in timer_ages.items()}
-    services = {name: _unit_state(run, unit) for name, unit in {
+    service_units = {
         "cleanup": "ci-fleet-cleanup.service",
         "drift": "ci-fleet-drift.service",
-    }.items()}
+    }
+    if remote_config:
+        service_units["reconcile"] = "ci-fleet-reconcile.service"
+    services = {name: _unit_state(run, unit) for name, unit in service_units.items()}
     debian = (root / "etc/debian_version").exists()
     if debian:
         timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)

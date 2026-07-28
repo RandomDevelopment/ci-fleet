@@ -215,9 +215,6 @@ PY
   lkg_repo=${lkg_vals[1]}
   lkg_controller=${lkg_vals[2]}
 
-  local lkg_config=$lkg_dir/fleet.json
-  [[ -f "$lkg_config" ]] || { log_json "ERROR" "rollback" "LKG fleet.json missing"; return 1; }
-
   # Re-apply the LKG ref via the installer
   # Create a checkout containing the LKG ref (may differ from fetched HEAD)
   local lkg_pinned=$temp_dir/lkg-pinned
@@ -240,85 +237,23 @@ PY
   fi
   git -C "$lkg_pinned" checkout -q FETCH_HEAD
 
-  release_lock
-  "$installer" --upgrade \
+  CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
     --config-repo "$lkg_pinned" \
+    --config-identity "$lkg_repo" \
     --ref "$lkg_ref" \
     --controller "$lkg_controller" 2>"$temp_dir/rollback_err" && {
-    acquire_lock
-    # Fix the config_repository in the state file to the durable name
-    fix_state_config_repo "$lkg_repo"
     log_json "WARN" "rollback" "restored last-known-good"
     return 0
   }
-  acquire_lock
   local err
   err=$(<"$temp_dir/rollback_err")
   log_json "ERROR" "rollback" "rollback failed: ${err}"
   return 1
 }
 
-fix_state_config_repo() {
-  local durable=$1
-  [[ -f "$state_file" ]] || return 0
-  python3 - "$state_file" "$durable" <<'PY' 2>/dev/null || true
-import json, os, sys, tempfile
-
-path = sys.argv[1]
-durable = sys.argv[2]
-state = json.load(open(path, encoding="utf-8"))
-if state.get("config_repository") != durable:
-    state["config_repository"] = durable
-    fd, tmp = tempfile.mkstemp(prefix=".fix-state.", dir=os.path.dirname(path), text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except:
-        os.unlink(tmp, missing_ok=True)
-        raise
-PY
-}
-
-fix_rendered_env_config_repo() {
-  local durable=$1
-  [[ -f "$rendered_env" ]] || return 0
-  python3 - "$rendered_env" "$durable" <<'PY' 2>/dev/null || true
-import os, sys, tempfile
-path = sys.argv[1]
-durable = sys.argv[2]
-with open(path, encoding="utf-8") as f:
-    lines = f.readlines()
-changed = False
-for i, line in enumerate(lines):
-    if line.startswith("CI_FLEET_CONFIG_REPOSITORY="):
-        val = line.split("=", 1)[1].strip()
-        if val != durable:
-            lines[i] = f"CI_FLEET_CONFIG_REPOSITORY={durable}\n"
-            changed = True
-        break
-if not changed:
-    raise SystemExit(0)
-fd, tmp = tempfile.mkstemp(prefix=".fix-env.", dir=os.path.dirname(path), text=True)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-except:
-    os.unlink(tmp, missing_ok=True)
-    raise
-PY
-}
-
 save_lkg() {
-  local checkout_dir=$1 commit=$2
+  local commit=$1
   install -d -m 0700 "$lkg_dir"
-  git -C "$checkout_dir" show "$commit:fleet.json" >"$lkg_dir/fleet.json" 2>/dev/null || true
   python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile
 
@@ -360,9 +295,6 @@ print(json.dumps({
 PY
 }
 
-release_lock() { flock -u 9 2>/dev/null || true; }
-acquire_lock() { flock -n 9 2>/dev/null || die "cannot re-acquire installer lock"; }
-
 # --- Health (with rendered env) ---
 
 run_health_check() {
@@ -373,7 +305,8 @@ run_health_check() {
     [[ ! -f "$rendered_env" ]] || . "$rendered_env"
     set +a
     python3 "$repo_root/scripts/health.py" local --output "$output" 2>/dev/null
-  ) && python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
+  ) || true
+  python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
 }
 
 # --- Main ---
@@ -439,33 +372,22 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
   # Run drift check using the fetched local checkout
   local_pinned=$temp_dir/config-repo
   if [[ -d "$local_pinned/.git" ]]; then
-    release_lock
-    if "$installer" --check \
+    if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --check \
       --config-repo "$local_pinned" \
+      --config-identity "$installed_config_repo" \
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
-      acquire_lock
       note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
       save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
       exit 0
     fi
-    acquire_lock
   fi
-  # Same commit + drift = check controller health
-  # If controller is unhealthy, reconcile; otherwise converge with drift note
+  # Same commit + drift is still drift: check-only reports it, normal mode repairs it.
   if [[ "$mode" == check-only ]]; then
     save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' 'internal drift detected'
     exit 3
   fi
-  # Full mode: run health check to decide if reconciliation is needed
-  controller_running=$(docker inspect --format '{{.State.Status}}' "ci-fleet-controller-1" 2>/dev/null || echo "missing")
-  if [[ "$controller_running" != "running" ]]; then
-    note "DRIFT with unhealthy controller, falling through to reconcile"
-  else
-    note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-    save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'drift' 'no commit change; internal drift tracked by drift timer'
-    exit 0
-  fi
+  note "DRIFT falling through to reconcile"
 fi
 
 # New commit or drift — validate and reconcile
@@ -475,7 +397,7 @@ if ! validate_config "$fetch_dir" "$desired_commit"; then
   note "INVALID_CONFIG commit=${desired_commit}"
   save_reconcile_state 'invalid' "$desired_commit" "$installed_config_ref" 'healthy' "config rejected at ${desired_commit}"
   if [[ "$installed_config_ref" != "$desired_commit" ]]; then
-    save_lkg "$fetch_dir" "$installed_config_ref"
+    save_lkg "$installed_config_ref"
   fi
   exit 3
 fi
@@ -495,35 +417,25 @@ if [[ "$no_op" == true ]]; then
 fi
 
 # Save LKG before reconciling
-save_lkg "$fetch_dir" "$installed_config_ref"
+save_lkg "$installed_config_ref"
 
 # Create a pinned local checkout for the installer.
-# Pass the durable config_repo name so install-state.json records
-# the correct identity; the installer uses the local checkout path
-# for fleet.json resolution.
+# Keep the durable repository identity while the installer reads the fetched checkout.
 pinned_dir=$temp_dir/pinned-config
 cp -a "$fetch_dir" "$pinned_dir"
 git -C "$pinned_dir" checkout -q "$desired_commit"
 
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
-release_lock
-if "$installer" --upgrade \
+if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   --config-repo "$pinned_dir" \
+  --config-identity "$installed_config_repo" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
-  acquire_lock
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
 
-  # Fix config_repository in state file AND rendered env to the durable name
-  fix_state_config_repo "$installed_config_repo"
-  fix_rendered_env_config_repo "$installed_config_repo"
-
-  # Re-enable reconcile timer (may have been disabled during local-checkout upgrade)
-  systemctl enable --now ci-fleet-reconcile.timer >/dev/null 2>&1 || true
-
   # Save new LKG
-  save_lkg "$fetch_dir" "$desired_commit"
+  save_lkg "$desired_commit"
 
   # Run health check
   health_status=$(run_health_check "$temp_dir/health.json")
@@ -532,7 +444,6 @@ if "$installer" --upgrade \
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
-  acquire_lock
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
 

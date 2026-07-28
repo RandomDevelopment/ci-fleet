@@ -244,6 +244,44 @@ class TestSystemdUnits(unittest.TestCase):
         self.assertIn("ci-fleet-reconcile.service", content)
         self.assertIn("ci-fleet-reconcile.timer", content)
 
+    def test_remote_installer_calls_keep_identity_and_lock(self):
+        """Remote check, upgrade, and rollback keep one locked transaction."""
+        reconcile = RECONCILE_SCRIPT.read_text()
+        installer = INSTALLER.read_text()
+        self.assertNotIn("release_lock", reconcile)
+        self.assertEqual(reconcile.count("CI_FLEET_INSTALLER_LOCK_FD=9"), 3)
+        self.assertEqual(reconcile.count("--config-identity"), 3)
+        self.assertIn("--config-identity)", installer)
+        self.assertIn("CI_FLEET_INSTALLER_LOCK_FD", installer)
+        self.assertIn("/proc/self/fd/9", installer)
+
+    def test_same_commit_drift_is_reconciled(self):
+        """Any failed same-commit check falls through to repair."""
+        content = RECONCILE_SCRIPT.read_text()
+        same_commit = content.split('if [[ "$desired_commit" == "$installed_config_ref" ]]', 1)[1]
+        same_commit = same_commit.split("# New commit or drift", 1)[0]
+        self.assertNotIn("controller_running", same_commit)
+        self.assertNotIn("internal drift tracked by drift timer", same_commit)
+
+    def test_timer_restore_failure_is_not_ignored(self):
+        """A remote activation cannot report success without its timer."""
+        content = INSTALLER.read_text()
+        remote_timer = content.split('if [[ "$config_identity" == *"/"*', 1)[1]
+        remote_timer = remote_timer.split("else", 1)[0]
+        self.assertNotIn("|| true", remote_timer)
+
+    def test_lkg_does_not_depend_on_an_unsaved_fleet_snapshot(self):
+        """Rollback uses the authenticated exact-ref checkout as its source."""
+        content = RECONCILE_SCRIPT.read_text()
+        apply_lkg = content.split("apply_lkg()", 1)[1].split("save_lkg()", 1)[0]
+        self.assertNotIn("LKG fleet.json missing", apply_lkg)
+
+    def test_health_report_is_parsed_for_warning_and_failure_results(self):
+        """Health severity does not discard the report it just wrote."""
+        content = RECONCILE_SCRIPT.read_text()
+        health = content.split("run_health_check()", 1)[1].split("# --- Main ---", 1)[0]
+        self.assertNotIn(") && python3", health)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -146,6 +146,17 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
                 self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
                 self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                remote = health.collect_snapshot(
+                    {
+                        "CI_FLEET_CONTROLLER_STATE": "disabled",
+                        "CI_FLEET_CONFIG_REPOSITORY": "example/config",
+                        "CI_FLEET_HEALTH_BOOTSTRAP": "1",
+                    },
+                    root=root,
+                    run=run,
+                )
+                self.assertEqual(set(remote["services"]), {"cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["timers"]), {"health", "cleanup", "drift", "reconcile"})
                 (root / "etc").mkdir()
                 (root / "etc/debian_version").write_text("13\n")
                 debian = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)
