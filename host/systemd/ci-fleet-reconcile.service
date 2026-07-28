@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile ci-fleet controller with remote desired-state repository
+Documentation=https://github.com/RandomDevelopment/ci-fleet
+After=docker.service network-online.target ci-fleet-drift.service
+Wants=docker.service network-online.target ci-fleet-drift.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ci-fleet/manager/current
+ExecStart=/opt/ci-fleet/manager/current/scripts/remote-reconcile.sh
+Restart=no
+# 0=noop, 3=drift/invalid — timer retries
+SuccessExitStatus=0 3

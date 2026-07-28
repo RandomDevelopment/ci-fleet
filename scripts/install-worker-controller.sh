@@ -114,6 +114,9 @@ unit_names=(
   ci-fleet-drift.service ci-fleet-drift.timer
 )
 timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
+optional_unit_names=(
+  ci-fleet-reconcile.service ci-fleet-reconcile.timer
+)
 
 temporary=$(mktemp -d)
 cleanup_temporary() {
@@ -718,13 +721,17 @@ install_systemd_units() {
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
+  local unit
+  for unit in "${optional_unit_names[@]}"; do
+    [[ -f "$source/host/systemd/$unit" ]] && install -m 0644 "$source/host/systemd/$unit" "$systemd_dir/"
+  done
   systemctl daemon-reload
 }
 
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   local unit
-  for unit in "${unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
   systemctl daemon-reload
 }
 
@@ -803,12 +810,21 @@ PY
   chmod 0600 "$staged_state"
   mv -f "$staged_state" "$state_file"
   systemctl enable --now "${timer_names[@]}" >/dev/null
+  local opt_timer
+  for opt_timer in "${optional_unit_names[@]}"; do
+    case "$opt_timer" in *.timer)
+      systemctl enable --now "$opt_timer" >/dev/null 2>&1 || true
+    ;; esac
+  done
 }
 
 restore_systemd_snapshot() {
   local unit timer failed=0
   remove_systemd_units || failed=1
   for unit in "${unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  done
+  for unit in "${optional_unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
   done
   systemctl daemon-reload || failed=1

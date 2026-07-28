@@ -32,7 +32,8 @@ Review `/etc/apt/apt.conf.d/50unattended-upgrades` and confirm only the intended
 
 - `ci-fleet-health.timer` runs the complete [fleet health contract](HEALTH-MONITORING.md);
 - `ci-fleet-cleanup.timer` removes only expired inactive fleet-owned resources;
-- `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes.
+- `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes;
+- `ci-fleet-reconcile.timer` fetches the latest reviewed desired-state commit from the private repository over authenticated HTTPS and applies it automatically.
 
 Run each service manually once before relying on its timer:
 
