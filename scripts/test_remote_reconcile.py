@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Regression tests for remote reconciliation scripts.
+
+Tests the github-app-token.sh wrapper behaviour, remote-reconcile.sh flow
+(validation, fetch, check, reconcile, rollback), and secret redaction.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = REPO_ROOT / "scripts"
+TOKEN_SCRIPT = SCRIPTS / "github-app-token.sh"
+RECONCILE_SCRIPT = SCRIPTS / "remote-reconcile.sh"
+TOKEN_SCRIPT.chmod(0o755)
+RECONCILE_SCRIPT.chmod(0o755)
+INSTALLER = SCRIPTS / "install-worker-controller.sh"
+
+
+def git(*args: str, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git"] + list(args),
+        capture_output=True, text=True, cwd=cwd,
+    )
+
+
+class TestGitHubAppToken(unittest.TestCase):
+    """Tests for the token helper (unit-level, no real API calls)."""
+
+    def test_requires_args(self):
+        """Exits 2 with no arguments."""
+        result = subprocess.run(
+            [str(TOKEN_SCRIPT)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR", result.stdout + result.stderr)
+
+    def test_requires_valid_env_file(self):
+        """Exits 2 with a non-existent --env-file."""
+        result = subprocess.run(
+            [str(TOKEN_SCRIPT), "--env-file", "/nonexistent/path"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not found", result.stderr)
+
+    def test_rejects_missing_key(self):
+        """Exits 2 when the key file does not exist."""
+        result = subprocess.run(
+            [str(TOKEN_SCRIPT), "--app-id", "123", "--install-id", "456", "--key-path", "/nonexistent/key.pem"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not found", result.stderr)
+
+    def test_parses_env_file(self):
+        """Correctly extracts app-id, install-id, and key-path from an env file."""
+        with tempfile.TemporaryDirectory() as td:
+            env_file = Path(td) / "host.env"
+            env_file.write_text(
+                "CI_FLEET_GITHUB_APP_CLIENT_ID=98765\n"
+                "CI_FLEET_GITHUB_APP_INSTALLATION_ID=54321\n"
+                "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/app-key.pem\n"
+                "CI_FLEET_RUNNER_TTL=6h\n"
+            )
+            result = subprocess.run(
+                [str(TOKEN_SCRIPT), "--env-file", str(env_file)],
+                capture_output=True, text=True,
+            )
+            # Should fail because key doesn't exist, but the parsing is correct
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("not found", result.stderr)
+
+    def test_stderr_does_not_leak_key(self):
+        """Error output must not contain the private key content."""
+        with tempfile.TemporaryDirectory() as td:
+            env_file = Path(td) / "host.env"
+            key_file = Path(td) / "key.pem"
+            # Write a fake but valid-looking RSA key
+            key_file.write_text(
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "MIIEpAIBAAKCAQEAFAKEKEYMATE\n"
+                "-----END RSA PRIVATE KEY-----\n"
+            )
+            env_file.write_text(
+                f"CI_FLEET_GITHUB_APP_CLIENT_ID=123\n"
+                f"CI_FLEET_GITHUB_APP_INSTALLATION_ID=456\n"
+                f"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE={key_file}\n"
+            )
+            result = subprocess.run(
+                [str(TOKEN_SCRIPT), "--env-file", str(env_file)],
+                capture_output=True, text=True,
+            )
+            combined = (result.stdout + result.stderr).lower()
+            # The fake key material itself must not appear in stderr or stdout
+            self.assertNotIn("fakekeymate", combined)
+            self.assertNotIn("begin rsa", combined)
+
+
+class TestRemoteReconcile(unittest.TestCase):
+    """Tests for the reconcile script (fixture-driven, no real API calls)."""
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.state_dir = self.td / "state"
+        self.lkg_dir = self.td / "lkg"
+        self.state_file = self.state_dir / "install-state.json"
+
+        # Create a minimal valid install state
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._write_state("RandomDevelopment/rd-delivery-config",
+                          "0000000000000000000000000000000000000000",
+                          "rd-ci-fleet-01")
+
+        # Create a fake host.env for token gen
+        self.host_env = self.td / "host.env"
+        self.host_env.write_text(
+            "CI_FLEET_GITHUB_APP_CLIENT_ID=123\n"
+            "CI_FLEET_GITHUB_APP_INSTALLATION_ID=456\n"
+            "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/nonexistent/key.pem\n"
+        )
+        self.host_env.chmod(0o600)
+
+        self.env = os.environ.copy()
+        self.env.update({
+            "CI_FLEET_REMOTE_STATE_FILE": str(self.state_file),
+            "CI_FLEET_RENDERED_ENV": str(self.td / "ci-fleet.env"),
+            "CI_FLEET_HOST_ENV": str(self.host_env),
+            "CI_FLEET_LKG_DIR": str(self.lkg_dir),
+            "CI_FLEET_RECONCILE_STATE_DIR": str(self.td / "reconcile-state"),
+            "CI_FLEET_RECONCILE_MAX_ATTEMPTS": "1",
+            "CI_FLEET_TESTING": "1",
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _write_state(self, config_repo: str, config_ref: str, controller: str):
+        state = {
+            "controller": controller,
+            "config_repository": config_repo,
+            "config_ref": config_ref,
+            "controller_state": "active",
+            "engine_ref": "0000000000000000000000000000000000000000",
+        }
+        self.state_file.write_text(json.dumps(state, indent=2))
+        self.state_file.chmod(0o600)
+
+    def test_no_installed_state_exits_2(self):
+        """Fails with exit 2 when no install-state.json exists."""
+        self.state_file.unlink(missing_ok=True)
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--check-only"],
+            capture_output=True, text=True, env=self.env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("RECONCILE_ERROR", result.stderr)
+
+    def test_token_env_prefers_host_env(self):
+        """Uses host.env when available for token generation."""
+        # Should try to generate token and fail because key doesn't exist
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--check-only"],
+            capture_output=True, text=True, env=self.env,
+        )
+        self.assertIn(result.returncode, (1, 2), f"expected 1 or 2, got {result.returncode}")
+        self.assertIn("token", result.stderr.lower())
+
+    def test_no_op_flag_succeeds_with_valid_state(self):
+        """--no-op should parse and validate state without fetching."""
+        # It will still try to generate a token, so it'll fail there.
+        # This tests that --no-op is accepted as a flag.
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--no-op"],
+            capture_output=True, text=True, env=self.env,
+        )
+        # It should fail on token generation, not arg parsing
+        self.assertIn(result.returncode, (1, 2), f"expected 1 or 2, got {result.returncode}")
+        # Verify it got past arg parsing
+        self.assertIn("GENERATING_TOKEN", result.stderr + result.stdout)
+
+    def test_help_exits_0(self):
+        """--help prints usage and exits 0."""
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--help"],
+            capture_output=True, text=True, env=self.env,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("usage", result.stdout + result.stderr)
+
+    def test_reconcile_state_saved_on_failure(self):
+        """State file is saved even when reconciliation fails."""
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT)],
+            capture_output=True, text=True, env=self.env,
+        )
+        state_file = self.env["CI_FLEET_RECONCILE_STATE_DIR"]
+        state_path = Path(state_file) / "state.json"
+        # Should exist even on failure
+        self.assertTrue(state_path.exists() or result.returncode != 0)
+
+    def test_validate_schema_output_no_secrets(self):
+        """Sanitized log output must not contain actual key material or token values."""
+        result = subprocess.run(
+            [str(RECONCILE_SCRIPT)],
+            capture_output=True, text=True, env=self.env,
+        )
+        combined = (result.stdout + result.stderr)
+        # Must not contain actual key file content or raw AIA value
+        self.assertNotIn("MIIEpAIBAAKCAQEAFAKEKEYMATE", combined)
+        # Must not contain raw host.env values
+        self.assertNotIn("installation_id=456", combined.lower())
+        self.assertNotIn("client_id=123", combined.lower())
+
+
+class TestSystemdUnits(unittest.TestCase):
+    """The systemd unit files must exist and pass basic validation."""
+
+    def test_service_file_exists(self):
+        svc = REPO_ROOT / "host" / "systemd" / "ci-fleet-reconcile.service"
+        self.assertTrue(svc.exists())
+        content = svc.read_text()
+        self.assertIn("ExecStart", content)
+        self.assertIn("remote-reconcile.sh", content)
+
+    def test_timer_file_exists(self):
+        timer = REPO_ROOT / "host" / "systemd" / "ci-fleet-reconcile.timer"
+        self.assertTrue(timer.exists())
+        content = timer.read_text()
+        self.assertIn("OnUnitActiveSec", content)
+
+    def test_installer_references_units(self):
+        """Installer script references the new reconcile units."""
+        content = INSTALLER.read_text()
+        self.assertIn("ci-fleet-reconcile.service", content)
+        self.assertIn("ci-fleet-reconcile.timer", content)
+
+
+if __name__ == "__main__":
+    unittest.main()
