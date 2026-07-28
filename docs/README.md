@@ -15,6 +15,7 @@ New operator? Follow the [Quickstart](QUICKSTART.md): what ci-fleet does, instal
 | Try the experimental implementation safely | [Live pilot runbook](LIVE-PILOT.md) |
 | Add another Docker host, VM, computer, or VPS | [Adding a host](ADDING-A-HOST.md) |
 | Manage controller configuration from Git | [Git-authored controller desired state](DESIRED-STATE.md) |
+| Create the controller GitHub App identity | [GitHub App setup](GITHUB-APP-SETUP.md) |
 | Add a private project to the shared runner pool | [Adding a project](ADDING-A-PROJECT.md) |
 | Convert an existing GitHub Actions workflow | [Migrating existing CI](MIGRATING-EXISTING-CI.md) |
 | Make a project compliant | [Project CI standard](PROJECT-STANDARD.md) and [compliance checklist](COMPLIANCE-CHECKLIST.md) |
