@@ -929,7 +929,7 @@ restore_checkpoint() {
         failed=1
       else
         compose "$release_dir" "$rendered_env" up -d --no-deps controller || failed=1
-        if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" || failed=1; fi
+        if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" true || failed=1; fi
       fi
     fi
   fi

@@ -157,7 +157,7 @@ class HealthTests(unittest.TestCase):
             pressure = root / "proc/pressure/memory"
             pressure.write_text("some avg10=0.00 avg60=0.05 avg300=0.20 total=1\n")
             def run(args):
-                output = "yes\n" if args[0] == "timedatectl" else "success\n" if args[0] == "systemctl" else ""
+                output = "yes\n" if args[0] == "timedatectl" else "failed\n" if args[:2] == ["systemctl", "show"] and args[2].endswith(".service") else "success\n" if args[0] == "systemctl" else ""
                 return health.subprocess.CompletedProcess(args, 1 if args[:2] == ["docker", "info"] else 0, output, "")
 
             original_load, original_cpus = health.os.getloadavg, health.os.cpu_count
@@ -183,6 +183,7 @@ class HealthTests(unittest.TestCase):
                     run=run,
                 )
                 self.assertEqual(set(remote["services"]), {"cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["services"].values()), {"ok"})
                 self.assertEqual(set(remote["timers"]), {"health", "cleanup", "drift", "reconcile"})
                 self.assertEqual(remote["reconciliation"]["status"], "bootstrap")
                 (root / "etc").mkdir()
