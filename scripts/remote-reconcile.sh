@@ -223,11 +223,21 @@ PY
   local lkg_pinned=$temp_dir/lkg-pinned
   mkdir -p "$lkg_pinned"
   git init -q "$lkg_pinned"
-  git -C "$lkg_pinned" remote add origin "https://github.com/${lkg_repo}.git"
-  GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
-    log_json "ERROR" "rollback" "LKG fetch failed"
-    return 1
-  }
+  # Use the reconciliation token for authenticated fetch
+  local lkg_token
+  lkg_token=$(cat "$temp_dir/reconcile-token" 2>/dev/null || echo "")
+  if [[ -n "$lkg_token" ]]; then
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 \
+      "https://x-access-token:${lkg_token}@github.com/${lkg_repo}.git" "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
+      log_json "ERROR" "rollback" "LKG fetch failed"
+      return 1
+    }
+  else
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
+      log_json "ERROR" "rollback" "LKG fetch failed"
+      return 1
+    }
+  fi
   git -C "$lkg_pinned" checkout -q FETCH_HEAD
 
   "$installer" --upgrade \
@@ -267,6 +277,39 @@ if state.get("config_repository") != durable:
     except:
         os.unlink(tmp, missing_ok=True)
         raise
+PY
+}
+
+fix_rendered_env_config_repo() {
+  local durable=$1
+  [[ -f "$rendered_env" ]] || return 0
+  python3 - "$rendered_env" "$durable" <<'PY' 2>/dev/null || true
+import os, sys, tempfile
+path = sys.argv[1]
+durable = sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    lines = f.readlines()
+changed = False
+for i, line in enumerate(lines):
+    if line.startswith("CI_FLEET_CONFIG_REPOSITORY="):
+        val = line.split("=", 1)[1].strip()
+        if val != durable:
+            lines[i] = f"CI_FLEET_CONFIG_REPOSITORY={durable}\n"
+            changed = True
+        break
+if not changed:
+    raise SystemExit(0)
+fd, tmp = tempfile.mkstemp(prefix=".fix-env.", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except:
+    os.unlink(tmp, missing_ok=True)
+    raise
 PY
 }
 
@@ -331,8 +374,8 @@ run_health_check() {
 
 require_commands
 
-# Serialize with installer mutations — acquire reconcile lock
-lock_file=${CI_FLEET_RECONCILE_LOCK:-/run/ci-fleet-reconcile.lock}
+# Serialize with installer mutations — share the installer's lock
+lock_file=${CI_FLEET_INSTALLER_LOCK:-/run/ci-fleet-installer.lock}
 install -d -m 0755 "$(dirname "$lock_file")"
 exec 9>"$lock_file"
 flock -n 9 || die "another reconcile or installer is already running"
@@ -363,6 +406,7 @@ while ((attempt < max_attempts)); do
     ((attempt < max_attempts)) && { sleep 5; continue; }
     die "token generation exhausted after ${max_attempts} attempts"
   }
+  printf '%s' "$token" >"$temp_dir/reconcile-token"
 
   # Fetch remote config
   note "FETCHING_CONFIG repo=${installed_config_repo}"
@@ -398,11 +442,21 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
       exit 0
     fi
   fi
-  # Same commit + drift = internal state mismatch on an already-converged ref.
-  # The drift timer handles this. Don't re-reconcile the same commit.
-  note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-  save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'drift' 'no commit change; internal drift tracked by drift timer'
-  exit 0
+  # Same commit + drift = check controller health
+  # If controller is unhealthy, reconcile; otherwise converge with drift note
+  if [[ "$mode" == check-only ]]; then
+    save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' 'internal drift detected'
+    exit 3
+  fi
+  # Full mode: run health check to decide if reconciliation is needed
+  controller_running=$(docker inspect --format '{{.State.Status}}' "ci-fleet-controller-1" 2>/dev/null || echo "missing")
+  if [[ "$controller_running" != "running" ]]; then
+    note "DRIFT with unhealthy controller, falling through to reconcile"
+  else
+    note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
+    save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'drift' 'no commit change; internal drift tracked by drift timer'
+    exit 0
+  fi
 fi
 
 # New commit or drift — validate and reconcile
@@ -450,8 +504,9 @@ if "$installer" --upgrade \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
 
-  # Fix the config_repository in the state file to the durable name
+  # Fix config_repository in state file AND rendered env to the durable name
   fix_state_config_repo "$installed_config_repo"
+  fix_rendered_env_config_repo "$installed_config_repo"
 
   # Save new LKG
   save_lkg "$fetch_dir" "$desired_commit"

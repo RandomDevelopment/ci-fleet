@@ -827,6 +827,9 @@ PY
       # identified as an OWNER/REPO (not a local checkout path)
       if [[ "$config_identity" == *"/"* && "$config_identity" != "/"* ]]; then
         systemctl enable --now "$opt_timer" >/dev/null 2>&1 || true
+      else
+        # Local checkout path — disable and stop any previously enabled timer
+        systemctl disable --now "$opt_timer" >/dev/null 2>&1 || true
       fi
     ;; esac
   done
@@ -845,6 +848,13 @@ restore_systemd_snapshot() {
   for timer in "${timer_names[@]}"; do
     if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
     if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
+  done
+  local opt_name
+  for opt_name in "${optional_unit_names[@]}"; do
+    case "$opt_name" in *.timer)
+      if grep -Fxq "$opt_name" "$checkpoint_dir/enabled-timers"; then systemctl enable "$opt_name" >/dev/null || failed=1; else systemctl disable "$opt_name" >/dev/null 2>&1 || true; fi
+      if grep -Fxq "$opt_name" "$checkpoint_dir/active-timers"; then systemctl start "$opt_name" || failed=1; else systemctl stop "$opt_name" >/dev/null 2>&1 || true; fi
+    ;; esac
   done
   return "$failed"
 }
