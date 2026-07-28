@@ -156,7 +156,7 @@ Bounded retries (up to 3 attempts) handle transient fetch or API failures. All l
 
 Prerequisites:
 
-- The controller's GitHub App must have `contents: read` permission and be authorized for the desired-state repository.
+- The controller's GitHub App must have `contents: read` permission and be authorized for the desired-state repository — see [GitHub App setup](GITHUB-APP-SETUP.md).
 - `host.env` must contain `CI_FLEET_GITHUB_APP_CLIENT_ID`, `CI_FLEET_GITHUB_APP_INSTALLATION_ID`, and `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE`.
 
 Manual invocation:
