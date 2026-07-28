@@ -197,6 +197,20 @@ class TestRemoteReconcile(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("usage", result.stdout + result.stderr)
 
+    def test_desired_ref_is_full_sha_and_check_only(self):
+        invalid = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--check-only", "--desired-ref", "main"],
+            capture_output=True, text=True, env=self.env,
+        )
+        mutating = subprocess.run(
+            [str(RECONCILE_SCRIPT), "--desired-ref", "a" * 40],
+            capture_output=True, text=True, env=self.env,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("full lowercase commit SHA", invalid.stderr)
+        self.assertEqual(mutating.returncode, 2)
+        self.assertIn("requires --check-only", mutating.stderr)
+
     def test_reconcile_state_saved_on_failure(self):
         """State file is saved even when reconciliation fails."""
         result = subprocess.run(

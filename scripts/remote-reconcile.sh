@@ -6,7 +6,7 @@
 # validates the configuration, checks for drift, and reconciles if needed.
 #
 # Usage:
-#   remote-reconcile.sh [--check-only] [--no-op]
+#   remote-reconcile.sh [--check-only] [--desired-ref SHA] [--no-op]
 set -Eeuo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,17 +26,19 @@ trap cleanup_temp EXIT
 
 mode=reconcile  # reconcile or check-only
 no_op=false
+desired_ref=
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
 
 usage() {
   cat >&2 <<'EOF'
 usage:
-  remote-reconcile.sh [--check-only] [--no-op]
+  remote-reconcile.sh [--check-only] [--desired-ref SHA] [--no-op]
 
   Fetches the desired-state repository at the current default-branch HEAD,
   validates it, and reconciles the controller if a newer commit is available.
 
   --check-only  Validate and report without reconciling.
+  --desired-ref Check this exact commit instead of remote HEAD (check-only only).
   --no-op       Log what would be done without side effects.
 EOF
 }
@@ -44,12 +46,15 @@ EOF
 while (($#)); do
   case "$1" in
     --check-only) mode=check-only ;;
+    --desired-ref) shift; (($#)) || { echo 'ERROR: --desired-ref requires a commit' >&2; exit 2; }; desired_ref=$1 ;;
     --no-op) no_op=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
   shift
 done
+[[ -z "$desired_ref" || "$mode" == check-only ]] || { echo 'ERROR: --desired-ref requires --check-only' >&2; exit 2; }
+[[ -z "$desired_ref" || "$desired_ref" =~ ^[0-9a-f]{40}$ ]] || { echo 'ERROR: --desired-ref must be a full lowercase commit SHA' >&2; exit 2; }
 
 note() { printf 'RECONCILE %s\n' "$*"; }
 die() {
@@ -135,16 +140,16 @@ generate_token() {
 # --- Remote fetch ---
 
 fetch_remote_config() {
-  local repo=$1 token=$2
+  local repo=$1 token=$2 ref=${3:-HEAD}
   local fetch_dir=$temp_dir/config-repo
   mkdir -p "$fetch_dir"
   git init -q "$fetch_dir"
   # Use auth_url with embedded token for authenticated fetch
   local auth_url="https://x-access-token:${token}@github.com/${repo}.git"
-  GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 origin HEAD 2>"$temp_dir/fetch_err" || {
+  GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 origin "$ref" 2>"$temp_dir/fetch_err" || {
     local err
     # Retry with auth_url if plain fetch failed (private repo needs auth)
-    GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 "$auth_url" HEAD 2>"$temp_dir/fetch_err" || {
+    GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 "$auth_url" "$ref" 2>"$temp_dir/fetch_err" || {
       local err
       err=$(<"$temp_dir/fetch_err")
       [[ -n "$err" ]] || err="fetch failed"
@@ -349,7 +354,7 @@ while ((attempt < max_attempts)); do
 
   # Fetch remote config
   note "FETCHING_CONFIG repo=${installed_config_repo}"
-  desired_commit=$(fetch_remote_config "$installed_config_repo" "$token") || {
+  desired_commit=$(fetch_remote_config "$installed_config_repo" "$token" "${desired_ref:-HEAD}") || {
     note "FETCH_FAILED attempt=${attempt}"
     ((attempt < max_attempts)) && { sleep 5; continue; }
     die "fetch exhausted after ${max_attempts} attempts"
