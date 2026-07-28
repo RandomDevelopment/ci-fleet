@@ -136,6 +136,42 @@ No mode uses global Docker prune or removes unrelated workloads.
 
 The host does not automatically follow or execute a moving branch. A new configuration becomes effective only when an operator or authorized external controller supplies its reviewed full commit SHA to `--upgrade`. Automatic dispatchers may watch a protected branch and invoke that exact command after merge, using read-only repository contents permission; their identity must remain host-side and unavailable to job runners.
 
+## Remote reconciliation
+
+`ci-fleet-reconcile.timer` runs every five minutes to fetch the desired configuration from the private desired-state repository and apply it if a newer reviewed commit is available. Authentication uses the existing GitHub App identity — no PAT, no SSH, no inbound management port.
+
+How it works:
+
+1. The timer invokes `scripts/remote-reconcile.sh`.
+2. The script generates a short-lived GitHub App installation token using the existing private key on the host (openssl + curl, no new dependencies).
+3. It fetches the default-branch HEAD of the desired-state repository over authenticated HTTPS.
+4. The fetched commit is resolved to an immutable SHA and compared with the installed SHA.
+5. If unchanged, a drift check confirms convergence (NO_CHANGE).
+6. If changed, the new configuration is validated (schema, secret scan, tree completeness) before any mutation.
+7. On success, the last-known-good state is updated and the controller runs with the new configuration.
+8. On failure, the controller rolls back to the last-known-good checkpoint via the existing installer mechanism.
+9. State is recorded at `/var/lib/ci-fleet/reconcile/state.json` with desired commit, applied commit, health, and failure description.
+
+Bounded retries (up to 3 attempts) handle transient fetch or API failures. All logging is sanitized — tokens, private keys, and raw credential values never appear in stdout, stderr, or state files.
+
+Prerequisites:
+
+- The controller's GitHub App must have `contents: read` permission and be authorized for the desired-state repository.
+- `host.env` must contain `CI_FLEET_GITHUB_APP_CLIENT_ID`, `CI_FLEET_GITHUB_APP_INSTALLATION_ID`, and `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE`.
+
+Manual invocation:
+
+```bash
+# Check-only — validate without applying
+sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
+
+# Full reconcile
+sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh
+
+# No-op — log what would be done
+sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --no-op
+```
+
 ## Drain and retirement
 
 1. Merge a private configuration change setting the controller to `drained`.

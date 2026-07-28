@@ -112,8 +112,9 @@ unit_names=(
   ci-fleet-health.service ci-fleet-health.timer
   ci-fleet-cleanup.service ci-fleet-cleanup.timer
   ci-fleet-drift.service ci-fleet-drift.timer
+  ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
-timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
+timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer ci-fleet-reconcile.timer)
 
 temporary=$(mktemp -d)
 cleanup_temporary() {
@@ -718,6 +719,8 @@ install_systemd_units() {
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.timer" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-reconcile.service" "$systemd_dir/"
+  install -m 0644 "$source/host/systemd/ci-fleet-reconcile.timer" "$systemd_dir/"
   systemctl daemon-reload
 }
 
