@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 state_file=${CI_FLEET_INSTALL_STATE_FILE:-/var/lib/ci-fleet/install-state.json}
 installer=${CI_FLEET_INSTALLER:-/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh}
+remote_reconciler=${CI_FLEET_REMOTE_RECONCILER:-/opt/ci-fleet/manager/current/scripts/remote-reconcile.sh}
 
 [[ -f "$state_file" ]] || { echo "ERROR: installed desired-state record is missing: $state_file" >&2; exit 2; }
 expected_owner=0
@@ -33,6 +34,11 @@ mapfile -t values <<<"$state_values"
 controller=${values[0]}
 config_repository=${values[1]}
 config_ref=${values[2]}
+
+if [[ "$config_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  [[ -x "$remote_reconciler" ]] || { echo "ERROR: remote reconciler is unavailable: $remote_reconciler" >&2; exit 2; }
+  exec "$remote_reconciler" --check-only
+fi
 
 exec "$installer" --check \
   --config-repo "$config_repository" \
