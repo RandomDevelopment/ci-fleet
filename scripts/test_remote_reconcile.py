@@ -263,6 +263,7 @@ class TestSystemdUnits(unittest.TestCase):
         reconcile = RECONCILE_SCRIPT.read_text()
         installer = INSTALLER.read_text()
         self.assertNotIn("release_lock", reconcile)
+        self.assertIn('flock -w "$lock_wait_seconds" 9', reconcile)
         self.assertEqual(reconcile.count("CI_FLEET_INSTALLER_LOCK_FD=9"), 3)
         self.assertEqual(reconcile.count("--config-identity"), 3)
         self.assertIn("--config-identity)", installer)
