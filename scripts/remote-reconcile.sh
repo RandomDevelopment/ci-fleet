@@ -163,11 +163,20 @@ validate_config() {
   git -C "$checkout_dir" ls-tree -rz --name-only "$commit" >"$temp_dir/tree-paths" 2>/dev/null || return 1
 
   # Validate using the installer's validation chain
+  # Also run the template validator with --strict + --tree-paths (like installer does)
   python3 "$repo_root/scripts/desired_state.py" validate --config "$temp_dir/fleet.json" 2>"$temp_dir/validate_err" || {
     local err
     err=$(<"$temp_dir/validate_err")
     [[ -n "$err" ]] || err="validation failed"
     log_json "ERROR" "validation" "config validation failed"
+    return 1
+  }
+  python3 "$repo_root/templates/config-repository/scripts/validate.py" \
+    --config "$temp_dir/fleet.json" --strict --tree-paths "$temp_dir/tree-paths" 2>"$temp_dir/strict_err" || {
+    local err
+    err=$(<"$temp_dir/strict_err")
+    [[ -n "$err" ]] || err="strict validation failed"
+    log_json "ERROR" "validation" "strict validation rejected"
     return 1
   }
 
@@ -209,19 +218,17 @@ PY
   local lkg_config=$lkg_dir/fleet.json
   [[ -f "$lkg_config" ]] || { log_json "ERROR" "rollback" "LKG fleet.json missing"; return 1; }
 
-  # Re-apply the LKG ref via the installer, using the durable repo identity
-  # Create a local checkout pinned to the LKG ref for the installer
+  # Re-apply the LKG ref via the installer
+  # Create a checkout containing the LKG ref (may differ from fetched HEAD)
   local lkg_pinned=$temp_dir/lkg-pinned
-  cp -a "$temp_dir/config-repo" "$lkg_pinned" 2>/dev/null || {
-    # Fallback: fresh fetch
-    mkdir -p "$lkg_pinned"
-    git init -q "$lkg_pinned"
-    git -C "$lkg_pinned" remote add origin "https://github.com/${lkg_repo}.git"
-    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>/dev/null || {
-      log_json "ERROR" "rollback" "LKG fetch failed"
-      return 1
-    }
+  mkdir -p "$lkg_pinned"
+  git init -q "$lkg_pinned"
+  git -C "$lkg_pinned" remote add origin "https://github.com/${lkg_repo}.git"
+  GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
+    log_json "ERROR" "rollback" "LKG fetch failed"
+    return 1
   }
+  git -C "$lkg_pinned" checkout -q FETCH_HEAD
 
   "$installer" --upgrade \
     --config-repo "$lkg_pinned" \
@@ -308,9 +315,27 @@ print(json.dumps({
 PY
 }
 
+# --- Health (with rendered env) ---
+
+run_health_check() {
+  local output=$1
+  (
+    set -a
+    [[ ! -f "$rendered_env" ]] || . "$rendered_env"
+    set +a
+    python3 "$repo_root/scripts/health.py" local --output "$output" 2>/dev/null
+  ) && python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
+}
+
 # --- Main ---
 
 require_commands
+
+# Serialize with installer mutations — acquire reconcile lock
+lock_file=${CI_FLEET_RECONCILE_LOCK:-/run/ci-fleet-reconcile.lock}
+install -d -m 0755 "$(dirname "$lock_file")"
+exec 9>"$lock_file"
+flock -n 9 || die "another reconcile or installer is already running"
 
 # Load installed state
 load_installed_state || die "no installed state found at $state_file"
@@ -361,21 +386,23 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
     exit 0
   fi
 
-  # Run existing drift check
-  if "$installer" --check \
-    --config-repo "$installed_config_repo" \
-    --ref "$installed_config_ref" \
-    --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
-    note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-    save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
-    exit 0
-  else
-    drift_exit=$?
-    note "DRIFT detected (exit=${drift_exit}), attempting reconcile"
-    if [[ "$mode" == check-only ]]; then
-      save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' "drift detected (exit=${drift_exit})"
-      exit 3
+  # Run drift check using the fetched local checkout
+  local_pinned=$temp_dir/config-repo
+  if [[ -d "$local_pinned/.git" ]]; then
+    if "$installer" --check \
+      --config-repo "$local_pinned" \
+      --ref "$installed_config_ref" \
+      --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
+      note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
+      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
+      exit 0
     fi
+  fi
+  # Drift or inaccessibility — fall through to reconcile
+  note "DRIFT detected, attempting reconcile"
+  if [[ "$mode" == check-only ]]; then
+    save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' "drift detected"
+    exit 3
   fi
 fi
 
@@ -419,7 +446,7 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
 if "$installer" --upgrade \
-  --config-repo "$installed_config_repo" \
+  --config-repo "$pinned_dir" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
@@ -431,7 +458,7 @@ if "$installer" --upgrade \
   save_lkg "$fetch_dir" "$desired_commit"
 
   # Run health check
-  health_status=$(python3 "$repo_root/scripts/health.py" local --output "$temp_dir/health.json" 2>/dev/null && python3 -c "import json; print(json.load(open('$temp_dir/health.json'))['status'])" 2>/dev/null || echo "unknown")
+  health_status=$(run_health_check "$temp_dir/health.json")
 
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}"
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
@@ -443,7 +470,7 @@ else
   # Rollback to LKG — reinstalls a checkpoint of this attempt was already created,
   # or safely restores LKG config directly via the installer
   apply_lkg || die "rollback to last-known-good also failed"
-  health_status=$(python3 "$repo_root/scripts/health.py" local --output "$temp_dir/health.json" 2>/dev/null && python3 -c "import json; print(json.load(open('$temp_dir/health.json'))['status'])" 2>/dev/null || echo "unknown")
+  health_status=$(run_health_check "$temp_dir/health.json")
   save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconciled failed, rolled back to ${installed_config_ref}"
   note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
   exit 3

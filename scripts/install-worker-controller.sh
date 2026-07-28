@@ -629,7 +629,7 @@ make_checkpoint() {
     printf '%s\n' "$target" >"$checkpoint_dir/manager-target"
     chmod 0600 "$checkpoint_dir/manager-target"
   fi
-  for unit in "${unit_names[@]}"; do
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
     [[ ! -f "$systemd_dir/$unit" ]] || install -m 0644 "$systemd_dir/$unit" "$checkpoint_dir/systemd/$unit"
   done
   : >"$checkpoint_dir/enabled-timers"
@@ -637,6 +637,13 @@ make_checkpoint() {
   for timer in "${timer_names[@]}"; do
     if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/enabled-timers"; fi
     if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/active-timers"; fi
+  done
+  local opt_name
+  for opt_name in "${optional_unit_names[@]}"; do
+    case "$opt_name" in *.timer)
+      if systemctl is-enabled --quiet "$opt_name" 2>/dev/null; then printf '%s\n' "$opt_name" >>"$checkpoint_dir/enabled-timers"; fi
+      if systemctl is-active --quiet "$opt_name" 2>/dev/null; then printf '%s\n' "$opt_name" >>"$checkpoint_dir/active-timers"; fi
+    ;; esac
   done
   chmod 0600 "$checkpoint_dir/enabled-timers" "$checkpoint_dir/active-timers"
   : >"$checkpoint_dir/.complete"
@@ -731,6 +738,9 @@ install_systemd_units() {
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   local unit
+  for unit in "${optional_unit_names[@]}"; do
+    case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac
+  done
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
   systemctl daemon-reload
 }
@@ -813,7 +823,11 @@ PY
   local opt_timer
   for opt_timer in "${optional_unit_names[@]}"; do
     case "$opt_timer" in *.timer)
-      systemctl enable --now "$opt_timer" >/dev/null 2>&1 || true
+      # Only enable remote reconciliation timers when config is
+      # identified as an OWNER/REPO (not a local checkout path)
+      if [[ "$config_identity" == *"/"* && "$config_identity" != "/"* ]]; then
+        systemctl enable --now "$opt_timer" >/dev/null 2>&1 || true
+      fi
     ;; esac
   done
 }
