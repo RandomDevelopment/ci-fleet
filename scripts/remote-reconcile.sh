@@ -364,6 +364,7 @@ run_health_check() {
   local output=$1
   (
     set -a
+    # shellcheck disable=SC1090
     [[ ! -f "$rendered_env" ]] || . "$rendered_env"
     set +a
     python3 "$repo_root/scripts/health.py" local --output "$output" 2>/dev/null
