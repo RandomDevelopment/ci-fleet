@@ -28,6 +28,8 @@ mode=reconcile  # reconcile or check-only
 no_op=false
 installed_ref=false
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
+# ponytail: one-hour queue cap; align with any future installer transaction timeout.
+lock_wait_seconds=3600
 
 usage() {
   cat >&2 <<'EOF'
@@ -321,7 +323,7 @@ require_commands
 lock_file=${CI_FLEET_INSTALLER_LOCK:-/run/ci-fleet-installer.lock}
 install -d -m 0755 "$(dirname "$lock_file")"
 exec 9>"$lock_file"
-flock 9
+flock -w "$lock_wait_seconds" 9 || die "timed out waiting for another reconcile or installer"
 
 # Load installed state
 load_installed_state || die "no installed state found at $state_file"
