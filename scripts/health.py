@@ -151,6 +151,21 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     add("clock", "ok" if snapshot["clock_synchronized"] else "warning")
     backup = snapshot["backup"]
     add("backup", "warning" if backup == "failed" else "ok", state=backup)
+    reconciliation = snapshot.get("reconciliation")
+    if reconciliation:
+        reconciliation_severity = (
+            "ok" if reconciliation["status"] in {"converged", "bootstrap"}
+            else "warning" if reconciliation["status"] in {"missing", "pending", "reconciling"}
+            else "critical"
+        )
+        add(
+            "reconciliation",
+            reconciliation_severity,
+            state=reconciliation["status"],
+            desired_commit=reconciliation["desired_commit"],
+            applied_commit=reconciliation["applied_commit"],
+            reported_health=reconciliation["health"],
+        )
 
     rank = max(({"ok": 0, "warning": 1, "critical": 2}[check["status"]] for check in checks), default=0)
     overall = ("healthy", "warning", "unhealthy")[rank]
@@ -294,6 +309,24 @@ def _backup_state(values: dict[str, str], run: Runner) -> str:
     return "ok" if run([str(path)]).returncode == 0 else "failed"
 
 
+def _reconcile_state(path: Path) -> dict[str, str]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"status": "missing", "desired_commit": "", "applied_commit": "", "health": ""}
+    if not isinstance(value, dict):
+        return {"status": "invalid", "desired_commit": "", "applied_commit": "", "health": ""}
+    status = value.get("status", "")
+    if not isinstance(status, str) or status not in {"converged", "drift", "invalid", "pending", "reconciling", "rolled_back", "failed"}:
+        status = "invalid"
+    commits = [value.get(name, "") for name in ("desired_commit", "applied_commit")]
+    commits = [commit if isinstance(commit, str) and (not commit or re.fullmatch(r"[0-9a-f]{40}", commit)) else "invalid" for commit in commits]
+    reported_health = value.get("health", "")
+    if not isinstance(reported_health, str) or reported_health not in {"", "healthy", "warning", "unhealthy", "maintenance", "drift", "unknown"}:
+        reported_health = "invalid"
+    return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health}
+
+
 def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Runner = _run) -> dict[str, Any]:
     docker_root = values.get("CI_FLEET_DOCKER_ROOT", "/var/lib/docker")
     available, swap = _memory(root)
@@ -315,11 +348,20 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
+    reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
+    if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
+        reconciliation["status"] = "bootstrap"
+    if remote_config:
+        timer_ages["reconcile"] = 900
     timers = {name: _unit_state(run, f"ci-fleet-{name}.timer", timer=True, max_age_seconds=age) for name, age in timer_ages.items()}
-    services = {name: _unit_state(run, unit) for name, unit in {
+    service_units = {
         "cleanup": "ci-fleet-cleanup.service",
         "drift": "ci-fleet-drift.service",
-    }.items()}
+    }
+    if remote_config:
+        service_units["reconcile"] = "ci-fleet-reconcile.service"
+    services = {name: _unit_state(run, unit) for name, unit in service_units.items()}
     debian = (root / "etc/debian_version").exists()
     if debian:
         timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)
@@ -351,6 +393,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "failed_packages": debian and bool(run(["dpkg", "--audit"]).stdout.strip()),
         "clock_synchronized": run(["timedatectl", "show", "--property=NTPSynchronized", "--value"]).stdout.strip() == "yes",
         "backup": _backup_state(values, run),
+        "reconciliation": reconciliation,
     }
 
 
