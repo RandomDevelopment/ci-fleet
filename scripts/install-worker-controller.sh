@@ -112,7 +112,7 @@ state_file=$state_root/install-state.json
 health_report=$state_root/health/latest.json
 checkpoints_dir=$state_root/checkpoints
 systemd_dir=$(root_path /etc/systemd/system)
-lock_file=$(root_path /run/ci-fleet-installer.lock)
+lock_file=${CI_FLEET_INSTALLER_LOCK:-$(root_path /run/ci-fleet-installer.lock)}
 controller_container=ci-fleet-controller-1
 unit_names=(
   ci-fleet-health.service ci-fleet-health.timer
@@ -835,7 +835,7 @@ PY
       # identified as an OWNER/REPO (not a local checkout path)
       if [[ "$config_identity" == *"/"* && "$config_identity" != "/"* ]]; then
         systemctl enable --now "$opt_timer" >/dev/null
-      else
+      elif [[ -f "$systemd_dir/$opt_timer" ]]; then
         # Local checkout path — disable and stop any previously enabled timer
         systemctl disable --now "$opt_timer" >/dev/null
       fi

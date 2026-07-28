@@ -453,9 +453,10 @@ grep -Fq "CI_FLEET_CONFIG_REPOSITORY=$config_repo" "$root/etc/ci-fleet/ci-fleet.
 expect_success "$installer" --install "${remote_args[@]}" >/dev/null
 grep -Fq 'CI_FLEET_CONFIG_REPOSITORY=fixture-org/fleet-config' "$root/etc/ci-fleet/ci-fleet.env" || fail 'local checkout did not retain its durable repository identity'
 grep -Fq '"config_repository": "fixture-org/fleet-config"' "$install_state" || fail 'install state did not retain the durable repository identity'
-exec 9>"$root/run/ci-fleet-installer.lock"
+custom_lock=$root/run/custom-installer.lock
+exec 9>"$custom_lock"
 flock -n 9 || fail 'fixture could not acquire installer lock'
-expect_success env CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --check "${remote_args[@]}" >/dev/null
+expect_success env CI_FLEET_INSTALLER_LOCK="$custom_lock" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --check "${remote_args[@]}" >/dev/null
 flock -u 9
 exec 9>&-
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null

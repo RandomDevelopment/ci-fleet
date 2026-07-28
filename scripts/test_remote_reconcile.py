@@ -254,6 +254,8 @@ class TestSystemdUnits(unittest.TestCase):
         self.assertIn("--config-identity)", installer)
         self.assertIn("CI_FLEET_INSTALLER_LOCK_FD", installer)
         self.assertIn("/proc/self/fd/9", installer)
+        self.assertIn("lock_file=${CI_FLEET_INSTALLER_LOCK:-", installer)
+        self.assertIn('elif [[ -f "$systemd_dir/$opt_timer" ]]; then', installer)
 
     def test_same_commit_drift_is_reconciled(self):
         """Any failed same-commit check falls through to repair."""
