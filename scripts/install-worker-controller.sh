@@ -437,6 +437,9 @@ runtime_release_complete() {
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
   if grep -Fq 'scripts/health.py' "$path/scripts/healthcheck.sh"; then
     [[ -f "$path/scripts/health.py" ]] || return 1
+    if grep -Fq 'build_status_report' "$path/scripts/health.py"; then
+      [[ -f "$path/scripts/status_auth.py" && -f "$path/controller/status.go" ]] || return 1
+    fi
   fi
   for required in controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
     [[ -f "$path/$required" ]] || return 1

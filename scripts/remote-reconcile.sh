@@ -80,13 +80,24 @@ save_reconcile_state() {
 import json, os, sys, tempfile
 
 path = sys.argv[1]
+now = int(__import__("time").time())
+try:
+    previous = json.load(open(path, encoding="utf-8"))
+    last_success_at = previous.get("last_success_at")
+    if not isinstance(last_success_at, int) or last_success_at < 0:
+        last_success_at = None
+except (OSError, ValueError, TypeError):
+    last_success_at = None
+if sys.argv[2] == "converged":
+    last_success_at = now
 state = {
     "status": sys.argv[2],
     "desired_commit": sys.argv[3] or "",
     "applied_commit": sys.argv[4] or "",
     "health": sys.argv[5] or "",
     "message": sys.argv[6] or "",
-    "checked_at": int(__import__("time").time()),
+    "checked_at": now,
+    "last_success_at": last_success_at,
 }
 fd, tmp = tempfile.mkstemp(prefix=".reconcile-state.", dir=os.path.dirname(path), text=True)
 try:

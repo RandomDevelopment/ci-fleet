@@ -5,14 +5,18 @@ import argparse
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from status_auth import sign_headers
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,58 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     }
 
 
+def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any], *, generated_at: int) -> dict[str, Any]:
+    reconciliation = snapshot.get("reconciliation") or {}
+    state = reconciliation.get("status", "missing")
+    error_code = f"reconciliation_{state}" if state in {"drift", "failed", "invalid", "rolled_back"} else ""
+    if not error_code:
+        failed = next((check for check in health_report.get("checks", []) if check.get("status") in {"critical", "warning"}), None)
+        error_code = f"health_{failed['id']}" if failed else ""
+    error = {"code": error_code, "message": error_code.replace("_", " ")} if error_code else None
+    timers = snapshot.get("timers", {})
+    disks = snapshot["disks"]
+    return {
+        "schema_version": 1,
+        "controller": {
+            "id": snapshot["controller_id"],
+            "software_version": snapshot.get("software_version", "unknown"),
+            "boot_time": snapshot.get("boot_time", 0),
+            "ssh": snapshot.get("ssh", "unknown"),
+        },
+        "configuration": {
+            "desired_commit": reconciliation.get("desired_commit", ""),
+            "applied_commit": reconciliation.get("applied_commit", ""),
+        },
+        "reconciliation": {"state": state, "last_success_at": reconciliation.get("last_success_at")},
+        "drift": {"state": snapshot.get("services", {}).get("drift", "unknown")},
+        "process": {
+            "state": snapshot["controller"].get("state", "unknown"),
+            "restart_count": snapshot["controller"].get("restart_count", 0),
+        },
+        "timers": {
+            "reconciliation": timers.get("reconcile", "unknown"),
+            "drift": timers.get("drift", "unknown"),
+            "health": timers.get("health", "unknown"),
+            "cleanup": timers.get("cleanup", "unknown"),
+        },
+        "runners": snapshot.get("runners", {"current": 0, "busy": 0, "maximum": 0}),
+        "metrics": {
+            "cpu": snapshot.get("cpu", {"logical": 1, "used_percent": 0}),
+            "memory": snapshot.get("memory", {"total_bytes": 0, "available_bytes": 0}),
+            "swap": snapshot.get("swap", {"total_bytes": 0, "used_bytes": 0}),
+            "disk": {name: {"total_bytes": value.get("total_bytes", 0), "used_bytes": value.get("used_bytes", 0)} for name, value in disks.items()},
+            "inodes": {name: {"total": value.get("inode_total", 0), "used": value.get("inode_used", 0)} for name, value in disks.items()},
+            "load": snapshot.get("load", {"one": 0, "five": 0, "fifteen": 0}),
+        },
+        "docker": {
+            "healthy": bool(snapshot.get("docker_available")),
+            "oom": bool(snapshot.get("recent_oom") or snapshot["controller"].get("oom_killed")),
+        },
+        "error": error,
+        "generated_at": generated_at,
+    }
+
+
 Runner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 
@@ -201,6 +257,10 @@ def _disk(path: str) -> dict[str, int]:
     return {
         "used_percent": round(100 * used / max(value.f_blocks, 1)),
         "inode_used_percent": round(100 * iused / max(value.f_files, 1)),
+        "total_bytes": value.f_blocks * value.f_frsize,
+        "used_bytes": used * value.f_frsize,
+        "inode_total": value.f_files,
+        "inode_used": iused,
     }
 
 
@@ -226,6 +286,15 @@ def _timespan_seconds(value: str) -> float | None:
     if not matches or "".join(match.group(0) for match in matches) != re.sub(r"\s+", "", value):
         return None
     return sum(float(match.group(1)) * units[match.group(2)] for match in matches)
+
+
+def _ssh_state(run: Runner) -> str:
+    results = [run(["systemctl", action, unit]) for unit in ("ssh.service", "ssh.socket") for action in ("is-enabled", "is-active")]
+    states = [result.stdout.strip().lower() for result in results]
+    if any(result.returncode == 0 and state in {"active", "enabled"} for result, state in zip(results, states)):
+        return "enabled"
+    disabled = {"disabled", "inactive", "masked", "not-found", "failed", "static"}
+    return "disabled" if all(state in disabled for state in states) else "unknown"
 
 
 def _unit_state(run: Runner, unit: str, timer: bool = False, max_age_seconds: int = 0) -> str:
@@ -270,18 +339,67 @@ def _container(run: Runner, name: str) -> tuple[dict[str, Any], dict[str, int]]:
     }, capacity
 
 
-def _memory(root: Path) -> tuple[int, int]:
+def _memory_details(root: Path) -> tuple[dict[str, int], dict[str, int]]:
     values: dict[str, int] = {}
     try:
         for line in (root / "proc/meminfo").read_text().splitlines():
             key, value = line.split(":", 1)
-            values[key] = int(value.split()[0])
+            values[key] = int(value.split()[0]) * 1024
     except (OSError, ValueError, IndexError):
-        return 0, 0
-    available = round(100 * values.get("MemAvailable", 0) / max(values.get("MemTotal", 1), 1))
+        return {"total_bytes": 0, "available_bytes": 0}, {"total_bytes": 0, "used_bytes": 0}
     swap_total = values.get("SwapTotal", 0)
-    swap = round(100 * (swap_total - values.get("SwapFree", 0)) / max(swap_total, 1)) if swap_total else 0
-    return available, swap
+    return (
+        {"total_bytes": values.get("MemTotal", 0), "available_bytes": values.get("MemAvailable", 0)},
+        {"total_bytes": swap_total, "used_bytes": max(0, swap_total - values.get("SwapFree", 0))},
+    )
+
+
+def _memory(root: Path) -> tuple[int, int]:
+    memory, swap = _memory_details(root)
+    available = round(100 * memory["available_bytes"] / max(memory["total_bytes"], 1))
+    swap_used = round(100 * swap["used_bytes"] / max(swap["total_bytes"], 1)) if swap["total_bytes"] else 0
+    return available, swap_used
+
+
+def _cpu(root: Path) -> dict[str, float | int]:
+    # ponytail: cumulative boot-average CPU; persist the prior sample if interval utilization becomes necessary.
+    try:
+        fields = next(line for line in (root / "proc/stat").read_text().splitlines() if line.startswith("cpu ")).split()[1:]
+        counters = [int(value) for value in fields]
+        total = sum(counters)
+        used = total - counters[3]
+        percent = round(100 * used / max(total, 1), 1)
+    except (OSError, ValueError, IndexError, StopIteration):
+        percent = 0.0
+    return {"logical": max(os.cpu_count() or 1, 1), "used_percent": percent}
+
+
+def _boot_time(root: Path) -> int:
+    try:
+        line = next(line for line in (root / "proc/stat").read_text().splitlines() if line.startswith("btime "))
+        return max(int(line.split()[1]), 0)
+    except (OSError, ValueError, IndexError, StopIteration):
+        return 0
+
+
+def _controller_status(run: Runner, name: str, controller: str, maximum: int) -> tuple[dict[str, int], str]:
+    result = run(["docker", "exec", name, "cat", "/run/ci-fleet/status.json"])
+    try:
+        value = json.loads(result.stdout) if result.returncode == 0 else {}
+        current, busy, reported_max = (value[key] for key in ("current", "busy", "maximum"))
+        version = value["software_version"]
+        valid = (
+            value.get("controller") == controller
+            and all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in (current, busy, reported_max))
+            and busy <= current <= reported_max == maximum
+            and isinstance(version, str)
+            and bool(re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", version))
+        )
+        if valid:
+            return {"current": current, "busy": busy, "maximum": reported_max}, version
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {"current": 0, "busy": 0, "maximum": maximum}, "unknown"
 
 
 def _memory_pressure(root: Path) -> float | None:
@@ -309,13 +427,14 @@ def _backup_state(values: dict[str, str], run: Runner) -> str:
     return "ok" if run([str(path)]).returncode == 0 else "failed"
 
 
-def _reconcile_state(path: Path) -> dict[str, str]:
+def _reconcile_state(path: Path) -> dict[str, Any]:
+    empty = {"status": "missing", "desired_commit": "", "applied_commit": "", "health": "", "last_success_at": None}
     try:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"status": "missing", "desired_commit": "", "applied_commit": "", "health": ""}
+        return empty
     if not isinstance(value, dict):
-        return {"status": "invalid", "desired_commit": "", "applied_commit": "", "health": ""}
+        return {**empty, "status": "invalid"}
     status = value.get("status", "")
     if not isinstance(status, str) or status not in {"converged", "drift", "invalid", "pending", "reconciling", "rolled_back", "failed"}:
         status = "invalid"
@@ -324,15 +443,23 @@ def _reconcile_state(path: Path) -> dict[str, str]:
     reported_health = value.get("health", "")
     if not isinstance(reported_health, str) or reported_health not in {"", "healthy", "warning", "unhealthy", "maintenance", "drift", "unknown"}:
         reported_health = "invalid"
-    return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health}
+    last_success = value.get("last_success_at")
+    if not isinstance(last_success, int) or isinstance(last_success, bool) or last_success < 0:
+        last_success = None
+    return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health, "last_success_at": last_success}
 
 
 def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Runner = _run) -> dict[str, Any]:
     docker_root = values.get("CI_FLEET_DOCKER_ROOT", "/var/lib/docker")
     available, swap = _memory(root)
+    memory, swap_metrics = _memory_details(root)
+    loads = os.getloadavg()
     docker_ok = run(["docker", "info"]).returncode == 0
     controller_name = values.get("CI_FLEET_CONTROLLER_CONTAINER", "ci-fleet-controller-1")
+    instance = values.get("CI_FLEET_INSTANCE", "unknown")
+    configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     controller, effective = _container(run, controller_name) if docker_ok else ({"state": "missing", "restart_count": 0, "oom_killed": False}, {"min": 0, "max": 0})
+    runners, software_version = _controller_status(run, controller_name, instance, configured["max"]) if docker_ok else ({"current": 0, "busy": 0, "maximum": configured["max"]}, "unknown")
     managed = {"running": 0, "inactive": 0, "unhealthy": 0, "restarting": 0}
     if docker_ok:
         result = run(["docker", "ps", "-a", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true", "--format", "{{json .}}"])
@@ -346,7 +473,6 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["unhealthy"] += int("unhealthy" in status)
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
-    configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
@@ -370,7 +496,6 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         # ponytail: activation validates unit installation separately; scheduled runs verify maintenance state after commit.
         timers = {name: "ok" for name in timers}
         services = {name: "ok" for name in services}
-    instance = values.get("CI_FLEET_INSTANCE", "unknown")
     stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0}
     stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"]) if docker_ok else 0
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
@@ -378,8 +503,16 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "controller_id": instance,
         "desired_state": values.get("CI_FLEET_CONTROLLER_STATE", "active"),
         "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
+        "cpu": _cpu(root),
+        "memory": memory,
+        "swap": swap_metrics,
+        "load": {"one": loads[0], "five": loads[1], "fifteen": loads[2]},
+        "boot_time": _boot_time(root),
+        "ssh": _ssh_state(run),
+        "software_version": software_version if software_version != "unknown" else values.get("CI_FLEET_ENGINE_REF", "unknown"),
+        "runners": runners,
         "memory_available_percent": available,
-        "load_per_cpu": os.getloadavg()[2] / max(os.cpu_count() or 1, 1),
+        "load_per_cpu": loads[2] / max(os.cpu_count() or 1, 1),
         "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,
         "recent_oom": oom.returncode == 0 and bool(oom.stdout.strip()),
         "docker_available": docker_ok,
@@ -425,26 +558,46 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _send_heartbeat(values: dict[str, str], report: dict[str, Any]) -> int:
-    url = values.get("CI_FLEET_HEALTH_HEARTBEAT_URL")
+def _send_status(
+    values: dict[str, str],
+    report: dict[str, Any],
+    *,
+    now: int | None = None,
+    nonce: str | None = None,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> int:
+    url = values.get("CI_FLEET_HEALTH_STATUS_URL")
     if not url:
         return 0
-    if not url.startswith("https://"):
-        return 2
-    headers = {"Content-Type": "application/json"}
-    token_file = values.get("CI_FLEET_HEALTH_HEARTBEAT_TOKEN_FILE")
-    if token_file:
-        path = Path(token_file)
-        try:
-            info = path.stat()
-            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
-                return 2
-            headers["Authorization"] = f"Bearer {path.read_text().strip()}"
-        except OSError:
-            return 2
-    request = urllib.request.Request(url, data=json.dumps(report).encode(), headers=headers, method="POST")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path != "/v1/status" or parsed.query or parsed.fragment:
+        return 1
+    key_file = values.get("CI_FLEET_HEALTH_STATUS_KEY_FILE")
+    if not key_file:
+        return 1
+    path = Path(key_file)
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        info = path.stat()
+        expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+        if info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) & 0o077:
+            return 1
+        key = path.read_bytes().strip()
+    except OSError:
+        return 1
+    if not 32 <= len(key) <= 128:
+        return 1
+    body = json.dumps(report, separators=(",", ":"), sort_keys=True).encode()
+    if len(body) > 32_768:
+        return 1
+    generated_at = int(now if now is not None else time.time())
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=sign_headers(report["controller"]["id"], body, key, timestamp=generated_at, nonce=nonce or secrets.token_hex(16)),
+        method="POST",
+    )
+    try:
+        with opener(request, timeout=10) as response:
             return 0 if 200 <= response.status < 300 else 1
     except OSError:
         return 1
@@ -453,14 +606,15 @@ def _send_heartbeat(values: dict[str, str], report: dict[str, Any]) -> int:
 def _local(args: argparse.Namespace) -> int:
     values = dict(os.environ)
     values.update(load_monitoring_config(args.monitoring_config))
-    report = evaluate(collect_snapshot(values), thresholds_from(values))
-    report["timestamp"] = int(time.time())
-    heartbeat = _send_heartbeat(values, report)
-    if heartbeat:
-        severity = "critical" if heartbeat == 2 else "warning"
-        report["checks"].append({"id": "heartbeat_delivery", "status": severity})
-        if heartbeat > report["exit_code"]:
-            report["status"], report["exit_code"] = ("warning", 1) if heartbeat == 1 else ("unhealthy", 2)
+    snapshot = collect_snapshot(values)
+    report = evaluate(snapshot, thresholds_from(values))
+    now = int(time.time())
+    report["timestamp"] = now
+    delivery = _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
+    if delivery:
+        report["checks"].append({"id": "status_delivery", "status": "warning"})
+        if report["exit_code"] == 0:
+            report["status"], report["exit_code"] = "warning", 1
     _write_report(args.output, report)
     print(json.dumps(report, sort_keys=True) if args.json else render_human(report))
     return int(report["exit_code"])

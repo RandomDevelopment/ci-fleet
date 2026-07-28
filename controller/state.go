@@ -13,9 +13,14 @@ func newRunnerState() runnerState {
 }
 
 func (r *runnerState) count() int {
+	current, _ := r.counts()
+	return current
+}
+
+func (r *runnerState) counts() (int, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.idle) + len(r.busy)
+	return len(r.idle) + len(r.busy), len(r.busy)
 }
 
 func (r *runnerState) addIdle(name, id string) {

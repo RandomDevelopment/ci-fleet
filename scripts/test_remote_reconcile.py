@@ -226,6 +226,16 @@ class TestRemoteReconcile(unittest.TestCase):
         # Should exist even on failure
         self.assertTrue(state_path.exists() or result.returncode != 0)
 
+    def test_reconcile_failure_preserves_last_success_timestamp(self):
+        state_path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "status": "converged", "desired_commit": "0" * 40, "applied_commit": "0" * 40,
+            "health": "healthy", "message": "ok", "checked_at": 777, "last_success_at": 777,
+        }))
+        subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
+        self.assertEqual(json.loads(state_path.read_text())["last_success_at"], 777)
+
     def test_validate_schema_output_no_secrets(self):
         """Sanitized log output must not contain actual key material or token values."""
         result = subprocess.run(

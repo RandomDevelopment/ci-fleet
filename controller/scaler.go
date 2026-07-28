@@ -30,6 +30,7 @@ type Scaler struct {
 }
 
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+	defer s.writeStatus()
 	current := s.runners.count()
 	target := min(s.config.MaxRunners, s.config.MinRunners+count)
 	for i := current; i < target; i++ {
@@ -44,6 +45,7 @@ func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) e
 	if !s.runners.markBusy(job.RunnerName) {
 		return fmt.Errorf("job started for unknown runner %q", job.RunnerName)
 	}
+	s.writeStatus()
 	s.logger.Info("job started", "runner", job.RunnerName, "jobID", job.JobID)
 	return nil
 }
@@ -53,6 +55,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobComple
 	if !ok {
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
+	s.writeStatus()
 	s.logger.Info("job completed", "runner", job.RunnerName, "jobID", job.JobID)
 	return s.logAndRemove(ctx, job.RunnerName, id)
 }
@@ -129,6 +132,7 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
 }
 
 func (s *Scaler) shutdown(ctx context.Context) {
+	defer s.writeStatus()
 	for name, id := range s.runners.drain() {
 		if err := s.logAndRemove(ctx, name, id); err != nil {
 			s.logger.Error("runner shutdown failed", slog.String("runner", name), slog.String("error", err.Error()))
