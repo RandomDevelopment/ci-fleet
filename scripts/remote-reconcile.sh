@@ -398,12 +398,11 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
       exit 0
     fi
   fi
-  # Drift or inaccessibility — fall through to reconcile
-  note "DRIFT detected, attempting reconcile"
-  if [[ "$mode" == check-only ]]; then
-    save_reconcile_state 'drift' "$desired_commit" "$installed_config_ref" 'drift' "drift detected"
-    exit 3
-  fi
+  # Same commit + drift = internal state mismatch on an already-converged ref.
+  # The drift timer handles this. Don't re-reconcile the same commit.
+  note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
+  save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'drift' 'no commit change; internal drift tracked by drift timer'
+  exit 0
 fi
 
 # New commit or drift — validate and reconcile
