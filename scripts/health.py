@@ -367,8 +367,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)
         services["updates"] = _unit_state(run, "apt-daily-upgrade.service")
     if values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
-        # ponytail: activation validates unit installation separately; scheduled runs verify live timers after enablement.
+        # ponytail: activation validates unit installation separately; scheduled runs verify maintenance state after commit.
         timers = {name: "ok" for name in timers}
+        services = {name: "ok" for name in services}
     instance = values.get("CI_FLEET_INSTANCE", "unknown")
     stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0}
     stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"]) if docker_ok else 0
