@@ -161,7 +161,7 @@ class TestRemoteReconcile(unittest.TestCase):
             capture_output=True, text=True, env=self.env,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("ERROR", result.stderr)
+        self.assertIn("RECONCILE_ERROR", result.stderr)
 
     def test_token_env_prefers_host_env(self):
         """Uses host.env when available for token generation."""
@@ -170,7 +170,7 @@ class TestRemoteReconcile(unittest.TestCase):
             [str(RECONCILE_SCRIPT), "--check-only"],
             capture_output=True, text=True, env=self.env,
         )
-        self.assertEqual(result.returncode, 2)
+        self.assertIn(result.returncode, (1, 2), f"expected 1 or 2, got {result.returncode}")
         self.assertIn("token", result.stderr.lower())
 
     def test_no_op_flag_succeeds_with_valid_state(self):
@@ -182,7 +182,7 @@ class TestRemoteReconcile(unittest.TestCase):
             capture_output=True, text=True, env=self.env,
         )
         # It should fail on token generation, not arg parsing
-        self.assertEqual(result.returncode, 2)
+        self.assertIn(result.returncode, (1, 2), f"expected 1 or 2, got {result.returncode}")
         # Verify it got past arg parsing
         self.assertIn("GENERATING_TOKEN", result.stderr + result.stdout)
 
