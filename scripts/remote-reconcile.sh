@@ -304,7 +304,7 @@ run_health_check() {
     # shellcheck disable=SC1090
     [[ ! -f "$rendered_env" ]] || . "$rendered_env"
     set +a
-    python3 "$repo_root/scripts/health.py" local --output "$output" 2>/dev/null
+    python3 "$repo_root/scripts/health.py" local --output "$output" >/dev/null 2>&1
   ) || true
   python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
 }
