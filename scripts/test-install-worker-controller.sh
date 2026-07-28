@@ -319,7 +319,7 @@ expect_success env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALL
 remote_reconciler=$tmp/fake-remote-reconciler
 remote_reconciler_log=$tmp/fake-remote-reconciler.log
 # shellcheck disable=SC2016
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >"$REMOTE_RECONCILER_LOG"\n' >"$remote_reconciler"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n%%s\\n" "$*" "$CI_FLEET_REMOTE_STATE_FILE" >"$REMOTE_RECONCILER_LOG"\n' >"$remote_reconciler"
 chmod 0755 "$remote_reconciler"
 python3 - "$install_state" <<'PY'
 import json, sys
@@ -330,7 +330,8 @@ with open(path, "w") as output:
     json.dump(state, output)
 PY
 expect_success env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" CI_FLEET_REMOTE_RECONCILER="$remote_reconciler" REMOTE_RECONCILER_LOG="$remote_reconciler_log" "$repo_root/scripts/check-installed-state.sh"
-[[ $(<"$remote_reconciler_log") == --check-only ]] || fail 'remote drift check did not delegate to authenticated reconciliation'
+mapfile -t remote_call <"$remote_reconciler_log"
+[[ ${remote_call[0]} == "--check-only --desired-ref $ref_one" && ${remote_call[1]} == "$install_state" ]] || fail 'remote drift check did not delegate the exact installed state to authenticated reconciliation'
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 export FAKE_DISABLED_TIMER=ci-fleet-cleanup.timer
