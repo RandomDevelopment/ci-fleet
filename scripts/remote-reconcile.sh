@@ -74,19 +74,32 @@ require_commands() {
 # --- State persistence ---
 
 save_reconcile_state() {
-  local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-}
+  local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-} mark_success=${6:-false}
   install -d -m 0700 "$reconcile_state_dir"
-  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" <<'PY' 2>/dev/null || true
+  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile
 
 path = sys.argv[1]
+now = int(__import__("time").time())
+try:
+    previous = json.load(open(path, encoding="utf-8"))
+    if not isinstance(previous, dict):
+        raise ValueError("reconciliation state must be an object")
+    last_success_at = previous.get("last_success_at")
+    if not isinstance(last_success_at, int) or last_success_at < 0:
+        last_success_at = None
+except (OSError, ValueError, TypeError):
+    last_success_at = None
+if sys.argv[7] == "true":
+    last_success_at = now
 state = {
     "status": sys.argv[2],
     "desired_commit": sys.argv[3] or "",
     "applied_commit": sys.argv[4] or "",
     "health": sys.argv[5] or "",
     "message": sys.argv[6] or "",
-    "checked_at": int(__import__("time").time()),
+    "checked_at": now,
+    "last_success_at": last_success_at,
 }
 fd, tmp = tempfile.mkstemp(prefix=".reconcile-state.", dir=os.path.dirname(path), text=True)
 try:
@@ -310,6 +323,7 @@ run_health_check() {
     # shellcheck disable=SC1090
     [[ ! -f "$rendered_env" ]] || . "$rendered_env"
     set +a
+    export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1
     python3 "$repo_root/scripts/health.py" local --output "$output" >/dev/null 2>&1
   ) || true
   python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
@@ -387,7 +401,7 @@ if [[ "$desired_commit" == "$installed_config_ref" ]]; then
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
       note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged'
+      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged' true
       exit 0
     fi
   fi
@@ -451,7 +465,7 @@ if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
   health_status=$(run_health_check "$temp_dir/health.json")
 
-  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}"
+  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else

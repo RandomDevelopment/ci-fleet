@@ -226,6 +226,39 @@ class TestRemoteReconcile(unittest.TestCase):
         # Should exist even on failure
         self.assertTrue(state_path.exists() or result.returncode != 0)
 
+    def test_reconcile_failure_preserves_last_success_timestamp(self):
+        state_path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "status": "converged", "desired_commit": "0" * 40, "applied_commit": "0" * 40,
+            "health": "healthy", "message": "ok", "checked_at": 777, "last_success_at": 777,
+        }))
+        subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
+        self.assertEqual(json.loads(state_path.read_text())["last_success_at"], 777)
+
+    def test_non_object_reconcile_state_is_recovered(self):
+        state_path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("[]\n")
+        subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
+        state = json.loads(state_path.read_text())
+        self.assertIsInstance(state, dict)
+        self.assertIsNone(state["last_success_at"])
+
+    def test_reconciliation_health_probe_suppresses_delivery(self):
+        content = RECONCILE_SCRIPT.read_text()
+        probe = content.split("run_health_check()", 1)[1].split("}", 1)[0]
+        self.assertIn("export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1", probe)
+
+    def test_no_op_does_not_advance_last_success_timestamp(self):
+        content = RECONCILE_SCRIPT.read_text()
+        no_op = content.split('if [[ "$no_op" == true ]]; then', 2)[2].split("exit 0", 1)[0]
+        self.assertNotIn("'no change, converged' true", no_op)
+        self.assertIn('if sys.argv[7] == "true":', content)
+        self.assertEqual(content.count("save_reconcile_state 'converged'"), 4)
+        self.assertEqual(content.count("'no change, converged' true"), 1)
+        self.assertEqual(content.count('"reconciled to ${desired_commit}" true'), 1)
+
     def test_validate_schema_output_no_secrets(self):
         """Sanitized log output must not contain actual key material or token values."""
         result = subprocess.run(

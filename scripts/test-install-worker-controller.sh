@@ -5,6 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 health_timer=$repo_root/host/systemd/ci-fleet-health.timer
 grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lacks activation-relative initial trigger\n' >&2; exit 1; }
 ! grep -Fq 'OnBootSec=' "$health_timer" || { printf 'FAIL: health timer initial trigger is boot-relative\n' >&2; exit 1; }
+grep -Fq 'export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1' "$repo_root/scripts/install-worker-controller.sh" || { printf 'FAIL: installer health check can submit monitoring reports\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fake_bin=$tmp/bin
@@ -488,12 +489,15 @@ expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/n
 [[ $(stat -c '%i' "$active_release") == "$complete_release_inode" ]] || fail 'complete immutable release was replaced instead of reused'
 
 warning_ref=$(write_config active 1 2)
-printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=0\n' >"$root/etc/ci-fleet/monitoring.env"
+printf '%s\n' \
+  'CI_FLEET_HEALTH_DISK_WARN_PERCENT=0' \
+  'CI_FLEET_HEALTH_STATUS_URL=https://status.example.invalid/v1/status' >"$root/etc/ci-fleet/monitoring.env"
 chmod 600 "$root/etc/ci-fleet/monitoring.env"
 warning_output=$tmp/warning-upgrade.out
 "$installer" --upgrade "${base_args[@]}" --ref "$warning_ref" >"$warning_output" 2>&1
 warning_upgrade=$(<"$warning_output")
 grep -Fq 'WARNING disk_root' <<<"$warning_upgrade" || fail 'warning health fixture did not produce a warning result'
+if grep -Fq 'WARNING status_delivery' <<<"$warning_upgrade"; then fail 'ad-hoc reconciliation health check submitted duplicate status'; fi
 grep -Fq 'CONVERGED mode=upgrade' <<<"$warning_upgrade" || fail 'warning health result did not report convergence'
 grep -Fq "CI_FLEET_CONFIG_REF=$warning_ref" "$root/etc/ci-fleet/ci-fleet.env" || fail 'warning health result rolled back an otherwise healthy activation'
 rm -f "$root/etc/ci-fleet/monitoring.env"
@@ -603,6 +607,7 @@ chmod 600 "$adopt_pem"
 cp "$repo_root/deploy/compose.yaml" "$adopt_root/opt/ci-fleet/deploy/compose.yaml"
 cp "$repo_root/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh"
 cp "$repo_root/scripts/health.py" "$adopt_root/opt/ci-fleet/scripts/health.py"
+cp "$repo_root/scripts/status_auth.py" "$adopt_root/opt/ci-fleet/scripts/status_auth.py"
 cp "$repo_root/scripts/cleanup.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
 chmod 0755 "$adopt_root/opt/ci-fleet/scripts/healthcheck.sh" "$adopt_root/opt/ci-fleet/scripts/cleanup.sh"
 printf '%s\n' \

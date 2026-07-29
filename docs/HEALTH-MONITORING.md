@@ -21,7 +21,7 @@ The check covers:
 - cleanup, drift, health, and update services/timers;
 - failed package state, pending reboot, and clock synchronization;
 - an optional host-local backup check;
-- optional outbound heartbeat delivery.
+- optional authenticated outbound status delivery.
 
 It reports but never prunes, restarts, or repairs resources. Project source, logs, environment values, tokens, and private keys are never included.
 
@@ -44,25 +44,19 @@ CI_FLEET_HEALTH_LOAD_WARN_PER_CPU=1.0
 CI_FLEET_HEALTH_LOAD_CRITICAL_PER_CPU=1.5
 CI_FLEET_HEALTH_RESTART_WARN_COUNT=3
 CI_FLEET_HEALTH_BACKUP_CHECK=/usr/local/sbin/ci-fleet-backup-check
-CI_FLEET_HEALTH_HEARTBEAT_URL=https://monitor.example.invalid/heartbeat
-CI_FLEET_HEALTH_HEARTBEAT_TOKEN_FILE=/etc/ci-fleet/secrets/heartbeat-token
+CI_FLEET_HEALTH_STATUS_URL=https://status.example.invalid/v1/status
+CI_FLEET_HEALTH_STATUS_KEY_FILE=/etc/ci-fleet/secrets/status-reporting.key
 ```
 
-The backup hook must be an absolute, executable, root-owned file that is not group- or world-writable. Its output is discarded; only its exit status is reported. The heartbeat URL must use HTTPS. An optional token file must be root-owned and inaccessible to group/other users. The installer never creates, prints, commits, or removes this host-local file or its credentials, so rollback preserves them.
+The backup hook must be an absolute, executable, root-owned file that is not group- or world-writable. Its output is discarded; only its exit status is reported. Status delivery requires HTTPS and a unique 32-128 byte root-owned key file with mode `0600`. The installer never creates, prints, commits, or removes host-local monitoring credentials, so rollback preserves them. Delivery failures are warnings and never block runners or reconciliation.
 
-## External missed-heartbeat detection
+See [authenticated controller status reporting](STATUS-REPORTING.md) for the v1 schema, request authentication, receiver, retention, API, and threat model.
 
-A receiver accepts the redacted JSON POST and stores the most recent body as `<controller-id>.json`. Receiver implementation, endpoint, credential, address, and alert destination are provider-local. The external monitor evaluates those files against reviewed desired state:
+## External missed-report detection
 
-```bash
-python3 scripts/health.py heartbeats \
-  --config /srv/private-desired-state/fleet.json \
-  --input-dir /var/lib/ci-fleet-heartbeats \
-  --grace-seconds 900 \
-  --json
-```
+The authenticated receiver stores each controller's `generated_at` and returns it through the read-only API. An external monitor compares the latest report with reviewed desired controller inventory and treats an active controller with no report inside the grace period as unhealthy. Drained or disabled lifecycle state remains a desired-state decision, not something an absent controller can assert.
 
-An active host with no fresh record is unhealthy. A drained host reports maintenance without a false alarm; a disabled host reports retired. A monitoring outage therefore cannot silently turn missing hosts healthy.
+The legacy file-based `health.py heartbeats` evaluator remains available for existing integrations, but new deployments should consume the authenticated API described in [STATUS-REPORTING.md](STATUS-REPORTING.md). During upgrade, a configured legacy heartbeat continues until `CI_FLEET_HEALTH_STATUS_URL` is present; provision and verify the authenticated receiver before removing the legacy settings.
 
 ## Operations
 

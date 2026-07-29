@@ -27,6 +27,7 @@ type Config struct {
 	RunnerMemory    int64
 	DockerGID       string
 	RunnerTTL       time.Duration
+	StatusFile      string
 }
 
 func configFromEnv() (Config, error) {
@@ -85,6 +86,7 @@ func configFromEnv() (Config, error) {
 		RunnerMemory: runnerMemoryMiB * 1024 * 1024,
 		DockerGID:    os.Getenv("CI_FLEET_DOCKER_GID"),
 		RunnerTTL:    runnerTTL,
+		StatusFile:   getenv("CI_FLEET_STATUS_FILE", "/run/ci-fleet/status.json"),
 	}
 	return cfg, cfg.Validate()
 }
