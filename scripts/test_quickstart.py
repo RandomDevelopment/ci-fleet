@@ -39,13 +39,16 @@ rotation = re.search(
 assert rotation and rotation[1] != rotation[2], "rotation destination must differ from active PEM"
 
 transfer = app_setup[
-    app_setup.index('[[ "$PEM_DEST" =~') : app_setup.index(
+    app_setup.index("valid_pem_path() {") : app_setup.index(
         "Use an equivalent privileged SSH workflow"
     )
 ]
 active_guard = '[[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]'
 noclobber_line = next(line for line in transfer.splitlines() if "set -C && cat >" in line)
 assert '"$PEM_DEST"' in noclobber_line
+assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
+assert 'install -d -m 0700 "\'"$PEM_DIR"\'"' in transfer
+assert "^/[A-Za-z0-9._/-]+\\.pem$" in transfer
 assert active_guard in transfer
 assert transfer.index(active_guard) < transfer.index('ssh "$CONTROLLER"')
 for command in ("cat >", "sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
@@ -53,15 +56,23 @@ for command in ("cat >", "sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
         f"transfer does not use configured destination: {command}"
     )
 
-success_branch, failure_branch = transfer.split("else", 1)
+verification = transfer[transfer.index('if\nssh "$CONTROLLER"') : transfer.index("then\n  if rm")]
 for check in (
     'test "$local_sha" = "$remote_sha" &&\n',
     "= 'root:root'\" &&\n",
-    "= '600'\"\nthen",
+    "= '600'\"\n",
 ):
-    assert check in success_branch, f"download deletion is not gated by: {check}"
-    assert success_branch.index(check) < success_branch.index('rm -f -- "$PEM"')
-assert 'rm -f -- "$PEM"' not in failure_branch
+    assert check in verification, f"download deletion is not gated by: {check}"
+
+delete_download = transfer[
+    transfer.index('if rm -f -- "$PEM"; then') : transfer.index(
+        "else\n  printf 'transfer verification failed"
+    )
+]
+delete_success, delete_failure = delete_download.split("else", 1)
+assert "unset PEM" in delete_success
+assert '"$PEM" >&2' in delete_failure and "exit 1" in delete_failure
+assert 'rm -f -- "$PEM"' not in transfer[transfer.index("transfer verification failed") :]
 
 for use in (
     "exact value of `PEM_DEST`",
@@ -79,18 +90,22 @@ validate_paths = 'for pem in "$PEM_DEST" "$ACTIVE_PEM"; do'
 distinct_paths = '[[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$ACTIVE_PEM"'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
+assert "^/[A-Za-z0-9._/-]+\\.pem$" in revocation
 assert revocation.index(read_destination) < revocation.index(validate_paths)
 assert revocation.index(validate_paths) < revocation.index(distinct_paths)
 assert revocation.index(distinct_paths) < revocation.index(remove_old_pem)
 
 retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
-validate_paths = '[[ "$pem" =~ ^/etc/ci-fleet/secrets/'
-uninstall = "scripts/install-worker-controller.sh \\\n     --uninstall"
-remove_pem = 'sudo rm -f -- "$pem"'
-remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env"
+validate_paths = 'valid_pem_path "$pem" || exit 1'
+uninstall = "scripts/install-worker-controller.sh \\\n        --uninstall &&"
+remove_pem = 'sudo rm -f -- "$pem" || return 1'
+remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env; then"
 assert 'RETIRED_PEMS=("$PEM_DEST")' in retirement
+assert "^/[A-Za-z0-9._/-]+\\.pem$" in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
-assert retirement.index(validate_paths) < retirement.index(uninstall)
-assert retirement.index(uninstall) < retirement.index(remove_pem)
-assert retirement.index(remove_pem) < retirement.index(remove_host_env)
+assert remove_pem in retirement
+assert retirement.index(uninstall) < retirement.index("remove_retired_pems &&")
+assert retirement.index("remove_retired_pems &&") < retirement.index(remove_host_env)
+retirement_failure = retirement[retirement.index("retirement cleanup failed") :]
+assert "path inventory and host.env" in retirement_failure and "exit 1" in retirement_failure
 print("documentation_contract=PASS")

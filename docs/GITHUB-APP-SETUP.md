@@ -78,15 +78,22 @@ rotation guard rejects the active path, and shell noclobber prevents replacing
 any existing file:
 
 ```bash
-[[ "$PEM_DEST" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+valid_pem_path() {
+  [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+     ! $1 =~ (^|/)\.\.?(/|$) ]]
+}
+valid_pem_path "$PEM_DEST" || exit 1
 if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
   printf 'refusing to overwrite active PEM: %s\n' "$ACTIVE_PEM" >&2
   exit 1
 fi
+PEM_DIR=${PEM_DEST%/*}
 
+# PEM_DEST is validated above and intentionally expanded client-side.
+# shellcheck disable=SC2029
 if
 ssh "$CONTROLLER" \
-  'install -d -m 0700 /etc/ci-fleet/secrets &&
+  'install -d -m 0700 "'"$PEM_DIR"'" &&
    umask 077 && set -C && cat > "'"$PEM_DEST"'" &&
    chown root:root "'"$PEM_DEST"'" &&
    chmod 0600 "'"$PEM_DEST"'"' <"$PEM" &&
@@ -99,8 +106,13 @@ ssh "$CONTROLLER" \
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
 then
-  rm -f -- "$PEM"
-  unset PEM local_sha remote_sha
+  if rm -f -- "$PEM"; then
+    unset PEM local_sha remote_sha
+  else
+    printf 'verified transfer, but could not delete downloaded PEM: %s\n' \
+      "$PEM" >&2
+    exit 1
+  fi
 else
   printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
   unset local_sha remote_sha
@@ -232,11 +244,15 @@ Only after every activation check above succeeds:
    use a broad wildcard in a shared secrets directory:
 
    ```bash
+   valid_pem_path() {
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+        ! $1 =~ (^|/)\.\.?(/|$) ]]
+   }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
    for pem in "$PEM_DEST" "$ACTIVE_PEM"; do
-     [[ "$pem" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+     valid_pem_path "$pem" || exit 1
    done
    [[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1
    sudo rm -f -- "$ACTIVE_PEM"
@@ -260,21 +276,33 @@ Retirement is not complete when only the App installation is removed:
    `/etc/ci-fleet/secrets`:
 
    ```bash
+   valid_pem_path() {
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+        ! $1 =~ (^|/)\.\.?(/|$) ]]
+   }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    RETIRED_PEMS=("$PEM_DEST")
    # Repeat for every retained old rotation path; never use a wildcard.
    RETIRED_PEMS+=("/etc/ci-fleet/secrets/OLD-ROTATION-ID.pem")
    for pem in "${RETIRED_PEMS[@]}"; do
-     [[ "$pem" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+     valid_pem_path "$pem" || exit 1
    done
 
-   sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
-     --uninstall
-   for pem in "${RETIRED_PEMS[@]}"; do
-     sudo rm -f -- "$pem"
-   done
-   sudo rm -f -- /etc/ci-fleet/host.env
+   remove_retired_pems() {
+     for pem in "${RETIRED_PEMS[@]}"; do
+       sudo rm -f -- "$pem" || return 1
+     done
+   }
+   if sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
+        --uninstall &&
+      remove_retired_pems &&
+      sudo rm -f -- /etc/ci-fleet/host.env; then
+     unset PEM_DEST RETIRED_PEMS
+   else
+     printf 'retirement cleanup failed; retained path inventory and host.env\n' >&2
+     exit 1
+   fi
    ```
 
    Replace or repeat the example old path for every exact rotation path used by
