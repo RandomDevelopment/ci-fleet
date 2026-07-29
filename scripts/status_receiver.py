@@ -352,6 +352,10 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
         def log_message(self, format: str, *args: Any) -> None:
             pass
 
+    if ipaddress.ip_address(bind).version == 6:
+        class IPv6Server(_BoundedHTTPServer):
+            address_family = socket.AF_INET6
+        return IPv6Server((bind, port), Handler)
     return _BoundedHTTPServer((bind, port), Handler)
 
 

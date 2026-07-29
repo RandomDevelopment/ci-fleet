@@ -137,6 +137,8 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     controller_state = snapshot["controller"]["state"]
     controller_ok = controller_state == "running" if desired == "active" else controller_state in {"missing", "exited", "created"}
     add("controller", "ok" if controller_ok else "critical", state=controller_state, desired_state=desired)
+    status_expected = desired == "active" and controller_state == "running"
+    add("controller_status", "warning" if status_expected and not snapshot.get("controller_status_valid", True) else "ok")
     restarts = snapshot["controller"]["restart_count"]
     add("restarts", "warning" if restarts >= thresholds.restart_warn_count else "ok", count=restarts)
 
@@ -205,6 +207,9 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         process_state = "unknown"
     commits = [reconciliation.get(name, "") for name in ("desired_commit", "applied_commit")]
     commits = [commit if isinstance(commit, str) and (not commit or re.fullmatch(r"[0-9a-f]{40}", commit)) else "" for commit in commits]
+    last_success = reconciliation.get("last_success_at")
+    if not isinstance(last_success, int) or isinstance(last_success, bool) or last_success > generated_at:
+        last_success = None
     return {
         "schema_version": 1,
         "controller": {
@@ -217,7 +222,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
             "desired_commit": commits[0],
             "applied_commit": commits[1],
         },
-        "reconciliation": {"state": state, "last_success_at": reconciliation.get("last_success_at")},
+        "reconciliation": {"state": state, "last_success_at": last_success},
         "drift": {"state": snapshot.get("services", {}).get("drift", "unknown")},
         "process": {
             "state": process_state,
@@ -392,7 +397,7 @@ def _boot_time(root: Path) -> int:
         return 0
 
 
-def _controller_status(run: Runner, name: str, controller: str, maximum: int) -> tuple[dict[str, int], str]:
+def _controller_status(run: Runner, name: str, controller: str, maximum: int) -> tuple[dict[str, int], str, bool]:
     result = run(["docker", "exec", name, "cat", "/run/ci-fleet/status.json"])
     try:
         value = json.loads(result.stdout) if result.returncode == 0 else {}
@@ -409,10 +414,10 @@ def _controller_status(run: Runner, name: str, controller: str, maximum: int) ->
             and abs(int(time.time()) - generated_at) <= 120
         )
         if valid:
-            return {"current": current, "busy": busy, "maximum": reported_max}, version
+            return {"current": current, "busy": busy, "maximum": reported_max}, version, True
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         pass
-    return {"current": 0, "busy": 0, "maximum": maximum}, "unknown"
+    return {"current": 0, "busy": 0, "maximum": maximum}, "unknown", False
 
 
 def _memory_pressure(root: Path) -> float | None:
@@ -472,7 +477,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     instance = values.get("CI_FLEET_INSTANCE", "unknown")
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     controller, effective = _container(run, controller_name) if docker_ok else ({"state": "missing", "restart_count": 0, "oom_killed": False}, {"min": 0, "max": 0})
-    runners, software_version = _controller_status(run, controller_name, instance, configured["max"]) if docker_ok else ({"current": 0, "busy": 0, "maximum": configured["max"]}, "unknown")
+    runners, software_version, controller_status_valid = _controller_status(run, controller_name, instance, configured["max"]) if docker_ok else ({"current": 0, "busy": 0, "maximum": configured["max"]}, "unknown", False)
     managed = {"running": 0, "inactive": 0, "unhealthy": 0, "restarting": 0}
     if docker_ok:
         result = run(["docker", "ps", "-a", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true", "--format", "{{json .}}"])
@@ -524,6 +529,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "ssh": _ssh_state(run),
         "software_version": software_version if software_version != "unknown" else values.get("CI_FLEET_ENGINE_REF", "unknown"),
         "runners": runners,
+        "controller_status_valid": controller_status_valid,
         "memory_available_percent": available,
         "load_per_cpu": loads[2] / max(os.cpu_count() or 1, 1),
         "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,

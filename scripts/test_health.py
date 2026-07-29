@@ -244,7 +244,14 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(snapshot["swap"], {"total_bytes": 524288, "used_bytes": 131072})
             self.assertAlmostEqual(snapshot["cpu"]["used_percent"], 20.0)
             generated_at[0] -= 121
-            self.assertEqual(health._controller_status(run, "controller", "example-ci-01", 6), ({"current": 0, "busy": 0, "maximum": 6}, "unknown"))
+            self.assertEqual(health._controller_status(run, "controller", "example-ci-01", 6), ({"current": 0, "busy": 0, "maximum": 6}, "unknown", False))
+            stale = health.collect_snapshot({
+                "CI_FLEET_INSTANCE": "example-ci-01", "CI_FLEET_CONTROLLER_CONTAINER": "controller",
+                "CI_FLEET_MAX_RUNNERS": "6", "CI_FLEET_HEALTH_BOOTSTRAP": "1",
+            }, root=root, run=run)
+            self.assertFalse(stale["controller_status_valid"])
+            stale_report = health.evaluate(stale, health.Thresholds())
+            self.assertEqual(next(check for check in stale_report["checks"] if check["id"] == "controller_status")["status"], "warning")
 
     def test_threshold_overrides_validate_ordering(self) -> None:
         self.assertAlmostEqual(health._timespan_seconds("3d 1h 41min 40.5s"), 265300.5)
@@ -308,6 +315,9 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["runners"], {"current": 1, "busy": 1, "maximum": 6})
         self.assertEqual(report["process"]["state"], "unknown")
         self.assertEqual(report["error"], {"code": "reconciliation_failed", "message": "reconciliation failed"})
+        snapshot["reconciliation"]["last_success_at"] = 1_001
+        future_success = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+        self.assertIsNone(future_success["reconciliation"]["last_success_at"])
         encoded = json.dumps(report)
         self.assertNotIn("SUPER_SECRET", encoded)
         self.assertNotIn("private.invalid", encoded)

@@ -280,6 +280,11 @@ class StatusReceiverTests(unittest.TestCase):
         self.assertTrue(expired.wait(1))
         self.assertEqual(request.how, status_receiver.socket.SHUT_RDWR)
 
+        if status_receiver.socket.has_ipv6:
+            ipv6 = status_receiver.create_server("::1", 0, self.receiver)
+            self.addCleanup(ipv6.server_close)
+            self.assertEqual(ipv6.address_family, status_receiver.socket.AF_INET6)
+
 
 if __name__ == "__main__":
     unittest.main()
