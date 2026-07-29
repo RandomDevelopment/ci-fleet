@@ -115,10 +115,17 @@ class HealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             path.write_text('{"status":[],"health":{},"desired_commit":[],"applied_commit":null}\n')
+            reconciliation = health._reconcile_state(path)
             self.assertEqual(
-                health._reconcile_state(path),
+                reconciliation,
                 {"status": "invalid", "desired_commit": "invalid", "applied_commit": "invalid", "health": "invalid", "last_success_at": None},
             )
+            snapshot = healthy_snapshot()
+            snapshot["controller_id"] = "example-ci-01"
+            snapshot["reconciliation"] = reconciliation
+            report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+            self.assertEqual(report["configuration"], {"desired_commit": "", "applied_commit": ""})
+            self.assertEqual(report["error"]["code"], "reconciliation_invalid")
 
     def test_external_heartbeats_detect_missing_and_stale_active_hosts(self) -> None:
         controllers = {
@@ -206,12 +213,13 @@ class HealthTests(unittest.TestCase):
             (root / "proc").mkdir()
             (root / "proc/stat").write_text("cpu  100 0 50 800 50 0 0 0\nbtime 900\n")
             (root / "proc/meminfo").write_text("MemTotal: 1024 kB\nMemAvailable: 768 kB\nSwapTotal: 512 kB\nSwapFree: 384 kB\n")
+            generated_at = [int(health.time.time())]
 
             def run(args):
                 if args[:3] == ["docker", "exec", "controller"]:
                     return health.subprocess.CompletedProcess(args, 0, json.dumps({
                         "controller": "example-ci-01", "software_version": "1" * 40,
-                        "current": 2, "busy": 1, "maximum": 6,
+                        "current": 2, "busy": 1, "maximum": 6, "generated_at": generated_at[0],
                     }), "")
                 if args[:2] == ["docker", "info"]:
                     return health.subprocess.CompletedProcess(args, 0, "", "")
@@ -235,6 +243,8 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(snapshot["memory"], {"total_bytes": 1048576, "available_bytes": 786432})
             self.assertEqual(snapshot["swap"], {"total_bytes": 524288, "used_bytes": 131072})
             self.assertAlmostEqual(snapshot["cpu"]["used_percent"], 20.0)
+            generated_at[0] -= 121
+            self.assertEqual(health._controller_status(run, "controller", "example-ci-01", 6), ({"current": 0, "busy": 0, "maximum": 6}, "unknown"))
 
     def test_threshold_overrides_validate_ordering(self) -> None:
         self.assertAlmostEqual(health._timespan_seconds("3d 1h 41min 40.5s"), 265300.5)

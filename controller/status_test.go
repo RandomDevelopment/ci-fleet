@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -58,5 +59,26 @@ func TestStatusWritesUsePublicationLock(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("status write did not resume after publication lock")
+	}
+}
+
+func TestStatusPublisherRefreshesIdleSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	scaler := &Scaler{
+		runners: newRunnerState(),
+		logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		config: Config{FleetInstance: "example-ci-01", MaxRunners: 1, StatusFile: path},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go scaler.publishStatus(ctx, time.Millisecond)
+	deadline := time.After(time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil { return }
+		select {
+		case <-deadline:
+			t.Fatal("idle status publisher did not refresh snapshot")
+		case <-time.After(time.Millisecond):
+		}
 	}
 }

@@ -200,6 +200,8 @@ class StatusReceiverTests(unittest.TestCase):
 
         self.submit(valid_report(generated_at=5_000), timestamp=5_000, nonce="e" * 32)
         self.assertEqual([item["generated_at"] for item in self.receiver.history("example-ci-01", "reader-token")], [5_000])
+        latest, history = self.receiver.latest_and_history("example-ci-01", "reader-token")
+        self.assertEqual(latest, history[0])
 
     def test_time_retention_is_enforced_on_read(self) -> None:
         receiver = status_receiver.StatusReceiver(

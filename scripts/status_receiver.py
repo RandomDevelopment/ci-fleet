@@ -228,6 +228,17 @@ class StatusReceiver:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def latest_and_history(self, controller: str, read_token: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        self._authorize_read(read_token)
+        with self._write_lock, self._connect() as connection:
+            self._expire(connection, int(self._clock()))
+            rows = connection.execute(
+                "SELECT payload FROM reports WHERE controller = ? ORDER BY generated_at DESC LIMIT ?",
+                (controller, self.history_limit),
+            ).fetchall()
+        history = [json.loads(row[0]) for row in rows]
+        return (history[0] if history else None), history
+
     def list_latest(self, read_token: str) -> list[dict[str, Any]]:
         self._authorize_read(read_token)
         with self._write_lock, self._connect() as connection:
@@ -326,10 +337,11 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
                     controller = urllib.parse.unquote(path.path.removeprefix("/v1/controllers/"))
                     if not CONTROLLER_ID.fullmatch(controller):
                         raise StatusError(404, "not_found")
+                    latest, history = receiver.latest_and_history(controller, self.bearer())
                     value = {
                         "schema_version": 1,
-                        "latest": receiver.latest(controller, self.bearer()),
-                        "history": receiver.history(controller, self.bearer()),
+                        "latest": latest,
+                        "history": history,
                     }
                 else:
                     raise StatusError(404, "not_found")

@@ -203,6 +203,8 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
     process_state = snapshot["controller"].get("state", "unknown")
     if process_state not in {"created", "exited", "missing", "paused", "restarting", "running"}:
         process_state = "unknown"
+    commits = [reconciliation.get(name, "") for name in ("desired_commit", "applied_commit")]
+    commits = [commit if isinstance(commit, str) and (not commit or re.fullmatch(r"[0-9a-f]{40}", commit)) else "" for commit in commits]
     return {
         "schema_version": 1,
         "controller": {
@@ -212,8 +214,8 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
             "ssh": snapshot.get("ssh", "unknown"),
         },
         "configuration": {
-            "desired_commit": reconciliation.get("desired_commit", ""),
-            "applied_commit": reconciliation.get("applied_commit", ""),
+            "desired_commit": commits[0],
+            "applied_commit": commits[1],
         },
         "reconciliation": {"state": state, "last_success_at": reconciliation.get("last_success_at")},
         "drift": {"state": snapshot.get("services", {}).get("drift", "unknown")},
@@ -396,12 +398,15 @@ def _controller_status(run: Runner, name: str, controller: str, maximum: int) ->
         value = json.loads(result.stdout) if result.returncode == 0 else {}
         current, busy, reported_max = (value[key] for key in ("current", "busy", "maximum"))
         version = value["software_version"]
+        generated_at = value["generated_at"]
         valid = (
             value.get("controller") == controller
             and all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in (current, busy, reported_max))
             and busy <= current <= reported_max == maximum
             and isinstance(version, str)
             and bool(re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", version))
+            and isinstance(generated_at, int) and not isinstance(generated_at, bool)
+            and abs(int(time.time()) - generated_at) <= 120
         )
         if valid:
             return {"current": current, "busy": busy, "maximum": reported_max}, version

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -47,4 +48,17 @@ func (s *Scaler) writeStatus() {
 	if closeErr := temporary.Close(); err == nil { err = closeErr }
 	if err == nil { err = os.Rename(name, s.config.StatusFile) }
 	if err != nil { s.logger.Warn("write controller status", "error", err) }
+}
+
+func (s *Scaler) publishStatus(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.writeStatus()
+		}
+	}
 }
