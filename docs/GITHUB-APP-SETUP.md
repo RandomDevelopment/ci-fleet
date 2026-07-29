@@ -88,6 +88,7 @@ if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
   exit 1
 fi
 PEM_DIR=${PEM_DEST%/*}
+[[ -n "$PEM_DIR" ]] || PEM_DIR=/
 
 # PEM_DEST is validated above and intentionally expanded client-side.
 # shellcheck disable=SC2029

@@ -47,6 +47,7 @@ active_guard = '[[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]'
 noclobber_line = next(line for line in transfer.splitlines() if "set -C && cat >" in line)
 assert '"$PEM_DEST"' in noclobber_line
 assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
+assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
 assert 'test -d "\'"$PEM_DIR"\'" || install -d -m 0700 "\'"$PEM_DIR"\'"' in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert active_guard in transfer
