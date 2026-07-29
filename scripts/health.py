@@ -676,7 +676,7 @@ def _local(args: argparse.Namespace) -> int:
     now = int(time.time())
     report["timestamp"] = now
     delivery = 0
-    if values.get("CI_FLEET_HEALTH_DELIVER_STATUS") == "1":
+    if values.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
         delivery = (
             _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
             if values.get("CI_FLEET_HEALTH_STATUS_URL") else _send_heartbeat(values, report)

@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+func TestRunnerStateRemovesOnlyMatchingExitedContainer(t *testing.T) {
+	state := newRunnerState()
+	state.addIdle("runner", "container-1")
+	if state.remove("runner", "container-2") { t.Fatal("removed replacement runner for stale exit") }
+	if current, _ := state.counts(); current != 1 { t.Fatalf("current=%d, want 1", current) }
+	if !state.remove("runner", "container-1") { t.Fatal("matching exited runner was not removed") }
+	if current, _ := state.counts(); current != 0 { t.Fatalf("current=%d, want 0", current) }
+}
+
 func TestWriteStatusReportsRunnerCountsWithoutControllingExecution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status.json")
 	scaler := &Scaler{

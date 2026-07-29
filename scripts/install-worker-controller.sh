@@ -769,6 +769,7 @@ run_health_check() {
     . "$environment"
     set +a
     [[ "$bootstrap" != true ]] || export CI_FLEET_HEALTH_BOOTSTRAP=1
+    export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1
     "$release/scripts/healthcheck.sh"
   ) || result=$?
   ((result < 2))

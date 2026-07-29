@@ -113,6 +113,14 @@ class StatusReceiverTests(unittest.TestCase):
         thread.join()
         self.assertEqual(errors, [])
 
+    def test_read_token_cannot_reuse_controller_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "read token"):
+            status_receiver.StatusReceiver(
+                Path(self.temporary.name) / "shared-secret.db",
+                {"example-ci-01": b"shared-secret"},
+                read_token="shared-secret",
+            )
+
     def test_duplicate_controller_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unique"):
             status_receiver.StatusReceiver(

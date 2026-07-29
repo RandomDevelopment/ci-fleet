@@ -350,9 +350,7 @@ class HealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "health.json"
             old_collect, old_send = getattr(health, "collect_snapshot"), getattr(health, "_send_heartbeat")
-            old_delivery = os.environ.get("CI_FLEET_HEALTH_DELIVER_STATUS")
             old_status_url = os.environ.pop("CI_FLEET_HEALTH_STATUS_URL", None)
-            os.environ["CI_FLEET_HEALTH_DELIVER_STATUS"] = "1"
             setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
             setattr(health, "_send_heartbeat", lambda _values, _report: 2)
             try:
@@ -365,10 +363,6 @@ class HealthTests(unittest.TestCase):
             finally:
                 setattr(health, "collect_snapshot", old_collect)
                 setattr(health, "_send_heartbeat", old_send)
-                if old_delivery is None:
-                    os.environ.pop("CI_FLEET_HEALTH_DELIVER_STATUS", None)
-                else:
-                    os.environ["CI_FLEET_HEALTH_DELIVER_STATUS"] = old_delivery
                 if old_status_url is not None:
                     os.environ["CI_FLEET_HEALTH_STATUS_URL"] = old_status_url
 

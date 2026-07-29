@@ -95,8 +95,23 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("start runner container: %w", err)
 	}
 	s.runners.addIdle(name, created.ID)
+	go s.watchRunner(context.WithoutCancel(ctx), name, created.ID)
 	s.logger.Info("runner started", "runner", name, "containerID", created.ID)
 	return name, nil
+}
+
+func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
+	stopped, errors := s.dockerClient.ContainerWait(ctx, id, container.WaitConditionNotRunning)
+	select {
+	case err := <-errors:
+		if err != nil { s.logger.Warn("watch runner container", "runner", name, "error", err) }
+		return
+	case <-stopped:
+	}
+	if !s.runners.remove(name, id) { return }
+	s.writeStatus()
+	s.logger.Warn("runner container exited before job completion", "runner", name)
+	_ = s.logAndRemove(context.WithoutCancel(ctx), name, id)
 }
 
 func (s *Scaler) recoverStale(ctx context.Context) error {

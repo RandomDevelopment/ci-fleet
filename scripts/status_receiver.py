@@ -46,6 +46,8 @@ class StatusReceiver:
             raise ValueError("history and retention bounds must be positive")
         if len(set(controller_keys.values())) != len(controller_keys):
             raise ValueError("controller authentication keys must be unique")
+        if any(hmac.compare_digest(key, read_token.encode()) for key in controller_keys.values()):
+            raise ValueError("read token must differ from controller authentication keys")
         self.database = database
         self.controller_keys = dict(controller_keys)
         self.read_token = read_token

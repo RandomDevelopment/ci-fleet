@@ -3,10 +3,9 @@ set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 health_timer=$repo_root/host/systemd/ci-fleet-health.timer
-health_service=$repo_root/host/systemd/ci-fleet-health.service
 grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lacks activation-relative initial trigger\n' >&2; exit 1; }
 ! grep -Fq 'OnBootSec=' "$health_timer" || { printf 'FAIL: health timer initial trigger is boot-relative\n' >&2; exit 1; }
-grep -Fqx 'Environment=CI_FLEET_HEALTH_DELIVER_STATUS=1' "$health_service" || { printf 'FAIL: scheduled health does not enable status delivery\n' >&2; exit 1; }
+grep -Fq 'export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1' "$repo_root/scripts/install-worker-controller.sh" || { printf 'FAIL: installer health check can submit monitoring reports\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fake_bin=$tmp/bin

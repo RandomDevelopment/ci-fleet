@@ -41,6 +41,20 @@ func (r *runnerState) markBusy(name string) bool {
 	return true
 }
 
+func (r *runnerState) remove(name, expectedID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id, ok := r.busy[name]; ok && id == expectedID {
+		delete(r.busy, name)
+		return true
+	}
+	if id, ok := r.idle[name]; ok && id == expectedID {
+		delete(r.idle, name)
+		return true
+	}
+	return false
+}
+
 func (r *runnerState) markDone(name string) (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
