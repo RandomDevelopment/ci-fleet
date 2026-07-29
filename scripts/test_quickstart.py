@@ -47,8 +47,8 @@ active_guard = '[[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]'
 noclobber_line = next(line for line in transfer.splitlines() if "set -C && cat >" in line)
 assert '"$PEM_DEST"' in noclobber_line
 assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
-assert 'install -d -m 0700 "\'"$PEM_DIR"\'"' in transfer
-assert "^/[A-Za-z0-9._/-]+\\.pem$" in transfer
+assert 'test -d "\'"$PEM_DIR"\'" || install -d -m 0700 "\'"$PEM_DIR"\'"' in transfer
+assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert active_guard in transfer
 assert transfer.index(active_guard) < transfer.index('ssh "$CONTROLLER"')
 for command in ("cat >", "sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
@@ -90,7 +90,7 @@ validate_paths = 'for pem in "$PEM_DEST" "$ACTIVE_PEM"; do'
 distinct_paths = '[[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$ACTIVE_PEM"'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
-assert "^/[A-Za-z0-9._/-]+\\.pem$" in revocation
+assert "^/[A-Za-z0-9._/-]+$" in revocation
 assert revocation.index(read_destination) < revocation.index(validate_paths)
 assert revocation.index(validate_paths) < revocation.index(distinct_paths)
 assert revocation.index(distinct_paths) < revocation.index(remove_old_pem)
@@ -99,13 +99,18 @@ retirement = app_setup[app_setup.index("## Controller retirement and PEM removal
 validate_paths = 'valid_pem_path "$pem" || exit 1'
 uninstall = "scripts/install-worker-controller.sh \\\n        --uninstall &&"
 remove_pem = 'sudo rm -f -- "$pem" || return 1'
-remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env; then"
+persist_inventory = 'sudo install -m 0600 /dev/stdin "$PEM_INVENTORY" || exit 1'
+remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env &&"
+remove_inventory = 'sudo rm -f -- "$PEM_INVENTORY"; then'
 assert 'RETIRED_PEMS=("$PEM_DEST")' in retirement
-assert "^/[A-Za-z0-9._/-]+\\.pem$" in retirement
+assert "^/[A-Za-z0-9._/-]+$" in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
+assert retirement.index(validate_paths) < retirement.index(persist_inventory)
+assert retirement.index(persist_inventory) < retirement.index(uninstall)
 assert remove_pem in retirement
 assert retirement.index(uninstall) < retirement.index("remove_retired_pems &&")
 assert retirement.index("remove_retired_pems &&") < retirement.index(remove_host_env)
+assert retirement.index(remove_host_env) < retirement.index(remove_inventory)
 retirement_failure = retirement[retirement.index("retirement cleanup failed") :]
-assert "path inventory and host.env" in retirement_failure and "exit 1" in retirement_failure
+assert '"$PEM_INVENTORY" >&2' in retirement_failure and "exit 1" in retirement_failure
 print("documentation_contract=PASS")

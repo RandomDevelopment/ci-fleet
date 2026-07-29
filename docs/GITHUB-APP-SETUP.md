@@ -79,7 +79,7 @@ any existing file:
 
 ```bash
 valid_pem_path() {
-  [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+  [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
      ! $1 =~ (^|/)\.\.?(/|$) ]]
 }
 valid_pem_path "$PEM_DEST" || exit 1
@@ -93,7 +93,7 @@ PEM_DIR=${PEM_DEST%/*}
 # shellcheck disable=SC2029
 if
 ssh "$CONTROLLER" \
-  'install -d -m 0700 "'"$PEM_DIR"'" &&
+  '{ test -d "'"$PEM_DIR"'" || install -d -m 0700 "'"$PEM_DIR"'"; } &&
    umask 077 && set -C && cat > "'"$PEM_DEST"'" &&
    chown root:root "'"$PEM_DEST"'" &&
    chmod 0600 "'"$PEM_DEST"'"' <"$PEM" &&
@@ -245,7 +245,7 @@ Only after every activation check above succeeds:
 
    ```bash
    valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
         ! $1 =~ (^|/)\.\.?(/|$) ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
@@ -277,7 +277,7 @@ Retirement is not complete when only the App installation is removed:
 
    ```bash
    valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+\.pem$ && $1 != *//* &&
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
         ! $1 =~ (^|/)\.\.?(/|$) ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
@@ -288,6 +288,9 @@ Retirement is not complete when only the App installation is removed:
    for pem in "${RETIRED_PEMS[@]}"; do
      valid_pem_path "$pem" || exit 1
    done
+   PEM_INVENTORY=/etc/ci-fleet/retired-pem-paths
+   printf '%s\n' "${RETIRED_PEMS[@]}" | \
+     sudo install -m 0600 /dev/stdin "$PEM_INVENTORY" || exit 1
 
    remove_retired_pems() {
      for pem in "${RETIRED_PEMS[@]}"; do
@@ -297,17 +300,21 @@ Retirement is not complete when only the App installation is removed:
    if sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
         --uninstall &&
       remove_retired_pems &&
-      sudo rm -f -- /etc/ci-fleet/host.env; then
-     unset PEM_DEST RETIRED_PEMS
+      sudo rm -f -- /etc/ci-fleet/host.env &&
+      sudo rm -f -- "$PEM_INVENTORY"; then
+     unset PEM_DEST PEM_INVENTORY RETIRED_PEMS
    else
-     printf 'retirement cleanup failed; retained path inventory and host.env\n' >&2
+     printf 'retirement cleanup failed; retained %s and host.env\n' \
+       "$PEM_INVENTORY" >&2
      exit 1
    fi
    ```
 
    Replace or repeat the example old path for every exact rotation path used by
    this app. If path extraction or validation fails, stop before uninstalling
-   or removing `host.env`.
+   or removing `host.env`. On later cleanup failure, rebuild `RETIRED_PEMS`
+   from the retained root-owned inventory before retrying exact-path removal;
+   the inventory is deleted only after every PEM and `host.env` are removed.
 5. Remove remaining management-workstation, temporary, secret-manager, and
    backup copies according to their retention and secure-erasure policies. If
    the retired storage cannot guarantee file-level erasure (for example SSD,
