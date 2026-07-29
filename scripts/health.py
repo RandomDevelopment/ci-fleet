@@ -201,7 +201,9 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
     if not error_code:
         error_code = f"reconciliation_{state}" if state in {"drift", "failed", "invalid", "rolled_back"} else ""
     if not error_code:
-        failed = next((check for check in health_report.get("checks", []) if check.get("status") in {"critical", "warning"}), None)
+        checks = health_report.get("checks", [])
+        failed = next((check for check in checks if check.get("status") == "critical"), None)
+        failed = failed or next((check for check in checks if check.get("status") == "warning"), None)
         error_code = f"health_{failed['id']}" if failed else ""
     error = {"code": error_code, "message": error_code.replace("_", " ")} if error_code else None
     timers = snapshot.get("timers", {})

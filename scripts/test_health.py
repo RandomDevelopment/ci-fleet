@@ -317,6 +317,14 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["runners"], {"current": 1, "busy": 1, "maximum": 6})
         self.assertEqual(report["process"]["state"], "unknown")
         self.assertEqual(report["error"], {"code": "reconciliation_failed", "message": "reconciliation failed"})
+        priority = copy.deepcopy(snapshot)
+        priority["reconciliation"]["status"] = "converged"
+        priority["controller_status_valid"] = True
+        prioritized = health.build_status_report(priority, {"checks": [
+            {"id": "early_warning", "status": "warning"},
+            {"id": "later_failure", "status": "critical"},
+        ]}, generated_at=1_000)
+        self.assertEqual(prioritized["error"]["code"], "health_later_failure")
         snapshot["reconciliation"]["last_success_at"] = 1_001
         future_success = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
         self.assertIsNone(future_success["reconciliation"]["last_success_at"])

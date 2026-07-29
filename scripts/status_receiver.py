@@ -79,7 +79,13 @@ class StatusReceiver:
         self.expire()
 
     def _connect(self) -> sqlite3.Connection:
-        self.database.parent.mkdir(parents=True, exist_ok=True)
+        self.database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.database, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
         return sqlite3.connect(self.database)
 
     def submit(self, body: bytes, headers: Mapping[str, str], *, now: int) -> None:
@@ -128,6 +134,14 @@ class StatusReceiver:
 
     def _expire(self, connection: sqlite3.Connection, now: int) -> None:
         connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
+        connection.execute("""
+            DELETE FROM reports WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (PARTITION BY controller ORDER BY generated_at DESC, rowid DESC) AS rank
+                    FROM reports
+                ) WHERE rank > ?
+            )
+        """, (self.history_limit,))
         connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
 
     def expire(self) -> None:

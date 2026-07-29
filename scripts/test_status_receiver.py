@@ -70,6 +70,7 @@ class StatusReceiverTests(unittest.TestCase):
             min_interval_seconds=0,
         )
         self.receiver._clock = lambda: 1_000
+        self.assertEqual(self.receiver.database.stat().st_mode & 0o777, 0o600)
 
     def signed(self, report: dict, *, timestamp: int = 1_000, nonce: str = "a" * 32,
                controller: str = "example-ci-01", key: bytes | None = None) -> tuple[bytes, dict[str, str]]:
@@ -212,6 +213,23 @@ class StatusReceiverTests(unittest.TestCase):
         self.assertEqual([item["generated_at"] for item in self.receiver.history("example-ci-01", "reader-token")], [5_000])
         latest, history = self.receiver.latest_and_history("example-ci-01", "reader-token")
         self.assertEqual(latest, history[0])
+
+    def test_smaller_history_limit_is_applied_on_restart(self) -> None:
+        database = Path(self.temporary.name) / "smaller-history.db"
+        receiver = status_receiver.StatusReceiver(
+            database, {"example-ci-01": self.key}, read_token="reader-token",
+            history_limit=3, retention_seconds=3_600, min_interval_seconds=0,
+        )
+        now = int(time.time())
+        for offset, nonce in enumerate(("a", "b", "c")):
+            body, headers = self.signed(valid_report(generated_at=now + offset), timestamp=now + offset, nonce=nonce * 32)
+            receiver.submit(body, headers, now=now + offset)
+        status_receiver.StatusReceiver(
+            database, {"example-ci-01": self.key}, read_token="reader-token",
+            history_limit=1, retention_seconds=3_600, min_interval_seconds=0,
+        )
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0], 1)
 
     def test_time_retention_is_enforced_without_traffic(self) -> None:
         receiver = status_receiver.StatusReceiver(
