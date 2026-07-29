@@ -52,33 +52,71 @@ transfer it over an authenticated, encrypted channel directly to the final
 root-owned path on the controller. Do not stage it in a shared directory or
 send it through chat, email, or a repository.
 
-For example, from the management workstation (replace both placeholders):
+For an initial installation, the destination may use the conventional active
+path because no controller key exists yet. Set `PEM_DEST` explicitly when a
+different installation path is wanted:
 
 ```bash
 PEM="$HOME/Downloads/YOUR-APP.private-key.pem"
 CONTROLLER=root@CONTROLLER_HOST
+ACTIVE_PEM=""
+PEM_DEST=${PEM_DEST:-"/etc/ci-fleet/secrets/github-app.pem"}
+```
+
+For rotation, replace the last two assignments with the exact active path from
+`CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` and a new key-specific filename. Never
+use the active path as the rotation destination:
+
+```bash
+ACTIVE_PEM="/etc/ci-fleet/secrets/github-app.pem"
+PEM_DEST="/etc/ci-fleet/secrets/github-app-ROTATION-ID.pem"
+```
+
+Then run the same transfer and verification sequence for either case. The path
+validation makes it safe to quote `PEM_DEST` in the remote shell command, the
+rotation guard rejects the active path, and shell noclobber prevents replacing
+any existing file:
+
+```bash
+[[ "$PEM_DEST" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
+  printf 'refusing to overwrite active PEM: %s\n' "$ACTIVE_PEM" >&2
+  exit 1
+fi
+
+if
 ssh "$CONTROLLER" \
   'install -d -m 0700 /etc/ci-fleet/secrets &&
-   umask 077 && cat > /etc/ci-fleet/secrets/github-app.pem &&
-   chown root:root /etc/ci-fleet/secrets/github-app.pem &&
-   chmod 0600 /etc/ci-fleet/secrets/github-app.pem' <"$PEM"
-local_sha=$(sha256sum -- "$PEM" | cut -d' ' -f1)
-remote_sha=$(ssh "$CONTROLLER" \
-  "sha256sum /etc/ci-fleet/secrets/github-app.pem | cut -d' ' -f1")
-test "$local_sha" = "$remote_sha"
-ssh "$CONTROLLER" \
-  "test \"\$(stat -c '%U:%G %a' /etc/ci-fleet/secrets/github-app.pem)\" = 'root:root 600'"
-rm -f -- "$PEM"
-unset PEM local_sha remote_sha
+   umask 077 && set -C && cat > "'"$PEM_DEST"'" &&
+   chown root:root "'"$PEM_DEST"'" &&
+   chmod 0600 "'"$PEM_DEST"'"' <"$PEM" &&
+  local_sha=$(sha256sum -- "$PEM" | cut -d' ' -f1) &&
+  remote_sha=$(ssh "$CONTROLLER" \
+    "sha256sum -- \"$PEM_DEST\" | cut -d' ' -f1") &&
+  test "$local_sha" = "$remote_sha" &&
+  ssh "$CONTROLLER" \
+    "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
+  ssh "$CONTROLLER" \
+    "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
+then
+  rm -f -- "$PEM"
+  unset PEM local_sha remote_sha
+else
+  printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
+  unset local_sha remote_sha
+  exit 1
+fi
 ```
 
 Use an equivalent privileged SSH workflow if direct root login is disabled.
-Do not delete the workstation copy until both checksum and ownership/mode
-checks pass. Then remove it from the browser download location, trash, sync,
-and temporary storage according to the workstation's secure-erasure policy;
-plain `rm` may not erase data from snapshots, SSDs, or copy-on-write storage.
-The only retained copy may be the controller file or an approved secret
-manager — see [SECRETS.md](SECRETS.md).
+If transfer, checksum, owner, or mode verification fails, the sequence stops,
+leaves the active controller PEM untouched, and retains the downloaded
+replacement for diagnosis or a safe retry. Do not revoke the old GitHub key.
+After success, remove any other copy from the browser download location, trash,
+sync, and temporary storage according to the workstation's secure-erasure
+policy; plain `rm` may not erase data from snapshots, SSDs, or copy-on-write
+storage. The only retained copy may be the controller file or an approved
+secret manager — see [SECRETS.md](SECRETS.md).
 
 ## 4. Install the app
 
@@ -149,11 +187,13 @@ see Troubleshooting.
 
 New controller: new app. Do not share one app across controllers.
 
-1. Generate a new key and use the secure-transfer procedure in section 3 to
-   place it at a **new** root-owned `0600` path. Verify the transfer and remove
-   the downloaded workstation copy.
+1. Generate a new key and use the rotation assignments and secure-transfer
+   procedure in section 3. `PEM_DEST` must differ from `ACTIVE_PEM`; the
+   transfer must not overwrite either path. Continue only after every transfer
+   and verification command succeeds and the downloaded workstation copy is
+   removed.
 2. Update `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` in
-   `/etc/ci-fleet/host.env` to the new path.
+   `/etc/ci-fleet/host.env` to the exact value of `PEM_DEST`.
 3. Verify that the new key can mint a token, always suppressing token stdout:
 
    ```bash
@@ -173,8 +213,10 @@ New controller: new app. Do not share one app across controllers.
    ```
 
    Stop if reconciliation does not report `RECONCILE_OK`, the health check is
-   not healthy, or the final check does not report `CHECK_OK`. Restore the old
-   `host.env` path and reconcile again; do not revoke the old key.
+   not healthy, or the final check does not report `CHECK_OK`. Restore
+   `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` to the exact value of `ACTIVE_PEM`
+   and reconcile again; do not revoke the old key or remove either PEM until
+   rollback is healthy and converged.
 
 ## Old-key revocation
 
@@ -186,7 +228,7 @@ Only after every activation check above succeeds:
    wildcard in a shared secrets directory:
 
    ```bash
-   sudo rm -f -- /etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem
+   sudo rm -f -- "$ACTIVE_PEM"
    ```
 
 3. Remove any old workstation or temporary copies under the applicable secure
@@ -208,7 +250,7 @@ Retirement is not complete when only the App installation is removed:
    ```bash
    sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
      --uninstall
-   sudo rm -f -- /etc/ci-fleet/secrets/github-app.pem
+   sudo rm -f -- "$PEM_DEST"
    sudo rm -f -- /etc/ci-fleet/host.env
    ```
 
