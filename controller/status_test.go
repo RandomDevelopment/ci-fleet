@@ -80,10 +80,22 @@ func TestStatusPublisherRefreshesIdleSnapshot(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go scaler.publishStatus(ctx, time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		scaler.publishStatus(ctx, time.Millisecond)
+		close(done)
+	}()
 	deadline := time.After(time.Second)
 	for {
-		if _, err := os.Stat(path); err == nil { return }
+		if _, err := os.Stat(path); err == nil {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("idle status publisher did not stop")
+			}
+			return
+		}
 		select {
 		case <-deadline:
 			t.Fatal("idle status publisher did not refresh snapshot")
