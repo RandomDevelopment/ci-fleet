@@ -181,6 +181,7 @@ class StatusReceiverTests(unittest.TestCase):
         limited.submit(body, headers, now=1_000)
         second_body, second_headers = self.signed(valid_report(generated_at=1_001), timestamp=1_001, nonce="b" * 32)
         self.assert_status_error(429, "submission_too_frequent", lambda: limited.submit(second_body, second_headers, now=1_001))
+        self.assert_status_error(409, "replayed_report", lambda: limited.submit(second_body, second_headers, now=1_031))
 
     def test_schema_compatibility_and_malformed_metrics(self) -> None:
         future = valid_report()
@@ -254,6 +255,22 @@ class StatusReceiverTests(unittest.TestCase):
         finally:
             stop.set()
             thread.join()
+
+    def test_retention_worker_retries_transient_database_errors(self) -> None:
+        stop = threading.Event()
+
+        class FlakyReceiver:
+            calls = 0
+
+            def expire(self) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise sqlite3.OperationalError("locked")
+                stop.set()
+
+        receiver = FlakyReceiver()
+        status_receiver._expiration_loop(receiver, stop, 0.001)
+        self.assertEqual(receiver.calls, 2)
 
     def test_receiver_restart_reloads_rotated_key(self) -> None:
         directory = Path(self.temporary.name)

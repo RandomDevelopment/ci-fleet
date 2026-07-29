@@ -103,16 +103,18 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 }
 
 func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
+waitLoop:
 	for {
 		stopped, errors := s.dockerClient.ContainerWait(ctx, id, container.WaitConditionNotRunning)
 		select {
 		case err := <-errors:
+			if !s.runners.contains(name, id) { return }
+			if errdefs.IsNotFound(err) { break waitLoop }
 			s.logger.Warn("watch runner container", "runner", name, "error", err)
 			time.Sleep(time.Minute)
-			continue
 		case <-stopped:
+			break waitLoop
 		}
-		break
 	}
 	if !s.runners.markExited(name, id) { return }
 	s.writeStatus()

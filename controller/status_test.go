@@ -22,7 +22,9 @@ func TestRunnerStateMakesExitAndCompletionIdempotent(t *testing.T) {
 	}
 
 	state.addIdle("normal", "container-2")
+	if !state.contains("normal", "container-2") { t.Fatal("tracked runner was not found") }
 	if _, cleanup, ok := state.markDone("normal"); !ok || !cleanup { t.Fatal("normal completion skipped cleanup") }
+	if state.contains("normal", "container-2") { t.Fatal("completed runner remained tracked") }
 	if state.markExited("normal", "container-2") { t.Fatal("exit won after normal completion") }
 }
 

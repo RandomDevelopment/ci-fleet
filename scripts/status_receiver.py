@@ -114,6 +114,7 @@ class StatusReceiver:
         with self._write_lock, self._connect() as connection:
             try:
                 connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
+                connection.commit()
             except sqlite3.IntegrityError as error:
                 raise StatusError(409, "replayed_report") from error
             last = connection.execute(
@@ -413,7 +414,10 @@ def load_auth_config(path: Path) -> tuple[dict[str, bytes], str]:
 
 def _expiration_loop(receiver: StatusReceiver, stop: threading.Event, interval: float = 60) -> None:
     while not stop.wait(interval):
-        receiver.expire()
+        try:
+            receiver.expire()
+        except (OSError, sqlite3.Error):
+            pass
 
 
 def main() -> int:
