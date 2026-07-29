@@ -243,18 +243,32 @@ Retirement is not complete when only the App installation is removed:
 2. Uninstall the App from the organization to invalidate installation access.
 3. On the GitHub App settings page, delete/revoke **every** private key for this
    controller's app; delete the dedicated app itself if it will not be reused.
-4. Uninstall the controller. The uninstaller deliberately preserves
-   `/etc/ci-fleet/host.env` and `/etc/ci-fleet/secrets`, so remove the retained
-   credentials explicitly:
+4. Before uninstalling, read the configured destination while `host.env` still
+   exists and enumerate every retained rotation path explicitly. The
+   uninstaller deliberately preserves `/etc/ci-fleet/host.env` and
+   `/etc/ci-fleet/secrets`:
 
    ```bash
+   PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
+     /etc/ci-fleet/host.env | cut -d= -f2-)
+   RETIRED_PEMS=("$PEM_DEST")
+   # Repeat for every retained old rotation path; never use a wildcard.
+   RETIRED_PEMS+=("/etc/ci-fleet/secrets/OLD-ROTATION-ID.pem")
+   for pem in "${RETIRED_PEMS[@]}"; do
+     [[ "$pem" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+   done
+
    sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh \
      --uninstall
-   sudo rm -f -- "$PEM_DEST"
+   for pem in "${RETIRED_PEMS[@]}"; do
+     sudo rm -f -- "$pem"
+   done
    sudo rm -f -- /etc/ci-fleet/host.env
    ```
 
-   Repeat the PEM removal for every exact rotation path used by this app.
+   Replace or repeat the example old path for every exact rotation path used by
+   this app. If path extraction or validation fails, stop before uninstalling
+   or removing `host.env`.
 5. Remove remaining management-workstation, temporary, secret-manager, and
    backup copies according to their retention and secure-erasure policies. If
    the retired storage cannot guarantee file-level erasure (for example SSD,

@@ -67,7 +67,18 @@ for use in (
     "exact value of `PEM_DEST`",
     "exact value of `ACTIVE_PEM`",
     'sudo rm -f -- "$ACTIVE_PEM"',
-    'sudo rm -f -- "$PEM_DEST"',
 ):
     assert use in app_setup, f"configured PEM destination contract missing: {use}"
+
+retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
+read_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
+validate_paths = '[[ "$pem" =~ ^/etc/ci-fleet/secrets/'
+uninstall = "scripts/install-worker-controller.sh \\\n     --uninstall"
+remove_pem = 'sudo rm -f -- "$pem"'
+remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env"
+assert 'RETIRED_PEMS=("$PEM_DEST")' in retirement
+assert retirement.index(read_destination) < retirement.index(validate_paths)
+assert retirement.index(validate_paths) < retirement.index(uninstall)
+assert retirement.index(uninstall) < retirement.index(remove_pem)
+assert retirement.index(remove_pem) < retirement.index(remove_host_env)
 print("documentation_contract=PASS")
