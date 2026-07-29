@@ -226,9 +226,9 @@ class HealthTests(unittest.TestCase):
                 if args[:2] == ["docker", "inspect"]:
                     outputs = {"{{.State.Status}}": "running\n", "{{.State.OOMKilled}}": "false\n", "{{.RestartCount}}": "0\n", "{{range .Config.Env}}{{println .}}{{end}}": "CI_FLEET_MIN_RUNNERS=0\nCI_FLEET_MAX_RUNNERS=6\n"}
                     return health.subprocess.CompletedProcess(args, 0, outputs.get(args[3], ""), "")
-                if args[:3] == ["systemctl", "is-enabled", "ssh.service"] or args[:3] == ["systemctl", "is-enabled", "ssh.socket"]:
+                if args[:2] == ["systemctl", "is-enabled"] and args[-1] in {"ssh.service", "ssh.socket", "sshd.service"}:
                     return health.subprocess.CompletedProcess(args, 1, "disabled\n", "")
-                if args[:3] == ["systemctl", "is-active", "ssh.service"] or args[:3] == ["systemctl", "is-active", "ssh.socket"]:
+                if args[:2] == ["systemctl", "is-active"] and args[-1] in {"ssh.service", "ssh.socket", "sshd.service"}:
                     return health.subprocess.CompletedProcess(args, 3, "inactive\n", "")
                 return health.subprocess.CompletedProcess(args, 0, "success\n", "")
 
@@ -344,6 +344,12 @@ class HealthTests(unittest.TestCase):
             return health.subprocess.CompletedProcess(args, 0 if active else 1, "active\n" if active else "inactive\n", "")
 
         self.assertEqual(health._ssh_state(socket_enabled), "enabled")
+
+        def sshd_enabled(args):
+            active = args[-1] == "sshd.service"
+            return health.subprocess.CompletedProcess(args, 0 if active else 1, "active\n" if active else "not-found\n", "")
+
+        self.assertEqual(health._ssh_state(sshd_enabled), "enabled")
         self.assertEqual(health._ssh_state(lambda args: health.subprocess.CompletedProcess(args, 127, "", "")), "unknown")
 
     def test_legacy_configuration_failure_remains_critical(self) -> None:

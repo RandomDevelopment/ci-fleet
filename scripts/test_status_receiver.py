@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -211,7 +213,7 @@ class StatusReceiverTests(unittest.TestCase):
         latest, history = self.receiver.latest_and_history("example-ci-01", "reader-token")
         self.assertEqual(latest, history[0])
 
-    def test_time_retention_is_enforced_on_read(self) -> None:
+    def test_time_retention_is_enforced_without_traffic(self) -> None:
         receiver = status_receiver.StatusReceiver(
             Path(self.temporary.name) / "expiry.db", {"example-ci-01": self.key},
             read_token="reader-token", retention_seconds=10, min_interval_seconds=0,
@@ -219,7 +221,21 @@ class StatusReceiverTests(unittest.TestCase):
         body, headers = self.signed(valid_report())
         receiver.submit(body, headers, now=1_000)
         receiver._clock = lambda: 1_011
-        self.assertIsNone(receiver.latest("example-ci-01", "reader-token"))
+        stop = threading.Event()
+        thread = threading.Thread(target=status_receiver._expiration_loop, args=(receiver, stop, 0.01))
+        thread.start()
+        try:
+            deadline = time.time() + 1
+            while time.time() < deadline:
+                with sqlite3.connect(receiver.database) as connection:
+                    if connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 0:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("expired report remained without request traffic")
+        finally:
+            stop.set()
+            thread.join()
 
     def test_receiver_restart_reloads_rotated_key(self) -> None:
         directory = Path(self.temporary.name)

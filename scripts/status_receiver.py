@@ -76,6 +76,7 @@ class StatusReceiver:
                 );
             """)
         os.chmod(self.database, 0o600)
+        self.expire()
 
     def _connect(self) -> sqlite3.Connection:
         self.database.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +129,10 @@ class StatusReceiver:
     def _expire(self, connection: sqlite3.Connection, now: int) -> None:
         connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
         connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
+
+    def expire(self) -> None:
+        with self._write_lock, self._connect() as connection:
+            self._expire(connection, int(self._clock()))
 
     @staticmethod
     def _validate_minimum(report: Any, controller: str) -> None:
@@ -392,6 +397,11 @@ def load_auth_config(path: Path) -> tuple[dict[str, bytes], str]:
     return keys, _read_secret(resolve(value["read_token_file"]), textual=True).decode()
 
 
+def _expiration_loop(receiver: StatusReceiver, stop: threading.Event, interval: float = 60) -> None:
+    while not stop.wait(interval):
+        receiver.expire()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Authenticated ci-fleet status receiver")
     parser.add_argument("--auth-config", type=Path, required=True)
@@ -408,7 +418,16 @@ def main() -> int:
         args.database, keys, read_token=read_token,
         history_limit=args.history_limit, retention_seconds=args.retention_seconds,
     )
-    create_server(args.bind, args.port, receiver).serve_forever()
+    stop = threading.Event()
+    maintenance = threading.Thread(target=_expiration_loop, args=(receiver, stop), daemon=True)
+    maintenance.start()
+    server = create_server(args.bind, args.port, receiver)
+    try:
+        server.serve_forever()
+    finally:
+        stop.set()
+        maintenance.join()
+        server.server_close()
     return 0
 
 

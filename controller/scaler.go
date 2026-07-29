@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/google/uuid"
 )
 
@@ -112,8 +113,15 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 	if !s.runners.markExited(name, id) { return }
 	s.writeStatus()
 	s.logger.Warn("runner container exited before job completion", "runner", name)
-	_ = s.logAndRemove(context.WithoutCancel(ctx), name, id)
-	time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, id) })
+	for {
+		if err := s.logAndRemove(context.WithoutCancel(ctx), name, id); err == nil {
+			s.runners.forgetExited(name, id)
+			return
+		} else {
+			s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
+		}
+		time.Sleep(time.Minute)
+	}
 }
 
 func (s *Scaler) recoverStale(ctx context.Context) error {
@@ -142,7 +150,7 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
 	} else {
 		s.logger.Warn("could not collect runner logs", "runner", name, "error", err)
 	}
-	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
+	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("remove runner %s: %w", name, err)
 	}
 	return nil

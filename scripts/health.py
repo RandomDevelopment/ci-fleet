@@ -308,7 +308,7 @@ def _timespan_seconds(value: str) -> float | None:
 
 
 def _ssh_state(run: Runner) -> str:
-    results = [run(["systemctl", action, unit]) for unit in ("ssh.service", "ssh.socket") for action in ("is-enabled", "is-active")]
+    results = [run(["systemctl", action, unit]) for unit in ("ssh.service", "ssh.socket", "sshd.service") for action in ("is-enabled", "is-active")]
     states = [result.stdout.strip().lower() for result in results]
     if any(result.returncode == 0 and state in {"active", "enabled"} for result, state in zip(results, states)):
         return "enabled"
