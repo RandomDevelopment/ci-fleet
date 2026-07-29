@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -60,7 +61,7 @@ class StatusReceiver:
         self._write_lock = threading.Lock()
         self._last_attempt: dict[str, int] = {}
         self._clock = time.time
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS reports (
                     controller TEXT NOT NULL,
@@ -112,7 +113,7 @@ class StatusReceiver:
         if abs(now - generated_at) > self.max_clock_skew_seconds:
             raise StatusError(409, "report_time_stale")
         encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
                 raise StatusError(409, "replayed_report")
             last_attempt = self._last_attempt.get(controller)
@@ -153,7 +154,7 @@ class StatusReceiver:
         connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
 
     def expire(self) -> None:
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             self._expire(connection, int(self._clock()))
 
     @staticmethod
@@ -244,7 +245,7 @@ class StatusReceiver:
 
     def latest(self, controller: str, read_token: str) -> dict[str, Any] | None:
         self._authorize_read(read_token)
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             self._expire(connection, int(self._clock()))
             row = connection.execute(
                 "SELECT payload FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1", (controller,)
@@ -254,7 +255,7 @@ class StatusReceiver:
     def history(self, controller: str, read_token: str, limit: int | None = None) -> list[dict[str, Any]]:
         self._authorize_read(read_token)
         count = min(max(limit or self.history_limit, 1), self.history_limit)
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             self._expire(connection, int(self._clock()))
             rows = connection.execute(
                 "SELECT payload FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?", (controller, count)
@@ -263,7 +264,7 @@ class StatusReceiver:
 
     def latest_and_history(self, controller: str, read_token: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         self._authorize_read(read_token)
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             self._expire(connection, int(self._clock()))
             rows = connection.execute(
                 "SELECT payload FROM reports WHERE controller = ? ORDER BY generated_at DESC LIMIT ?",
@@ -274,7 +275,7 @@ class StatusReceiver:
 
     def list_latest(self, read_token: str) -> list[dict[str, Any]]:
         self._authorize_read(read_token)
-        with self._write_lock, self._connect() as connection:
+        with self._write_lock, closing(self._connect()) as connection, connection:
             self._expire(connection, int(self._clock()))
             rows = connection.execute("""
                 SELECT reports.payload FROM reports
@@ -399,6 +400,8 @@ def _read_secret(path: Path, *, textual: bool = False) -> bytes:
     value = path.read_bytes()
     if textual:
         value = value.strip()
+        if any(byte < 0x21 or byte > 0x7e for byte in value):
+            raise ValueError(f"textual secret must contain visible ASCII only: {path}")
     if not 32 <= len(value) <= 128:
         raise ValueError(f"secret must contain 32-128 bytes: {path}")
     return value

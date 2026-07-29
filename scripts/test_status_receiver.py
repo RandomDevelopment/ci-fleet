@@ -166,6 +166,28 @@ class StatusReceiverTests(unittest.TestCase):
         stale_body, stale_headers = self.signed(valid_report(), timestamp=1_001, nonce="c" * 32)
         self.assert_status_error(409, "stale_report", lambda: self.receiver.submit(stale_body, stale_headers, now=1_001))
 
+    def test_rejected_submissions_close_database_connections(self) -> None:
+        connections = []
+
+        class TrackingConnection(sqlite3.Connection):
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                super().close()
+
+        def connect() -> sqlite3.Connection:
+            connection = sqlite3.connect(self.receiver.database, factory=TrackingConnection)
+            connections.append(connection)
+            return connection
+
+        self.receiver._connect = connect
+        body, headers = self.signed(valid_report())
+        self.receiver.submit(body, headers, now=1_000)
+        self.assert_status_error(409, "replayed_report", lambda: self.receiver.submit(body, headers, now=1_000))
+        self.assertEqual(len(connections), 2)
+        self.assertTrue(all(connection.closed for connection in connections))
+
     def test_payload_and_submission_frequency_are_bounded(self) -> None:
         small = status_receiver.StatusReceiver(
             Path(self.temporary.name) / "small.db", {"example-ci-01": self.key},
@@ -287,6 +309,20 @@ class StatusReceiverTests(unittest.TestCase):
         receiver = FlakyReceiver()
         status_receiver._expiration_loop(receiver, stop, 0.001)
         self.assertEqual(receiver.calls, 2)
+
+    def test_read_token_must_be_http_header_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key_file, token_file, config_file = root / "key", root / "token", root / "auth.json"
+            key_file.write_bytes(b"k" * 32)
+            config_file.write_text(json.dumps({"controllers": {"example-ci-01": "key"}, "read_token_file": "token"}))
+            for path in (key_file, token_file, config_file):
+                path.touch(exist_ok=True)
+                path.chmod(0o600)
+            for value in ("€" * 32, "a" * 32 + "\n" + "b" * 32):
+                token_file.write_text(value)
+                with self.assertRaisesRegex(ValueError, "visible ASCII"):
+                    status_receiver.load_auth_config(config_file)
 
     def test_receiver_restart_reloads_rotated_key(self) -> None:
         directory = Path(self.temporary.name)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,6 +18,8 @@ func TestRunnerStateMakesExitAndCompletionIdempotent(t *testing.T) {
 	if current, _ := state.counts(); current != 1 { t.Fatalf("current=%d, want 1", current) }
 	if !state.markExited("runner", "container-1") { t.Fatal("matching exited runner was not removed") }
 	if current, _ := state.counts(); current != 0 { t.Fatalf("current=%d, want 0", current) }
+	if !state.markBusy("runner") { t.Fatal("late job start rejected exited runner") }
+	if current, busy := state.counts(); current != 0 || busy != 0 { t.Fatalf("late start restored exited runner: current=%d busy=%d", current, busy) }
 	if id, cleanup, ok := state.markDone("runner"); !ok || cleanup || id != "container-1" {
 		t.Fatalf("late completion = id %q cleanup %t ok %t", id, cleanup, ok)
 	}
@@ -55,6 +58,27 @@ func TestWriteStatusReportsRunnerCountsWithoutControllingExecution(t *testing.T)
 	if current, busy := scaler.runners.counts(); current != 2 || busy != 1 {
 		t.Fatalf("status failure changed runner state: current=%d busy=%d", current, busy)
 	}
+}
+
+func TestWriteStatusPreservesPreviousSnapshotOnEncodingFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	previous := []byte(`{"previous":true}`)
+	if err := os.WriteFile(path, previous, 0o644); err != nil { t.Fatal(err) }
+	scaler := &Scaler{
+		runners: newRunnerState(),
+		logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		config: Config{FleetInstance: "example-ci-01", MaxRunners: 1, StatusFile: path},
+	}
+	original := encodeControllerStatus
+	encodeControllerStatus = func(file *os.File, _ controllerStatus) error {
+		_, _ = file.WriteString("truncated")
+		return errors.New("filesystem full")
+	}
+	defer func() { encodeControllerStatus = original }()
+	scaler.writeStatus()
+	got, err := os.ReadFile(path)
+	if err != nil { t.Fatal(err) }
+	if string(got) != string(previous) { t.Fatalf("status replaced after encoding failure: %q", got) }
 }
 
 func TestStatusWritesUsePublicationLock(t *testing.T) {

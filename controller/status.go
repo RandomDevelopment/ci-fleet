@@ -10,6 +10,9 @@ import (
 )
 
 var statusWriteMu sync.Mutex
+var encodeControllerStatus = func(file *os.File, value controllerStatus) error {
+	return json.NewEncoder(file).Encode(value)
+}
 
 type controllerStatus struct {
 	Controller      string `json:"controller"`
@@ -42,8 +45,8 @@ func (s *Scaler) writeStatus() {
 	}
 	name := temporary.Name()
 	defer os.Remove(name)
-	if err := temporary.Chmod(0o644); err == nil {
-		err = json.NewEncoder(temporary).Encode(value)
+	if err = temporary.Chmod(0o644); err == nil {
+		err = encodeControllerStatus(temporary, value)
 	}
 	if closeErr := temporary.Close(); err == nil { err = closeErr }
 	if err == nil { err = os.Rename(name, s.config.StatusFile) }

@@ -35,7 +35,8 @@ func (r *runnerState) markBusy(name string) bool {
 	defer r.mu.Unlock()
 	id, ok := r.idle[name]
 	if !ok {
-		return false
+		_, ok = r.exited[name]
+		return ok
 	}
 	delete(r.idle, name)
 	r.busy[name] = id
