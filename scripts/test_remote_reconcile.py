@@ -245,6 +245,11 @@ class TestRemoteReconcile(unittest.TestCase):
         self.assertIsInstance(state, dict)
         self.assertIsNone(state["last_success_at"])
 
+    def test_reconciliation_health_probe_suppresses_delivery(self):
+        content = RECONCILE_SCRIPT.read_text()
+        probe = content.split("run_health_check()", 1)[1].split("}", 1)[0]
+        self.assertIn("export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1", probe)
+
     def test_no_op_does_not_advance_last_success_timestamp(self):
         content = RECONCILE_SCRIPT.read_text()
         no_op = content.split('if [[ "$no_op" == true ]]; then', 2)[2].split("exit 0", 1)[0]
