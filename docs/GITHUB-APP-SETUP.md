@@ -101,7 +101,7 @@ ssh "$CONTROLLER" "
   cat >\"\$tmp\" &&
   chown root:root \"\$tmp\" &&
   chmod 0600 \"\$tmp\" &&
-  ln -- \"\$tmp\" \"$PEM_DEST\" &&
+  ln -T -- \"\$tmp\" \"$PEM_DEST\" &&
   rm -f -- \"\$tmp\" &&
   trap - 0
 " <"$PEM" &&
@@ -290,11 +290,20 @@ Only after every activation check above succeeds:
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
-   for pem in "$PEM_DEST" "$ACTIVE_PEM"; do
+   OLD_PEM_PATHS=("$ACTIVE_PEM")
+   if sudo test -L "$ACTIVE_PEM"; then
+     backing=$(sudo readlink -f -- "$ACTIVE_PEM") || exit 1
+     OLD_PEM_PATHS+=("$backing")
+   fi
+   valid_pem_path "$PEM_DEST" || exit 1
+   for pem in "${OLD_PEM_PATHS[@]}"; do
      valid_pem_path "$pem" || exit 1
+     [[ "$pem" != "$PEM_DEST" ]] || exit 1
    done
-   [[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1
-   sudo rm -f -- "$ACTIVE_PEM"
+   for pem in "${OLD_PEM_PATHS[@]}"; do
+     sudo rm -f -- "$pem" || exit 1
+   done
+   unset backing OLD_PEM_PATHS
    ```
 
 3. Remove any old workstation or temporary copies under the applicable secure

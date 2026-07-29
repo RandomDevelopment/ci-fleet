@@ -51,7 +51,7 @@ assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert active_guard in transfer
 assert transfer.index(active_guard) < transfer.index('ssh "$CONTROLLER"')
 assert "mktemp --" in transfer and 'cat >\\"\\$tmp\\"' in transfer
-hard_link = 'ln -- \\"\\$tmp\\" \\"$PEM_DEST\\"'
+hard_link = 'ln -T -- \\"\\$tmp\\" \\"$PEM_DEST\\"'
 assert hard_link in transfer
 assert transfer.index("mktemp --") < transfer.index('cat >\\"\\$tmp\\"')
 assert transfer.index('cat >\\"\\$tmp\\"') < transfer.index(hard_link)
@@ -110,10 +110,12 @@ revocation = app_setup[
     )
 ]
 read_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
-validate_paths = 'for pem in "$PEM_DEST" "$ACTIVE_PEM"; do'
-distinct_paths = '[[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1'
-remove_old_pem = 'sudo rm -f -- "$ACTIVE_PEM"'
+validate_paths = 'for pem in "${OLD_PEM_PATHS[@]}"; do'
+distinct_paths = '[[ "$pem" != "$PEM_DEST" ]] || exit 1'
+remove_old_pem = 'sudo rm -f -- "$pem" || exit 1'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
+assert 'backing=$(sudo readlink -f -- "$ACTIVE_PEM") || exit 1' in revocation
+assert 'OLD_PEM_PATHS+=("$backing")' in revocation
 assert "^/[A-Za-z0-9._/-]+$" in revocation
 assert revocation.index(read_destination) < revocation.index(validate_paths)
 assert revocation.index(validate_paths) < revocation.index(distinct_paths)
