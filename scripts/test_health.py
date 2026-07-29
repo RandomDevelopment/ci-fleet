@@ -349,7 +349,9 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(health._send_status(values, report, now=1_000, nonce="b" * 32, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError())), 1)
                 self.assertEqual(report, original)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "http://unsafe.invalid"}, report), 1)
+                self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "https://[bad/v1/status"}, report), 1)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_HEARTBEAT_URL": "https://legacy.invalid"}, report), 1)
+                self.assertIsNone(health._NoRedirect().redirect_request(None, None, 302, None, {}, None))
             finally:
                 if old is None:
                     os.environ.pop("CI_FLEET_TESTING", None)

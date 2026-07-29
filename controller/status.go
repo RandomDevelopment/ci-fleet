@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
+
+var statusWriteMu sync.Mutex
 
 type controllerStatus struct {
 	Controller      string `json:"controller"`
@@ -17,6 +20,8 @@ type controllerStatus struct {
 }
 
 func (s *Scaler) writeStatus() {
+	statusWriteMu.Lock()
+	defer statusWriteMu.Unlock()
 	current, busy := s.runners.counts()
 	softwareVersion := commitSHA
 	if softwareVersion == "unknown" { softwareVersion = version }

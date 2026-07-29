@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriteStatusReportsRunnerCountsWithoutControllingExecution(t *testing.T) {
@@ -34,5 +35,28 @@ func TestWriteStatusReportsRunnerCountsWithoutControllingExecution(t *testing.T)
 	scaler.writeStatus()
 	if current, busy := scaler.runners.counts(); current != 2 || busy != 1 {
 		t.Fatalf("status failure changed runner state: current=%d busy=%d", current, busy)
+	}
+}
+
+func TestStatusWritesUsePublicationLock(t *testing.T) {
+	scaler := &Scaler{
+		runners: newRunnerState(),
+		logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		config: Config{FleetInstance: "example-ci-01", MaxRunners: 1, StatusFile: filepath.Join(t.TempDir(), "status.json")},
+	}
+	statusWriteMu.Lock()
+	done := make(chan struct{})
+	go func() { scaler.writeStatus(); close(done) }()
+	select {
+	case <-done:
+		statusWriteMu.Unlock()
+		t.Fatal("status write bypassed publication lock")
+	case <-time.After(20 * time.Millisecond):
+		statusWriteMu.Unlock()
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("status write did not resume after publication lock")
 	}
 }

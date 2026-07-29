@@ -121,6 +121,14 @@ class StatusReceiverTests(unittest.TestCase):
                 read_token="reader-token",
             )
 
+    def test_retention_bounds_must_be_positive(self) -> None:
+        for values in ({"history_limit": 0}, {"retention_seconds": -1}):
+            with self.assertRaisesRegex(ValueError, "positive"):
+                status_receiver.StatusReceiver(
+                    Path(self.temporary.name) / "invalid.db", {"example-ci-01": self.key},
+                    read_token="reader-token", **values,
+                )
+
     def test_authentication_rejects_tampering_and_unknown_controller(self) -> None:
         body, headers = self.signed(valid_report())
         self.assert_status_error(401, "authentication_failed", lambda: self.receiver.submit(body + b" ", headers, now=1_000))
@@ -240,7 +248,18 @@ class StatusReceiverTests(unittest.TestCase):
     def test_read_api_authentication_and_controller_listing(self) -> None:
         self.submit(valid_report())
         self.assert_status_error(401, "read_authentication_failed", lambda: self.receiver.latest("example-ci-01", "wrong"))
+        self.assert_status_error(401, "read_authentication_failed", lambda: self.receiver.latest("example-ci-01", "tök"))
         self.assertEqual(self.receiver.list_latest("reader-token"), [valid_report()])
+
+    def test_http_server_bounds_slow_clients(self) -> None:
+        server = status_receiver.create_server("127.0.0.1", 0, self.receiver)
+        self.addCleanup(server.server_close)
+        self.assertEqual((server.max_requests, server.request_timeout), (32, 15))
+        for _ in range(server.max_requests):
+            self.assertTrue(server._slots.acquire(blocking=False))
+        self.assertFalse(server._slots.acquire(blocking=False))
+        for _ in range(server.max_requests):
+            server._slots.release()
 
 
 if __name__ == "__main__":

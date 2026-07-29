@@ -236,6 +236,15 @@ class TestRemoteReconcile(unittest.TestCase):
         subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
         self.assertEqual(json.loads(state_path.read_text())["last_success_at"], 777)
 
+    def test_non_object_reconcile_state_is_recovered(self):
+        state_path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("[]\n")
+        subprocess.run([str(RECONCILE_SCRIPT)], capture_output=True, text=True, env=self.env)
+        state = json.loads(state_path.read_text())
+        self.assertIsInstance(state, dict)
+        self.assertIsNone(state["last_success_at"])
+
     def test_no_op_does_not_advance_last_success_timestamp(self):
         content = RECONCILE_SCRIPT.read_text()
         no_op = content.split('if [[ "$no_op" == true ]]; then', 2)[2].split("exit 0", 1)[0]

@@ -41,6 +41,8 @@ class StatusReceiver:
         max_payload_bytes: int = 32_768,
         max_clock_skew_seconds: int = 300,
     ) -> None:
+        if history_limit < 1 or retention_seconds < 1:
+            raise ValueError("history and retention bounds must be positive")
         if len(set(controller_keys.values())) != len(controller_keys):
             raise ValueError("controller authentication keys must be unique")
         self.database = database
@@ -203,7 +205,7 @@ class StatusReceiver:
             raise StatusError(400, "invalid_report")
 
     def _authorize_read(self, read_token: str) -> None:
-        if not hmac.compare_digest(read_token, self.read_token):
+        if not hmac.compare_digest(read_token.encode(), self.read_token.encode()):
             raise StatusError(401, "read_authentication_failed")
 
     def latest(self, controller: str, read_token: str) -> dict[str, Any] | None:
@@ -238,7 +240,34 @@ class StatusReceiver:
         return [json.loads(row[0]) for row in rows]
 
 
-def create_server(bind: str, port: int, receiver: StatusReceiver) -> http.server.ThreadingHTTPServer:
+class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args: Any, max_requests: int = 32, request_timeout: int = 15, **kwargs: Any) -> None:
+        self.max_requests = max_requests
+        self.request_timeout = request_timeout
+        self._slots = threading.BoundedSemaphore(max_requests)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            request.settimeout(self.request_timeout)
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTTPServer:
     class Handler(http.server.BaseHTTPRequestHandler):
         def send_json(self, status: int, value: Any) -> None:
             body = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -292,9 +321,7 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> http.server
         def log_message(self, format: str, *args: Any) -> None:
             pass
 
-    server = http.server.ThreadingHTTPServer((bind, port), Handler)
-    server.daemon_threads = True
-    return server
+    return _BoundedHTTPServer((bind, port), Handler)
 
 
 def _read_secret(path: Path) -> bytes:

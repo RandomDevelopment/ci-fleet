@@ -19,6 +19,11 @@ from typing import Any, Callable
 from status_auth import sign_headers
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
 @dataclass(frozen=True)
 class Thresholds:
     disk_warn_percent: int = 80
@@ -567,12 +572,15 @@ def _send_status(
     *,
     now: int | None = None,
     nonce: str | None = None,
-    opener: Callable[..., Any] = urllib.request.urlopen,
+    opener: Callable[..., Any] | None = None,
 ) -> int:
     url = values.get("CI_FLEET_HEALTH_STATUS_URL")
     if not url:
         return 1 if values.get("CI_FLEET_HEALTH_HEARTBEAT_URL") else 0
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return 1
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path != "/v1/status" or parsed.query or parsed.fragment:
         return 1
     key_file = values.get("CI_FLEET_HEALTH_STATUS_KEY_FILE")
@@ -600,7 +608,8 @@ def _send_status(
         method="POST",
     )
     try:
-        with opener(request, timeout=10) as response:
+        transport = opener or urllib.request.build_opener(_NoRedirect).open
+        with transport(request, timeout=10) as response:
             return 0 if 200 <= response.status < 300 else 1
     except OSError:
         return 1

@@ -83,6 +83,8 @@ path = sys.argv[1]
 now = int(__import__("time").time())
 try:
     previous = json.load(open(path, encoding="utf-8"))
+    if not isinstance(previous, dict):
+        raise ValueError("reconciliation state must be an object")
     last_success_at = previous.get("last_success_at")
     if not isinstance(last_success_at, int) or last_success_at < 0:
         last_success_at = None
