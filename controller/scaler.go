@@ -51,12 +51,13 @@ func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) e
 }
 
 func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobCompleted) error {
-	id, ok := s.runners.markDone(job.RunnerName)
+	id, cleanup, ok := s.runners.markDone(job.RunnerName)
 	if !ok {
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
 	s.writeStatus()
 	s.logger.Info("job completed", "runner", job.RunnerName, "jobID", job.JobID)
+	if !cleanup { return nil }
 	return s.logAndRemove(ctx, job.RunnerName, id)
 }
 
@@ -108,10 +109,11 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 		return
 	case <-stopped:
 	}
-	if !s.runners.remove(name, id) { return }
+	if !s.runners.markExited(name, id) { return }
 	s.writeStatus()
 	s.logger.Warn("runner container exited before job completion", "runner", name)
 	_ = s.logAndRemove(context.WithoutCancel(ctx), name, id)
+	time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, id) })
 }
 
 func (s *Scaler) recoverStale(ctx context.Context) error {
