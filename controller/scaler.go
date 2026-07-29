@@ -112,9 +112,15 @@ waitLoop:
 			if ok && errdefs.IsNotFound(err) { break waitLoop }
 			if ok { s.logger.Warn("watch runner container", "runner", name, "error", err) }
 			time.Sleep(time.Minute)
-		case _, ok := <-stopped:
+		case response, ok := <-stopped:
 			if !ok {
 				if !s.runners.contains(name, id) { return }
+				time.Sleep(time.Minute)
+				continue
+			}
+			if response.Error != nil {
+				if !s.runners.contains(name, id) { return }
+				s.logger.Warn("watch runner container", "runner", name, "error", response.Error.Message)
 				time.Sleep(time.Minute)
 				continue
 			}
