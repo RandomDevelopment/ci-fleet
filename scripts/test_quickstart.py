@@ -66,12 +66,24 @@ assert 'rm -f -- "$PEM"' not in failure_branch
 for use in (
     "exact value of `PEM_DEST`",
     "exact value of `ACTIVE_PEM`",
-    'sudo rm -f -- "$ACTIVE_PEM"',
 ):
     assert use in app_setup, f"configured PEM destination contract missing: {use}"
 
-retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
+revocation = app_setup[
+    app_setup.index("## Old-key revocation") : app_setup.index(
+        "## Controller retirement and PEM removal"
+    )
+]
 read_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
+validate_paths = 'for pem in "$PEM_DEST" "$ACTIVE_PEM"; do'
+distinct_paths = '[[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1'
+remove_old_pem = 'sudo rm -f -- "$ACTIVE_PEM"'
+assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
+assert revocation.index(read_destination) < revocation.index(validate_paths)
+assert revocation.index(validate_paths) < revocation.index(distinct_paths)
+assert revocation.index(distinct_paths) < revocation.index(remove_old_pem)
+
+retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
 validate_paths = '[[ "$pem" =~ ^/etc/ci-fleet/secrets/'
 uninstall = "scripts/install-worker-controller.sh \\\n     --uninstall"
 remove_pem = 'sudo rm -f -- "$pem"'

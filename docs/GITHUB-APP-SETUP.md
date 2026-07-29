@@ -192,8 +192,10 @@ New controller: new app. Do not share one app across controllers.
    transfer must not overwrite either path. Continue only after every transfer
    and verification command succeeds and the downloaded workstation copy is
    removed.
-2. Update `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` in
-   `/etc/ci-fleet/host.env` to the exact value of `PEM_DEST`.
+2. Before changing `host.env`, record the exact value of `ACTIVE_PEM` for
+   rollback and old-file removal. Then update
+   `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` in `/etc/ci-fleet/host.env` to the
+   exact value of `PEM_DEST`.
 3. Verify that the new key can mint a token, always suppressing token stdout:
 
    ```bash
@@ -224,10 +226,19 @@ Only after every activation check above succeeds:
 
 1. On the GitHub App settings page, under **Private keys**, delete/revoke the
    old key.
-2. Remove the old PEM from the controller by its exact path; do not use a broad
-   wildcard in a shared secrets directory:
+2. In the current shell, read the new active destination from `host.env` and
+   reassign `ACTIVE_PEM` to the exact old path recorded before activation.
+   Validate both paths and their inequality before removing the old PEM; do not
+   use a broad wildcard in a shared secrets directory:
 
    ```bash
+   PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
+     /etc/ci-fleet/host.env | cut -d= -f2-)
+   ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
+   for pem in "$PEM_DEST" "$ACTIVE_PEM"; do
+     [[ "$pem" =~ ^/etc/ci-fleet/secrets/[A-Za-z0-9._-]+\.pem$ ]] || exit 1
+   done
+   [[ "$ACTIVE_PEM" != "$PEM_DEST" ]] || exit 1
    sudo rm -f -- "$ACTIVE_PEM"
    ```
 
