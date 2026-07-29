@@ -58,6 +58,7 @@ class StatusReceiver:
         self.max_clock_skew_seconds = max_clock_skew_seconds
         # ponytail: one receiver-wide lock; split by controller only if measured write contention warrants it.
         self._write_lock = threading.Lock()
+        self._last_attempt: dict[str, int] = {}
         self._clock = time.time
         with self._connect() as connection:
             connection.executescript("""
@@ -112,6 +113,12 @@ class StatusReceiver:
             raise StatusError(409, "report_time_stale")
         encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
         with self._write_lock, self._connect() as connection:
+            if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
+                raise StatusError(409, "replayed_report")
+            last_attempt = self._last_attempt.get(controller)
+            if last_attempt is not None and now - last_attempt < 1:
+                raise StatusError(429, "submission_too_frequent")
+            self._last_attempt[controller] = now
             try:
                 connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
                 connection.commit()
@@ -160,6 +167,9 @@ class StatusReceiver:
         def number(value: Any, minimum: float = 0) -> bool:
             return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= minimum and value < float("inf")
 
+        def enum(value: Any, choices: set[str]) -> bool:
+            return isinstance(value, str) and value in choices
+
         if not isinstance(report, dict) or type(report.get("schema_version")) is not int or report["schema_version"] != 1:
             raise StatusError(400, "unsupported_schema")
         root_keys = {"schema_version", "controller", "configuration", "reconciliation", "drift", "process", "timers", "runners", "metrics", "docker", "error", "generated_at"}
@@ -170,7 +180,7 @@ class StatusReceiver:
             raise StatusError(403, "controller_identity_mismatch")
         if not isinstance(identity["software_version"], str) or not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", identity["software_version"]):
             raise StatusError(400, "invalid_report")
-        if not integer(identity["boot_time"]) or identity["ssh"] not in {"enabled", "disabled", "unknown"}:
+        if not integer(identity["boot_time"]) or not enum(identity["ssh"], {"enabled", "disabled", "unknown"}):
             raise StatusError(400, "invalid_report")
         generated_at = report["generated_at"]
         if not integer(generated_at) or identity["boot_time"] > generated_at:
@@ -182,17 +192,17 @@ class StatusReceiver:
             raise StatusError(400, "invalid_report")
         reconciliation = report["reconciliation"]
         reconcile_states = {"bootstrap", "converged", "drift", "failed", "invalid", "missing", "pending", "reconciling", "rolled_back", "unknown"}
-        if not exact(reconciliation, {"state", "last_success_at"}) or reconciliation["state"] not in reconcile_states:
+        if not exact(reconciliation, {"state", "last_success_at"}) or not enum(reconciliation["state"], reconcile_states):
             raise StatusError(400, "invalid_report")
         if reconciliation["last_success_at"] is not None and (not integer(reconciliation["last_success_at"]) or reconciliation["last_success_at"] > generated_at):
             raise StatusError(400, "invalid_report")
-        if not exact(report["drift"], {"state"}) or report["drift"]["state"] not in {"ok", "stale", "failed", "unknown"}:
+        if not exact(report["drift"], {"state"}) or not enum(report["drift"]["state"], {"ok", "stale", "failed", "unknown"}):
             raise StatusError(400, "invalid_report")
         process = report["process"]
-        if not exact(process, {"state", "restart_count"}) or process["state"] not in {"created", "exited", "missing", "paused", "restarting", "running", "unknown"} or not integer(process["restart_count"]):
+        if not exact(process, {"state", "restart_count"}) or not enum(process["state"], {"created", "exited", "missing", "paused", "restarting", "running", "unknown"}) or not integer(process["restart_count"]):
             raise StatusError(400, "invalid_report")
         timers = report["timers"]
-        if not exact(timers, {"reconciliation", "drift", "health", "cleanup"}) or any(value not in {"ok", "stale", "failed", "unknown"} for value in timers.values()):
+        if not exact(timers, {"reconciliation", "drift", "health", "cleanup"}) or any(not enum(value, {"ok", "stale", "failed", "unknown"}) for value in timers.values()):
             raise StatusError(400, "invalid_report")
         runners = report["runners"]
         if not exact(runners, {"current", "busy", "maximum"}) or not all(integer(value) for value in runners.values()) or not (runners["busy"] <= runners["current"] <= runners["maximum"]):

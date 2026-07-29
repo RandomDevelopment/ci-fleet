@@ -104,6 +104,7 @@ Covered threats:
 Residual risks:
 
 - compromise of one controller exposes that controller's reporting key and permits forged reports for that identity until rotation;
+- ordinary runner jobs are already host-root-equivalent through the Docker socket and can read any host-local reporting key; this channel prevents cross-controller impersonation but does not attest a controller against malicious code already running on that controller. Isolate job Docker onto a separate trust boundary before treating reports as adversarial to job code;
 - compromise of the receiver exposes retained status and all receiver-side reporting keys;
 - HMAC keys are symmetric; use a managed asymmetric identity service later if receiver compromise becomes part of the impersonation threat model;
 - the read bearer token is suitable for the backend foundation, not browser distribution. A future console should terminate user authentication before this API.

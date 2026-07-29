@@ -181,6 +181,10 @@ class StatusReceiverTests(unittest.TestCase):
         limited.submit(body, headers, now=1_000)
         second_body, second_headers = self.signed(valid_report(generated_at=1_001), timestamp=1_001, nonce="b" * 32)
         self.assert_status_error(429, "submission_too_frequent", lambda: limited.submit(second_body, second_headers, now=1_001))
+        third_body, third_headers = self.signed(valid_report(generated_at=1_002), timestamp=1_002, nonce="c" * 32)
+        self.assert_status_error(429, "submission_too_frequent", lambda: limited.submit(third_body, third_headers, now=1_001))
+        with sqlite3.connect(limited.database) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM nonces").fetchone()[0], 2)
         self.assert_status_error(409, "replayed_report", lambda: limited.submit(second_body, second_headers, now=1_031))
 
     def test_schema_compatibility_and_malformed_metrics(self) -> None:
@@ -193,6 +197,18 @@ class StatusReceiverTests(unittest.TestCase):
         boolean["schema_version"] = True
         body, headers = self.signed(boolean, nonce="f" * 32)
         self.assert_status_error(400, "unsupported_schema", lambda: self.receiver.submit(body, headers, now=1_000))
+
+        for mutate in (
+            lambda report: report["controller"].update(ssh={}),
+            lambda report: report["reconciliation"].update(state=[]),
+            lambda report: report["drift"].update(state={}),
+            lambda report: report["process"].update(state=[]),
+            lambda report: report["timers"].update(health={}),
+        ):
+            malformed = valid_report()
+            mutate(malformed)
+            body, headers = self.signed(malformed, nonce="e" * 32)
+            self.assert_status_error(400, "invalid_report", lambda body=body, headers=headers: self.receiver.submit(body, headers, now=1_000))
 
         malformed = valid_report()
         malformed["metrics"]["memory"]["available_bytes"] = -1
