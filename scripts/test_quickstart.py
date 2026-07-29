@@ -81,6 +81,16 @@ for use in (
 ):
     assert use in app_setup, f"configured PEM destination contract missing: {use}"
 
+rotation = app_setup[
+    app_setup.index("## Key rotation: activate and verify before revocation") :
+    app_setup.index("## Old-key revocation")
+]
+assert "`healthy` for an `active` controller" in rotation
+assert "`maintenance`" in rotation and "`drained` or `disabled`" in rotation
+checkpoint_match = '"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST"'
+assert checkpoint_match in rotation
+assert "retain the old GitHub key and old PEM" in rotation
+
 revocation = app_setup[
     app_setup.index("## Old-key revocation") : app_setup.index(
         "## Controller retirement and PEM removal"
@@ -100,15 +110,23 @@ retirement = app_setup[app_setup.index("## Controller retirement and PEM removal
 validate_paths = 'valid_pem_path "$pem" || exit 1'
 uninstall = "scripts/install-worker-controller.sh \\\n        --uninstall &&"
 remove_pem = 'sudo rm -f -- "$pem" || return 1'
-persist_inventory = 'sudo install -m 0600 /dev/stdin "$PEM_INVENTORY" || exit 1'
+persist_inventory = 'sudo install -m 0600 /dev/stdin "$PEM_INVENTORY"'
 remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env &&"
 remove_inventory = 'sudo rm -f -- "$PEM_INVENTORY"; then'
-assert 'RETIRED_PEMS=("$PEM_DEST")' in retirement
+classify_destination = 'configured_classifications=$((configured_classifications + 1))'
+manager_absent = 'sudo test ! -e "$pem" || exit 1'
+inventory_distinct = '[[ "$pem" != "$PEM_INVENTORY" ]] || exit 1'
+assert 'LOCAL_PEMS=(' in retirement and 'MANAGED_PEMS=(' in retirement
 assert "^/[A-Za-z0-9._/-]+$" in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
-assert retirement.index(validate_paths) < retirement.index(persist_inventory)
+assert retirement.index(validate_paths) < retirement.index(inventory_distinct)
+assert retirement.index(inventory_distinct) < retirement.index(classify_destination)
+assert "((configured_classifications == 1)) || exit 1" in retirement
+assert retirement.index(classify_destination) < retirement.index(manager_absent)
+assert retirement.index(manager_absent) < retirement.index(persist_inventory)
 assert retirement.index(persist_inventory) < retirement.index(uninstall)
 assert remove_pem in retirement
+assert 'for pem in "${LOCAL_PEMS[@]}"; do' in retirement
 assert retirement.index(uninstall) < retirement.index("remove_retired_pems &&")
 assert retirement.index("remove_retired_pems &&") < retirement.index(remove_host_env)
 assert retirement.index(remove_host_env) < retirement.index(remove_inventory)

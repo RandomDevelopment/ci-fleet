@@ -228,10 +228,30 @@ New controller: new app. Do not share one app across controllers.
    ```
 
    Stop if reconciliation does not report `RECONCILE_OK`, the health check is
-   not healthy, or the final check does not report `CHECK_OK`. Restore
+   not `healthy` for an `active` controller or `maintenance` for a controller
+   whose reviewed desired state is `drained` or `disabled`, or the final check
+   does not report `CHECK_OK`. Warning and unhealthy results always fail.
+   Restore
    `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` to the exact value of `ACTIVE_PEM`
    and reconcile again; do not revoke the old key or remove either PEM until
    rollback is healthy and converged.
+5. Before revoking the old key, verify that the newest complete rollback
+   checkpoint references `PEM_DEST`, not `ACTIVE_PEM`:
+
+   ```bash
+   LATEST_CHECKPOINT=$(sudo find /var/lib/ci-fleet/checkpoints \
+     -mindepth 2 -maxdepth 2 -type f -name .complete \
+     -printf '%T@ %h\n' | sort -nr | awk 'NR == 1 {print $2}')
+   [[ -n "$LATEST_CHECKPOINT" ]] || exit 1
+   sudo grep -Fx -- \
+     "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST" \
+     "$LATEST_CHECKPOINT/ci-fleet.env" >/dev/null || exit 1
+   ```
+
+   The rotation itself checkpoints the pre-rotation environment. If this gate
+   fails, retain the old GitHub key and old PEM until a subsequent reviewed
+   controller mutation creates and validates a checkpoint based on the new
+   path. Do not revoke a key still required by the latest rollback checkpoint.
 
 ## Old-key revocation
 
@@ -272,9 +292,11 @@ Retirement is not complete when only the App installation is removed:
 3. On the GitHub App settings page, delete/revoke **every** private key for this
    controller's app; delete the dedicated app itself if it will not be reused.
 4. Before uninstalling, read the configured destination while `host.env` still
-   exists and enumerate every retained rotation path explicitly. The
-   uninstaller deliberately preserves `/etc/ci-fleet/host.env` and
-   `/etc/ci-fleet/secrets`:
+   exists and classify every retained rotation path explicitly. Revoke or
+   unmount each secret-manager-backed path through that manager first and
+   verify that it is absent; never pass a manager-owned path to `rm`.
+   `LOCAL_PEMS` must contain only host-local files. The uninstaller deliberately
+   preserves `/etc/ci-fleet/host.env` and `/etc/ci-fleet/secrets`:
 
    ```bash
    valid_pem_path() {
@@ -283,18 +305,31 @@ Retirement is not complete when only the App installation is removed:
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
-   RETIRED_PEMS=("$PEM_DEST")
-   # Repeat for every retained old rotation path; never use a wildcard.
-   RETIRED_PEMS+=("/etc/ci-fleet/secrets/OLD-ROTATION-ID.pem")
-   for pem in "${RETIRED_PEMS[@]}"; do
-     valid_pem_path "$pem" || exit 1
-   done
+   # Put PEM_DEST and every old path in exactly one array; never use a wildcard.
+   LOCAL_PEMS=("/etc/ci-fleet/secrets/HOST-LOCAL-KEY.pem")
+   MANAGED_PEMS=("/run/secret-manager/MANAGER-BACKED-KEY")
    PEM_INVENTORY=/etc/ci-fleet/retired-pem-paths
-   printf '%s\n' "${RETIRED_PEMS[@]}" | \
-     sudo install -m 0600 /dev/stdin "$PEM_INVENTORY" || exit 1
+   configured_classifications=0
+   for pem in "${LOCAL_PEMS[@]}" "${MANAGED_PEMS[@]}"; do
+     valid_pem_path "$pem" || exit 1
+     [[ "$pem" != "$PEM_INVENTORY" ]] || exit 1
+     if [[ "$pem" == "$PEM_DEST" ]]; then
+       configured_classifications=$((configured_classifications + 1))
+     fi
+   done
+   ((configured_classifications == 1)) || exit 1
+   for pem in "${MANAGED_PEMS[@]}"; do
+     sudo test ! -e "$pem" || exit 1
+   done
+   if ((${#LOCAL_PEMS[@]})); then
+     printf '%s\n' "${LOCAL_PEMS[@]}" | \
+       sudo install -m 0600 /dev/stdin "$PEM_INVENTORY"
+   else
+     sudo install -m 0600 /dev/null "$PEM_INVENTORY"
+   fi || exit 1
 
    remove_retired_pems() {
-     for pem in "${RETIRED_PEMS[@]}"; do
+     for pem in "${LOCAL_PEMS[@]}"; do
        sudo rm -f -- "$pem" || return 1
      done
    }
@@ -303,7 +338,7 @@ Retirement is not complete when only the App installation is removed:
       remove_retired_pems &&
       sudo rm -f -- /etc/ci-fleet/host.env &&
       sudo rm -f -- "$PEM_INVENTORY"; then
-     unset PEM_DEST PEM_INVENTORY RETIRED_PEMS
+     unset PEM_DEST PEM_INVENTORY LOCAL_PEMS MANAGED_PEMS
    else
      printf 'retirement cleanup failed; retained %s and host.env\n' \
        "$PEM_INVENTORY" >&2
@@ -311,13 +346,14 @@ Retirement is not complete when only the App installation is removed:
    fi
    ```
 
-   Replace or repeat the example old path for every exact rotation path used by
-   this app. If path extraction or validation fails, stop before uninstalling
-   or removing `host.env`. On later cleanup failure, rebuild `RETIRED_PEMS`
+   Replace or repeat the examples for every exact rotation path used by this
+   app. If classification, manager cleanup, extraction, or validation fails,
+   stop before uninstalling
+   or removing `host.env`. On later cleanup failure, rebuild `LOCAL_PEMS`
    from the retained root-owned inventory before retrying exact-path removal;
    the inventory is deleted only after every PEM and `host.env` are removed.
-5. Remove remaining management-workstation, temporary, secret-manager, and
-   backup copies according to their retention and secure-erasure policies. If
+5. Remove remaining management-workstation, temporary, and backup copies
+   according to their retention and secure-erasure policies. If
    the retired storage cannot guarantee file-level erasure (for example SSD,
    snapshot, or copy-on-write media), destroy the encrypted volume or its
    encryption key before disposal.
