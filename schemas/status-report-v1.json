@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RandomDevelopment/ci-fleet/blob/main/schemas/status-report-v1.json",
+  "title": "ci-fleet controller status report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "controller", "configuration", "reconciliation", "drift", "process", "timers", "runners", "metrics", "docker", "error", "generated_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "controller": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "software_version", "boot_time", "ssh"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+        "software_version": {"type": "string", "pattern": "^[A-Za-z0-9_.+-]{1,64}$"},
+        "boot_time": {"type": "integer", "minimum": 0},
+        "ssh": {"enum": ["enabled", "disabled", "unknown"]}
+      }
+    },
+    "configuration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["desired_commit", "applied_commit"],
+      "properties": {
+        "desired_commit": {"$ref": "#/$defs/commit"},
+        "applied_commit": {"$ref": "#/$defs/commit"}
+      }
+    },
+    "reconciliation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "last_success_at"],
+      "properties": {
+        "state": {"enum": ["bootstrap", "converged", "drift", "failed", "invalid", "missing", "pending", "reconciling", "rolled_back", "unknown"]},
+        "last_success_at": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "drift": {
+      "type": "object", "additionalProperties": false, "required": ["state"],
+      "properties": {"state": {"enum": ["ok", "stale", "failed", "unknown"]}}
+    },
+    "process": {
+      "type": "object", "additionalProperties": false, "required": ["state", "restart_count"],
+      "properties": {
+        "state": {"enum": ["created", "exited", "missing", "paused", "restarting", "running", "unknown"]},
+        "restart_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "timers": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reconciliation", "drift", "health", "cleanup"],
+      "properties": {
+        "reconciliation": {"$ref": "#/$defs/unitState"},
+        "drift": {"$ref": "#/$defs/unitState"},
+        "health": {"$ref": "#/$defs/unitState"},
+        "cleanup": {"$ref": "#/$defs/unitState"}
+      }
+    },
+    "runners": {
+      "type": "object", "additionalProperties": false,
+      "required": ["current", "busy", "maximum"],
+      "properties": {
+        "current": {"type": "integer", "minimum": 0},
+        "busy": {"type": "integer", "minimum": 0},
+        "maximum": {"type": "integer", "minimum": 0}
+      }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cpu", "memory", "swap", "disk", "inodes", "load"],
+      "properties": {
+        "cpu": {
+          "type": "object", "additionalProperties": false, "required": ["logical", "used_percent"],
+          "properties": {
+            "logical": {"type": "integer", "minimum": 1},
+            "used_percent": {"type": "number", "minimum": 0, "maximum": 100}
+          }
+        },
+        "memory": {
+          "type": "object", "additionalProperties": false, "required": ["total_bytes", "available_bytes"],
+          "properties": {
+            "total_bytes": {"type": "integer", "minimum": 0},
+            "available_bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "swap": {"$ref": "#/$defs/byteUsage"},
+        "disk": {
+          "type": "object", "additionalProperties": false, "required": ["root", "docker"],
+          "properties": {"root": {"$ref": "#/$defs/byteUsage"}, "docker": {"$ref": "#/$defs/byteUsage"}}
+        },
+        "inodes": {
+          "type": "object", "additionalProperties": false, "required": ["root", "docker"],
+          "properties": {"root": {"$ref": "#/$defs/inodeUsage"}, "docker": {"$ref": "#/$defs/inodeUsage"}}
+        },
+        "load": {
+          "type": "object", "additionalProperties": false, "required": ["one", "five", "fifteen"],
+          "properties": {
+            "one": {"type": "number", "minimum": 0},
+            "five": {"type": "number", "minimum": 0},
+            "fifteen": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    },
+    "docker": {
+      "type": "object", "additionalProperties": false, "required": ["healthy", "oom"],
+      "properties": {"healthy": {"type": "boolean"}, "oom": {"type": "boolean"}}
+    },
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false, "required": ["code", "message"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^[a-z0-9_]{1,64}$"},
+            "message": {"type": "string", "pattern": "^[a-z0-9 ]{1,64}$"}
+          }
+        }
+      ]
+    },
+    "generated_at": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^(|[0-9a-f]{40})$"},
+    "unitState": {"enum": ["ok", "stale", "failed", "unknown"]},
+    "byteUsage": {
+      "type": "object", "additionalProperties": false, "required": ["total_bytes", "used_bytes"],
+      "properties": {
+        "total_bytes": {"type": "integer", "minimum": 0},
+        "used_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "inodeUsage": {
+      "type": "object", "additionalProperties": false, "required": ["total", "used"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "used": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/google/uuid"
 )
 
@@ -30,6 +31,7 @@ type Scaler struct {
 }
 
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+	defer s.writeStatus()
 	current := s.runners.count()
 	target := min(s.config.MaxRunners, s.config.MinRunners+count)
 	for i := current; i < target; i++ {
@@ -44,16 +46,19 @@ func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) e
 	if !s.runners.markBusy(job.RunnerName) {
 		return fmt.Errorf("job started for unknown runner %q", job.RunnerName)
 	}
+	s.writeStatus()
 	s.logger.Info("job started", "runner", job.RunnerName, "jobID", job.JobID)
 	return nil
 }
 
 func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobCompleted) error {
-	id, ok := s.runners.markDone(job.RunnerName)
+	id, cleanup, ok := s.runners.markDone(job.RunnerName)
 	if !ok {
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
+	s.writeStatus()
 	s.logger.Info("job completed", "runner", job.RunnerName, "jobID", job.JobID)
+	if !cleanup { return nil }
 	return s.logAndRemove(ctx, job.RunnerName, id)
 }
 
@@ -92,8 +97,48 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("start runner container: %w", err)
 	}
 	s.runners.addIdle(name, created.ID)
+	go s.watchRunner(context.WithoutCancel(ctx), name, created.ID)
 	s.logger.Info("runner started", "runner", name, "containerID", created.ID)
 	return name, nil
+}
+
+func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
+waitLoop:
+	for {
+		stopped, errors := s.dockerClient.ContainerWait(ctx, id, container.WaitConditionNotRunning)
+		select {
+		case err, ok := <-errors:
+			if !s.runners.contains(name, id) { return }
+			if ok && errdefs.IsNotFound(err) { break waitLoop }
+			if ok { s.logger.Warn("watch runner container", "runner", name, "error", err) }
+			time.Sleep(time.Minute)
+		case response, ok := <-stopped:
+			if !ok {
+				if !s.runners.contains(name, id) { return }
+				time.Sleep(time.Minute)
+				continue
+			}
+			if response.Error != nil {
+				if !s.runners.contains(name, id) { return }
+				s.logger.Warn("watch runner container", "runner", name, "error", response.Error.Message)
+				time.Sleep(time.Minute)
+				continue
+			}
+			break waitLoop
+		}
+	}
+	if !s.runners.markExited(name, id) { return }
+	s.writeStatus()
+	s.logger.Warn("runner container exited before job completion", "runner", name)
+	for {
+		if err := s.logAndRemove(context.WithoutCancel(ctx), name, id); err == nil {
+			time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, id) })
+			return
+		} else {
+			s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
+		}
+		time.Sleep(time.Minute)
+	}
 }
 
 func (s *Scaler) recoverStale(ctx context.Context) error {
@@ -122,13 +167,14 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
 	} else {
 		s.logger.Warn("could not collect runner logs", "runner", name, "error", err)
 	}
-	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
+	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("remove runner %s: %w", name, err)
 	}
 	return nil
 }
 
 func (s *Scaler) shutdown(ctx context.Context) {
+	defer s.writeStatus()
 	for name, id := range s.runners.drain() {
 		if err := s.logAndRemove(ctx, name, id); err != nil {
 			s.logger.Error("runner shutdown failed", slog.String("runner", name), slog.String("error", err.Error()))

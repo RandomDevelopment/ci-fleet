@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -74,6 +75,8 @@ func run(ctx context.Context) error {
 
 	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, scalesetClient: client, logger: logger, config: cfg, scaleSetID: set.ID}
 	if err := scaler.recoverStale(ctx); err != nil { return err }
+	scaler.writeStatus()
+	go scaler.publishStatus(ctx, time.Minute)
 	defer scaler.shutdown(context.WithoutCancel(ctx))
 	hostname, err := os.Hostname()
 	if err != nil { return fmt.Errorf("get hostname: %w", err) }
