@@ -211,7 +211,7 @@ class HealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "proc").mkdir()
-            (root / "proc/stat").write_text("cpu  100 0 50 800 50 0 0 0\nbtime 900\n")
+            (root / "proc/stat").write_text("cpu  100 0 50 800 50 0 0 0 40 10\nbtime 900\n")
             (root / "proc/meminfo").write_text("MemTotal: 1024 kB\nMemAvailable: 768 kB\nSwapTotal: 512 kB\nSwapFree: 384 kB\n")
             generated_at = [int(health.time.time())]
 
@@ -320,6 +320,11 @@ class HealthTests(unittest.TestCase):
         snapshot["reconciliation"]["last_success_at"] = 1_001
         future_success = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
         self.assertIsNone(future_success["reconciliation"]["last_success_at"])
+        snapshot.update({"desired_state": "disabled", "controller_status_valid": False})
+        snapshot["controller"]["state"] = "exited"
+        snapshot["reconciliation"].update({"status": "converged", "last_success_at": 900})
+        maintenance = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+        self.assertNotEqual(maintenance["error"]["code"], "health_controller_status")
         encoded = json.dumps(report)
         self.assertNotIn("SUPER_SECRET", encoded)
         self.assertNotIn("private.invalid", encoded)
@@ -340,6 +345,32 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(health._ssh_state(socket_enabled), "enabled")
         self.assertEqual(health._ssh_state(lambda args: health.subprocess.CompletedProcess(args, 127, "", "")), "unknown")
+
+    def test_legacy_configuration_failure_remains_critical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "health.json"
+            old_collect, old_send = getattr(health, "collect_snapshot"), getattr(health, "_send_heartbeat")
+            old_delivery = os.environ.get("CI_FLEET_HEALTH_DELIVER_STATUS")
+            old_status_url = os.environ.pop("CI_FLEET_HEALTH_STATUS_URL", None)
+            os.environ["CI_FLEET_HEALTH_DELIVER_STATUS"] = "1"
+            setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
+            setattr(health, "_send_heartbeat", lambda _values, _report: 2)
+            try:
+                result = health._local(health.argparse.Namespace(
+                    monitoring_config=Path(directory) / "missing.env", output=output, json=True,
+                ))
+                report = json.loads(output.read_text())
+                self.assertEqual((result, report["status"]), (2, "unhealthy"))
+                self.assertEqual(report["checks"][-1], {"id": "status_delivery", "status": "critical"})
+            finally:
+                setattr(health, "collect_snapshot", old_collect)
+                setattr(health, "_send_heartbeat", old_send)
+                if old_delivery is None:
+                    os.environ.pop("CI_FLEET_HEALTH_DELIVER_STATUS", None)
+                else:
+                    os.environ["CI_FLEET_HEALTH_DELIVER_STATUS"] = old_delivery
+                if old_status_url is not None:
+                    os.environ["CI_FLEET_HEALTH_STATUS_URL"] = old_status_url
 
     def test_status_delivery_is_signed_and_outage_is_non_disruptive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

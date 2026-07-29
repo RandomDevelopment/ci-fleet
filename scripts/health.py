@@ -196,7 +196,8 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
 def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any], *, generated_at: int) -> dict[str, Any]:
     reconciliation = snapshot.get("reconciliation") or {}
     state = reconciliation.get("status", "missing")
-    error_code = "health_controller_status" if snapshot.get("controller_status_valid") is False else ""
+    status_expected = snapshot.get("desired_state") == "active" and snapshot.get("controller", {}).get("state") == "running"
+    error_code = "health_controller_status" if status_expected and snapshot.get("controller_status_valid") is False else ""
     if not error_code:
         error_code = f"reconciliation_{state}" if state in {"drift", "failed", "invalid", "rolled_back"} else ""
     if not error_code:
@@ -384,7 +385,7 @@ def _cpu(root: Path) -> dict[str, float | int]:
     try:
         fields = next(line for line in (root / "proc/stat").read_text().splitlines() if line.startswith("cpu ")).split()[1:]
         counters = [int(value) for value in fields]
-        total = sum(counters)
+        total = sum(counters[:8])
         used = total - counters[3]
         percent = round(100 * used / max(total, 1), 1)
     except (OSError, ValueError, IndexError, StopIteration):
@@ -681,9 +682,10 @@ def _local(args: argparse.Namespace) -> int:
             if values.get("CI_FLEET_HEALTH_STATUS_URL") else _send_heartbeat(values, report)
         )
     if delivery:
-        report["checks"].append({"id": "status_delivery", "status": "warning"})
-        if report["exit_code"] == 0:
-            report["status"], report["exit_code"] = "warning", 1
+        severity = "critical" if delivery == 2 else "warning"
+        report["checks"].append({"id": "status_delivery", "status": severity})
+        if delivery > report["exit_code"]:
+            report["status"], report["exit_code"] = ("unhealthy", 2) if delivery == 2 else ("warning", 1)
     _write_report(args.output, report)
     print(json.dumps(report, sort_keys=True) if args.json else render_human(report))
     return int(report["exit_code"])
