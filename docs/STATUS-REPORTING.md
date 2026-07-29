@@ -33,7 +33,7 @@ All times are Unix seconds. Commit values are empty when unavailable. Receiver v
 
 ## Authentication
 
-Each controller receives a unique random HMAC key. A key must contain 32-128 bytes and be owned by root with mode `0600` on the controller. The receiver keeps a separate copy owned by its service account with mode `0600`.
+Each controller receives a unique random HMAC key. A key must contain 32-128 bytes and be owned by root with mode `0600` on the controller. The receiver keeps a separate copy owned by its service account with mode `0600`. Key files are read byte-for-byte, including leading or trailing whitespace; copy the same raw bytes to both sides.
 
 Every report includes:
 

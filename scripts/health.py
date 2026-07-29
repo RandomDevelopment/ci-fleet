@@ -579,6 +579,7 @@ def _send_status(
         return 1 if values.get("CI_FLEET_HEALTH_HEARTBEAT_URL") else 0
     try:
         parsed = urllib.parse.urlsplit(url)
+        parsed.port
     except ValueError:
         return 1
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path != "/v1/status" or parsed.query or parsed.fragment:
@@ -592,7 +593,7 @@ def _send_status(
         expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
         if info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) & 0o077:
             return 1
-        key = path.read_bytes().strip()
+        key = path.read_bytes()
     except OSError:
         return 1
     if not 32 <= len(key) <= 128:
@@ -611,7 +612,7 @@ def _send_status(
         transport = opener or urllib.request.build_opener(_NoRedirect).open
         with transport(request, timeout=10) as response:
             return 0 if 200 <= response.status < 300 else 1
-    except OSError:
+    except (OSError, ValueError):
         return 1
 
 
@@ -622,7 +623,7 @@ def _local(args: argparse.Namespace) -> int:
     report = evaluate(snapshot, thresholds_from(values))
     now = int(time.time())
     report["timestamp"] = now
-    delivery = _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
+    delivery = _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now) if values.get("CI_FLEET_HEALTH_DELIVER_STATUS") == "1" else 0
     if delivery:
         report["checks"].append({"id": "status_delivery", "status": "warning"})
         if report["exit_code"] == 0:

@@ -3,8 +3,10 @@ set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 health_timer=$repo_root/host/systemd/ci-fleet-health.timer
+health_service=$repo_root/host/systemd/ci-fleet-health.service
 grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lacks activation-relative initial trigger\n' >&2; exit 1; }
 ! grep -Fq 'OnBootSec=' "$health_timer" || { printf 'FAIL: health timer initial trigger is boot-relative\n' >&2; exit 1; }
+grep -Fqx 'Environment=CI_FLEET_HEALTH_DELIVER_STATUS=1' "$health_service" || { printf 'FAIL: scheduled health does not enable status delivery\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 fake_bin=$tmp/bin
@@ -496,7 +498,7 @@ warning_output=$tmp/warning-upgrade.out
 "$installer" --upgrade "${base_args[@]}" --ref "$warning_ref" >"$warning_output" 2>&1
 warning_upgrade=$(<"$warning_output")
 grep -Fq 'WARNING disk_root' <<<"$warning_upgrade" || fail 'warning health fixture did not produce a warning result'
-grep -Fq 'WARNING status_delivery' <<<"$warning_upgrade" || fail 'status reporting outage was not observable as a warning'
+if grep -Fq 'WARNING status_delivery' <<<"$warning_upgrade"; then fail 'ad-hoc reconciliation health check submitted duplicate status'; fi
 grep -Fq 'CONVERGED mode=upgrade' <<<"$warning_upgrade" || fail 'warning health result did not report convergence'
 grep -Fq "CI_FLEET_CONFIG_REF=$warning_ref" "$root/etc/ci-fleet/ci-fleet.env" || fail 'warning health result rolled back an otherwise healthy activation'
 rm -f "$root/etc/ci-fleet/monitoring.env"

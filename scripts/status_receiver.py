@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -136,7 +137,7 @@ class StatusReceiver:
         def number(value: Any, minimum: float = 0) -> bool:
             return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= minimum and value < float("inf")
 
-        if not isinstance(report, dict) or report.get("schema_version") != 1:
+        if not isinstance(report, dict) or type(report.get("schema_version")) is not int or report["schema_version"] != 1:
             raise StatusError(400, "unsupported_schema")
         root_keys = {"schema_version", "controller", "configuration", "reconciliation", "drift", "process", "timers", "runners", "metrics", "docker", "error", "generated_at"}
         if set(report) != root_keys:
@@ -247,6 +248,7 @@ class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
         self.max_requests = max_requests
         self.request_timeout = request_timeout
         self._slots = threading.BoundedSemaphore(max_requests)
+        self._deadlines: dict[Any, threading.Timer] = {}
         super().__init__(*args, **kwargs)
 
     def process_request(self, request: Any, client_address: Any) -> None:
@@ -255,15 +257,32 @@ class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
             return
         try:
             request.settimeout(self.request_timeout)
+            timer = threading.Timer(self.request_timeout, self._expire_request, (request,))
+            timer.daemon = True
+            self._deadlines[request] = timer
+            timer.start()
             super().process_request(request, client_address)
         except Exception:
+            timer = self._deadlines.pop(request, None)
+            if timer:
+                timer.cancel()
             self._slots.release()
             raise
+
+    @staticmethod
+    def _expire_request(request: Any) -> None:
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
+            timer = self._deadlines.pop(request, None)
+            if timer:
+                timer.cancel()
             self._slots.release()
 
 
@@ -324,11 +343,13 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
     return _BoundedHTTPServer((bind, port), Handler)
 
 
-def _read_secret(path: Path) -> bytes:
+def _read_secret(path: Path, *, textual: bool = False) -> bytes:
     info = path.stat()
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError(f"secret must be owned by the receiver user with mode 0600: {path}")
-    value = path.read_bytes().strip()
+    value = path.read_bytes()
+    if textual:
+        value = value.strip()
     if not 32 <= len(value) <= 128:
         raise ValueError(f"secret must contain 32-128 bytes: {path}")
     return value
@@ -349,7 +370,7 @@ def load_auth_config(path: Path) -> tuple[dict[str, bytes], str]:
         keys[controller] = _read_secret(resolve(key_file))
     if not keys or not isinstance(value["read_token_file"], str):
         raise ValueError("auth config requires at least one controller and a read token")
-    return keys, _read_secret(resolve(value["read_token_file"])).decode()
+    return keys, _read_secret(resolve(value["read_token_file"]), textual=True).decode()
 
 
 def main() -> int:

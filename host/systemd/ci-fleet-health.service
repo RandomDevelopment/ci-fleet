@@ -8,5 +8,6 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/ci-fleet/manager/current
 EnvironmentFile=/etc/ci-fleet/ci-fleet.env
+Environment=CI_FLEET_HEALTH_DELIVER_STATUS=1
 ExecStart=/opt/ci-fleet/manager/current/scripts/healthcheck.sh
 SuccessExitStatus=1

@@ -177,6 +177,11 @@ class StatusReceiverTests(unittest.TestCase):
         body, headers = self.signed(future)
         self.assert_status_error(400, "unsupported_schema", lambda: self.receiver.submit(body, headers, now=1_000))
 
+        boolean = valid_report()
+        boolean["schema_version"] = True
+        body, headers = self.signed(boolean, nonce="f" * 32)
+        self.assert_status_error(400, "unsupported_schema", lambda: self.receiver.submit(body, headers, now=1_000))
+
         malformed = valid_report()
         malformed["metrics"]["memory"]["available_bytes"] = -1
         body, headers = self.signed(malformed, nonce="b" * 32)
@@ -209,7 +214,8 @@ class StatusReceiverTests(unittest.TestCase):
     def test_receiver_restart_reloads_rotated_key(self) -> None:
         directory = Path(self.temporary.name)
         key_file, token_file, config_file = directory / "key", directory / "token", directory / "auth.json"
-        key_file.write_bytes(b"a" * 32)
+        raw_key = b"\n" + b"a" * 30 + b" "
+        key_file.write_bytes(raw_key)
         token_file.write_bytes(b"r" * 32)
         config_file.write_text(json.dumps({"controllers": {"example-ci-01": "key"}, "read_token_file": "token"}))
         for path in (key_file, token_file, config_file):
@@ -217,7 +223,7 @@ class StatusReceiverTests(unittest.TestCase):
         first, _ = status_receiver.load_auth_config(config_file)
         key_file.write_bytes(b"b" * 32)
         second, _ = status_receiver.load_auth_config(config_file)
-        self.assertEqual((first["example-ci-01"], second["example-ci-01"]), (b"a" * 32, b"b" * 32))
+        self.assertEqual((first["example-ci-01"], second["example-ci-01"]), (raw_key, b"b" * 32))
 
     def test_http_post_and_read_only_api(self) -> None:
         server = status_receiver.create_server("127.0.0.1", 0, self.receiver)
@@ -260,6 +266,17 @@ class StatusReceiverTests(unittest.TestCase):
         self.assertFalse(server._slots.acquire(blocking=False))
         for _ in range(server.max_requests):
             server._slots.release()
+
+        expired = threading.Event()
+        class SlowRequest:
+            def shutdown(self, how: int) -> None:
+                self.how = how
+                expired.set()
+        request = SlowRequest()
+        timer = threading.Timer(0.01, server._expire_request, (request,))
+        timer.start()
+        self.assertTrue(expired.wait(1))
+        self.assertEqual(request.how, status_receiver.socket.SHUT_RDWR)
 
 
 if __name__ == "__main__":
