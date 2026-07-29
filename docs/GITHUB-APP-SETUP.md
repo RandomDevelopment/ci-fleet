@@ -74,8 +74,8 @@ PEM_DEST="/etc/ci-fleet/secrets/github-app-ROTATION-ID.pem"
 
 Then run the same transfer and verification sequence for either case. The path
 validation makes it safe to quote `PEM_DEST` in the remote shell command, the
-rotation guard rejects the active path, and shell noclobber prevents replacing
-any existing file:
+rotation guard rejects the active path, and an atomic hard-link creation refuses
+any existing destination node before the key can appear at that path:
 
 ```bash
 valid_pem_path() {
@@ -90,17 +90,27 @@ fi
 PEM_DIR=${PEM_DEST%/*}
 [[ -n "$PEM_DIR" ]] || PEM_DIR=/
 
-# PEM_DEST is validated above and intentionally expanded client-side.
+# PEM_DIR and PEM_DEST are validated above and intentionally expanded locally.
 # shellcheck disable=SC2029
 if
-ssh "$CONTROLLER" \
-  '{ test -d "'"$PEM_DIR"'" || install -d -m 0700 "'"$PEM_DIR"'"; } &&
-   umask 077 && set -C && cat > "'"$PEM_DEST"'" &&
-   chown root:root "'"$PEM_DEST"'" &&
-   chmod 0600 "'"$PEM_DEST"'"' <"$PEM" &&
-  local_sha=$(sha256sum -- "$PEM" | cut -d' ' -f1) &&
-  remote_sha=$(ssh "$CONTROLLER" \
-    "sha256sum -- \"$PEM_DEST\" | cut -d' ' -f1") &&
+ssh "$CONTROLLER" "
+  { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
+  umask 077 &&
+  tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
+  trap 'rm -f -- \"\$tmp\"' 0 &&
+  cat >\"\$tmp\" &&
+  chown root:root \"\$tmp\" &&
+  chmod 0600 \"\$tmp\" &&
+  ln -- \"\$tmp\" \"$PEM_DEST\" &&
+  rm -f -- \"\$tmp\" &&
+  trap - 0
+" <"$PEM" &&
+  local_sha=$(sha256sum -- "$PEM") &&
+  local_sha=${local_sha%% *} &&
+  [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
+  remote_sha=$(ssh "$CONTROLLER" "sha256sum -- \"$PEM_DEST\"") &&
+  remote_sha=${remote_sha%% *} &&
+  [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&
   test "$local_sha" = "$remote_sha" &&
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
@@ -239,6 +249,13 @@ New controller: new app. Do not share one app across controllers.
    checkpoint references `PEM_DEST`, not `ACTIVE_PEM`:
 
    ```bash
+   valid_pem_path() {
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
+        ! $1 =~ (^|/)\.\.?(/|$) ]]
+   }
+   PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
+     /etc/ci-fleet/host.env | cut -d= -f2-)
+   valid_pem_path "$PEM_DEST" || exit 1
    LATEST_CHECKPOINT=$(sudo find /var/lib/ci-fleet/checkpoints \
      -mindepth 2 -maxdepth 2 -type f -name .complete \
      ! -path '/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*' \
@@ -309,6 +326,14 @@ Retirement is not complete when only the App installation is removed:
    # Put PEM_DEST and every old path in exactly one array; never use a wildcard.
    LOCAL_PEMS=("/etc/ci-fleet/secrets/HOST-LOCAL-KEY.pem")
    MANAGED_PEMS=("/run/secret-manager/MANAGER-BACKED-KEY")
+   # Retire both a host-local symlink and its backing key file.
+   for pem in "${LOCAL_PEMS[@]}"; do
+     if sudo test -L "$pem"; then
+       backing=$(sudo readlink -f -- "$pem") || exit 1
+       valid_pem_path "$backing" || exit 1
+       LOCAL_PEMS+=("$backing")
+     fi
+   done
    PEM_INVENTORY=/etc/ci-fleet/retired-pem-paths
    configured_classifications=0
    for pem in "${LOCAL_PEMS[@]}" "${MANAGED_PEMS[@]}"; do

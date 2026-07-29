@@ -44,21 +44,27 @@ transfer = app_setup[
     )
 ]
 active_guard = '[[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]'
-noclobber_line = next(line for line in transfer.splitlines() if "set -C && cat >" in line)
-assert '"$PEM_DEST"' in noclobber_line
 assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
 assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
-assert 'test -d "\'"$PEM_DIR"\'" || install -d -m 0700 "\'"$PEM_DIR"\'"' in transfer
+assert "install -d -m 0700" in transfer and "$PEM_DIR" in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert active_guard in transfer
 assert transfer.index(active_guard) < transfer.index('ssh "$CONTROLLER"')
-for command in ("cat >", "sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
+assert "mktemp --" in transfer and 'cat >\\"\\$tmp\\"' in transfer
+hard_link = 'ln -- \\"\\$tmp\\" \\"$PEM_DEST\\"'
+assert hard_link in transfer
+assert transfer.index("mktemp --") < transfer.index('cat >\\"\\$tmp\\"')
+assert transfer.index('cat >\\"\\$tmp\\"') < transfer.index(hard_link)
+assert "set -C" not in transfer
+for command in ("sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
     assert any(command in line and "$PEM_DEST" in line for line in transfer.splitlines()), (
         f"transfer does not use configured destination: {command}"
     )
 
 verification = transfer[transfer.index('if\nssh "$CONTROLLER"') : transfer.index("then\n  if rm")]
 for check in (
+    '[[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&\n',
+    '[[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&\n',
     'test "$local_sha" = "$remote_sha" &&\n',
     "= 'root:root'\" &&\n",
     "= '600'\"\n",
@@ -89,6 +95,12 @@ assert "`healthy` for an `active` controller" in rotation
 assert "`maintenance`" in rotation and "`drained` or `disabled`" in rotation
 checkpoint_match = '"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST"'
 assert checkpoint_match in rotation
+checkpoint_query = "LATEST_CHECKPOINT=$(sudo find"
+checkpoint_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
+assert rotation.index(checkpoint_destination) < rotation.index(checkpoint_query)
+assert rotation.index('valid_pem_path "$PEM_DEST" || exit 1') < rotation.index(
+    checkpoint_query
+)
 assert "! -path '/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*'" in rotation
 assert "retain the old GitHub key and old PEM" in rotation
 
@@ -118,6 +130,9 @@ classify_destination = 'configured_classifications=$((configured_classifications
 manager_absent = 'sudo test ! -e "$pem" || exit 1'
 inventory_distinct = '[[ "$pem" != "$PEM_INVENTORY" ]] || exit 1'
 assert 'LOCAL_PEMS=(' in retirement and 'MANAGED_PEMS=(' in retirement
+assert 'if sudo test -L "$pem"; then' in retirement
+assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in retirement
+assert 'LOCAL_PEMS+=("$backing")' in retirement
 assert "^/[A-Za-z0-9._/-]+$" in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
 assert retirement.index(validate_paths) < retirement.index(inventory_distinct)
