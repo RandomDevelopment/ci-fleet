@@ -84,12 +84,13 @@ class StatusReceiver:
             raise StatusError(413, "payload_too_large")
         claimed = {name.lower(): value for name, value in headers.items()}.get("x-ci-fleet-controller", "")
         key = self.controller_keys.get(claimed)
-        if key is None:
-            raise StatusError(401, "unknown_controller")
+        known_controller = key is not None
         try:
-            controller, authenticated_at, nonce = verify_headers(headers, body, key)
+            controller, authenticated_at, nonce = verify_headers(headers, body, key or b"\0" * 32)
         except ValueError as error:
             raise StatusError(401, "authentication_failed") from error
+        if not known_controller:
+            raise StatusError(401, "authentication_failed")
         if controller != claimed or abs(now - authenticated_at) > self.max_clock_skew_seconds or not NONCE.fullmatch(nonce):
             raise StatusError(401, "authentication_stale")
         try:

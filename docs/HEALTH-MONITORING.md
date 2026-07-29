@@ -56,7 +56,7 @@ See [authenticated controller status reporting](STATUS-REPORTING.md) for the v1 
 
 The authenticated receiver stores each controller's `generated_at` and returns it through the read-only API. An external monitor compares the latest report with reviewed desired controller inventory and treats an active controller with no report inside the grace period as unhealthy. Drained or disabled lifecycle state remains a desired-state decision, not something an absent controller can assert.
 
-The legacy file-based `health.py heartbeats` evaluator remains available for existing integrations, but new deployments should consume the authenticated API described in [STATUS-REPORTING.md](STATUS-REPORTING.md).
+The legacy file-based `health.py heartbeats` evaluator remains available for existing integrations, but new deployments should consume the authenticated API described in [STATUS-REPORTING.md](STATUS-REPORTING.md). During upgrade, a configured legacy heartbeat continues until `CI_FLEET_HEALTH_STATUS_URL` is present; provision and verify the authenticated receiver before removing the legacy settings.
 
 ## Operations
 

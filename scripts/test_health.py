@@ -252,6 +252,8 @@ class HealthTests(unittest.TestCase):
             self.assertFalse(stale["controller_status_valid"])
             stale_report = health.evaluate(stale, health.Thresholds())
             self.assertEqual(next(check for check in stale_report["checks"] if check["id"] == "controller_status")["status"], "warning")
+            outbound = health.build_status_report(stale, stale_report, generated_at=int(health.time.time()))
+            self.assertEqual(outbound["error"]["code"], "health_controller_status")
 
     def test_threshold_overrides_validate_ordering(self) -> None:
         self.assertAlmostEqual(health._timespan_seconds("3d 1h 41min 40.5s"), 265300.5)
@@ -369,11 +371,14 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(captured["headers"]["Authorization"], expected["Authorization"])
                 original = copy.deepcopy(report)
                 self.assertEqual(health._send_status(values, report, now=1_000, nonce="b" * 32, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError())), 1)
+                self.assertEqual(health._send_status(values, report, now=1_000, nonce="c" * 32, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(health.http.client.BadStatusLine("bad"))), 1)
                 self.assertEqual(report, original)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "http://unsafe.invalid"}, report), 1)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "https://[bad/v1/status"}, report), 1)
                 self.assertEqual(health._send_status({"CI_FLEET_HEALTH_STATUS_URL": "https://status.example.invalid:bad/v1/status"}, report), 1)
-                self.assertEqual(health._send_status({"CI_FLEET_HEALTH_HEARTBEAT_URL": "https://legacy.invalid"}, report), 1)
+                legacy = {"CI_FLEET_HEALTH_HEARTBEAT_URL": "https://legacy.invalid"}
+                self.assertEqual(health._send_status(legacy, report), 0)
+                self.assertEqual(health._send_heartbeat(legacy, report, opener=opener), 0)
                 self.assertIsNone(health._NoRedirect().redirect_request(None, None, 302, None, {}, None))
             finally:
                 if old is None:

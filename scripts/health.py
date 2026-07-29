@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -195,7 +196,9 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
 def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any], *, generated_at: int) -> dict[str, Any]:
     reconciliation = snapshot.get("reconciliation") or {}
     state = reconciliation.get("status", "missing")
-    error_code = f"reconciliation_{state}" if state in {"drift", "failed", "invalid", "rolled_back"} else ""
+    error_code = "health_controller_status" if snapshot.get("controller_status_valid") is False else ""
+    if not error_code:
+        error_code = f"reconciliation_{state}" if state in {"drift", "failed", "invalid", "rolled_back"} else ""
     if not error_code:
         failed = next((check for check in health_report.get("checks", []) if check.get("status") in {"critical", "warning"}), None)
         error_code = f"health_{failed['id']}" if failed else ""
@@ -587,7 +590,7 @@ def _send_status(
 ) -> int:
     url = values.get("CI_FLEET_HEALTH_STATUS_URL")
     if not url:
-        return 1 if values.get("CI_FLEET_HEALTH_HEARTBEAT_URL") else 0
+        return 0
     try:
         parsed = urllib.parse.urlsplit(url)
         parsed.port
@@ -623,7 +626,44 @@ def _send_status(
         transport = opener or urllib.request.build_opener(_NoRedirect).open
         with transport(request, timeout=10) as response:
             return 0 if 200 <= response.status < 300 else 1
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
+        return 1
+
+
+def _send_heartbeat(
+    values: dict[str, str],
+    report: dict[str, Any],
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> int:
+    url = values.get("CI_FLEET_HEALTH_HEARTBEAT_URL")
+    if not url:
+        return 0
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        parsed.port
+    except ValueError:
+        return 2
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return 2
+    headers = {"Content-Type": "application/json"}
+    token_file = values.get("CI_FLEET_HEALTH_HEARTBEAT_TOKEN_FILE")
+    if token_file:
+        path = Path(token_file)
+        try:
+            info = path.stat()
+            expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+            if info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) & 0o077:
+                return 2
+            headers["Authorization"] = f"Bearer {path.read_text().strip()}"
+        except OSError:
+            return 2
+    request = urllib.request.Request(url, data=json.dumps(report).encode(), headers=headers, method="POST")
+    try:
+        transport = opener or urllib.request.build_opener(_NoRedirect).open
+        with transport(request, timeout=10) as response:
+            return 0 if 200 <= response.status < 300 else 1
+    except (OSError, ValueError, http.client.HTTPException):
         return 1
 
 
@@ -634,7 +674,12 @@ def _local(args: argparse.Namespace) -> int:
     report = evaluate(snapshot, thresholds_from(values))
     now = int(time.time())
     report["timestamp"] = now
-    delivery = _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now) if values.get("CI_FLEET_HEALTH_DELIVER_STATUS") == "1" else 0
+    delivery = 0
+    if values.get("CI_FLEET_HEALTH_DELIVER_STATUS") == "1":
+        delivery = (
+            _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
+            if values.get("CI_FLEET_HEALTH_STATUS_URL") else _send_heartbeat(values, report)
+        )
     if delivery:
         report["checks"].append({"id": "status_delivery", "status": "warning"})
         if report["exit_code"] == 0:

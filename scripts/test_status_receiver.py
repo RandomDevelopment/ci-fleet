@@ -133,7 +133,7 @@ class StatusReceiverTests(unittest.TestCase):
         body, headers = self.signed(valid_report())
         self.assert_status_error(401, "authentication_failed", lambda: self.receiver.submit(body + b" ", headers, now=1_000))
         headers["X-CI-Fleet-Controller"] = "missing"
-        self.assert_status_error(401, "unknown_controller", lambda: self.receiver.submit(body, headers, now=1_000))
+        self.assert_status_error(401, "authentication_failed", lambda: self.receiver.submit(body, headers, now=1_000))
 
     def test_controller_identity_isolation(self) -> None:
         report = valid_report("other-ci-01")
