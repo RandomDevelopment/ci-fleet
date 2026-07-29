@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import re
 from pathlib import Path
 
-raw_quickstart = (Path(__file__).resolve().parents[1] / "docs" / "QUICKSTART.md").read_text()
+repo_root = Path(__file__).resolve().parents[1]
+raw_quickstart = (repo_root / "docs" / "QUICKSTART.md").read_text()
 quickstart = " ".join(raw_quickstart.split())
 
 required = (
@@ -16,4 +18,16 @@ for text in required:
 assert quickstart.index("Cancel every queued job") < quickstart.index("3. Authorize the repository")
 assert "PROJECT_PREFIX=" not in raw_quickstart
 assert "managed controller managed controller" not in quickstart
-print("quickstart_contract=PASS")
+
+app_setup = (repo_root / "docs" / "GITHUB-APP-SETUP.md").read_text()
+token_calls = app_setup.count("scripts/github-app-token.sh \\")
+redirected_token_calls = re.findall(
+    r"scripts/github-app-token\.sh \\\n\s+--env-file [^\n]+ >/dev/null",
+    app_setup,
+)
+assert token_calls == 2, f"expected two documented token-helper calls, found {token_calls}"
+assert len(redirected_token_calls) == token_calls, "token-helper stdout must be redirected"
+assert app_setup.index("## Key rotation: activate and verify before revocation") < app_setup.index(
+    "## Old-key revocation"
+)
+print("documentation_contract=PASS")
