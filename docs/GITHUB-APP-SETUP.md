@@ -241,6 +241,7 @@ New controller: new app. Do not share one app across controllers.
    ```bash
    LATEST_CHECKPOINT=$(sudo find /var/lib/ci-fleet/checkpoints \
      -mindepth 2 -maxdepth 2 -type f -name .complete \
+     ! -path '/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*' \
      -printf '%T@ %h\n' | sort -nr | awk 'NR == 1 {print $2}')
    [[ -n "$LATEST_CHECKPOINT" ]] || exit 1
    sudo grep -Fx -- \

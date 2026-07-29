@@ -89,6 +89,7 @@ assert "`healthy` for an `active` controller" in rotation
 assert "`maintenance`" in rotation and "`drained` or `disabled`" in rotation
 checkpoint_match = '"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST"'
 assert checkpoint_match in rotation
+assert "! -path '/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*'" in rotation
 assert "retain the old GitHub key and old PEM" in rotation
 
 revocation = app_setup[
