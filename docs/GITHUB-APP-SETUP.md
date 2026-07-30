@@ -94,6 +94,7 @@ version and path untouched:
 # PEM_DEST is canonical and intentionally expanded client-side.
 # shellcheck disable=SC2029
 if
+  [[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]] &&
   ssh "$CONTROLLER" \
     "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
   local_sha=$(sha256sum -- "$PEM") &&
@@ -390,16 +391,20 @@ Only after every activation check above succeeds:
    ((active_classifications == 1)) || exit 1
    PEM_DEST_BACKING=$(sudo readlink -f -- "$PEM_DEST") || exit 1
    valid_pem_path "$PEM_DEST_BACKING" || exit 1
+   RESOLVED_OLD_LOCAL_PEMS=()
    for pem in "${OLD_LOCAL_PEMS[@]}"; do
      backing=$(sudo readlink -f -- "$pem") || exit 1
      valid_pem_path "$backing" || exit 1
      [[ "$backing" != "$PEM_DEST_BACKING" ]] || exit 1
-     OLD_LOCAL_PEMS=("$backing")
+     RESOLVED_OLD_LOCAL_PEMS+=("$backing")
+     [[ "$pem" == "$backing" ]] || RESOLVED_OLD_LOCAL_PEMS+=("$pem")
    done
+   OLD_LOCAL_PEMS=("${RESOLVED_OLD_LOCAL_PEMS[@]}")
    valid_pem_path "$PEM_DEST" || exit 1
    for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do
-     valid_pem_path "$pem" || exit 1
-     [[ "$pem" != "$PEM_DEST" ]] || exit 1
+     [[ $pem =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+     pem_backing=$(sudo realpath -m -- "$pem") || exit 1
+     [[ "$pem_backing" != "$PEM_DEST_BACKING" ]] || exit 1
    done
    for pem in "${OLD_MANAGED_PEMS[@]}"; do
      sudo test ! -e "$pem" || exit 1
@@ -407,7 +412,8 @@ Only after every activation check above succeeds:
    for pem in "${OLD_LOCAL_PEMS[@]}"; do
      sudo rm -f -- "$pem" || exit 1
    done
-   unset active_classifications backing PEM_DEST_BACKING \
+   unset active_classifications backing pem_backing PEM_DEST_BACKING \
+     RESOLVED_OLD_LOCAL_PEMS \
      OLD_LOCAL_PEMS OLD_MANAGED_PEMS
    ```
 
@@ -439,7 +445,7 @@ Retirement is not complete when only the App installation is removed:
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    safe_pem_path "$PEM_DEST" || exit 1
-   [[ $(realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1
+   [[ $(sudo realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1
    # Put PEM_DEST and every old path in exactly one array; never use a wildcard.
    LOCAL_PEMS=("/etc/ci-fleet/secrets/HOST-LOCAL-KEY.pem")
    MANAGED_PEMS=("/run/secret-manager/MANAGER-BACKED-KEY")
@@ -455,8 +461,8 @@ Retirement is not complete when only the App installation is removed:
    configured_classifications=0
    for pem in "${LOCAL_PEMS[@]}" "${MANAGED_PEMS[@]}"; do
      safe_pem_path "$pem" || exit 1
-     [[ $(realpath -m -- "$pem") != \
-        $(realpath -m -- "$PEM_INVENTORY") ]] || exit 1
+     [[ $(sudo realpath -m -- "$pem") != \
+        $(sudo realpath -m -- "$PEM_INVENTORY") ]] || exit 1
      if [[ "$pem" == "$PEM_DEST" ]]; then
        configured_classifications=$((configured_classifications + 1))
      fi

@@ -107,6 +107,14 @@ assert "retry idempotent marker cleanup before activation" in marker_cleanup
 assert "secret-manager-backed destination" in app_setup
 assert "authenticated import/version operation" in app_setup
 assert "remove only the new inactive version through the manager" in app_setup
+manager_workflow = app_setup[
+    app_setup.index("secret-manager-backed destination, do not") : app_setup.index(
+        "For a host-local destination"
+    )
+]
+assert manager_workflow.index('[[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]]') < manager_workflow.index(
+    'ssh "$CONTROLLER"'
+)
 assert "sudo readlink -f -- \"$ACTIVE_PEM\"" in app_setup
 assert "update `host.env` to that\ncanonical result" in app_setup
 assert "rotating, revoking, or directly retiring" in app_setup
@@ -144,17 +152,19 @@ revocation = app_setup[
 ]
 read_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
 validate_paths = 'for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do'
-distinct_paths = '[[ "$pem" != "$PEM_DEST" ]] || exit 1'
+distinct_paths = '[[ "$pem_backing" != "$PEM_DEST_BACKING" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$pem" || exit 1'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
 assert 'PEM_DEST_BACKING=$(sudo readlink -f -- "$PEM_DEST") || exit 1' in revocation
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in revocation
 assert '[[ "$backing" != "$PEM_DEST_BACKING" ]] || exit 1' in revocation
-assert 'OLD_LOCAL_PEMS=("$backing")' in revocation
+assert 'RESOLVED_OLD_LOCAL_PEMS+=("$backing")' in revocation
+assert 'RESOLVED_OLD_LOCAL_PEMS+=("$pem")' in revocation
+assert 'OLD_LOCAL_PEMS=("${RESOLVED_OLD_LOCAL_PEMS[@]}")' in revocation
 assert 'OLD_MANAGED_PEMS=()' in revocation
 assert "((active_classifications == 1)) || exit 1" in revocation
 assert revocation.index("((active_classifications == 1)) || exit 1") < revocation.index(
-    'OLD_LOCAL_PEMS=("$backing")'
+    'OLD_LOCAL_PEMS=("${RESOLVED_OLD_LOCAL_PEMS[@]}")'
 )
 old_manager_absent = 'for pem in "${OLD_MANAGED_PEMS[@]}"; do'
 assert "^/[A-Za-z0-9._/-]+$" in revocation
@@ -175,13 +185,14 @@ remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env &&"
 remove_inventory = 'sudo rm -f -- "$PEM_INVENTORY"; then'
 classify_destination = 'configured_classifications=$((configured_classifications + 1))'
 manager_absent = 'sudo test ! -e "$pem" || exit 1'
-inventory_distinct = '$(realpath -m -- "$PEM_INVENTORY") ]] || exit 1'
+inventory_distinct = '$(sudo realpath -m -- "$PEM_INVENTORY") ]] || exit 1'
 assert 'LOCAL_PEMS=(' in retirement and 'MANAGED_PEMS=(' in retirement
 assert 'if sudo test -L "$pem"; then' in retirement
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in retirement
 assert 'LOCAL_PEMS+=("$backing")' in retirement
 assert "^/[A-Za-z0-9._/-]+$" in retirement
-assert '[[ $(realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1' in retirement
+assert '[[ $(sudo realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1' in retirement
+assert '$(sudo realpath -m -- "$PEM_INVENTORY")' in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
 assert retirement.index(validate_paths) < retirement.index(inventory_distinct)
 assert retirement.index(inventory_distinct) < retirement.index(classify_destination)
