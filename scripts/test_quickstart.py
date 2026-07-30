@@ -68,7 +68,8 @@ for command in ("sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
         f"transfer does not use configured destination: {command}"
     )
 
-verification = transfer[transfer.index('if\nssh "$CONTROLLER"') : transfer.index("then\n  if rm")]
+main_then = transfer.index("\nthen\n  if ! ssh", transfer.index("stat -c '%a'"))
+verification = transfer[transfer.index('if\nssh "$CONTROLLER"') : main_then]
 for check in (
     '[[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&\n',
     '[[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&\n',
@@ -93,6 +94,12 @@ assert 'rm -f -- \\"$PEM_DEST\\" \\"$PEM_MARKER\\"' in verification_failure
 assert "remote ownership cleanup failed" in verification_failure
 assert "per-transfer hard-link marker proves" in app_setup
 assert "pre-existing destinations are preserved" in app_setup
+verification_ack = transfer[transfer.index("stat -c '%a'") : main_then]
+assert 'test \\"$PEM_MARKER\\" -ef \\"$PEM_DEST\\"' in verification_ack
+assert 'rm -f -- \\"$PEM_MARKER\\"' not in verification_ack
+marker_cleanup = transfer[main_then : transfer.index('if rm -f -- "$PEM"')]
+assert 'if test -e \\"$PEM_MARKER\\"; then' in marker_cleanup
+assert "retry idempotent marker cleanup before activation" in marker_cleanup
 assert "secret-manager-backed destination" in app_setup
 assert "authenticated import/version operation" in app_setup
 assert "remove only the new inactive version through the manager" in app_setup
@@ -153,7 +160,7 @@ assert revocation.index(remove_old_pem) < revocation.index(
 )
 
 retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
-validate_paths = 'valid_pem_path "$pem" || exit 1'
+validate_paths = 'safe_pem_path "$pem" || exit 1'
 uninstall = "scripts/install-worker-controller.sh \\\n        --uninstall &&"
 remove_pem = 'sudo rm -f -- "$pem" || return 1'
 persist_inventory = 'sudo install -m 0600 /dev/stdin "$PEM_INVENTORY"'
@@ -161,12 +168,13 @@ remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env &&"
 remove_inventory = 'sudo rm -f -- "$PEM_INVENTORY"; then'
 classify_destination = 'configured_classifications=$((configured_classifications + 1))'
 manager_absent = 'sudo test ! -e "$pem" || exit 1'
-inventory_distinct = '[[ "$pem" != "$PEM_INVENTORY" ]] || exit 1'
+inventory_distinct = '$(realpath -m -- "$PEM_INVENTORY") ]] || exit 1'
 assert 'LOCAL_PEMS=(' in retirement and 'MANAGED_PEMS=(' in retirement
 assert 'if sudo test -L "$pem"; then' in retirement
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in retirement
 assert 'LOCAL_PEMS+=("$backing")' in retirement
 assert "^/[A-Za-z0-9._/-]+$" in retirement
+assert '[[ $(realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1' in retirement
 assert retirement.index(read_destination) < retirement.index(validate_paths)
 assert retirement.index(validate_paths) < retirement.index(inventory_distinct)
 assert retirement.index(inventory_distinct) < retirement.index(classify_destination)

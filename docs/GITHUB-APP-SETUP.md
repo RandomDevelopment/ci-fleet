@@ -177,8 +177,16 @@ ssh "$CONTROLLER" "
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'" &&
   ssh "$CONTROLLER" \
-    "test \"$PEM_MARKER\" -ef \"$PEM_DEST\" && rm -f -- \"$PEM_MARKER\""
+    "test \"$PEM_MARKER\" -ef \"$PEM_DEST\""
 then
+  if ! ssh "$CONTROLLER" \
+    "if test -e \"$PEM_MARKER\"; then
+       test \"$PEM_MARKER\" -ef \"$PEM_DEST\" && rm -f -- \"$PEM_MARKER\";
+     fi"; then
+    printf 'verified transfer; retry idempotent marker cleanup before activation: %s\n' \
+      "$PEM_MARKER" >&2
+    exit 1
+  fi
   if rm -f -- "$PEM"; then
     unset PEM local_sha remote_sha TRANSFER_ID PEM_MARKER
   else
@@ -206,7 +214,9 @@ It removes `PEM_DEST` only when the per-transfer hard-link marker proves that
 this invocation created that inode, including after an ambiguous SSH result;
 pre-existing destinations are preserved. The active controller PEM remains
 untouched and the downloaded replacement is retained for diagnosis or a safe
-retry. Do not revoke the old GitHub key.
+retry. If marker cleanup itself returns an ambiguous SSH result, rerun only its
+idempotent cleanup command before activation; do not rerun the transfer. Do not
+revoke the old GitHub key.
 After success, remove any other copy from the browser download location, trash,
 sync, and temporary storage according to the workstation's secure-erasure
 policy; plain `rm` may not erase data from snapshots, SSDs, or copy-on-write
@@ -420,12 +430,13 @@ Retirement is not complete when only the App installation is removed:
    preserves `/etc/ci-fleet/host.env` and `/etc/ci-fleet/secrets`:
 
    ```bash
-   valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
-       [[ $(realpath -m -- "$1") == "$1" ]]
+   safe_pem_path() {
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
+   safe_pem_path "$PEM_DEST" || exit 1
+   [[ $(realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1
    # Put PEM_DEST and every old path in exactly one array; never use a wildcard.
    LOCAL_PEMS=("/etc/ci-fleet/secrets/HOST-LOCAL-KEY.pem")
    MANAGED_PEMS=("/run/secret-manager/MANAGER-BACKED-KEY")
@@ -433,15 +444,16 @@ Retirement is not complete when only the App installation is removed:
    for pem in "${LOCAL_PEMS[@]}"; do
      if sudo test -L "$pem"; then
        backing=$(sudo readlink -f -- "$pem") || exit 1
-       valid_pem_path "$backing" || exit 1
+       safe_pem_path "$backing" || exit 1
        LOCAL_PEMS+=("$backing")
      fi
    done
    PEM_INVENTORY=/etc/ci-fleet/retired-pem-paths
    configured_classifications=0
    for pem in "${LOCAL_PEMS[@]}" "${MANAGED_PEMS[@]}"; do
-     valid_pem_path "$pem" || exit 1
-     [[ "$pem" != "$PEM_INVENTORY" ]] || exit 1
+     safe_pem_path "$pem" || exit 1
+     [[ $(realpath -m -- "$pem") != \
+        $(realpath -m -- "$PEM_INVENTORY") ]] || exit 1
      if [[ "$pem" == "$PEM_DEST" ]]; then
        configured_classifications=$((configured_classifications + 1))
      fi
