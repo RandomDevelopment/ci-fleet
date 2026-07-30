@@ -20,13 +20,15 @@ assert "PROJECT_PREFIX=" not in raw_quickstart
 assert "managed controller managed controller" not in quickstart
 
 app_setup = (repo_root / "docs" / "GITHUB-APP-SETUP.md").read_text()
-token_calls = app_setup.count("scripts/github-app-token.sh \\")
-redirected_token_calls = re.findall(
-    r"scripts/github-app-token\.sh \\\n\s+--env-file [^\n]+ >/dev/null",
-    app_setup,
+bash_blocks = "\n".join(re.findall(r"```bash\n(.*?)\n\s*```", app_setup, re.S))
+bash_commands = re.sub(r"\\\n\s*", " ", bash_blocks).splitlines()
+token_commands = [
+    command for command in bash_commands if "scripts/github-app-token.sh" in command
+]
+assert len(token_commands) == 2, f"expected two documented token-helper calls, found {len(token_commands)}"
+assert all(">/dev/null" in command for command in token_commands), (
+    "token-helper stdout must be redirected"
 )
-assert token_calls == 2, f"expected two documented token-helper calls, found {token_calls}"
-assert len(redirected_token_calls) == token_calls, "token-helper stdout must be redirected"
 assert app_setup.index("## Key rotation: activate and verify before revocation") < app_setup.index(
     "## Old-key revocation"
 )
@@ -151,6 +153,9 @@ assert '[[ "$backing" != "$PEM_DEST_BACKING" ]] || exit 1' in revocation
 assert 'OLD_LOCAL_PEMS=("$backing")' in revocation
 assert 'OLD_MANAGED_PEMS=()' in revocation
 assert "((active_classifications == 1)) || exit 1" in revocation
+assert revocation.index("((active_classifications == 1)) || exit 1") < revocation.index(
+    'OLD_LOCAL_PEMS=("$backing")'
+)
 old_manager_absent = 'for pem in "${OLD_MANAGED_PEMS[@]}"; do'
 assert "^/[A-Za-z0-9._/-]+$" in revocation
 assert revocation.index(read_destination) < revocation.index(validate_paths)

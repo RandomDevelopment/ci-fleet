@@ -380,6 +380,14 @@ Only after every activation check above succeeds:
    ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
    OLD_LOCAL_PEMS=("$ACTIVE_PEM")
    OLD_MANAGED_PEMS=()
+   active_classifications=0
+   for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do
+     [[ $pem =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+     if [[ "$pem" == "$ACTIVE_PEM" ]]; then
+       active_classifications=$((active_classifications + 1))
+     fi
+   done
+   ((active_classifications == 1)) || exit 1
    PEM_DEST_BACKING=$(sudo readlink -f -- "$PEM_DEST") || exit 1
    valid_pem_path "$PEM_DEST_BACKING" || exit 1
    for pem in "${OLD_LOCAL_PEMS[@]}"; do
@@ -389,15 +397,10 @@ Only after every activation check above succeeds:
      OLD_LOCAL_PEMS=("$backing")
    done
    valid_pem_path "$PEM_DEST" || exit 1
-   active_classifications=0
    for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do
      valid_pem_path "$pem" || exit 1
      [[ "$pem" != "$PEM_DEST" ]] || exit 1
-     if [[ "$pem" == "$ACTIVE_PEM" ]]; then
-       active_classifications=$((active_classifications + 1))
-     fi
    done
-   ((active_classifications == 1)) || exit 1
    for pem in "${OLD_MANAGED_PEMS[@]}"; do
      sudo test ! -e "$pem" || exit 1
    done
