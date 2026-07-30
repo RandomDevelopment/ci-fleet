@@ -128,6 +128,21 @@ if
   [[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]] &&
   ssh "$CONTROLLER" \
     "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
+  ssh "$CONTROLLER" "
+    secure_pem_ancestors() {
+      dir=\"${PEM_DEST%/*}\";
+      test -n \"\$dir\" || dir=/;
+      while :; do
+        test \"\$(stat -c '%U' -- \"\$dir\")\" = root || return 1;
+        test -z \"\$(find \"\$dir\" -maxdepth 0 -perm /022 -print -quit)\" || return 1;
+        test \"\$dir\" != / || break;
+        dir=\${dir%/*};
+        test -n \"\$dir\" || dir=/;
+      done;
+    }
+    test \"\$(stat -c '%F' -- \"$PEM_DEST\")\" = 'regular file' &&
+    secure_pem_ancestors
+  " &&
   local_sha=$(sha256sum -- "$PEM") &&
   local_sha=${local_sha%% *} &&
   [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
@@ -153,6 +168,9 @@ else
   exit 1
 fi
 ```
+
+Manager layouts whose materialized file or any containing directory fails
+these checks are unsupported until secured.
 
 For a host-local destination, run the transfer and verification sequence below.
 The path

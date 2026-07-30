@@ -138,6 +138,28 @@ manager_workflow = app_setup[
 assert manager_workflow.index('[[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]]') < manager_workflow.index(
     'ssh "$CONTROLLER"'
 )
+manager_condition = manager_workflow[
+    manager_workflow.index("if\n") : manager_workflow.index("\nthen\n")
+]
+manager_ancestor_gate = manager_condition.index("secure_pem_ancestors\n")
+regular_file_gate = (
+    "test \\\"\\$(stat -c '%F' -- \\\"$PEM_DEST\\\")\\\" = 'regular file' &&"
+)
+assert regular_file_gate in manager_condition
+assert "stat -c '%U'" in manager_condition and "-perm /022" in manager_condition
+assert (
+    "dir=\\${dir%/*}" in manager_condition
+    and 'test \\\"\\$dir\\\" != / || break' in manager_condition
+)
+assert manager_ancestor_gate < manager_condition.index('local_sha=$(sha256sum -- "$PEM")')
+assert manager_workflow.index("secure_pem_ancestors\n") < manager_workflow.index('rm -f -- "$PEM"')
+manager_failure = manager_workflow[manager_workflow.index("else\n") :]
+assert "manager import verification failed" in manager_failure and "exit 1" in manager_failure
+assert "unsupported until secured" in manager_workflow
+manager_gate = app_setup.index("secure_pem_ancestors\n", manager_import)
+rotation_start = app_setup.index("## Key rotation: activate and verify before revocation")
+rotation_token = app_setup.index("scripts/github-app-token.sh", rotation_start)
+assert manager_gate < rotation_start < rotation_token
 assert 'ACTIVE_PEM=$(ssh "$CONTROLLER" "readlink -f -- \\"$ACTIVE_PEM\\"")' in app_setup
 assert "Update controller `host.env` to that canonical result" in app_setup
 assert "rotating, revoking, or directly retiring" in app_setup
