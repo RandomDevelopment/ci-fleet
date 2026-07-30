@@ -72,15 +72,57 @@ ACTIVE_PEM="/etc/ci-fleet/secrets/github-app.pem"
 PEM_DEST="/etc/ci-fleet/secrets/github-app-ROTATION-ID.pem"
 ```
 
-Then run the same transfer and verification sequence for either case. The path
+Lifecycle commands use canonical absolute paths so path comparisons and exact
+deletion cannot change meaning. Before rotating an existing non-canonical path
+(for example one containing `..`, repeated separators, or a symlinked parent),
+resolve it with `sudo readlink -f -- "$ACTIVE_PEM"`, update `host.env` to that
+canonical result, then reconcile and verify healthy convergence before
+continuing. Record the canonical result as `ACTIVE_PEM`. New destinations must
+also equal `realpath -m -- "$PEM_DEST"`.
+
+The SSH workflow below is only for a host-local destination. For a
+secret-manager-backed destination, do not write into the materialized mount.
+Instead, use that manager's authenticated import/version operation to create a
+new inactive version from `$PEM`, materialize it at a distinct canonical
+`PEM_DEST`, and run the following verification. Activate that version only in
+step 2 of the rotation procedure. If verification fails, retain the download,
+remove only the new inactive version through the manager, and leave the active
+version and path untouched:
+
+```bash
+# PEM_DEST is canonical and intentionally expanded client-side.
+# shellcheck disable=SC2029
+if
+  local_sha=$(sha256sum -- "$PEM") &&
+  local_sha=${local_sha%% *} &&
+  [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
+  remote_sha=$(ssh "$CONTROLLER" "sha256sum -- \"$PEM_DEST\"") &&
+  remote_sha=${remote_sha%% *} &&
+  [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&
+  test "$local_sha" = "$remote_sha" &&
+  ssh "$CONTROLLER" \
+    "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
+  ssh "$CONTROLLER" \
+    "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
+then
+  rm -f -- "$PEM" || exit 1
+else
+  printf 'manager import verification failed; retained download: %s\n' \
+    "$PEM" >&2
+  exit 1
+fi
+```
+
+For a host-local destination, run the transfer and verification sequence below.
+The path
 validation makes it safe to quote `PEM_DEST` in the remote shell command, the
 rotation guard rejects the active path, and an atomic hard-link creation refuses
 any existing destination node before the key can appear at that path:
 
 ```bash
 valid_pem_path() {
-  [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
-     ! $1 =~ (^|/)\.\.?(/|$) ]]
+  [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+    [[ $(realpath -m -- "$1") == "$1" ]]
 }
 valid_pem_path "$PEM_DEST" || exit 1
 if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
@@ -267,8 +309,8 @@ New controller: new app. Do not share one app across controllers.
 
    ```bash
    valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
-        ! $1 =~ (^|/)\.\.?(/|$) ]]
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+       [[ $(realpath -m -- "$1") == "$1" ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
@@ -302,20 +344,21 @@ Only after every activation check above succeeds:
 
    ```bash
    valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
-        ! $1 =~ (^|/)\.\.?(/|$) ]]
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+       [[ $(realpath -m -- "$1") == "$1" ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
    OLD_LOCAL_PEMS=("$ACTIVE_PEM")
    OLD_MANAGED_PEMS=()
+   PEM_DEST_BACKING=$(sudo readlink -f -- "$PEM_DEST") || exit 1
+   valid_pem_path "$PEM_DEST_BACKING" || exit 1
    for pem in "${OLD_LOCAL_PEMS[@]}"; do
-     if sudo test -L "$pem"; then
-       backing=$(sudo readlink -f -- "$pem") || exit 1
-       valid_pem_path "$backing" || exit 1
-       OLD_LOCAL_PEMS=("$backing" "$pem")
-     fi
+     backing=$(sudo readlink -f -- "$pem") || exit 1
+     valid_pem_path "$backing" || exit 1
+     [[ "$backing" != "$PEM_DEST_BACKING" ]] || exit 1
+     OLD_LOCAL_PEMS=("$backing")
    done
    valid_pem_path "$PEM_DEST" || exit 1
    active_classifications=0
@@ -333,7 +376,8 @@ Only after every activation check above succeeds:
    for pem in "${OLD_LOCAL_PEMS[@]}"; do
      sudo rm -f -- "$pem" || exit 1
    done
-   unset active_classifications backing OLD_LOCAL_PEMS OLD_MANAGED_PEMS
+   unset active_classifications backing PEM_DEST_BACKING \
+     OLD_LOCAL_PEMS OLD_MANAGED_PEMS
    ```
 
 2. On the GitHub App settings page, under **Private keys**, delete/revoke the
@@ -359,8 +403,8 @@ Retirement is not complete when only the App installation is removed:
 
    ```bash
    valid_pem_path() {
-     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ && $1 != *//* &&
-        ! $1 =~ (^|/)\.\.?(/|$) ]]
+     [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
+       [[ $(realpath -m -- "$1") == "$1" ]]
    }
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)

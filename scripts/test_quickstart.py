@@ -48,6 +48,7 @@ assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
 assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
 assert "install -d -m 0700" in transfer and "$PEM_DIR" in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
+assert '[[ $(realpath -m -- "$1") == "$1" ]]' in transfer
 assert active_guard in transfer
 assert transfer.index(active_guard) < transfer.index('ssh "$CONTROLLER"')
 assert "mktemp --" in transfer and 'cat >\\"\\$tmp\\"' in transfer
@@ -86,6 +87,11 @@ assert 'rm -f -- "$PEM"' not in transfer[transfer.index("transfer verification f
 verification_failure = transfer[transfer.index("else\n  if $created_dest") :]
 assert '! ssh "$CONTROLLER" "rm -f -- \\"$PEM_DEST\\""' in verification_failure
 assert "remote cleanup failed; retained inactive destination" in verification_failure
+assert "secret-manager-backed destination" in app_setup
+assert "authenticated import/version operation" in app_setup
+assert "remove only the new inactive version through the manager" in app_setup
+assert "sudo readlink -f -- \"$ACTIVE_PEM\"" in app_setup
+assert "update `host.env` to that\ncanonical result" in app_setup
 
 for use in (
     "exact value of `PEM_DEST`",
@@ -123,8 +129,10 @@ validate_paths = 'for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do
 distinct_paths = '[[ "$pem" != "$PEM_DEST" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$pem" || exit 1'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
+assert 'PEM_DEST_BACKING=$(sudo readlink -f -- "$PEM_DEST") || exit 1' in revocation
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in revocation
-assert 'OLD_LOCAL_PEMS=("$backing" "$pem")' in revocation
+assert '[[ "$backing" != "$PEM_DEST_BACKING" ]] || exit 1' in revocation
+assert 'OLD_LOCAL_PEMS=("$backing")' in revocation
 assert 'OLD_MANAGED_PEMS=()' in revocation
 assert "((active_classifications == 1)) || exit 1" in revocation
 old_manager_absent = 'for pem in "${OLD_MANAGED_PEMS[@]}"; do'
