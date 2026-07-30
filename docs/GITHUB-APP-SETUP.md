@@ -73,7 +73,8 @@ PEM_DEST="/etc/ci-fleet/secrets/github-app-ROTATION-ID.pem"
 ```
 
 Lifecycle commands use canonical absolute paths so path comparisons and exact
-deletion cannot change meaning. Before rotating an existing non-canonical path
+deletion cannot change meaning. Before rotating, revoking, or directly retiring
+an existing non-canonical path
 (for example one containing `..`, repeated separators, or a symlinked parent),
 resolve it with `sudo readlink -f -- "$ACTIVE_PEM"`, update `host.env` to that
 canonical result, then reconcile and verify healthy convergence before
@@ -93,6 +94,8 @@ version and path untouched:
 # PEM_DEST is canonical and intentionally expanded client-side.
 # shellcheck disable=SC2029
 if
+  ssh "$CONTROLLER" \
+    "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
   local_sha=$(sha256sum -- "$PEM") &&
   local_sha=${local_sha%% *} &&
   [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
@@ -121,8 +124,7 @@ any existing destination node before the key can appear at that path:
 
 ```bash
 valid_pem_path() {
-  [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] &&
-    [[ $(realpath -m -- "$1") == "$1" ]]
+  [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]]
 }
 valid_pem_path "$PEM_DEST" || exit 1
 if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
@@ -132,10 +134,11 @@ fi
 PEM_DIR=${PEM_DEST%/*}
 [[ -n "$PEM_DIR" ]] || PEM_DIR=/
 
-created_dest=false
 # PEM_DIR and PEM_DEST are validated above and intentionally expanded locally.
 # shellcheck disable=SC2029
 if
+ssh "$CONTROLLER" \
+  "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
 ssh "$CONTROLLER" "
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
   umask 077 &&
@@ -154,7 +157,6 @@ ssh "$CONTROLLER" "
   rm -f -- \"\$tmp\" &&
   trap - 0
 " <"$PEM" &&
-  created_dest=true &&
   local_sha=$(sha256sum -- "$PEM") &&
   local_sha=${local_sha%% *} &&
   [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
@@ -168,27 +170,29 @@ ssh "$CONTROLLER" "
     "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
 then
   if rm -f -- "$PEM"; then
-    unset PEM created_dest local_sha remote_sha
+    unset PEM local_sha remote_sha
   else
     printf 'verified transfer, but could not delete downloaded PEM: %s\n' \
       "$PEM" >&2
     exit 1
   fi
 else
-  if $created_dest && ! ssh "$CONTROLLER" "rm -f -- \"$PEM_DEST\""; then
+  if ! ssh "$CONTROLLER" "rm -f -- \"$PEM_DEST\""; then
     printf 'remote cleanup failed; retained inactive destination: %s\n' \
       "$PEM_DEST" >&2
   fi
   printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
-  unset created_dest local_sha remote_sha
+  unset local_sha remote_sha
   exit 1
 fi
 ```
 
 Use an equivalent privileged SSH workflow if direct root login is disabled.
 If transfer, checksum, owner, or mode verification fails, the sequence stops,
-leaves the active controller PEM untouched, and retains the downloaded
-replacement for diagnosis or a safe retry. Do not revoke the old GitHub key.
+removes the exact destination declared inactive even if SSH returned an
+ambiguous result, leaves the active controller PEM untouched, and retains the
+downloaded replacement for diagnosis or a safe retry. Do not revoke the old
+GitHub key.
 After success, remove any other copy from the browser download location, trash,
 sync, and temporary storage according to the workstation's secure-erasure
 policy; plain `rm` may not erase data from snapshots, SSDs, or copy-on-write
