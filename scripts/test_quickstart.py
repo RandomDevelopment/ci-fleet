@@ -93,6 +93,9 @@ rotation = app_setup[
 ]
 assert "`healthy` for an `active` controller" in rotation
 assert "`maintenance`" in rotation and "`drained` or `disabled`" in rotation
+assert "If token generation fails, immediately restore" in rotation
+assert "run normal\n   reconciliation" in rotation
+assert "`RECONCILE CONVERGED`" in rotation
 checkpoint_match = '"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST"'
 assert checkpoint_match in rotation
 checkpoint_query = "LATEST_CHECKPOINT=$(sudo find"
@@ -110,16 +113,23 @@ revocation = app_setup[
     )
 ]
 read_destination = "PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE='"
-validate_paths = 'for pem in "${OLD_PEM_PATHS[@]}"; do'
+validate_paths = 'for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do'
 distinct_paths = '[[ "$pem" != "$PEM_DEST" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$pem" || exit 1'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
-assert 'backing=$(sudo readlink -f -- "$ACTIVE_PEM") || exit 1' in revocation
-assert 'OLD_PEM_PATHS+=("$backing")' in revocation
+assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in revocation
+assert 'OLD_LOCAL_PEMS+=("$backing")' in revocation
+assert 'OLD_MANAGED_PEMS=()' in revocation
+assert "((active_classifications == 1)) || exit 1" in revocation
+old_manager_absent = 'for pem in "${OLD_MANAGED_PEMS[@]}"; do'
 assert "^/[A-Za-z0-9._/-]+$" in revocation
 assert revocation.index(read_destination) < revocation.index(validate_paths)
 assert revocation.index(validate_paths) < revocation.index(distinct_paths)
-assert revocation.index(distinct_paths) < revocation.index(remove_old_pem)
+assert revocation.index(distinct_paths) < revocation.index(old_manager_absent)
+assert revocation.index(old_manager_absent) < revocation.index(remove_old_pem)
+assert revocation.index(remove_old_pem) < revocation.index(
+    "On the GitHub App settings page"
+)
 
 retirement = app_setup[app_setup.index("## Controller retirement and PEM removal") :]
 validate_paths = 'valid_pem_path "$pem" || exit 1'

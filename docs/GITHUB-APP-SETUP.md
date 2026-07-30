@@ -192,7 +192,7 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh \
   --check-only --installed-ref
 ```
 
-`CHECK_OK` means the app can read and validate the installed desired-state
+`RECONCILE CONVERGED` means the app can read and validate the installed desired-state
 commit and the controller is converged. The reconcile script consumes its
 token internally; it does not print the token. A 403 or "Repository not found"
 means the installation lacks the repository or the `contents: read` grant —
@@ -226,6 +226,11 @@ New controller: new app. Do not share one app across controllers.
      --env-file /etc/ci-fleet/host.env >/dev/null
    ```
 
+   If token generation fails, immediately restore
+   `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` in `host.env` to the exact recorded
+   `ACTIVE_PEM`, verify token generation with the old key, and run normal
+   reconciliation. Stop; retain both PEMs and do not revoke the old GitHub key.
+
 4. Run a normal reconciliation, not `--check-only`. The host-configuration
    drift forces the installer upgrade path, recreates the controller with the
    new PEM mount, and runs its post-activation health check:
@@ -240,7 +245,7 @@ New controller: new app. Do not share one app across controllers.
    Stop if reconciliation does not report `RECONCILE_OK`, the health check is
    not `healthy` for an `active` controller or `maintenance` for a controller
    whose reviewed desired state is `drained` or `disabled`, or the final check
-   does not report `CHECK_OK`. Warning and unhealthy results always fail.
+   does not report `RECONCILE CONVERGED`. Warning and unhealthy results always fail.
    Restore
    `CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE` to the exact value of `ACTIVE_PEM`
    and reconcile again; do not revoke the old key or remove either PEM until
@@ -275,12 +280,13 @@ New controller: new app. Do not share one app across controllers.
 
 Only after every activation check above succeeds:
 
-1. On the GitHub App settings page, under **Private keys**, delete/revoke the
-   old key.
-2. In the current shell, read the new active destination from `host.env` and
+1. In the current shell, read the new active destination from `host.env` and
    reassign `ACTIVE_PEM` to the exact old path recorded before activation.
-   Validate both paths and their inequality before removing the old PEM; do not
-   use a broad wildcard in a shared secrets directory:
+   Put it in exactly one array: `OLD_LOCAL_PEMS` for host-local storage or
+   `OLD_MANAGED_PEMS` for secret-manager-backed storage. Remove manager-backed
+   material through that manager and verify it is absent before running this
+   block. The block resolves host-local symlinks, validates every exact path,
+   and removes only host-local material; do not use a wildcard:
 
    ```bash
    valid_pem_path() {
@@ -290,22 +296,36 @@ Only after every activation check above succeeds:
    PEM_DEST=$(sudo grep -E '^CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=' \
      /etc/ci-fleet/host.env | cut -d= -f2-)
    ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"
-   OLD_PEM_PATHS=("$ACTIVE_PEM")
-   if sudo test -L "$ACTIVE_PEM"; then
-     backing=$(sudo readlink -f -- "$ACTIVE_PEM") || exit 1
-     OLD_PEM_PATHS+=("$backing")
-   fi
+   OLD_LOCAL_PEMS=("$ACTIVE_PEM")
+   OLD_MANAGED_PEMS=()
+   for pem in "${OLD_LOCAL_PEMS[@]}"; do
+     if sudo test -L "$pem"; then
+       backing=$(sudo readlink -f -- "$pem") || exit 1
+       valid_pem_path "$backing" || exit 1
+       OLD_LOCAL_PEMS+=("$backing")
+     fi
+   done
    valid_pem_path "$PEM_DEST" || exit 1
-   for pem in "${OLD_PEM_PATHS[@]}"; do
+   active_classifications=0
+   for pem in "${OLD_LOCAL_PEMS[@]}" "${OLD_MANAGED_PEMS[@]}"; do
      valid_pem_path "$pem" || exit 1
      [[ "$pem" != "$PEM_DEST" ]] || exit 1
+     if [[ "$pem" == "$ACTIVE_PEM" ]]; then
+       active_classifications=$((active_classifications + 1))
+     fi
    done
-   for pem in "${OLD_PEM_PATHS[@]}"; do
+   ((active_classifications == 1)) || exit 1
+   for pem in "${OLD_MANAGED_PEMS[@]}"; do
+     sudo test ! -e "$pem" || exit 1
+   done
+   for pem in "${OLD_LOCAL_PEMS[@]}"; do
      sudo rm -f -- "$pem" || exit 1
    done
-   unset backing OLD_PEM_PATHS
+   unset active_classifications backing OLD_LOCAL_PEMS OLD_MANAGED_PEMS
    ```
 
+2. On the GitHub App settings page, under **Private keys**, delete/revoke the
+   old key. Do not revoke it unless step 1 completed.
 3. Remove any old workstation or temporary copies under the applicable secure
    erasure policy. Keep the new key and its configured path unchanged.
 
