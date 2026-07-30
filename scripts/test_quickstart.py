@@ -59,6 +59,10 @@ assert transfer.index('cat >\\"\\$tmp\\"') < transfer.index(hard_link)
 assert "set -C" not in transfer
 marker_link = 'ln -T -- \\"\\$tmp\\" \\"$PEM_MARKER\\"'
 assert transfer.index(marker_link) < transfer.index(hard_link)
+trap_body = transfer[transfer.index("trap 'status=") : transfer.index("exit \\\"\\$status\\\"' 0")]
+assert trap_body.index('\\"$PEM_MARKER\\" -ef \\"\\$tmp\\"') < trap_body.index(
+    'rm -f -- \\"\\$tmp\\"'
+)
 for command in ("sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
     assert any(command in line and "$PEM_DEST" in line for line in transfer.splitlines()), (
         f"transfer does not use configured destination: {command}"

@@ -147,7 +147,7 @@ ssh "$CONTROLLER" "
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
   umask 077 &&
   tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
-  trap 'status=\$?; rm -f -- \"\$tmp\";
+  trap 'status=\$?;
     if [ \"\$status\" -ne 0 ] &&
        [ -e \"$PEM_MARKER\" ] && [ \"$PEM_MARKER\" -ef \"\$tmp\" ]; then
       if [ -e \"$PEM_DEST\" ] && [ \"$PEM_DEST\" -ef \"$PEM_MARKER\" ]; then
@@ -155,6 +155,7 @@ ssh "$CONTROLLER" "
       fi;
       rm -f -- \"$PEM_MARKER\";
     fi;
+    rm -f -- \"\$tmp\";
     exit \"\$status\"' 0 &&
   cat >\"\$tmp\" &&
   chown root:root \"\$tmp\" &&
