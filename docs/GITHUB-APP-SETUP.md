@@ -78,8 +78,31 @@ an existing non-canonical path
 (for example one containing `..`, repeated separators, or a symlinked parent),
 resolve it with `sudo readlink -f -- "$ACTIVE_PEM"`, update `host.env` to that
 canonical result, then reconcile and verify healthy convergence before
-continuing. Record the canonical result as `ACTIVE_PEM`. New destinations must
-also equal `realpath -m -- "$PEM_DEST"`.
+continuing. Record the canonical path as `ACTIVE_PEM`.
+
+Before either transfer workflow, reject the active path and key itself as the
+replacement. This preflight runs before importing a manager-backed version:
+
+```bash
+[[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+if [[ -n "$ACTIVE_PEM" ]]; then
+  [[ $ACTIVE_PEM =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+  [[ "$PEM_DEST" != "$ACTIVE_PEM" ]] || exit 1
+  set -o pipefail
+  replacement_pubkey_sha=$(openssl pkey -in "$PEM" -pubout -outform DER | \
+    sha256sum) || exit 1
+  replacement_pubkey_sha=${replacement_pubkey_sha%% *}
+  # ACTIVE_PEM is shell-safe above and intentionally expanded client-side.
+  # shellcheck disable=SC2029
+  active_pubkey_sha=$(ssh "$CONTROLLER" \
+    "openssl pkey -in \"$ACTIVE_PEM\" -pubout -outform DER | sha256sum") || exit 1
+  active_pubkey_sha=${active_pubkey_sha%% *}
+  [[ "$replacement_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  [[ "$active_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  [[ "$replacement_pubkey_sha" != "$active_pubkey_sha" ]] || exit 1
+  unset active_pubkey_sha replacement_pubkey_sha
+fi
+```
 
 The SSH workflow below is only for a host-local destination. For a
 secret-manager-backed destination, do not write into the materialized mount.
@@ -146,6 +169,8 @@ ssh "$CONTROLLER" \
   "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
 ssh "$CONTROLLER" "
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
+  test \"\$(stat -c '%U' -- \"$PEM_DIR\")\" = root &&
+  test -z \"\$(find \"$PEM_DIR\" -maxdepth 0 -perm /022 -print -quit)\" &&
   umask 077 &&
   tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
   trap 'status=\$?;
@@ -199,7 +224,7 @@ else
   if ! ssh "$CONTROLLER" \
     "if test -e \"$PEM_MARKER\" && test \"$PEM_MARKER\" -ef \"$PEM_DEST\"; then
        rm -f -- \"$PEM_DEST\" \"$PEM_MARKER\";
-     elif test -e \"$PEM_MARKER\"; then exit 1; fi"; then
+     elif test -e \"$PEM_MARKER\"; then rm -f -- \"$PEM_MARKER\"; fi"; then
     printf 'remote ownership cleanup failed; inspect inactive destination: %s\n' \
       "$PEM_DEST" >&2
   fi
@@ -449,14 +474,15 @@ Retirement is not complete when only the App installation is removed:
    # Put PEM_DEST and every old path in exactly one array; never use a wildcard.
    LOCAL_PEMS=("/etc/ci-fleet/secrets/HOST-LOCAL-KEY.pem")
    MANAGED_PEMS=("/run/secret-manager/MANAGER-BACKED-KEY")
-   # Retire both a host-local symlink and its backing key file.
+   # Resolve every host-local path before persisting the retry inventory.
+   RESOLVED_LOCAL_PEMS=()
    for pem in "${LOCAL_PEMS[@]}"; do
-     if sudo test -L "$pem"; then
-       backing=$(sudo readlink -f -- "$pem") || exit 1
-       safe_pem_path "$backing" || exit 1
-       LOCAL_PEMS+=("$backing")
-     fi
+     backing=$(sudo readlink -f -- "$pem") || exit 1
+     safe_pem_path "$backing" || exit 1
+     RESOLVED_LOCAL_PEMS+=("$backing")
+     [[ "$pem" == "$backing" ]] || RESOLVED_LOCAL_PEMS+=("$pem")
    done
+   LOCAL_PEMS=("${RESOLVED_LOCAL_PEMS[@]}")
    PEM_INVENTORY=/etc/ci-fleet/retired-pem-paths
    configured_classifications=0
    for pem in "${LOCAL_PEMS[@]}" "${MANAGED_PEMS[@]}"; do
@@ -473,9 +499,9 @@ Retirement is not complete when only the App installation is removed:
    done
    if ((${#LOCAL_PEMS[@]})); then
      printf '%s\n' "${LOCAL_PEMS[@]}" | \
-       sudo install -m 0600 /dev/stdin "$PEM_INVENTORY"
+       sudo install -T -m 0600 /dev/stdin "$PEM_INVENTORY"
    else
-     sudo install -m 0600 /dev/null "$PEM_INVENTORY"
+     sudo install -T -m 0600 /dev/null "$PEM_INVENTORY"
    fi || exit 1
 
    remove_retired_pems() {
@@ -488,7 +514,7 @@ Retirement is not complete when only the App installation is removed:
       remove_retired_pems &&
       sudo rm -f -- /etc/ci-fleet/host.env &&
       sudo rm -f -- "$PEM_INVENTORY"; then
-     unset PEM_DEST PEM_INVENTORY LOCAL_PEMS MANAGED_PEMS
+     unset PEM_DEST PEM_INVENTORY LOCAL_PEMS MANAGED_PEMS RESOLVED_LOCAL_PEMS
    else
      printf 'retirement cleanup failed; retained %s and host.env\n' \
        "$PEM_INVENTORY" >&2

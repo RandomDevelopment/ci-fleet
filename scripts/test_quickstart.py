@@ -51,6 +51,7 @@ assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
 assert 'PEM_MARKER="$PEM_DIR/.ci-fleet-transfer-$TRANSFER_ID"' in transfer
 assert 'PEM_MARKER="$PEM_DEST' not in transfer
 assert "install -d -m 0700" in transfer and "$PEM_DIR" in transfer
+assert "stat -c '%U'" in transfer and "-perm /022" in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert 'realpath -m -- \\"$PEM_DEST\\"' in transfer
 assert active_guard in transfer
@@ -96,6 +97,7 @@ verification_failure = transfer[transfer.index("else\n  if ! ssh") :]
 assert 'test \\"$PEM_MARKER\\" -ef \\"$PEM_DEST\\"' in verification_failure
 assert 'rm -f -- \\"$PEM_DEST\\" \\"$PEM_MARKER\\"' in verification_failure
 assert "remote ownership cleanup failed" in verification_failure
+assert 'elif test -e \\"$PEM_MARKER\\"; then rm -f -- \\"$PEM_MARKER\\"' in verification_failure
 assert "per-transfer hard-link marker proves" in app_setup
 assert "pre-existing destinations are preserved" in app_setup
 verification_ack = transfer[transfer.index("stat -c '%a'") : main_then]
@@ -107,6 +109,11 @@ assert "retry idempotent marker cleanup before activation" in marker_cleanup
 assert "secret-manager-backed destination" in app_setup
 assert "authenticated import/version operation" in app_setup
 assert "remove only the new inactive version through the manager" in app_setup
+manager_import = app_setup.index("authenticated import/version operation")
+preflight_guard = '[[ "$PEM_DEST" != "$ACTIVE_PEM" ]] || exit 1'
+assert app_setup.index(preflight_guard) < manager_import
+assert app_setup.index('replacement_pubkey_sha=$(openssl pkey') < manager_import
+assert '[[ "$replacement_pubkey_sha" != "$active_pubkey_sha" ]] || exit 1' in app_setup
 manager_workflow = app_setup[
     app_setup.index("secret-manager-backed destination, do not") : app_setup.index(
         "For a host-local destination"
@@ -180,16 +187,17 @@ retirement = app_setup[app_setup.index("## Controller retirement and PEM removal
 validate_paths = 'safe_pem_path "$pem" || exit 1'
 uninstall = "scripts/install-worker-controller.sh \\\n        --uninstall &&"
 remove_pem = 'sudo rm -f -- "$pem" || return 1'
-persist_inventory = 'sudo install -m 0600 /dev/stdin "$PEM_INVENTORY"'
+persist_inventory = 'sudo install -T -m 0600 /dev/stdin "$PEM_INVENTORY"'
 remove_host_env = "sudo rm -f -- /etc/ci-fleet/host.env &&"
 remove_inventory = 'sudo rm -f -- "$PEM_INVENTORY"; then'
 classify_destination = 'configured_classifications=$((configured_classifications + 1))'
 manager_absent = 'sudo test ! -e "$pem" || exit 1'
 inventory_distinct = '$(sudo realpath -m -- "$PEM_INVENTORY") ]] || exit 1'
 assert 'LOCAL_PEMS=(' in retirement and 'MANAGED_PEMS=(' in retirement
-assert 'if sudo test -L "$pem"; then' in retirement
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in retirement
-assert 'LOCAL_PEMS+=("$backing")' in retirement
+assert 'RESOLVED_LOCAL_PEMS+=("$backing")' in retirement
+assert 'RESOLVED_LOCAL_PEMS+=("$pem")' in retirement
+assert 'LOCAL_PEMS=("${RESOLVED_LOCAL_PEMS[@]}")' in retirement
 assert "^/[A-Za-z0-9._/-]+$" in retirement
 assert '[[ $(sudo realpath -m -- "$PEM_DEST") == "$PEM_DEST" ]] || exit 1' in retirement
 assert '$(sudo realpath -m -- "$PEM_INVENTORY")' in retirement
