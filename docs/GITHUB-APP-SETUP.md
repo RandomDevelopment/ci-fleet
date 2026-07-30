@@ -133,6 +133,10 @@ if [[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]; then
 fi
 PEM_DIR=${PEM_DEST%/*}
 [[ -n "$PEM_DIR" ]] || PEM_DIR=/
+TRANSFER_ID=$(< /proc/sys/kernel/random/uuid) || exit 1
+PEM_MARKER="$PEM_DEST.ci-fleet-transfer-$TRANSFER_ID"
+[[ $PEM_MARKER =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+[[ -z "$ACTIVE_PEM" || "$PEM_MARKER" != "$ACTIVE_PEM" ]] || exit 1
 
 # PEM_DIR and PEM_DEST are validated above and intentionally expanded locally.
 # shellcheck disable=SC2029
@@ -143,17 +147,20 @@ ssh "$CONTROLLER" "
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
   umask 077 &&
   tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
-  linked=false &&
   trap 'status=\$?; rm -f -- \"\$tmp\";
-    if [ \"\$status\" -ne 0 ] && [ \"\$linked\" = true ]; then
-      rm -f -- \"$PEM_DEST\";
+    if [ \"\$status\" -ne 0 ] &&
+       [ -e \"$PEM_MARKER\" ] && [ \"$PEM_MARKER\" -ef \"\$tmp\" ]; then
+      if [ -e \"$PEM_DEST\" ] && [ \"$PEM_DEST\" -ef \"$PEM_MARKER\" ]; then
+        rm -f -- \"$PEM_DEST\";
+      fi;
+      rm -f -- \"$PEM_MARKER\";
     fi;
     exit \"\$status\"' 0 &&
   cat >\"\$tmp\" &&
   chown root:root \"\$tmp\" &&
   chmod 0600 \"\$tmp\" &&
+  ln -T -- \"\$tmp\" \"$PEM_MARKER\" &&
   ln -T -- \"\$tmp\" \"$PEM_DEST\" &&
-  linked=true &&
   rm -f -- \"\$tmp\" &&
   trap - 0
 " <"$PEM" &&
@@ -167,32 +174,38 @@ ssh "$CONTROLLER" "
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
   ssh "$CONTROLLER" \
-    "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
+    "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'" &&
+  ssh "$CONTROLLER" \
+    "test \"$PEM_MARKER\" -ef \"$PEM_DEST\" && rm -f -- \"$PEM_MARKER\""
 then
   if rm -f -- "$PEM"; then
-    unset PEM local_sha remote_sha
+    unset PEM local_sha remote_sha TRANSFER_ID PEM_MARKER
   else
     printf 'verified transfer, but could not delete downloaded PEM: %s\n' \
       "$PEM" >&2
     exit 1
   fi
 else
-  if ! ssh "$CONTROLLER" "rm -f -- \"$PEM_DEST\""; then
-    printf 'remote cleanup failed; retained inactive destination: %s\n' \
+  if ! ssh "$CONTROLLER" \
+    "if test -e \"$PEM_MARKER\" && test \"$PEM_MARKER\" -ef \"$PEM_DEST\"; then
+       rm -f -- \"$PEM_DEST\" \"$PEM_MARKER\";
+     elif test -e \"$PEM_MARKER\"; then exit 1; fi"; then
+    printf 'remote ownership cleanup failed; inspect inactive destination: %s\n' \
       "$PEM_DEST" >&2
   fi
   printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
-  unset local_sha remote_sha
+  unset local_sha remote_sha TRANSFER_ID PEM_MARKER
   exit 1
 fi
 ```
 
 Use an equivalent privileged SSH workflow if direct root login is disabled.
-If transfer, checksum, owner, or mode verification fails, the sequence stops,
-removes the exact destination declared inactive even if SSH returned an
-ambiguous result, leaves the active controller PEM untouched, and retains the
-downloaded replacement for diagnosis or a safe retry. Do not revoke the old
-GitHub key.
+If transfer, checksum, owner, or mode verification fails, the sequence stops.
+It removes `PEM_DEST` only when the per-transfer hard-link marker proves that
+this invocation created that inode, including after an ambiguous SSH result;
+pre-existing destinations are preserved. The active controller PEM remains
+untouched and the downloaded replacement is retained for diagnosis or a safe
+retry. Do not revoke the old GitHub key.
 After success, remove any other copy from the browser download location, trash,
 sync, and temporary storage according to the workstation's secure-erasure
 policy; plain `rm` may not erase data from snapshots, SSDs, or copy-on-write

@@ -57,7 +57,8 @@ assert hard_link in transfer
 assert transfer.index("mktemp --") < transfer.index('cat >\\"\\$tmp\\"')
 assert transfer.index('cat >\\"\\$tmp\\"') < transfer.index(hard_link)
 assert "set -C" not in transfer
-assert '[ \\"\\$linked\\" = true ]' in transfer
+marker_link = 'ln -T -- \\"\\$tmp\\" \\"$PEM_MARKER\\"'
+assert transfer.index(marker_link) < transfer.index(hard_link)
 for command in ("sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
     assert any(command in line and "$PEM_DEST" in line for line in transfer.splitlines()), (
         f"transfer does not use configured destination: {command}"
@@ -69,7 +70,7 @@ for check in (
     '[[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&\n',
     'test "$local_sha" = "$remote_sha" &&\n',
     "= 'root:root'\" &&\n",
-    "= '600'\"\n",
+    "= '600'\" &&\n",
 ):
     assert check in verification, f"download deletion is not gated by: {check}"
 
@@ -83,9 +84,11 @@ assert "unset PEM" in delete_success
 assert '"$PEM" >&2' in delete_failure and "exit 1" in delete_failure
 assert 'rm -f -- "$PEM"' not in transfer[transfer.index("transfer verification failed") :]
 verification_failure = transfer[transfer.index("else\n  if ! ssh") :]
-assert '! ssh "$CONTROLLER" "rm -f -- \\"$PEM_DEST\\""' in verification_failure
-assert "remote cleanup failed; retained inactive destination" in verification_failure
-assert "even if SSH returned an\nambiguous result" in app_setup
+assert 'test \\"$PEM_MARKER\\" -ef \\"$PEM_DEST\\"' in verification_failure
+assert 'rm -f -- \\"$PEM_DEST\\" \\"$PEM_MARKER\\"' in verification_failure
+assert "remote ownership cleanup failed" in verification_failure
+assert "per-transfer hard-link marker proves" in app_setup
+assert "pre-existing destinations are preserved" in app_setup
 assert "secret-manager-backed destination" in app_setup
 assert "authenticated import/version operation" in app_setup
 assert "remove only the new inactive version through the manager" in app_setup
