@@ -51,7 +51,9 @@ assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
 assert 'PEM_MARKER="$PEM_DIR/.ci-fleet-transfer-$TRANSFER_ID"' in transfer
 assert 'PEM_MARKER="$PEM_DEST' not in transfer
 assert "install -d -m 0700" in transfer and "$PEM_DIR" in transfer
+assert "secure_pem_ancestors()" in transfer
 assert "stat -c '%U'" in transfer and "-perm /022" in transfer
+assert "dir=\\${dir%/*}" in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert 'realpath -m -- \\"$PEM_DEST\\"' in transfer
 assert active_guard in transfer
@@ -96,7 +98,14 @@ assert 'rm -f -- "$PEM"' not in transfer[transfer.index("transfer verification f
 verification_failure = transfer[transfer.index("else\n  if ! ssh") :]
 assert 'test \\"$PEM_MARKER\\" -ef \\"$PEM_DEST\\"' in verification_failure
 assert 'rm -f -- \\"$PEM_DEST\\" \\"$PEM_MARKER\\"' in verification_failure
-assert "remote ownership cleanup failed" in verification_failure
+assert "remote ownership cleanup failed; retain and retry marker" in verification_failure
+assert '"$PEM_MARKER" "$PEM_DEST" >&2' in verification_failure
+cleanup_failure = verification_failure[
+    verification_failure.index("remote ownership cleanup failed") :
+    verification_failure.index("transfer verification failed")
+]
+assert "unset local_sha remote_sha TRANSFER_ID\n" in cleanup_failure
+assert "PEM_MARKER" not in cleanup_failure.split("unset", 1)[1]
 assert 'elif test -e \\"$PEM_MARKER\\"; then rm -f -- \\"$PEM_MARKER\\"' in verification_failure
 assert "per-transfer hard-link marker proves" in app_setup
 assert "pre-existing destinations are preserved" in app_setup
@@ -114,6 +123,11 @@ preflight_guard = '[[ "$PEM_DEST" != "$ACTIVE_PEM" ]] || exit 1'
 assert app_setup.index(preflight_guard) < manager_import
 assert app_setup.index('replacement_pubkey_sha=$(openssl pkey') < manager_import
 assert '[[ "$replacement_pubkey_sha" != "$active_pubkey_sha" ]] || exit 1' in app_setup
+preflight = app_setup[app_setup.index("Before either transfer workflow") : manager_import]
+assert preflight.index('replacement_pubkey_sha=$(openssl pkey') < preflight.index(
+    'if [[ -n "$ACTIVE_PEM" ]]'
+)
+assert "bash -o pipefail -c 'openssl pkey" in preflight
 manager_workflow = app_setup[
     app_setup.index("secret-manager-backed destination, do not") : app_setup.index(
         "For a host-local destination"

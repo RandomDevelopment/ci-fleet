@@ -85,23 +85,24 @@ replacement. This preflight runs before importing a manager-backed version:
 
 ```bash
 [[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+set -o pipefail
+replacement_pubkey_sha=$(openssl pkey -in "$PEM" -pubout -outform DER | \
+  sha256sum) || exit 1
+replacement_pubkey_sha=${replacement_pubkey_sha%% *}
+[[ "$replacement_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
 if [[ -n "$ACTIVE_PEM" ]]; then
   [[ $ACTIVE_PEM =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
   [[ "$PEM_DEST" != "$ACTIVE_PEM" ]] || exit 1
-  set -o pipefail
-  replacement_pubkey_sha=$(openssl pkey -in "$PEM" -pubout -outform DER | \
-    sha256sum) || exit 1
-  replacement_pubkey_sha=${replacement_pubkey_sha%% *}
   # ACTIVE_PEM is shell-safe above and intentionally expanded client-side.
   # shellcheck disable=SC2029
   active_pubkey_sha=$(ssh "$CONTROLLER" \
-    "openssl pkey -in \"$ACTIVE_PEM\" -pubout -outform DER | sha256sum") || exit 1
+    "bash -o pipefail -c 'openssl pkey -in \"$ACTIVE_PEM\" -pubout -outform DER | sha256sum'") || exit 1
   active_pubkey_sha=${active_pubkey_sha%% *}
-  [[ "$replacement_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
   [[ "$active_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
   [[ "$replacement_pubkey_sha" != "$active_pubkey_sha" ]] || exit 1
-  unset active_pubkey_sha replacement_pubkey_sha
+  unset active_pubkey_sha
 fi
+unset replacement_pubkey_sha
 ```
 
 The SSH workflow below is only for a host-local destination. For a
@@ -168,9 +169,18 @@ if
 ssh "$CONTROLLER" \
   "test \"\$(realpath -m -- \"$PEM_DEST\")\" = \"$PEM_DEST\"" &&
 ssh "$CONTROLLER" "
+  secure_pem_ancestors() {
+    dir=\"$PEM_DIR\";
+    while :; do
+      test \"\$(stat -c '%U' -- \"\$dir\")\" = root || return 1;
+      test -z \"\$(find \"\$dir\" -maxdepth 0 -perm /022 -print -quit)\" || return 1;
+      test \"\$dir\" != / || break;
+      dir=\${dir%/*};
+      test -n \"\$dir\" || dir=/;
+    done;
+  }
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
-  test \"\$(stat -c '%U' -- \"$PEM_DIR\")\" = root &&
-  test -z \"\$(find \"$PEM_DIR\" -maxdepth 0 -perm /022 -print -quit)\" &&
+  secure_pem_ancestors &&
   umask 077 &&
   tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
   trap 'status=\$?;
@@ -225,8 +235,10 @@ else
     "if test -e \"$PEM_MARKER\" && test \"$PEM_MARKER\" -ef \"$PEM_DEST\"; then
        rm -f -- \"$PEM_DEST\" \"$PEM_MARKER\";
      elif test -e \"$PEM_MARKER\"; then rm -f -- \"$PEM_MARKER\"; fi"; then
-    printf 'remote ownership cleanup failed; inspect inactive destination: %s\n' \
-      "$PEM_DEST" >&2
+    printf 'remote ownership cleanup failed; retain and retry marker %s for destination %s\n' \
+      "$PEM_MARKER" "$PEM_DEST" >&2
+    unset local_sha remote_sha TRANSFER_ID
+    exit 1
   fi
   printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
   unset local_sha remote_sha TRANSFER_ID PEM_MARKER
