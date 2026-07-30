@@ -128,6 +128,8 @@ assert preflight.index('replacement_pubkey_sha=$(openssl pkey') < preflight.inde
     'if [[ -n "$ACTIVE_PEM" ]]'
 )
 assert "bash -o pipefail -c 'openssl pkey" in preflight
+assert "unset replacement_pubkey_sha" not in preflight
+assert app_setup.count('test "$replacement_pubkey_sha" = "$remote_pubkey_sha"') == 2
 manager_workflow = app_setup[
     app_setup.index("secret-manager-backed destination, do not") : app_setup.index(
         "For a host-local destination"
@@ -136,8 +138,8 @@ manager_workflow = app_setup[
 assert manager_workflow.index('[[ $PEM_DEST =~ ^/[A-Za-z0-9._/-]+$ ]]') < manager_workflow.index(
     'ssh "$CONTROLLER"'
 )
-assert "sudo readlink -f -- \"$ACTIVE_PEM\"" in app_setup
-assert "update `host.env` to that\ncanonical result" in app_setup
+assert 'ACTIVE_PEM=$(ssh "$CONTROLLER" "readlink -f -- \\"$ACTIVE_PEM\\"")' in app_setup
+assert "Update controller `host.env` to that canonical result" in app_setup
 assert "rotating, revoking, or directly retiring" in app_setup
 
 for use in (
@@ -155,6 +157,8 @@ assert "`maintenance`" in rotation and "`drained` or `disabled`" in rotation
 assert "If token generation fails, immediately restore" in rotation
 assert "run normal\n   reconciliation" in rotation
 assert "`RECONCILE CONVERGED`" in rotation
+health_gate = "sudo /opt/ci-fleet/current/scripts/healthcheck.sh || exit 1"
+assert rotation.index(health_gate) < rotation.index("--check-only --installed-ref")
 checkpoint_match = '"CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$PEM_DEST"'
 assert checkpoint_match in rotation
 checkpoint_query = "LATEST_CHECKPOINT=$(sudo find"

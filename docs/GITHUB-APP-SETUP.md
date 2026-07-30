@@ -76,9 +76,17 @@ Lifecycle commands use canonical absolute paths so path comparisons and exact
 deletion cannot change meaning. Before rotating, revoking, or directly retiring
 an existing non-canonical path
 (for example one containing `..`, repeated separators, or a symlinked parent),
-resolve it with `sudo readlink -f -- "$ACTIVE_PEM"`, update `host.env` to that
-canonical result, then reconcile and verify healthy convergence before
-continuing. Record the canonical path as `ACTIVE_PEM`.
+validate it as shell-safe and resolve it on the controller—not the workstation:
+
+```bash
+[[ $ACTIVE_PEM =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
+# ACTIVE_PEM is shell-safe above and intentionally expanded client-side.
+# shellcheck disable=SC2029
+ACTIVE_PEM=$(ssh "$CONTROLLER" "readlink -f -- \"$ACTIVE_PEM\"") || exit 1
+```
+
+Update controller `host.env` to that canonical result, then reconcile and verify
+healthy convergence before continuing. Record the result as `ACTIVE_PEM`.
 
 Before either transfer workflow, reject the active path and key itself as the
 replacement. This preflight runs before importing a manager-backed version:
@@ -102,7 +110,6 @@ if [[ -n "$ACTIVE_PEM" ]]; then
   [[ "$replacement_pubkey_sha" != "$active_pubkey_sha" ]] || exit 1
   unset active_pubkey_sha
 fi
-unset replacement_pubkey_sha
 ```
 
 The SSH workflow below is only for a host-local destination. For a
@@ -128,12 +135,18 @@ if
   remote_sha=${remote_sha%% *} &&
   [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&
   test "$local_sha" = "$remote_sha" &&
+  remote_pubkey_sha=$(ssh "$CONTROLLER" \
+    "bash -o pipefail -c 'openssl pkey -in \"$PEM_DEST\" -pubout -outform DER | sha256sum'") &&
+  remote_pubkey_sha=${remote_pubkey_sha%% *} &&
+  [[ "$remote_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] &&
+  test "$replacement_pubkey_sha" = "$remote_pubkey_sha" &&
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
 then
   rm -f -- "$PEM" || exit 1
+  unset replacement_pubkey_sha remote_pubkey_sha
 else
   printf 'manager import verification failed; retained download: %s\n' \
     "$PEM" >&2
@@ -208,6 +221,11 @@ ssh "$CONTROLLER" "
   remote_sha=${remote_sha%% *} &&
   [[ "$remote_sha" =~ ^[0-9a-f]{64}$ ]] &&
   test "$local_sha" = "$remote_sha" &&
+  remote_pubkey_sha=$(ssh "$CONTROLLER" \
+    "bash -o pipefail -c 'openssl pkey -in \"$PEM_DEST\" -pubout -outform DER | sha256sum'") &&
+  remote_pubkey_sha=${remote_pubkey_sha%% *} &&
+  [[ "$remote_pubkey_sha" =~ ^[0-9a-f]{64}$ ]] &&
+  test "$replacement_pubkey_sha" = "$remote_pubkey_sha" &&
   ssh "$CONTROLLER" \
     "test \"\$(stat -c '%U:%G' -- \"$PEM_DEST\")\" = 'root:root'" &&
   ssh "$CONTROLLER" \
@@ -224,7 +242,8 @@ then
     exit 1
   fi
   if rm -f -- "$PEM"; then
-    unset PEM local_sha remote_sha TRANSFER_ID PEM_MARKER
+    unset PEM local_sha remote_sha remote_pubkey_sha replacement_pubkey_sha \
+      TRANSFER_ID PEM_MARKER
   else
     printf 'verified transfer, but could not delete downloaded PEM: %s\n' \
       "$PEM" >&2
@@ -357,7 +376,7 @@ New controller: new app. Do not share one app across controllers.
 
    ```bash
    sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh
-   sudo /opt/ci-fleet/current/scripts/healthcheck.sh
+   sudo /opt/ci-fleet/current/scripts/healthcheck.sh || exit 1
    sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh \
      --check-only --installed-ref
    ```
