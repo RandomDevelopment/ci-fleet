@@ -134,7 +134,7 @@ fi
 PEM_DIR=${PEM_DEST%/*}
 [[ -n "$PEM_DIR" ]] || PEM_DIR=/
 TRANSFER_ID=$(< /proc/sys/kernel/random/uuid) || exit 1
-PEM_MARKER="$PEM_DEST.ci-fleet-transfer-$TRANSFER_ID"
+PEM_MARKER="$PEM_DIR/.ci-fleet-transfer-$TRANSFER_ID"
 [[ $PEM_MARKER =~ ^/[A-Za-z0-9._/-]+$ ]] || exit 1
 [[ -z "$ACTIVE_PEM" || "$PEM_MARKER" != "$ACTIVE_PEM" ]] || exit 1
 

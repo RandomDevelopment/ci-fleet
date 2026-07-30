@@ -46,6 +46,8 @@ transfer = app_setup[
 active_guard = '[[ -n "$ACTIVE_PEM" && "$PEM_DEST" == "$ACTIVE_PEM" ]]'
 assert "valid_pem_path \"$PEM_DEST\" || exit 1" in transfer
 assert '[[ -n "$PEM_DIR" ]] || PEM_DIR=/' in transfer
+assert 'PEM_MARKER="$PEM_DIR/.ci-fleet-transfer-$TRANSFER_ID"' in transfer
+assert 'PEM_MARKER="$PEM_DEST' not in transfer
 assert "install -d -m 0700" in transfer and "$PEM_DIR" in transfer
 assert "^/[A-Za-z0-9._/-]+$" in transfer
 assert 'realpath -m -- \\"$PEM_DEST\\"' in transfer
