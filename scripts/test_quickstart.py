@@ -56,6 +56,9 @@ assert hard_link in transfer
 assert transfer.index("mktemp --") < transfer.index('cat >\\"\\$tmp\\"')
 assert transfer.index('cat >\\"\\$tmp\\"') < transfer.index(hard_link)
 assert "set -C" not in transfer
+assert "created_dest=false" in transfer
+assert transfer.index(hard_link) < transfer.index("created_dest=true &&")
+assert '[ \\"\\$linked\\" = true ]' in transfer
 for command in ("sha256sum --", "stat -c '%U:%G'", "stat -c '%a'"):
     assert any(command in line and "$PEM_DEST" in line for line in transfer.splitlines()), (
         f"transfer does not use configured destination: {command}"
@@ -73,13 +76,16 @@ for check in (
 
 delete_download = transfer[
     transfer.index('if rm -f -- "$PEM"; then') : transfer.index(
-        "else\n  printf 'transfer verification failed"
+        "else\n  if $created_dest"
     )
 ]
 delete_success, delete_failure = delete_download.split("else", 1)
 assert "unset PEM" in delete_success
 assert '"$PEM" >&2' in delete_failure and "exit 1" in delete_failure
 assert 'rm -f -- "$PEM"' not in transfer[transfer.index("transfer verification failed") :]
+verification_failure = transfer[transfer.index("else\n  if $created_dest") :]
+assert '! ssh "$CONTROLLER" "rm -f -- \\"$PEM_DEST\\""' in verification_failure
+assert "remote cleanup failed; retained inactive destination" in verification_failure
 
 for use in (
     "exact value of `PEM_DEST`",
@@ -118,7 +124,7 @@ distinct_paths = '[[ "$pem" != "$PEM_DEST" ]] || exit 1'
 remove_old_pem = 'sudo rm -f -- "$pem" || exit 1'
 assert 'ACTIVE_PEM="/etc/ci-fleet/secrets/OLD-GITHUB-APP-KEY.pem"' in revocation
 assert 'backing=$(sudo readlink -f -- "$pem") || exit 1' in revocation
-assert 'OLD_LOCAL_PEMS+=("$backing")' in revocation
+assert 'OLD_LOCAL_PEMS=("$backing" "$pem")' in revocation
 assert 'OLD_MANAGED_PEMS=()' in revocation
 assert "((active_classifications == 1)) || exit 1" in revocation
 old_manager_absent = 'for pem in "${OLD_MANAGED_PEMS[@]}"; do'

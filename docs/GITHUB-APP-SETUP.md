@@ -90,6 +90,7 @@ fi
 PEM_DIR=${PEM_DEST%/*}
 [[ -n "$PEM_DIR" ]] || PEM_DIR=/
 
+created_dest=false
 # PEM_DIR and PEM_DEST are validated above and intentionally expanded locally.
 # shellcheck disable=SC2029
 if
@@ -97,14 +98,21 @@ ssh "$CONTROLLER" "
   { test -d \"$PEM_DIR\" || install -d -m 0700 \"$PEM_DIR\"; } &&
   umask 077 &&
   tmp=\$(mktemp -- \"$PEM_DIR/.github-app-key.XXXXXX\") &&
-  trap 'rm -f -- \"\$tmp\"' 0 &&
+  linked=false &&
+  trap 'status=\$?; rm -f -- \"\$tmp\";
+    if [ \"\$status\" -ne 0 ] && [ \"\$linked\" = true ]; then
+      rm -f -- \"$PEM_DEST\";
+    fi;
+    exit \"\$status\"' 0 &&
   cat >\"\$tmp\" &&
   chown root:root \"\$tmp\" &&
   chmod 0600 \"\$tmp\" &&
   ln -T -- \"\$tmp\" \"$PEM_DEST\" &&
+  linked=true &&
   rm -f -- \"\$tmp\" &&
   trap - 0
 " <"$PEM" &&
+  created_dest=true &&
   local_sha=$(sha256sum -- "$PEM") &&
   local_sha=${local_sha%% *} &&
   [[ "$local_sha" =~ ^[0-9a-f]{64}$ ]] &&
@@ -118,15 +126,19 @@ ssh "$CONTROLLER" "
     "test \"\$(stat -c '%a' -- \"$PEM_DEST\")\" = '600'"
 then
   if rm -f -- "$PEM"; then
-    unset PEM local_sha remote_sha
+    unset PEM created_dest local_sha remote_sha
   else
     printf 'verified transfer, but could not delete downloaded PEM: %s\n' \
       "$PEM" >&2
     exit 1
   fi
 else
+  if $created_dest && ! ssh "$CONTROLLER" "rm -f -- \"$PEM_DEST\""; then
+    printf 'remote cleanup failed; retained inactive destination: %s\n' \
+      "$PEM_DEST" >&2
+  fi
   printf 'transfer verification failed; retained downloaded PEM: %s\n' "$PEM" >&2
-  unset local_sha remote_sha
+  unset created_dest local_sha remote_sha
   exit 1
 fi
 ```
@@ -302,7 +314,7 @@ Only after every activation check above succeeds:
      if sudo test -L "$pem"; then
        backing=$(sudo readlink -f -- "$pem") || exit 1
        valid_pem_path "$backing" || exit 1
-       OLD_LOCAL_PEMS+=("$backing")
+       OLD_LOCAL_PEMS=("$backing" "$pem")
      fi
    done
    valid_pem_path "$PEM_DEST" || exit 1
