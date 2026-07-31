@@ -102,6 +102,7 @@ if [[ "$mode" == rollback ]]; then
   force=0
   [[ -f "$restart_required" ]] && force=1
   activate "$target" 0
+  link_unit
   restart_live_service "$force"
   rm -f "$restart_required"
   echo "ROLLED_BACK $target"

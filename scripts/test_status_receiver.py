@@ -378,7 +378,18 @@ class StatusReceiverTests(unittest.TestCase):
         self.assertEqual(payload["history"], [report])
 
     def test_health_requires_receiver_schema(self) -> None:
+        queries: list[str] = []
+        connect = self.receiver._connect
+
+        def traced_connect() -> sqlite3.Connection:
+            connection = connect()
+            connection.set_trace_callback(queries.append)
+            return connection
+
+        self.receiver._connect = traced_connect
         self.receiver.health()
+        self.receiver.health()
+        self.assertEqual(sum("quick_check" in query.lower() for query in queries), 1)
         with sqlite3.connect(self.receiver.database) as connection:
             connection.execute("DROP TABLE nonces")
         with self.assertRaises(sqlite3.Error):

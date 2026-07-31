@@ -92,7 +92,10 @@ test "$(stat -c %a "$root/var/lib/ci-fleet-status-installer")" = 700
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --check)" = "CHECK_OK $second"
+rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
+printf '%s\n' drift >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --rollback)" = "ROLLED_BACK $first"
+test -L "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
 cmp "$tmp/first-unit" "$root/etc/systemd/system/ci-fleet-status-receiver.service"

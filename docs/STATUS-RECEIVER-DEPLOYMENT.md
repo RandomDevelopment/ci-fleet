@@ -112,9 +112,22 @@ management or reconciliation.
 The receiver suppresses request logs. Keep systemd journal retention bounded by
 the host's reviewed journald policy and monitor service restart count. SQLite
 retention is enforced independently by age and per-controller count. The status
-database is disposable; recovery is reinstalling the reviewed release,
-reprovisioning credentials, and accepting fresh reports. Back it up only if an
-operator separately decides that short status history is durable evidence.
+database is disposable. For database corruption, stop the service, quarantine the
+database and its journal files outside service-writable state, and start with a
+fresh database:
+
+```bash
+sudo systemctl stop ci-fleet-status-receiver.service
+quarantine="/var/lib/ci-fleet-status-installer/quarantine/$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -o root -g root -m 0700 "$quarantine"
+sudo find /var/lib/ci-fleet-status -maxdepth 1 -type f -name 'status.db*' \
+  -exec mv -t "$quarantine" -- {} +
+sudo systemctl start ci-fleet-status-receiver.service
+```
+
+A full host-loss recovery reinstalls the reviewed release and reprovisions
+credentials. Back up the database only if an operator separately decides that
+short status history is durable evidence.
 
 ## Upgrade and rollback
 

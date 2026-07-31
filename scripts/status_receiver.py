@@ -61,6 +61,8 @@ class StatusReceiver:
         self._write_lock = threading.Lock()
         self._last_attempt: dict[str, int] = {}
         self._clock = time.time
+        self._monotonic = time.monotonic
+        self._health_checked_at = float("-inf")
         with closing(self._connect()) as connection, connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS reports (
@@ -286,9 +288,12 @@ class StatusReceiver:
         return [json.loads(row[0]) for row in rows]
 
     def health(self) -> None:
-        with closing(self._connect()) as connection:
-            if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
-                raise sqlite3.DatabaseError("database quick check failed")
+        with self._write_lock, closing(self._connect()) as connection:
+            now = self._monotonic()
+            if now - self._health_checked_at >= 60:
+                if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
+                    raise sqlite3.DatabaseError("database quick check failed")
+                self._health_checked_at = now
             connection.execute(
                 "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
             )
