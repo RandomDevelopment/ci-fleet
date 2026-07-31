@@ -44,11 +44,26 @@ Nothing else. No `write` on contents, no actions, no administration. If the
 controller ever needs more, that is a reviewed design change, not a settings
 tweak.
 
-## 3. Generate the private key
+## 3. Generate and transfer the private key
 
 On the app page: Private keys → Generate a private key. GitHub downloads one
-PEM. Store it only on the controller host, root-owned `0600`. It is never
-committed, printed, or copied elsewhere — see [SECRETS.md](SECRETS.md).
+PEM. The normal manual workflow in this guide stores it on the controller's
+local filesystem at `/etc/ci-fleet/secrets/github-app.pem`, owned by root with
+mode `0600`.
+
+Transfer the PEM to a fresh operator-owned temporary file on the controller
+using an encrypted channel such as SSH. Compare a SHA-256 digest at both ends,
+then install the verified file with `sudo install -o root -g root -m 0600`.
+Remove the controller's temporary copy. Delete the workstation copy **only
+after** the encrypted transfer, digest comparison, installation, ownership,
+and mode checks have all succeeded. The PEM must never be committed or printed;
+see [SECRETS.md](SECRETS.md).
+
+This manual example does not cover arbitrary custom paths, symlinks, or an
+external secret manager's import, rotation, or deletion lifecycle. Those cases
+require provider-specific tested automation. Do not improvise them from these
+Markdown examples; [issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27)
+tracks that automation.
 
 ## 4. Install the app
 
@@ -68,7 +83,7 @@ Record from the installation page URL and app page:
 ```bash
 CI_FLEET_GITHUB_APP_CLIENT_ID=<client id>
 CI_FLEET_GITHUB_APP_INSTALLATION_ID=<installation id>
-CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=<absolute path to the PEM>
+CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/secrets/github-app.pem
 ```
 
 The controller exchanges a short-lived JWT signed with the PEM for an
@@ -77,18 +92,26 @@ stored.
 
 ## 6. Verify
 
-On the controller host:
+The token helper writes a token to stdout. Every verification invocation must
+redirect stdout to `/dev/null`; exit status alone is the result.
+
+Before installation, use only a reviewed checkout at the intended immutable
+commit. Confirm `git rev-parse HEAD` is that commit, ensure the checkout is
+clean, and run the checkout's helper:
+
+```bash
+sudo ./scripts/github-app-token.sh \
+  --env-file /etc/ci-fleet/host.env >/dev/null
+```
+
+**Stop** if the checkout or commit is not the reviewed source, the checkout is
+dirty, or the command fails. Do not substitute a downloaded standalone script.
+
+After installation, use the installed manager rather than a working tree:
 
 ```bash
 sudo /opt/ci-fleet/manager/current/scripts/github-app-token.sh \
-  --env-file /etc/ci-fleet/host.env
-```
-
-Prints nothing secret; exit 0 means JWT signing and token exchange work.
-Then a check-only reconcile validates the full fetch path without applying
-anything:
-
-```bash
+  --env-file /etc/ci-fleet/host.env >/dev/null
 sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 ```
 
@@ -98,15 +121,44 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 
 ## Troubleshooting
 
-| Symptom | Cause |
-| --- | --- |
-| `Repository not found` on fetch | repository not in the installation's selected list |
-| 403 on content API after granting permission | permission change saved on the app but not yet accepted on the installation — reopen the installation page and approve the pending permission request |
-| 401 on token exchange | wrong client ID, installation ID, or PEM path in `host.env` |
+- `Repository not found` on fetch: the repository is not in the installation's
+  selected list.
+- 403 on the content API after granting permission: the installation has not
+  accepted the app's pending permission change. Reopen the installation page
+  and approve it.
+- 401 on token exchange: `host.env` has the wrong client ID, installation ID,
+  or PEM path.
 
-## Rotation and removal
+## Rotation
 
-- New controller: new app. Do not share one app across controllers.
-- Rotate: generate a new key, update the PEM path, delete the old key.
-- Retire: uninstall the app from the organization. The host keeps no usable
-  credential.
+Use this ordered safety checklist for the normal host-local root-owned PEM
+workflow. It is a set of gates, not a copy-and-paste shell program.
+
+1. Generate a new GitHub key and transfer, verify, and install it as described
+   above at a new root-owned `0600` host-local path. Keep the old key active.
+2. Update the protected controller identity configuration to select the new PEM.
+3. Activate the new key and require the installed manager's token verification,
+   reconciliation, health check, and installed-state convergence check all to
+   succeed with the new key.
+4. Confirm the controller remains healthy and converged after a fresh check.
+5. Only then revoke the old key in GitHub and remove the old controller PEM.
+
+**Stop before old-key revocation or deletion** if new-key activation,
+reconciliation, health, or convergence is incomplete or fails. Restore the old
+configuration while its key remains valid. Custom paths, symlinks, and secret
+managers must use the provider-specific tested automation tracked by issue #27;
+do not adapt this checklist into ad hoc shell.
+
+## Retirement
+
+1. Drain and stop the controller through its reviewed operational procedure.
+2. Revoke every key for this controller in GitHub and uninstall its GitHub App.
+3. Confirm the controller can no longer authenticate.
+4. Remove the controller's PEM and its local GitHub App identity state, including
+   the protected client ID, installation ID, and PEM-path configuration.
+5. Verify that no usable controller credential or identity state remains.
+
+**Stop and preserve evidence** if revocation cannot be confirmed or if the
+normal host-local files cannot be identified safely. Arbitrary paths, symlinks,
+and secret-manager lifecycle operations require the tested automation tracked
+by issue #27; operators must not improvise removal from Markdown examples.
