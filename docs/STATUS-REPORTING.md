@@ -121,3 +121,7 @@ Reports never contain:
 - Docker socket access or any host-control capability.
 
 The local full health result remains available for recovery, but only the status schema's allowlisted summary leaves the controller.
+
+For dedicated-host packaging, one-time secret boundaries, activation,
+verification, upgrade, and rollback, see
+[Status receiver deployment](STATUS-RECEIVER-DEPLOYMENT.md).

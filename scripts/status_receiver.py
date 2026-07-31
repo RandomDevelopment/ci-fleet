@@ -285,6 +285,10 @@ class StatusReceiver:
             """).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def health(self) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("SELECT 1").fetchone()
+
 
 class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -365,6 +369,10 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
             try:
                 if path.query or path.fragment:
                     raise StatusError(400, "invalid_request")
+                if path.path == "/healthz":
+                    receiver.health()
+                    self.send_json(200, {"status": "ok"})
+                    return
                 if path.path == "/v1/controllers":
                     value = {"schema_version": 1, "controllers": receiver.list_latest(self.bearer())}
                 elif path.path.startswith("/v1/controllers/"):
@@ -382,6 +390,8 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
                 self.send_json(200, value)
             except StatusError as error:
                 self.send_json(error.status, {"error": error.code})
+            except (OSError, sqlite3.Error):
+                self.send_json(503, {"error": "unavailable"})
 
         def log_message(self, format: str, *args: Any) -> None:
             pass

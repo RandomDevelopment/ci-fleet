@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -354,6 +355,18 @@ class StatusReceiverTests(unittest.TestCase):
         request = urllib.request.Request(base + "/v1/status", data=body, headers=headers, method="POST")
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 202)
+        request = urllib.request.Request(base + "/healthz")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(json.load(response), {"status": "ok"})
+        health = self.receiver.health
+        self.receiver.health = lambda: (_ for _ in ()).throw(sqlite3.OperationalError("unavailable"))
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request)
+            self.assertEqual(caught.exception.code, 503)
+            self.assertEqual(json.load(caught.exception), {"error": "unavailable"})
+        finally:
+            self.receiver.health = health
         request = urllib.request.Request(base + "/v1/controllers", headers={"Authorization": "Bearer reader-token"})
         with urllib.request.urlopen(request) as response:
             payload = json.load(response)

@@ -27,6 +27,7 @@ python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.jso
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
 scripts/test-install-worker-controller.sh
+scripts/test-install-status-receiver.sh
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
