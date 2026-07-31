@@ -287,6 +287,8 @@ class StatusReceiver:
 
     def health(self) -> None:
         with closing(self._connect()) as connection:
+            if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
+                raise sqlite3.DatabaseError("database quick check failed")
             connection.execute(
                 "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
             )

@@ -49,8 +49,10 @@ test "$(stat -c %a "$root/var/lib/ci-fleet-status")" = 700
 test "$(stat -c %a "$root/run/lock")" = 1777
 test "$(stat -c %a "$root/opt/ci-fleet-status/releases/$first")" = 755
 cp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" "$tmp/first-unit"
+rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 printf '%s\n' 'ExecStart=python3 --bind 127.0.0.1' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --install --ref "$first")" = NO_CHANGE
+test -L "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 
@@ -79,6 +81,10 @@ printf '\n# upgraded unit\n' >>"$source_tree/deploy/status-receiver/ci-fleet-sta
 git -C "$source_tree" add .
 git -C "$source_tree" commit -qm upgrade
 second=$(git -C "$source_tree" rev-parse HEAD)
+if run --install --ref "$second" >/dev/null 2>&1; then
+  echo "install mode changed an active release" >&2
+  exit 1
+fi
 test "$(run --upgrade --ref "$second")" = UPGRADED
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$second"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
@@ -101,5 +107,6 @@ grep -F 'ReadWritePaths=/var/lib/ci-fleet-status' "$unit" >/dev/null
 grep -F 'useradd --system --user-group' "$installer" >/dev/null
 grep -F 'restart-required' "$installer" >/dev/null
 grep -F 'getent passwd ci-fleet-status' "$installer" >/dev/null
+grep -F '/usr/bin/python3' "$installer" >/dev/null
 
 echo STATUS_RECEIVER_INSTALL_TESTS_OK

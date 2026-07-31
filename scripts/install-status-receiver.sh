@@ -35,6 +35,7 @@ metadata_root="$root/var/lib/ci-fleet-status-installer"
 config_root="$root/etc/ci-fleet-status"
 unit_path="$root/etc/systemd/system/ci-fleet-status-receiver.service"
 current="$install_root/current"
+unit_target="$current/ci-fleet-status-receiver.service"
 previous="$metadata_root/previous-ref"
 restart_required="$metadata_root/restart-required"
 mkdir -p "$root/run/lock"
@@ -61,11 +62,9 @@ write_metadata() {
   mv -Tf "$temporary" "$destination"
 }
 
-install_unit() {
-  local target=$1 temporary
-  temporary=$(mktemp "$(dirname "$unit_path")/.ci-fleet-status-receiver.XXXXXX")
-  install -m 0644 "$install_root/releases/$target/ci-fleet-status-receiver.service" "$temporary"
-  mv -Tf "$temporary" "$unit_path"
+link_unit() {
+  ln -sfn "$unit_target" "$unit_path.new"
+  mv -Tf "$unit_path.new" "$unit_path"
 }
 
 activate() {
@@ -75,7 +74,6 @@ activate() {
   if [[ "$record_previous" == 1 && -n "$old" && "$old" != "$target" ]]; then
     write_metadata "$previous" "$old"
   fi
-  install_unit "$target"
   ln -sfn "releases/$target" "$current.new"
   mv -Tf "$current.new" "$current"
 }
@@ -92,7 +90,7 @@ restart_live_service() {
 if [[ "$mode" == check ]]; then
   installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
   [[ -x "$current/status_receiver.py" && -r "$current/status_auth.py" ]]
-  cmp -s "$current/ci-fleet-status-receiver.service" "$unit_path"
+  [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]]
   echo "CHECK_OK $installed"
   exit
 fi
@@ -123,6 +121,10 @@ git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
   echo "reviewed receiver inputs differ from HEAD" >&2
   exit 1
 }
+/usr/bin/python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' || {
+  echo "Python 3.9 or newer is required" >&2
+  exit 1
+}
 
 if [[ -z "$root" ]]; then
   getent passwd ci-fleet-status >/dev/null || \
@@ -138,6 +140,11 @@ else
   install -d -m 0700 "$state_root" "$config_root" "$metadata_root"
 fi
 install -d -m 0755 "$install_root/releases" "$(dirname "$unit_path")"
+existing=$(current_ref || true)
+if [[ "$mode" == install && -n "$existing" && "$existing" != "$ref" ]]; then
+  echo "use --upgrade to change an active release" >&2
+  exit 1
+fi
 release="$install_root/releases/$ref"
 if [[ -d "$release" ]]; then
   cmp -s "$repo_root/scripts/status_receiver.py" "$release/status_receiver.py"
@@ -156,11 +163,10 @@ else
   trap - EXIT
 fi
 
-existing=$(current_ref || true)
 if [[ "$existing" == "$ref" ]]; then
   changed=0
-  cmp -s "$release/ci-fleet-status-receiver.service" "$unit_path" || changed=1
-  install_unit "$ref"
+  [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]] || changed=1
+  link_unit
   [[ "$changed" == 0 ]] || restart_live_service
   echo NO_CHANGE
   exit
@@ -174,6 +180,7 @@ if [[ "$mode" == upgrade && -z "$root" ]]; then
   fi
 fi
 activate "$ref"
+link_unit
 restart_live_service
 if [[ "$mode" == upgrade ]]; then
   echo UPGRADED

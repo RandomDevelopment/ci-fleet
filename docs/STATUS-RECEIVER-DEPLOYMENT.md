@@ -18,10 +18,11 @@ submit outbound HTTPS. The read API is authenticated and has no mutation route.
 
 ## Install from a reviewed commit
 
-On the prepared receiver host, check out the exact reviewed commit and verify a
-clean tree. The installer creates the unprivileged `ci-fleet-status` account,
-release and state directories, a hardened systemd unit, and an atomic `current`
-link. It does not create credentials.
+On the prepared receiver host, use the supported `/usr/bin/python3` version 3.9
+or newer, check out the exact reviewed commit, and verify a clean tree. The
+installer creates the unprivileged `ci-fleet-status` account, release and state
+directories, a hardened systemd unit, and an atomic `current` link. It does not
+create credentials.
 
 ```bash
 ref=$(git rev-parse HEAD)
