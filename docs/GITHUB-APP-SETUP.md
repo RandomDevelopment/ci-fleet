@@ -51,19 +51,42 @@ PEM. The normal manual workflow in this guide stores it on the controller's
 local filesystem at `/etc/ci-fleet/secrets/github-app.pem`, owned by root with
 mode `0600`.
 
-Transfer the PEM to a fresh operator-owned temporary file on the controller
-using an encrypted channel such as SSH. Compare a SHA-256 digest at both ends,
-then install the verified file with `sudo install -o root -g root -m 0600`.
-Remove the controller's temporary copy. Delete the workstation copy **only
-after** the encrypted transfer, digest comparison, installation, ownership,
-and mode checks have all succeeded. The PEM must never be committed or printed;
-see [SECRETS.md](SECRETS.md).
+GitHub's browser download is necessarily present briefly on a controlled
+management workstation. Choose a fresh temporary directory outside synchronized,
+indexed, and backed-up locations, restrict the downloaded file to the operator
+immediately, and transfer it at once. This is transient handling, not approved
+long-term credential storage; never claim that the key was absent from the
+workstation.
 
-This manual example does not cover arbitrary custom paths, symlinks, or an
-external secret manager's import, rotation, or deletion lifecycle. Those cases
-require provider-specific tested automation. Do not improvise them from these
-Markdown examples; [issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27)
-tracks that automation.
+Before any key bytes arrive, create the controller directory as root-owned mode
+`0700` and pre-create the destination as a root-owned regular file with mode
+`0600`. Initial setup uses only the active path:
+
+```bash
+sudo install -d -o root -g root -m 0700 /etc/ci-fleet/secrets
+sudo install -o root -g root -m 0600 /dev/null \
+  /etc/ci-fleet/secrets/github-app.pem
+```
+
+Verify the directory and destination ownership, type, and mode without reading
+the content. Then use an authenticated encrypted channel to stream into that
+already secured file; the transfer must not replace it with a default-mode node.
+Keep key bytes out of tracing, logs, stdout, process arguments, Git, issues, and
+PRs. Compare a SHA-256 digest at both ends without printing file content, then
+verify the destination again.
+
+Delete the workstation copy immediately after authenticated transfer and those
+transfer checks succeed, before token, reconciliation, health, or convergence
+checks. Stop if transfer verification or local deletion fails. The PEM must
+never be committed or printed; see [SECRETS.md](SECRETS.md).
+
+This manual workflow permits exactly two host-local files: the active path above
+and `/etc/ci-fleet/secrets/github-app.next.pem` while rotating. It does not cover
+other custom paths, symlinks, or an external secret manager's import, rotation,
+or deletion lifecycle. Those cases require provider-specific tested automation.
+Do not improvise them from these Markdown examples;
+[issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27) tracks that
+automation.
 
 ## 4. Install the app
 
@@ -135,28 +158,43 @@ Use this ordered safety checklist for the normal host-local root-owned PEM
 workflow. It is a set of gates, not a copy-and-paste shell program.
 
 1. Generate a new GitHub key and transfer, verify, and install it as described
-   above at a new root-owned `0600` host-local path. Keep the old key active.
+   above at the one approved replacement path,
+   `/etc/ci-fleet/secrets/github-app.next.pem`. Pre-create it as root-owned
+   `0600` inside the root-owned `0700` directory before transfer. Keep the old
+   key and `/etc/ci-fleet/secrets/github-app.pem` active for rollback, and delete
+   the workstation copy before continuing.
 2. Update the protected controller identity configuration to select the new PEM.
 3. Activate the new key and require the installed manager's token verification,
    reconciliation, health check, and installed-state convergence check all to
    succeed with the new key.
 4. Confirm the controller remains healthy and converged after a fresh check.
-5. Only then revoke the old key in GitHub and remove the old controller PEM.
+5. Only then revoke the old key in GitHub. Remove its exact old controller PEM
+   only after revocation is confirmed. Retain the now-active replacement PEM;
+   never use a wildcard in the shared secrets directory.
 
 **Stop before old-key revocation or deletion** if new-key activation,
 reconciliation, health, or convergence is incomplete or fails. Restore the old
-configuration while its key remains valid. Custom paths, symlinks, and secret
-managers must use the provider-specific tested automation tracked by issue #27;
-do not adapt this checklist into ad hoc shell.
+configuration while its key and old PEM remain valid. The approved replacement
+file is not cleanup residue after successful activation; it is the selected
+active key. Further rotation, canonical-path normalization, custom paths,
+symlinks, and secret managers require the tested automation tracked by
+[issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27); do not
+adapt this checklist into ad hoc shell.
 
 ## Retirement
 
-1. Drain and stop the controller through its reviewed operational procedure.
+1. In the reviewed private schema-v3 desired state, drain the controller and
+   converge that state; verify zero managed runners and zero effective capacity.
 2. Revoke every key for this controller in GitHub and uninstall its GitHub App.
 3. Confirm the controller can no longer authenticate.
 4. Remove the controller's PEM and its local GitHub App identity state, including
    the protected client ID, installation ID, and PEM-path configuration.
-5. Verify that no usable controller credential or identity state remains.
+5. Through review, permanently disable or remove the controller declaration,
+   update lifecycle and capacity inventory as appropriate, and converge the
+   reviewed private desired state. Keep private identifiers out of this public
+   repository.
+6. Verify that no usable controller credential or identity state remains and
+   that the authoritative desired state no longer declares active capacity.
 
 **Stop and preserve evidence** if revocation cannot be confirmed or if the
 normal host-local files cannot be identified safely. Arbitrary paths, symlinks,
