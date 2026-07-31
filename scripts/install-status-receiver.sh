@@ -18,6 +18,11 @@ done
 [[ -n "$mode" ]] || usage
 
 root=${CI_FLEET_STATUS_ROOT:-}
+test_mode=${CI_FLEET_STATUS_TEST_MODE:-0}
+if [[ (-n "$root" && "$test_mode" != 1) || (-z "$root" && "$test_mode" != 0) ]]; then
+  echo "alternate root requires CI_FLEET_STATUS_TEST_MODE=1 and a nonempty root" >&2
+  exit 1
+fi
 if [[ -z "$root" && $EUID -ne 0 ]]; then
   echo "run as root" >&2
   exit 1
@@ -29,6 +34,9 @@ config_root="$root/etc/ci-fleet-status"
 unit_path="$root/etc/systemd/system/ci-fleet-status-receiver.service"
 current="$install_root/current"
 previous="$state_root/previous-ref"
+install -d -m 0755 "$root/run/lock"
+exec 9>"$root/run/lock/ci-fleet-status-install.lock"
+flock 9
 
 current_ref() {
   [[ -L "$current" ]] || return 1
@@ -78,6 +86,16 @@ fi
 [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || usage
 head=$(git -C "$repo_root" rev-parse HEAD)
 [[ "$head" == "$ref" ]] || { echo "--ref must equal the reviewed checkout HEAD" >&2; exit 1; }
+inputs=(
+  scripts/install-status-receiver.sh
+  scripts/status_auth.py
+  scripts/status_receiver.py
+  deploy/status-receiver/ci-fleet-status-receiver.service
+)
+git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
+  echo "reviewed receiver inputs differ from HEAD" >&2
+  exit 1
+}
 existing=$(current_ref || true)
 if [[ "$existing" == "$ref" ]]; then
   echo NO_CHANGE
@@ -85,7 +103,7 @@ if [[ "$existing" == "$ref" ]]; then
 fi
 
 if [[ -z "$root" ]]; then
-  id ci-fleet-status >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
+  id ci-fleet-status >/dev/null 2>&1 || useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
   install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
 else
   install -d -m 0700 "$state_root" "$config_root"

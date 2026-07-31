@@ -23,14 +23,40 @@ git -C "$source_tree" commit -qm initial
 first=$(git -C "$source_tree" rev-parse HEAD)
 
 run() {
-  CI_FLEET_STATUS_ROOT="$root" "$source_tree/scripts/install-status-receiver.sh" "$@"
+  CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_ROOT="$root" \
+    "$source_tree/scripts/install-status-receiver.sh" "$@"
 }
 
+if CI_FLEET_STATUS_ROOT="$root" "$source_tree/scripts/install-status-receiver.sh" --check >/dev/null 2>&1; then
+  echo "alternate root accepted without explicit test mode" >&2
+  exit 1
+fi
 test "$(run --install --ref "$first")" = INSTALLED
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
 test "$(stat -c %a "$root/var/lib/ci-fleet-status")" = 700
 test "$(run --install --ref "$first")" = NO_CHANGE
+
+printf '\n# dirty\n' >>"$source_tree/scripts/status_auth.py"
+if run --upgrade --ref "$first" >/dev/null 2>&1; then
+  echo "dirty reviewed input was installed" >&2
+  exit 1
+fi
+git -C "$source_tree" checkout -q -- scripts/status_auth.py
+
+lock="$root/run/lock/ci-fleet-status-install.lock"
+ready="$tmp/lock-ready"
+(flock 9; : >"$ready"; sleep 1) 9>"$lock" &
+lock_pid=$!
+for _ in {1..20}; do [[ -e "$ready" ]] && break; sleep 0.05; done
+if CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_ROOT="$root" \
+  timeout 0.1 "$source_tree/scripts/install-status-receiver.sh" --check >/dev/null 2>&1; then
+  echo "overlapping installer did not wait for lock" >&2
+  exit 1
+else
+  test "$?" = 124
+fi
+wait "$lock_pid"
 
 git -C "$source_tree" commit --allow-empty -qm upgrade
 second=$(git -C "$source_tree" rev-parse HEAD)
@@ -46,5 +72,6 @@ grep -F 'User=ci-fleet-status' "$unit" >/dev/null
 grep -F 'NoNewPrivileges=yes' "$unit" >/dev/null
 grep -F 'ProtectSystem=strict' "$unit" >/dev/null
 grep -F 'ReadWritePaths=/var/lib/ci-fleet-status' "$unit" >/dev/null
+grep -F 'useradd --system --user-group' "$installer" >/dev/null
 
 echo STATUS_RECEIVER_INSTALL_TESTS_OK

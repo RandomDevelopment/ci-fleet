@@ -377,6 +377,13 @@ class StatusReceiverTests(unittest.TestCase):
         self.assertEqual(payload["latest"], report)
         self.assertEqual(payload["history"], [report])
 
+    def test_health_requires_receiver_schema(self) -> None:
+        self.receiver.health()
+        with sqlite3.connect(self.receiver.database) as connection:
+            connection.execute("DROP TABLE nonces")
+        with self.assertRaises(sqlite3.Error):
+            self.receiver.health()
+
     def test_read_api_authentication_and_controller_listing(self) -> None:
         self.submit(valid_report())
         self.assert_status_error(401, "read_authentication_failed", lambda: self.receiver.latest("example-ci-01", "wrong"))

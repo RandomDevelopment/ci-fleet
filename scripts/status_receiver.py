@@ -287,7 +287,12 @@ class StatusReceiver:
 
     def health(self) -> None:
         with closing(self._connect()) as connection:
-            connection.execute("SELECT 1").fetchone()
+            connection.execute(
+                "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
+            )
+            connection.execute(
+                "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
+            )
 
 
 class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
