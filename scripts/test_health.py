@@ -433,7 +433,9 @@ class HealthTests(unittest.TestCase):
             monitoring.chmod(0o600)
             old_collect = health.collect_snapshot
             old_required = os.environ.get("CI_FLEET_STATUS_REPORTING_REQUIRED")
+            old_testing = os.environ.get("CI_FLEET_TESTING")
             os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+            os.environ["CI_FLEET_TESTING"] = "1"
             setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
             try:
                 result = health._local(health.argparse.Namespace(
@@ -448,6 +450,10 @@ class HealthTests(unittest.TestCase):
                     os.environ.pop("CI_FLEET_STATUS_REPORTING_REQUIRED", None)
                 else:
                     os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = old_required
+                if old_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = old_testing
 
     def test_expired_active_resources_and_stopped_capacity_are_observable(self) -> None:
         cleanup = "KEEP container runner state=running expired=1 (routine cleanup never removes active containers)\nWOULD_REMOVE volume old expired=1\n"
