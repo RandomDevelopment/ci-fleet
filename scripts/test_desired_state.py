@@ -68,6 +68,12 @@ class DesiredStateTests(unittest.TestCase):
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(DesiredStateError, "fixed host-local monitoring"):
                 load_and_validate_config(path)
+        value["controllers"]["example-ci-01"]["status_reporting"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "must be an object"):
+                load_and_validate_config(path)
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

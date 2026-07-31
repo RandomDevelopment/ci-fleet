@@ -71,6 +71,23 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_status_reporting_null_is_rejected(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["status_reporting"] = None
+        self.assert_rejected(config, "must be an object")
+
+    def test_initializer_can_require_host_local_status_reporting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--require-status-reporting",
+                "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            reporting = first_controller(json.loads(output.read_text()))["status_reporting"]
+        self.assertEqual(reporting, {"enabled": True, "config_file": "/etc/ci-fleet/monitoring.env"})
+
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
         self.assertEqual(errors_for(config), [])

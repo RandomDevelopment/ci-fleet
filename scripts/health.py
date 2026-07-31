@@ -671,14 +671,15 @@ def _send_heartbeat(
 
 
 def _local(args: argparse.Namespace) -> int:
-    values = dict(os.environ)
+    environment = dict(os.environ)
+    values = dict(environment)
     values.update(load_monitoring_config(args.monitoring_config))
     snapshot = collect_snapshot(values)
     report = evaluate(snapshot, thresholds_from(values))
     now = int(time.time())
     report["timestamp"] = now
     delivery = 0
-    if values.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
+    if environment.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
         if values.get("CI_FLEET_HEALTH_STATUS_URL") or values.get("CI_FLEET_STATUS_REPORTING_REQUIRED") == "1":
             delivery = (
                 _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)

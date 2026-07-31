@@ -42,6 +42,14 @@ if run --install --ref "$first" >/dev/null 2>&1; then
 fi
 test "$(stat -c %a "$tmp/attacker-lock-target")" = 777
 rm "$root/run/lock/ci-fleet-status"
+mkdir -p "$root/opt/ci-fleet-status" "$tmp/untrusted-releases"
+chmod 0755 "$root/opt/ci-fleet-status" "$tmp/untrusted-releases"
+ln -s "$tmp/untrusted-releases" "$root/opt/ci-fleet-status/releases"
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "symlinked release root was accepted" >&2
+  exit 1
+fi
+rm -rf "$root/opt/ci-fleet-status"
 test "$(run --install --ref "$first")" = INSTALLED
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
@@ -131,6 +139,7 @@ grep -F 'ReadWritePaths=/var/lib/ci-fleet-status' "$unit" >/dev/null
 grep -F 'useradd --system --user-group' "$installer" >/dev/null
 grep -F 'restart-required' "$installer" >/dev/null
 grep -F 'getent passwd ci-fleet-status' "$installer" >/dev/null
+grep -F "\$gid\" != 0" "$installer" >/dev/null
 grep -F '/usr/bin/python3' "$installer" >/dev/null
 grep -F 'SQLite 3.25.0 or newer is required' "$installer" >/dev/null
 

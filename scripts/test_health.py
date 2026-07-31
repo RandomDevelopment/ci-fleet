@@ -428,13 +428,16 @@ class HealthTests(unittest.TestCase):
     def test_required_status_reporting_fails_closed_without_host_local_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "health.json"
+            monitoring = Path(directory) / "monitoring.env"
+            monitoring.write_text("CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1\n")
+            monitoring.chmod(0o600)
             old_collect = health.collect_snapshot
             old_required = os.environ.get("CI_FLEET_STATUS_REPORTING_REQUIRED")
             os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
             setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
             try:
                 result = health._local(health.argparse.Namespace(
-                    monitoring_config=Path(directory) / "missing.env", output=output, json=True,
+                    monitoring_config=monitoring, output=output, json=True,
                 ))
                 report = json.loads(output.read_text())
                 self.assertEqual(result, 1)

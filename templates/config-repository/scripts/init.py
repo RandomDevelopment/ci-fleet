@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
+    parser.add_argument("--require-status-reporting", action="store_true", help="require fixed host-local status reporting configuration")
     parser.add_argument("--output", type=Path, default=ROOT / "fleet.json", help="output configuration path")
     parser.add_argument("--force", action="store_true", help="replace an existing non-example output file")
     return parser.parse_args()
@@ -114,6 +115,10 @@ def main() -> int:
                 "runner_resources": {
                     "cpu_cores": args.runner_cpu_cores,
                     "memory_mib": args.runner_memory_mib,
+                },
+                "status_reporting": {
+                    "enabled": args.require_status_reporting,
+                    "config_file": "/etc/ci-fleet/monitoring.env",
                 },
             }
         },

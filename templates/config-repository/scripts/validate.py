@@ -297,7 +297,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(minimum <= maximum, f"{path}.min_runners", "must not exceed max_runners")
         validation.require(minimum == 0, f"{path}.min_runners", "must be zero because managed prewarmed runners are not supported")
         status_reporting = controller.get("status_reporting")
-        if status_reporting is not None and validation.exact_keys(status_reporting, f"{path}.status_reporting", {"enabled", "config_file"}):
+        if "status_reporting" in controller and validation.exact_keys(status_reporting, f"{path}.status_reporting", {"enabled", "config_file"}):
             validation.require(type(status_reporting.get("enabled")) is bool, f"{path}.status_reporting.enabled", "must be a boolean")
             validation.require(status_reporting.get("config_file") == "/etc/ci-fleet/monitoring.env", f"{path}.status_reporting.config_file", "must use the fixed host-local monitoring configuration")
         resources = controller.get("runner_resources")

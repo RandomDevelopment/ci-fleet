@@ -94,6 +94,26 @@ restart_live_service() {
   fi
 }
 
+managed_uid=0
+[[ -z "$root" ]] || managed_uid=$EUID
+managed_directory() {
+  local path=$1 create=${2:-0}
+  if [[ -L "$path" ]]; then
+    echo "unsafe managed release directory: $path" >&2
+    exit 1
+  elif [[ -e "$path" ]]; then
+    [[ -d "$path" && $(stat -c '%u:%a' "$path") == "$managed_uid:755" ]] || {
+      echo "unsafe managed release directory: $path" >&2
+      exit 1
+    }
+  elif [[ "$create" == 1 ]]; then
+    install -d -m 0755 "$path"
+    [[ $(stat -c '%u:%a' "$path") == "$managed_uid:755" ]]
+  else
+    return 1
+  fi
+}
+
 python=/usr/bin/python3
 if [[ "$test_mode" == 1 && -n ${CI_FLEET_STATUS_TEST_PYTHON:-} ]]; then
   python=$CI_FLEET_STATUS_TEST_PYTHON
@@ -114,6 +134,14 @@ if [[ -n ${sqlite_extra:-} || ! ${sqlite_major:-} =~ ^[0-9]+$ || ! ${sqlite_mino
    ((sqlite_major < 3 || (sqlite_major == 3 && sqlite_minor < 25))); then
   echo "SQLite 3.25.0 or newer is required by the Python receiver (found $sqlite_version)" >&2
   exit 1
+fi
+
+if [[ "$mode" == install || "$mode" == upgrade ]]; then
+  managed_directory "$install_root" 1
+  managed_directory "$install_root/releases" 1
+else
+  managed_directory "$install_root" || { echo "status receiver is not installed" >&2; exit 1; }
+  managed_directory "$install_root/releases" || { echo "status receiver is not installed" >&2; exit 1; }
 fi
 
 if [[ "$mode" == check ]]; then
@@ -157,14 +185,14 @@ if [[ -z "$root" ]]; then
   IFS=: read -r account _ uid gid _ home shell < <(getent passwd ci-fleet-status)
   IFS=: read -r group _ group_gid _ < <(getent group ci-fleet-status)
   [[ "$account" == ci-fleet-status && "$group" == ci-fleet-status ]]
-  [[ "$uid" != 0 && "$gid" == "$group_gid" ]]
+  [[ "$uid" != 0 && "$gid" != 0 && "$gid" == "$group_gid" ]]
   [[ "$home" == /nonexistent && "$shell" == /usr/sbin/nologin ]]
   install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
   install -d -o root -g root -m 0700 "$metadata_root"
 else
   install -d -m 0700 "$state_root" "$config_root" "$metadata_root"
 fi
-install -d -m 0755 "$install_root/releases" "$(dirname "$unit_path")"
+install -d -m 0755 "$(dirname "$unit_path")"
 existing=$(current_ref || true)
 if [[ "$mode" == install && -n "$existing" && "$existing" != "$ref" ]]; then
   echo "use --upgrade to change an active release" >&2

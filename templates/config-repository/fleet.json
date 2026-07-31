@@ -30,6 +30,10 @@
       "runner_resources": {
         "cpu_cores": 2,
         "memory_mib": 4096
+      },
+      "status_reporting": {
+        "enabled": false,
+        "config_file": "/etc/ci-fleet/monitoring.env"
       }
     }
   },
