@@ -38,8 +38,14 @@ current="$install_root/current"
 previous="$metadata_root/previous-ref"
 restart_required="$metadata_root/restart-required"
 mkdir -p "$root/run/lock"
-install -d -m 0700 "$root/run/lock/ci-fleet-status"
-exec 9>"$root/run/lock/ci-fleet-status/install.lock"
+lock_directory="$root/run/lock/ci-fleet-status"
+expected_lock_uid=0
+[[ -z "$root" ]] || expected_lock_uid=$EUID
+if ! mkdir -m 0700 "$lock_directory" 2>/dev/null; then
+  [[ -d "$lock_directory" && ! -L "$lock_directory" ]]
+  [[ $(stat -c '%u:%a' "$lock_directory") == "$expected_lock_uid:700" ]]
+fi
+exec 9<"$lock_directory"
 flock 9
 
 current_ref() {
@@ -56,15 +62,17 @@ write_metadata() {
 }
 
 install_unit() {
-  local target=$1
-  install -m 0644 "$install_root/releases/$target/ci-fleet-status-receiver.service" "$unit_path"
+  local target=$1 temporary
+  temporary=$(mktemp "$(dirname "$unit_path")/.ci-fleet-status-receiver.XXXXXX")
+  install -m 0644 "$install_root/releases/$target/ci-fleet-status-receiver.service" "$temporary"
+  mv -Tf "$temporary" "$unit_path"
 }
 
 activate() {
-  local target=$1 old=
+  local target=$1 record_previous=${2:-1} old=
   [[ -d "$install_root/releases/$target" ]] || { echo "release not installed: $target" >&2; exit 1; }
   old=$(current_ref || true)
-  if [[ -n "$old" && "$old" != "$target" ]]; then
+  if [[ "$record_previous" == 1 && -n "$old" && "$old" != "$target" ]]; then
     write_metadata "$previous" "$old"
   fi
   install_unit "$target"
@@ -95,7 +103,7 @@ if [[ "$mode" == rollback ]]; then
   [[ "$target" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid rollback release" >&2; exit 1; }
   force=0
   [[ -f "$restart_required" ]] && force=1
-  activate "$target"
+  activate "$target" 0
   restart_live_service "$force"
   rm -f "$restart_required"
   echo "ROLLED_BACK $target"
@@ -117,7 +125,13 @@ git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
 }
 
 if [[ -z "$root" ]]; then
-  id ci-fleet-status >/dev/null 2>&1 || useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
+  getent passwd ci-fleet-status >/dev/null || \
+    useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
+  IFS=: read -r account _ uid gid _ home shell < <(getent passwd ci-fleet-status)
+  IFS=: read -r group _ group_gid _ < <(getent group ci-fleet-status)
+  [[ "$account" == ci-fleet-status && "$group" == ci-fleet-status ]]
+  [[ "$uid" != 0 && "$gid" == "$group_gid" ]]
+  [[ "$home" == /nonexistent && "$shell" == /usr/sbin/nologin ]]
   install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
   install -d -o root -g root -m 0700 "$metadata_root"
 else
@@ -133,6 +147,7 @@ if [[ -d "$release" ]]; then
 else
   staging=$(mktemp -d "$install_root/releases/.staging.XXXXXX")
   trap 'rm -rf "$staging"' EXIT
+  chmod 0755 "$staging"
   install -m 0755 "$repo_root/scripts/status_receiver.py" "$staging/status_receiver.py"
   install -m 0644 "$repo_root/scripts/status_auth.py" "$staging/status_auth.py"
   install -m 0644 "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" \
