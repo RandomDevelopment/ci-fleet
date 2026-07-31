@@ -134,9 +134,10 @@ sudo ./scripts/install-status-receiver.sh --rollback
 sudo ./scripts/install-status-receiver.sh --check
 ```
 
-Rollback changes application files only. It preserves `auth.json`, keys, read
-token, database, reverse-proxy configuration, and journal policy. Reverse-proxy
-or schema changes require their own reviewed compatibility and rollback plan.
+Rollback restores the selected release's application files and systemd unit. It
+preserves `auth.json`, keys, read token, database, reverse-proxy configuration,
+and journal policy. Reverse-proxy or schema changes require their own reviewed
+compatibility and rollback plan.
 
 ## Test coverage
 

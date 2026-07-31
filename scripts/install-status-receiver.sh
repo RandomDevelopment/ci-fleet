@@ -27,15 +27,19 @@ if [[ -z "$root" && $EUID -ne 0 ]]; then
   echo "run as root" >&2
   exit 1
 fi
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 install_root="$root/opt/ci-fleet-status"
 state_root="$root/var/lib/ci-fleet-status"
+metadata_root="$root/var/lib/ci-fleet-status-installer"
 config_root="$root/etc/ci-fleet-status"
 unit_path="$root/etc/systemd/system/ci-fleet-status-receiver.service"
 current="$install_root/current"
-previous="$state_root/previous-ref"
-install -d -m 0755 "$root/run/lock"
-exec 9>"$root/run/lock/ci-fleet-status-install.lock"
+previous="$metadata_root/previous-ref"
+restart_required="$metadata_root/restart-required"
+mkdir -p "$root/run/lock"
+install -d -m 0700 "$root/run/lock/ci-fleet-status"
+exec 9>"$root/run/lock/ci-fleet-status/install.lock"
 flock 9
 
 current_ref() {
@@ -43,23 +47,36 @@ current_ref() {
   basename "$(readlink "$current")"
 }
 
+write_metadata() {
+  local destination=$1 value=$2 temporary
+  temporary=$(mktemp "$metadata_root/.metadata.XXXXXX")
+  printf '%s\n' "$value" >"$temporary"
+  chmod 0600 "$temporary"
+  mv -Tf "$temporary" "$destination"
+}
+
+install_unit() {
+  local target=$1
+  install -m 0644 "$install_root/releases/$target/ci-fleet-status-receiver.service" "$unit_path"
+}
+
 activate() {
   local target=$1 old=
   [[ -d "$install_root/releases/$target" ]] || { echo "release not installed: $target" >&2; exit 1; }
   old=$(current_ref || true)
+  if [[ -n "$old" && "$old" != "$target" ]]; then
+    write_metadata "$previous" "$old"
+  fi
+  install_unit "$target"
   ln -sfn "releases/$target" "$current.new"
   mv -Tf "$current.new" "$current"
-  if [[ -n "$old" && "$old" != "$target" ]]; then
-    printf '%s\n' "$old" >"$previous.tmp"
-    chmod 0600 "$previous.tmp"
-    mv -Tf "$previous.tmp" "$previous"
-  fi
 }
 
 restart_live_service() {
+  local force=${1:-0}
   [[ -n "$root" ]] && return
   systemctl daemon-reload
-  if systemctl is-active --quiet ci-fleet-status-receiver.service; then
+  if [[ "$force" == 1 ]] || systemctl is-active --quiet ci-fleet-status-receiver.service; then
     systemctl restart ci-fleet-status-receiver.service
   fi
 }
@@ -67,8 +84,7 @@ restart_live_service() {
 if [[ "$mode" == check ]]; then
   installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
   [[ -x "$current/status_receiver.py" && -r "$current/status_auth.py" ]]
-  [[ -f "$unit_path" ]]
-  grep -F -- '--bind 127.0.0.1' "$unit_path" >/dev/null
+  cmp -s "$current/ci-fleet-status-receiver.service" "$unit_path"
   echo "CHECK_OK $installed"
   exit
 fi
@@ -77,8 +93,11 @@ if [[ "$mode" == rollback ]]; then
   [[ -s "$previous" ]] || { echo "no rollback release recorded" >&2; exit 1; }
   target=$(<"$previous")
   [[ "$target" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid rollback release" >&2; exit 1; }
+  force=0
+  [[ -f "$restart_required" ]] && force=1
   activate "$target"
-  restart_live_service
+  restart_live_service "$force"
+  rm -f "$restart_required"
   echo "ROLLED_BACK $target"
   exit
 fi
@@ -96,31 +115,54 @@ git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
   echo "reviewed receiver inputs differ from HEAD" >&2
   exit 1
 }
-existing=$(current_ref || true)
-if [[ "$existing" == "$ref" ]]; then
-  echo NO_CHANGE
-  exit
-fi
 
 if [[ -z "$root" ]]; then
   id ci-fleet-status >/dev/null 2>&1 || useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
   install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
+  install -d -o root -g root -m 0700 "$metadata_root"
 else
-  install -d -m 0700 "$state_root" "$config_root"
+  install -d -m 0700 "$state_root" "$config_root" "$metadata_root"
 fi
 install -d -m 0755 "$install_root/releases" "$(dirname "$unit_path")"
-staging="$install_root/releases/.staging.$$"
-trap 'rm -rf "$staging"' EXIT
-install -d -m 0755 "$staging"
-install -m 0755 "$repo_root/scripts/status_receiver.py" "$staging/status_receiver.py"
-install -m 0644 "$repo_root/scripts/status_auth.py" "$staging/status_auth.py"
-mv -T "$staging" "$install_root/releases/$ref"
-trap - EXIT
-install -m 0644 "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" "$unit_path"
+release="$install_root/releases/$ref"
+if [[ -d "$release" ]]; then
+  cmp -s "$repo_root/scripts/status_receiver.py" "$release/status_receiver.py"
+  cmp -s "$repo_root/scripts/status_auth.py" "$release/status_auth.py"
+  cmp -s "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" \
+    "$release/ci-fleet-status-receiver.service"
+else
+  staging=$(mktemp -d "$install_root/releases/.staging.XXXXXX")
+  trap 'rm -rf "$staging"' EXIT
+  install -m 0755 "$repo_root/scripts/status_receiver.py" "$staging/status_receiver.py"
+  install -m 0644 "$repo_root/scripts/status_auth.py" "$staging/status_auth.py"
+  install -m 0644 "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" \
+    "$staging/ci-fleet-status-receiver.service"
+  mv -T "$staging" "$release"
+  trap - EXIT
+fi
+
+existing=$(current_ref || true)
+if [[ "$existing" == "$ref" ]]; then
+  changed=0
+  cmp -s "$release/ci-fleet-status-receiver.service" "$unit_path" || changed=1
+  install_unit "$ref"
+  [[ "$changed" == 0 ]] || restart_live_service
+  echo NO_CHANGE
+  exit
+fi
+
+if [[ "$mode" == upgrade && -z "$root" ]]; then
+  if systemctl is-active --quiet ci-fleet-status-receiver.service; then
+    write_metadata "$restart_required" 1
+  else
+    rm -f "$restart_required"
+  fi
+fi
 activate "$ref"
 restart_live_service
 if [[ "$mode" == upgrade ]]; then
   echo UPGRADED
 else
+  rm -f "$restart_required"
   echo INSTALLED
 fi
