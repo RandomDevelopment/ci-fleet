@@ -54,6 +54,21 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(environment["CI_FLEET_COMMIT"], environment["CI_FLEET_ENGINE_REF"])
         self.assertEqual(metadata["controller_state"], "active")
 
+    def test_status_reporting_requires_fixed_host_local_configuration(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        environment, _ = self.render(value)
+        self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
+        value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "fixed host-local monitoring"):
+                load_and_validate_config(path)
+
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"]["state"] = "drained"

@@ -50,8 +50,15 @@ exec 9<"$lock_directory"
 flock 9
 
 current_ref() {
+  local link release releases target
   [[ -L "$current" ]] || return 1
-  basename "$(readlink "$current")"
+  link=$(readlink "$current")
+  [[ "$link" =~ ^releases/([0-9a-f]{40})$ ]] || return 1
+  release=${BASH_REMATCH[1]}
+  releases=$(realpath -e "$install_root/releases") || return 1
+  target=$(realpath -e "$current") || return 1
+  [[ -d "$target" && $(dirname "$target") == "$releases" && "$target" == "$releases/$release" ]] || return 1
+  printf '%s\n' "$release"
 }
 
 write_metadata() {
@@ -86,6 +93,28 @@ restart_live_service() {
     systemctl restart ci-fleet-status-receiver.service
   fi
 }
+
+python=/usr/bin/python3
+if [[ "$test_mode" == 1 && -n ${CI_FLEET_STATUS_TEST_PYTHON:-} ]]; then
+  python=$CI_FLEET_STATUS_TEST_PYTHON
+fi
+"$python" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' || {
+  echo "Python 3.9 or newer is required" >&2
+  exit 1
+}
+sqlite_version=$("$python" -c 'import sqlite3; print(".".join(map(str, sqlite3.sqlite_version_info)))') || {
+  echo "Python SQLite version detection failed" >&2
+  exit 1
+}
+if [[ "$test_mode" == 1 && -n ${CI_FLEET_STATUS_TEST_SQLITE_VERSION:-} ]]; then
+  sqlite_version=$CI_FLEET_STATUS_TEST_SQLITE_VERSION
+fi
+IFS=. read -r sqlite_major sqlite_minor sqlite_patch sqlite_extra <<<"$sqlite_version"
+if [[ -n ${sqlite_extra:-} || ! ${sqlite_major:-} =~ ^[0-9]+$ || ! ${sqlite_minor:-} =~ ^[0-9]+$ || ! ${sqlite_patch:-} =~ ^[0-9]+$ ]] ||
+   ((sqlite_major < 3 || (sqlite_major == 3 && sqlite_minor < 25))); then
+  echo "SQLite 3.25.0 or newer is required by the Python receiver (found $sqlite_version)" >&2
+  exit 1
+fi
 
 if [[ "$mode" == check ]]; then
   installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
@@ -122,11 +151,6 @@ git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
   echo "reviewed receiver inputs differ from HEAD" >&2
   exit 1
 }
-/usr/bin/python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' || {
-  echo "Python 3.9 or newer is required" >&2
-  exit 1
-}
-
 if [[ -z "$root" ]]; then
   getent passwd ci-fleet-status >/dev/null || \
     useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status

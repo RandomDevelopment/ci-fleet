@@ -395,6 +395,37 @@ class StatusReceiverTests(unittest.TestCase):
         with self.assertRaises(sqlite3.Error):
             self.receiver.health()
 
+    def test_health_caches_failure_then_rechecks_and_recovers(self) -> None:
+        checks = 0
+        results = iter([("corrupt",), ("ok",)])
+
+        class Connection:
+            def execute(self, query: str):
+                nonlocal checks
+                if "quick_check" in query.lower():
+                    checks += 1
+                    result = next(results)
+                    return type("Result", (), {"fetchone": lambda self: result})()
+                return self
+
+            def close(self) -> None:
+                pass
+
+        now = 0.0
+        self.receiver._connect = Connection
+        self.receiver._monotonic = lambda: now
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.receiver.health()
+        now = 59.0
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.receiver.health()
+        self.assertEqual(checks, 1)
+        now = 60.0
+        self.receiver.health()
+        now = 119.0
+        self.receiver.health()
+        self.assertEqual(checks, 2)
+
     def test_read_api_authentication_and_controller_listing(self) -> None:
         self.submit(valid_report())
         self.assert_status_error(401, "read_authentication_failed", lambda: self.receiver.latest("example-ci-01", "wrong"))

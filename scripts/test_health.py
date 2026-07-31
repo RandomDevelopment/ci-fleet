@@ -425,6 +425,27 @@ class HealthTests(unittest.TestCase):
                 else:
                     os.environ["CI_FLEET_TESTING"] = old
 
+    def test_required_status_reporting_fails_closed_without_host_local_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "health.json"
+            old_collect = health.collect_snapshot
+            old_required = os.environ.get("CI_FLEET_STATUS_REPORTING_REQUIRED")
+            os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+            setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
+            try:
+                result = health._local(health.argparse.Namespace(
+                    monitoring_config=Path(directory) / "missing.env", output=output, json=True,
+                ))
+                report = json.loads(output.read_text())
+                self.assertEqual(result, 1)
+                self.assertEqual(report["checks"][-1], {"id": "status_delivery", "status": "warning"})
+            finally:
+                setattr(health, "collect_snapshot", old_collect)
+                if old_required is None:
+                    os.environ.pop("CI_FLEET_STATUS_REPORTING_REQUIRED", None)
+                else:
+                    os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = old_required
+
     def test_expired_active_resources_and_stopped_capacity_are_observable(self) -> None:
         cleanup = "KEEP container runner state=running expired=1 (routine cleanup never removes active containers)\nWOULD_REMOVE volume old expired=1\n"
         run = lambda args: health.subprocess.CompletedProcess(args, 0, cleanup, "")

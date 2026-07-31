@@ -63,6 +63,7 @@ class StatusReceiver:
         self._clock = time.time
         self._monotonic = time.monotonic
         self._health_checked_at = float("-inf")
+        self._health_integrity_ok = False
         with closing(self._connect()) as connection, connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS reports (
@@ -291,9 +292,13 @@ class StatusReceiver:
         with self._write_lock, closing(self._connect()) as connection:
             now = self._monotonic()
             if now - self._health_checked_at >= 60:
-                if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
-                    raise sqlite3.DatabaseError("database quick check failed")
+                try:
+                    self._health_integrity_ok = connection.execute("PRAGMA quick_check(1)").fetchone() == ("ok",)
+                except sqlite3.Error:
+                    self._health_integrity_ok = False
                 self._health_checked_at = now
+            if not self._health_integrity_ok:
+                raise sqlite3.DatabaseError("database quick check failed")
             connection.execute(
                 "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
             )

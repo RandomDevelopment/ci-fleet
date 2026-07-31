@@ -165,6 +165,8 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if controller.get("status_reporting", {}).get("enabled"):
+        rendered["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
     for name, value in rendered.items():
         if not SAFE_ENV_VALUE.fullmatch(value):
             raise DesiredStateError(f"rendered value for {name} contains unsafe characters")

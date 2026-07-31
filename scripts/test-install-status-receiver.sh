@@ -45,6 +45,16 @@ rm "$root/run/lock/ci-fleet-status"
 test "$(run --install --ref "$first")" = INSTALLED
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
+external="$tmp/external/$first"
+mkdir -p "$external"
+cp "$source_tree/scripts/status_receiver.py" "$source_tree/scripts/status_auth.py" "$external/"
+ln -sfn "$external" "$root/opt/ci-fleet-status/current"
+if run --check >/dev/null 2>&1; then
+  echo "external same-basename release was accepted" >&2
+  exit 1
+fi
+test "$(run --install --ref "$first")" = INSTALLED
+test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test "$(stat -c %a "$root/var/lib/ci-fleet-status")" = 700
 test "$(stat -c %a "$root/run/lock")" = 1777
 test "$(stat -c %a "$root/opt/ci-fleet-status/releases/$first")" = 755
@@ -62,6 +72,17 @@ if run --upgrade --ref "$first" >/dev/null 2>&1; then
   exit 1
 fi
 git -C "$source_tree" checkout -q -- scripts/status_auth.py
+
+for version in 3.24.9 3.25.0 3.99.0; do
+  if output=$(CI_FLEET_STATUS_TEST_SQLITE_VERSION="$version" run --install --ref "$first" 2>&1); then
+    [[ "$version" != 3.24.9 ]] || { echo "old SQLite was accepted" >&2; exit 1; }
+  else
+    [[ "$version" == 3.24.9 && "$output" == *"SQLite 3.25.0 or newer is required"* ]] || {
+      echo "supported SQLite $version was rejected" >&2
+      exit 1
+    }
+  fi
+done
 
 lock="$root/run/lock/ci-fleet-status"
 ready="$tmp/lock-ready"
@@ -111,5 +132,6 @@ grep -F 'useradd --system --user-group' "$installer" >/dev/null
 grep -F 'restart-required' "$installer" >/dev/null
 grep -F 'getent passwd ci-fleet-status' "$installer" >/dev/null
 grep -F '/usr/bin/python3' "$installer" >/dev/null
+grep -F 'SQLite 3.25.0 or newer is required' "$installer" >/dev/null
 
 echo STATUS_RECEIVER_INSTALL_TESTS_OK

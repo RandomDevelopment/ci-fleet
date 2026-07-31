@@ -679,10 +679,13 @@ def _local(args: argparse.Namespace) -> int:
     report["timestamp"] = now
     delivery = 0
     if values.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
-        delivery = (
-            _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
-            if values.get("CI_FLEET_HEALTH_STATUS_URL") else _send_heartbeat(values, report)
-        )
+        if values.get("CI_FLEET_HEALTH_STATUS_URL") or values.get("CI_FLEET_STATUS_REPORTING_REQUIRED") == "1":
+            delivery = (
+                _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
+                if values.get("CI_FLEET_HEALTH_STATUS_URL") else 1
+            )
+        else:
+            delivery = _send_heartbeat(values, report)
     if delivery:
         severity = "critical" if delivery == 2 else "warning"
         report["checks"].append({"id": "status_delivery", "status": severity})
