@@ -307,12 +307,14 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))
 for key in ("controller_state", "engine_ref", "engine_repository"):
     print(value[key])
 print(1 if value["status_reporting_required"] else 0)
+print(1 if value["status_reporting_configured"] else 0)
 PY
   )
-  [[ ${#metadata_values[@]} == 4 ]] || die 'rendered controller metadata is incomplete'
+  [[ ${#metadata_values[@]} == 5 ]] || die 'rendered controller metadata is incomplete'
   target_state=${metadata_values[0]}
   [[ ${metadata_values[1]} == "$engine_ref" && ${metadata_values[2]} == "$engine_repository" ]] || die 'rendered engine metadata changed during validation'
   status_reporting_required=${metadata_values[3]}
+  status_reporting_configured=${metadata_values[4]}
 }
 
 compose() {
@@ -464,13 +466,14 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} marker required stored_digest actual_digest
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest
   local -a capability_args=()
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
-  if [[ -e "$path/engine-capabilities.json" || "$require_status" == 1 ]]; then
+  if [[ -e "$path/engine-capabilities.json" || "$require_status" == 1 || "$require_schema" == 1 ]]; then
     [[ ! -L "$path/engine-capabilities.json" && -f "$path/engine-capabilities.json" ]] || return 1
-    [[ "$require_status" != 1 ]] || capability_args=(--require-status-reporting)
+    [[ "$require_schema" != 1 ]] || capability_args+=(--require-status-reporting-config)
+    [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
   fi
@@ -492,8 +495,8 @@ runtime_release_complete() {
 }
 
 manager_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} marker required unit
-  runtime_release_complete "$path" "$expected" "$require_status" || return 1
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required unit
+  runtime_release_complete "$path" "$expected" "$require_status" "$require_schema" || return 1
   [[ -x "$path/scripts/install-worker-controller.sh" && -x "$path/scripts/check-installed-state.sh" ]] || return 1
   for required in scripts/desired_state.py scripts/scan_committed_secrets.py templates/config-repository/fleet.schema.json templates/config-repository/scripts/validate.py; do
     [[ -f "$path/$required" ]] || return 1
@@ -505,7 +508,7 @@ manager_release_complete() {
 }
 
 release_matches() {
-  runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" || return 1
+  runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$current_link" ]] || return 1
   [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
 }
@@ -524,7 +527,7 @@ managed_images_match() {
 systemd_matches() {
   local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
-  manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" || return 1
+  manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$manager_current" ]] || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
@@ -589,7 +592,7 @@ PY
 
 install_release() {
   local archive checkout resolved staged_release
-  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required"; then
+  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured"; then
     return
   fi
   install -d -m 0755 "$releases_dir"
@@ -614,7 +617,7 @@ install_release() {
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
   chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
-  runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" || die 'staged engine release is incomplete'
+  runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || die 'staged engine release is incomplete'
   atomic_replace_directory "$staged_release" "$release_dir"
 }
 
@@ -622,9 +625,9 @@ install_manager() {
   local manager_commit manager_release archive staged_manager
   manager_commit=$engine_ref
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
-  runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" || die 'desired engine release is unavailable for installer manager activation'
+  runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
-  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required"; then
+  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required" "$status_reporting_configured"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     tar -cf "$archive" -C "$release_dir" .
@@ -634,7 +637,7 @@ install_manager() {
     tar -xf "$archive" -C "$staged_manager"
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" || die 'staged installer manager release is incomplete'
+    manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'staged installer manager release is incomplete'
     atomic_replace_directory "$staged_manager" "$manager_release"
   fi
   install -d -m 0755 "$manager_root"

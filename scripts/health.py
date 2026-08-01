@@ -557,11 +557,12 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
 
 
 def load_monitoring_config(path: Path) -> dict[str, str]:
-    if not path.exists():
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
         return {}
-    info = path.stat()
     expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
-    if info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) & 0o077:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) & 0o077:
         raise ValueError(f"monitoring configuration must be root-owned mode 0600: {path}")
     values: dict[str, str] = {}
     for number, raw in enumerate(path.read_text().splitlines(), 1):
@@ -673,14 +674,22 @@ def _send_heartbeat(
 def _local(args: argparse.Namespace) -> int:
     environment = dict(os.environ)
     values = dict(environment)
-    values.update(load_monitoring_config(args.monitoring_config))
+    config_invalid = False
+    try:
+        values.update(load_monitoring_config(args.monitoring_config))
+    except (OSError, UnicodeError, ValueError):
+        if environment.get("CI_FLEET_STATUS_REPORTING_REQUIRED") != "1":
+            raise
+        config_invalid = True
     snapshot = collect_snapshot(values)
     report = evaluate(snapshot, thresholds_from(values))
     now = int(time.time())
     report["timestamp"] = now
     delivery = 0
     if environment.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
-        if values.get("CI_FLEET_HEALTH_STATUS_URL") or values.get("CI_FLEET_STATUS_REPORTING_REQUIRED") == "1":
+        if config_invalid:
+            delivery = 1
+        elif values.get("CI_FLEET_HEALTH_STATUS_URL") or values.get("CI_FLEET_STATUS_REPORTING_REQUIRED") == "1":
             delivery = (
                 _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
                 if values.get("CI_FLEET_HEALTH_STATUS_URL") else 1

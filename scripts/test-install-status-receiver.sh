@@ -161,6 +161,15 @@ if CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER=99999 CI_FLEE
   exit 1
 fi
 test "$(run --check)" = "CHECK_OK $first"
+test "$(CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER="$(id -u)" \
+  CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS=12345 CI_FLEET_STATUS_ROOT="$root" \
+  "$source_tree/scripts/install-status-receiver.sh" --check)" = "CHECK_OK $first"
+if CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER="$(id -u)" \
+  CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS='12345 99999' CI_FLEET_STATUS_ROOT="$root" \
+  "$source_tree/scripts/install-status-receiver.sh" --check >/dev/null 2>&1; then
+  echo "service account supplementary groups were accepted" >&2
+  exit 1
+fi
 
 grep -F -- '--bind 127.0.0.1' "$unit" >/dev/null
 grep -F 'User=ci-fleet-status' "$unit" >/dev/null

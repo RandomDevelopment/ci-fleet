@@ -173,6 +173,16 @@ validate_release() {
   [[ "$actual_digest" == "$stored_digest" ]] || { echo "modified receiver release: $release" >&2; return 1; }
 }
 
+validate_service_account() {
+  local passwd_record=$1 group_record=$2 groups=$3 account uid gid home shell group group_gid
+  IFS=: read -r account _ uid gid _ home shell <<<"$passwd_record"
+  IFS=: read -r group _ group_gid _ <<<"$group_record"
+  [[ "$account" == ci-fleet-status && "$group" == ci-fleet-status ]]
+  [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ && "$uid" != 0 && "$gid" != 0 && "$gid" == "$group_gid" ]]
+  [[ "$home" == /nonexistent && "$shell" == /usr/sbin/nologin ]]
+  [[ "$groups" == "$gid" ]] || { echo "ci-fleet-status has unexpected supplementary groups" >&2; return 1; }
+}
+
 python=/usr/bin/python3
 if [[ "$test_mode" == 1 && -n ${CI_FLEET_STATUS_TEST_PYTHON:-} ]]; then
   python=$CI_FLEET_STATUS_TEST_PYTHON
@@ -201,6 +211,15 @@ if [[ "$mode" == install || "$mode" == upgrade ]]; then
 else
   managed_directory "$install_root" || { echo "status receiver is not installed" >&2; exit 1; }
   managed_directory "$install_root/releases" || { echo "status receiver is not installed" >&2; exit 1; }
+fi
+
+if [[ -n ${CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS:-} ]]; then
+  validate_service_account 'ci-fleet-status:x:12345:12345::/nonexistent:/usr/sbin/nologin' \
+    'ci-fleet-status:x:12345:' "$CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS"
+elif [[ -z "$root" && ("$mode" == check || "$mode" == rollback) ]]; then
+  passwd_record=$(getent passwd ci-fleet-status) || { echo "ci-fleet-status account is missing" >&2; exit 1; }
+  group_record=$(getent group ci-fleet-status) || { echo "ci-fleet-status group is missing" >&2; exit 1; }
+  validate_service_account "$passwd_record" "$group_record" "$(id -G ci-fleet-status)"
 fi
 
 if [[ "$mode" == check ]]; then
@@ -244,11 +263,7 @@ git -C "$repo_root" diff --quiet HEAD -- "${inputs[@]}" || {
 if [[ -z "$root" ]]; then
   getent passwd ci-fleet-status >/dev/null || \
     useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
-  IFS=: read -r account _ uid gid _ home shell < <(getent passwd ci-fleet-status)
-  IFS=: read -r group _ group_gid _ < <(getent group ci-fleet-status)
-  [[ "$account" == ci-fleet-status && "$group" == ci-fleet-status ]]
-  [[ "$uid" != 0 && "$gid" != 0 && "$gid" == "$group_gid" ]]
-  [[ "$home" == /nonexistent && "$shell" == /usr/sbin/nologin ]]
+  validate_service_account "$(getent passwd ci-fleet-status)" "$(getent group ci-fleet-status)" "$(id -G ci-fleet-status)"
   install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
   install -d -o root -g root -m 0700 "$metadata_root"
 else

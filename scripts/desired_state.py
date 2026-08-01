@@ -29,6 +29,7 @@ HOST_REQUIRED = {
 }
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
+STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
 
 
 class DesiredStateError(ValueError):
@@ -193,9 +194,12 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
         raise DesiredStateError("selected engine does not advertise required status reporting")
+    if reporting_configured and STATUS_REPORTING_CONFIG_CAPABILITY not in (engine_capabilities or set()):
+        raise DesiredStateError("selected engine does not support status reporting configuration")
     if reporting_required:
         rendered["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
     for name, value in rendered.items():
@@ -216,6 +220,7 @@ def build_rendered_env(
         "config_ref": config_ref,
         "engine_ref": engine_commit,
         "engine_repository": config["organization"]["delivery_engine"],
+        "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
     }
     return rendered, metadata
@@ -283,6 +288,8 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
+    if args.require_status_reporting_config and STATUS_REPORTING_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support status reporting configuration")
     if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not advertise required status reporting")
     print("ENGINE_CAPABILITIES_OK")
@@ -320,6 +327,7 @@ def parse_args() -> argparse.Namespace:
 
     capabilities = subparsers.add_parser("validate-engine-capabilities", help="validate an engine capability declaration")
     capabilities.add_argument("--manifest", type=Path, required=True)
+    capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)
     return parser.parse_args()

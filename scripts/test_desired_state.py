@@ -45,7 +45,7 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities=capabilities,
+            engine_capabilities={"status_reporting_config"} if capabilities is None else capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -62,7 +62,7 @@ class DesiredStateTests(unittest.TestCase):
             "enabled": True,
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
-        environment, _ = self.render(value, {"required_status_reporting"})
+        environment, _ = self.render(value, {"status_reporting_config", "required_status_reporting"})
         self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
         value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
         with tempfile.TemporaryDirectory() as directory:
@@ -81,7 +81,7 @@ class DesiredStateTests(unittest.TestCase):
         value = config()
         value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = True
         with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
-            self.render(value)
+            self.render(value, set())
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "engine-capabilities.json"
             manifest.write_text("not json", encoding="utf-8")
@@ -94,11 +94,22 @@ class DesiredStateTests(unittest.TestCase):
             with self.assertRaisesRegex(DesiredStateError, "missing"):
                 load_engine_capabilities(manifest)
 
-    def test_disabled_status_reporting_accepts_older_engine(self) -> None:
+    def test_omitted_status_reporting_accepts_older_engine(self) -> None:
+        value = config()
+        del value["controllers"]["example-ci-01"]["status_reporting"]
+        environment, metadata = self.render(value, set())
+        self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
+        self.assertFalse(metadata["status_reporting_configured"])
+        self.assertFalse(metadata["status_reporting_required"])
+
+    def test_disabled_status_reporting_requires_schema_capability(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = False
-        environment, metadata = self.render(value)
+        with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
+            self.render(value, set())
+        environment, metadata = self.render(value, {"status_reporting_config"})
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
+        self.assertTrue(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
