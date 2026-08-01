@@ -89,6 +89,9 @@ def load_json(path: Path, validation: Validation) -> Any:
             value[key] = child
         return value
 
+    if path.is_symlink():
+        validation.errors.append(f"{path}: symlinked JSON files are forbidden")
+        return None
     try:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except FileNotFoundError:
@@ -478,9 +481,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     validation = Validation()
-    config_path = args.config.resolve()
+    config_path = args.config.absolute()
     config = load_json(config_path, validation)
-    evidence_path = args.rollout_evidence.resolve() if args.rollout_evidence else None
+    evidence_path = args.rollout_evidence.absolute() if args.rollout_evidence else None
     if evidence_path is None and config_path == ROOT / "fleet.json":
         evidence_path = ROOT / "engine-rollout-evidence.json"
     evidence = load_json(evidence_path, validation) if evidence_path is not None else None
@@ -504,9 +507,9 @@ def main() -> int:
                 "must match the current controller engine_ref; remove stale evidence before changing or removing the controller",
             )
         if args.previous_config is not None:
-            previous = load_json(args.previous_config.resolve(), validation)
+            previous = load_json(args.previous_config.absolute(), validation)
             previous_evidence = (
-                load_json(args.previous_rollout_evidence.resolve(), validation)
+                load_json(args.previous_rollout_evidence.absolute(), validation)
                 if args.previous_rollout_evidence
                 else None
             )

@@ -219,6 +219,20 @@ class PolicyTests(unittest.TestCase):
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_default_fleet_config_cannot_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            fleet = template / "fleet.json"
+            fleet.rename(template / "fleet-target.json")
+            fleet.symlink_to("fleet-target.json")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlinked JSON files are forbidden", result.stderr)
+
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
         self.assertEqual(errors_for(config), [])
