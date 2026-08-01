@@ -28,10 +28,38 @@ HOST_REQUIRED = {
     "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE",
 }
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
+REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
+STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
 
 
 class DesiredStateError(ValueError):
     """A safe operator-facing desired-state error."""
+
+
+def load_engine_capabilities(path: Path) -> set[str]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("duplicate capability key")
+            value[name] = item
+        return value
+
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise DesiredStateError("engine capability declaration must be a regular file")
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
+    except FileNotFoundError as exc:
+        raise DesiredStateError("engine capability declaration is missing") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise DesiredStateError("engine capability declaration is malformed") from exc
+    if not isinstance(value, dict) or set(value) != {"schema_version", "capabilities"} or value.get("schema_version") != 1:
+        raise DesiredStateError("engine capability declaration is malformed")
+    capabilities = value.get("capabilities")
+    if not isinstance(capabilities, dict) or any(type(supported) is not bool for supported in capabilities.values()):
+        raise DesiredStateError("engine capability declaration is malformed")
+    return {name for name, supported in capabilities.items() if supported}
 
 
 def load_template_validator():
@@ -127,6 +155,7 @@ def build_rendered_env(
     config_repository: str,
     config_ref: str,
     docker_gid: int,
+    engine_capabilities: set[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     controller, pool = select_controller(config, controller_id)
     engine_commit = controller["engine_ref"]
@@ -165,6 +194,14 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    reporting_configured = "status_reporting" in controller
+    reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
+    if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
+        raise DesiredStateError("selected engine does not advertise required status reporting")
+    if reporting_configured and STATUS_REPORTING_CONFIG_CAPABILITY not in (engine_capabilities or set()):
+        raise DesiredStateError("selected engine does not support status reporting configuration")
+    if reporting_required:
+        rendered["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
     for name, value in rendered.items():
         if not SAFE_ENV_VALUE.fullmatch(value):
             raise DesiredStateError(f"rendered value for {name} contains unsafe characters")
@@ -183,6 +220,8 @@ def build_rendered_env(
         "config_ref": config_ref,
         "engine_ref": engine_commit,
         "engine_repository": config["organization"]["delivery_engine"],
+        "status_reporting_configured": reporting_configured,
+        "status_reporting_required": reporting_required,
     }
     return rendered, metadata
 
@@ -221,6 +260,7 @@ def command_extract_host(args: argparse.Namespace) -> None:
 def command_render(args: argparse.Namespace) -> None:
     config = load_and_validate_config(args.config)
     host_values = parse_env(args.host_config, allow_unknown=False)
+    capabilities = load_engine_capabilities(args.engine_capabilities) if args.engine_capabilities else set()
     values, metadata = build_rendered_env(
         config,
         args.controller,
@@ -228,6 +268,7 @@ def command_render(args: argparse.Namespace) -> None:
         config_repository=args.config_repository,
         config_ref=args.config_ref,
         docker_gid=args.docker_gid,
+        engine_capabilities=capabilities,
     )
     write_private(args.output, render_env(values))
     write_private(args.metadata_output, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -236,6 +277,22 @@ def command_render(args: argparse.Namespace) -> None:
         f"controller={metadata['controller']} state={metadata['controller_state']} "
         f"config_ref={metadata['config_ref']} engine_ref={metadata['engine_ref']}"
     )
+
+
+def command_engine(args: argparse.Namespace) -> None:
+    config = load_and_validate_config(args.config)
+    controller, _ = select_controller(config, args.controller)
+    print(controller["engine_ref"])
+    print(config["organization"]["delivery_engine"])
+
+
+def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
+    capabilities = load_engine_capabilities(args.manifest)
+    if args.require_status_reporting_config and STATUS_REPORTING_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support status reporting configuration")
+    if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not advertise required status reporting")
+    print("ENGINE_CAPABILITIES_OK")
 
 
 def parse_args() -> argparse.Namespace:
@@ -258,9 +315,21 @@ def parse_args() -> argparse.Namespace:
     render.add_argument("--config-repository", required=True)
     render.add_argument("--config-ref", required=True)
     render.add_argument("--docker-gid", type=int, required=True)
+    render.add_argument("--engine-capabilities", type=Path)
     render.add_argument("--output", type=Path, required=True)
     render.add_argument("--metadata-output", type=Path, required=True)
     render.set_defaults(function=command_render)
+
+    engine = subparsers.add_parser("engine", help="select the immutable engine for one controller")
+    engine.add_argument("--config", type=Path, required=True)
+    engine.add_argument("--controller", required=True)
+    engine.set_defaults(function=command_engine)
+
+    capabilities = subparsers.add_parser("validate-engine-capabilities", help="validate an engine capability declaration")
+    capabilities.add_argument("--manifest", type=Path, required=True)
+    capabilities.add_argument("--require-status-reporting-config", action="store_true")
+    capabilities.add_argument("--require-status-reporting", action="store_true")
+    capabilities.set_defaults(function=command_validate_engine_capabilities)
     return parser.parse_args()
 
 

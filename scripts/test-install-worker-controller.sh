@@ -14,6 +14,8 @@ export REAL_STAT
 REAL_STAT=$(command -v stat)
 export REAL_TAR
 REAL_TAR=$(command -v tar)
+export REAL_GIT
+REAL_GIT=$(command -v git)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -174,6 +176,15 @@ exec "$REAL_TAR" "$@"
 EOF
 chmod 700 "$fake_bin/tar"
 
+cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${FAKE_FAIL_GIT_FETCH:-} && " $* " == *" fetch "* ]]; then
+  exit 90
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod 700 "$fake_bin/git"
+
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
@@ -229,11 +240,11 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" <<'PY'
 import json
 import sys
-source, target, engine_ref, state, maximum, budget = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
@@ -242,12 +253,31 @@ controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)
+if reporting == "omit":
+    controller.pop("status_reporting", None)
+else:
+    controller["status_reporting"] = {
+        "enabled": reporting == "true",
+        "config_file": "/etc/ci-fleet/monitoring.env",
+    }
 value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)
     handle.write("\n")
+with open(evidence_target, "w", encoding="utf-8") as handle:
+    json.dump({
+        "schema_version": 1,
+        "status_reporting_engine_capabilities": {
+            "example-ci-01": {
+                "engine_ref": engine_ref,
+                "status_reporting_config": True,
+                "required_status_reporting": True,
+            },
+        },
+    }, handle, indent=2)
+    handle.write("\n")
 PY
-  git -C "$config_repo" add fleet.json
+  git -C "$config_repo" add fleet.json engine-rollout-evidence.json
   git -C "$config_repo" commit -q -m "fixture $state $maximum"
   git -C "$config_repo" rev-parse HEAD
 }
@@ -351,6 +381,8 @@ second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
+installed_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+expect_success env FAKE_FAIL_GIT_FETCH=1 "$installed_installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ ! -d "$root/opt/ci-fleet/manager/releases/$engine_ref/templates/config-repository/scripts/__pycache__" ]] || fail 'manager validation wrote Python bytecode into the immutable release'
 python3 - "$install_state" <<'PY'
 import json
@@ -435,6 +467,10 @@ printf '\n# tampered runtime fixture\n' >>"$active_release/scripts/preflight.sh"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 if grep -Fq 'tampered runtime fixture' "$active_release/scripts/preflight.sh"; then fail 'modified runtime release was reused'; fi
+printf '{"schema_version":1,"capabilities":null}\n' >"$active_release/engine-capabilities.json"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" >/dev/null || fail 'engine capability declaration was not repaired'
 rm -f "$active_release/deploy/compose.yaml"
 export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
 : >"$FAKE_FAIL_TAR_ONCE"
@@ -646,7 +682,11 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 
 # Public pre-health engine fixture; do not depend on a local remote-tracking ref.
 legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
-legacy_ref=$(write_config active 1 1 "$legacy_engine_ref")
+legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false)
+expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
+legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true)
+expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
+legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}

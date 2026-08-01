@@ -80,7 +80,16 @@
         "engine_ref": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
         "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
-        "runner_resources": {"$ref": "#/$defs/runner_resources"}
+        "runner_resources": {"$ref": "#/$defs/runner_resources"},
+        "status_reporting": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "config_file"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "config_file": {"const": "/etc/ci-fleet/monitoring.env"}
+          }
+        }
       }
     },
     "runner_resources": {

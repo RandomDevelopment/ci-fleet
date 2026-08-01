@@ -56,8 +56,20 @@ jobs:
           done
 
       - name: Validate reference configurations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          ./scripts/validate.sh
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:fleet.json" 2>/dev/null; then
+            git show "$BASE_SHA:fleet.json" >"$RUNNER_TEMP/previous-fleet.json"
+            args=(--previous-config "$RUNNER_TEMP/previous-fleet.json")
+            if git cat-file -e "$BASE_SHA:engine-rollout-evidence.json" 2>/dev/null; then
+              git show "$BASE_SHA:engine-rollout-evidence.json" >"$RUNNER_TEMP/previous-rollout-evidence.json"
+              args+=(--previous-rollout-evidence "$RUNNER_TEMP/previous-rollout-evidence.json")
+            fi
+            ./scripts/validate.sh "${args[@]}"
+          else
+            ./scripts/validate.sh
+          fi
           ./scripts/validate.sh --config examples/multi-host/fleet.json
 
       - name: Prove initialized configurations pass strict policy

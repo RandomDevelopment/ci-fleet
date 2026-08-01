@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -116,6 +117,27 @@ class StatusReceiverTests(unittest.TestCase):
         thread.join()
         self.assertEqual(errors, [])
 
+    def test_concurrent_duplicate_reports_allow_one_success(self) -> None:
+        body, headers = self.signed(valid_report())
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def submit() -> None:
+            barrier.wait()
+            try:
+                self.receiver.submit(body, headers, now=1_000)
+                outcomes.append("accepted")
+            except status_receiver.StatusError as error:
+                outcomes.append((error.status, error.code))
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertCountEqual(outcomes, ["accepted", (409, "replayed_report")])
+
     def test_read_token_cannot_reuse_controller_key(self) -> None:
         with self.assertRaisesRegex(ValueError, "read token"):
             status_receiver.StatusReceiver(
@@ -166,6 +188,54 @@ class StatusReceiverTests(unittest.TestCase):
         stale_body, stale_headers = self.signed(valid_report(), timestamp=1_001, nonce="c" * 32)
         self.assert_status_error(409, "stale_report", lambda: self.receiver.submit(stale_body, stale_headers, now=1_001))
 
+    def test_persistence_failure_rolls_back_nonce_and_allows_retry(self) -> None:
+        body, headers = self.signed(valid_report())
+        with sqlite3.connect(self.receiver.database) as connection:
+            connection.execute("""
+                CREATE TRIGGER fail_report BEFORE INSERT ON reports
+                BEGIN SELECT RAISE(ABORT, 'test persistence failure'); END
+            """)
+        with self.assertRaises(sqlite3.Error):
+            self.receiver.submit(body, headers, now=1_000)
+        with sqlite3.connect(self.receiver.database) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM nonces").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0], 0)
+            connection.execute("DROP TRIGGER fail_report")
+        self.receiver.submit(body, headers, now=1_000)
+        self.assertEqual(self.receiver.latest("example-ci-01", "reader-token"), valid_report())
+
+    def test_http_503_can_retry_the_same_signed_report(self) -> None:
+        server = status_receiver.create_server("127.0.0.1", 0, self.receiver)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        now = int(time.time())
+        report = valid_report(generated_at=now)
+        report["controller"]["boot_time"] = now - 100
+        report["reconciliation"]["last_success_at"] = now - 10
+        body, headers = self.signed(report, timestamp=now)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/v1/status",
+            data=body, headers=headers, method="POST",
+        )
+        with sqlite3.connect(self.receiver.database) as connection:
+            connection.execute("""
+                CREATE TRIGGER fail_report BEFORE INSERT ON reports
+                BEGIN SELECT RAISE(ABORT, 'test persistence failure'); END
+            """)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        self.assertEqual(caught.exception.code, 503)
+        with sqlite3.connect(self.receiver.database) as connection:
+            connection.execute("DROP TRIGGER fail_report")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 202)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        self.assertEqual(caught.exception.code, 409)
+
     def test_rejected_submissions_close_database_connections(self) -> None:
         connections = []
 
@@ -206,8 +276,10 @@ class StatusReceiverTests(unittest.TestCase):
         third_body, third_headers = self.signed(valid_report(generated_at=1_002), timestamp=1_002, nonce="c" * 32)
         self.assert_status_error(429, "submission_too_frequent", lambda: limited.submit(third_body, third_headers, now=1_001))
         with sqlite3.connect(limited.database) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM nonces").fetchone()[0], 1)
+        limited.submit(second_body, second_headers, now=1_031)
+        with sqlite3.connect(limited.database) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM nonces").fetchone()[0], 2)
-        self.assert_status_error(409, "replayed_report", lambda: limited.submit(second_body, second_headers, now=1_031))
 
     def test_schema_compatibility_and_malformed_metrics(self) -> None:
         future = valid_report()
@@ -354,6 +426,27 @@ class StatusReceiverTests(unittest.TestCase):
         request = urllib.request.Request(base + "/v1/status", data=body, headers=headers, method="POST")
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 202)
+        submit = self.receiver.submit
+        self.receiver.submit = lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("unavailable"))
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request)
+            self.assertEqual(caught.exception.code, 503)
+            self.assertEqual(json.load(caught.exception), {"error": "unavailable"})
+        finally:
+            self.receiver.submit = submit
+        request = urllib.request.Request(base + "/healthz")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(json.load(response), {"status": "ok"})
+        health = self.receiver.health
+        self.receiver.health = lambda: (_ for _ in ()).throw(sqlite3.OperationalError("unavailable"))
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request)
+            self.assertEqual(caught.exception.code, 503)
+            self.assertEqual(json.load(caught.exception), {"error": "unavailable"})
+        finally:
+            self.receiver.health = health
         request = urllib.request.Request(base + "/v1/controllers", headers={"Authorization": "Bearer reader-token"})
         with urllib.request.urlopen(request) as response:
             payload = json.load(response)
@@ -363,6 +456,93 @@ class StatusReceiverTests(unittest.TestCase):
             payload = json.load(response)
         self.assertEqual(payload["latest"], report)
         self.assertEqual(payload["history"], [report])
+
+    def test_health_requires_receiver_schema(self) -> None:
+        queries: list[str] = []
+        now = [0.0]
+        connect = self.receiver._connect
+
+        def traced_connect() -> sqlite3.Connection:
+            connection = connect()
+            connection.set_trace_callback(queries.append)
+            return connection
+
+        self.receiver._connect = traced_connect
+        self.receiver._monotonic = lambda: now[0]
+        self.receiver.health()
+        self.receiver.health()
+        self.assertEqual(sum("quick_check" in query.lower() for query in queries), 1)
+        with sqlite3.connect(self.receiver.database) as connection:
+            connection.execute("DROP TABLE nonces")
+        now[0] = 60.0
+        with self.assertRaises(sqlite3.Error):
+            self.receiver.health()
+
+    def test_health_write_probe_leaves_no_application_rows(self) -> None:
+        with sqlite3.connect(self.receiver.database) as connection:
+            before = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("reports", "nonces"))
+        self.receiver.health()
+        with sqlite3.connect(self.receiver.database) as connection:
+            after = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("reports", "nonces"))
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM health_write_probe").fetchone()[0], 0)
+        self.assertEqual(after, before)
+
+    def test_health_rejects_commit_failure(self) -> None:
+        class FailingCommit(sqlite3.Connection):
+            def commit(self) -> None:
+                raise sqlite3.OperationalError("test commit failure")
+
+        self.receiver._connect = lambda: sqlite3.connect(self.receiver.database, factory=FailingCommit)
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "health check failed"):
+            self.receiver.health()
+
+    def test_health_rejects_read_only_storage_and_caches_failure(self) -> None:
+        queries: list[str] = []
+
+        def read_only_connect() -> sqlite3.Connection:
+            connection = sqlite3.connect(f"file:{self.receiver.database}?mode=ro", uri=True)
+            connection.set_trace_callback(queries.append)
+            return connection
+
+        self.receiver._connect = read_only_connect
+        for _ in range(2):
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "health check failed"):
+                self.receiver.health()
+        self.assertEqual(sum("insert" in query.lower() and "health_write_probe" in query.lower() for query in queries), 1)
+
+    def test_health_caches_failure_then_rechecks_and_recovers(self) -> None:
+        checks = 0
+        results = iter([("corrupt",), ("ok",)])
+
+        class Connection:
+            def execute(self, query: str, parameters=()):
+                nonlocal checks
+                if "quick_check" in query.lower():
+                    checks += 1
+                    result = next(results)
+                    return type("Result", (), {"fetchone": lambda self: result})()
+                return self
+
+            def commit(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        now = 0.0
+        self.receiver._connect = Connection
+        self.receiver._monotonic = lambda: now
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.receiver.health()
+        now = 59.0
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.receiver.health()
+        self.assertEqual(checks, 1)
+        now = 60.0
+        self.receiver.health()
+        now = 119.0
+        self.receiver.health()
+        self.assertEqual(checks, 2)
 
     def test_read_api_authentication_and_controller_listing(self) -> None:
         self.submit(valid_report())

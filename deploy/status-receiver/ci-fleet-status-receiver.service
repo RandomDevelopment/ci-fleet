@@ -1,0 +1,32 @@
+[Unit]
+Description=ci-fleet authenticated status receiver
+After=network.target
+
+[Service]
+Type=simple
+User=ci-fleet-status
+Group=ci-fleet-status
+ExecStart=/usr/bin/python3 /opt/ci-fleet-status/current/status_receiver.py --auth-config /etc/ci-fleet-status/auth.json --database /var/lib/ci-fleet-status/status.db --bind 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5s
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/ci-fleet-status
+ReadWritePaths=/var/lib/ci-fleet-status
+
+[Install]
+WantedBy=multi-user.target

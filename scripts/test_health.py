@@ -425,6 +425,72 @@ class HealthTests(unittest.TestCase):
                 else:
                     os.environ["CI_FLEET_TESTING"] = old
 
+    def test_required_status_reporting_fails_closed_without_host_local_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "health.json"
+            monitoring = Path(directory) / "monitoring.env"
+            monitoring.write_text("CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1\n")
+            monitoring.chmod(0o600)
+            old_collect = health.collect_snapshot
+            old_required = os.environ.get("CI_FLEET_STATUS_REPORTING_REQUIRED")
+            old_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+            os.environ["CI_FLEET_TESTING"] = "1"
+            setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
+            try:
+                result = health._local(health.argparse.Namespace(
+                    monitoring_config=monitoring, output=output, json=True,
+                ))
+                report = json.loads(output.read_text())
+                self.assertEqual(result, 1)
+                self.assertEqual(report["checks"][-1], {"id": "status_delivery", "status": "warning"})
+            finally:
+                setattr(health, "collect_snapshot", old_collect)
+                if old_required is None:
+                    os.environ.pop("CI_FLEET_STATUS_REPORTING_REQUIRED", None)
+                else:
+                    os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = old_required
+                if old_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = old_testing
+
+    def test_required_status_reporting_redacts_invalid_host_local_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "health.json"
+            monitoring = Path(directory) / "monitoring.env"
+            old_collect = health.collect_snapshot
+            old_required = os.environ.get("CI_FLEET_STATUS_REPORTING_REQUIRED")
+            old_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+            os.environ["CI_FLEET_TESTING"] = "1"
+            setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
+            try:
+                for contents, mode in (
+                    ("not-an-env-line\n", 0o600),
+                    ("CI_FLEET_HEALTH_STATUS_URL=https://example.invalid/v1/status\n", 0o644),
+                    ("CI_FLEET_HEALTH_DISK_WARN_PERCENT=abc\n", 0o600),
+                ):
+                    monitoring.write_text(contents)
+                    monitoring.chmod(mode)
+                    result = health._local(health.argparse.Namespace(
+                        monitoring_config=monitoring, output=output, json=True,
+                    ))
+                    report = json.loads(output.read_text())
+                    self.assertEqual(result, 1)
+                    self.assertEqual(report["checks"][-1], {"id": "status_delivery", "status": "warning"})
+                    self.assertNotIn("example.invalid", output.read_text())
+            finally:
+                setattr(health, "collect_snapshot", old_collect)
+                if old_required is None:
+                    os.environ.pop("CI_FLEET_STATUS_REPORTING_REQUIRED", None)
+                else:
+                    os.environ["CI_FLEET_STATUS_REPORTING_REQUIRED"] = old_required
+                if old_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = old_testing
+
     def test_expired_active_resources_and_stopped_capacity_are_observable(self) -> None:
         cleanup = "KEEP container runner state=running expired=1 (routine cleanup never removes active containers)\nWOULD_REMOVE volume old expired=1\n"
         run = lambda args: health.subprocess.CompletedProcess(args, 0, cleanup, "")

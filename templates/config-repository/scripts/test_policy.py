@@ -6,13 +6,14 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config
+from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_rollout_evidence, validate_transition
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,344 @@ class PolicyTests(unittest.TestCase):
 
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
+
+    def test_status_reporting_null_is_rejected(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["status_reporting"] = None
+        self.assert_rejected(config, "must be an object")
+
+    def test_initializer_omits_status_reporting_for_staged_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            controller = first_controller(json.loads(output.read_text()))
+        self.assertNotIn("status_reporting", controller)
+
+    def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        first_controller(current)["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("later commit" in error for error in validation.errors), validation.errors)
+
+        staged = copy.deepcopy(current)
+        first_controller(staged).pop("status_reporting")
+        validation = Validation()
+        validate_transition(staged, current, {}, validation)
+        self.assertTrue(any("rollout evidence" in error for error in validation.errors), validation.errors)
+        validation = Validation()
+        controller_name = next(iter(staged["controllers"]))
+        validate_transition(staged, current, {
+            controller_name: {
+                "engine_ref": first_controller(staged)["engine_ref"],
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            },
+        }, validation)
+        self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(staged, current, {
+            controller_name: {
+                "engine_ref": first_controller(staged)["engine_ref"],
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            },
+        }, validation, {})
+        self.assertTrue(any("capability evidence" in error for error in validation.errors), validation.errors)
+
+    def test_retained_reporting_requires_target_engine_capabilities(self) -> None:
+        previous = reference_config()
+        first_controller(previous)["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        controller = next(iter(current["controllers"]))
+        compatible = {
+            controller: {
+                "engine_ref": "2" * 40,
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            }
+        }
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertEqual(validation.errors, [])
+
+        for evidence in (
+            {},
+            {controller: {**compatible[controller], "engine_ref": "3" * 40}},
+            {controller: {**compatible[controller], "status_reporting_config": False}},
+        ):
+            validation = Validation()
+            validate_transition(previous, current, evidence, validation)
+            self.assertTrue(any("configuration capability evidence" in error for error in validation.errors), validation.errors)
+
+        first_controller(previous)["status_reporting"]["enabled"] = True
+        first_controller(current)["status_reporting"]["enabled"] = True
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertTrue(any("required status-reporting" in error for error in validation.errors), validation.errors)
+        compatible[controller]["required_status_reporting"] = True
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_reporting_removal_before_engine_change_needs_no_evidence(self) -> None:
+        previous = reference_config()
+        first_controller(previous)["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        removed = copy.deepcopy(previous)
+        first_controller(removed).pop("status_reporting")
+        validation = Validation()
+        validate_transition(previous, removed, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+        changed = copy.deepcopy(removed)
+        first_controller(changed)["engine_ref"] = "2" * 40
+        validation = Validation()
+        validate_transition(removed, changed, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_rollout_evidence_requires_explicit_capability_booleans(self) -> None:
+        base = {"engine_ref": "1" * 40, "status_reporting_config": True, "required_status_reporting": False}
+        for evidence in (
+            {key: value for key, value in base.items() if key != "status_reporting_config"},
+            {**base, "status_reporting_config": None},
+            {**base, "required_status_reporting": None},
+        ):
+            validation = Validation()
+            self.assertEqual(validate_rollout_evidence({
+                "schema_version": 1,
+                "status_reporting_engine_capabilities": {"example-ci-01": evidence},
+            }, validation), {})
+            self.assertTrue(validation.errors)
+
+    def test_new_controller_cannot_introduce_status_reporting(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        controller = copy.deepcopy(first_controller(current))
+        controller["scale_set_name"] = "example-ci-02-scale"
+        controller["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        current["controllers"]["example-ci-02"] = controller
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("new controller" in error for error in validation.errors), validation.errors)
+
+    def test_rollout_evidence_is_scoped_to_its_controller(self) -> None:
+        previous = reference_config()
+        second = copy.deepcopy(first_controller(previous))
+        second["scale_set_name"] = "example-ci-02-scale"
+        previous["controllers"]["example-ci-02"] = second
+        current = copy.deepcopy(previous)
+        current["controllers"]["example-ci-02"]["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        validation = Validation()
+        validate_transition(previous, current, {
+            "example-ci-01": {
+                "engine_ref": second["engine_ref"],
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            },
+        }, validation)
+        self.assertTrue(any("for this controller" in error for error in validation.errors), validation.errors)
+
+    def test_rollout_evidence_requires_controller_mapping(self) -> None:
+        validation = Validation()
+        evidence = {
+            "engine_ref": "1" * 40,
+            "status_reporting_config": True,
+            "required_status_reporting": False,
+        }
+        refs = validate_rollout_evidence({
+            "schema_version": 1,
+            "status_reporting_engine_capabilities": {"example-ci-01": evidence},
+        }, validation)
+        self.assertEqual(refs, {"example-ci-01": evidence})
+        self.assertEqual(validation.errors, [])
+
+    def test_rollout_evidence_requires_previous_engine_selection(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "previous.json").write_text(json.dumps(previous), encoding="utf-8")
+            (root / "current.json").write_text(json.dumps(current), encoding="utf-8")
+            (root / "previous-evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_engine_capabilities": {},
+            }), encoding="utf-8")
+            (root / "evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_engine_capabilities": {
+                    next(iter(current["controllers"])): {
+                        "engine_ref": "2" * 40,
+                        "status_reporting_config": True,
+                        "required_status_reporting": False,
+                    },
+                },
+            }), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must already be selected", result.stderr)
+
+    def test_rollout_evidence_must_match_current_controller_ref(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        controller_name = next(iter(current["controllers"]))
+        proven_ref = first_controller(previous)["engine_ref"]
+        first_controller(current)["engine_ref"] = "2" * 40
+        evidence = {
+            "schema_version": 1,
+            "status_reporting_engine_capabilities": {
+                controller_name: {
+                    "engine_ref": proven_ref,
+                    "status_reporting_config": True,
+                    "required_status_reporting": False,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in (
+                ("previous.json", previous),
+                ("current.json", current),
+                ("previous-evidence.json", evidence),
+                ("evidence.json", evidence),
+            ):
+                (root / name).write_text(json.dumps(value), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must match the current controller engine_ref", result.stderr)
+
+    def test_enabling_required_reporting_needs_required_capability_evidence(self) -> None:
+        previous = reference_config()
+        controller_name = next(iter(previous["controllers"]))
+        first_controller(previous)["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        current = copy.deepcopy(previous)
+        first_controller(current)["status_reporting"]["enabled"] = True
+        evidence = {
+            "schema_version": 1,
+            "status_reporting_engine_capabilities": {
+                controller_name: {
+                    "engine_ref": first_controller(previous)["engine_ref"],
+                    "status_reporting_config": True,
+                    "required_status_reporting": False,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in (
+                ("previous.json", previous),
+                ("current.json", current),
+                ("previous-evidence.json", evidence),
+                ("evidence.json", evidence),
+            ):
+                (root / name).write_text(json.dumps(value), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires required status-reporting rollout evidence", result.stderr)
+        validation = Validation()
+        validate_transition(previous, current, {
+            controller_name: {
+                "engine_ref": first_controller(previous)["engine_ref"],
+                "status_reporting_config": True,
+                "required_status_reporting": True,
+            },
+        }, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_alternate_config_does_not_use_fleet_rollout_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            (template / "engine-rollout-evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_engine_capabilities": {
+                    "private-ci-01": {
+                        "engine_ref": "1" * 40,
+                        "status_reporting_config": True,
+                        "required_status_reporting": False,
+                    },
+                },
+            }), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--config", str(template / "examples" / "multi-host" / "fleet.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_fleet_config_cannot_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            fleet = template / "fleet.json"
+            fleet.rename(template / "fleet-target.json")
+            fleet.symlink_to("fleet-target.json")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlinked JSON files are forbidden", result.stderr)
+
+    def test_rollout_evidence_cannot_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            evidence = template / "engine-rollout-evidence.json"
+            evidence.rename(template / "evidence-target.json")
+            evidence.symlink_to("evidence-target.json")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlinked JSON files are forbidden", result.stderr)
 
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
