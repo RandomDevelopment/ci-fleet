@@ -173,6 +173,36 @@ class PolicyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must already be selected", result.stderr)
 
+    def test_rollout_evidence_must_match_current_controller_ref(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        controller_name = next(iter(current["controllers"]))
+        proven_ref = first_controller(previous)["engine_ref"]
+        first_controller(current)["engine_ref"] = "2" * 40
+        evidence = {
+            "schema_version": 1,
+            "status_reporting_compatible_engine_refs": {controller_name: proven_ref},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in (
+                ("previous.json", previous),
+                ("current.json", current),
+                ("previous-evidence.json", evidence),
+                ("evidence.json", evidence),
+            ):
+                (root / name).write_text(json.dumps(value), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must match the current controller engine_ref", result.stderr)
+
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
         self.assertEqual(errors_for(config), [])

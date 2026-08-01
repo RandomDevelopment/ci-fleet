@@ -491,6 +491,14 @@ def main() -> int:
     if config is not None:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
+        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
+        for controller, ref in current_compatible_engine_refs.items():
+            current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
+            validation.require(
+                isinstance(current_controller, dict) and current_controller.get("engine_ref") == ref,
+                f"engine-rollout-evidence.json.status_reporting_compatible_engine_refs.{controller}",
+                "must match the current controller engine_ref; remove stale evidence before changing or removing the controller",
+            )
         if args.previous_config is not None:
             previous = load_json(args.previous_config.resolve(), validation)
             previous_evidence = (
