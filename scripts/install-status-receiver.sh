@@ -358,6 +358,7 @@ fi
 activate "$ref"
 link_unit
 restart_live_service
+rm -f "$restart_required"
 if [[ "$mode" == upgrade ]]; then
   echo UPGRADED
 else

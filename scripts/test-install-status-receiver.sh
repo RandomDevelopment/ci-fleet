@@ -124,7 +124,9 @@ if run --install --ref "$second" >/dev/null 2>&1; then
   echo "install mode changed an active release" >&2
   exit 1
 fi
+printf '%s\n' 1 >"$root/var/lib/ci-fleet-status-installer/restart-required"
 test "$(run --upgrade --ref "$second")" = UPGRADED
+test ! -e "$root/var/lib/ci-fleet-status-installer/restart-required"
 assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$second"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
