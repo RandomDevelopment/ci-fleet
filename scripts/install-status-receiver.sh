@@ -267,6 +267,11 @@ if [[ "$mode" == check ]]; then
   validate_release "$install_root/releases/$installed"
   ensure_systemd_directory
   [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]]
+  [[ ! -f "$restart_required" ]] || { echo "receiver restart is pending" >&2; exit 1; }
+  [[ "$test_mode" == 1 ]] || systemctl is-active --quiet ci-fleet-status-receiver.service || {
+    echo "status receiver service is not active" >&2
+    exit 1
+  }
   echo "CHECK_OK $installed"
   exit
 fi

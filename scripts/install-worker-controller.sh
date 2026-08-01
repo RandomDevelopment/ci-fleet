@@ -273,6 +273,14 @@ select_engine() {
 prepare_engine_capabilities() {
   local checkout resolved manifest_mode
   engine_capabilities=$temporary/engine-capabilities.json
+  if runtime_release_complete "$release_dir" "$engine_ref"; then
+    if [[ -f "$release_dir/engine-capabilities.json" ]]; then
+      cp "$release_dir/engine-capabilities.json" "$engine_capabilities"
+    else
+      rm -f "$engine_capabilities"
+    fi
+    return
+  fi
   if is_git_checkout "$repo_root" && git -C "$repo_root" cat-file -e "$engine_ref^{commit}" 2>/dev/null; then
     manifest_mode=$(git -C "$repo_root" ls-tree "$engine_ref" -- engine-capabilities.json | awk '{print $1}')
     [[ "$manifest_mode" == 100644 ]] || { rm -f "$engine_capabilities"; return; }

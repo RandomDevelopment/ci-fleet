@@ -14,6 +14,8 @@ export REAL_STAT
 REAL_STAT=$(command -v stat)
 export REAL_TAR
 REAL_TAR=$(command -v tar)
+export REAL_GIT
+REAL_GIT=$(command -v git)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -173,6 +175,15 @@ fi
 exec "$REAL_TAR" "$@"
 EOF
 chmod 700 "$fake_bin/tar"
+
+cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${FAKE_FAIL_GIT_FETCH:-} && " $* " == *" fetch "* ]]; then
+  exit 90
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod 700 "$fake_bin/git"
 
 export PATH="$fake_bin:$PATH"
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
@@ -370,6 +381,8 @@ second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
 check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
+installed_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+expect_success env FAKE_FAIL_GIT_FETCH=1 "$installed_installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ ! -d "$root/opt/ci-fleet/manager/releases/$engine_ref/templates/config-repository/scripts/__pycache__" ]] || fail 'manager validation wrote Python bytecode into the immutable release'
 python3 - "$install_state" <<'PY'
 import json

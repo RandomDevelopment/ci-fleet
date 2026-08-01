@@ -137,6 +137,12 @@ test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
 test "$(stat -c %a "$root/var/lib/ci-fleet-status-installer")" = 700
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
+printf '%s\n' 1 >"$root/var/lib/ci-fleet-status-installer/restart-required"
+if run --check >/dev/null 2>&1; then
+  echo "pending receiver restart was accepted" >&2
+  exit 1
+fi
+rm "$root/var/lib/ci-fleet-status-installer/restart-required"
 test "$(run --check)" = "CHECK_OK $second"
 assert_systemd_mode
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
