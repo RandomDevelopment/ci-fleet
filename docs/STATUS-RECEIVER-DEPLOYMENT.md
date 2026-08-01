@@ -30,10 +30,10 @@ test -z "$(git status --porcelain)"
 sudo ./scripts/install-status-receiver.sh --install --ref "$ref"
 ```
 
-A second identical invocation returns `NO_CHANGE`. Before activation, verify:
+A second identical invocation returns `NO_CHANGE`. Before activation, verify the
+unit definition:
 
 ```bash
-sudo ./scripts/install-status-receiver.sh --check
 sudo systemd-analyze verify \
   /etc/systemd/system/ci-fleet-status-receiver.service
 ```
@@ -76,6 +76,7 @@ After receiver-local credential metadata and reverse-proxy configuration pass:
 sudo systemctl daemon-reload
 sudo systemctl enable --now ci-fleet-status-receiver.service
 sudo systemctl is-active --quiet ci-fleet-status-receiver.service
+sudo ./scripts/install-status-receiver.sh --check
 python3 - <<'PY'
 import json
 import urllib.request
