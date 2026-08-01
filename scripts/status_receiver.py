@@ -61,6 +61,9 @@ class StatusReceiver:
         self._write_lock = threading.Lock()
         self._last_attempt: dict[str, int] = {}
         self._clock = time.time
+        self._monotonic = time.monotonic
+        self._health_checked_at = float("-inf")
+        self._health_integrity_ok = False
         with closing(self._connect()) as connection, connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS reports (
@@ -75,6 +78,9 @@ class StatusReceiver:
                     nonce TEXT NOT NULL,
                     authenticated_at INTEGER NOT NULL,
                     PRIMARY KEY (controller, nonce)
+                );
+                CREATE TABLE IF NOT EXISTS health_write_probe (
+                    checked_at INTEGER NOT NULL
                 );
             """)
         os.chmod(self.database, 0o600)
@@ -113,33 +119,33 @@ class StatusReceiver:
         if abs(now - generated_at) > self.max_clock_skew_seconds:
             raise StatusError(409, "report_time_stale")
         encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
-        with self._write_lock, closing(self._connect()) as connection, connection:
-            if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
-                raise StatusError(409, "replayed_report")
-            last_attempt = self._last_attempt.get(controller)
-            if last_attempt is not None and now - last_attempt < 1:
-                raise StatusError(429, "submission_too_frequent")
+        with self._write_lock, closing(self._connect()) as connection:
+            with connection:
+                if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
+                    raise StatusError(409, "replayed_report")
+                last_attempt = self._last_attempt.get(controller)
+                if last_attempt is not None and now - last_attempt < 1:
+                    raise StatusError(429, "submission_too_frequent")
+                try:
+                    connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
+                except sqlite3.IntegrityError as error:
+                    raise StatusError(409, "replayed_report") from error
+                last = connection.execute(
+                    "SELECT generated_at, received_at FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1",
+                    (controller,),
+                ).fetchone()
+                if last and generated_at <= last[0]:
+                    raise StatusError(409, "stale_report")
+                if last and now - last[1] < self.min_interval_seconds:
+                    raise StatusError(429, "submission_too_frequent")
+                connection.execute("INSERT INTO reports VALUES (?, ?, ?, ?)", (controller, generated_at, now, encoded))
+                connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
+                connection.execute(
+                    "DELETE FROM reports WHERE controller=? AND rowid NOT IN (SELECT rowid FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?)",
+                    (controller, controller, self.history_limit),
+                )
+                connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
             self._last_attempt[controller] = now
-            try:
-                connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
-                connection.commit()
-            except sqlite3.IntegrityError as error:
-                raise StatusError(409, "replayed_report") from error
-            last = connection.execute(
-                "SELECT generated_at, received_at FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1",
-                (controller,),
-            ).fetchone()
-            if last and generated_at <= last[0]:
-                raise StatusError(409, "stale_report")
-            if last and now - last[1] < self.min_interval_seconds:
-                raise StatusError(429, "submission_too_frequent")
-            connection.execute("INSERT INTO reports VALUES (?, ?, ?, ?)", (controller, generated_at, now, encoded))
-            connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
-            connection.execute(
-                "DELETE FROM reports WHERE controller=? AND rowid NOT IN (SELECT rowid FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?)",
-                (controller, controller, self.history_limit),
-            )
-            connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
 
     def _expire(self, connection: sqlite3.Connection, now: int) -> None:
         connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
@@ -285,6 +291,32 @@ class StatusReceiver:
             """).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def health(self) -> None:
+        with self._write_lock, closing(self._connect()) as connection:
+            now = self._monotonic()
+            if now - self._health_checked_at >= 60:
+                try:
+                    if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError("database health check failed")
+                    connection.execute(
+                        "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
+                    )
+                    connection.execute(
+                        "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
+                    )
+                    connection.execute("INSERT INTO health_write_probe VALUES (?)", (int(self._clock()),))
+                    connection.commit()
+                    connection.execute("DELETE FROM health_write_probe")
+                    connection.commit()
+                except sqlite3.Error:
+                    self._health_integrity_ok = False
+                    self._health_checked_at = now
+                    raise sqlite3.DatabaseError("database health check failed") from None
+                self._health_integrity_ok = True
+                self._health_checked_at = now
+            if not self._health_integrity_ok:
+                raise sqlite3.DatabaseError("database health check failed")
+
 
 class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -359,12 +391,18 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
             except (ValueError, StatusError) as error:
                 failure = error if isinstance(error, StatusError) else StatusError(400, "invalid_request")
                 self.send_json(failure.status, {"error": failure.code})
+            except (OSError, sqlite3.Error):
+                self.send_json(503, {"error": "unavailable"})
 
         def do_GET(self) -> None:
             path = urllib.parse.urlsplit(self.path)
             try:
                 if path.query or path.fragment:
                     raise StatusError(400, "invalid_request")
+                if path.path == "/healthz":
+                    receiver.health()
+                    self.send_json(200, {"status": "ok"})
+                    return
                 if path.path == "/v1/controllers":
                     value = {"schema_version": 1, "controllers": receiver.list_latest(self.bearer())}
                 elif path.path.startswith("/v1/controllers/"):
@@ -382,6 +420,8 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
                 self.send_json(200, value)
             except StatusError as error:
                 self.send_json(error.status, {"error": error.code})
+            except (OSError, sqlite3.Error):
+                self.send_json(503, {"error": "unavailable"})
 
         def log_message(self, format: str, *args: Any) -> None:
             pass

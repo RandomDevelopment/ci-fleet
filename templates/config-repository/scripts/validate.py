@@ -89,6 +89,9 @@ def load_json(path: Path, validation: Validation) -> Any:
             value[key] = child
         return value
 
+    if path.is_symlink():
+        validation.errors.append(f"{path}: symlinked JSON files are forbidden")
+        return None
     try:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except FileNotFoundError:
@@ -268,7 +271,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     for name, controller in controllers.items():
         path = f"$.controllers.{name}"
         validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "controller ID must be a unique lowercase slug")
-        if not validation.exact_keys(controller, path, controller_keys):
+        if not validation.exact_keys(controller, path, controller_keys, {"status_reporting"}):
             continue
         pool_name = controller.get("pool")
         location = controller.get("location")
@@ -296,6 +299,10 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         if type(minimum) is int and type(maximum) is int:
             validation.require(minimum <= maximum, f"{path}.min_runners", "must not exceed max_runners")
         validation.require(minimum == 0, f"{path}.min_runners", "must be zero because managed prewarmed runners are not supported")
+        status_reporting = controller.get("status_reporting")
+        if "status_reporting" in controller and validation.exact_keys(status_reporting, f"{path}.status_reporting", {"enabled", "config_file"}):
+            validation.require(type(status_reporting.get("enabled")) is bool, f"{path}.status_reporting.enabled", "must be a boolean")
+            validation.require(status_reporting.get("config_file") == "/etc/ci-fleet/monitoring.env", f"{path}.status_reporting.config_file", "must use the fixed host-local monitoring configuration")
         resources = controller.get("runner_resources")
         if validation.exact_keys(resources, f"{path}.runner_resources", {"cpu_cores", "memory_mib"}):
             cpu = resources.get("cpu_cores")
@@ -400,9 +407,126 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(repository != "example-org/example-app", f"{path}.repository", "replace the example repository before use")
 
 
+def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, dict[str, Any]]:
+    if not validation.exact_keys(
+        value,
+        "engine-rollout-evidence.json",
+        {"schema_version", "status_reporting_engine_capabilities"},
+    ):
+        return {}
+    validation.require(value.get("schema_version") == 1, "engine-rollout-evidence.json.schema_version", "must equal 1")
+    capabilities = value.get("status_reporting_engine_capabilities")
+    if not isinstance(capabilities, dict):
+        validation.errors.append("engine-rollout-evidence.json.status_reporting_engine_capabilities: must be an object mapping controller IDs to capability evidence")
+        return {}
+    valid: dict[str, dict[str, Any]] = {}
+    for controller, evidence in capabilities.items():
+        path = f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}"
+        controller_valid = bool(SLUG.fullmatch(controller))
+        validation.require(controller_valid, path, "controller ID must be a lowercase slug")
+        if not validation.exact_keys(evidence, path, {"engine_ref", "status_reporting_config", "required_status_reporting"}):
+            continue
+        ref = evidence.get("engine_ref")
+        configured = evidence.get("status_reporting_config")
+        required = evidence.get("required_status_reporting")
+        ref_valid = isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40
+        validation.require(ref_valid, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
+        validation.require(type(configured) is bool, f"{path}.status_reporting_config", "must be a boolean")
+        validation.require(type(required) is bool, f"{path}.required_status_reporting", "must be a boolean")
+        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool:
+            valid[controller] = {
+                "engine_ref": ref,
+                "status_reporting_config": configured,
+                "required_status_reporting": required,
+            }
+    return valid
+
+
+def validate_reporting_evidence(
+    name: str,
+    controller: dict[str, Any],
+    evidence: dict[str, Any],
+    validation: Validation,
+) -> None:
+    reporting = controller.get("status_reporting")
+    if not isinstance(reporting, dict):
+        return
+    validation.require(
+        evidence.get("engine_ref") == controller.get("engine_ref")
+        and evidence.get("status_reporting_config") is True,
+        f"$.controllers.{name}.status_reporting",
+        "requires status-reporting configuration capability evidence for this controller and engine_ref",
+    )
+    if reporting.get("enabled") is True:
+        validation.require(
+            evidence.get("engine_ref") == controller.get("engine_ref")
+            and evidence.get("required_status_reporting") is True,
+            f"$.controllers.{name}.status_reporting.enabled",
+            "requires required status-reporting rollout evidence for this controller and engine_ref",
+        )
+
+
+def validate_transition(
+    previous: Any,
+    current: Any,
+    compatible_engine_refs: dict[str, dict[str, Any]],
+    validation: Validation,
+    previous_compatible_engine_refs: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return
+    old_controllers = previous.get("controllers")
+    new_controllers = current.get("controllers")
+    if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
+        return
+    for name, new in new_controllers.items():
+        old = old_controllers.get(name)
+        if not isinstance(new, dict):
+            continue
+        if name not in old_controllers:
+            if "status_reporting" in new:
+                validation.errors.append(
+                    f"$.controllers.{name}.status_reporting: must be omitted from a new controller until its engine rollout is proven"
+                )
+            continue
+        if not isinstance(old, dict):
+            continue
+        current_evidence = compatible_engine_refs.get(name, {})
+        previous_evidence_source = (
+            compatible_engine_refs
+            if previous_compatible_engine_refs is None
+            else previous_compatible_engine_refs
+        )
+        previous_evidence = previous_evidence_source.get(name, {})
+        old_reporting = old.get("status_reporting")
+        new_reporting = new.get("status_reporting")
+        staged_capability_required = (
+            "status_reporting" not in old
+            or (
+                isinstance(new_reporting, dict)
+                and new_reporting.get("enabled") is True
+                and (not isinstance(old_reporting, dict) or old_reporting.get("enabled") is not True)
+            )
+        )
+        evidence = previous_evidence if staged_capability_required else current_evidence
+        validate_reporting_evidence(name, new, evidence, validation)
+        if "status_reporting" not in old and "status_reporting" in new:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.status_reporting",
+                "must be introduced in a later commit after the compatible engine_ref is active",
+            )
+            validation.require(
+                evidence.get("engine_ref") == old.get("engine_ref"),
+                f"$.controllers.{name}.status_reporting",
+                "requires reviewed rollout evidence for this controller and its already-active compatible engine_ref",
+            )
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
+    parser.add_argument("--previous-config", type=Path, help="previous integrated configuration for rollout validation")
+    parser.add_argument("--rollout-evidence", type=Path, help="rollout evidence file (defaults to engine-rollout-evidence.json only for the default fleet.json)")
+    parser.add_argument("--previous-rollout-evidence", type=Path, help="previous integrated rollout evidence")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
     parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
@@ -412,13 +536,71 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     validation = Validation()
-    config = load_json(args.config.resolve(), validation)
+    config_path = args.config.absolute()
+    config = load_json(config_path, validation)
+    evidence_path = args.rollout_evidence.absolute() if args.rollout_evidence else None
+    if evidence_path is None and config_path == ROOT / "fleet.json":
+        evidence_path = ROOT / "engine-rollout-evidence.json"
+    evidence = load_json(evidence_path, validation) if evidence_path is not None else None
+    current_compatible_engine_refs = (
+        validate_rollout_evidence(evidence, validation)
+        if evidence is not None
+        else {}
+    )
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
     if config is not None:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
+        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
+        for controller, evidence in current_compatible_engine_refs.items():
+            current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
+            validation.require(
+                isinstance(current_controller, dict) and current_controller.get("engine_ref") == evidence["engine_ref"],
+                f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
+                "must match the current controller engine_ref; remove stale evidence before changing or removing the controller",
+            )
+        if isinstance(current_controllers, dict):
+            for controller, value in current_controllers.items():
+                if isinstance(value, dict):
+                    validate_reporting_evidence(
+                        controller,
+                        value,
+                        current_compatible_engine_refs.get(controller, {}),
+                        validation,
+                    )
+        if args.previous_config is not None:
+            previous = load_json(args.previous_config.absolute(), validation)
+            previous_evidence = (
+                load_json(args.previous_rollout_evidence.absolute(), validation)
+                if args.previous_rollout_evidence
+                else None
+            )
+            previous_compatible_engine_refs = (
+                validate_rollout_evidence(previous_evidence, validation)
+                if previous_evidence is not None
+                else {}
+            )
+            if previous is not None:
+                previous_controllers = previous.get("controllers", {}) if isinstance(previous, dict) else {}
+                for controller, evidence in current_compatible_engine_refs.items():
+                    if previous_compatible_engine_refs.get(controller) == evidence:
+                        continue
+                    ref = evidence["engine_ref"]
+                    previous_controller = previous_controllers.get(controller) if isinstance(previous_controllers, dict) else None
+                    validation.require(
+                        isinstance(previous_controller, dict) and previous_controller.get("engine_ref") == ref,
+                        f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
+                        f"{ref} must already be selected for this controller in the previous integrated fleet configuration",
+                    )
+                validate_transition(
+                    previous,
+                    config,
+                    current_compatible_engine_refs,
+                    validation,
+                    previous_compatible_engine_refs,
+                )
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)
     elif not args.skip_path_scan:

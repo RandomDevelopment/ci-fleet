@@ -86,6 +86,10 @@ CI_FLEET_HEALTH_STATUS_KEY_FILE=/etc/ci-fleet/secrets/status-reporting.key
 ```
 
 The URL must be HTTPS with the exact `/v1/status` path and no embedded credentials, query, or fragment.
+Schema-v3 desired state may require reporting with only the fixed host-local
+configuration reference `/etc/ci-fleet/monitoring.env`; endpoint and key values
+remain outside Git. A required but missing or unsafe host-local configuration is
+reported as a redacted delivery warning and does not interrupt runner lifecycle.
 
 ## Threat model
 
@@ -121,3 +125,7 @@ Reports never contain:
 - Docker socket access or any host-control capability.
 
 The local full health result remains available for recovery, but only the status schema's allowlisted summary leaves the controller.
+
+For dedicated-host packaging, one-time secret boundaries, activation,
+verification, upgrade, and rollback, see
+[Status receiver deployment](STATUS-RECEIVER-DEPLOYMENT.md).

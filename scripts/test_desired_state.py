@@ -12,6 +12,7 @@ from pathlib import Path
 from desired_state import (
     DesiredStateError,
     build_rendered_env,
+    load_engine_capabilities,
     load_and_validate_config,
     parse_env,
     validate_host_values,
@@ -36,7 +37,7 @@ def host_values() -> dict[str, str]:
 
 
 class DesiredStateTests(unittest.TestCase):
-    def render(self, value: dict | None = None):
+    def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
             value or config(),
             "example-ci-01",
@@ -44,6 +45,7 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
+            engine_capabilities={"status_reporting_config"} if capabilities is None else capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -53,6 +55,68 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(environment["CI_FLEET_LABELS"], "docker-ci")
         self.assertEqual(environment["CI_FLEET_COMMIT"], environment["CI_FLEET_ENGINE_REF"])
         self.assertEqual(metadata["controller_state"], "active")
+
+    def test_status_reporting_requires_fixed_host_local_configuration(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        environment, _ = self.render(value, {"status_reporting_config", "required_status_reporting"})
+        self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
+        value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "fixed host-local monitoring"):
+                load_and_validate_config(path)
+        value["controllers"]["example-ci-01"]["status_reporting"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "must be an object"):
+                load_and_validate_config(path)
+
+    def test_status_reporting_requires_engine_capability(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
+            self.render(value, set())
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "engine-capabilities.json"
+            manifest.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "malformed"):
+                load_engine_capabilities(manifest)
+            manifest.write_text('{"schema_version":1,"schema_version":1,"capabilities":{}}', encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "malformed"):
+                load_engine_capabilities(manifest)
+            manifest.unlink()
+            with self.assertRaisesRegex(DesiredStateError, "missing"):
+                load_engine_capabilities(manifest)
+
+    def test_omitted_status_reporting_accepts_older_engine(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"].pop("status_reporting", None)
+        environment, metadata = self.render(value, set())
+        self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
+        self.assertFalse(metadata["status_reporting_configured"])
+        self.assertFalse(metadata["status_reporting_required"])
+
+    def test_disabled_status_reporting_requires_schema_capability(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
+            self.render(value, set())
+        environment, metadata = self.render(value, {"status_reporting_config"})
+        self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
+        self.assertTrue(metadata["status_reporting_configured"])
+        self.assertFalse(metadata["status_reporting_required"])
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

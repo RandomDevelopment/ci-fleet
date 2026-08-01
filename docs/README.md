@@ -62,6 +62,7 @@ These pages are normative for compatible projects and hosts:
 - [Host maintenance standard](HOST-MAINTENANCE.md)
 - [Fleet health monitoring](HEALTH-MONITORING.md)
 - [Authenticated controller status reporting](STATUS-REPORTING.md)
+- [Status receiver deployment](STATUS-RECEIVER-DEPLOYMENT.md)
 - [Git-authored controller desired state](DESIRED-STATE.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)
