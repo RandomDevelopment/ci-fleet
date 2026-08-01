@@ -230,10 +230,10 @@ git -C "$config_repo" config user.email fixture@example.invalid
 write_config() {
   local state=$1 maximum=$2 budget=$3
   local desired_engine=${4:-$engine_ref} reporting=${5:-false}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" <<'PY'
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" <<'PY'
 import json
 import sys
-source, target, engine_ref, state, maximum, budget, reporting = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
@@ -253,8 +253,20 @@ value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)
     handle.write("\n")
+with open(evidence_target, "w", encoding="utf-8") as handle:
+    json.dump({
+        "schema_version": 1,
+        "status_reporting_engine_capabilities": {
+            "example-ci-01": {
+                "engine_ref": engine_ref,
+                "status_reporting_config": True,
+                "required_status_reporting": True,
+            },
+        },
+    }, handle, indent=2)
+    handle.write("\n")
 PY
-  git -C "$config_repo" add fleet.json
+  git -C "$config_repo" add fleet.json engine-rollout-evidence.json
   git -C "$config_repo" commit -q -m "fixture $state $maximum"
   git -C "$config_repo" rev-parse HEAD
 }

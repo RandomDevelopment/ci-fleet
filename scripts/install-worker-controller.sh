@@ -181,10 +181,15 @@ resolve_config() {
 }
 
 validate_candidate_config_commit() {
-  local tree_paths=$temporary/config-tree-paths
+  local tree_paths=$temporary/config-tree-paths evidence=$temporary/engine-rollout-evidence.json
+  local args=(--config "$candidate_config" --strict --tree-paths "$tree_paths")
   git -C "$config_source_checkout" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
+  if git -C "$config_source_checkout" cat-file -e "$config_ref:engine-rollout-evidence.json" 2>/dev/null; then
+    git -C "$config_source_checkout" show "$config_ref:engine-rollout-evidence.json" >"$evidence" || die 'cannot read engine rollout evidence'
+    args+=(--rollout-evidence "$evidence")
+  fi
   python3 "$repo_root/templates/config-repository/scripts/validate.py" \
-    --config "$candidate_config" --strict --tree-paths "$tree_paths" || die 'configuration commit validation failed'
+    "${args[@]}" || die 'configuration commit validation failed'
   python3 "$repo_root/scripts/scan_committed_secrets.py" \
     --repository "$config_source_checkout" --commit "$config_ref" || die 'configuration commit secret scan failed'
 }

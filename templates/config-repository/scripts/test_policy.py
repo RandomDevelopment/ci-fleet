@@ -110,10 +110,91 @@ class PolicyTests(unittest.TestCase):
         validate_transition(staged, current, {
             controller_name: {
                 "engine_ref": first_controller(staged)["engine_ref"],
+                "status_reporting_config": True,
                 "required_status_reporting": False,
             },
         }, validation)
         self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(staged, current, {
+            controller_name: {
+                "engine_ref": first_controller(staged)["engine_ref"],
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            },
+        }, validation, {})
+        self.assertTrue(any("capability evidence" in error for error in validation.errors), validation.errors)
+
+    def test_retained_reporting_requires_target_engine_capabilities(self) -> None:
+        previous = reference_config()
+        first_controller(previous)["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        controller = next(iter(current["controllers"]))
+        compatible = {
+            controller: {
+                "engine_ref": "2" * 40,
+                "status_reporting_config": True,
+                "required_status_reporting": False,
+            }
+        }
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertEqual(validation.errors, [])
+
+        for evidence in (
+            {},
+            {controller: {**compatible[controller], "engine_ref": "3" * 40}},
+            {controller: {**compatible[controller], "status_reporting_config": False}},
+        ):
+            validation = Validation()
+            validate_transition(previous, current, evidence, validation)
+            self.assertTrue(any("configuration capability evidence" in error for error in validation.errors), validation.errors)
+
+        first_controller(previous)["status_reporting"]["enabled"] = True
+        first_controller(current)["status_reporting"]["enabled"] = True
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertTrue(any("required status-reporting" in error for error in validation.errors), validation.errors)
+        compatible[controller]["required_status_reporting"] = True
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_reporting_removal_before_engine_change_needs_no_evidence(self) -> None:
+        previous = reference_config()
+        first_controller(previous)["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        removed = copy.deepcopy(previous)
+        first_controller(removed).pop("status_reporting")
+        validation = Validation()
+        validate_transition(previous, removed, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+        changed = copy.deepcopy(removed)
+        first_controller(changed)["engine_ref"] = "2" * 40
+        validation = Validation()
+        validate_transition(removed, changed, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_rollout_evidence_requires_explicit_capability_booleans(self) -> None:
+        base = {"engine_ref": "1" * 40, "status_reporting_config": True, "required_status_reporting": False}
+        for evidence in (
+            {key: value for key, value in base.items() if key != "status_reporting_config"},
+            {**base, "status_reporting_config": None},
+            {**base, "required_status_reporting": None},
+        ):
+            validation = Validation()
+            self.assertEqual(validate_rollout_evidence({
+                "schema_version": 1,
+                "status_reporting_engine_capabilities": {"example-ci-01": evidence},
+            }, validation), {})
+            self.assertTrue(validation.errors)
 
     def test_new_controller_cannot_introduce_status_reporting(self) -> None:
         previous = reference_config()
@@ -143,6 +224,7 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, {
             "example-ci-01": {
                 "engine_ref": second["engine_ref"],
+                "status_reporting_config": True,
                 "required_status_reporting": False,
             },
         }, validation)
@@ -152,6 +234,7 @@ class PolicyTests(unittest.TestCase):
         validation = Validation()
         evidence = {
             "engine_ref": "1" * 40,
+            "status_reporting_config": True,
             "required_status_reporting": False,
         }
         refs = validate_rollout_evidence({
@@ -178,6 +261,7 @@ class PolicyTests(unittest.TestCase):
                 "status_reporting_engine_capabilities": {
                     next(iter(current["controllers"])): {
                         "engine_ref": "2" * 40,
+                        "status_reporting_config": True,
                         "required_status_reporting": False,
                     },
                 },
@@ -204,6 +288,7 @@ class PolicyTests(unittest.TestCase):
             "status_reporting_engine_capabilities": {
                 controller_name: {
                     "engine_ref": proven_ref,
+                    "status_reporting_config": True,
                     "required_status_reporting": False,
                 },
             },
@@ -242,6 +327,7 @@ class PolicyTests(unittest.TestCase):
             "status_reporting_engine_capabilities": {
                 controller_name: {
                     "engine_ref": first_controller(previous)["engine_ref"],
+                    "status_reporting_config": True,
                     "required_status_reporting": False,
                 },
             },
@@ -269,6 +355,7 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, {
             controller_name: {
                 "engine_ref": first_controller(previous)["engine_ref"],
+                "status_reporting_config": True,
                 "required_status_reporting": True,
             },
         }, validation)
@@ -283,6 +370,7 @@ class PolicyTests(unittest.TestCase):
                 "status_reporting_engine_capabilities": {
                     "private-ci-01": {
                         "engine_ref": "1" * 40,
+                        "status_reporting_config": True,
                         "required_status_reporting": False,
                     },
                 },
@@ -301,6 +389,20 @@ class PolicyTests(unittest.TestCase):
             fleet = template / "fleet.json"
             fleet.rename(template / "fleet-target.json")
             fleet.symlink_to("fleet-target.json")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlinked JSON files are forbidden", result.stderr)
+
+    def test_rollout_evidence_cannot_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            evidence = template / "engine-rollout-evidence.json"
+            evidence.rename(template / "evidence-target.json")
+            evidence.symlink_to("evidence-target.json")
             result = subprocess.run([
                 sys.executable, str(template / "scripts" / "validate.py"),
                 "--skip-path-scan",
