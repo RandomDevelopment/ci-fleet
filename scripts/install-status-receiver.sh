@@ -97,6 +97,10 @@ restart_live_service() {
   validate_release "$install_root/releases/$installed"
   ensure_systemd_directory
   if [[ -n "$root" ]]; then
+    if [[ -n ${CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE:-} && -f "$CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE" ]]; then
+      rm -f "$CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE"
+      return 1
+    fi
     printf '%s\n' "$force" >"$root/run/ci-fleet-status-last-restart-force"
     return
   fi
@@ -343,8 +347,6 @@ fi
 validate_release "$release"
 
 if [[ "$existing" == "$ref" ]]; then
-  changed=0
-  [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]] || changed=1
   link_unit
   if [[ -f "$restart_required" ]]; then
     restart_live_service 1
@@ -352,7 +354,7 @@ if [[ "$existing" == "$ref" ]]; then
     echo UPGRADED
     exit
   fi
-  [[ "$changed" == 0 ]] || restart_live_service
+  restart_live_service
   echo NO_CHANGE
   exit
 fi

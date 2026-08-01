@@ -54,7 +54,14 @@ fi
 rm -rf "$root/opt/ci-fleet-status"
 mkdir -p "$root/etc/systemd/system"
 chmod 0750 "$root/etc/systemd/system"
-test "$(run --install --ref "$first")" = INSTALLED
+export CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE=$tmp/fail-reload-once
+: >"$CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE"
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "simulated daemon reload failure was accepted" >&2
+  exit 1
+fi
+test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
+test "$(run --install --ref "$first")" = NO_CHANGE
 assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
