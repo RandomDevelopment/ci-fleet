@@ -80,6 +80,9 @@ assert_systemd_mode
 test -L "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
+printf '%s\n' 1 >"$root/var/lib/ci-fleet-status-installer/restart-required"
+test "$(run --upgrade --ref "$first")" = UPGRADED
+test ! -e "$root/var/lib/ci-fleet-status-installer/restart-required"
 
 printf '\n# dirty\n' >>"$source_tree/scripts/status_auth.py"
 if run --upgrade --ref "$first" >/dev/null 2>&1; then

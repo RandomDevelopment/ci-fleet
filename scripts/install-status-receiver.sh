@@ -337,6 +337,12 @@ if [[ "$existing" == "$ref" ]]; then
   changed=0
   [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]] || changed=1
   link_unit
+  if [[ -f "$restart_required" ]]; then
+    restart_live_service 1
+    rm -f "$restart_required"
+    echo UPGRADED
+    exit
+  fi
   [[ "$changed" == 0 ]] || restart_live_service
   echo NO_CHANGE
   exit
