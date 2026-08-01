@@ -117,6 +117,33 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(refs, {"1" * 40})
         self.assertTrue(any("unique" in error for error in validation.errors), validation.errors)
 
+    def test_rollout_evidence_requires_previous_engine_selection(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "previous.json").write_text(json.dumps(previous), encoding="utf-8")
+            (root / "current.json").write_text(json.dumps(current), encoding="utf-8")
+            (root / "previous-evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_compatible_engine_refs": [],
+            }), encoding="utf-8")
+            (root / "evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_compatible_engine_refs": ["2" * 40],
+            }), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must already be selected", result.stderr)
+
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
         self.assertEqual(errors_for(config), [])

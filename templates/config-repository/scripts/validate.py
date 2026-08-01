@@ -469,8 +469,11 @@ def main() -> int:
     validation = Validation()
     config = load_json(args.config.resolve(), validation)
     evidence = load_json(args.rollout_evidence.resolve(), validation)
-    if evidence is not None:
+    current_compatible_engine_refs = (
         validate_rollout_evidence(evidence, validation)
+        if evidence is not None
+        else set()
+    )
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
@@ -484,13 +487,25 @@ def main() -> int:
                 if args.previous_rollout_evidence
                 else None
             )
-            compatible_engine_refs = (
+            previous_compatible_engine_refs = (
                 validate_rollout_evidence(previous_evidence, validation)
                 if previous_evidence is not None
                 else set()
             )
             if previous is not None:
-                validate_transition(previous, config, compatible_engine_refs, validation)
+                previous_controllers = previous.get("controllers", {}) if isinstance(previous, dict) else {}
+                previous_engine_refs = {
+                    controller.get("engine_ref")
+                    for controller in previous_controllers.values()
+                    if isinstance(controller, dict)
+                } if isinstance(previous_controllers, dict) else set()
+                for ref in current_compatible_engine_refs - previous_compatible_engine_refs:
+                    validation.require(
+                        ref in previous_engine_refs,
+                        "engine-rollout-evidence.json.status_reporting_compatible_engine_refs",
+                        f"{ref} must already be selected in the previous integrated fleet configuration",
+                    )
+                validate_transition(previous, config, previous_compatible_engine_refs, validation)
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)
     elif not args.skip_path_scan:
