@@ -79,7 +79,10 @@ class DesiredStateTests(unittest.TestCase):
 
     def test_status_reporting_requires_engine_capability(self) -> None:
         value = config()
-        value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = True
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": True,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
         with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
             self.render(value, set())
         with tempfile.TemporaryDirectory() as directory:
@@ -96,7 +99,7 @@ class DesiredStateTests(unittest.TestCase):
 
     def test_omitted_status_reporting_accepts_older_engine(self) -> None:
         value = config()
-        del value["controllers"]["example-ci-01"]["status_reporting"]
+        value["controllers"]["example-ci-01"].pop("status_reporting", None)
         environment, metadata = self.render(value, set())
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertFalse(metadata["status_reporting_configured"])
@@ -104,7 +107,10 @@ class DesiredStateTests(unittest.TestCase):
 
     def test_disabled_status_reporting_requires_schema_capability(self) -> None:
         value = config()
-        value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = False
+        value["controllers"]["example-ci-01"]["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
         with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
             self.render(value, set())
         environment, metadata = self.render(value, {"status_reporting_config"})

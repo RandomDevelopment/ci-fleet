@@ -245,7 +245,10 @@ controller["max_runners"] = int(maximum)
 if reporting == "omit":
     controller.pop("status_reporting", None)
 else:
-    controller["status_reporting"]["enabled"] = reporting == "true"
+    controller["status_reporting"] = {
+        "enabled": reporting == "true",
+        "config_file": "/etc/ci-fleet/monitoring.env",
+    }
 value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)

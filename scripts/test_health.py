@@ -466,7 +466,11 @@ class HealthTests(unittest.TestCase):
             os.environ["CI_FLEET_TESTING"] = "1"
             setattr(health, "collect_snapshot", lambda _values: healthy_snapshot())
             try:
-                for contents, mode in (("not-an-env-line\n", 0o600), ("CI_FLEET_HEALTH_STATUS_URL=https://example.invalid/v1/status\n", 0o644)):
+                for contents, mode in (
+                    ("not-an-env-line\n", 0o600),
+                    ("CI_FLEET_HEALTH_STATUS_URL=https://example.invalid/v1/status\n", 0o644),
+                    ("CI_FLEET_HEALTH_DISK_WARN_PERCENT=abc\n", 0o600),
+                ):
                     monitoring.write_text(contents)
                     monitoring.chmod(mode)
                     result = health._local(health.argparse.Namespace(

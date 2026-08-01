@@ -60,11 +60,17 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - an `experimental`, `stable`, or `retiring` lifecycle;
 - the full reviewed ci-fleet commit SHA it runs;
 - a zero managed minimum and reviewed maximum runner capacity;
-- CPU and memory available to each ephemeral runner;
-- whether status reporting is required from the fixed host-local
-  `/etc/ci-fleet/monitoring.env` configuration. Pass
-  `--require-status-reporting` to the initializer to enable it; endpoint and key
-  values never enter Git.
+- CPU and memory available to each ephemeral runner.
+
+`status_reporting` is deliberately omitted from initialized and reference
+configurations. For an existing controller, roll out schema support in two
+separately reviewed, integrated changes: first update only `engine_ref` and prove
+routine reconciliation has activated that engine; only then add the optional
+`status_reporting` object without changing `engine_ref`. Transition validation
+rejects introducing the property in the same change that updates the engine.
+This prevents an older active manager from rejecting the new property before it
+can upgrade itself. Endpoint and key values remain host-local and never enter
+Git.
 
 The controller ID is how a target host selects its declaration. A location is a non-sensitive logical slug such as `primary-site` or `remote-site`, never an address. Runtime-generated configuration and credentials remain host-local.
 

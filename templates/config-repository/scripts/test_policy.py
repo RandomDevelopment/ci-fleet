@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config
+from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_transition
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,17 +76,34 @@ class PolicyTests(unittest.TestCase):
         first_controller(config)["status_reporting"] = None
         self.assert_rejected(config, "must be an object")
 
-    def test_initializer_can_require_host_local_status_reporting(self) -> None:
+    def test_initializer_omits_status_reporting_for_staged_adoption(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fleet.json"
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
-                "--engine-ref", "1" * 40, "--require-status-reporting",
-                "--output", str(output),
+                "--engine-ref", "1" * 40, "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
-            reporting = first_controller(json.loads(output.read_text()))["status_reporting"]
-        self.assertEqual(reporting, {"enabled": True, "config_file": "/etc/ci-fleet/monitoring.env"})
+            controller = first_controller(json.loads(output.read_text()))
+        self.assertNotIn("status_reporting", controller)
+
+    def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        first_controller(current)["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        validation = Validation()
+        validate_transition(previous, current, validation)
+        self.assertTrue(any("later commit" in error for error in validation.errors), validation.errors)
+
+        staged = copy.deepcopy(current)
+        first_controller(staged).pop("status_reporting")
+        validation = Validation()
+        validate_transition(staged, current, validation)
+        self.assertEqual(validation.errors, [])
 
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))

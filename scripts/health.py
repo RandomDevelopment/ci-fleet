@@ -677,12 +677,15 @@ def _local(args: argparse.Namespace) -> int:
     config_invalid = False
     try:
         values.update(load_monitoring_config(args.monitoring_config))
+        thresholds = thresholds_from(values)
     except (OSError, UnicodeError, ValueError):
         if environment.get("CI_FLEET_STATUS_REPORTING_REQUIRED") != "1":
             raise
         config_invalid = True
+        values = environment
+        thresholds = thresholds_from(values)
     snapshot = collect_snapshot(values)
-    report = evaluate(snapshot, thresholds_from(values))
+    report = evaluate(snapshot, thresholds)
     now = int(time.time())
     report["timestamp"] = now
     delivery = 0

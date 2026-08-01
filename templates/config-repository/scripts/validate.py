@@ -404,9 +404,30 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(repository != "example-org/example-app", f"{path}.repository", "replace the example repository before use")
 
 
+def validate_transition(previous: Any, current: Any, validation: Validation) -> None:
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return
+    old_controllers = previous.get("controllers")
+    new_controllers = current.get("controllers")
+    if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
+        return
+    for name in old_controllers.keys() & new_controllers.keys():
+        old = old_controllers[name]
+        new = new_controllers[name]
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            continue
+        if "status_reporting" not in old and "status_reporting" in new:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.status_reporting",
+                "must be introduced in a later commit after the compatible engine_ref is active",
+            )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
+    parser.add_argument("--previous-config", type=Path, help="previous integrated configuration for rollout validation")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
     parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
@@ -423,6 +444,10 @@ def main() -> int:
     if config is not None:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
+        if args.previous_config is not None:
+            previous = load_json(args.previous_config.resolve(), validation)
+            if previous is not None:
+                validate_transition(previous, config, validation)
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)
     elif not args.skip_path_scan:
