@@ -38,6 +38,7 @@ current="$install_root/current"
 unit_target="$current/ci-fleet-status-receiver.service"
 previous="$metadata_root/previous-ref"
 restart_required="$metadata_root/restart-required"
+previous_was_active="$metadata_root/previous-was-active"
 mkdir -p "$root/run/lock"
 lock_directory="$root/run/lock/ci-fleet-status"
 expected_lock_uid=0
@@ -274,11 +275,11 @@ if [[ "$mode" == rollback ]]; then
   validate_release "$install_root/releases/$target"
   ensure_systemd_directory
   force=0
-  [[ -f "$restart_required" ]] && force=1
+  [[ -f "$restart_required" || -f "$previous_was_active" ]] && force=1
   activate "$target" 0
   link_unit
   restart_live_service "$force"
-  rm -f "$restart_required"
+  rm -f "$restart_required" "$previous_was_active"
   echo "ROLLED_BACK $target"
   exit
 fi
@@ -351,10 +352,14 @@ fi
 if [[ "$mode" == upgrade && -z "$root" ]]; then
   if systemctl is-active --quiet ci-fleet-status-receiver.service; then
     write_metadata "$restart_required" 1
+    write_metadata "$previous_was_active" 1
   else
-    rm -f "$restart_required"
+    rm -f "$restart_required" "$previous_was_active"
   fi
+elif [[ "$mode" != upgrade ]]; then
+  rm -f "$restart_required" "$previous_was_active"
 fi
+
 activate "$ref"
 link_unit
 restart_live_service
@@ -362,6 +367,6 @@ rm -f "$restart_required"
 if [[ "$mode" == upgrade ]]; then
   echo UPGRADED
 else
-  rm -f "$restart_required"
+  rm -f "$restart_required" "$previous_was_active"
   echo INSTALLED
 fi
