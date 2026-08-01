@@ -355,6 +355,15 @@ class StatusReceiverTests(unittest.TestCase):
         request = urllib.request.Request(base + "/v1/status", data=body, headers=headers, method="POST")
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 202)
+        submit = self.receiver.submit
+        self.receiver.submit = lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("unavailable"))
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request)
+            self.assertEqual(caught.exception.code, 503)
+            self.assertEqual(json.load(caught.exception), {"error": "unavailable"})
+        finally:
+            self.receiver.submit = submit
         request = urllib.request.Request(base + "/healthz")
         with urllib.request.urlopen(request) as response:
             self.assertEqual(json.load(response), {"status": "ok"})

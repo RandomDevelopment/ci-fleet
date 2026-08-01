@@ -380,6 +380,8 @@ def create_server(bind: str, port: int, receiver: StatusReceiver) -> _BoundedHTT
             except (ValueError, StatusError) as error:
                 failure = error if isinstance(error, StatusError) else StatusError(400, "invalid_request")
                 self.send_json(failure.status, {"error": failure.code})
+            except (OSError, sqlite3.Error):
+                self.send_json(503, {"error": "unavailable"})
 
         def do_GET(self) -> None:
             path = urllib.parse.urlsplit(self.path)
