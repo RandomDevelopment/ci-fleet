@@ -404,28 +404,32 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(repository != "example-org/example-app", f"{path}.repository", "replace the example repository before use")
 
 
-def validate_rollout_evidence(value: Any, validation: Validation) -> set[str]:
+def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, str]:
     if not validation.exact_keys(
         value,
         "engine-rollout-evidence.json",
         {"schema_version", "status_reporting_compatible_engine_refs"},
     ):
-        return set()
+        return {}
     validation.require(value.get("schema_version") == 1, "engine-rollout-evidence.json.schema_version", "must equal 1")
     refs = value.get("status_reporting_compatible_engine_refs")
-    if not isinstance(refs, list):
-        validation.errors.append("engine-rollout-evidence.json.status_reporting_compatible_engine_refs: must be an array")
-        return set()
-    validation.require(len(refs) == len(set(refs)) if all(isinstance(ref, str) for ref in refs) else False, "engine-rollout-evidence.json.status_reporting_compatible_engine_refs", "must contain unique commit SHAs")
-    for index, ref in enumerate(refs):
-        validation.require(isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40, f"engine-rollout-evidence.json.status_reporting_compatible_engine_refs[{index}]", "must be a nonzero full lowercase commit SHA")
-    return {ref for ref in refs if isinstance(ref, str) and COMMIT_SHA.fullmatch(ref) and ref != "0" * 40}
+    if not isinstance(refs, dict):
+        validation.errors.append("engine-rollout-evidence.json.status_reporting_compatible_engine_refs: must be an object mapping controller IDs to commit SHAs")
+        return {}
+    valid: dict[str, str] = {}
+    for controller, ref in refs.items():
+        path = f"engine-rollout-evidence.json.status_reporting_compatible_engine_refs.{controller}"
+        validation.require(bool(SLUG.fullmatch(controller)), path, "controller ID must be a lowercase slug")
+        validation.require(isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40, path, "must be a nonzero full lowercase commit SHA")
+        if SLUG.fullmatch(controller) and isinstance(ref, str) and COMMIT_SHA.fullmatch(ref) and ref != "0" * 40:
+            valid[controller] = ref
+    return valid
 
 
 def validate_transition(
     previous: Any,
     current: Any,
-    compatible_engine_refs: set[str],
+    compatible_engine_refs: dict[str, str],
     validation: Validation,
 ) -> None:
     if not isinstance(previous, dict) or not isinstance(current, dict):
@@ -453,9 +457,9 @@ def validate_transition(
                 "must be introduced in a later commit after the compatible engine_ref is active",
             )
             validation.require(
-                old.get("engine_ref") in compatible_engine_refs,
+                compatible_engine_refs.get(name) == old.get("engine_ref"),
                 f"$.controllers.{name}.status_reporting",
-                "requires reviewed rollout evidence for the already-active compatible engine_ref",
+                "requires reviewed rollout evidence for this controller and its already-active compatible engine_ref",
             )
 
 
@@ -479,7 +483,7 @@ def main() -> int:
     current_compatible_engine_refs = (
         validate_rollout_evidence(evidence, validation)
         if evidence is not None
-        else set()
+        else {}
     )
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
@@ -497,20 +501,18 @@ def main() -> int:
             previous_compatible_engine_refs = (
                 validate_rollout_evidence(previous_evidence, validation)
                 if previous_evidence is not None
-                else set()
+                else {}
             )
             if previous is not None:
                 previous_controllers = previous.get("controllers", {}) if isinstance(previous, dict) else {}
-                previous_engine_refs = {
-                    controller.get("engine_ref")
-                    for controller in previous_controllers.values()
-                    if isinstance(controller, dict)
-                } if isinstance(previous_controllers, dict) else set()
-                for ref in current_compatible_engine_refs - previous_compatible_engine_refs:
+                for controller, ref in current_compatible_engine_refs.items():
+                    if previous_compatible_engine_refs.get(controller) == ref:
+                        continue
+                    previous_controller = previous_controllers.get(controller) if isinstance(previous_controllers, dict) else None
                     validation.require(
-                        ref in previous_engine_refs,
-                        "engine-rollout-evidence.json.status_reporting_compatible_engine_refs",
-                        f"{ref} must already be selected in the previous integrated fleet configuration",
+                        isinstance(previous_controller, dict) and previous_controller.get("engine_ref") == ref,
+                        f"engine-rollout-evidence.json.status_reporting_compatible_engine_refs.{controller}",
+                        f"{ref} must already be selected for this controller in the previous integrated fleet configuration",
                     )
                 validate_transition(previous, config, previous_compatible_engine_refs, validation)
     if args.tree_paths is not None:

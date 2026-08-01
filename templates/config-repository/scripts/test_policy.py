@@ -96,16 +96,17 @@ class PolicyTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         validation = Validation()
-        validate_transition(previous, current, set(), validation)
+        validate_transition(previous, current, {}, validation)
         self.assertTrue(any("later commit" in error for error in validation.errors), validation.errors)
 
         staged = copy.deepcopy(current)
         first_controller(staged).pop("status_reporting")
         validation = Validation()
-        validate_transition(staged, current, set(), validation)
+        validate_transition(staged, current, {}, validation)
         self.assertTrue(any("rollout evidence" in error for error in validation.errors), validation.errors)
         validation = Validation()
-        validate_transition(staged, current, {first_controller(staged)["engine_ref"]}, validation)
+        controller_name = next(iter(staged["controllers"]))
+        validate_transition(staged, current, {controller_name: first_controller(staged)["engine_ref"]}, validation)
         self.assertEqual(validation.errors, [])
 
     def test_new_controller_cannot_introduce_status_reporting(self) -> None:
@@ -119,17 +120,31 @@ class PolicyTests(unittest.TestCase):
         }
         current["controllers"]["example-ci-02"] = controller
         validation = Validation()
-        validate_transition(previous, current, {controller["engine_ref"]}, validation)
+        validate_transition(previous, current, {}, validation)
         self.assertTrue(any("new controller" in error for error in validation.errors), validation.errors)
 
-    def test_rollout_evidence_requires_unique_full_refs(self) -> None:
+    def test_rollout_evidence_is_scoped_to_its_controller(self) -> None:
+        previous = reference_config()
+        second = copy.deepcopy(first_controller(previous))
+        second["scale_set_name"] = "example-ci-02-scale"
+        previous["controllers"]["example-ci-02"] = second
+        current = copy.deepcopy(previous)
+        current["controllers"]["example-ci-02"]["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        validation = Validation()
+        validate_transition(previous, current, {"example-ci-01": second["engine_ref"]}, validation)
+        self.assertTrue(any("for this controller" in error for error in validation.errors), validation.errors)
+
+    def test_rollout_evidence_requires_controller_mapping(self) -> None:
         validation = Validation()
         refs = validate_rollout_evidence({
             "schema_version": 1,
-            "status_reporting_compatible_engine_refs": ["1" * 40, "1" * 40],
+            "status_reporting_compatible_engine_refs": {"example-ci-01": "1" * 40},
         }, validation)
-        self.assertEqual(refs, {"1" * 40})
-        self.assertTrue(any("unique" in error for error in validation.errors), validation.errors)
+        self.assertEqual(refs, {"example-ci-01": "1" * 40})
+        self.assertEqual(validation.errors, [])
 
     def test_rollout_evidence_requires_previous_engine_selection(self) -> None:
         previous = reference_config()
@@ -141,11 +156,11 @@ class PolicyTests(unittest.TestCase):
             (root / "current.json").write_text(json.dumps(current), encoding="utf-8")
             (root / "previous-evidence.json").write_text(json.dumps({
                 "schema_version": 1,
-                "status_reporting_compatible_engine_refs": [],
+                "status_reporting_compatible_engine_refs": {},
             }), encoding="utf-8")
             (root / "evidence.json").write_text(json.dumps({
                 "schema_version": 1,
-                "status_reporting_compatible_engine_refs": ["2" * 40],
+                "status_reporting_compatible_engine_refs": {next(iter(current["controllers"])): "2" * 40},
             }), encoding="utf-8")
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "validate.py"),
