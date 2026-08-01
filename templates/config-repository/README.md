@@ -65,11 +65,13 @@ The initializer refuses to replace a configured file unless `--force` is explici
 `status_reporting` is deliberately omitted from initialized and reference
 configurations. For an existing controller, roll out schema support in three
 separately reviewed, integrated changes: first update only `engine_ref` and prove
-routine reconciliation has activated that engine; then record the controller ID
-and proven active ref in `engine-rollout-evidence.json`; only then add the optional
-`status_reporting` object without changing `engine_ref`. Transition validation rejects
-the property while changing the engine or without reviewed rollout evidence.
-This prevents an older active manager from rejecting the new property before it
+routine reconciliation has activated that engine; then record the controller ID,
+proven active ref, and reviewed reporting capabilities in
+`engine-rollout-evidence.json`; only then add the optional `status_reporting`
+object without changing `engine_ref`. Enabling required delivery also requires the
+prior evidence to record `required_status_reporting: true`. Transition validation
+rejects introducing or enabling the property without the corresponding evidence.
+This staging prevents an older active manager from rejecting the new property before it
 can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
