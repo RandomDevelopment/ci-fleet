@@ -116,33 +116,33 @@ class StatusReceiver:
         if abs(now - generated_at) > self.max_clock_skew_seconds:
             raise StatusError(409, "report_time_stale")
         encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
-        with self._write_lock, closing(self._connect()) as connection, connection:
-            if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
-                raise StatusError(409, "replayed_report")
-            last_attempt = self._last_attempt.get(controller)
-            if last_attempt is not None and now - last_attempt < 1:
-                raise StatusError(429, "submission_too_frequent")
+        with self._write_lock, closing(self._connect()) as connection:
+            with connection:
+                if connection.execute("SELECT 1 FROM nonces WHERE controller=? AND nonce=?", (controller, nonce)).fetchone():
+                    raise StatusError(409, "replayed_report")
+                last_attempt = self._last_attempt.get(controller)
+                if last_attempt is not None and now - last_attempt < 1:
+                    raise StatusError(429, "submission_too_frequent")
+                try:
+                    connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
+                except sqlite3.IntegrityError as error:
+                    raise StatusError(409, "replayed_report") from error
+                last = connection.execute(
+                    "SELECT generated_at, received_at FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1",
+                    (controller,),
+                ).fetchone()
+                if last and generated_at <= last[0]:
+                    raise StatusError(409, "stale_report")
+                if last and now - last[1] < self.min_interval_seconds:
+                    raise StatusError(429, "submission_too_frequent")
+                connection.execute("INSERT INTO reports VALUES (?, ?, ?, ?)", (controller, generated_at, now, encoded))
+                connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
+                connection.execute(
+                    "DELETE FROM reports WHERE controller=? AND rowid NOT IN (SELECT rowid FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?)",
+                    (controller, controller, self.history_limit),
+                )
+                connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
             self._last_attempt[controller] = now
-            try:
-                connection.execute("INSERT INTO nonces VALUES (?, ?, ?)", (controller, nonce, authenticated_at))
-                connection.commit()
-            except sqlite3.IntegrityError as error:
-                raise StatusError(409, "replayed_report") from error
-            last = connection.execute(
-                "SELECT generated_at, received_at FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT 1",
-                (controller,),
-            ).fetchone()
-            if last and generated_at <= last[0]:
-                raise StatusError(409, "stale_report")
-            if last and now - last[1] < self.min_interval_seconds:
-                raise StatusError(429, "submission_too_frequent")
-            connection.execute("INSERT INTO reports VALUES (?, ?, ?, ?)", (controller, generated_at, now, encoded))
-            connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
-            connection.execute(
-                "DELETE FROM reports WHERE controller=? AND rowid NOT IN (SELECT rowid FROM reports WHERE controller=? ORDER BY generated_at DESC LIMIT ?)",
-                (controller, controller, self.history_limit),
-            )
-            connection.execute("DELETE FROM nonces WHERE authenticated_at < ?", (now - self.max_clock_skew_seconds,))
 
     def _expire(self, connection: sqlite3.Connection, now: int) -> None:
         connection.execute("DELETE FROM reports WHERE received_at < ?", (now - self.retention_seconds,))
@@ -298,13 +298,26 @@ class StatusReceiver:
                     self._health_integrity_ok = False
                 self._health_checked_at = now
             if not self._health_integrity_ok:
-                raise sqlite3.DatabaseError("database quick check failed")
-            connection.execute(
-                "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
-            )
-            connection.execute(
-                "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
-            )
+                raise sqlite3.DatabaseError("database health check failed")
+            try:
+                connection.execute(
+                    "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
+                )
+                connection.execute(
+                    "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
+                )
+                connection.execute("SAVEPOINT health_write_probe")
+                try:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO nonces VALUES ('__health__', '00000000000000000000000000000000', 0)"
+                    )
+                finally:
+                    connection.execute("ROLLBACK TO health_write_probe")
+                    connection.execute("RELEASE health_write_probe")
+            except sqlite3.Error:
+                self._health_integrity_ok = False
+                self._health_checked_at = now
+                raise sqlite3.DatabaseError("database health check failed") from None
 
 
 class _BoundedHTTPServer(http.server.ThreadingHTTPServer):
