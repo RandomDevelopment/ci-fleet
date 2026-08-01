@@ -150,15 +150,15 @@ ensure_systemd_directory() {
 }
 
 validate_release() {
-  local release=$1 entry expected name mode
+  local release=$1 entry expected name mode stored_digest actual_digest
   local -a entries=()
   [[ ! -L "$release" && -d "$release" && $(stat -c '%F:%u:%a' "$release") == "directory:$expected_release_uid:755" ]] || {
     echo "unsafe receiver release: $release" >&2
     return 1
   }
   mapfile -d '' entries < <(find "$release" -mindepth 1 -maxdepth 1 -print0)
-  ((${#entries[@]} == 3)) || { echo "unexpected receiver release contents: $release" >&2; return 1; }
-  for expected in status_receiver.py:755 status_auth.py:644 ci-fleet-status-receiver.service:644; do
+  ((${#entries[@]} == 4)) || { echo "unexpected receiver release contents: $release" >&2; return 1; }
+  for expected in status_receiver.py:755 status_auth.py:644 ci-fleet-status-receiver.service:644 .ci-fleet-tree-sha256:644; do
     name=${expected%%:*}
     mode=${expected##*:}
     entry=$release/$name
@@ -167,6 +167,10 @@ validate_release() {
       return 1
     }
   done
+  stored_digest=$(<"$release/.ci-fleet-tree-sha256")
+  [[ "$stored_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid receiver release digest: $release" >&2; return 1; }
+  actual_digest=$(cd "$release" && sha256sum status_receiver.py status_auth.py ci-fleet-status-receiver.service | sha256sum | cut -d' ' -f1)
+  [[ "$actual_digest" == "$stored_digest" ]] || { echo "modified receiver release: $release" >&2; return 1; }
 }
 
 python=/usr/bin/python3
@@ -271,6 +275,9 @@ else
   install -m 0644 "$repo_root/scripts/status_auth.py" "$staging/status_auth.py"
   install -m 0644 "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" \
     "$staging/ci-fleet-status-receiver.service"
+  (cd "$staging" && sha256sum status_receiver.py status_auth.py ci-fleet-status-receiver.service | sha256sum | cut -d' ' -f1) \
+    >"$staging/.ci-fleet-tree-sha256"
+  chmod 0644 "$staging/.ci-fleet-tree-sha256"
   mv -T "$staging" "$release"
   trap - EXIT
 fi

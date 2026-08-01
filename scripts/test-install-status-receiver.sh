@@ -143,6 +143,10 @@ test "$(run --rollback)" = "ROLLED_BACK $first"
 assert_systemd_mode
 
 active="$root/opt/ci-fleet-status/releases/$first"
+printf '\n# modified\n' >>"$active/status_receiver.py"
+if run --check >/dev/null 2>&1; then echo "modified artifact was accepted" >&2; exit 1; fi
+git -C "$source_tree" show "$first:scripts/status_receiver.py" >"$active/status_receiver.py"
+chmod 0755 "$active/status_receiver.py"
 chmod 0664 "$active/status_auth.py"
 if run --check >/dev/null 2>&1; then echo "writable artifact was accepted" >&2; exit 1; fi
 chmod 0644 "$active/status_auth.py"
