@@ -404,7 +404,30 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(repository != "example-org/example-app", f"{path}.repository", "replace the example repository before use")
 
 
-def validate_transition(previous: Any, current: Any, validation: Validation) -> None:
+def validate_rollout_evidence(value: Any, validation: Validation) -> set[str]:
+    if not validation.exact_keys(
+        value,
+        "engine-rollout-evidence.json",
+        {"schema_version", "status_reporting_compatible_engine_refs"},
+    ):
+        return set()
+    validation.require(value.get("schema_version") == 1, "engine-rollout-evidence.json.schema_version", "must equal 1")
+    refs = value.get("status_reporting_compatible_engine_refs")
+    if not isinstance(refs, list):
+        validation.errors.append("engine-rollout-evidence.json.status_reporting_compatible_engine_refs: must be an array")
+        return set()
+    validation.require(len(refs) == len(set(refs)) if all(isinstance(ref, str) for ref in refs) else False, "engine-rollout-evidence.json.status_reporting_compatible_engine_refs", "must contain unique commit SHAs")
+    for index, ref in enumerate(refs):
+        validation.require(isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40, f"engine-rollout-evidence.json.status_reporting_compatible_engine_refs[{index}]", "must be a nonzero full lowercase commit SHA")
+    return {ref for ref in refs if isinstance(ref, str) and COMMIT_SHA.fullmatch(ref) and ref != "0" * 40}
+
+
+def validate_transition(
+    previous: Any,
+    current: Any,
+    compatible_engine_refs: set[str],
+    validation: Validation,
+) -> None:
     if not isinstance(previous, dict) or not isinstance(current, dict):
         return
     old_controllers = previous.get("controllers")
@@ -422,12 +445,19 @@ def validate_transition(previous: Any, current: Any, validation: Validation) -> 
                 f"$.controllers.{name}.status_reporting",
                 "must be introduced in a later commit after the compatible engine_ref is active",
             )
+            validation.require(
+                old.get("engine_ref") in compatible_engine_refs,
+                f"$.controllers.{name}.status_reporting",
+                "requires reviewed rollout evidence for the already-active compatible engine_ref",
+            )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
     parser.add_argument("--previous-config", type=Path, help="previous integrated configuration for rollout validation")
+    parser.add_argument("--rollout-evidence", type=Path, default=ROOT / "engine-rollout-evidence.json")
+    parser.add_argument("--previous-rollout-evidence", type=Path, help="previous integrated rollout evidence")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
     parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
@@ -438,6 +468,9 @@ def main() -> int:
     args = parse_args()
     validation = Validation()
     config = load_json(args.config.resolve(), validation)
+    evidence = load_json(args.rollout_evidence.resolve(), validation)
+    if evidence is not None:
+        validate_rollout_evidence(evidence, validation)
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
@@ -446,8 +479,18 @@ def main() -> int:
         validate_config(config, validation, args.strict)
         if args.previous_config is not None:
             previous = load_json(args.previous_config.resolve(), validation)
+            previous_evidence = (
+                load_json(args.previous_rollout_evidence.resolve(), validation)
+                if args.previous_rollout_evidence
+                else None
+            )
+            compatible_engine_refs = (
+                validate_rollout_evidence(previous_evidence, validation)
+                if previous_evidence is not None
+                else set()
+            )
             if previous is not None:
-                validate_transition(previous, config, validation)
+                validate_transition(previous, config, compatible_engine_refs, validation)
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)
     elif not args.skip_path_scan:

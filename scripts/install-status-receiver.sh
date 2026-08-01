@@ -103,6 +103,7 @@ restart_live_service() {
 }
 
 managed_uid=0
+managed_gid=0
 expected_release_uid=0
 if [[ -n "$root" ]]; then
   [[ ${CI_FLEET_STATUS_TEST_EXPECTED_OWNER:-} =~ ^[0-9]+$ ]] || {
@@ -110,6 +111,7 @@ if [[ -n "$root" ]]; then
     exit 1
   }
   managed_uid=$EUID
+  managed_gid=$(id -g)
   expected_release_uid=$CI_FLEET_STATUS_TEST_EXPECTED_OWNER
 fi
 managed_directory() {
@@ -152,7 +154,7 @@ ensure_systemd_directory() {
 validate_release() {
   local release=$1 entry expected name mode stored_digest actual_digest
   local -a entries=()
-  [[ ! -L "$release" && -d "$release" && $(stat -c '%F:%u:%a' "$release") == "directory:$expected_release_uid:755" ]] || {
+  [[ ! -L "$release" && -d "$release" && $(stat -c '%u:%a' "$release") == "$expected_release_uid:755" ]] || {
     echo "unsafe receiver release: $release" >&2
     return 1
   }
@@ -162,7 +164,7 @@ validate_release() {
     name=${expected%%:*}
     mode=${expected##*:}
     entry=$release/$name
-    [[ ! -L "$entry" && $(stat -c '%F:%u:%a' "$entry" 2>/dev/null) == "regular file:$expected_release_uid:$mode" ]] || {
+    [[ ! -L "$entry" && -f "$entry" && $(stat -c '%u:%a' "$entry" 2>/dev/null) == "$expected_release_uid:$mode" ]] || {
       echo "unsafe receiver artifact: $entry" >&2
       return 1
     }
@@ -181,6 +183,32 @@ validate_service_account() {
   [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ && "$uid" != 0 && "$gid" != 0 && "$gid" == "$group_gid" ]]
   [[ "$home" == /nonexistent && "$shell" == /usr/sbin/nologin ]]
   [[ "$groups" == "$gid" ]] || { echo "ci-fleet-status has unexpected supplementary groups" >&2; return 1; }
+}
+
+ensure_owned_directory() {
+  local path=$1 uid=$2 gid=$3 expected_mode=$4 create=${5:-0}
+  if [[ -L "$path" ]]; then
+    echo "unsafe receiver directory: $path" >&2
+    return 1
+  elif [[ ! -e "$path" ]]; then
+    [[ "$create" == 1 ]] || { echo "receiver directory is missing: $path" >&2; return 1; }
+    if [[ -z "$root" ]]; then
+      install -d -o "$uid" -g "$gid" -m "$expected_mode" "$path"
+    else
+      install -d -m "$expected_mode" "$path"
+    fi
+  fi
+  [[ -d "$path" && $(stat -c '%u:%g:%a' "$path") == "$uid:$gid:$expected_mode" ]] || {
+    echo "unsafe receiver directory: $path" >&2
+    return 1
+  }
+}
+
+validate_runtime_directories() {
+  local create=${1:-0}
+  ensure_owned_directory "$state_root" "$service_uid" "$service_gid" 700 "$create"
+  ensure_owned_directory "$config_root" "$service_uid" "$service_gid" 700 "$create"
+  ensure_owned_directory "$metadata_root" "$managed_uid" "$managed_gid" 700 "$create"
 }
 
 python=/usr/bin/python3
@@ -213,6 +241,8 @@ else
   managed_directory "$install_root/releases" || { echo "status receiver is not installed" >&2; exit 1; }
 fi
 
+service_uid=$managed_uid
+service_gid=$managed_gid
 if [[ -n ${CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS:-} ]]; then
   validate_service_account 'ci-fleet-status:x:12345:12345::/nonexistent:/usr/sbin/nologin' \
     'ci-fleet-status:x:12345:' "$CI_FLEET_STATUS_TEST_ACCOUNT_GROUPS"
@@ -220,6 +250,12 @@ elif [[ -z "$root" && ("$mode" == check || "$mode" == rollback) ]]; then
   passwd_record=$(getent passwd ci-fleet-status) || { echo "ci-fleet-status account is missing" >&2; exit 1; }
   group_record=$(getent group ci-fleet-status) || { echo "ci-fleet-status group is missing" >&2; exit 1; }
   validate_service_account "$passwd_record" "$group_record" "$(id -G ci-fleet-status)"
+  service_uid=$(id -u ci-fleet-status)
+  service_gid=$(id -g ci-fleet-status)
+fi
+
+if [[ "$mode" == check || "$mode" == rollback ]]; then
+  validate_runtime_directories
 fi
 
 if [[ "$mode" == check ]]; then
@@ -264,11 +300,10 @@ if [[ -z "$root" ]]; then
   getent passwd ci-fleet-status >/dev/null || \
     useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin ci-fleet-status
   validate_service_account "$(getent passwd ci-fleet-status)" "$(getent group ci-fleet-status)" "$(id -G ci-fleet-status)"
-  install -d -o ci-fleet-status -g ci-fleet-status -m 0700 "$state_root" "$config_root"
-  install -d -o root -g root -m 0700 "$metadata_root"
-else
-  install -d -m 0700 "$state_root" "$config_root" "$metadata_root"
+  service_uid=$(id -u ci-fleet-status)
+  service_gid=$(id -g ci-fleet-status)
 fi
+validate_runtime_directories 1
 ensure_systemd_directory
 existing=$(current_ref || true)
 if [[ "$mode" == install && -n "$existing" && "$existing" != "$ref" ]]; then

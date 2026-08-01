@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_transition
+from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_rollout_evidence, validate_transition
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,14 +96,26 @@ class PolicyTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         validation = Validation()
-        validate_transition(previous, current, validation)
+        validate_transition(previous, current, set(), validation)
         self.assertTrue(any("later commit" in error for error in validation.errors), validation.errors)
 
         staged = copy.deepcopy(current)
         first_controller(staged).pop("status_reporting")
         validation = Validation()
-        validate_transition(staged, current, validation)
+        validate_transition(staged, current, set(), validation)
+        self.assertTrue(any("rollout evidence" in error for error in validation.errors), validation.errors)
+        validation = Validation()
+        validate_transition(staged, current, {first_controller(staged)["engine_ref"]}, validation)
         self.assertEqual(validation.errors, [])
+
+    def test_rollout_evidence_requires_unique_full_refs(self) -> None:
+        validation = Validation()
+        refs = validate_rollout_evidence({
+            "schema_version": 1,
+            "status_reporting_compatible_engine_refs": ["1" * 40, "1" * 40],
+        }, validation)
+        self.assertEqual(refs, {"1" * 40})
+        self.assertTrue(any("unique" in error for error in validation.errors), validation.errors)
 
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))

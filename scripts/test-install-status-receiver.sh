@@ -170,6 +170,20 @@ if CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER="$(id -u)" \
   echo "service account supplementary groups were accepted" >&2
   exit 1
 fi
+for directory in "$root/etc/ci-fleet-status" "$root/var/lib/ci-fleet-status"; do
+  mv "$directory" "$directory.real"
+  ln -s "${directory##*/}.real" "$directory"
+  if run --check >/dev/null 2>&1; then
+    echo "symlinked receiver directory was accepted: $directory" >&2
+    exit 1
+  fi
+  rm "$directory"
+  mv "$directory.real" "$directory"
+done
+if grep -F '%F' "$source_tree/scripts/install-status-receiver.sh" >/dev/null; then
+  echo "locale-dependent stat file types remain" >&2
+  exit 1
+fi
 
 grep -F -- '--bind 127.0.0.1' "$unit" >/dev/null
 grep -F 'User=ci-fleet-status' "$unit" >/dev/null
