@@ -96,7 +96,10 @@ restart_live_service() {
   installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
   validate_release "$install_root/releases/$installed"
   ensure_systemd_directory
-  [[ -n "$root" ]] && return
+  if [[ -n "$root" ]]; then
+    printf '%s\n' "$force" >"$root/run/ci-fleet-status-last-restart-force"
+    return
+  fi
   systemctl daemon-reload
   if [[ "$force" == 1 ]] || systemctl is-active --quiet ci-fleet-status-receiver.service; then
     systemctl restart ci-fleet-status-receiver.service
@@ -362,7 +365,9 @@ fi
 
 activate "$ref"
 link_unit
-restart_live_service
+force=0
+[[ -f "$restart_required" ]] && force=1
+restart_live_service "$force"
 rm -f "$restart_required"
 if [[ "$mode" == upgrade ]]; then
   echo UPGRADED

@@ -130,6 +130,7 @@ printf '%s\n' 1 >"$root/var/lib/ci-fleet-status-installer/restart-required"
 test "$(run --upgrade --ref "$second")" = UPGRADED
 test ! -e "$root/var/lib/ci-fleet-status-installer/restart-required"
 test -e "$root/var/lib/ci-fleet-status-installer/previous-was-active"
+test "$(cat "$root/run/ci-fleet-status-last-restart-force")" = 1
 assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$second"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
