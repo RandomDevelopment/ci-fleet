@@ -12,6 +12,7 @@ from pathlib import Path
 from desired_state import (
     DesiredStateError,
     build_rendered_env,
+    load_engine_capabilities,
     load_and_validate_config,
     parse_env,
     validate_host_values,
@@ -36,7 +37,7 @@ def host_values() -> dict[str, str]:
 
 
 class DesiredStateTests(unittest.TestCase):
-    def render(self, value: dict | None = None):
+    def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
             value or config(),
             "example-ci-01",
@@ -44,6 +45,7 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
+            engine_capabilities=capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -60,7 +62,7 @@ class DesiredStateTests(unittest.TestCase):
             "enabled": True,
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
-        environment, _ = self.render(value)
+        environment, _ = self.render(value, {"required_status_reporting"})
         self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
         value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
         with tempfile.TemporaryDirectory() as directory:
@@ -74,6 +76,27 @@ class DesiredStateTests(unittest.TestCase):
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(DesiredStateError, "must be an object"):
                 load_and_validate_config(path)
+
+    def test_status_reporting_requires_engine_capability(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = True
+        with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
+            self.render(value)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "engine-capabilities.json"
+            manifest.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "malformed"):
+                load_engine_capabilities(manifest)
+            manifest.unlink()
+            with self.assertRaisesRegex(DesiredStateError, "missing"):
+                load_engine_capabilities(manifest)
+
+    def test_disabled_status_reporting_accepts_older_engine(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["status_reporting"]["enabled"] = False
+        environment, metadata = self.render(value)
+        self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
+        self.assertFalse(metadata["status_reporting_required"])
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

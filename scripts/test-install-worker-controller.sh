@@ -229,11 +229,11 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" <<'PY'
 import json
 import sys
-source, target, engine_ref, state, maximum, budget = sys.argv[1:]
+source, target, engine_ref, state, maximum, budget, reporting = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
@@ -242,6 +242,7 @@ controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)
+controller["status_reporting"]["enabled"] = reporting == "true"
 value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)
@@ -435,6 +436,10 @@ printf '\n# tampered runtime fixture\n' >>"$active_release/scripts/preflight.sh"
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 if grep -Fq 'tampered runtime fixture' "$active_release/scripts/preflight.sh"; then fail 'modified runtime release was reused'; fi
+printf '{"schema_version":1,"capabilities":null}\n' >"$active_release/engine-capabilities.json"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" >/dev/null || fail 'engine capability declaration was not repaired'
 rm -f "$active_release/deploy/compose.yaml"
 export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
 : >"$FAKE_FAIL_TAR_ONCE"
@@ -646,6 +651,8 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 
 # Public pre-health engine fixture; do not depend on a local remote-tracking ref.
 legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
+legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true)
+expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
 legacy_ref=$(write_config active 1 1 "$legacy_engine_ref")
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}

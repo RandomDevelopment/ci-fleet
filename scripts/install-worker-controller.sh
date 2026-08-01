@@ -254,10 +254,42 @@ docker_gid() {
   stat -c '%g' /var/run/docker.sock
 }
 
+select_engine() {
+  local -a selected
+  mapfile -t selected < <(python3 "$repo_root/scripts/desired_state.py" engine \
+    --config "$candidate_config" --controller "$controller_id")
+  [[ ${#selected[@]} == 2 ]] || die 'selected engine metadata is incomplete'
+  engine_ref=${selected[0]}
+  engine_repository=${selected[1]}
+  [[ "$engine_repository" == RandomDevelopment/ci-fleet ]] || die 'delivery engine repository is not the fixed reviewed public engine'
+  release_dir=$releases_dir/$engine_ref
+}
+
+prepare_engine_capabilities() {
+  local checkout resolved manifest_mode
+  engine_capabilities=$temporary/engine-capabilities.json
+  if is_git_checkout "$repo_root" && git -C "$repo_root" cat-file -e "$engine_ref^{commit}" 2>/dev/null; then
+    manifest_mode=$(git -C "$repo_root" ls-tree "$engine_ref" -- engine-capabilities.json | awk '{print $1}')
+    [[ "$manifest_mode" == 100644 ]] || { rm -f "$engine_capabilities"; return; }
+    git -C "$repo_root" show "$engine_ref:engine-capabilities.json" >"$engine_capabilities" 2>/dev/null || rm -f "$engine_capabilities"
+    return
+  fi
+  checkout=$temporary/engine-capabilities-repository
+  git init -q "$checkout"
+  git -C "$checkout" remote add origin "https://github.com/${engine_repository}.git"
+  GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$engine_ref" || die 'pinned ci-fleet engine commit could not be fetched for capability validation'
+  resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
+  [[ "$resolved" == "$engine_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
+  manifest_mode=$(git -C "$checkout" ls-tree FETCH_HEAD -- engine-capabilities.json | awk '{print $1}')
+  [[ "$manifest_mode" == 100644 ]] || { rm -f "$engine_capabilities"; return; }
+  git -C "$checkout" show "FETCH_HEAD:engine-capabilities.json" >"$engine_capabilities" 2>/dev/null || rm -f "$engine_capabilities"
+}
+
 render_candidate() {
-  local -a metadata_values
+  local -a metadata_values capability_args=()
   candidate_env=$temporary/ci-fleet.env
   candidate_metadata=$temporary/metadata.json
+  [[ ! -f "$engine_capabilities" ]] || capability_args=(--engine-capabilities "$engine_capabilities")
   python3 "$repo_root/scripts/desired_state.py" render \
     --config "$candidate_config" \
     --controller "$controller_id" \
@@ -265,6 +297,7 @@ render_candidate() {
     --config-repository "$config_identity" \
     --config-ref "$config_ref" \
     --docker-gid "$(docker_gid)" \
+    "${capability_args[@]}" \
     --output "$candidate_env" \
     --metadata-output "$candidate_metadata"
   mapfile -t metadata_values < <(python3 - "$candidate_metadata" <<'PY'
@@ -273,14 +306,13 @@ import sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 for key in ("controller_state", "engine_ref", "engine_repository"):
     print(value[key])
+print(1 if value["status_reporting_required"] else 0)
 PY
   )
-  [[ ${#metadata_values[@]} == 3 ]] || die 'rendered controller metadata is incomplete'
+  [[ ${#metadata_values[@]} == 4 ]] || die 'rendered controller metadata is incomplete'
   target_state=${metadata_values[0]}
-  engine_ref=${metadata_values[1]}
-  engine_repository=${metadata_values[2]}
-  [[ "$engine_repository" == RandomDevelopment/ci-fleet ]] || die 'delivery engine repository is not the fixed reviewed public engine'
-  release_dir=$releases_dir/$engine_ref
+  [[ ${metadata_values[1]} == "$engine_ref" && ${metadata_values[2]} == "$engine_repository" ]] || die 'rendered engine metadata changed during validation'
+  status_reporting_required=${metadata_values[3]}
 }
 
 compose() {
@@ -432,9 +464,16 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 marker required stored_digest actual_digest
+  local path=$1 expected=$2 require_status=${3:-0} marker required stored_digest actual_digest
+  local -a capability_args=()
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
+  if [[ -e "$path/engine-capabilities.json" || "$require_status" == 1 ]]; then
+    [[ ! -L "$path/engine-capabilities.json" && -f "$path/engine-capabilities.json" ]] || return 1
+    [[ "$require_status" != 1 ]] || capability_args=(--require-status-reporting)
+    python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
+      --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
+  fi
   if grep -Fq 'scripts/health.py' "$path/scripts/healthcheck.sh"; then
     [[ -f "$path/scripts/health.py" ]] || return 1
     if grep -Fq 'build_status_report' "$path/scripts/health.py"; then
@@ -453,8 +492,8 @@ runtime_release_complete() {
 }
 
 manager_release_complete() {
-  local path=$1 expected=$2 marker required unit
-  runtime_release_complete "$path" "$expected" || return 1
+  local path=$1 expected=$2 require_status=${3:-0} marker required unit
+  runtime_release_complete "$path" "$expected" "$require_status" || return 1
   [[ -x "$path/scripts/install-worker-controller.sh" && -x "$path/scripts/check-installed-state.sh" ]] || return 1
   for required in scripts/desired_state.py scripts/scan_committed_secrets.py templates/config-repository/fleet.schema.json templates/config-repository/scripts/validate.py; do
     [[ -f "$path/$required" ]] || return 1
@@ -466,7 +505,7 @@ manager_release_complete() {
 }
 
 release_matches() {
-  runtime_release_complete "$release_dir" "$engine_ref" || return 1
+  runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" || return 1
   [[ -L "$current_link" ]] || return 1
   [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
 }
@@ -485,7 +524,7 @@ managed_images_match() {
 systemd_matches() {
   local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
-  manager_release_complete "$expected_manager" "$engine_ref" || return 1
+  manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" || return 1
   [[ -L "$manager_current" ]] || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
@@ -550,7 +589,7 @@ PY
 
 install_release() {
   local archive checkout resolved staged_release
-  if runtime_release_complete "$release_dir" "$engine_ref"; then
+  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required"; then
     return
   fi
   install -d -m 0755 "$releases_dir"
@@ -575,7 +614,7 @@ install_release() {
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
   chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
-  runtime_release_complete "$staged_release" "$engine_ref" || die 'staged engine release is incomplete'
+  runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" || die 'staged engine release is incomplete'
   atomic_replace_directory "$staged_release" "$release_dir"
 }
 
@@ -583,9 +622,9 @@ install_manager() {
   local manager_commit manager_release archive staged_manager
   manager_commit=$engine_ref
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
-  runtime_release_complete "$release_dir" "$manager_commit" || die 'desired engine release is unavailable for installer manager activation'
+  runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
-  if ! manager_release_complete "$manager_release" "$manager_commit"; then
+  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     tar -cf "$archive" -C "$release_dir" .
@@ -595,7 +634,7 @@ install_manager() {
     tar -xf "$archive" -C "$staged_manager"
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    manager_release_complete "$staged_manager" "$manager_commit" || die 'staged installer manager release is incomplete'
+    manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" || die 'staged installer manager release is incomplete'
     atomic_replace_directory "$staged_manager" "$manager_release"
   fi
   install -d -m 0755 "$manager_root"
@@ -1058,6 +1097,8 @@ case "$mode" in
     validate_candidate_config_commit
     prepare_host_config
     verify_host_files
+    select_engine
+    prepare_engine_capabilities
     render_candidate
     if [[ "$mode" == check ]]; then perform_check; else perform_converge; fi
     ;;

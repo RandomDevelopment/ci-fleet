@@ -70,13 +70,17 @@ write_metadata() {
 }
 
 link_unit() {
+  local installed
+  installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
+  validate_release "$install_root/releases/$installed"
+  ensure_systemd_directory
   ln -sfn "$unit_target" "$unit_path.new"
   mv -Tf "$unit_path.new" "$unit_path"
 }
 
 activate() {
   local target=$1 record_previous=${2:-1} old=
-  [[ -d "$install_root/releases/$target" ]] || { echo "release not installed: $target" >&2; exit 1; }
+  validate_release "$install_root/releases/$target" || { echo "release not installed safely: $target" >&2; exit 1; }
   old=$(current_ref || true)
   if [[ "$record_previous" == 1 && -n "$old" && "$old" != "$target" ]]; then
     write_metadata "$previous" "$old"
@@ -87,6 +91,10 @@ activate() {
 
 restart_live_service() {
   local force=${1:-0}
+  local installed
+  installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
+  validate_release "$install_root/releases/$installed"
+  ensure_systemd_directory
   [[ -n "$root" ]] && return
   systemctl daemon-reload
   if [[ "$force" == 1 ]] || systemctl is-active --quiet ci-fleet-status-receiver.service; then
@@ -95,7 +103,15 @@ restart_live_service() {
 }
 
 managed_uid=0
-[[ -z "$root" ]] || managed_uid=$EUID
+expected_release_uid=0
+if [[ -n "$root" ]]; then
+  [[ ${CI_FLEET_STATUS_TEST_EXPECTED_OWNER:-} =~ ^[0-9]+$ ]] || {
+    echo "test mode requires CI_FLEET_STATUS_TEST_EXPECTED_OWNER" >&2
+    exit 1
+  }
+  managed_uid=$EUID
+  expected_release_uid=$CI_FLEET_STATUS_TEST_EXPECTED_OWNER
+fi
 managed_directory() {
   local path=$1 create=${2:-0}
   if [[ -L "$path" ]]; then
@@ -112,6 +128,45 @@ managed_directory() {
   else
     return 1
   fi
+}
+
+ensure_systemd_directory() {
+  local path mode owner
+  path=$(dirname "$unit_path")
+  if [[ -L "$path" ]]; then
+    echo "unsafe systemd directory: $path" >&2
+    exit 1
+  elif [[ ! -e "$path" ]]; then
+    [[ "$test_mode" == 1 ]] || { echo "systemd directory is missing: $path" >&2; exit 1; }
+    install -d -m 0755 "$path"
+  fi
+  [[ -d "$path" ]] || { echo "unsafe systemd directory: $path" >&2; exit 1; }
+  owner=$(stat -c %u "$path")
+  mode=$(stat -c %a "$path")
+  [[ "$owner" == "$managed_uid" && $((8#$mode & 0300)) == $((8#0300)) && $((8#$mode & 022)) == 0 ]] || {
+    echo "unsafe systemd directory: $path" >&2
+    exit 1
+  }
+}
+
+validate_release() {
+  local release=$1 entry expected name mode
+  local -a entries=()
+  [[ ! -L "$release" && -d "$release" && $(stat -c '%F:%u:%a' "$release") == "directory:$expected_release_uid:755" ]] || {
+    echo "unsafe receiver release: $release" >&2
+    return 1
+  }
+  mapfile -d '' entries < <(find "$release" -mindepth 1 -maxdepth 1 -print0)
+  ((${#entries[@]} == 3)) || { echo "unexpected receiver release contents: $release" >&2; return 1; }
+  for expected in status_receiver.py:755 status_auth.py:644 ci-fleet-status-receiver.service:644; do
+    name=${expected%%:*}
+    mode=${expected##*:}
+    entry=$release/$name
+    [[ ! -L "$entry" && $(stat -c '%F:%u:%a' "$entry" 2>/dev/null) == "regular file:$expected_release_uid:$mode" ]] || {
+      echo "unsafe receiver artifact: $entry" >&2
+      return 1
+    }
+  done
 }
 
 python=/usr/bin/python3
@@ -146,7 +201,8 @@ fi
 
 if [[ "$mode" == check ]]; then
   installed=$(current_ref) || { echo "receiver is not installed" >&2; exit 1; }
-  [[ -x "$current/status_receiver.py" && -r "$current/status_auth.py" ]]
+  validate_release "$install_root/releases/$installed"
+  ensure_systemd_directory
   [[ -L "$unit_path" && $(readlink "$unit_path") == "$unit_target" ]]
   echo "CHECK_OK $installed"
   exit
@@ -156,6 +212,8 @@ if [[ "$mode" == rollback ]]; then
   [[ -s "$previous" ]] || { echo "no rollback release recorded" >&2; exit 1; }
   target=$(<"$previous")
   [[ "$target" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid rollback release" >&2; exit 1; }
+  validate_release "$install_root/releases/$target"
+  ensure_systemd_directory
   force=0
   [[ -f "$restart_required" ]] && force=1
   activate "$target" 0
@@ -192,7 +250,7 @@ if [[ -z "$root" ]]; then
 else
   install -d -m 0700 "$state_root" "$config_root" "$metadata_root"
 fi
-install -d -m 0755 "$(dirname "$unit_path")"
+ensure_systemd_directory
 existing=$(current_ref || true)
 if [[ "$mode" == install && -n "$existing" && "$existing" != "$ref" ]]; then
   echo "use --upgrade to change an active release" >&2
@@ -200,6 +258,7 @@ if [[ "$mode" == install && -n "$existing" && "$existing" != "$ref" ]]; then
 fi
 release="$install_root/releases/$ref"
 if [[ -d "$release" ]]; then
+  validate_release "$release"
   cmp -s "$repo_root/scripts/status_receiver.py" "$release/status_receiver.py"
   cmp -s "$repo_root/scripts/status_auth.py" "$release/status_auth.py"
   cmp -s "$repo_root/deploy/status-receiver/ci-fleet-status-receiver.service" \
@@ -215,6 +274,7 @@ else
   mv -T "$staging" "$release"
   trap - EXIT
 fi
+validate_release "$release"
 
 if [[ "$existing" == "$ref" ]]; then
   changed=0

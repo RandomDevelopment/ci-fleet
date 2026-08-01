@@ -25,9 +25,11 @@ git -C "$source_tree" commit -qm initial
 first=$(git -C "$source_tree" rev-parse HEAD)
 
 run() {
-  CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_ROOT="$root" \
+  CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER="$(id -u)" CI_FLEET_STATUS_ROOT="$root" \
     "$source_tree/scripts/install-status-receiver.sh" "$@"
 }
+
+assert_systemd_mode() { test "$(stat -c %a "$root/etc/systemd/system")" = 750; }
 
 if CI_FLEET_STATUS_ROOT="$root" "$source_tree/scripts/install-status-receiver.sh" --check >/dev/null 2>&1; then
   echo "alternate root accepted without explicit test mode" >&2
@@ -50,7 +52,10 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   exit 1
 fi
 rm -rf "$root/opt/ci-fleet-status"
+mkdir -p "$root/etc/systemd/system"
+chmod 0750 "$root/etc/systemd/system"
 test "$(run --install --ref "$first")" = INSTALLED
+assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
 external="$tmp/external/$first"
@@ -62,6 +67,7 @@ if run --check >/dev/null 2>&1; then
   exit 1
 fi
 test "$(run --install --ref "$first")" = INSTALLED
+assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test "$(stat -c %a "$root/var/lib/ci-fleet-status")" = 700
 test "$(stat -c %a "$root/run/lock")" = 1777
@@ -70,6 +76,7 @@ cp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" "$tmp/
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 printf '%s\n' 'ExecStart=python3 --bind 127.0.0.1' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --install --ref "$first")" = NO_CHANGE
+assert_systemd_mode
 test -L "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
@@ -115,21 +122,41 @@ if run --install --ref "$second" >/dev/null 2>&1; then
   exit 1
 fi
 test "$(run --upgrade --ref "$second")" = UPGRADED
+assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$second"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
 test "$(stat -c %a "$root/var/lib/ci-fleet-status-installer")" = 700
 cmp "$source_tree/deploy/status-receiver/ci-fleet-status-receiver.service" \
   "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --check)" = "CHECK_OK $second"
+assert_systemd_mode
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 printf '%s\n' drift >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --rollback)" = "ROLLED_BACK $first"
+assert_systemd_mode
 test -L "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test "$(cat "$root/var/lib/ci-fleet-status-installer/previous-ref")" = "$first"
 cmp "$tmp/first-unit" "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 test "$(run --upgrade --ref "$second")" = UPGRADED
 test "$(run --rollback)" = "ROLLED_BACK $first"
+assert_systemd_mode
+
+active="$root/opt/ci-fleet-status/releases/$first"
+chmod 0664 "$active/status_auth.py"
+if run --check >/dev/null 2>&1; then echo "writable artifact was accepted" >&2; exit 1; fi
+chmod 0644 "$active/status_auth.py"
+mv "$active/status_auth.py" "$tmp/status_auth.py.real"
+ln -s "$tmp/status_auth.py.real" "$active/status_auth.py"
+if run --rollback >/dev/null 2>&1; then echo "symlinked artifact was accepted" >&2; exit 1; fi
+rm "$active/status_auth.py"
+mv "$tmp/status_auth.py.real" "$active/status_auth.py"
+if CI_FLEET_STATUS_TEST_MODE=1 CI_FLEET_STATUS_TEST_EXPECTED_OWNER=99999 CI_FLEET_STATUS_ROOT="$root" \
+  "$source_tree/scripts/install-status-receiver.sh" --check >/dev/null 2>&1; then
+  echo "service-owned release directory was accepted" >&2
+  exit 1
+fi
+test "$(run --check)" = "CHECK_OK $first"
 
 grep -F -- '--bind 127.0.0.1' "$unit" >/dev/null
 grep -F 'User=ci-fleet-status' "$unit" >/dev/null

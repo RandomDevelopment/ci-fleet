@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "capabilities": {
+    "required_status_reporting": true
+  }
+}
