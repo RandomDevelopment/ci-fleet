@@ -87,6 +87,9 @@ class DesiredStateTests(unittest.TestCase):
             manifest.write_text("not json", encoding="utf-8")
             with self.assertRaisesRegex(DesiredStateError, "malformed"):
                 load_engine_capabilities(manifest)
+            manifest.write_text('{"schema_version":1,"schema_version":1,"capabilities":{}}', encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "malformed"):
+                load_engine_capabilities(manifest)
             manifest.unlink()
             with self.assertRaisesRegex(DesiredStateError, "missing"):
                 load_engine_capabilities(manifest)
