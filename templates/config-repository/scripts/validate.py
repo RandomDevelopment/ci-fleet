@@ -467,7 +467,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "fleet.json", help="configuration file to validate")
     parser.add_argument("--previous-config", type=Path, help="previous integrated configuration for rollout validation")
-    parser.add_argument("--rollout-evidence", type=Path, default=ROOT / "engine-rollout-evidence.json")
+    parser.add_argument("--rollout-evidence", type=Path, help="rollout evidence file (defaults to engine-rollout-evidence.json only for the default fleet.json)")
     parser.add_argument("--previous-rollout-evidence", type=Path, help="previous integrated rollout evidence")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
@@ -478,8 +478,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     validation = Validation()
-    config = load_json(args.config.resolve(), validation)
-    evidence = load_json(args.rollout_evidence.resolve(), validation)
+    config_path = args.config.resolve()
+    config = load_json(config_path, validation)
+    evidence_path = args.rollout_evidence.resolve() if args.rollout_evidence else None
+    if evidence_path is None and config_path == ROOT / "fleet.json":
+        evidence_path = ROOT / "engine-rollout-evidence.json"
+    evidence = load_json(evidence_path, validation) if evidence_path is not None else None
     current_compatible_engine_refs = (
         validate_rollout_evidence(evidence, validation)
         if evidence is not None

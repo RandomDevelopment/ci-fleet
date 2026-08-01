@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -202,6 +203,21 @@ class PolicyTests(unittest.TestCase):
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must match the current controller engine_ref", result.stderr)
+
+    def test_alternate_config_does_not_use_fleet_rollout_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory) / "template"
+            shutil.copytree(ROOT, template)
+            (template / "engine-rollout-evidence.json").write_text(json.dumps({
+                "schema_version": 1,
+                "status_reporting_compatible_engine_refs": {"private-ci-01": "1" * 40},
+            }), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(template / "scripts" / "validate.py"),
+                "--config", str(template / "examples" / "multi-host" / "fleet.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_multi_host_multi_location_configuration_is_valid(self) -> None:
         config = json.loads((ROOT / "examples" / "multi-host" / "fleet.json").read_text(encoding="utf-8"))
