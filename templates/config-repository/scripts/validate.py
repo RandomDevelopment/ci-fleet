@@ -434,10 +434,17 @@ def validate_transition(
     new_controllers = current.get("controllers")
     if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
         return
-    for name in old_controllers.keys() & new_controllers.keys():
-        old = old_controllers[name]
-        new = new_controllers[name]
-        if not isinstance(old, dict) or not isinstance(new, dict):
+    for name, new in new_controllers.items():
+        old = old_controllers.get(name)
+        if not isinstance(new, dict):
+            continue
+        if name not in old_controllers:
+            if "status_reporting" in new:
+                validation.errors.append(
+                    f"$.controllers.{name}.status_reporting: must be omitted from a new controller until its engine rollout is proven"
+                )
+            continue
+        if not isinstance(old, dict):
             continue
         if "status_reporting" not in old and "status_reporting" in new:
             validation.require(

@@ -108,6 +108,20 @@ class PolicyTests(unittest.TestCase):
         validate_transition(staged, current, {first_controller(staged)["engine_ref"]}, validation)
         self.assertEqual(validation.errors, [])
 
+    def test_new_controller_cannot_introduce_status_reporting(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        controller = copy.deepcopy(first_controller(current))
+        controller["scale_set_name"] = "example-ci-02-scale"
+        controller["status_reporting"] = {
+            "enabled": False,
+            "config_file": "/etc/ci-fleet/monitoring.env",
+        }
+        current["controllers"]["example-ci-02"] = controller
+        validation = Validation()
+        validate_transition(previous, current, {controller["engine_ref"]}, validation)
+        self.assertTrue(any("new controller" in error for error in validation.errors), validation.errors)
+
     def test_rollout_evidence_requires_unique_full_refs(self) -> None:
         validation = Validation()
         refs = validate_rollout_evidence({
