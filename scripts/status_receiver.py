@@ -79,6 +79,9 @@ class StatusReceiver:
                     authenticated_at INTEGER NOT NULL,
                     PRIMARY KEY (controller, nonce)
                 );
+                CREATE TABLE IF NOT EXISTS health_write_probe (
+                    checked_at INTEGER NOT NULL
+                );
             """)
         os.chmod(self.database, 0o600)
         self.expire()
@@ -293,31 +296,26 @@ class StatusReceiver:
             now = self._monotonic()
             if now - self._health_checked_at >= 60:
                 try:
-                    self._health_integrity_ok = connection.execute("PRAGMA quick_check(1)").fetchone() == ("ok",)
+                    if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
+                        raise sqlite3.DatabaseError("database health check failed")
+                    connection.execute(
+                        "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
+                    )
+                    connection.execute(
+                        "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
+                    )
+                    connection.execute("INSERT INTO health_write_probe VALUES (?)", (int(self._clock()),))
+                    connection.commit()
+                    connection.execute("DELETE FROM health_write_probe")
+                    connection.commit()
                 except sqlite3.Error:
                     self._health_integrity_ok = False
+                    self._health_checked_at = now
+                    raise sqlite3.DatabaseError("database health check failed") from None
+                self._health_integrity_ok = True
                 self._health_checked_at = now
             if not self._health_integrity_ok:
                 raise sqlite3.DatabaseError("database health check failed")
-            try:
-                connection.execute(
-                    "SELECT controller, generated_at, received_at, payload FROM reports LIMIT 0"
-                )
-                connection.execute(
-                    "SELECT controller, nonce, authenticated_at FROM nonces LIMIT 0"
-                )
-                connection.execute("SAVEPOINT health_write_probe")
-                try:
-                    connection.execute(
-                        "INSERT OR REPLACE INTO nonces VALUES ('__health__', '00000000000000000000000000000000', 0)"
-                    )
-                finally:
-                    connection.execute("ROLLBACK TO health_write_probe")
-                    connection.execute("RELEASE health_write_probe")
-            except sqlite3.Error:
-                self._health_integrity_ok = False
-                self._health_checked_at = now
-                raise sqlite3.DatabaseError("database health check failed") from None
 
 
 class _BoundedHTTPServer(http.server.ThreadingHTTPServer):

@@ -459,6 +459,7 @@ class StatusReceiverTests(unittest.TestCase):
 
     def test_health_requires_receiver_schema(self) -> None:
         queries: list[str] = []
+        now = [0.0]
         connect = self.receiver._connect
 
         def traced_connect() -> sqlite3.Connection:
@@ -467,21 +468,33 @@ class StatusReceiverTests(unittest.TestCase):
             return connection
 
         self.receiver._connect = traced_connect
+        self.receiver._monotonic = lambda: now[0]
         self.receiver.health()
         self.receiver.health()
         self.assertEqual(sum("quick_check" in query.lower() for query in queries), 1)
         with sqlite3.connect(self.receiver.database) as connection:
             connection.execute("DROP TABLE nonces")
+        now[0] = 60.0
         with self.assertRaises(sqlite3.Error):
             self.receiver.health()
 
-    def test_health_write_probe_rolls_back_without_application_rows(self) -> None:
+    def test_health_write_probe_leaves_no_application_rows(self) -> None:
         with sqlite3.connect(self.receiver.database) as connection:
             before = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("reports", "nonces"))
         self.receiver.health()
         with sqlite3.connect(self.receiver.database) as connection:
             after = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("reports", "nonces"))
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM health_write_probe").fetchone()[0], 0)
         self.assertEqual(after, before)
+
+    def test_health_rejects_commit_failure(self) -> None:
+        class FailingCommit(sqlite3.Connection):
+            def commit(self) -> None:
+                raise sqlite3.OperationalError("test commit failure")
+
+        self.receiver._connect = lambda: sqlite3.connect(self.receiver.database, factory=FailingCommit)
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "health check failed"):
+            self.receiver.health()
 
     def test_health_rejects_read_only_storage_and_caches_failure(self) -> None:
         queries: list[str] = []
@@ -495,20 +508,23 @@ class StatusReceiverTests(unittest.TestCase):
         for _ in range(2):
             with self.assertRaisesRegex(sqlite3.DatabaseError, "health check failed"):
                 self.receiver.health()
-        self.assertEqual(sum("insert" in query.lower() and "nonces" in query.lower() for query in queries), 1)
+        self.assertEqual(sum("insert" in query.lower() and "health_write_probe" in query.lower() for query in queries), 1)
 
     def test_health_caches_failure_then_rechecks_and_recovers(self) -> None:
         checks = 0
         results = iter([("corrupt",), ("ok",)])
 
         class Connection:
-            def execute(self, query: str):
+            def execute(self, query: str, parameters=()):
                 nonlocal checks
                 if "quick_check" in query.lower():
                     checks += 1
                     result = next(results)
                     return type("Result", (), {"fetchone": lambda self: result})()
                 return self
+
+            def commit(self) -> None:
+                pass
 
             def close(self) -> None:
                 pass
