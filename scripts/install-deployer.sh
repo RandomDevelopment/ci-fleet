@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+set +x
+export PYTHONDONTWRITEBYTECODE=1
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+mode=
+config=
+error_reported=0
+root=${CI_FLEET_DEPLOYER_ROOT:-}
+testing=${CI_FLEET_DEPLOYER_TESTING:-0}
+effective_uid=${EUID:-$(id -u)}
+action=unknown
+environment=unknown
+target=unknown
+core_ref=unknown
+artifact=unknown
+health=unknown
+staging_path=
+transaction_dir=
+transaction_committed=0
+on_exit() {
+  local status=$?
+  if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then restore_transaction || true; fi
+  [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
+  if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
+  return "$status"
+}
+trap on_exit EXIT
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-deployer.sh --check|--install|--upgrade|--repair|--rollback|--drain|--uninstall --config /etc/ci-fleet-deployer/deployer.conf
+
+Modes are explicit and mutually exclusive. Configuration and credential references
+are host-local; secret values are never accepted as arguments.
+EOF
+}
+report() {
+  local result=$1 changed=$2 next=$3 rollback=${4:-no}
+  printf 'REPORT action=%s result=%s environment=%s target=%s version=%s digest=%s health=%s changed=%s rollback_available=%s next=%s\n' \
+    "$action" "$result" "$environment" "$target" "$core_ref" "${artifact#*@}" "$health" "$changed" "$rollback" "$next"
+}
+rollback_available() { [[ -n ${previous_state:-} && -f ${previous_state:-/nonexistent} && -n ${previous_policy:-} && -f ${previous_policy:-/nonexistent} ]] && printf yes || printf no; }
+die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
+block() { error_reported=1; printf 'BLOCKED: %s\n' "$*" >&2; report BLOCKED no resolve-precondition "$(rollback_available)" >&2; exit 3; }
+
+while (($#)); do
+  case "$1" in
+    --check|--install|--upgrade|--repair|--rollback|--drain|--uninstall)
+      [[ -z "$mode" ]] || die 'select exactly one operating mode'
+      mode=${1#--}; action=$mode; shift ;;
+    --config) (($# >= 2)) || die '--config requires a value'; config=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[[ -n "$mode" ]] || { usage; die 'an explicit operating mode is required'; }
+[[ -n "$config" ]] || die '--config is required'
+[[ -z "$root" || "$testing" == 1 ]] || die 'CI_FLEET_DEPLOYER_ROOT is test-only'
+if [[ "$testing" == 1 ]]; then
+  [[ -n "$root" ]] || die 'test mode requires an alternate root'
+  effective_uid=${CI_FLEET_DEPLOYER_EUID_OVERRIDE:-$effective_uid}
+else
+  [[ -z "$root" ]] || die 'alternate root is forbidden'
+  [[ -z ${CI_FLEET_DEPLOYER_EUID_OVERRIDE:-} ]] || die 'effective UID override is test-only'
+fi
+if [[ "$mode" != check && "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
+
+root_path() { printf '%s%s' "$root" "$1"; }
+etc_root=$(root_path /etc/ci-fleet-deployer)
+install_root=$(root_path /opt/ci-fleet-deployer)
+releases=$install_root/releases
+current=$install_root/current
+state_root=$(root_path /var/lib/ci-fleet-deployer)
+state_file=$state_root/install-state.json
+active_policy=$state_root/active-policy.conf
+previous_state=$state_root/last-known-good.json
+previous_policy=$state_root/last-known-good-policy.conf
+drained=$state_root/drained
+active_operation=$state_root/active-operation
+lock_root=$(root_path /var/lock/ci-fleet-deployer)
+log_root=$(root_path /var/log/ci-fleet-deployer)
+systemd_root=$(root_path /etc/systemd/system)
+unit_source=$repo_root/deploy/deployer
+unit_names=(
+  ci-fleet-deployer.service
+  ci-fleet-deployer-health.service ci-fleet-deployer-health.timer
+  ci-fleet-deployer-cleanup.service ci-fleet-deployer-cleanup.timer
+  ci-fleet-deployer-drain.service
+)
+timer_names=(ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer)
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+
+expected_uid=0
+[[ "$testing" != 1 ]] || expected_uid=$(id -u)
+inside() {
+  local path=$1 base=$2 normalized normalized_base
+  normalized=$(realpath -m -- "$path")
+  normalized_base=$(realpath -m -- "$base")
+  [[ "$normalized" == "$normalized_base/"* ]]
+}
+secure_file() {
+  local path=$1 description=$2 mode=${3:-600}
+  [[ ! -L "$path" && -f "$path" ]] || block "$description must be a regular file, not a symlink"
+  [[ $(realpath -e -- "$path") == $(realpath -m -- "$path") ]] || block "$description path contains a symlink"
+  [[ $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || block "$description must be owned by root with mode 0$mode"
+}
+secure_directory() {
+  local path=$1 mode=$2 create=${3:-0}
+  [[ ! -L "$path" ]] || die "unsafe symlinked managed directory: $path"
+  if [[ ! -e "$path" ]]; then
+    [[ "$create" == 1 ]] || return 1
+    install -d -m "$mode" "$path"
+  fi
+  if [[ "$create" == 1 && -d "$path" && $(stat -c %u "$path") == "$expected_uid" ]]; then chmod "$mode" "$path"; fi
+  [[ -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || die "unsafe managed directory: $path"
+}
+
+parse_file() {
+  local path=$1 prefix=$2 kind=$3 allowed=$4 line key value
+  declare -gA "$prefix=()"
+  local -n output=$prefix
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && ${line:0:1} != '#' ]] || continue
+    [[ "$line" == *=* ]] || block "malformed $kind line"
+    key=${line%%=*}; value=${line#*=}
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ && -n "$value" && "$value" != *$'\r'* && "$value" != *$'\n'* ]] || block "malformed $kind line"
+    [[ ! -v "output[$key]" ]] || block "duplicate $kind key: $key"
+    [[ " $allowed " == *" $key "* ]] || block "unknown $kind key: $key"
+    # key indexes a nameref to an associative array.
+    # shellcheck disable=SC2004
+    output[$key]=$value
+  done <"$path"
+}
+
+validate_config() {
+  inside "$config" "$etc_root" || block "configuration path must be inside $etc_root"
+  secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
+  secure_file "$config" 'configuration file'
+  parse_file "$config" cfg configuration "$config_keys"
+  local key
+  for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID; do
+    [[ -v "cfg[$key]" ]] || block "configuration is missing required key: $key"
+  done
+  [[ ${cfg[SCHEMA_VERSION]} == 1 ]] || block 'unsupported configuration schema'
+  environment=${cfg[ENVIRONMENT]}; target=${cfg[TARGET_ID]}; core_ref=${cfg[CORE_REF]:-unknown}; artifact=${cfg[ARTIFACT_IMAGE]:-unknown}
+  [[ "$environment" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || block 'invalid explicit environment'
+  [[ "$target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid explicit target identity'
+  if [[ "$mode" == drain || "$mode" == uninstall ]]; then return; fi
+  secure_directory "$etc_root/adapters" 700 0 || block 'adapter directory is missing'
+  secure_directory "$etc_root/credentials" 700 0 || block 'credential directory is missing'
+  secure_directory "$etc_root/evidence" 700 0 || block 'evidence directory is missing'
+  for key in SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE; do
+    [[ -v "cfg[$key]" ]] || block "configuration is missing required key: $key"
+  done
+  [[ ${cfg[DEPLOYER_IDENTITY]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid deployer identity'
+  [[ ${cfg[CREDENTIAL_SCOPE]} == "$environment" ]] || block 'credential scope must exactly match the explicit environment'
+  [[ "$core_ref" =~ ^[0-9a-f]{40}$ && ${cfg[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ ]] || block 'core and source revisions must be full lowercase commit SHAs'
+  [[ ${cfg[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || block 'artifact image must be an immutable qualified digest reference'
+  [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || block 'adapter digest must be lowercase SHA-256'
+  [[ ${cfg[NETWORK_HOST]} =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || block 'invalid network prerequisite host'
+  [[ ${cfg[MIN_DISK_GIB]} =~ ^[1-9][0-9]{0,3}$ ]] || block 'MIN_DISK_GIB must be a positive integer'
+  [[ ${cfg[REQUIRE_COMPOSE]} == 0 || ${cfg[REQUIRE_COMPOSE]} == 1 ]] || block 'REQUIRE_COMPOSE must be 0 or 1'
+  inside "${cfg[ADAPTER_PATH]}" "$etc_root/adapters" || block 'adapter path is outside the approved adapter directory'
+  secure_file "${cfg[ADAPTER_PATH]}" 'adapter file' 700
+  [[ $(sha256sum "${cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || block 'adapter digest does not match the protected regular file'
+  case ${cfg[CREDENTIAL_PROVIDER]} in
+    file)
+      inside "${cfg[CREDENTIAL_REF]}" "$etc_root/credentials" || block 'credential reference is outside the approved credential directory'
+      [[ ! -L ${cfg[CREDENTIAL_REF]} && -f ${cfg[CREDENTIAL_REF]} ]] || block 'credential reference must be a regular file, not a symlink'
+      [[ $(stat -c '%u:%a' "${cfg[CREDENTIAL_REF]}") == "$expected_uid:600" ]] || block 'credential file must be owner-only mode 0600'
+      ;;
+    external)
+      [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || block 'invalid external secret-manager adapter reference'
+      ;;
+    *) block 'CREDENTIAL_PROVIDER must be file or external' ;;
+  esac
+  validate_evidence
+}
+
+validate_evidence() {
+  local allowed='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
+  inside "${cfg[APPROVAL_EVIDENCE_PATH]}" "$etc_root/evidence" || block 'approval evidence is outside the approved evidence directory'
+  secure_file "${cfg[APPROVAL_EVIDENCE_PATH]}" 'approval evidence'
+  parse_file "${cfg[APPROVAL_EVIDENCE_PATH]}" approval 'approval evidence' "$allowed"
+  local key
+  for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT; do
+    [[ -v "approval[$key]" ]] || block "approval evidence is missing $key"
+  done
+  [[ ${approval[SCHEMA_VERSION]} == 1 ]] || block 'unsupported approval evidence schema'
+  for key in ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do
+    [[ ${approval[$key]} == "${cfg[$key]}" ]] || block "approval evidence does not match exact $key"
+  done
+  [[ ${approval[APPROVAL_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[POLICY_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[APPROVAL_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || block 'approval identity is malformed'
+  [[ ${approval[APPROVED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'approval timestamp must be UTC RFC3339'
+  case ${cfg[APPROVAL_PROVIDER]} in
+    manual-exact-head|external-exact-head) ;;
+    github-environment)
+      [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || block 'GitHub Environment approval requires capability evidence'
+      inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$etc_root/evidence" || block 'capability evidence is outside the approved evidence directory'
+      secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
+      parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' 'SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+      [[ ${capability[SCHEMA_VERSION]:-} == 1 && ${capability[ENVIRONMENT_PROTECTION]:-} == verified && ${capability[EXACT_HEAD]:-} == "${cfg[SOURCE_COMMIT]}" ]] || block 'GitHub Environment capability evidence is not exact-head verified'
+      ;;
+    *) block 'unsupported approval provider' ;;
+  esac
+  inside "${cfg[CHECKPOINT_EVIDENCE_PATH]}" "$etc_root/evidence" || block 'checkpoint evidence is outside the approved evidence directory'
+  secure_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" 'checkpoint evidence'
+  parse_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" checkpoint 'checkpoint evidence' 'SCHEMA_VERSION ENVIRONMENT TARGET_ID CHECKPOINT_ID RECORDED_AT'
+  [[ ${checkpoint[SCHEMA_VERSION]:-} == 1 && ${checkpoint[ENVIRONMENT]:-} == "$environment" && ${checkpoint[TARGET_ID]:-} == "$target" ]] || block 'checkpoint evidence does not match the explicit environment and target'
+  [[ ${checkpoint[CHECKPOINT_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${checkpoint[RECORDED_AT]:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'checkpoint evidence is malformed'
+}
+
+require_host() {
+  local command os_id os_version available required
+  for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
+    command -v "$command" >/dev/null || block "$command is required"
+  done
+  local os_release
+  os_release=$(root_path /etc/os-release)
+  [[ -f "$os_release" && ! -L "$os_release" ]] || block 'supported Linux os-release metadata is missing'
+  os_id=$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2}' "$os_release")
+  os_version=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2}' "$os_release")
+  [[ "$os_id" == debian && "$os_version" =~ ^(12|13)(\.|$) || "$os_id" == ubuntu && "$os_version" =~ ^(22\.04|24\.04)$ ]] || block 'unsupported Linux distribution or release'
+  [[ -d $(root_path /run/systemd/system) ]] || block 'systemd is not the active init system'
+  systemctl is-system-running >/dev/null 2>&1 || block 'systemd is unavailable'
+  docker info >/dev/null 2>&1 || block 'Docker Engine is unavailable'
+  [[ ${cfg[REQUIRE_COMPOSE]} != 1 ]] || docker compose version >/dev/null 2>&1 || block 'Docker Compose v2 is required but unavailable'
+  [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]] || block 'host time is not synchronized'
+  available=$(df -Pk "$state_root" 2>/dev/null | awk 'NR==2 {print $4}')
+  [[ "$available" =~ ^[0-9]+$ ]] || available=$(df -Pk "$(dirname "$state_root")" | awk 'NR==2 {print $4}')
+  required=$((cfg[MIN_DISK_GIB] * 1024 * 1024))
+  ((available >= required)) || block 'insufficient deployer disk capacity'
+  if [[ "$testing" != 1 || ${CI_FLEET_DEPLOYER_TEST_NETWORK:-} != ok ]]; then
+    printf '%s\n' "${cfg[NETWORK_HOST]}" | python3 -c 'import socket,sys; socket.getaddrinfo(sys.stdin.readline().strip(), 443)' >/dev/null 2>&1 || block 'network prerequisite DNS lookup failed'
+  fi
+  printf 'url = "https://%s/"\nconnect-timeout = 5\nmax-time = 10\nhead\nsilent\n' "${cfg[NETWORK_HOST]}" | curl --config - >/dev/null 2>&1 || block 'network prerequisite HTTPS check failed'
+  reject_mixed_role
+}
+
+require_maintenance_host() {
+  local command
+  for command in bash awk stat readlink realpath install cp rm mkdir chmod mv flock kill systemctl date; do
+    command -v "$command" >/dev/null || block "$command is required for maintenance"
+  done
+  [[ -d "$systemd_root" && ! -L "$systemd_root" ]] || block 'systemd unit directory is unavailable'
+}
+
+reject_mixed_role() {
+  local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service actions.runner.service; do
+    [[ ! -e "$systemd_root/$unit" ]] || block 'ordinary CI controller or runner state is present'
+  done
+  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || block 'ordinary CI controller or runner state is present'
+  done
+  output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || block 'Docker workload inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || block 'unrelated Docker workload is present'; done <<<"$output"
+  output=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || block 'Docker network inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || block 'incompatible custom Docker network is present'; done <<<"$output"
+  output=$(docker volume ls --format '{{.Name}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || block 'Docker volume inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || block 'incompatible Docker volume is present'; done <<<"$output"
+}
+
+validate_checkout() {
+  local head
+  head=$(git -C "$repo_root" rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
+  [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
+  if [[ "$testing" != 1 ]]; then
+    git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
+  fi
+}
+
+active_deployment() {
+  local pid started now
+  [[ -f "$active_operation" && ! -L "$active_operation" ]] || return 1
+  pid=$(awk -F= '$1=="pid" {print $2}' "$active_operation")
+  started=$(awk -F= '$1=="started_at" {print $2}' "$active_operation")
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  now=$(date +%s)
+  ((now - started <= 3600))
+}
+
+release_complete() {
+  local release=$1 stored actual unit entry
+  [[ -d "$release" && ! -L "$release" && $(stat -c '%u:%a' "$release") == "$expected_uid:755" && -x "$release/scripts/install-deployer.sh" && -x "$release/scripts/deployer-runtime.sh" ]] || return 1
+  for entry in "$release/scripts/install-deployer.sh" "$release/scripts/deployer-runtime.sh"; do [[ ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || return 1; done
+  [[ -f "$release/.ci-fleet-tree-sha256" ]] || return 1
+  stored=$(<"$release/.ci-fleet-tree-sha256")
+  actual=$(cd "$release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
+  [[ "$stored" == "$actual" ]] || return 1
+  for unit in "${unit_names[@]}"; do [[ -f "$release/deploy/deployer/$unit" && ! -L "$release/deploy/deployer/$unit" && $(stat -c '%u:%a' "$release/deploy/deployer/$unit") == "$expected_uid:644" ]] || return 1; done
+}
+
+state_matches() {
+  [[ -f "$state_file" && ! -L "$state_file" && $(stat -c '%u:%a' "$state_file") == "$expected_uid:600" ]] || return 1
+  [[ -f "$active_policy" && ! -L "$active_policy" && $(stat -c '%u:%a' "$active_policy") == "$expected_uid:600" && $(cmp -s "$config" "$active_policy"; echo $?) == 0 ]] || return 1
+  printf '%s\n' "$core_ref" "$environment" "$target" "${cfg[DEPLOYER_IDENTITY]}" "${cfg[SOURCE_COMMIT]}" "$artifact" "${approval[APPROVAL_ID]}" "${approval[POLICY_IDENTITY]}" "${cfg[APPROVAL_PROVIDER]}" "${checkpoint[CHECKPOINT_ID]}" | python3 -c '
+import json, sys
+try: value=json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError): raise SystemExit(1)
+keys=("core_ref","environment","target","deployer_identity","source_commit","artifact","approval_id","policy_identity","approval_provider","checkpoint_id")
+expected=[line.rstrip("\n") for line in sys.stdin]
+raise SystemExit(0 if all(value.get(k)==v for k,v in zip(keys,expected)) else 1)
+' "$state_file"
+}
+
+units_match() {
+  local unit
+  for unit in "${unit_names[@]}"; do
+    [[ -f "$systemd_root/$unit" && ! -L "$systemd_root/$unit" ]] || return 1
+    cmp -s "$unit_source/$unit" "$systemd_root/$unit" || return 1
+  done
+  for unit in "${timer_names[@]}"; do systemctl is-enabled "$unit" >/dev/null 2>&1 && systemctl is-active "$unit" >/dev/null 2>&1 || return 1; done
+}
+
+current_matches() {
+  local target_path=$releases/$core_ref
+  [[ -L "$current" && $(readlink -f "$current") == $(readlink -f "$target_path") ]] || return 1
+  release_complete "$target_path"
+}
+
+managed_boundaries_match() {
+  local path mode
+  for path in "$install_root:755" "$releases:755" "$state_root:700" "$lock_root:700" "$log_root:700"; do
+    mode=${path##*:}; path=${path%:*}
+    [[ -d "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || return 1
+  done
+}
+
+converged() { managed_boundaries_match && current_matches && state_matches && units_match; }
+
+acquire_lock() {
+  local path
+  secure_directory "$lock_root" 700 1
+  exec 9<"$lock_root"
+  flock -n 9 || block 'another deployer installer operation is running'
+  if [[ -e "$active_operation" ]] && ! active_deployment; then
+    [[ ! -L "$active_operation" && -f "$active_operation" && $(stat -c '%u:%a' "$active_operation") == "$expected_uid:600" ]] || block 'stale operation state is unsafe'
+    rm -f "$active_operation"
+  fi
+  if [[ -d "$releases" ]]; then
+    shopt -s nullglob
+    for path in "$releases"/."$core_ref".staging.*; do
+      [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:755" ]] || block 'interrupted release staging state is unsafe'
+      rm -rf -- "$path"
+    done
+    shopt -u nullglob
+  fi
+  recover_interrupted_transaction
+}
+
+begin_transaction() {
+  local name path current_target
+  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+    path=$state_root/$name
+    [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
+  done
+  if [[ -L "$current" ]]; then
+    current_target=$(readlink "$current")
+    [[ "$current_target" =~ ^releases/[0-9a-f]{40}$ ]] || block 'current release pointer is unsafe'
+  elif [[ -e "$current" ]]; then block 'current release pointer has an unsafe type'
+  fi
+  for name in "${unit_names[@]}"; do
+    path=$systemd_root/$name
+    [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c %u "$path") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
+  done
+  transaction_dir=$(mktemp -d "$state_root/.transaction.XXXXXX")
+  chmod 0700 "$transaction_dir"
+  install -d -m 0700 "$transaction_dir/units" "$transaction_dir/state"
+  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+    path=$state_root/$name
+    if [[ -f "$path" ]]; then
+      install -m 0600 "$path" "$transaction_dir/state/$name"
+      printf '%s\n' "$name" >>"$transaction_dir/state-present"
+    fi
+  done
+  [[ -z ${current_target:-} ]] || printf '%s\n' "$current_target" >"$transaction_dir/current-target"
+  for name in "${unit_names[@]}"; do
+    path=$systemd_root/$name
+    if [[ -f "$path" ]]; then
+      install -m 0644 "$path" "$transaction_dir/units/$name"
+      printf '%s\n' "$name" >>"$transaction_dir/units-present"
+    fi
+  done
+  for name in "${timer_names[@]}"; do
+    if systemctl is-enabled "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
+  done
+}
+
+restore_transaction() {
+  local name target_value
+  [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
+  transaction_committed=1
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name"; done
+  if [[ -f "$transaction_dir/units-present" ]]; then
+    while IFS= read -r name; do
+      [[ " ${unit_names[*]} " == *" $name "* && -f "$transaction_dir/units/$name" && ! -L "$transaction_dir/units/$name" ]] || block 'transaction unit manifest is unsafe'
+      install -m 0644 "$transaction_dir/units/$name" "$systemd_root/$name"
+    done <"$transaction_dir/units-present"
+  fi
+  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do rm -f -- "$state_root/$name"; done
+  if [[ -f "$transaction_dir/state-present" ]]; then
+    while IFS= read -r name; do
+      [[ " install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf " == *" $name "* && -f "$transaction_dir/state/$name" && ! -L "$transaction_dir/state/$name" ]] || block 'transaction state manifest is unsafe'
+      install -m 0600 "$transaction_dir/state/$name" "$state_root/$name"
+    done <"$transaction_dir/state-present"
+  fi
+  rm -f -- "$current" "$install_root/.current.new" "$state_root/.install-state.new" "$active_policy.new" "$state_file.new"
+  if [[ -f "$transaction_dir/current-target" ]]; then
+    target_value=$(<"$transaction_dir/current-target")
+    [[ "$target_value" =~ ^releases/[0-9a-f]{40}$ ]] || block 'transaction current pointer is unsafe'
+    ln -s "$target_value" "$current"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ -f "$transaction_dir/timers-enabled" ]]; then
+    while IFS= read -r name; do
+      [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
+      systemctl enable --now "$name" >/dev/null 2>&1 || true
+    done <"$transaction_dir/timers-enabled"
+  fi
+  rm -rf -- "$transaction_dir"
+  transaction_dir=
+}
+
+recover_interrupted_transaction() {
+  local candidates=() candidate
+  [[ -d "$state_root" ]] || return 0
+  shopt -s nullglob
+  candidates=("$state_root"/.transaction.*)
+  shopt -u nullglob
+  ((${#candidates[@]} <= 1)) || block 'multiple interrupted installer transactions require operator recovery'
+  ((${#candidates[@]} == 1)) || return 0
+  candidate=${candidates[0]}
+  [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
+  transaction_dir=$candidate
+  restore_transaction
+  transaction_committed=0
+}
+
+commit_transaction() {
+  transaction_committed=1
+  rm -rf -- "$transaction_dir"
+  transaction_dir=
+}
+
+atomic_replace_directory() {
+  local replacement=$1 target_path=$2
+  if [[ ! -e "$target_path" && ! -L "$target_path" ]]; then mv "$replacement" "$target_path"; return; fi
+  [[ ! -L "$target_path" && -d "$target_path" ]] || block 'managed release target has an unsafe type'
+  python3 - "$replacement" "$target_path" <<'PY'
+import ctypes, os, sys
+source, target = map(os.fsencode, sys.argv[1:])
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = getattr(libc, 'renameat2', None)
+if renameat2 is None:
+    raise OSError('atomic directory exchange is unavailable')
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+if renameat2(-100, source, -100, target, 2) != 0:
+    error = ctypes.get_errno(); raise OSError(error, os.strerror(error))
+fd = os.open(os.path.dirname(target), os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+install_release() {
+  local release=$releases/$core_ref staging
+  secure_directory "$install_root" 755 1
+  secure_directory "$releases" 755 1
+  if release_complete "$release"; then return; fi
+  staging=$(mktemp -d "$releases/.${core_ref}.staging.XXXXXX")
+  chmod 0755 "$staging"
+  staging_path=$staging
+  install -d -m 0755 "$staging/scripts" "$staging/deploy/deployer"
+  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$staging/scripts/"
+  install -m 0644 "$unit_source"/* "$staging/deploy/deployer/"
+  (cd "$staging" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1) >"$staging/.ci-fleet-tree-sha256"
+  chmod 0644 "$staging/.ci-fleet-tree-sha256"
+  release_complete "$staging" || die 'staged deployer release is incomplete'
+  atomic_replace_directory "$staging" "$release"
+  [[ ! -e "$staging" ]] || rm -rf -- "$staging"
+  staging_path=
+}
+
+write_state() {
+  local destination=$1 temporary
+  temporary=$(mktemp "$state_root/.state.XXXXXX")
+  printf '%s\n' "$core_ref" "$environment" "$target" "${cfg[DEPLOYER_IDENTITY]}" "${cfg[SOURCE_COMMIT]}" "$artifact" "${approval[APPROVAL_ID]}" "${approval[APPROVAL_IDENTITY]}" "${approval[POLICY_IDENTITY]}" "${cfg[APPROVAL_PROVIDER]}" "${checkpoint[CHECKPOINT_ID]}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | python3 -c '
+import json,sys
+keys=("core_ref","environment","target","deployer_identity","source_commit","artifact","approval_id","approval_identity","policy_identity","approval_provider","checkpoint_id","installed_at")
+values=[line.rstrip("\n") for line in sys.stdin]
+with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(dict(zip(keys,values)),f,indent=2,sort_keys=True); f.write("\n")
+' "$temporary"
+  chmod 0600 "$temporary"
+  mv -Tf "$temporary" "$destination"
+}
+
+install_units() {
+  local unit systemd_mode
+  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
+  systemd_mode=$(stat -c %a "$systemd_root")
+  (((8#$systemd_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
+  for unit in "${unit_names[@]}"; do
+    if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
+      [[ ! -L "$systemd_root/$unit" && -f "$systemd_root/$unit" && $(stat -c %u "$systemd_root/$unit") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
+    fi
+    install -m 0644 "$unit_source/$unit" "$systemd_root/$unit"
+  done
+  systemd-analyze verify "${unit_names[@]/#/$systemd_root/}" >/dev/null || die 'systemd unit verification failed'
+  systemctl daemon-reload
+  systemctl enable --now "${timer_names[@]}" >/dev/null
+}
+
+policy_adapter_operation() {
+  local policy=$1 operation_name=$2 description=$3 key
+  local -A policy_cfg=()
+  secure_file "$policy" "$description"
+  parse_file "$policy" policy_cfg "$description" "$config_keys"
+  for key in ADAPTER_PATH ADAPTER_SHA256; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
+  [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
+  secure_file "${policy_cfg[ADAPTER_PATH]}" "$description adapter" 700
+  [[ $(sha256sum "${policy_cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${policy_cfg[ADAPTER_SHA256]}" ]] || die "$description adapter digest mismatch"
+  CI_FLEET_DEPLOYER_CONFIG="$policy" "${policy_cfg[ADAPTER_PATH]}" "$operation_name" >/dev/null 2>&1
+}
+
+perform_check() {
+  if active_deployment; then block 'active deployment prevents a consistent check'; fi
+  converged || block 'installed deployer state is absent or drifted'
+  policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed'
+  health=healthy
+  report NO_CHANGE no none "$(rollback_available)"
+}
+
+perform_converge() {
+  local had_state=0 old_environment old_target candidate_changed=1 old_release
+  [[ -f "$state_file" ]] && had_state=1
+  if ((had_state)); then
+    read -r old_environment old_target < <(python3 - "$state_file" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1])); print(v.get('environment',''),v.get('target',''))
+PY
+)
+    [[ "$old_environment" == "$environment" && "$old_target" == "$target" ]] || block 'installed environment and target identity cannot change in place'
+    if [[ "$mode" == install && -L "$current" ]] && ! state_matches; then block 'install cannot select a new candidate; use --upgrade or --repair'; fi
+  elif [[ "$mode" == upgrade ]]; then
+    block '--upgrade requires an existing installation'
+  fi
+  if state_matches; then candidate_changed=0; fi
+  if [[ "$mode" == upgrade && ! -L "$current" ]]; then block '--upgrade requires an active installation; use --install after uninstall'; fi
+  if active_deployment; then block 'active deployment prevents this operation'; fi
+  if converged; then
+    policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed'
+    health=healthy; report NO_CHANGE no none "$(rollback_available)"; return
+  fi
+  if [[ -L "$current" ]]; then
+    old_release=$(readlink -f "$current")
+    release_complete "$old_release" || block 'active deployer release is incomplete'
+    policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'
+  fi
+  CI_FLEET_DEPLOYER_CONFIG="$config" "${cfg[ADAPTER_PATH]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
+  install_release
+  secure_directory "$state_root" 700 1
+  secure_directory "$log_root" 700 1
+  begin_transaction
+  if ((had_state && candidate_changed)); then
+    install -m 0600 "$state_file" "$previous_state"
+    install -m 0600 "$active_policy" "$previous_policy"
+  fi
+  ln -sfn "releases/$core_ref" "$install_root/.current.new"
+  install_units
+  install -m 0600 "$config" "$active_policy.new"
+  write_state "$state_root/.install-state.new"
+  mv -Tf "$active_policy.new" "$active_policy"
+  mv -Tf "$state_root/.install-state.new" "$state_file"
+  mv -Tf "$install_root/.current.new" "$current"
+  rm -f "$drained"
+  policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
+  commit_transaction
+  health=healthy
+  report CHANGED yes run-check "$(rollback_available)"
+}
+
+perform_rollback() {
+  active_deployment && block 'active deployment prevents rollback'
+  [[ -f "$previous_state" && -f "$previous_policy" ]] || block 'no last-known-good release is available'
+  secure_directory "$state_root" 700 0
+  begin_transaction
+  install -m 0600 "$previous_state" "$state_file.new"
+  install -m 0600 "$previous_policy" "$active_policy.new"
+  core_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["core_ref"])' "$previous_state")
+  environment=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment"])' "$previous_state")
+  target=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target"])' "$previous_state")
+  artifact=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact"])' "$previous_state")
+  release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
+  policy_adapter_operation "$previous_policy" rollback 'last-known-good policy' || die 'application adapter rollback failed'
+  ln -sfn "releases/$core_ref" "$install_root/.current.new"
+  install_units
+  mv -Tf "$active_policy.new" "$active_policy"
+  mv -Tf "$state_file.new" "$state_file"
+  mv -Tf "$install_root/.current.new" "$current"
+  policy_adapter_operation "$active_policy" health 'rolled-back policy' || die 'rolled-back deployer health check failed'
+  commit_transaction
+  health=healthy
+  report CHANGED yes restore-host-policy-evidence-then-check yes
+}
+
+perform_drain() {
+  if active_deployment; then block 'active deployment prevents drain'; fi
+  secure_directory "$state_root" 700 1
+  if [[ -f "$drained" ]]; then report NO_CHANGE no safe-to-maintain "$(rollback_available)"; return; fi
+  : >"$drained"
+  chmod 0600 "$drained"
+  report CHANGED yes safe-to-maintain "$(rollback_available)"
+}
+
+perform_uninstall() {
+  local changed=no unit managed_present=no
+  if [[ -e "$state_root" || -L "$state_root" || -e "$lock_root" || -L "$lock_root" || -e "$current" || -L "$current" ]]; then managed_present=yes; fi
+  for unit in "${unit_names[@]}"; do [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/$unit" ]] || managed_present=yes; done
+  if [[ "$managed_present" == no ]]; then report NO_CHANGE no retained-state "$(rollback_available)"; return; fi
+  if active_deployment; then block 'active deployment prevents this operation'; fi
+  acquire_lock
+  secure_directory "$state_root" 700 1
+  : >"$drained"
+  chmod 0600 "$drained"
+  if active_deployment; then block 'active deployment started while draining'; fi
+  if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f "$drained" "$active_operation"
+  if [[ "$changed" == yes ]]; then report CHANGED yes retained-state "$(rollback_available)"; else report NO_CHANGE no retained-state "$(rollback_available)"; fi
+}
+
+validate_config
+if [[ "$mode" == drain || "$mode" == uninstall ]]; then
+  require_maintenance_host
+else
+  validate_checkout
+  require_host
+fi
+case "$mode" in
+  check) perform_check ;;
+  install|upgrade|repair) acquire_lock; perform_converge ;;
+  rollback) acquire_lock; perform_rollback ;;
+  drain) acquire_lock; perform_drain ;;
+  uninstall) perform_uninstall ;;
+esac
