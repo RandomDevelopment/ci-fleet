@@ -1,0 +1,24 @@
+[Unit]
+Description=Run one approved ci-fleet deployment
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+ConditionPathExists=!/var/lib/ci-fleet-deployer/drained
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh deploy
+Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
+Environment=CI_FLEET_DEPLOYER_REQUEST=/var/lib/ci-fleet-deployer/request.conf
+TimeoutStartSec=45min
+TimeoutStopSec=45min
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer
+ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer /var/lock/ci-fleet-deployer /run/docker.sock
+RestrictSUIDSGID=yes
+LockPersonality=yes

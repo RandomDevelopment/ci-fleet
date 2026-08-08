@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+installer=$repo_root/scripts/install-deployer.sh
+runtime=$repo_root/scripts/deployer-runtime.sh
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+expect_success() {
+  local output
+  output=$("$@" 2>&1) || fail "expected success: $*; output=$output"
+  printf '%s\n' "$output"
+}
+expect_failure() {
+  local expected=$1 output
+  shift
+  if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+  grep -Fq -- "$expected" <<<"$output" || fail "missing [$expected]: $output"
+  printf '%s\n' "$output"
+}
+
+[[ -x "$installer" && -x "$runtime" ]] || fail 'deployer installer/runtime is missing'
+expect_failure 'an explicit operating mode is required' "$installer"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+root=$tmp/root
+fake_bin=$tmp/bin
+mkdir -p "$fake_bin" "$root/etc/ci-fleet-deployer/adapters" \
+  "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence" \
+  "$root/etc/systemd/system" "$root/run/systemd/system"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
+chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" \
+  "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence"
+
+cat >"$fake_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  info) exit "${FAKE_DOCKER_INFO_EXIT:-0}" ;;
+  compose) [[ "${2:-}" == version ]] && exit "${FAKE_COMPOSE_EXIT:-0}" ;;
+  ps) [[ -z "${FAKE_DOCKER_PS:-}" ]] || printf '%s\n' "$FAKE_DOCKER_PS" ;;
+  network) [[ "${2:-}" == ls ]] && { [[ -z "${FAKE_DOCKER_NETWORKS:-}" ]] || printf '%s\n' "$FAKE_DOCKER_NETWORKS"; exit 0; } ;;
+  volume) [[ "${2:-}" == ls ]] && { [[ -z "${FAKE_DOCKER_VOLUMES:-}" ]] || printf '%s\n' "$FAKE_DOCKER_VOLUMES"; exit 0; } ;;
+esac
+exit 0
+EOF
+cat >"$fake_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -u
+root=${CI_FLEET_DEPLOYER_ROOT:-}
+log=${FAKE_SYSTEMCTL_LOG:-/dev/null}
+printf '%s\n' "$*" >>"$log"
+case "${1:-}" in
+  is-system-running) [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1; printf 'running\n' ;;
+  is-enabled|is-active) [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] ;;
+  enable)
+    shift
+    [[ "${1:-}" != --now ]] || shift
+    for unit in "$@"; do : >"$root/var/lib/ci-fleet-deployer/unit-$unit"; done ;;
+  disable)
+    shift
+    [[ "${1:-}" != --now ]] || shift
+    for unit in "$@"; do rm -f "$root/var/lib/ci-fleet-deployer/unit-$unit"; done ;;
+esac
+exit 0
+EOF
+cat >"$fake_bin/systemd-analyze" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == verify ]] || exit 1
+exit "${FAKE_SYSTEMD_VERIFY_EXIT:-0}"
+EOF
+cat >"$fake_bin/timedatectl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_TIME_SYNC:-yes}"
+EOF
+cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+exit "${FAKE_CURL_EXIT:-0}"
+EOF
+cat >"$fake_bin/systemd-inhibit" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+while (($#)); do
+  [[ "$1" != -- ]] || { shift; exec "$@"; }
+  shift
+done
+exit 2
+EOF
+cat >"$fake_bin/df" <<'EOF'
+#!/usr/bin/env bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 104857600 1 %s 1%% /\n' "${FAKE_DISK_AVAILABLE:-104857599}"
+EOF
+chmod 0755 "$fake_bin"/*
+export PATH="$fake_bin:$PATH"
+export FAKE_SYSTEMCTL_LOG=$tmp/systemctl.log
+export CI_FLEET_DEPLOYER_TESTING=1 CI_FLEET_DEPLOYER_ROOT=$root
+export CI_FLEET_DEPLOYER_EUID_OVERRIDE=0 CI_FLEET_DEPLOYER_TEST_NETWORK=ok
+
+adapter=$root/etc/ci-fleet-deployer/adapters/application-adapter
+cat >"$adapter" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
+if [[ -e "${FAKE_ADAPTER_FAIL:-/nonexistent}" ]]; then
+  fail_operation=$(<"$FAKE_ADAPTER_FAIL")
+  [[ "$fail_operation" != all && "$fail_operation" != "$1" ]] || exit 42
+fi
+case "$1" in validate|health|cleanup|deploy|rollback) ;; *) exit 2 ;; esac
+EOF
+chmod 0700 "$adapter"
+export FAKE_ADAPTER_LOG=$tmp/adapter.log
+credential=$root/etc/ci-fleet-deployer/credentials/application.credential
+printf 'CANARY_SECRET_VALUE_DO_NOT_PRINT\n' >"$credential"
+chmod 0600 "$credential"
+approval=$root/etc/ci-fleet-deployer/evidence/approval.conf
+checkpoint=$root/etc/ci-fleet-deployer/evidence/checkpoint.conf
+core_ref=$(git -C "$repo_root" rev-parse HEAD)
+source_ref=1111111111111111111111111111111111111111
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence() {
+  local evidence_environment=${1:-staging} evidence_target=${2:-example-staging}
+  cat >"$approval" <<EOF
+SCHEMA_VERSION=1
+ENVIRONMENT=$evidence_environment
+TARGET_ID=$evidence_target
+SOURCE_COMMIT=$source_ref
+ARTIFACT_IMAGE=$image
+APPROVAL_IDENTITY=example-reviewer
+POLICY_IDENTITY=example-staging-policy-v1
+APPROVAL_ID=approval-20260808-1
+APPROVED_AT=2026-08-08T20:00:00Z
+EOF
+  cat >"$checkpoint" <<EOF
+SCHEMA_VERSION=1
+ENVIRONMENT=$evidence_environment
+TARGET_ID=$evidence_target
+CHECKPOINT_ID=checkpoint-20260808-1
+RECORDED_AT=2026-08-08T19:55:00Z
+EOF
+  chmod 0600 "$approval" "$checkpoint"
+}
+write_config() {
+  local environment=${1:-staging} target=${2:-example-staging} digest=${3:-$image}
+  cat >"$root/etc/ci-fleet-deployer/deployer.conf" <<EOF
+SCHEMA_VERSION=1
+CORE_REF=$core_ref
+ENVIRONMENT=$environment
+TARGET_ID=$target
+DEPLOYER_IDENTITY=${environment}-deployer-01
+ADAPTER_PATH=$adapter
+ADAPTER_SHA256=$(sha256sum "$adapter" | cut -d' ' -f1)
+CREDENTIAL_PROVIDER=file
+CREDENTIAL_REF=$credential
+CREDENTIAL_SCOPE=$environment
+APPROVAL_PROVIDER=manual-exact-head
+APPROVAL_EVIDENCE_PATH=$approval
+CHECKPOINT_EVIDENCE_PATH=$checkpoint
+SOURCE_COMMIT=$source_ref
+ARTIFACT_IMAGE=$digest
+NETWORK_HOST=registry.example.invalid
+MIN_DISK_GIB=10
+REQUIRE_COMPOSE=1
+EOF
+  chmod 0600 "$root/etc/ci-fleet-deployer/deployer.conf"
+}
+write_evidence
+write_config
+config=$root/etc/ci-fleet-deployer/deployer.conf
+
+# Read-only preflight and strict policy variants fail closed without reading secrets.
+cp "$root/etc/os-release" "$tmp/os-release"
+printf 'ID=alpine\nVERSION_ID=3.20\n' >"$root/etc/os-release"
+expect_failure 'unsupported Linux distribution or release' "$installer" --check --config "$config" >/dev/null
+cp "$tmp/os-release" "$root/etc/os-release"
+FAKE_TIME_SYNC=no expect_failure 'host time is not synchronized' "$installer" --check --config "$config" >/dev/null
+FAKE_SYSTEMD_FAIL=1 expect_failure 'systemd is unavailable' "$installer" --check --config "$config" >/dev/null
+FAKE_DOCKER_INFO_EXIT=1 expect_failure 'Docker Engine is unavailable' "$installer" --check --config "$config" >/dev/null
+CI_FLEET_DEPLOYER_TEST_NETWORK=fail expect_failure 'network prerequisite DNS lookup failed' "$installer" --check --config "$config" >/dev/null
+FAKE_CURL_EXIT=1 expect_failure 'network prerequisite HTTPS check failed' "$installer" --check --config "$config" >/dev/null
+FAKE_DISK_AVAILABLE=1 expect_failure 'insufficient deployer disk capacity' "$installer" --check --config "$config" >/dev/null
+FAKE_COMPOSE_EXIT=1 expect_failure 'Docker Compose v2 is required but unavailable' "$installer" --check --config "$config" >/dev/null
+
+chmod 0755 "$root/etc/ci-fleet-deployer"
+expect_failure 'unsafe managed directory' "$installer" --check --config "$config" >/dev/null
+chmod 0700 "$root/etc/ci-fleet-deployer"
+mv "$root/etc/ci-fleet-deployer/adapters" "$root/etc/ci-fleet-deployer/adapters.real"
+ln -s adapters.real "$root/etc/ci-fleet-deployer/adapters"
+expect_failure 'unsafe symlinked managed directory' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/ci-fleet-deployer/adapters"
+mv "$root/etc/ci-fleet-deployer/adapters.real" "$root/etc/ci-fleet-deployer/adapters"
+
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ARTIFACT_IMAGE=registry.example.invalid/example/app@sha256:', 'ARTIFACT_IMAGE=registry.example.invalid/example/app:latest#'))
+PY
+expect_failure 'artifact image must be an immutable' "$installer" --check --config "$config" >/dev/null
+write_config
+
+capability=$root/etc/ci-fleet-deployer/evidence/github-capability.conf
+python3 - "$config" "$capability" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=manual-exact-head', 'APPROVAL_PROVIDER=github-environment') + 'APPROVAL_CAPABILITY_EVIDENCE_PATH='+sys.argv[2]+'\n')
+PY
+expect_failure 'GitHub capability evidence must be a regular file' "$installer" --check --config "$config" >/dev/null
+cat >"$capability" <<EOF
+SCHEMA_VERSION=1
+ENVIRONMENT_PROTECTION=verified
+EXACT_HEAD=$source_ref
+CAPABILITY_ID=example-capability-check
+CHECKED_AT=2026-08-08T20:00:00Z
+EOF
+chmod 0600 "$capability"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+write_config
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external').replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=external:example-vault:staging/deployer'))
+PY
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+write_config
+
+printf 'UNKNOWN=value\n' >"$tmp/unknown.conf"; chmod 0600 "$tmp/unknown.conf"
+expect_failure 'configuration path must be inside' "$installer" --check --config "$tmp/unknown.conf" >/dev/null
+printf 'UNKNOWN=value\n' >"$config"
+expect_failure 'unknown configuration key: UNKNOWN' "$installer" --check --config "$config" >/dev/null
+write_config
+printf 'SCHEMA_VERSION=1\n' >>"$config"
+expect_failure 'duplicate configuration key: SCHEMA_VERSION' "$installer" --check --config "$config" >/dev/null
+write_config
+
+export CI_FLEET_DEPLOYER_EUID_OVERRIDE=1000
+expect_failure 'run this mode as root' "$installer" --install --config "$config" >/dev/null
+export CI_FLEET_DEPLOYER_EUID_OVERRIDE=0
+
+before=$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)
+expect_failure 'result=BLOCKED' "$installer" --check --config "$config" >/dev/null
+after=$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)
+[[ "$before" == "$after" ]] || fail '--check changed the test host'
+fresh_uninstall=$(expect_success "$installer" --uninstall --config "$config")
+[[ "$after" == "$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'fresh uninstall mutated an unmanaged host'
+grep -Fq 'result=NO_CHANGE' <<<"$fresh_uninstall" || fail 'fresh uninstall did not report NO_CHANGE'
+
+first=$(expect_success "$installer" --install --config "$config")
+grep -Fq 'REPORT action=install result=CHANGED environment=staging' <<<"$first" || fail 'fresh install report is incomplete'
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'fresh install lacks atomic current release'
+[[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/install-state.json") == 600 ]] || fail 'install state mode is not 0600'
+for unit in ci-fleet-deployer.service ci-fleet-deployer-health.service ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.service ci-fleet-deployer-cleanup.timer ci-fleet-deployer-drain.service; do
+  [[ -f "$root/etc/systemd/system/$unit" ]] || fail "missing unit $unit"
+done
+second=$(expect_success "$installer" --install --config "$config")
+grep -Fq 'result=NO_CHANGE' <<<"$second" || fail 'second install was not idempotent'
+check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'REPORT action=check result=NO_CHANGE' <<<"$check" || fail 'check did not report convergence'
+
+interrupted=$root/var/lib/ci-fleet-deployer/.transaction.interrupted
+mkdir -m 0700 "$interrupted" "$interrupted/units" "$interrupted/state"
+for name in install-state.json active-policy.conf; do
+  cp "$root/var/lib/ci-fleet-deployer/$name" "$interrupted/state/$name"
+  printf '%s\n' "$name" >>"$interrupted/state-present"
+done
+for path in "$root"/etc/systemd/system/ci-fleet-deployer*; do
+  name=${path##*/}; cp "$path" "$interrupted/units/$name"; printf '%s\n' "$name" >>"$interrupted/units-present"
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$interrupted/current-target"
+printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$interrupted/timers-enabled"
+printf 'interrupted\n' >>"$root/var/lib/ci-fleet-deployer/install-state.json"
+printf 'interrupted\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$interrupted" ]] || fail 'interrupted transaction was not recovered'
+expect_success "$installer" --check --config "$config" >/dev/null
+
+rm "$root/etc/systemd/system/ci-fleet-deployer-health.timer"
+expect_failure 'result=BLOCKED' "$installer" --check --config "$config" >/dev/null
+repair=$(expect_success "$installer" --repair --config "$config")
+grep -Fq 'result=CHANGED' <<<"$repair" || fail 'repair did not report a change'
+[[ -f "$root/etc/systemd/system/ci-fleet-deployer-health.timer" ]] || fail 'repair did not restore unit drift'
+
+transaction_state=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+printf '# transaction-checkpoint\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+transaction_unit=$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service")
+FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --repair --config "$config" >/dev/null
+[[ "$transaction_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed transaction replaced healthy state'
+[[ "$transaction_unit" == "$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service")" ]] || fail 'failed transaction did not restore units'
+if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'failed transaction left recovery residue'; fi
+
+stale_stage="$root/opt/ci-fleet-deployer/releases/.${core_ref}.staging.interrupted"
+mkdir "$stale_stage"; chmod 0755 "$stale_stage"
+printf 'pid=999999\nstarted_at=1\n' >"$root/var/lib/ci-fleet-deployer/active-operation"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$stale_stage" && ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'bounded stale transaction recovery did not converge'
+
+exec 8<"$root/var/lock/ci-fleet-deployer"
+flock -n 8 || fail 'fixture could not acquire installer lock'
+expect_failure 'another deployer installer operation is running' "$installer" --repair --config "$config" >/dev/null
+flock -u 8; exec 8>&-
+
+mv "$root/var/lock/ci-fleet-deployer" "$root/var/lock/ci-fleet-deployer.real"
+ln -s "$root/var/lock/ci-fleet-deployer.real" "$root/var/lock/ci-fleet-deployer"
+expect_failure 'unsafe symlinked managed directory' "$installer" --repair --config "$config" >/dev/null
+rm "$root/var/lock/ci-fleet-deployer"
+mv "$root/var/lock/ci-fleet-deployer.real" "$root/var/lock/ci-fleet-deployer"
+
+unit_path=$root/etc/systemd/system/ci-fleet-deployer.service
+mv "$unit_path" "$unit_path.real"
+printf 'unrelated-unit\n' >"$tmp/unrelated-unit"
+ln -s "$tmp/unrelated-unit" "$unit_path"
+expect_failure 'managed systemd unit has an unsafe owner or type' "$installer" --repair --config "$config" >/dev/null
+[[ $(<"$tmp/unrelated-unit") == unrelated-unit ]] || fail 'systemd unit symlink attack changed an unrelated file'
+rm "$unit_path"; mv "$unit_path.real" "$unit_path"
+
+printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-health.service"
+expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/systemd/system/ci-fleet-health.service"
+export FAKE_DOCKER_PS='unrelated workload'
+expect_failure 'unrelated Docker workload is present' "$installer" --check --config "$config" >/dev/null
+unset FAKE_DOCKER_PS
+export FAKE_DOCKER_PS='owned|deployer|staging-deployer-01'
+expect_success "$installer" --check --config "$config" >/dev/null
+export FAKE_DOCKER_PS='wrong|deployer|other-identity'
+expect_failure 'unrelated Docker workload is present' "$installer" --check --config "$config" >/dev/null
+unset FAKE_DOCKER_PS
+
+chmod 0644 "$credential"
+secret_error=$(expect_failure 'credential file must be owner-only mode 0600' "$installer" --check --config "$config")
+[[ "$secret_error" != *CANARY_SECRET_VALUE_DO_NOT_PRINT* ]] || fail 'credential content leaked in error output'
+chmod 0600 "$credential"
+
+ln -s "$credential" "$root/etc/ci-fleet-deployer/credentials/symlinked"
+python3 - "$config" "$root/etc/ci-fleet-deployer/credentials/symlinked" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_REF='+str(p.parent/'credentials/application.credential'), 'CREDENTIAL_REF='+sys.argv[2]))
+PY
+expect_failure 'credential reference must be a regular file, not a symlink' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/ci-fleet-deployer/credentials/symlinked"
+write_config
+
+printf 'bad\n' >>"$approval"
+approval_error=$(expect_failure 'malformed approval evidence line' "$installer" --check --config "$config")
+[[ "$approval_error" != *CANARY_SECRET_VALUE_DO_NOT_PRINT* ]] || fail 'secret content leaked beside evidence failure'
+write_evidence
+
+old_state=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+new_image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+image=$new_image
+write_evidence
+write_config
+export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
+printf 'validate\n' >"$FAKE_ADAPTER_FAIL"
+expect_failure 'candidate adapter validation failed' "$installer" --upgrade --config "$config" >/dev/null
+[[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed candidate replaced healthy state'
+rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
+
+upgrade=$(expect_success "$installer" --upgrade --config "$config")
+grep -Fq 'result=CHANGED' <<<"$upgrade" || fail 'upgrade did not activate new immutable artifact'
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'rollback did not restore last-known-good state'
+grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'rollback state lacks prior artifact'
+grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'rollback report lacks the exact operator reconciliation action'
+grep -Fq 'sha256:bbbbbbbb' "$config" || fail 'rollback unexpectedly rewrote operator-owned desired policy'
+
+write_evidence production example-production
+write_config production example-production
+expect_failure 'installed environment and target identity cannot change in place' "$installer" --upgrade --config "$config" >/dev/null
+write_evidence
+write_config staging example-staging
+
+active=$root/var/lib/ci-fleet-deployer/active-operation
+printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$active"
+chmod 0600 "$active"
+expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
+expect_failure 'active deployment prevents drain' "$installer" --drain --config "$config" >/dev/null
+rm "$active"
+drain=$(expect_success "$installer" --drain --config "$config")
+grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+
+unrelated=$root/var/lib/ci-fleet-deployer/operator-note
+printf 'preserve\n' >"$unrelated"
+mv "$root/etc/ci-fleet-deployer/adapters" "$root/etc/ci-fleet-deployer/adapters.retained"
+mv "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/credentials.retained"
+mv "$root/etc/ci-fleet-deployer/evidence" "$root/etc/ci-fleet-deployer/evidence.retained"
+export FAKE_DOCKER_INFO_EXIT=1
+uninstall=$(expect_success "$installer" --uninstall --config "$config")
+unset FAKE_DOCKER_INFO_EXIT
+mv "$root/etc/ci-fleet-deployer/adapters.retained" "$root/etc/ci-fleet-deployer/adapters"
+mv "$root/etc/ci-fleet-deployer/credentials.retained" "$root/etc/ci-fleet-deployer/credentials"
+mv "$root/etc/ci-fleet-deployer/evidence.retained" "$root/etc/ci-fleet-deployer/evidence"
+grep -Fq 'result=CHANGED' <<<"$uninstall" || fail 'uninstall did not report change'
+[[ -f "$config" && -f "$credential" && -f "$unrelated" ]] || fail 'uninstall removed retained operator state or credentials'
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'uninstall retained activation pointer'
+repeat_uninstall=$(expect_success "$installer" --uninstall --config "$config")
+grep -Fq 'result=NO_CHANGE' <<<"$repeat_uninstall" || fail 'repeated uninstall was not idempotent'
+
+# Runtime contract: exact-head request/evidence, drain and scoped adapter calls.
+expect_success "$installer" --install --config "$config" >/dev/null
+request=$root/var/lib/ci-fleet-deployer/request.conf
+cp "$approval" "$request"
+chmod 0600 "$request"
+export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
+expect_success "$runtime" health >/dev/null
+expect_success "$runtime" cleanup >/dev/null
+expect_success "$runtime" deploy >/dev/null
+[[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
+cp "$root/var/lib/ci-fleet-deployer/last-request.conf" "$request"; chmod 0600 "$request"
+expect_failure 'deployment request was already completed' "$runtime" deploy >/dev/null
+grep -Fq 'sha256:bbbbbbbb' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit log omitted the immutable digest'
+if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.log"; then fail 'audit log exposed a private-capable endpoint'; fi
+for operation in health cleanup deploy; do grep -Fxq "$operation" "$FAKE_ADAPTER_LOG" || fail "runtime did not invoke adapter $operation"; done
+: >"$root/var/lib/ci-fleet-deployer/drained"
+expect_failure 'deployer is drained' "$runtime" deploy >/dev/null
+
+grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
+[[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
+grep -Fq 'scripts/test-deployer-units.sh' "$repo_root/scripts/validate.sh" || fail 'repository validation omits systemd unit verification'
+for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'application-owned' 'REPORT action='; do
+  grep -Fq -- "$phrase" "$repo_root/docs/DEPLOYER-HOST.md" || fail "deployer runbook omits $phrase"
+done
+for unit in "$repo_root"/deploy/deployer/*; do
+  grep -Fq 'ci-fleet-deployer' "$unit" || fail "unit is not deployer-scoped: $unit"
+done
+
+printf 'DEPLOYER_INSTALL_TESTS_OK\n'
