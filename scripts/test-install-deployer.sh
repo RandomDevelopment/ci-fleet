@@ -559,6 +559,29 @@ grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/install-state.json" 
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'rollback report lacks the exact operator reconciliation action'
 grep -Fq 'sha256:bbbbbbbb' "$config" || fail 'rollback unexpectedly rewrote operator-owned desired policy'
 
+# An interrupted committed rollback must report recovery without converging.
+recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.rollback-interrupted
+rm -rf "$root/var/lib/ci-fleet-deployer/deployed"
+mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
+done
+for path in "$root"/etc/systemd/system/ci-fleet-deployer*; do
+  name=${path##*/}; cp "$path" "$recovery_transaction/units/$name"; printf '%s\n' "$name" >>"$recovery_transaction/units-present"
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
+printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$recovery_transaction/timers-enabled"
+install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+recovery=$(expect_success "$installer" --upgrade --config "$config")
+grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'interrupted committed rollback recovery lacks the operator reconciliation action'
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'convergence ran after committed rollback recovery'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'convergence health ran after committed rollback recovery'
+[[ ! -e "$recovery_transaction" ]] || fail 'committed rollback recovery retained its transaction'
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 write_production_gate
 write_evidence production example-production
 write_config production example-production
@@ -688,21 +711,51 @@ expect_failure 'unsupported approval provider' "$runtime" deploy >/dev/null
 python3 - "$config" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environmnt', 'APPROVAL_PROVIDER=github-environment'))
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('SCHEMA_VERSION=1', 'SCHEMA_VERSION=2', 1))
+PY
+expect_failure 'configuration has an unsupported or missing schema version' "$runtime" deploy >/dev/null
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('SCHEMA_VERSION=2', 'SCHEMA_VERSION=1', 1))
+PY
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environmnt', 'APPROVAL_PROVIDER=external-exact-head').replace('APPROVAL_CAPABILITY_EVIDENCE_PATH='+str(p.parent/'evidence/github-capability.conf'), '').rstrip()+'\n')
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+expect_success "$runtime" deploy >/dev/null
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=approval-20260808-2').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:01:00Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=external-exact-head', 'APPROVAL_PROVIDER=github-environment') + 'APPROVAL_CAPABILITY_EVIDENCE_PATH='+str(p.parent/'evidence/github-capability.conf')+'\n')
 PY
 python3 - "$approval" "$request" <<'PY'
 from pathlib import Path
 import sys
 for name in sys.argv[1:]:
-    p=Path(name); p.write_text(p.read_text().replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-99-99T99:99:99Z'))
+    p=Path(name); p.write_text(p.read_text().replace('APPROVED_AT=2026-08-08T20:01:00Z', 'APPROVED_AT=2026-99-99T99:99:99Z'))
 PY
 expect_failure 'deployment request has an invalid approval time' "$runtime" deploy >/dev/null
 write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=approval-20260808-3').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:02:00Z'))
+PY
 cp "$approval" "$request"; chmod 0600 "$request"
 python3 - "$request" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=forged-approval'))
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-3', 'APPROVAL_ID=forged-approval'))
 PY
 expect_failure 'deployment request does not match protected approval APPROVAL_ID' "$runtime" deploy >/dev/null
 cp "$approval" "$request"; chmod 0600 "$request"
@@ -732,10 +785,11 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'unsafe audit storage was touched after adapter execution'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
+write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=failed-adapter-attempt'))
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=failed-adapter-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:03:00Z'))
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
@@ -743,11 +797,13 @@ printf 'deploy\n' >"$FAKE_ADAPTER_FAIL"
 expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter"
 grep -Fq 'approval=failed-adapter-attempt policy=example-staging-policy-v1 result=failed phase=adapter status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
+rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=snapshot-mutation-attempt'))
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=snapshot-mutation-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:04:00Z'))
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
@@ -758,7 +814,7 @@ write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
 import sys
-p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-replacement-attempt'))
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-replacement-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:00Z'))
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_AUDIT_TARGET=$tmp/unrelated-audit

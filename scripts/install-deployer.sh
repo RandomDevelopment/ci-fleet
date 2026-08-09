@@ -838,7 +838,8 @@ else
 fi
 case "$mode" in
   check) acquire_check_lock; perform_check ;;
-  install|upgrade|repair) acquire_lock; perform_converge ;;
+  install|upgrade|repair) acquire_lock
+    if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; else perform_converge; fi ;;
   rollback) acquire_lock; perform_rollback ;;
   drain) acquire_lock; perform_drain ;;
   resume) acquire_lock; perform_resume ;;
