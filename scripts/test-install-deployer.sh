@@ -629,6 +629,7 @@ grep -Fq 'sha256:bbbbbbbb' "$root/var/log/ci-fleet-deployer/audit.log" || fail '
 if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.log"; then fail 'audit log exposed a private-capable endpoint'; fi
 for operation in health cleanup deploy; do grep -Fxq "$operation" "$FAKE_ADAPTER_LOG" || fail "runtime did not invoke adapter $operation"; done
 : >"$root/var/lib/ci-fleet-deployer/drained"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/drained"
 expect_failure 'deployer is drained' "$runtime" deploy >/dev/null
 expect_failure 'deployer is drained' "$runtime" cleanup >/dev/null
 rm "$root/var/lib/ci-fleet-deployer/drained"
