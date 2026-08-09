@@ -21,8 +21,8 @@ drained=$state_root/drained
 last_request=$state_root/last-request.conf
 consumed_root=$state_root/consumed-requests
 install_state=$state_root/install-state.json
-deployed_policy=$state_root/deployed-policy.conf
-deployed_state=$state_root/deployed-state.json
+deployed_root=$state_root/deployed
+deployed_current=$deployed_root/current
 audit_log=$log_root/audit.log
 systemd_root=$(root_path /etc/systemd/system)
 
@@ -64,6 +64,16 @@ inside() {
   local path=$1 base=$2
   [[ $(realpath -m -- "$path") == "$(realpath -m -- "$base")/"* ]]
 }
+valid_utc() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && [[ $(date -u -d "$value" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) == "$value" ]]
+}
+not_drained() {
+  if [[ -e "$drained" || -L "$drained" ]]; then
+    secure_file "$drained" 'drain marker'
+    die 'deployer is drained'
+  fi
+}
 parse_file() {
   local path=$1 prefix=$2 kind=$3 allowed=$4 line key value
   declare -gA "$prefix=()"
@@ -84,7 +94,7 @@ parse_file() {
 secure_file "$config" 'deployer configuration'
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
-for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
+for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
@@ -107,11 +117,13 @@ case "$operation" in
     "${cfg[ADAPTER_PATH]}" "$operation"
     ;;
   cleanup)
-    [[ ! -e "$drained" ]] || die 'deployer is drained'
+    not_drained
+    reject_mixed_role
     "${cfg[ADAPTER_PATH]}" cleanup
     ;;
   deploy)
-    [[ ! -e "$drained" ]] || die 'deployer is drained'
+    not_drained
+    [[ ! -e "$active" && ! -L "$active" ]] || die 'active operation marker requires recovery'
     reject_mixed_role
     secure_file "$request" 'deployment request'
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
@@ -125,7 +137,7 @@ case "$operation" in
     done
     [[ ${req[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ && ${req[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || die 'deployment request is not immutable and qualified'
     for key in APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID; do [[ ${req[$key]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || die "deployment request has an unsafe $key"; done
-    [[ ${req[APPROVED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'deployment request has an invalid approval time'
+    valid_utc "${req[APPROVED_AT]}" || die 'deployment request has an invalid approval time'
     if [[ -e "$last_request" || -L "$last_request" ]]; then
       secure_file "$last_request" 'last completed deployment request'
       parse_file "$last_request" completed 'last completed deployment request' "$request_keys"
@@ -141,7 +153,7 @@ case "$operation" in
     parse_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" checkpoint 'checkpoint evidence' "$checkpoint_keys"
     for key in $checkpoint_keys; do [[ -v "checkpoint[$key]" ]] || die "checkpoint evidence is missing $key"; done
     [[ ${checkpoint[SCHEMA_VERSION]} == 1 && ${checkpoint[ENVIRONMENT]} == "${req[ENVIRONMENT]}" && ${checkpoint[TARGET_ID]} == "${req[TARGET_ID]}" ]] || die 'checkpoint evidence does not match the deployment target'
-    [[ ${checkpoint[CHECKPOINT_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${checkpoint[RECORDED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'checkpoint evidence is malformed'
+    if [[ ! ${checkpoint[CHECKPOINT_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${checkpoint[RECORDED_AT]}"; then die 'checkpoint evidence is malformed'; fi
     [[ -v 'cfg[APPROVAL_EVIDENCE_PATH]' ]] || die 'installed policy is missing approval evidence'
     inside "${cfg[APPROVAL_EVIDENCE_PATH]}" "$evidence_dir" || die 'approval evidence is outside the protected evidence directory'
     secure_file "${cfg[APPROVAL_EVIDENCE_PATH]}" 'approval evidence'
@@ -158,7 +170,7 @@ case "$operation" in
       parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' "$capability_keys"
       for key in $capability_keys; do [[ -v "capability[$key]" ]] || die "capability evidence is missing $key"; done
       [[ ${capability[SCHEMA_VERSION]} == 1 && ${capability[ENVIRONMENT_PROTECTION]} == verified && ${capability[EXACT_HEAD]} == "${req[SOURCE_COMMIT]}" ]] || die 'GitHub Environment capability evidence is not exact-head verified'
-      [[ ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${capability[CHECKED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'GitHub Environment capability evidence is malformed'
+      if [[ ! ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]}"; then die 'GitHub Environment capability evidence is malformed'; fi
     fi
     if [[ ${cfg[ENVIRONMENT]} == production ]]; then
       [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || die 'production policy is missing separate authorization evidence'
@@ -168,35 +180,58 @@ case "$operation" in
       parse_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" production 'production authorization evidence' "$production_keys"
       for key in $production_keys; do [[ -v "production[$key]" ]] || die "production authorization evidence is missing $key"; done
       [[ ${production[SCHEMA_VERSION]} == 1 && ${production[ENVIRONMENT]} == production ]] || die 'production authorization evidence has the wrong scope'
-      [[ ${production[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production[AUTHORIZED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'production authorization evidence is malformed'
+      if [[ ! ${production[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ || ! ${production[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${production[AUTHORIZED_AT]}"; then die 'production authorization evidence is malformed'; fi
       for key in ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do
         [[ -v "production[$key]" && ${req[$key]} == "${production[$key]}" ]] || die "deployment request does not match production authorization $key"
       done
     fi
+    [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
+    case ${cfg[CREDENTIAL_PROVIDER]} in
+      file)
+        inside "${cfg[CREDENTIAL_REF]}" "$(root_path /etc/ci-fleet-deployer/credentials)" || die 'credential reference is outside the protected credential directory'
+        secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
+        ;;
+      external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
+      *) die 'unsupported credential provider' ;;
+    esac
     if [[ -e "$consumed_root" || -L "$consumed_root" ]]; then secure_directory "$consumed_root" 'consumed request directory'; else install -d -m 0700 "$consumed_root"; fi
     request_id=$(for key in $request_keys; do printf '%s=%s\0' "$key" "${req[$key]}"; done | sha256sum | cut -d' ' -f1)
     consumed_marker=$consumed_root/$request_id
     [[ ! -e "$consumed_marker" && ! -L "$consumed_marker" ]] || die 'deployment request was already consumed'
     if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
-    : >>"$audit_log"
+    exec 8>>"$audit_log"
     secure_file "$install_state" 'deployer install state'
-    for path in "$deployed_policy" "$deployed_state"; do [[ ! -e "$path" && ! -L "$path" ]] || secure_file "$path" 'deployed rollback state'; done
-    install -m 0600 "$config" "$state_root/.deployed-policy.new"
-    install -m 0600 "$install_state" "$state_root/.deployed-state.new"
+    if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
+    if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
+      [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
+      deployed_snapshot=$(readlink -f "$deployed_current")
+      inside "$deployed_snapshot" "$deployed_root" || die 'deployed snapshot pointer escapes managed state'
+      secure_directory "$deployed_snapshot" 'deployed snapshot'
+      secure_file "$deployed_snapshot/policy.conf" 'deployed rollback policy'
+      secure_file "$deployed_snapshot/state.json" 'deployed rollback state'
+    fi
+    snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
+    chmod 0700 "$snapshot"
+    install -m 0600 "$config" "$snapshot/policy.conf"
+    install -m 0600 "$install_state" "$snapshot/state.json"
     install -m 0600 /dev/null "$consumed_marker"
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
-    trap 'rm -f "$active" "$state_root/.deployed-policy.new" "$state_root/.deployed-state.new"' EXIT INT TERM
+    trap 'rm -f "$active"; [[ -z ${snapshot:-} || ! -d $snapshot ]] || rm -rf -- "$snapshot"' EXIT INT TERM
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
       --why='approved deployment is active' -- "${cfg[ADAPTER_PATH]}" deploy
-    mv -Tf "$state_root/.deployed-policy.new" "$deployed_policy"
-    mv -Tf "$state_root/.deployed-state.new" "$deployed_state"
+    pointer=$deployed_root/.current.$$
+    ln -s "${snapshot##*/}" "$pointer"
+    mv -Tf "$pointer" "$deployed_current"
+    snapshot=
     mv -Tf "$request" "$last_request"
+    secure_file "$audit_log" 'deployer audit log'
+    [[ $(stat -Lc '%d:%i' /proc/self/fd/8) == $(stat -c '%d:%i' "$audit_log") ]] || die 'deployer audit log changed during deployment'
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=success\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
-      >>"$audit_log"
+      >&8
     ;;
 esac

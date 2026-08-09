@@ -80,8 +80,8 @@ state_file=$state_root/install-state.json
 active_policy=$state_root/active-policy.conf
 previous_state=$state_root/last-known-good.json
 previous_policy=$state_root/last-known-good-policy.conf
-deployed_state=$state_root/deployed-state.json
-deployed_policy=$state_root/deployed-policy.conf
+deployed_root=$state_root/deployed
+deployed_current=$deployed_root/current
 drained=$state_root/drained
 active_operation=$state_root/active-operation
 lock_root=$(root_path /var/lock/ci-fleet-deployer)
@@ -104,6 +104,10 @@ inside() {
   normalized=$(realpath -m -- "$path")
   normalized_base=$(realpath -m -- "$base")
   [[ "$normalized" == "$normalized_base/"* ]]
+}
+valid_utc() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && [[ $(date -u -d "$value" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) == "$value" ]]
 }
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
@@ -144,15 +148,16 @@ validate_config() {
   secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
   secure_file "$config" 'configuration file'
   parse_file "$config" cfg configuration "$config_keys"
-  local key
+  local key candidate_environment candidate_target candidate_core candidate_artifact
   for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID; do
     [[ -v "cfg[$key]" ]] || block "configuration is missing required key: $key"
   done
   [[ ${cfg[SCHEMA_VERSION]} == 1 ]] || block 'unsupported configuration schema'
-  environment=${cfg[ENVIRONMENT]}; target=${cfg[TARGET_ID]}; core_ref=${cfg[CORE_REF]:-unknown}; artifact=${cfg[ARTIFACT_IMAGE]:-unknown}
-  [[ "$environment" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || block 'invalid explicit environment'
-  [[ "$target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid explicit target identity'
-  if [[ "$mode" == drain || "$mode" == uninstall ]]; then return; fi
+  candidate_environment=${cfg[ENVIRONMENT]}; candidate_target=${cfg[TARGET_ID]}
+  [[ "$candidate_environment" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || block 'invalid explicit environment'
+  [[ "$candidate_target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid explicit target identity'
+  environment=$candidate_environment; target=$candidate_target
+  if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then return; fi
   secure_directory "$etc_root/adapters" 700 0 || block 'adapter directory is missing'
   secure_directory "$etc_root/credentials" 700 0 || block 'credential directory is missing'
   secure_directory "$etc_root/evidence" 700 0 || block 'evidence directory is missing'
@@ -161,8 +166,10 @@ validate_config() {
   done
   [[ ${cfg[DEPLOYER_IDENTITY]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid deployer identity'
   [[ ${cfg[CREDENTIAL_SCOPE]} == "$environment" ]] || block 'credential scope must exactly match the explicit environment'
-  [[ "$core_ref" =~ ^[0-9a-f]{40}$ && ${cfg[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ ]] || block 'core and source revisions must be full lowercase commit SHAs'
-  [[ ${cfg[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || block 'artifact image must be an immutable qualified digest reference'
+  candidate_core=${cfg[CORE_REF]}; candidate_artifact=${cfg[ARTIFACT_IMAGE]}
+  [[ "$candidate_core" =~ ^[0-9a-f]{40}$ && ${cfg[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ ]] || block 'core and source revisions must be full lowercase commit SHAs'
+  [[ "$candidate_artifact" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || block 'artifact image must be an immutable qualified digest reference'
+  core_ref=$candidate_core; artifact=$candidate_artifact
   [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || block 'adapter digest must be lowercase SHA-256'
   [[ ${cfg[NETWORK_HOST]} =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || block 'invalid network prerequisite host'
   [[ ${cfg[MIN_DISK_GIB]} =~ ^[1-9][0-9]{0,3}$ ]] || block 'MIN_DISK_GIB must be a positive integer'
@@ -201,7 +208,7 @@ validate_production_gate() {
   [[ ${production_gate[SCHEMA_VERSION]} == 1 && ${production_gate[ENVIRONMENT]} == production ]] || block 'production authorization evidence has the wrong scope'
   for key in TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do [[ ${production_gate[$key]} == "${cfg[$key]}" ]] || block "production authorization evidence does not match exact $key"; done
   [[ ${production_gate[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production_gate[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || block 'production authorization identity is malformed'
-  [[ ${production_gate[AUTHORIZED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'production authorization timestamp must be UTC RFC3339'
+  valid_utc "${production_gate[AUTHORIZED_AT]}" || block 'production authorization timestamp must be UTC RFC3339'
 }
 
 validate_evidence() {
@@ -218,7 +225,7 @@ validate_evidence() {
     [[ ${approval[$key]} == "${cfg[$key]}" ]] || block "approval evidence does not match exact $key"
   done
   [[ ${approval[APPROVAL_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[POLICY_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[APPROVAL_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || block 'approval identity is malformed'
-  [[ ${approval[APPROVED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'approval timestamp must be UTC RFC3339'
+  valid_utc "${approval[APPROVED_AT]}" || block 'approval timestamp must be UTC RFC3339'
   case ${cfg[APPROVAL_PROVIDER]} in
     manual-exact-head|external-exact-head) ;;
     github-environment)
@@ -227,7 +234,7 @@ validate_evidence() {
       secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
       parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' 'SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
       [[ ${capability[SCHEMA_VERSION]:-} == 1 && ${capability[ENVIRONMENT_PROTECTION]:-} == verified && ${capability[EXACT_HEAD]:-} == "${cfg[SOURCE_COMMIT]}" ]] || block 'GitHub Environment capability evidence is not exact-head verified'
-      [[ ${capability[CAPABILITY_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${capability[CHECKED_AT]:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'GitHub Environment capability evidence is missing identity or UTC time'
+      if [[ ! ${capability[CAPABILITY_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]:-}"; then block 'GitHub Environment capability evidence is missing identity or UTC time'; fi
       ;;
     *) block 'unsupported approval provider' ;;
   esac
@@ -235,7 +242,7 @@ validate_evidence() {
   secure_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" 'checkpoint evidence'
   parse_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" checkpoint 'checkpoint evidence' 'SCHEMA_VERSION ENVIRONMENT TARGET_ID CHECKPOINT_ID RECORDED_AT'
   [[ ${checkpoint[SCHEMA_VERSION]:-} == 1 && ${checkpoint[ENVIRONMENT]:-} == "$environment" && ${checkpoint[TARGET_ID]:-} == "$target" ]] || block 'checkpoint evidence does not match the explicit environment and target'
-  [[ ${checkpoint[CHECKPOINT_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${checkpoint[RECORDED_AT]:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'checkpoint evidence is malformed'
+  if [[ ! ${checkpoint[CHECKPOINT_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${checkpoint[RECORDED_AT]:-}"; then block 'checkpoint evidence is malformed'; fi
 }
 
 require_host() {
@@ -269,7 +276,7 @@ require_host() {
 
 require_maintenance_host() {
   local command
-  for command in bash awk stat readlink realpath install cp rm mkdir chmod mv flock kill systemctl date; do
+  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 systemctl systemd-analyze date; do
     command -v "$command" >/dev/null || block "$command is required for maintenance"
   done
   [[ -d "$systemd_root" && ! -L "$systemd_root" ]] || block 'systemd unit directory is unavailable'
@@ -491,8 +498,7 @@ recover_interrupted_transaction() {
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
-  install -m 0600 "$active_policy" "$deployed_policy"
-  install -m 0600 "$state_file" "$deployed_state"
+  publish_deployed_snapshot "$active_policy" "$state_file"
   rm -f "$previous_state" "$previous_policy"
   transaction_committed=1
   rm -rf -- "$transaction_dir"
@@ -555,6 +561,32 @@ with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(dict(zip(keys,values
 ' "$temporary"
   chmod 0600 "$temporary"
   mv -Tf "$temporary" "$destination"
+}
+
+load_deployed_snapshot() {
+  local snapshot
+  secure_directory "$deployed_root" 700 0 || block 'deployed snapshot directory is missing'
+  [[ -L "$deployed_current" ]] || block 'deployed snapshot pointer is absent or unsafe'
+  snapshot=$(readlink -f "$deployed_current")
+  inside "$snapshot" "$deployed_root" || block 'deployed snapshot pointer escapes managed state'
+  secure_directory "$snapshot" 700 0 || block 'deployed snapshot is unsafe'
+  secure_file "$snapshot/policy.conf" 'deployed rollback policy'
+  secure_file "$snapshot/state.json" 'deployed rollback state'
+  deployed_snapshot_policy=$snapshot/policy.conf
+  deployed_snapshot_state=$snapshot/state.json
+}
+
+publish_deployed_snapshot() {
+  local policy=$1 state=$2 snapshot pointer
+  secure_directory "$deployed_root" 700 1
+  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
+  snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
+  chmod 0700 "$snapshot"
+  install -m 0600 "$policy" "$snapshot/policy.conf"
+  install -m 0600 "$state" "$snapshot/state.json"
+  pointer=$deployed_root/.current.$$
+  ln -s "${snapshot##*/}" "$pointer"
+  mv -Tf "$pointer" "$deployed_current"
 }
 
 install_units() {
@@ -645,11 +677,10 @@ PY
   secure_directory "$log_root" 700 1
   begin_transaction
   if ((had_state && candidate_changed)); then
-    if [[ -e "$deployed_state" || -L "$deployed_state" || -e "$deployed_policy" || -L "$deployed_policy" ]]; then
-      secure_file "$deployed_state" 'deployed rollback state'
-      secure_file "$deployed_policy" 'deployed rollback policy'
-      install -m 0600 "$deployed_state" "$previous_state"
-      install -m 0600 "$deployed_policy" "$previous_policy"
+    if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
+      load_deployed_snapshot
+      install -m 0600 "$deployed_snapshot_state" "$previous_state"
+      install -m 0600 "$deployed_snapshot_policy" "$previous_policy"
     fi
   fi
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
@@ -659,13 +690,10 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_root/.install-state.new" "$state_file"
   mv -Tf "$install_root/.current.new" "$current"
-  rm -f "$drained"
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
-  if [[ ! -e "$deployed_state" && ! -L "$deployed_state" && ! -e "$deployed_policy" && ! -L "$deployed_policy" ]]; then
-    install -m 0600 "$state_file" "$deployed_state"
-    install -m 0600 "$active_policy" "$deployed_policy"
-  fi
+  if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then publish_deployed_snapshot "$active_policy" "$state_file"; fi
   commit_transaction
+  rm -f "$drained"
   health=healthy
   report CHANGED yes run-check "$(rollback_available)"
 }
@@ -734,7 +762,7 @@ perform_uninstall() {
 }
 
 validate_config
-if [[ "$mode" == drain || "$mode" == uninstall ]]; then
+if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then
   require_maintenance_host
 else
   validate_checkout

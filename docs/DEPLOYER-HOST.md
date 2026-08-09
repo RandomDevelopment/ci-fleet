@@ -215,7 +215,7 @@ sudo ./scripts/install-deployer.sh \
   --upgrade --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
-The adapter candidate passes `validate` before activation. Core stages a complete commit-pinned release, atomically switches it, writes active policy/state with mode `0600`, and keeps the prior state and policy as last-known-good. A failed candidate does not replace the current release.
+The adapter candidate passes `validate` before activation. Core stages a complete commit-pinned release, atomically switches it, writes active policy/state with mode `0600`, and derives last-known-good from the atomically published deployed policy/state snapshot rather than an undeployed candidate. A failed candidate does not replace the current release or remove drain state.
 
 Drain before reboot or maintenance; changes drain state and refuses while a deployment is active:
 
@@ -225,7 +225,7 @@ sudo ./scripts/install-deployer.sh \
 sudo systemctl start ci-fleet-deployer-drain.service
 ```
 
-Rollback changes the active core/application state but deliberately does not overwrite the operator-owned desired configuration or evidence. It refuses while a deployment is active:
+Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active:
 
 ```bash
 sudo ./scripts/install-deployer.sh \
