@@ -109,6 +109,10 @@ cat >"$adapter" <<'EOF'
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
 if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
+if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
+  health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+  ((health_calls <= FAKE_ADAPTER_FAIL_HEALTH_AFTER)) || exit 42
+fi
 if [[ -e "${FAKE_ADAPTER_FAIL:-/nonexistent}" ]]; then
   fail_operation=$(<"$FAKE_ADAPTER_FAIL")
   [[ "$fail_operation" != all && "$fail_operation" != "$1" ]] || exit 42
@@ -116,6 +120,10 @@ fi
 case "$1" in validate|health|cleanup|deploy|rollback) ;; *) exit 2 ;; esac
 if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
+fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_AUDIT_PATH:-} ]]; then
+  rm -f "$FAKE_ADAPTER_AUDIT_PATH"
+  ln -s "$FAKE_ADAPTER_AUDIT_TARGET" "$FAKE_ADAPTER_AUDIT_PATH"
 fi
 EOF
 chmod 0700 "$adapter"
@@ -202,6 +210,23 @@ write_production_gate
 expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
 rm "$production_gate"
 write_evidence
+write_config
+
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-99-99T99:99:99Z'))
+PY
+expect_failure 'approval timestamp must be UTC RFC3339' "$installer" --check --config "$config" >/dev/null
+write_evidence
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ENVIRONMENT=staging', 'ENVIRONMENT=bad result=CHANGED'))
+PY
+unsafe_report=$(expect_failure 'invalid explicit environment' "$installer" --check --config "$config")
+grep -Fq 'environment=unknown target=unknown' <<<"$unsafe_report" || fail 'report exposed unvalidated configuration fields'
+[[ "$unsafe_report" != *'environment=bad result=CHANGED'* ]] || fail 'report allowed field injection'
 write_config
 
 # Read-only preflight and strict policy variants fail closed without reading secrets.
@@ -424,6 +449,13 @@ expect_failure 'candidate adapter validation failed' "$installer" --upgrade --co
 [[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed candidate replaced healthy state'
 rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
 
+install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/drained"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1))
+expect_failure 'candidate health check failed after activation' "$installer" --upgrade --config "$config" >/dev/null
+unset FAKE_ADAPTER_FAIL_HEALTH_AFTER
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed convergence removed the drain marker'
+rm "$root/var/lib/ci-fleet-deployer/drained"
 upgrade=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'result=CHANGED' <<<"$upgrade" || fail 'upgrade did not activate new immutable artifact'
 python3 - "$approval" <<'PY'
@@ -442,7 +474,13 @@ rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
 FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'application rollback ran before core rollback staging was proven'
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed rollback did not preserve current core state'
+mv "$approval" "$approval.rollback-saved"
+mv "$checkpoint" "$checkpoint.rollback-saved"
+export FAKE_CURL_EXIT=1
 rollback=$(expect_success "$installer" --rollback --config "$config")
+unset FAKE_CURL_EXIT
+mv "$approval.rollback-saved" "$approval"
+mv "$checkpoint.rollback-saved" "$checkpoint"
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'rollback did not restore last-known-good state'
 grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'rollback state lacks prior artifact'
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'rollback report lacks the exact operator reconciliation action'
@@ -504,11 +542,29 @@ chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+printf 'pid=999999\nstarted_at=1\n' >"$root/var/lib/ci-fleet-deployer/active-operation"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'active operation marker requires recovery' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment replaced an unresolved active marker'
+rm "$root/var/lib/ci-fleet-deployer/active-operation"
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.late-added.service"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" deploy >/dev/null
+expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" cleanup >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran after role isolation drift'
+[[ $(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true) == "$cleanup_calls_before" ]] || fail 'cleanup ran after role isolation drift'
 rm "$root/etc/systemd/system/actions.runner.late-added.service"
+python3 - "$approval" "$request" <<'PY'
+from pathlib import Path
+import sys
+for name in sys.argv[1:]:
+    p=Path(name); p.write_text(p.read_text().replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-99-99T99:99:99Z'))
+PY
+expect_failure 'deployment request has an invalid approval time' "$runtime" deploy >/dev/null
+write_evidence staging example-staging
+cp "$approval" "$request"; chmod 0600 "$request"
 python3 - "$request" <<'PY'
 from pathlib import Path
 import sys
@@ -526,14 +582,34 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'GitHub capability evidence must be a regular file' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without GitHub capability evidence'
 mv "$capability.saved" "$capability"
+chmod 0644 "$credential"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran with unsafe file credentials'
+chmod 0600 "$credential"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'unsafe audit storage was touched after adapter execution'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-replacement-attempt'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_AUDIT_TARGET=$tmp/unrelated-audit
+expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_AUDIT_PATH FAKE_ADAPTER_AUDIT_TARGET
+[[ $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'adapter audit replacement redirected the trusted append'
+rm "$root/var/log/ci-fleet-deployer/audit.log"
+write_evidence staging example-staging
+cp "$approval" "$request"; chmod 0600 "$request"
 expect_success "$runtime" deploy >/dev/null
 [[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
+deployed_current=$root/var/lib/ci-fleet-deployer/deployed/current
+[[ -L "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'deployed policy/state pair was not published through one pointer'
 { printf '# semantic replay with different bytes\n'; tac "$root/var/lib/ci-fleet-deployer/last-request.conf"; } >"$request"
 chmod 0600 "$request"
 expect_failure 'deployment request was already completed' "$runtime" deploy >/dev/null
@@ -555,6 +631,10 @@ for operation in health cleanup deploy; do grep -Fxq "$operation" "$FAKE_ADAPTER
 : >"$root/var/lib/ci-fleet-deployer/drained"
 expect_failure 'deployer is drained' "$runtime" deploy >/dev/null
 expect_failure 'deployer is drained' "$runtime" cleanup >/dev/null
+rm "$root/var/lib/ci-fleet-deployer/drained"
+ln -s "$tmp/missing-drain-target" "$root/var/lib/ci-fleet-deployer/drained"
+expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" cleanup >/dev/null
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
