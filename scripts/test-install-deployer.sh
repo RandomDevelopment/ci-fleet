@@ -349,6 +349,10 @@ chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$stale_stage" && ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'bounded stale transaction recovery did not converge'
+printf 'pid=%s\nstarted_at=1\n' "$$" >"$root/var/lib/ci-fleet-deployer/active-operation"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'old operation marker survived PID reuse'
 
 exec 8<"$root/var/lock/ci-fleet-deployer"
 flock -n 8 || fail 'fixture could not acquire installer lock'
@@ -422,6 +426,13 @@ rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
 
 upgrade=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'result=CHANGED' <<<"$upgrade" || fail 'upgrade did not activate new immutable artifact'
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=approval-20260808-2'))
+PY
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/last-known-good.json" || fail 'second undeployed upgrade replaced the deployed rollback point'
 printf 'rollback\n' >"$tmp/fail-rollback"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
@@ -479,6 +490,13 @@ repeat_uninstall=$(expect_success "$installer" --uninstall --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$repeat_uninstall" || fail 'repeated uninstall was not idempotent'
 
 # Runtime contract: exact-head request/evidence, drain and scoped adapter calls.
+write_evidence staging example-staging
+write_config staging example-staging
+python3 - "$config" "$capability" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=manual-exact-head', 'APPROVAL_PROVIDER=github-environment') + 'APPROVAL_CAPABILITY_EVIDENCE_PATH='+sys.argv[2]+'\n')
+PY
 expect_success "$installer" --install --config "$config" >/dev/null
 request=$root/var/lib/ci-fleet-deployer/request.conf
 cp "$approval" "$request"
@@ -486,6 +504,11 @@ chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+printf 'runner\n' >"$root/etc/systemd/system/actions.runner.late-added.service"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran after role isolation drift'
+rm "$root/etc/systemd/system/actions.runner.late-added.service"
 python3 - "$request" <<'PY'
 from pathlib import Path
 import sys
@@ -498,6 +521,11 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'checkpoint evidence must be a regular file' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without checkpoint evidence'
 mv "$checkpoint.saved" "$checkpoint"
+mv "$capability" "$capability.saved"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'GitHub capability evidence must be a regular file' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without GitHub capability evidence'
+mv "$capability.saved" "$capability"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
@@ -509,6 +537,18 @@ expect_success "$runtime" deploy >/dev/null
 { printf '# semantic replay with different bytes\n'; tac "$root/var/lib/ci-fleet-deployer/last-request.conf"; } >"$request"
 chmod 0600 "$request"
 expect_failure 'deployment request was already completed' "$runtime" deploy >/dev/null
+cp "$root/var/lib/ci-fleet-deployer/last-request.conf" "$tmp/request-a"
+cp "$approval" "$tmp/approval-a"
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=approval-20260808-2').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:01:00Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+expect_success "$runtime" deploy >/dev/null
+cp "$tmp/approval-a" "$approval"; chmod 0600 "$approval"
+cp "$tmp/request-a" "$request"; chmod 0600 "$request"
+expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
 grep -Fq 'sha256:bbbbbbbb' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit log omitted the immutable digest'
 if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.log"; then fail 'audit log exposed a private-capable endpoint'; fi
 for operation in health cleanup deploy; do grep -Fxq "$operation" "$FAKE_ADAPTER_LOG" || fail "runtime did not invoke adapter $operation"; done
