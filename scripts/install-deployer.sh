@@ -61,6 +61,7 @@ rollback_available() {
   [[ $(stat -c '%u:%a' "$previous_state" 2>/dev/null) == "$expected_uid:600" && $(stat -c '%u:%a' "$previous_policy" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
   python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || { printf no; return; }
 import json, sys
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError):
@@ -72,13 +73,19 @@ try:
         if not line or line.startswith('#'):
             continue
         key, sep, value = line.partition('=')
-        if not sep:
+        if not sep or key not in allowed or key in policy or not value:
             raise SystemExit(1)
         policy[key] = value
 except OSError:
     raise SystemExit(1)
+import re
+sha = re.compile(r'^[0-9a-f]{40}$')
 pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
-raise SystemExit(0 if all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs) else 1)
+ok = (all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
+      and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
+      and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact']))
+      and policy.get('SCHEMA_VERSION') == '1')
+raise SystemExit(0 if ok else 1)
 PY
   printf yes
 }
@@ -184,9 +191,9 @@ parse_file() {
 validate_config() {
   inside "$config" "$etc_root" || block "configuration path must be inside $etc_root"
   secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
-  if [[ "$mode" == rollback ]]; then
-    # Rollback must work from the retained pair even when the operator-owned
-    # candidate configuration is missing or malformed.
+  if [[ "$mode" == rollback || "$mode" == uninstall ]]; then
+    # Rollback and uninstall must work even when the operator-owned candidate
+    # configuration is missing or malformed.
     declare -gA cfg=()
     if [[ -f "$config" && ! -L "$config" && $(stat -c '%u:%a' "$config" 2>/dev/null) == "$expected_uid:600" ]]; then
       validated_config=$(mktemp)
@@ -466,7 +473,7 @@ acquire_check_lock() {
 }
 
 begin_transaction() {
-  local name path current_target transaction_name transaction_ready
+  local name path current_target transaction_name transaction_ready deployed_target
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -502,6 +509,13 @@ begin_transaction() {
   for name in "${timer_names[@]}"; do
     if systemctl is-enabled "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
   done
+  if [[ -L "$deployed_current" ]]; then
+    deployed_target=$(readlink "$deployed_current")
+    [[ "$deployed_target" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'deployed snapshot pointer is unsafe'
+    printf '%s\n' "$deployed_target" >"$transaction_dir/deployed-target"
+  elif [[ -e "$deployed_current" ]]; then block 'deployed snapshot pointer has an unsafe type'
+  else printf 'absent\n' >"$transaction_dir/deployed-target"
+  fi
   transaction_name=${transaction_dir##*/}
   transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
   mv "$transaction_dir" "$transaction_ready"
@@ -533,6 +547,16 @@ restore_transaction() {
     target_value=$(<"$transaction_dir/current-target")
     [[ "$target_value" =~ ^releases/[0-9a-f]{40}$ ]] || block 'transaction current pointer is unsafe'
     ln -s "$target_value" "$current" || return
+  fi
+  if [[ -f "$transaction_dir/deployed-target" ]]; then
+    target_value=$(<"$transaction_dir/deployed-target")
+    if [[ "$target_value" == absent ]]; then
+      rm -f -- "$deployed_current" || return
+    else
+      [[ "$target_value" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction deployed pointer is unsafe'
+      rm -f -- "$deployed_current" || return
+      ln -s "$target_value" "$deployed_current" || return
+    fi
   fi
   systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
