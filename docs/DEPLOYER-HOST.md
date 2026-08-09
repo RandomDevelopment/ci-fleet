@@ -225,6 +225,13 @@ sudo ./scripts/install-deployer.sh \
 sudo systemctl start ci-fleet-deployer-drain.service
 ```
 
+After maintenance, explicitly resume through the same serialized installer boundary. This validates and removes only the managed drain marker and is idempotent:
+
+```bash
+sudo ./scripts/install-deployer.sh \
+  --resume --config /etc/ci-fleet-deployer/deployer.conf
+```
+
 Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active:
 
 ```bash
