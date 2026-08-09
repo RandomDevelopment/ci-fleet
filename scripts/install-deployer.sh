@@ -385,6 +385,7 @@ active_deployment() {
   started=$(awk -F= '$1=="started_at" {print $2}' "$active_operation")
   [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 0
   now=$(date +%s)
+  ((started <= now)) || return 0
   ((now - started <= 3600)) || return 1
   kill -0 "$pid" 2>/dev/null || return 0
   return 0
@@ -509,6 +510,7 @@ begin_transaction() {
   done
   for name in "${timer_names[@]}"; do
     if systemctl is-enabled "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
+    if systemctl is-active "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-active"; fi
   done
   if [[ -L "$deployed_current" ]]; then
     deployed_target=$(readlink "$deployed_current")
@@ -563,8 +565,14 @@ restore_transaction() {
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
     while IFS= read -r name; do
       [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
-      systemctl enable --now "$name" >/dev/null 2>&1 || return
+      systemctl enable "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-enabled"
+  fi
+  if [[ -f "$transaction_dir/timers-active" ]]; then
+    while IFS= read -r name; do
+      [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
+      systemctl start "$name" >/dev/null 2>&1 || return
+    done <"$transaction_dir/timers-active"
   fi
   rm -rf -- "$transaction_dir" || return
   transaction_dir=
@@ -675,6 +683,32 @@ load_deployed_snapshot() {
   secure_file "$snapshot/state.json" 'deployed rollback state'
   deployed_snapshot_policy=$snapshot/policy.conf
   deployed_snapshot_state=$snapshot/state.json
+  python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
+import json, re, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+policy = {}
+try:
+    for line in open(sys.argv[2], encoding='utf-8'):
+        line = line.rstrip('\n')
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if not sep or key in policy:
+            raise SystemExit(1)
+        policy[key] = value
+except OSError:
+    raise SystemExit(1)
+sha = re.compile(r'^[0-9a-f]{40}$')
+pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
+ok = (policy.get('SCHEMA_VERSION') == '1'
+      and all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
+      and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
+      and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
+raise SystemExit(0 if ok else 1)
+PY
 }
 
 publish_deployed_snapshot() {
@@ -744,6 +778,7 @@ policy_adapter_operation() {
   parse_file "$policy" policy_cfg "$description" "$config_keys"
   for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
+  inside "${policy_cfg[ADAPTER_PATH]}" "$etc_root/adapters" || die "$description adapter path is outside the protected adapter directory"
   [[ ${policy_cfg[CREDENTIAL_SCOPE]} == "${policy_cfg[ENVIRONMENT]}" ]] || die "$description credential scope does not match its environment"
   case ${policy_cfg[CREDENTIAL_PROVIDER]} in
     file)
@@ -790,6 +825,12 @@ v=json.load(open(sys.argv[1])); print(v.get('environment',''),v.get('target','')
 PY
 )
     [[ "$old_environment" == "$environment" && "$old_target" == "$target" ]] || block 'installed environment and target identity cannot change in place'
+    old_deployer_identity=$(python3 - "$state_file" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1])).get('deployer_identity',''))
+PY
+)
+    [[ -z "$old_deployer_identity" || "$old_deployer_identity" == "${cfg[DEPLOYER_IDENTITY]}" ]] || block 'installed deployer ownership identity cannot change in place'
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || block 'deployed rollback snapshot is missing; restore it before convergence'
     load_deployed_snapshot
     if [[ "$mode" == install && -L "$current" ]] && ! state_matches; then block 'install cannot select a new candidate; use --upgrade or --repair'; fi
