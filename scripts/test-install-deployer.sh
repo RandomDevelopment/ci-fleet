@@ -519,6 +519,10 @@ expect_failure 'candidate adapter validation failed' "$installer" --upgrade --co
 [[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed candidate replaced healthy state'
 rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
 
+chmod 0644 "$credential"
+expect_failure 'credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
+chmod 0600 "$credential"
+
 install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/drained"
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1))
@@ -603,7 +607,21 @@ rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'config-independent rollback did not report change'
 mv "$tmp/config.saved" "$config"; chmod 0600 "$config"
 expect_success "$installer" --repair --config "$config" >/dev/null
+printf 'malformed line\n' >"$config"; chmod 0600 "$config"
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'malformed-config rollback did not report change'
+write_config
+expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
+
+# rollback_available must reflect a validated retained pair.
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'expected a retained rollback point'
+chmod 0644 "$root/var/lib/ci-fleet-deployer/last-known-good.json"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'drifted retained pair still reported rollback_available=yes'
+chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good.json"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid retained pair was not reported rollback_available=yes'
 
 write_production_gate
 write_evidence production example-production
@@ -752,6 +770,17 @@ PY
 python3 - "$config" <<'PY'
 from pathlib import Path
 import sys
+p=Path(sys.argv[1]); p.write_text('\n'.join(x for x in p.read_text().splitlines() if not x.startswith('CORE_REF='))+'\n')
+PY
+expect_failure 'configuration is missing a valid core revision' "$runtime" deploy >/dev/null
+python3 - "$config" "$core_ref" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text() + 'CORE_REF='+sys.argv[2]+'\n')
+PY
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environmnt', 'APPROVAL_PROVIDER=external-exact-head').replace('APPROVAL_CAPABILITY_EVIDENCE_PATH='+str(p.parent/'evidence/github-capability.conf'), '').rstrip()+'\n')
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
@@ -826,7 +855,7 @@ export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
 printf 'deploy\n' >"$FAKE_ADAPTER_FAIL"
 expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter"
-grep -Fq 'approval=failed-adapter-attempt policy=example-staging-policy-v1 result=failed phase=adapter status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
+grep -Fq 'approval=failed-adapter-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=adapter status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
 rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 write_evidence staging example-staging
@@ -839,7 +868,7 @@ cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
 expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
-grep -Fq 'approval=snapshot-mutation-attempt policy=example-staging-policy-v1 result=failed phase=post-adapter' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited'
+grep -Fq 'approval=snapshot-mutation-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=post-adapter' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited'
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path

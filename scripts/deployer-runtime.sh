@@ -33,9 +33,10 @@ deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
   if [[ ${audit_pending:-0} == 1 ]]; then
-    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=failed phase=%s status=%s\n' \
+    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
   rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
@@ -43,6 +44,7 @@ deploy_exit() {
 }
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
+declare -A production=()
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
   [[ ! -L "$path" && -f "$path" ]] || die "$description must be a regular file, not a symlink"
@@ -146,6 +148,7 @@ config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADA
 parse_file "$config" cfg configuration "$config_keys"
 for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[SCHEMA_VERSION]:-} == 1 ]] || die 'configuration has an unsupported or missing schema version'
+[[ ${cfg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
@@ -258,6 +261,7 @@ case "$operation" in
     install -m 0600 "$install_state" "$snapshot/state.json"
     snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
     snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
+    reject_mixed_role
     install -m 0600 /dev/null "$consumed_marker"
     audit_pending=1
     audit_phase=pre-adapter
@@ -293,9 +297,10 @@ case "$operation" in
     request_snapshot=
     secure_file "$audit_log" 'deployer audit log'
     [[ $(stat -Lc '%d:%i' /proc/self/fd/8) == $(stat -c '%d:%i' "$audit_log") ]] || die 'deployer audit log changed during deployment'
-    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=success\n' \
+    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=success\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       >&8
     audit_pending=0
     ;;
