@@ -412,6 +412,12 @@ expect_failure 'unsafe symlinked managed directory' "$installer" --repair --conf
 rm "$root/var/lock/ci-fleet-deployer"
 mv "$root/var/lock/ci-fleet-deployer.real" "$root/var/lock/ci-fleet-deployer"
 
+mkdir -p "$root/run"
+mv "$root/var/lock" "$root/run/lock"
+ln -s ../run/lock "$root/var/lock"
+expect_success "$installer" --check --config "$config" >/dev/null
+rm "$root/var/lock"; mv "$root/run/lock" "$root/var/lock"
+
 unit_path=$root/etc/systemd/system/ci-fleet-deployer.service
 mv "$unit_path" "$unit_path.real"
 printf 'unrelated-unit\n' >"$tmp/unrelated-unit"
@@ -468,11 +474,19 @@ PY
 write_evidence
 expect_success "$installer" --repair --config "$config" >/dev/null
 
+mv "$root/var/lib/ci-fleet-deployer/active-policy.conf" "$root/var/lib/ci-fleet-deployer/active-policy.missing"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/active-policy.conf" ]] || fail 'repair did not restore a missing active policy'
+rm "$root/var/lib/ci-fleet-deployer/active-policy.missing"
+
 printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
-export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1)) FAKE_SYSTEMCTL_FAIL_COMMAND=disable
+# Repair bypasses only the untrusted old-policy health probe, so the candidate
+# health check after activation is the next (and only) adapter health call.
+export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before)) FAKE_SYSTEMCTL_FAIL_COMMAND=disable
 expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL_HEALTH_AFTER FAKE_SYSTEMCTL_FAIL_COMMAND
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == $((health_calls_before + 1)) ]] || fail 'repair did not run exactly the candidate health check'
 compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null || fail 'failed restoration deleted its recovery transaction'
 expect_success "$installer" --repair --config "$config" >/dev/null
 if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'retry did not recover the retained transaction'; fi
@@ -522,6 +536,13 @@ rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
 FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'application rollback ran before core rollback staging was proven'
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed rollback did not preserve current core state'
+cp "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$tmp/last-known-good.saved"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good.json" <<'PY'
+import json, sys
+p=sys.argv[1]; value=json.load(open(p)); value['core_ref']='2222222222222222222222222222222222222222'; json.dump(value,open(p,'w'),indent=2,sort_keys=True)
+PY
+expect_failure 'last-known-good state and policy do not match' "$installer" --rollback --config "$config" >/dev/null
+cp "$tmp/last-known-good.saved" "$root/var/lib/ci-fleet-deployer/last-known-good.json"; chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good.json"
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.rollback-drift.service"
 expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'rollback adapter ran after role isolation drift'
@@ -658,6 +679,17 @@ expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" he
 [[ $(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true) == "$cleanup_calls_before" ]] || fail 'cleanup ran after role isolation drift'
 [[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'health adapter ran after role isolation drift'
 rm "$root/etc/systemd/system/actions.runner.late-added.service"
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environment', 'APPROVAL_PROVIDER=github-environmnt'))
+PY
+expect_failure 'unsupported approval provider' "$runtime" deploy >/dev/null
+python3 - "$config" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environmnt', 'APPROVAL_PROVIDER=github-environment'))
+PY
 python3 - "$approval" "$request" <<'PY'
 from pathlib import Path
 import sys
@@ -710,7 +742,7 @@ export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
 printf 'deploy\n' >"$FAKE_ADAPTER_FAIL"
 expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter"
-grep -Fq 'approval=failed-adapter-attempt policy=example-staging-policy-v1 result=failed status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
+grep -Fq 'approval=failed-adapter-attempt policy=example-staging-policy-v1 result=failed phase=adapter status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
@@ -721,6 +753,7 @@ cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
 expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
+grep -Fq 'approval=snapshot-mutation-attempt policy=example-staging-policy-v1 result=failed phase=post-adapter' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited'
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path

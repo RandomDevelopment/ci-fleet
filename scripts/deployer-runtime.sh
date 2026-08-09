@@ -29,6 +29,18 @@ audit_log=$log_root/audit.log
 systemd_root=$(root_path /etc/systemd/system)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+deploy_exit() {
+  local status=$?
+  local recorded_status=${adapter_status:-$status}
+  if [[ ${audit_pending:-0} == 1 ]]; then
+    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=failed phase=%s status=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
+      "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
+  fi
+  rm -f "$active" "${request_snapshot:-}" || true
+  return "$status"
+}
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
 secure_file() {
@@ -41,7 +53,6 @@ secure_file() {
 secure_directory() {
   local path=$1 description=$2
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
-  [[ "$path" == "$(realpath -m -- "$path")" ]] || die "$description path contains a symlink or non-canonical component"
 }
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
@@ -194,16 +205,20 @@ case "$operation" in
     for key in $approval_keys; do
       [[ -v "approved[$key]" && ${req[$key]} == "${approved[$key]}" ]] || die "deployment request does not match protected approval $key"
     done
-    if [[ ${cfg[APPROVAL_PROVIDER]} == github-environment ]]; then
-      [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || die 'GitHub Environment approval is missing capability evidence'
-      inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$evidence_dir" || die 'capability evidence is outside the protected evidence directory'
-      secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
-      capability_keys='SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
-      parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' "$capability_keys"
-      for key in $capability_keys; do [[ -v "capability[$key]" ]] || die "capability evidence is missing $key"; done
-      [[ ${capability[SCHEMA_VERSION]} == 1 && ${capability[ENVIRONMENT_PROTECTION]} == verified && ${capability[EXACT_HEAD]} == "${req[SOURCE_COMMIT]}" ]] || die 'GitHub Environment capability evidence is not exact-head verified'
-      if [[ ! ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]}"; then die 'GitHub Environment capability evidence is malformed'; fi
-    fi
+    case ${cfg[APPROVAL_PROVIDER]} in
+      manual-exact-head) ;;
+      github-environment)
+        [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || die 'GitHub Environment approval is missing capability evidence'
+        inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$evidence_dir" || die 'capability evidence is outside the protected evidence directory'
+        secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
+        capability_keys='SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+        parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' "$capability_keys"
+        for key in $capability_keys; do [[ -v "capability[$key]" ]] || die "capability evidence is missing $key"; done
+        [[ ${capability[SCHEMA_VERSION]} == 1 && ${capability[ENVIRONMENT_PROTECTION]} == verified && ${capability[EXACT_HEAD]} == "${req[SOURCE_COMMIT]}" ]] || die 'GitHub Environment capability evidence is not exact-head verified'
+        if [[ ! ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]}"; then die 'GitHub Environment capability evidence is malformed'; fi
+        ;;
+      *) die 'unsupported approval provider' ;;
+    esac
     if [[ ${cfg[ENVIRONMENT]} == production ]]; then
       [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || die 'production policy is missing separate authorization evidence'
       inside "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" "$evidence_dir" || die 'production authorization evidence is outside the protected evidence directory'
@@ -239,22 +254,25 @@ case "$operation" in
     snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
     snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
     install -m 0600 /dev/null "$consumed_marker"
+    audit_pending=1
+    audit_phase=pre-adapter
+    adapter_status=
+    trap deploy_exit EXIT
+    trap 'exit 2' INT TERM
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
-    trap 'rm -f "$active" "${request_snapshot:-}"' EXIT INT TERM
     set +e
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
       --why='approved deployment is active' -- env CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
     if ((adapter_status != 0)); then
-      printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=failed status=%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-        "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" "$adapter_status" >&8
+      audit_phase=adapter
       die 'deployment adapter failed after approval consumption'
     fi
+    audit_phase=post-adapter
     secure_directory "$deployed_root" 'deployed snapshot directory'
     inside "$snapshot" "$deployed_root" || die 'prepared deployed snapshot escaped managed state'
     secure_directory "$snapshot" 'prepared deployed snapshot'
@@ -274,5 +292,6 @@ case "$operation" in
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
       >&8
+    audit_pending=0
     ;;
 esac
