@@ -110,6 +110,12 @@ cat >"$adapter" <<'EOF'
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
 if [[ -n ${FAKE_ADAPTER_FORBID_CONFIG_PATH:-} && ${CI_FLEET_DEPLOYER_CONFIG:-} == "$FAKE_ADAPTER_FORBID_CONFIG_PATH" ]]; then exit 43; fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_FORBID_REQUEST_PATH:-} && ${CI_FLEET_DEPLOYER_REQUEST:-} == "$FAKE_ADAPTER_FORBID_REQUEST_PATH" ]]; then exit 44; fi
+if [[ -n ${FAKE_ADAPTER_REPLACE_PATH:-} && -e $FAKE_ADAPTER_REPLACE_PATH ]]; then
+  mv "$FAKE_ADAPTER_REPLACE_PATH" "$FAKE_ADAPTER_REPLACE_PATH.saved"
+  printf '#!/usr/bin/env bash\nexit 45\n' >"$FAKE_ADAPTER_REPLACE_PATH"
+  chmod 0700 "$FAKE_ADAPTER_REPLACE_PATH"
+fi
 if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
 if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
@@ -344,6 +350,12 @@ expect_failure 'installed deployer state is absent or drifted' "$installer" --ch
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ $(stat -c %a "$root/etc/systemd/system/ci-fleet-deployer.service") == 644 ]] || fail 'repair did not restore unit mode 0644'
 
+preparing=$root/var/lib/ci-fleet-deployer/.transaction-preparing.interrupted
+mkdir -m 0700 "$preparing"
+state_before_preparing=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$preparing" && "$state_before_preparing" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'incomplete transaction preparation was treated as recovery state'
+
 interrupted=$root/var/lib/ci-fleet-deployer/.transaction.interrupted
 mkdir -m 0700 "$interrupted" "$interrupted/units" "$interrupted/state"
 for name in install-state.json active-policy.conf; do
@@ -546,6 +558,9 @@ rm "$active"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+mv "$fake_bin/docker" "$fake_bin/docker.unavailable"
+expect_success "$installer" --drain --config "$config" >/dev/null
+mv "$fake_bin/docker.unavailable" "$fake_bin/docker"
 chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed resume removed drain state'
@@ -553,6 +568,7 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'repair implicitly resumed the deployer'
 resume=$(expect_success "$installer" --resume --config "$config")
 grep -Fq 'result=CHANGED' <<<"$resume" || fail 'resume did not clear drain state'
+grep -Fq 'health=healthy' <<<"$resume" || fail 'resume report omitted verified health'
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'resume retained drain state'
 chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
@@ -604,6 +620,10 @@ expect_success "$runtime" drain >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'runtime drain required a healthy adapter'
 rm "$root/var/lib/ci-fleet-deployer/drained"
 mv "$adapter.saved" "$adapter"
+export FAKE_ADAPTER_REPLACE_PATH=$adapter
+expect_success "$runtime" health >/dev/null
+unset FAKE_ADAPTER_REPLACE_PATH
+rm "$adapter"; mv "$adapter.saved" "$adapter"
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
 chmod 0644 "$credential"
@@ -611,6 +631,11 @@ cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" cleanup >/dev/null
 [[ $(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true) == "$cleanup_calls_before" ]] || fail 'cleanup ran with unsafe file credentials'
 chmod 0600 "$credential"
+mv "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/credentials.real"
+ln -s "$root/etc/ci-fleet-deployer/credentials.real" "$root/etc/ci-fleet-deployer/credentials"
+expect_failure 'credential directory has unsafe owner, mode, or type' "$runtime" cleanup >/dev/null
+rm "$root/etc/ci-fleet-deployer/credentials"
+mv "$root/etc/ci-fleet-deployer/credentials.real" "$root/etc/ci-fleet-deployer/credentials"
 mkdir "$root/var/lib/ci-fleet-deployer/.transaction.interrupted"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'interrupted installer transaction requires recovery' "$runtime" deploy >/dev/null
@@ -710,7 +735,9 @@ unset FAKE_ADAPTER_AUDIT_PATH FAKE_ADAPTER_AUDIT_TARGET
 rm "$root/var/log/ci-fleet-deployer/audit.log"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_FORBID_REQUEST_PATH=$request
 expect_success "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_FORBID_REQUEST_PATH
 [[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
 deployed_current=$root/var/lib/ci-fleet-deployer/deployed/current
 [[ -L "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'deployed policy/state pair was not published through one pointer'

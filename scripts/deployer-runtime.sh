@@ -16,6 +16,8 @@ state_root=$(root_path /var/lib/ci-fleet-deployer)
 log_root=$(root_path /var/log/ci-fleet-deployer)
 lock_dir=$(root_path /var/lock/ci-fleet-deployer)
 evidence_dir=$(root_path /etc/ci-fleet-deployer/evidence)
+deployer_etc=$(root_path /etc/ci-fleet-deployer)
+credential_dir=$deployer_etc/credentials
 active=$state_root/active-operation
 drained=$state_root/drained
 last_request=$state_root/last-request.conf
@@ -32,12 +34,14 @@ expected_uid=0
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
   [[ ! -L "$path" && -f "$path" ]] || die "$description must be a regular file, not a symlink"
+  [[ "$path" == "$(realpath -m -- "$path")" ]] || die "$description path contains a symlink or non-canonical component"
   [[ $(realpath -e -- "$path") == $(realpath -m -- "$path") ]] || die "$description path contains a symlink"
   [[ $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || die "$description has unsafe owner or mode"
 }
 secure_directory() {
   local path=$1 description=$2
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
+  [[ "$path" == "$(realpath -m -- "$path")" ]] || die "$description path contains a symlink or non-canonical component"
 }
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
@@ -92,10 +96,12 @@ parse_file() {
 }
 
 validate_credential() {
+  secure_directory "$deployer_etc" 'deployer configuration directory'
+  secure_directory "$credential_dir" 'credential directory'
   [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
   case ${cfg[CREDENTIAL_PROVIDER]} in
     file)
-      inside "${cfg[CREDENTIAL_REF]}" "$(root_path /etc/ci-fleet-deployer/credentials)" || die 'credential reference is outside the protected credential directory'
+      inside "${cfg[CREDENTIAL_REF]}" "$credential_dir" || die 'credential reference is outside the protected credential directory'
       secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
       ;;
     external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
@@ -127,7 +133,9 @@ for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 C
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
-[[ $(sha256sum "${cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
+exec 7<"${cfg[ADAPTER_PATH]}"
+[[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
+adapter_path=/proc/$$/fd/7
 validate_credential
 
 secure_directory "$log_root" 'deployer log directory'
@@ -135,20 +143,23 @@ secure_directory "$log_root" 'deployer log directory'
 case "$operation" in
   health)
     reject_mixed_role
-    "${cfg[ADAPTER_PATH]}" "$operation"
+    "$adapter_path" "$operation"
     ;;
   cleanup)
     not_drained
     reject_mixed_role
-    "${cfg[ADAPTER_PATH]}" cleanup
+    "$adapter_path" cleanup
     ;;
   deploy)
     not_drained
     [[ ! -e "$active" && ! -L "$active" ]] || die 'active operation marker requires recovery'
     reject_mixed_role
     secure_file "$request" 'deployment request'
+    request_snapshot=$(mktemp "$state_root/.request.XXXXXX")
+    install -m 0600 "$request" "$request_snapshot"
+    trap 'rm -f "${request_snapshot:-}"' EXIT INT TERM
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
-    parse_file "$request" req request "$request_keys"
+    parse_file "$request_snapshot" req request "$request_keys"
     for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT; do
       [[ -v "req[$key]" ]] || die "deployment request is missing $key"
     done
@@ -232,10 +243,10 @@ case "$operation" in
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
-    trap 'rm -f "$active"' EXIT INT TERM
+    trap 'rm -f "$active" "${request_snapshot:-}"' EXIT INT TERM
     set +e
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='approved deployment is active' -- "${cfg[ADAPTER_PATH]}" deploy
+      --why='approved deployment is active' -- env CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
     if ((adapter_status != 0)); then
@@ -254,7 +265,9 @@ case "$operation" in
     ln -s "${snapshot##*/}" "$pointer"
     mv -Tf "$pointer" "$deployed_current"
     snapshot=
-    mv -Tf "$request" "$last_request"
+    if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
+    mv -Tf "$request_snapshot" "$last_request"
+    request_snapshot=
     secure_file "$audit_log" 'deployer audit log'
     [[ $(stat -Lc '%d:%i' /proc/self/fd/8) == $(stat -c '%d:%i' "$audit_log") ]] || die 'deployer audit log changed during deployment'
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=success\n' \
