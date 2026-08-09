@@ -91,6 +91,15 @@ parse_file() {
   done <"$path"
 }
 
+secure_directory "$state_root" 'deployer state directory'
+secure_directory "$lock_dir" 'deployer lock directory'
+exec 9<"$lock_dir"
+flock -n 9 || die 'another deployer operation is running'
+shopt -s nullglob
+transactions=("$state_root"/.transaction.*)
+shopt -u nullglob
+((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
+
 secure_file "$config" 'deployer configuration'
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
@@ -100,11 +109,7 @@ for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 C
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
 [[ $(sha256sum "${cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
 
-secure_directory "$state_root" 'deployer state directory'
 secure_directory "$log_root" 'deployer log directory'
-secure_directory "$lock_dir" 'deployer lock directory'
-exec 9<"$lock_dir"
-flock -n 9 || die 'another deployer operation is running'
 
 case "$operation" in
   drain)

@@ -33,7 +33,7 @@ trap on_exit EXIT
 
 usage() {
   cat >&2 <<'EOF'
-usage: install-deployer.sh --check|--install|--upgrade|--repair|--rollback|--drain|--uninstall --config /etc/ci-fleet-deployer/deployer.conf
+usage: install-deployer.sh --check|--install|--upgrade|--repair|--rollback|--drain|--resume|--uninstall --config /etc/ci-fleet-deployer/deployer.conf
 
 Modes are explicit and mutually exclusive. Configuration and credential references
 are host-local; secret values are never accepted as arguments.
@@ -50,7 +50,7 @@ block() { error_reported=1; printf 'BLOCKED: %s\n' "$*" >&2; report BLOCKED no r
 
 while (($#)); do
   case "$1" in
-    --check|--install|--upgrade|--repair|--rollback|--drain|--uninstall)
+    --check|--install|--upgrade|--repair|--rollback|--drain|--resume|--uninstall)
       [[ -z "$mode" ]] || die 'select exactly one operating mode'
       mode=${1#--}; action=$mode; shift ;;
     --config) (($# >= 2)) || die '--config requires a value'; config=$2; shift 2 ;;
@@ -157,7 +157,7 @@ validate_config() {
   [[ "$candidate_environment" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || block 'invalid explicit environment'
   [[ "$candidate_target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid explicit target identity'
   environment=$candidate_environment; target=$candidate_target
-  if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then return; fi
+  if [[ "$mode" == drain || "$mode" == resume || "$mode" == uninstall || "$mode" == rollback ]]; then return; fi
   secure_directory "$etc_root/adapters" 700 0 || block 'adapter directory is missing'
   secure_directory "$etc_root/credentials" 700 0 || block 'credential directory is missing'
   secure_directory "$etc_root/evidence" 700 0 || block 'evidence directory is missing'
@@ -737,6 +737,15 @@ perform_drain() {
   report CHANGED yes safe-to-maintain "$(rollback_available)"
 }
 
+perform_resume() {
+  secure_directory "$state_root" 700 0 || block 'deployer state directory is missing'
+  if active_deployment; then block 'active deployment prevents resume'; fi
+  if [[ ! -e "$drained" && ! -L "$drained" ]]; then report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; fi
+  secure_file "$drained" 'drain marker'
+  rm -f "$drained"
+  report CHANGED yes ready-to-deploy "$(rollback_available)"
+}
+
 perform_uninstall() {
   local changed=no unit managed_present=no
   if [[ -e "$state_root" || -L "$state_root" || -e "$lock_root" || -L "$lock_root" || -e "$current" || -L "$current" ]]; then managed_present=yes; fi
@@ -762,7 +771,7 @@ perform_uninstall() {
 }
 
 validate_config
-if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then
+if [[ "$mode" == drain || "$mode" == resume || "$mode" == uninstall || "$mode" == rollback ]]; then
   require_maintenance_host
 else
   validate_checkout
@@ -773,5 +782,6 @@ case "$mode" in
   install|upgrade|repair) acquire_lock; perform_converge ;;
   rollback) acquire_lock; perform_rollback ;;
   drain) acquire_lock; perform_drain ;;
+  resume) acquire_lock; perform_resume ;;
   uninstall) perform_uninstall ;;
 esac

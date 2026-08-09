@@ -502,6 +502,12 @@ rm "$active"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+resume=$(expect_success "$installer" --resume --config "$config")
+grep -Fq 'result=CHANGED' <<<"$resume" || fail 'resume did not clear drain state'
+[[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'resume retained drain state'
+repeat_resume=$(expect_success "$installer" --resume --config "$config")
+grep -Fq 'result=NO_CHANGE' <<<"$repeat_resume" || fail 'repeated resume was not idempotent'
+expect_success "$installer" --drain --config "$config" >/dev/null
 rm "$root/var/lib/ci-fleet-deployer/drained"
 printf 'unrelated-drain-target\n' >"$tmp/unrelated-drain-target"
 ln -s "$tmp/unrelated-drain-target" "$root/var/lib/ci-fleet-deployer/drained"
@@ -542,6 +548,11 @@ chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+mkdir "$root/var/lib/ci-fleet-deployer/.transaction.interrupted"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'interrupted installer transaction requires recovery' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran during an interrupted installer transaction'
+rmdir "$root/var/lib/ci-fleet-deployer/.transaction.interrupted"
 printf 'pid=999999\nstarted_at=1\n' >"$root/var/lib/ci-fleet-deployer/active-operation"
 chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
@@ -640,7 +651,10 @@ expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" c
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
 grep -Fq 'scripts/test-deployer-units.sh' "$repo_root/scripts/validate.sh" || fail 'repository validation omits systemd unit verification'
-for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
+lock_line=$(grep -n 'flock -n 9' "$runtime" | cut -d: -f1)
+policy_line=$(grep -n "secure_file \"\$config\" 'deployer configuration'" "$runtime" | cut -d: -f1)
+((lock_line < policy_line)) || fail 'runtime loads active policy before acquiring the shared operation lock'
+for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--resume' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
   grep -Fq -- "$phrase" "$repo_root/docs/DEPLOYER-HOST.md" || fail "deployer runbook omits $phrase"
 done
 for unit in "$repo_root"/deploy/deployer/*; do
