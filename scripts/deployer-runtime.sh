@@ -3,7 +3,7 @@ set -Eeuo pipefail
 set +x
 
 operation=${1:-}
-case "$operation" in health|cleanup|deploy|rollback|drain) ;; *) printf 'ERROR: usage: deployer-runtime.sh health|cleanup|deploy|rollback|drain\n' >&2; exit 2 ;; esac
+case "$operation" in health|cleanup|deploy|drain) ;; *) printf 'ERROR: usage: deployer-runtime.sh health|cleanup|deploy|drain\n' >&2; exit 2 ;; esac
 
 root=${CI_FLEET_DEPLOYER_ROOT:-}
 testing=${CI_FLEET_DEPLOYER_TESTING:-0}
@@ -100,6 +100,14 @@ transactions=("$state_root"/.transaction.*)
 shopt -u nullglob
 ((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
 
+if [[ "$operation" == drain ]]; then
+  [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'
+  temporary=$(mktemp "$state_root/.drained.XXXXXX")
+  chmod 0600 "$temporary"
+  mv -Tf "$temporary" "$drained"
+  exit 0
+fi
+
 secure_file "$config" 'deployer configuration'
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
@@ -112,13 +120,8 @@ secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
 secure_directory "$log_root" 'deployer log directory'
 
 case "$operation" in
-  drain)
-    [[ ! -e "$active" ]] || die 'active deployment prevents drain'
-    temporary=$(mktemp "$state_root/.drained.XXXXXX")
-    chmod 0600 "$temporary"
-    mv -Tf "$temporary" "$drained"
-    ;;
-  health|rollback)
+  health)
+    reject_mixed_role
     "${cfg[ADAPTER_PATH]}" "$operation"
     ;;
   cleanup)
