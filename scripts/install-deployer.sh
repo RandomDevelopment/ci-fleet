@@ -19,11 +19,15 @@ artifact=unknown
 health=unknown
 staging_path=
 transaction_dir=
+transaction_preparing=0
 transaction_committed=0
 recovered_rollback=0
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
+  if [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
+    rm -rf -- "$transaction_dir"
+    transaction_dir=
+  elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
     if [[ -f "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback; recovery_status=$?; else restore_transaction; recovery_status=$?; fi
     set -e
@@ -120,12 +124,14 @@ valid_utc() {
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
   [[ ! -L "$path" && -f "$path" ]] || block "$description must be a regular file, not a symlink"
+  [[ "$path" == "$(realpath -m -- "$path")" ]] || block "$description path contains a symlink or non-canonical component"
   [[ $(realpath -e -- "$path") == $(realpath -m -- "$path") ]] || block "$description path contains a symlink"
   [[ $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || block "$description must be owned by root with mode 0$mode"
 }
 secure_directory() {
   local path=$1 mode=$2 create=${3:-0}
   [[ ! -L "$path" ]] || die "unsafe symlinked managed directory: $path"
+  [[ "$path" == "$(realpath -m -- "$path")" ]] || die "managed directory path contains a symlink or non-canonical component: $path"
   if [[ ! -e "$path" ]]; then
     [[ "$create" == 1 ]] || return 1
     install -d -m "$mode" "$path"
@@ -287,7 +293,7 @@ require_host() {
 
 require_maintenance_host() {
   local command
-  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 docker systemctl systemd-analyze date; do
+  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 systemctl systemd-analyze date; do
     command -v "$command" >/dev/null || block "$command is required for maintenance"
   done
   [[ -d "$systemd_root" && ! -L "$systemd_root" ]] || block 'systemd unit directory is unavailable'
@@ -403,6 +409,12 @@ acquire_lock() {
     done
     shopt -u nullglob
   fi
+  shopt -s nullglob
+  for path in "$state_root"/.transaction-preparing.*; do
+    [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || block 'incomplete transaction preparation is unsafe'
+    rm -rf -- "$path"
+  done
+  shopt -u nullglob
   recover_interrupted_transaction
 }
 
@@ -413,7 +425,7 @@ acquire_check_lock() {
 }
 
 begin_transaction() {
-  local name path current_target
+  local name path current_target transaction_name transaction_ready
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -427,7 +439,8 @@ begin_transaction() {
     path=$systemd_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c %u "$path") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
   done
-  transaction_dir=$(mktemp -d "$state_root/.transaction.XXXXXX")
+  transaction_dir=$(mktemp -d "$state_root/.transaction-preparing.XXXXXX")
+  transaction_preparing=1
   chmod 0700 "$transaction_dir"
   install -d -m 0700 "$transaction_dir/units" "$transaction_dir/state"
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
@@ -448,6 +461,11 @@ begin_transaction() {
   for name in "${timer_names[@]}"; do
     if systemctl is-enabled "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
   done
+  transaction_name=${transaction_dir##*/}
+  transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
+  mv "$transaction_dir" "$transaction_ready"
+  transaction_dir=$transaction_ready
+  transaction_preparing=0
 }
 
 restore_transaction() {
@@ -637,6 +655,14 @@ run_adapter() {
   fi
 }
 
+run_verified_adapter() {
+  local policy=$1 path=$2 digest=$3 operation_name=$4 marker=${5:-}
+  secure_file "$path" "$operation_name adapter" 700
+  exec 7<"$path"
+  [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "$digest" ]] || die "$operation_name adapter digest mismatch"
+  run_adapter "$policy" "/proc/$$/fd/7" "$operation_name" "$marker"
+}
+
 policy_adapter_operation() {
   local policy=$1 operation_name=$2 description=$3 marker=${4:-} key
   local -A policy_cfg=()
@@ -644,9 +670,7 @@ policy_adapter_operation() {
   parse_file "$policy" policy_cfg "$description" "$config_keys"
   for key in ADAPTER_PATH ADAPTER_SHA256; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
-  secure_file "${policy_cfg[ADAPTER_PATH]}" "$description adapter" 700
-  [[ $(sha256sum "${policy_cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${policy_cfg[ADAPTER_SHA256]}" ]] || die "$description adapter digest mismatch"
-  run_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "$operation_name" "$marker" >/dev/null 2>&1
+  run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null 2>&1
 }
 
 perform_check() {
@@ -690,7 +714,7 @@ PY
     release_complete "$old_release" || block 'active deployer release is incomplete'
     policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'
   fi
-  run_adapter "$config" "${cfg[ADAPTER_PATH]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
+  run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
   install_release
   secure_directory "$state_root" 700 1
   secure_directory "$log_root" 700 1
@@ -726,6 +750,7 @@ perform_rollback() {
   parse_file "$previous_policy" rollback_policy 'last-known-good policy' "$config_keys"
   [[ -v 'rollback_policy[DEPLOYER_IDENTITY]' ]] || block 'last-known-good policy is missing deployer identity'
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
+  command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
   begin_transaction
   install -m 0600 "$previous_state" "$state_file.new"
@@ -768,6 +793,7 @@ perform_resume() {
   if [[ -e "$drained" || -L "$drained" ]]; then secure_file "$drained" 'drain marker'; was_drained=1; fi
   converged || block 'installed deployer state is absent or drifted; repair before resume'
   policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed; repair before resume'
+  health=healthy
   ((was_drained == 1)) || { report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; }
   rm -f "$drained"
   report CHANGED yes ready-to-deploy "$(rollback_available)"
