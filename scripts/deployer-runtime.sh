@@ -40,6 +40,7 @@ deploy_exit() {
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
   rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
+  [[ -z ${snapshot:-} ]] || rm -rf -- "$snapshot" || true
   return "$status"
 }
 expected_uid=0
@@ -151,6 +152,7 @@ for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 C
 [[ ${cfg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
+inside "${cfg[ADAPTER_PATH]}" "$(root_path /etc/ci-fleet-deployer/adapters)" || die 'application adapter is outside the protected adapter directory'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
 exec 7<"${cfg[ADAPTER_PATH]}"
 [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
@@ -247,14 +249,14 @@ case "$operation" in
     if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
     exec 8>>"$audit_log"
     secure_file "$install_state" 'deployer install state'
-    state_core_ref=$(python3 - "$install_state" <<'PY'
+    python3 - "$install_state" "${cfg[CORE_REF]}" "${cfg[ENVIRONMENT]}" "${cfg[TARGET_ID]}" "${cfg[DEPLOYER_IDENTITY]}" "${cfg[SOURCE_COMMIT]}" "${cfg[ARTIFACT_IMAGE]}" <<'PY' >/dev/null 2>&1 || die 'deployer install state is malformed'
 import json, sys
 try: value = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError): raise SystemExit(1)
-print(value.get('core_ref', ''))
+keys = ('core_ref', 'environment', 'target', 'deployer_identity', 'source_commit', 'artifact')
+raise SystemExit(0 if all(value.get(k) == v for k, v in zip(keys, sys.argv[2:])) else 1)
 PY
-    ) || die 'deployer install state is malformed'
-    [[ "$state_core_ref" =~ ^[0-9a-f]{40}$ && "$state_core_ref" == "${cfg[CORE_REF]}" ]] || die 'deployer install state does not match the active policy core revision'
+    [[ ${cfg[CORE_REF]} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
     if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || die 'deployed rollback snapshot is missing'
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
