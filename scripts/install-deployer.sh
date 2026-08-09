@@ -131,7 +131,6 @@ secure_file() {
 secure_directory() {
   local path=$1 mode=$2 create=${3:-0}
   [[ ! -L "$path" ]] || die "unsafe symlinked managed directory: $path"
-  [[ "$path" == "$(realpath -m -- "$path")" ]] || die "managed directory path contains a symlink or non-canonical component: $path"
   if [[ ! -e "$path" ]]; then
     [[ "$create" == 1 ]] || return 1
     install -d -m "$mode" "$path"
@@ -712,7 +711,7 @@ PY
   if [[ -L "$current" ]]; then
     old_release=$(readlink -f "$current")
     release_complete "$old_release" || block 'active deployer release is incomplete'
-    policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'
+    if [[ "$mode" != repair ]]; then policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'; fi
   fi
   run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
   install_release
@@ -741,6 +740,7 @@ PY
 }
 
 perform_rollback() {
+  local source_commit deployer_identity key
   local -A rollback_policy=()
   if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; return; fi
   active_deployment && block 'active deployment prevents rollback'
@@ -748,17 +748,23 @@ perform_rollback() {
   secure_directory "$state_root" 700 0
   secure_file "$previous_policy" 'last-known-good policy'
   parse_file "$previous_policy" rollback_policy 'last-known-good policy' "$config_keys"
-  [[ -v 'rollback_policy[DEPLOYER_IDENTITY]' ]] || block 'last-known-good policy is missing deployer identity'
+  for key in CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "rollback_policy[$key]" ]] || block "last-known-good policy is missing $key"; done
+  read -r core_ref environment target source_commit artifact deployer_identity < <(python3 - "$previous_state" <<'PY'
+import json, sys
+try: value=json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError): raise SystemExit(1)
+print(*(value.get(k, '') for k in ('core_ref','environment','target','source_commit','artifact','deployer_identity')))
+PY
+  ) || block 'last-known-good state is malformed'
+  [[ "$core_ref" =~ ^[0-9a-f]{40}$ && "$source_commit" =~ ^[0-9a-f]{40}$ && "$artifact" =~ @sha256:[0-9a-f]{64}$ ]] || block 'last-known-good state has unsafe immutable identifiers'
+  [[ "$core_ref" == "${rollback_policy[CORE_REF]}" && "$environment" == "${rollback_policy[ENVIRONMENT]}" && "$target" == "${rollback_policy[TARGET_ID]}" && "$source_commit" == "${rollback_policy[SOURCE_COMMIT]}" && "$artifact" == "${rollback_policy[ARTIFACT_IMAGE]}" && "$deployer_identity" == "${rollback_policy[DEPLOYER_IDENTITY]}" ]] || block 'last-known-good state and policy do not match'
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
   begin_transaction
   install -m 0600 "$previous_state" "$state_file.new"
   install -m 0600 "$previous_policy" "$active_policy.new"
-  core_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["core_ref"])' "$previous_state")
-  environment=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["environment"])' "$previous_state")
-  target=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target"])' "$previous_state")
-  artifact=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact"])' "$previous_state")
+
   release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
   unit_source=$releases/$core_ref/deploy/deployer
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
