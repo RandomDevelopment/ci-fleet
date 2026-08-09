@@ -610,8 +610,17 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 printf 'malformed line\n' >"$config"; chmod 0600 "$config"
 rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'malformed-config rollback did not report change'
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'malformed-config uninstall retained the activation pointer'
 write_config
-expect_success "$installer" --repair --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --install --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # rollback_available must reflect a validated retained pair.
@@ -804,6 +813,7 @@ for name in sys.argv[1:]:
     p=Path(name); p.write_text(p.read_text().replace('APPROVED_AT=2026-08-08T20:01:00Z', 'APPROVED_AT=2026-99-99T99:99:99Z'))
 PY
 expect_failure 'deployment request has an invalid approval time' "$runtime" deploy >/dev/null
+compgen -G "$root/var/lib/ci-fleet-deployer/.active-policy.*" >/dev/null && fail 'rejected request left a stale policy snapshot'
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path

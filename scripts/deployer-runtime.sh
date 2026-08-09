@@ -176,7 +176,7 @@ case "$operation" in
     secure_file "$request" 'deployment request'
     request_snapshot=$(mktemp "$state_root/.request.XXXXXX")
     install -m 0600 "$request" "$request_snapshot"
-    trap 'rm -f "${request_snapshot:-}"' EXIT INT TERM
+    trap 'rm -f "${request_snapshot:-}" "${policy_snapshot:-}"' EXIT INT TERM
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
     parse_file "$request_snapshot" req request "$request_keys"
     for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT; do
@@ -247,6 +247,14 @@ case "$operation" in
     if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
     exec 8>>"$audit_log"
     secure_file "$install_state" 'deployer install state'
+    state_core_ref=$(python3 - "$install_state" <<'PY'
+import json, sys
+try: value = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError): raise SystemExit(1)
+print(value.get('core_ref', ''))
+PY
+    ) || die 'deployer install state is malformed'
+    [[ "$state_core_ref" =~ ^[0-9a-f]{40}$ && "$state_core_ref" == "${cfg[CORE_REF]}" ]] || die 'deployer install state does not match the active policy core revision'
     if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || die 'deployed rollback snapshot is missing'
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
