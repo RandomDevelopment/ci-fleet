@@ -109,6 +109,7 @@ cat >"$adapter" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
+[[ -z ${FAKE_ADAPTER_RECORD_CONFIG:-} ]] || { printf '%s\n' "${CI_FLEET_DEPLOYER_CONFIG:-unset}" >"$FAKE_ADAPTER_RECORD_CONFIG"; : >"$FAKE_ADAPTER_RECORD_CONFIG.seen"; cp "${CI_FLEET_DEPLOYER_CONFIG:-/dev/null}" "$FAKE_ADAPTER_RECORD_CONFIG.content" 2>/dev/null || true; }
 if [[ -n ${FAKE_ADAPTER_FORBID_CONFIG_PATH:-} && ${CI_FLEET_DEPLOYER_CONFIG:-} == "$FAKE_ADAPTER_FORBID_CONFIG_PATH" ]]; then exit 43; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_FORBID_REQUEST_PATH:-} && ${CI_FLEET_DEPLOYER_REQUEST:-} == "$FAKE_ADAPTER_FORBID_REQUEST_PATH" ]]; then exit 44; fi
 if [[ -n ${FAKE_ADAPTER_REPLACE_PATH:-} && -e $FAKE_ADAPTER_REPLACE_PATH ]]; then
@@ -455,6 +456,13 @@ PY
 expect_failure 'credential reference must be a regular file, not a symlink' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/ci-fleet-deployer/credentials/symlinked"
 write_config
+python3 - "$config" "$root/etc/ci-fleet-deployer/credentials/./application.credential" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_REF='+str(p.parent/'credentials/application.credential'), 'CREDENTIAL_REF='+sys.argv[2]))
+PY
+expect_failure 'credential reference contains a symlink or non-canonical component' "$installer" --check --config "$config" >/dev/null
+write_config
 
 printf 'bad\n' >>"$approval"
 approval_error=$(expect_failure 'malformed approval evidence line' "$installer" --check --config "$config")
@@ -582,6 +590,21 @@ grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail '
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# A lost install state with surviving release/units must not be treated as a fresh install.
+mv "$root/var/lib/ci-fleet-deployer/install-state.json" "$tmp/install-state.saved"
+expect_failure 'restore install state before convergence' "$installer" --repair --config "$config" >/dev/null
+mv "$tmp/install-state.saved" "$root/var/lib/ci-fleet-deployer/install-state.json"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/install-state.json"
+expect_success "$installer" --repair --config "$config" >/dev/null
+
+# Rollback must work from the retained pair without a usable candidate config.
+mv "$config" "$tmp/config.saved"
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'config-independent rollback did not report change'
+mv "$tmp/config.saved" "$config"; chmod 0600 "$config"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 write_production_gate
 write_evidence production example-production
 write_config production example-production
@@ -670,6 +693,13 @@ unset FAKE_ADAPTER_REPLACE_PATH
 rm "$adapter"; mv "$adapter.saved" "$adapter"
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+adapter_config=$tmp/adapter-config
+FAKE_ADAPTER_RECORD_CONFIG=$adapter_config expect_success "$runtime" health >/dev/null
+unset FAKE_ADAPTER_RECORD_CONFIG
+[[ -e "$adapter_config.seen" ]] || fail 'adapter config snapshot was not recorded'
+[[ $(<"$adapter_config") == "$root"/var/lib/ci-fleet-deployer/.active-policy.* ]] || fail 'adapter did not receive an immutable policy snapshot path'
+cmp -s "$adapter_config.content" "$root/var/lib/ci-fleet-deployer/active-policy.conf" || fail 'adapter policy snapshot content differs from the validated policy'
+compgen -G "$root/var/lib/ci-fleet-deployer/.active-policy.*" >/dev/null && fail 'policy snapshot was not cleaned up'
 chmod 0644 "$credential"
 cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" cleanup >/dev/null

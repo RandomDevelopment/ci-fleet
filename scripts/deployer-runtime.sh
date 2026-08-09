@@ -38,7 +38,7 @@ deploy_exit() {
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
-  rm -f "$active" "${request_snapshot:-}" || true
+  rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   return "$status"
 }
 expected_uid=0
@@ -138,6 +138,10 @@ if [[ "$operation" == drain ]]; then
 fi
 
 secure_file "$config" 'deployer configuration'
+policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
+install -m 0600 "$config" "$policy_snapshot"
+config=$policy_snapshot
+trap 'rm -f "${policy_snapshot:-}"' EXIT
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
 for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
@@ -155,12 +159,12 @@ secure_directory "$log_root" 'deployer log directory'
 case "$operation" in
   health)
     reject_mixed_role
-    "$adapter_path" "$operation"
+    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" "$operation"
     ;;
   cleanup)
     not_drained
     reject_mixed_role
-    "$adapter_path" cleanup
+    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup
     ;;
   deploy)
     not_drained
@@ -266,7 +270,7 @@ case "$operation" in
     mv -Tf "$temporary" "$active"
     set +e
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='approved deployment is active' -- env CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
+      --why='approved deployment is active' -- env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
     if ((adapter_status != 0)); then
