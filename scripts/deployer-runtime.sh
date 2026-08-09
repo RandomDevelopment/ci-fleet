@@ -91,6 +91,18 @@ parse_file() {
   done <"$path"
 }
 
+validate_credential() {
+  [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
+  case ${cfg[CREDENTIAL_PROVIDER]} in
+    file)
+      inside "${cfg[CREDENTIAL_REF]}" "$(root_path /etc/ci-fleet-deployer/credentials)" || die 'credential reference is outside the protected credential directory'
+      secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
+      ;;
+    external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
+    *) die 'unsupported credential provider' ;;
+  esac
+}
+
 secure_directory "$state_root" 'deployer state directory'
 secure_directory "$lock_dir" 'deployer lock directory'
 exec 9<"$lock_dir"
@@ -116,6 +128,7 @@ for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 C
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
 [[ $(sha256sum "${cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
+validate_credential
 
 secure_directory "$log_root" 'deployer log directory'
 
@@ -193,15 +206,6 @@ case "$operation" in
         [[ -v "production[$key]" && ${req[$key]} == "${production[$key]}" ]] || die "deployment request does not match production authorization $key"
       done
     fi
-    [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
-    case ${cfg[CREDENTIAL_PROVIDER]} in
-      file)
-        inside "${cfg[CREDENTIAL_REF]}" "$(root_path /etc/ci-fleet-deployer/credentials)" || die 'credential reference is outside the protected credential directory'
-        secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
-        ;;
-      external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
-      *) die 'unsupported credential provider' ;;
-    esac
     if [[ -e "$consumed_root" || -L "$consumed_root" ]]; then secure_directory "$consumed_root" 'consumed request directory'; else install -d -m 0700 "$consumed_root"; fi
     request_id=$(for key in $request_keys; do printf '%s=%s\0' "$key" "${req[$key]}"; done | sha256sum | cut -d' ' -f1)
     consumed_marker=$consumed_root/$request_id
@@ -210,26 +214,42 @@ case "$operation" in
     exec 8>>"$audit_log"
     secure_file "$install_state" 'deployer install state'
     if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
-    if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
-      [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
-      deployed_snapshot=$(readlink -f "$deployed_current")
-      inside "$deployed_snapshot" "$deployed_root" || die 'deployed snapshot pointer escapes managed state'
-      secure_directory "$deployed_snapshot" 'deployed snapshot'
-      secure_file "$deployed_snapshot/policy.conf" 'deployed rollback policy'
-      secure_file "$deployed_snapshot/state.json" 'deployed rollback state'
-    fi
+    [[ -e "$deployed_current" || -L "$deployed_current" ]] || die 'deployed rollback snapshot is missing'
+    [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
+    deployed_snapshot=$(readlink -f "$deployed_current")
+    inside "$deployed_snapshot" "$deployed_root" || die 'deployed snapshot pointer escapes managed state'
+    secure_directory "$deployed_snapshot" 'deployed snapshot'
+    secure_file "$deployed_snapshot/policy.conf" 'deployed rollback policy'
+    secure_file "$deployed_snapshot/state.json" 'deployed rollback state'
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
     chmod 0700 "$snapshot"
     install -m 0600 "$config" "$snapshot/policy.conf"
     install -m 0600 "$install_state" "$snapshot/state.json"
+    snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
+    snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
     install -m 0600 /dev/null "$consumed_marker"
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
-    trap 'rm -f "$active"; [[ -z ${snapshot:-} || ! -d $snapshot ]] || rm -rf -- "$snapshot"' EXIT INT TERM
+    trap 'rm -f "$active"' EXIT INT TERM
+    set +e
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
       --why='approved deployment is active' -- "${cfg[ADAPTER_PATH]}" deploy
+    adapter_status=$?
+    set -e
+    if ((adapter_status != 0)); then
+      printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=failed status=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+        "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" "$adapter_status" >&8
+      die 'deployment adapter failed after approval consumption'
+    fi
+    secure_directory "$deployed_root" 'deployed snapshot directory'
+    inside "$snapshot" "$deployed_root" || die 'prepared deployed snapshot escaped managed state'
+    secure_directory "$snapshot" 'prepared deployed snapshot'
+    secure_file "$snapshot/policy.conf" 'prepared deployed policy'
+    secure_file "$snapshot/state.json" 'prepared deployed state'
+    [[ $(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1) == "$snapshot_policy_sha" && $(sha256sum "$snapshot/state.json" | cut -d' ' -f1) == "$snapshot_state_sha" ]] || die 'prepared deployed snapshot changed during deployment'
     pointer=$deployed_root/.current.$$
     ln -s "${snapshot##*/}" "$pointer"
     mv -Tf "$pointer" "$deployed_current"

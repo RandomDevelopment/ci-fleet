@@ -6,6 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode=
 config=
+validated_config=
 error_reported=0
 root=${CI_FLEET_DEPLOYER_ROOT:-}
 testing=${CI_FLEET_DEPLOYER_TESTING:-0}
@@ -32,6 +33,7 @@ on_exit() {
     fi
   fi
   [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
+  [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
   return "$status"
 }
@@ -153,6 +155,9 @@ validate_config() {
   inside "$config" "$etc_root" || block "configuration path must be inside $etc_root"
   secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
   secure_file "$config" 'configuration file'
+  validated_config=$(mktemp)
+  install -m 0600 "$config" "$validated_config"
+  config=$validated_config
   parse_file "$config" cfg configuration "$config_keys"
   local key candidate_environment candidate_target candidate_core candidate_artifact
   for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID; do
@@ -282,7 +287,7 @@ require_host() {
 
 require_maintenance_host() {
   local command
-  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 systemctl systemd-analyze date; do
+  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 docker systemctl systemd-analyze date; do
     command -v "$command" >/dev/null || block "$command is required for maintenance"
   done
   [[ -d "$systemd_root" && ! -L "$systemd_root" ]] || block 'systemd unit directory is unavailable'
@@ -345,11 +350,11 @@ release_complete() {
 state_matches() {
   [[ -f "$state_file" && ! -L "$state_file" && $(stat -c '%u:%a' "$state_file") == "$expected_uid:600" ]] || return 1
   [[ -f "$active_policy" && ! -L "$active_policy" && $(stat -c '%u:%a' "$active_policy") == "$expected_uid:600" && $(cmp -s "$config" "$active_policy"; echo $?) == 0 ]] || return 1
-  printf '%s\n' "$core_ref" "$environment" "$target" "${cfg[DEPLOYER_IDENTITY]}" "${cfg[SOURCE_COMMIT]}" "$artifact" "${approval[APPROVAL_ID]}" "${approval[POLICY_IDENTITY]}" "${cfg[APPROVAL_PROVIDER]}" "${checkpoint[CHECKPOINT_ID]}" | python3 -c '
+  printf '%s\n' "$core_ref" "$environment" "$target" "${cfg[DEPLOYER_IDENTITY]}" "${cfg[SOURCE_COMMIT]}" "$artifact" "${approval[APPROVAL_ID]}" "${approval[APPROVAL_IDENTITY]}" "${approval[POLICY_IDENTITY]}" "${cfg[APPROVAL_PROVIDER]}" "${checkpoint[CHECKPOINT_ID]}" | python3 -c '
 import json, sys
 try: value=json.load(open(sys.argv[1], encoding="utf-8"))
 except (OSError, ValueError): raise SystemExit(1)
-keys=("core_ref","environment","target","deployer_identity","source_commit","artifact","approval_id","policy_identity","approval_provider","checkpoint_id")
+keys=("core_ref","environment","target","deployer_identity","source_commit","artifact","approval_id","approval_identity","policy_identity","approval_provider","checkpoint_id")
 expected=[line.rstrip("\n") for line in sys.stdin]
 raise SystemExit(0 if all(value.get(k)==v for k,v in zip(keys,expected)) else 1)
 ' "$state_file"
@@ -385,6 +390,7 @@ acquire_lock() {
   secure_directory "$lock_root" 700 1
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer installer operation is running'
+  [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" ]] && ! active_deployment; then
     [[ ! -L "$active_operation" && -f "$active_operation" && $(stat -c '%u:%a' "$active_operation") == "$expected_uid:600" ]] || block 'stale operation state is unsafe'
     rm -f "$active_operation"
@@ -711,10 +717,16 @@ PY
 }
 
 perform_rollback() {
+  local -A rollback_policy=()
   if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; return; fi
   active_deployment && block 'active deployment prevents rollback'
   [[ -f "$previous_state" && -f "$previous_policy" ]] || block 'no last-known-good release is available'
   secure_directory "$state_root" 700 0
+  secure_file "$previous_policy" 'last-known-good policy'
+  parse_file "$previous_policy" rollback_policy 'last-known-good policy' "$config_keys"
+  [[ -v 'rollback_policy[DEPLOYER_IDENTITY]' ]] || block 'last-known-good policy is missing deployer identity'
+  cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
+  reject_mixed_role
   begin_transaction
   install -m 0600 "$previous_state" "$state_file.new"
   install -m 0600 "$previous_policy" "$active_policy.new"
@@ -752,10 +764,11 @@ perform_drain() {
 perform_resume() {
   secure_directory "$state_root" 700 0 || block 'deployer state directory is missing'
   if active_deployment; then block 'active deployment prevents resume'; fi
-  if [[ ! -e "$drained" && ! -L "$drained" ]]; then report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; fi
-  secure_file "$drained" 'drain marker'
+  local was_drained=0
+  if [[ -e "$drained" || -L "$drained" ]]; then secure_file "$drained" 'drain marker'; was_drained=1; fi
   converged || block 'installed deployer state is absent or drifted; repair before resume'
   policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed; repair before resume'
+  ((was_drained == 1)) || { report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; }
   rm -f "$drained"
   report CHANGED yes ready-to-deploy "$(rollback_available)"
 }
