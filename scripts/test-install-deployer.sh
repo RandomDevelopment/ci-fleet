@@ -109,6 +109,7 @@ cat >"$adapter" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
+if [[ -n ${FAKE_ADAPTER_FORBID_CONFIG_PATH:-} && ${CI_FLEET_DEPLOYER_CONFIG:-} == "$FAKE_ADAPTER_FORBID_CONFIG_PATH" ]]; then exit 43; fi
 if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
 if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
@@ -125,6 +126,10 @@ fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_AUDIT_PATH:-} ]]; then
   rm -f "$FAKE_ADAPTER_AUDIT_PATH"
   ln -s "$FAKE_ADAPTER_AUDIT_TARGET" "$FAKE_ADAPTER_AUDIT_PATH"
+fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
+  snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+  [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
 fi
 EOF
 chmod 0700 "$adapter"
@@ -320,7 +325,9 @@ fresh_uninstall=$(expect_success "$installer" --uninstall --config "$config")
 [[ "$after" == "$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'fresh uninstall mutated an unmanaged host'
 grep -Fq 'result=NO_CHANGE' <<<"$fresh_uninstall" || fail 'fresh uninstall did not report NO_CHANGE'
 
+export FAKE_ADAPTER_FORBID_CONFIG_PATH=$config
 first=$(expect_success "$installer" --install --config "$config")
+unset FAKE_ADAPTER_FORBID_CONFIG_PATH
 grep -Fq 'REPORT action=install result=CHANGED environment=staging' <<<"$first" || fail 'fresh install report is incomplete'
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'fresh install lacks atomic current release'
 [[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/install-state.json") == 600 ]] || fail 'install state mode is not 0600'
@@ -436,6 +443,19 @@ approval_error=$(expect_failure 'malformed approval evidence line' "$installer" 
 [[ "$approval_error" != *CANARY_SECRET_VALUE_DO_NOT_PRINT* ]] || fail 'secret content leaked beside evidence failure'
 write_evidence
 
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_IDENTITY=example-reviewer', 'APPROVAL_IDENTITY=alternate-reviewer'))
+PY
+expect_success "$installer" --repair --config "$config" >/dev/null
+python3 - "$root/var/lib/ci-fleet-deployer/install-state.json" <<'PY' || fail 'approval identity drift was not recorded'
+import json, sys
+assert json.load(open(sys.argv[1]))['approval_identity'] == 'alternate-reviewer'
+PY
+write_evidence
+expect_success "$installer" --repair --config "$config" >/dev/null
+
 printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1)) FAKE_SYSTEMCTL_FAIL_COMMAND=disable
@@ -490,6 +510,10 @@ rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
 FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'application rollback ran before core rollback staging was proven'
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed rollback did not preserve current core state'
+printf 'runner\n' >"$root/etc/systemd/system/actions.runner.rollback-drift.service"
+expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --rollback --config "$config" >/dev/null
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'rollback adapter ran after role isolation drift'
+rm "$root/etc/systemd/system/actions.runner.rollback-drift.service"
 mv "$approval" "$approval.rollback-saved"
 mv "$checkpoint" "$checkpoint.rollback-saved"
 export FAKE_CURL_EXIT=1
@@ -510,6 +534,10 @@ write_evidence
 write_config staging example-staging
 
 active=$root/var/lib/ci-fleet-deployer/active-operation
+printf 'unrelated-active\n' >"$tmp/unrelated-active"
+ln -s "$tmp/unrelated-active" "$active"
+expect_failure 'active operation marker is an unsafe symlink' "$installer" --repair --config "$config" >/dev/null
+rm "$active"
 printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$active"
 chmod 0600 "$active"
 expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
@@ -526,6 +554,9 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 resume=$(expect_success "$installer" --resume --config "$config")
 grep -Fq 'result=CHANGED' <<<"$resume" || fail 'resume did not clear drain state'
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'resume retained drain state'
+chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
 repeat_resume=$(expect_success "$installer" --resume --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$repeat_resume" || fail 'repeated resume was not idempotent'
 expect_success "$installer" --drain --config "$config" >/dev/null
@@ -575,6 +606,11 @@ rm "$root/var/lib/ci-fleet-deployer/drained"
 mv "$adapter.saved" "$adapter"
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+chmod 0644 "$credential"
+cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'credential file has unsafe owner or mode' "$runtime" cleanup >/dev/null
+[[ $(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true) == "$cleanup_calls_before" ]] || fail 'cleanup ran with unsafe file credentials'
+chmod 0600 "$credential"
 mkdir "$root/var/lib/ci-fleet-deployer/.transaction.interrupted"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'interrupted installer transaction requires recovery' "$runtime" deploy >/dev/null
@@ -623,17 +659,44 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'GitHub capability evidence must be a regular file' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without GitHub capability evidence'
 mv "$capability.saved" "$capability"
+deployed_target=$(readlink "$deployed_current")
+rm "$deployed_current"
+expect_failure 'deployed rollback snapshot is missing' "$runtime" deploy >/dev/null
+ln -s "$deployed_target" "$deployed_current"
 chmod 0644 "$credential"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran with unsafe file credentials'
 chmod 0600 "$credential"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
+rm -f "$root/var/log/ci-fleet-deployer/audit.log"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'unsafe audit storage was touched after adapter execution'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=failed-adapter-attempt'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
+printf 'deploy\n' >"$FAKE_ADAPTER_FAIL"
+expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter"
+grep -Fq 'approval=failed-adapter-attempt policy=example-staging-policy-v1 result=failed status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=snapshot-mutation-attempt'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
+expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
+write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
 import sys
