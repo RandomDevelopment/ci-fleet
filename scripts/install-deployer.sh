@@ -159,6 +159,21 @@ parse_file() {
 validate_config() {
   inside "$config" "$etc_root" || block "configuration path must be inside $etc_root"
   secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
+  if [[ "$mode" == rollback ]]; then
+    # Rollback must work from the retained pair even when the operator-owned
+    # candidate configuration is missing or malformed.
+    declare -gA cfg=()
+    if [[ -f "$config" && ! -L "$config" && $(stat -c '%u:%a' "$config" 2>/dev/null) == "$expected_uid:600" ]]; then
+      validated_config=$(mktemp)
+      install -m 0600 "$config" "$validated_config"
+      config=$validated_config
+      parse_file "$config" cfg configuration "$config_keys"
+      if [[ ${cfg[SCHEMA_VERSION]:-} == 1 && ${cfg[ENVIRONMENT]:-} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]:-} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+        environment=${cfg[ENVIRONMENT]}; target=${cfg[TARGET_ID]}
+      fi
+    fi
+    return
+  fi
   secure_file "$config" 'configuration file'
   validated_config=$(mktemp)
   install -m 0600 "$config" "$validated_config"
@@ -197,6 +212,7 @@ validate_config() {
     file)
       inside "${cfg[CREDENTIAL_REF]}" "$etc_root/credentials" || block 'credential reference is outside the approved credential directory'
       [[ ! -L ${cfg[CREDENTIAL_REF]} && -f ${cfg[CREDENTIAL_REF]} ]] || block 'credential reference must be a regular file, not a symlink'
+      [[ ${cfg[CREDENTIAL_REF]} == "$(realpath -m -- "${cfg[CREDENTIAL_REF]}")" && $(realpath -e -- "${cfg[CREDENTIAL_REF]}") == "${cfg[CREDENTIAL_REF]}" ]] || block 'credential reference contains a symlink or non-canonical component'
       [[ $(stat -c '%u:%a' "${cfg[CREDENTIAL_REF]}") == "$expected_uid:600" ]] || block 'credential file must be owner-only mode 0600'
       ;;
     external)
@@ -525,13 +541,15 @@ recover_interrupted_transaction() {
 }
 
 finalize_committed_rollback() {
-  local marker=$transaction_dir/application-rollback-committed
+  local marker=$transaction_dir/application-rollback-committed retired
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
   publish_deployed_snapshot "$active_policy" "$state_file" || return
   rm -f "$previous_state" "$previous_policy" || return
   transaction_committed=1
-  rm -rf -- "$transaction_dir" || return
+  retired=$state_root/.retired.$$.transaction
+  mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
+  rm -rf -- "$retired"
 }
 
 commit_transaction() {
@@ -688,6 +706,9 @@ perform_check() {
 perform_converge() {
   local had_state=0 old_environment old_target candidate_changed=1 old_release
   [[ -f "$state_file" ]] && had_state=1
+  if ((!had_state)) && { [[ -L "$current" ]] || compgen -G "$systemd_root/ci-fleet-deployer*" >/dev/null; }; then
+    block 'installed deployer state is absent or drifted; restore install state before convergence'
+  fi
   if ((had_state)); then
     read -r old_environment old_target < <(python3 - "$state_file" <<'PY'
 import json,sys
@@ -713,6 +734,7 @@ PY
     release_complete "$old_release" || block 'active deployer release is incomplete'
     if [[ "$mode" != repair ]]; then policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'; fi
   fi
+  reject_mixed_role
   run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
   install_release
   secure_directory "$state_root" 700 1
@@ -758,6 +780,7 @@ PY
   ) || block 'last-known-good state is malformed'
   [[ "$core_ref" =~ ^[0-9a-f]{40}$ && "$source_commit" =~ ^[0-9a-f]{40}$ && "$artifact" =~ @sha256:[0-9a-f]{64}$ ]] || block 'last-known-good state has unsafe immutable identifiers'
   [[ "$core_ref" == "${rollback_policy[CORE_REF]}" && "$environment" == "${rollback_policy[ENVIRONMENT]}" && "$target" == "${rollback_policy[TARGET_ID]}" && "$source_commit" == "${rollback_policy[SOURCE_COMMIT]}" && "$artifact" == "${rollback_policy[ARTIFACT_IMAGE]}" && "$deployer_identity" == "${rollback_policy[DEPLOYER_IDENTITY]}" ]] || block 'last-known-good state and policy do not match'
+  [[ "$environment" =~ ^[a-z][a-z0-9-]{0,31}$ && "$target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'last-known-good identity is malformed'
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
