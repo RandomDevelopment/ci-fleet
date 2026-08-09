@@ -299,9 +299,12 @@ PY
     secure_file "$snapshot/state.json" 'prepared deployed state'
     [[ $(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1) == "$snapshot_policy_sha" && $(sha256sum "$snapshot/state.json" | cut -d' ' -f1) == "$snapshot_state_sha" ]] || die 'prepared deployed snapshot changed during deployment'
     pointer=$deployed_root/.current.$$
+    retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
+    [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
     mv -Tf "$pointer" "$deployed_current"
     snapshot=
+    if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
     mv -Tf "$request_snapshot" "$last_request"
     request_snapshot=
