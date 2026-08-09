@@ -442,6 +442,7 @@ converged() { managed_boundaries_match && current_matches && state_matches && un
 acquire_lock() {
   local path
   secure_directory "$lock_root" 700 1
+  if [[ -e "$state_root" || -L "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer installer operation is running'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
@@ -734,9 +735,12 @@ run_verified_adapter() {
 }
 
 policy_adapter_operation() {
-  local policy=$1 operation_name=$2 description=$3 marker=${4:-} key
+  local policy=$1 operation_name=$2 description=$3 marker=${4:-} key snapshot
   local -A policy_cfg=()
   secure_file "$policy" "$description"
+  snapshot=$(mktemp "$state_root/.policy-check.XXXXXX")
+  install -m 0600 "$policy" "$snapshot"
+  policy=$snapshot
   parse_file "$policy" policy_cfg "$description" "$config_keys"
   for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
@@ -753,7 +757,11 @@ policy_adapter_operation() {
       ;;
     *) die "$description CREDENTIAL_PROVIDER must be file or external" ;;
   esac
+  local status
   run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null 2>&1
+  status=$?
+  rm -f "$snapshot"
+  return "$status"
 }
 
 perform_check() {
@@ -817,6 +825,7 @@ PY
   install_units
   install -m 0600 "$config" "$active_policy.new"
   write_state "$state_root/.install-state.new"
+  reject_mixed_role
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_root/.install-state.new" "$state_file"
   mv -Tf "$install_root/.current.new" "$current"
@@ -837,6 +846,7 @@ perform_rollback() {
   secure_file "$previous_policy" 'last-known-good policy'
   parse_file "$previous_policy" rollback_policy 'last-known-good policy' "$config_keys"
   for key in CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "rollback_policy[$key]" ]] || block "last-known-good policy is missing $key"; done
+  [[ ${rollback_policy[SCHEMA_VERSION]:-} == 1 ]] || block 'last-known-good policy has an unsupported or missing schema version'
   read -r core_ref environment target source_commit artifact deployer_identity < <(python3 - "$previous_state" <<'PY'
 import json, sys
 try: value=json.load(open(sys.argv[1], encoding='utf-8'))
@@ -911,6 +921,7 @@ perform_uninstall() {
   fi
   if active_deployment; then block 'active deployment started while draining'; fi
   if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
+  [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
   systemctl daemon-reload >/dev/null 2>&1 || true
