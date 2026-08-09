@@ -80,6 +80,8 @@ state_file=$state_root/install-state.json
 active_policy=$state_root/active-policy.conf
 previous_state=$state_root/last-known-good.json
 previous_policy=$state_root/last-known-good-policy.conf
+deployed_state=$state_root/deployed-state.json
+deployed_policy=$state_root/deployed-policy.conf
 drained=$state_root/drained
 active_operation=$state_root/active-operation
 lock_root=$(root_path /var/lock/ci-fleet-deployer)
@@ -310,9 +312,10 @@ active_deployment() {
   pid=$(awk -F= '$1=="pid" {print $2}' "$active_operation")
   started=$(awk -F= '$1=="started_at" {print $2}' "$active_operation")
   [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 0
-  if kill -0 "$pid" 2>/dev/null; then return 0; fi
   now=$(date +%s)
-  ((now - started <= 3600))
+  ((now - started <= 3600)) || return 1
+  kill -0 "$pid" 2>/dev/null || return 0
+  return 0
 }
 
 release_complete() {
@@ -488,6 +491,8 @@ recover_interrupted_transaction() {
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
+  install -m 0600 "$active_policy" "$deployed_policy"
+  install -m 0600 "$state_file" "$deployed_state"
   rm -f "$previous_state" "$previous_policy"
   transaction_committed=1
   rm -rf -- "$transaction_dir"
@@ -640,8 +645,12 @@ PY
   secure_directory "$log_root" 700 1
   begin_transaction
   if ((had_state && candidate_changed)); then
-    install -m 0600 "$state_file" "$previous_state"
-    install -m 0600 "$active_policy" "$previous_policy"
+    if [[ -e "$deployed_state" || -L "$deployed_state" || -e "$deployed_policy" || -L "$deployed_policy" ]]; then
+      secure_file "$deployed_state" 'deployed rollback state'
+      secure_file "$deployed_policy" 'deployed rollback policy'
+      install -m 0600 "$deployed_state" "$previous_state"
+      install -m 0600 "$deployed_policy" "$previous_policy"
+    fi
   fi
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
   install_units
@@ -652,6 +661,10 @@ PY
   mv -Tf "$install_root/.current.new" "$current"
   rm -f "$drained"
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
+  if [[ ! -e "$deployed_state" && ! -L "$deployed_state" && ! -e "$deployed_policy" && ! -L "$deployed_policy" ]]; then
+    install -m 0600 "$state_file" "$deployed_state"
+    install -m 0600 "$active_policy" "$deployed_policy"
+  fi
   commit_transaction
   health=healthy
   report CHANGED yes run-check "$(rollback_available)"

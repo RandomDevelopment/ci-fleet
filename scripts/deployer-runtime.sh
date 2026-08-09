@@ -19,7 +19,12 @@ evidence_dir=$(root_path /etc/ci-fleet-deployer/evidence)
 active=$state_root/active-operation
 drained=$state_root/drained
 last_request=$state_root/last-request.conf
+consumed_root=$state_root/consumed-requests
+install_state=$state_root/install-state.json
+deployed_policy=$state_root/deployed-policy.conf
+deployed_state=$state_root/deployed-state.json
 audit_log=$log_root/audit.log
+systemd_root=$(root_path /etc/systemd/system)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 expected_uid=0
@@ -33,6 +38,27 @@ secure_file() {
 secure_directory() {
   local path=$1 description=$2
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
+}
+reject_mixed_role() {
+  local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service actions.runner.service; do
+    [[ ! -e "$systemd_root/$unit" ]] || die 'ordinary CI controller or runner state is present'
+  done
+  shopt -s nullglob
+  for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
+    shopt -u nullglob
+    [[ -n "$runner_unit" ]] && die 'ordinary GitHub Actions runner service is present'
+  done
+  shopt -u nullglob
+  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || die 'ordinary CI controller or runner state is present'
+  done
+  output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker workload inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'unrelated Docker workload is present'; done <<<"$output"
+  output=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker network inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'incompatible custom Docker network is present'; done <<<"$output"
+  output=$(docker volume ls --format '{{.Name}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker volume inventory failed'
+  while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'incompatible Docker volume is present'; done <<<"$output"
 }
 inside() {
   local path=$1 base=$2
@@ -58,7 +84,7 @@ parse_file() {
 secure_file "$config" 'deployer configuration'
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
-for key in ENVIRONMENT TARGET_ID ADAPTER_PATH ADAPTER_SHA256 CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
+for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
@@ -86,6 +112,7 @@ case "$operation" in
     ;;
   deploy)
     [[ ! -e "$drained" ]] || die 'deployer is drained'
+    reject_mixed_role
     secure_file "$request" 'deployment request'
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
     parse_file "$request" req request "$request_keys"
@@ -123,6 +150,16 @@ case "$operation" in
     for key in $approval_keys; do
       [[ -v "approved[$key]" && ${req[$key]} == "${approved[$key]}" ]] || die "deployment request does not match protected approval $key"
     done
+    if [[ ${cfg[APPROVAL_PROVIDER]} == github-environment ]]; then
+      [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || die 'GitHub Environment approval is missing capability evidence'
+      inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$evidence_dir" || die 'capability evidence is outside the protected evidence directory'
+      secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
+      capability_keys='SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+      parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' "$capability_keys"
+      for key in $capability_keys; do [[ -v "capability[$key]" ]] || die "capability evidence is missing $key"; done
+      [[ ${capability[SCHEMA_VERSION]} == 1 && ${capability[ENVIRONMENT_PROTECTION]} == verified && ${capability[EXACT_HEAD]} == "${req[SOURCE_COMMIT]}" ]] || die 'GitHub Environment capability evidence is not exact-head verified'
+      [[ ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${capability[CHECKED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'GitHub Environment capability evidence is malformed'
+    fi
     if [[ ${cfg[ENVIRONMENT]} == production ]]; then
       [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || die 'production policy is missing separate authorization evidence'
       inside "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" "$evidence_dir" || die 'production authorization evidence is outside the protected evidence directory'
@@ -136,15 +173,26 @@ case "$operation" in
         [[ -v "production[$key]" && ${req[$key]} == "${production[$key]}" ]] || die "deployment request does not match production authorization $key"
       done
     fi
+    if [[ -e "$consumed_root" || -L "$consumed_root" ]]; then secure_directory "$consumed_root" 'consumed request directory'; else install -d -m 0700 "$consumed_root"; fi
+    request_id=$(for key in $request_keys; do printf '%s=%s\0' "$key" "${req[$key]}"; done | sha256sum | cut -d' ' -f1)
+    consumed_marker=$consumed_root/$request_id
+    [[ ! -e "$consumed_marker" && ! -L "$consumed_marker" ]] || die 'deployment request was already consumed'
     if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
     : >>"$audit_log"
+    secure_file "$install_state" 'deployer install state'
+    for path in "$deployed_policy" "$deployed_state"; do [[ ! -e "$path" && ! -L "$path" ]] || secure_file "$path" 'deployed rollback state'; done
+    install -m 0600 "$config" "$state_root/.deployed-policy.new"
+    install -m 0600 "$install_state" "$state_root/.deployed-state.new"
+    install -m 0600 /dev/null "$consumed_marker"
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
-    trap 'rm -f "$active"' EXIT INT TERM
+    trap 'rm -f "$active" "$state_root/.deployed-policy.new" "$state_root/.deployed-state.new"' EXIT INT TERM
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
       --why='approved deployment is active' -- "${cfg[ADAPTER_PATH]}" deploy
+    mv -Tf "$state_root/.deployed-policy.new" "$deployed_policy"
+    mv -Tf "$state_root/.deployed-state.new" "$deployed_state"
     mv -Tf "$request" "$last_request"
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=success\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
