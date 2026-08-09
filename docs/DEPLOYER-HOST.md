@@ -243,7 +243,7 @@ A cross-environment or cross-target in-place upgrade is rejected. Build a separa
 
 ## Submit an approved deployment
 
-Place one root-owned mode-`0600` request at `/var/lib/ci-fleet-deployer/request.conf`. It uses the same exact-head approval fields shown above. No secret values belong in the request. After a successful adapter call, the runtime atomically moves it to `last-request.conf`; submitting the identical completed request again fails closed.
+Place one root-owned mode-`0600` request at `/var/lib/ci-fleet-deployer/request.conf`. It uses the same exact-head approval fields shown above. No secret values belong in the request. Before invoking the adapter, runtime revalidates the protected approval and checkpoint evidence. After success it atomically moves the request to `last-request.conf`; resubmitting the same semantic request fails closed regardless of field order or comments.
 
 Then run on the deployer host; this changes the application target through its adapter:
 

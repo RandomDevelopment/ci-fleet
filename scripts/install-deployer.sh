@@ -225,6 +225,7 @@ validate_evidence() {
       secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
       parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' 'SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
       [[ ${capability[SCHEMA_VERSION]:-} == 1 && ${capability[ENVIRONMENT_PROTECTION]:-} == verified && ${capability[EXACT_HEAD]:-} == "${cfg[SOURCE_COMMIT]}" ]] || block 'GitHub Environment capability evidence is not exact-head verified'
+      [[ ${capability[CAPABILITY_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${capability[CHECKED_AT]:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'GitHub Environment capability evidence is missing identity or UTC time'
       ;;
     *) block 'unsupported approval provider' ;;
   esac
@@ -236,7 +237,7 @@ validate_evidence() {
 }
 
 require_host() {
-  local command os_id os_version available required systemd_state
+  local command os_id os_version available required systemd_state disk_path
   for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
@@ -252,8 +253,9 @@ require_host() {
   docker info >/dev/null 2>&1 || block 'Docker Engine is unavailable'
   [[ ${cfg[REQUIRE_COMPOSE]} != 1 ]] || docker compose version >/dev/null 2>&1 || block 'Docker Compose v2 is required but unavailable'
   [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]] || block 'host time is not synchronized'
-  available=$(df -Pk "$state_root" 2>/dev/null | awk 'NR==2 {print $4}')
-  [[ "$available" =~ ^[0-9]+$ ]] || available=$(df -Pk "$(dirname "$state_root")" | awk 'NR==2 {print $4}')
+  disk_path=$state_root
+  while [[ ! -e "$disk_path" ]]; do disk_path=$(dirname "$disk_path"); done
+  available=$(df -Pk "$disk_path" | awk 'NR==2 {print $4}')
   required=$((cfg[MIN_DISK_GIB] * 1024 * 1024))
   ((available >= required)) || block 'insufficient deployer disk capacity'
   if [[ "$testing" != 1 || ${CI_FLEET_DEPLOYER_TEST_NETWORK:-} != ok ]]; then
@@ -340,7 +342,7 @@ raise SystemExit(0 if all(value.get(k)==v for k,v in zip(keys,expected)) else 1)
 units_match() {
   local unit
   for unit in "${unit_names[@]}"; do
-    [[ -f "$systemd_root/$unit" && ! -L "$systemd_root/$unit" ]] || return 1
+    [[ -f "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && $(stat -c '%u:%a' "$systemd_root/$unit") == "$expected_uid:644" ]] || return 1
     cmp -s "$unit_source/$unit" "$systemd_root/$unit" || return 1
   done
   for unit in "${timer_names[@]}"; do systemctl is-enabled "$unit" >/dev/null 2>&1 && systemctl is-active "$unit" >/dev/null 2>&1 || return 1; done
@@ -684,9 +686,13 @@ perform_rollback() {
 perform_drain() {
   if active_deployment; then block 'active deployment prevents drain'; fi
   secure_directory "$state_root" 700 1
-  if [[ -f "$drained" ]]; then report NO_CHANGE no safe-to-maintain "$(rollback_available)"; return; fi
-  : >"$drained"
-  chmod 0600 "$drained"
+  if [[ -e "$drained" || -L "$drained" ]]; then
+    secure_file "$drained" 'drain marker'
+    report NO_CHANGE no safe-to-maintain "$(rollback_available)"; return
+  fi
+  temporary=$(mktemp "$state_root/.drained.XXXXXX")
+  chmod 0600 "$temporary"
+  mv -Tf "$temporary" "$drained"
   report CHANGED yes safe-to-maintain "$(rollback_available)"
 }
 
@@ -698,8 +704,13 @@ perform_uninstall() {
   if active_deployment; then block 'active deployment prevents this operation'; fi
   acquire_lock
   secure_directory "$state_root" 700 1
-  : >"$drained"
-  chmod 0600 "$drained"
+  if [[ -e "$drained" || -L "$drained" ]]; then
+    secure_file "$drained" 'drain marker'
+  else
+    temporary=$(mktemp "$state_root/.drained.XXXXXX")
+    chmod 0600 "$temporary"
+    mv -Tf "$temporary" "$drained"
+  fi
   if active_deployment; then block 'active deployment started while draining'; fi
   if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true

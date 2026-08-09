@@ -58,7 +58,7 @@ parse_file() {
 secure_file "$config" 'deployer configuration'
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
-for key in ENVIRONMENT TARGET_ID ADAPTER_PATH ADAPTER_SHA256 SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
+for key in ENVIRONMENT TARGET_ID ADAPTER_PATH ADAPTER_SHA256 CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
@@ -87,10 +87,6 @@ case "$operation" in
   deploy)
     [[ ! -e "$drained" ]] || die 'deployer is drained'
     secure_file "$request" 'deployment request'
-    if [[ -e "$last_request" || -L "$last_request" ]]; then
-      secure_file "$last_request" 'last completed deployment request'
-      cmp -s "$request" "$last_request" && die 'deployment request was already completed'
-    fi
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
     parse_file "$request" req request "$request_keys"
     for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT; do
@@ -103,6 +99,22 @@ case "$operation" in
     [[ ${req[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ && ${req[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || die 'deployment request is not immutable and qualified'
     for key in APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID; do [[ ${req[$key]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || die "deployment request has an unsafe $key"; done
     [[ ${req[APPROVED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'deployment request has an invalid approval time'
+    if [[ -e "$last_request" || -L "$last_request" ]]; then
+      secure_file "$last_request" 'last completed deployment request'
+      parse_file "$last_request" completed 'last completed deployment request' "$request_keys"
+      replay=1
+      for key in $request_keys; do
+        [[ -v "completed[$key]" && ${req[$key]} == "${completed[$key]}" ]] || replay=0
+      done
+      ((replay == 0)) || die 'deployment request was already completed'
+    fi
+    inside "${cfg[CHECKPOINT_EVIDENCE_PATH]}" "$evidence_dir" || die 'checkpoint evidence is outside the protected evidence directory'
+    secure_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" 'checkpoint evidence'
+    checkpoint_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID CHECKPOINT_ID RECORDED_AT'
+    parse_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" checkpoint 'checkpoint evidence' "$checkpoint_keys"
+    for key in $checkpoint_keys; do [[ -v "checkpoint[$key]" ]] || die "checkpoint evidence is missing $key"; done
+    [[ ${checkpoint[SCHEMA_VERSION]} == 1 && ${checkpoint[ENVIRONMENT]} == "${req[ENVIRONMENT]}" && ${checkpoint[TARGET_ID]} == "${req[TARGET_ID]}" ]] || die 'checkpoint evidence does not match the deployment target'
+    [[ ${checkpoint[CHECKPOINT_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${checkpoint[RECORDED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'checkpoint evidence is malformed'
     [[ -v 'cfg[APPROVAL_EVIDENCE_PATH]' ]] || die 'installed policy is missing approval evidence'
     inside "${cfg[APPROVAL_EVIDENCE_PATH]}" "$evidence_dir" || die 'approval evidence is outside the protected evidence directory'
     secure_file "${cfg[APPROVAL_EVIDENCE_PATH]}" 'approval evidence'
