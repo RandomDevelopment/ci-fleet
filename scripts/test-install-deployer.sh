@@ -94,6 +94,7 @@ exit 2
 EOF
 cat >"$fake_bin/df" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n ${FAKE_DF_REQUIRE_EXISTING:-} && ! -e ${!#} ]]; then exit 1; fi
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 104857600 1 %s 1%% /\n' "${FAKE_DISK_AVAILABLE:-104857599}"
 EOF
 chmod 0755 "$fake_bin"/*
@@ -192,6 +193,8 @@ write_evidence
 write_config
 config=$root/etc/ci-fleet-deployer/deployer.conf
 
+FAKE_DF_REQUIRE_EXISTING=1 expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
+
 write_evidence production example-production
 write_config production example-production
 expect_failure 'production authorization evidence must be a regular file' "$installer" --check --config "$config" >/dev/null
@@ -247,6 +250,20 @@ CHECKED_AT=2026-08-08T20:00:00Z
 EOF
 chmod 0600 "$capability"
 expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
+python3 - "$capability" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text('\n'.join(x for x in p.read_text().splitlines() if not x.startswith('CAPABILITY_ID='))+'\n')
+PY
+expect_failure 'GitHub Environment capability evidence is missing identity or UTC time' "$installer" --check --config "$config" >/dev/null
+cat >"$capability" <<EOF
+SCHEMA_VERSION=1
+ENVIRONMENT_PROTECTION=verified
+EXACT_HEAD=$source_ref
+CAPABILITY_ID=example-capability-check
+CHECKED_AT=2026-08-08T20:00:00Z
+EOF
+chmod 0600 "$capability"
 write_config
 python3 - "$config" <<'PY'
 from pathlib import Path
@@ -289,6 +306,10 @@ grep -Fq 'result=NO_CHANGE' <<<"$second" || fail 'second install was not idempot
 check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'REPORT action=check result=NO_CHANGE' <<<"$check" || fail 'check did not report convergence'
 FAKE_SYSTEMD_STATE=degraded expect_success "$installer" --check --config "$config" >/dev/null
+chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ $(stat -c %a "$root/etc/systemd/system/ci-fleet-deployer.service") == 644 ]] || fail 'repair did not restore unit mode 0644'
 
 interrupted=$root/var/lib/ci-fleet-deployer/.transaction.interrupted
 mkdir -m 0700 "$interrupted" "$interrupted/units" "$interrupted/state"
@@ -432,6 +453,13 @@ rm "$active"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+rm "$root/var/lib/ci-fleet-deployer/drained"
+printf 'unrelated-drain-target\n' >"$tmp/unrelated-drain-target"
+ln -s "$tmp/unrelated-drain-target" "$root/var/lib/ci-fleet-deployer/drained"
+expect_failure 'drain marker must be a regular file, not a symlink' "$installer" --uninstall --config "$config" >/dev/null
+[[ $(<"$tmp/unrelated-drain-target") == unrelated-drain-target ]] || fail 'uninstall followed an unsafe drain marker'
+rm "$root/var/lib/ci-fleet-deployer/drained"
+install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/drained"
 
 unrelated=$root/var/lib/ci-fleet-deployer/operator-note
 printf 'preserve\n' >"$unrelated"
@@ -465,6 +493,11 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 expect_failure 'deployment request does not match protected approval APPROVAL_ID' "$runtime" deploy >/dev/null
 cp "$approval" "$request"; chmod 0600 "$request"
+mv "$checkpoint" "$checkpoint.saved"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'checkpoint evidence must be a regular file' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without checkpoint evidence'
+mv "$checkpoint.saved" "$checkpoint"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
@@ -473,7 +506,8 @@ expect_failure 'deployer audit log must be a regular file, not a symlink' "$runt
 rm "$root/var/log/ci-fleet-deployer/audit.log"
 expect_success "$runtime" deploy >/dev/null
 [[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
-cp "$root/var/lib/ci-fleet-deployer/last-request.conf" "$request"; chmod 0600 "$request"
+{ printf '# semantic replay with different bytes\n'; tac "$root/var/lib/ci-fleet-deployer/last-request.conf"; } >"$request"
+chmod 0600 "$request"
 expect_failure 'deployment request was already completed' "$runtime" deploy >/dev/null
 grep -Fq 'sha256:bbbbbbbb' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit log omitted the immutable digest'
 if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.log"; then fail 'audit log exposed a private-capable endpoint'; fi
