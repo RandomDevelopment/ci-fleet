@@ -52,7 +52,11 @@ root=${CI_FLEET_DEPLOYER_ROOT:-}
 log=${FAKE_SYSTEMCTL_LOG:-/dev/null}
 printf '%s\n' "$*" >>"$log"
 case "${1:-}" in
-  is-system-running) [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1; printf 'running\n' ;;
+  is-system-running)
+    [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1
+    printf '%s\n' "${FAKE_SYSTEMD_STATE:-running}"
+    [[ ${FAKE_SYSTEMD_STATE:-running} != degraded ]]
+    ;;
   is-enabled|is-active) [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] ;;
   enable)
     shift
@@ -103,11 +107,15 @@ cat >"$adapter" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
+if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
 if [[ -e "${FAKE_ADAPTER_FAIL:-/nonexistent}" ]]; then
   fail_operation=$(<"$FAKE_ADAPTER_FAIL")
   [[ "$fail_operation" != all && "$fail_operation" != "$1" ]] || exit 42
 fi
 case "$1" in validate|health|cleanup|deploy|rollback) ;; *) exit 2 ;; esac
+if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
+  install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
+fi
 EOF
 chmod 0700 "$adapter"
 export FAKE_ADAPTER_LOG=$tmp/adapter.log
@@ -116,6 +124,7 @@ printf 'CANARY_SECRET_VALUE_DO_NOT_PRINT\n' >"$credential"
 chmod 0600 "$credential"
 approval=$root/etc/ci-fleet-deployer/evidence/approval.conf
 checkpoint=$root/etc/ci-fleet-deployer/evidence/checkpoint.conf
+production_gate=$root/etc/ci-fleet-deployer/evidence/production-authorization.conf
 core_ref=$(git -C "$repo_root" rev-parse HEAD)
 source_ref=1111111111111111111111111111111111111111
 image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -141,6 +150,19 @@ RECORDED_AT=2026-08-08T19:55:00Z
 EOF
   chmod 0600 "$approval" "$checkpoint"
 }
+write_production_gate() {
+  cat >"$production_gate" <<EOF
+SCHEMA_VERSION=1
+ENVIRONMENT=production
+TARGET_ID=example-production
+SOURCE_COMMIT=$source_ref
+ARTIFACT_IMAGE=$image
+AUTHORIZED_BY=example-production-authorizer
+GATE_ID=production-gate-20260808-1
+AUTHORIZED_AT=2026-08-08T20:00:00Z
+EOF
+  chmod 0600 "$production_gate"
+}
 write_config() {
   local environment=${1:-staging} target=${2:-example-staging} digest=${3:-$image}
   cat >"$root/etc/ci-fleet-deployer/deployer.conf" <<EOF
@@ -163,11 +185,21 @@ NETWORK_HOST=registry.example.invalid
 MIN_DISK_GIB=10
 REQUIRE_COMPOSE=1
 EOF
+  if [[ "$environment" == production ]]; then printf 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=%s\n' "$production_gate" >>"$root/etc/ci-fleet-deployer/deployer.conf"; fi
   chmod 0600 "$root/etc/ci-fleet-deployer/deployer.conf"
 }
 write_evidence
 write_config
 config=$root/etc/ci-fleet-deployer/deployer.conf
+
+write_evidence production example-production
+write_config production example-production
+expect_failure 'production authorization evidence must be a regular file' "$installer" --check --config "$config" >/dev/null
+write_production_gate
+expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
+rm "$production_gate"
+write_evidence
+write_config
 
 # Read-only preflight and strict policy variants fail closed without reading secrets.
 cp "$root/etc/os-release" "$tmp/os-release"
@@ -214,14 +246,14 @@ CAPABILITY_ID=example-capability-check
 CHECKED_AT=2026-08-08T20:00:00Z
 EOF
 chmod 0600 "$capability"
-expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
 write_config
 python3 - "$config" <<'PY'
 from pathlib import Path
 import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external').replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=external:example-vault:staging/deployer'))
 PY
-expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_failure 'installed deployer lock boundary is absent or unsafe' "$installer" --check --config "$config" >/dev/null
 write_config
 
 printf 'UNKNOWN=value\n' >"$tmp/unknown.conf"; chmod 0600 "$tmp/unknown.conf"
@@ -256,6 +288,7 @@ second=$(expect_success "$installer" --install --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$second" || fail 'second install was not idempotent'
 check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'REPORT action=check result=NO_CHANGE' <<<"$check" || fail 'check did not report convergence'
+FAKE_SYSTEMD_STATE=degraded expect_success "$installer" --check --config "$config" >/dev/null
 
 interrupted=$root/var/lib/ci-fleet-deployer/.transaction.interrupted
 mkdir -m 0700 "$interrupted" "$interrupted/units" "$interrupted/state"
@@ -299,6 +332,7 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 exec 8<"$root/var/lock/ci-fleet-deployer"
 flock -n 8 || fail 'fixture could not acquire installer lock'
 expect_failure 'another deployer installer operation is running' "$installer" --repair --config "$config" >/dev/null
+expect_failure 'another deployer operation is running' "$installer" --check --config "$config" >/dev/null
 flock -u 8; exec 8>&-
 
 mv "$root/var/lock/ci-fleet-deployer" "$root/var/lock/ci-fleet-deployer.real"
@@ -318,6 +352,9 @@ rm "$unit_path"; mv "$unit_path.real" "$unit_path"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-health.service"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-health.service"
+printf 'runner\n' >"$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
+expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
 export FAKE_DOCKER_PS='unrelated workload'
 expect_failure 'unrelated Docker workload is present' "$installer" --check --config "$config" >/dev/null
 unset FAKE_DOCKER_PS
@@ -352,6 +389,10 @@ new_image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbb
 image=$new_image
 write_evidence
 write_config
+export FAKE_ADAPTER_SLEEP_OPERATION=validate CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS=1
+expect_failure 'candidate adapter validation failed' "$installer" --upgrade --config "$config" >/dev/null
+unset FAKE_ADAPTER_SLEEP_OPERATION CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS
+[[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'timed-out candidate replaced healthy state'
 export FAKE_ADAPTER_FAIL=$tmp/fail-adapter
 printf 'validate\n' >"$FAKE_ADAPTER_FAIL"
 expect_failure 'candidate adapter validation failed' "$installer" --upgrade --config "$config" >/dev/null
@@ -360,12 +401,22 @@ rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
 
 upgrade=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'result=CHANGED' <<<"$upgrade" || fail 'upgrade did not activate new immutable artifact'
+printf 'rollback\n' >"$tmp/fail-rollback"
+export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
+expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
+unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed application rollback did not restore current core state'
+rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
+FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --rollback --config "$config" >/dev/null
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'application rollback ran before core rollback staging was proven'
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed rollback did not preserve current core state'
 rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'rollback did not restore last-known-good state'
 grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'rollback state lacks prior artifact'
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'rollback report lacks the exact operator reconciliation action'
 grep -Fq 'sha256:bbbbbbbb' "$config" || fail 'rollback unexpectedly rewrote operator-owned desired policy'
 
+write_production_gate
 write_evidence production example-production
 write_config production example-production
 expect_failure 'installed environment and target identity cannot change in place' "$installer" --upgrade --config "$config" >/dev/null
@@ -407,6 +458,19 @@ chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
+python3 - "$request" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=forged-approval'))
+PY
+expect_failure 'deployment request does not match protected approval APPROVAL_ID' "$runtime" deploy >/dev/null
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
+ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'unsafe audit storage was touched after adapter execution'
+rm "$root/var/log/ci-fleet-deployer/audit.log"
 expect_success "$runtime" deploy >/dev/null
 [[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
 cp "$root/var/lib/ci-fleet-deployer/last-request.conf" "$request"; chmod 0600 "$request"
@@ -416,11 +480,12 @@ if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.lo
 for operation in health cleanup deploy; do grep -Fxq "$operation" "$FAKE_ADAPTER_LOG" || fail "runtime did not invoke adapter $operation"; done
 : >"$root/var/lib/ci-fleet-deployer/drained"
 expect_failure 'deployer is drained' "$runtime" deploy >/dev/null
+expect_failure 'deployer is drained' "$runtime" cleanup >/dev/null
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
 grep -Fq 'scripts/test-deployer-units.sh' "$repo_root/scripts/validate.sh" || fail 'repository validation omits systemd unit verification'
-for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'application-owned' 'REPORT action='; do
+for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
   grep -Fq -- "$phrase" "$repo_root/docs/DEPLOYER-HOST.md" || fail "deployer runbook omits $phrase"
 done
 for unit in "$repo_root"/deploy/deployer/*; do

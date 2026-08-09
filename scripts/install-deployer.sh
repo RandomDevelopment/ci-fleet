@@ -19,9 +19,12 @@ health=unknown
 staging_path=
 transaction_dir=
 transaction_committed=0
+recovered_rollback=0
 on_exit() {
   local status=$?
-  if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then restore_transaction || true; fi
+  if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
+    if [[ -f "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback || true; else restore_transaction || true; fi
+  fi
   [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
   return "$status"
@@ -90,7 +93,7 @@ unit_names=(
   ci-fleet-deployer-drain.service
 )
 timer_names=(ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer)
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
@@ -177,6 +180,26 @@ validate_config() {
     *) block 'CREDENTIAL_PROVIDER must be file or external' ;;
   esac
   validate_evidence
+  validate_production_gate
+}
+
+validate_production_gate() {
+  local key
+  if [[ "$environment" != production ]]; then
+    [[ ! -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || block 'production authorization evidence is forbidden outside production'
+    return
+  fi
+  [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || block 'production requires separate authorization evidence'
+  inside "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" "$etc_root/evidence" || block 'production authorization evidence is outside the approved evidence directory'
+  secure_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" 'production authorization evidence'
+  parse_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" production_gate 'production authorization evidence' 'SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE AUTHORIZED_BY GATE_ID AUTHORIZED_AT'
+  for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE AUTHORIZED_BY GATE_ID AUTHORIZED_AT; do
+    [[ -v "production_gate[$key]" ]] || block "production authorization evidence is missing $key"
+  done
+  [[ ${production_gate[SCHEMA_VERSION]} == 1 && ${production_gate[ENVIRONMENT]} == production ]] || block 'production authorization evidence has the wrong scope'
+  for key in TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do [[ ${production_gate[$key]} == "${cfg[$key]}" ]] || block "production authorization evidence does not match exact $key"; done
+  [[ ${production_gate[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production_gate[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || block 'production authorization identity is malformed'
+  [[ ${production_gate[AUTHORIZED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || block 'production authorization timestamp must be UTC RFC3339'
 }
 
 validate_evidence() {
@@ -213,8 +236,8 @@ validate_evidence() {
 }
 
 require_host() {
-  local command os_id os_version available required
-  for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
+  local command os_id os_version available required systemd_state
+  for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
   local os_release
@@ -224,7 +247,8 @@ require_host() {
   os_version=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2}' "$os_release")
   [[ "$os_id" == debian && "$os_version" =~ ^(12|13)(\.|$) || "$os_id" == ubuntu && "$os_version" =~ ^(22\.04|24\.04)$ ]] || block 'unsupported Linux distribution or release'
   [[ -d $(root_path /run/systemd/system) ]] || block 'systemd is not the active init system'
-  systemctl is-system-running >/dev/null 2>&1 || block 'systemd is unavailable'
+  systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+  [[ "$systemd_state" == running || "$systemd_state" == degraded ]] || block 'systemd is unavailable'
   docker info >/dev/null 2>&1 || block 'Docker Engine is unavailable'
   [[ ${cfg[REQUIRE_COMPOSE]} != 1 ]] || docker compose version >/dev/null 2>&1 || block 'Docker Compose v2 is required but unavailable'
   [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]] || block 'host time is not synchronized'
@@ -248,10 +272,16 @@ require_maintenance_host() {
 }
 
 reject_mixed_role() {
-  local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}" runner_unit
   for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service actions.runner.service; do
     [[ ! -e "$systemd_root/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
+  shopt -s nullglob
+  for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
+    shopt -u nullglob
+    [[ -n "$runner_unit" ]] && block 'ordinary GitHub Actions runner service is present'
+  done
+  shopt -u nullglob
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'ordinary CI controller or runner state is present'
   done
@@ -352,6 +382,12 @@ acquire_lock() {
   recover_interrupted_transaction
 }
 
+acquire_check_lock() {
+  [[ -d "$lock_root" && ! -L "$lock_root" && $(stat -c '%u:%a' "$lock_root") == "$expected_uid:700" ]] || block 'installed deployer lock boundary is absent or unsafe'
+  exec 9<"$lock_root"
+  flock -n 9 || block 'another deployer operation is running'
+}
+
 begin_transaction() {
   local name path current_target
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
@@ -437,8 +473,23 @@ recover_interrupted_transaction() {
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
   transaction_dir=$candidate
+  if [[ -f "$transaction_dir/application-rollback-committed" ]]; then
+    finalize_committed_rollback
+    recovered_rollback=1
+    transaction_committed=0
+    return
+  fi
   restore_transaction
   transaction_committed=0
+}
+
+finalize_committed_rollback() {
+  local marker=$transaction_dir/application-rollback-committed
+  [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
+  rm -f "$previous_state" "$previous_policy"
+  transaction_committed=1
+  rm -rf -- "$transaction_dir"
+  transaction_dir=
 }
 
 commit_transaction() {
@@ -515,8 +566,28 @@ install_units() {
   systemctl enable --now "${timer_names[@]}" >/dev/null
 }
 
+adapter_deadline() {
+  local operation_name=$1 seconds=120
+  [[ "$operation_name" != rollback ]] || seconds=2700
+  if [[ "$testing" == 1 && -n ${CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS:-} ]]; then
+    [[ ${CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS} =~ ^[1-9][0-9]?$ ]] || die 'invalid test-only adapter timeout'
+    seconds=$CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS
+  fi
+  printf '%s' "$seconds"
+}
+
+run_adapter() {
+  local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds
+  seconds=$(adapter_deadline "$operation_name")
+  if [[ -n "$marker" ]]; then
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name"
+  else
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name"
+  fi
+}
+
 policy_adapter_operation() {
-  local policy=$1 operation_name=$2 description=$3 key
+  local policy=$1 operation_name=$2 description=$3 marker=${4:-} key
   local -A policy_cfg=()
   secure_file "$policy" "$description"
   parse_file "$policy" policy_cfg "$description" "$config_keys"
@@ -524,7 +595,7 @@ policy_adapter_operation() {
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
   secure_file "${policy_cfg[ADAPTER_PATH]}" "$description adapter" 700
   [[ $(sha256sum "${policy_cfg[ADAPTER_PATH]}" | cut -d' ' -f1) == "${policy_cfg[ADAPTER_SHA256]}" ]] || die "$description adapter digest mismatch"
-  CI_FLEET_DEPLOYER_CONFIG="$policy" "${policy_cfg[ADAPTER_PATH]}" "$operation_name" >/dev/null 2>&1
+  run_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "$operation_name" "$marker" >/dev/null 2>&1
 }
 
 perform_check() {
@@ -561,7 +632,7 @@ PY
     release_complete "$old_release" || block 'active deployer release is incomplete'
     policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'
   fi
-  CI_FLEET_DEPLOYER_CONFIG="$config" "${cfg[ADAPTER_PATH]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
+  run_adapter "$config" "${cfg[ADAPTER_PATH]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
   install_release
   secure_directory "$state_root" 700 1
   secure_directory "$log_root" 700 1
@@ -585,6 +656,7 @@ PY
 }
 
 perform_rollback() {
+  if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; return; fi
   active_deployment && block 'active deployment prevents rollback'
   [[ -f "$previous_state" && -f "$previous_policy" ]] || block 'no last-known-good release is available'
   secure_directory "$state_root" 700 0
@@ -596,16 +668,17 @@ perform_rollback() {
   target=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target"])' "$previous_state")
   artifact=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact"])' "$previous_state")
   release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
-  policy_adapter_operation "$previous_policy" rollback 'last-known-good policy' || die 'application adapter rollback failed'
+  unit_source=$releases/$core_ref/deploy/deployer
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
   install_units
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   mv -Tf "$install_root/.current.new" "$current"
-  policy_adapter_operation "$active_policy" health 'rolled-back policy' || die 'rolled-back deployer health check failed'
-  commit_transaction
+  policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" || die 'application adapter rollback failed'
+  finalize_committed_rollback
+  recovered_rollback=0
   health=healthy
-  report CHANGED yes restore-host-policy-evidence-then-check yes
+  report CHANGED yes restore-host-policy-evidence-then-check no
 }
 
 perform_drain() {
@@ -644,7 +717,7 @@ else
   require_host
 fi
 case "$mode" in
-  check) perform_check ;;
+  check) acquire_check_lock; perform_check ;;
   install|upgrade|repair) acquire_lock; perform_converge ;;
   rollback) acquire_lock; perform_rollback ;;
   drain) acquire_lock; perform_drain ;;

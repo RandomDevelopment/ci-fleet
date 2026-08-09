@@ -16,6 +16,8 @@ GitHub-native Environment protection is optional, not assumed. In particular, do
 
 A secret store proves only that a credential exists. It is not approval evidence. Every provider still binds the environment, target, source commit, artifact digest, approving identity, policy identity, approval ID, and UTC time.
 
+Production remains separately gated during the controlled-migration phase. `ENVIRONMENT=production` is rejected unless `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH` names an additional protected exact-target, exact-head, exact-artifact authorization record. Ordinary approval or credential access does not satisfy this gate, and the field is rejected outside production.
+
 The systemd services run as root because access to the Docker socket is root-equivalent and protected credential references may be root-only. `NoNewPrivileges`, a read-only host filesystem, explicit writable paths, private temporary storage, and no supplementary service account reduce accidental reach, but they do not turn Docker access into a low-privilege boundary. Put nothing else on this host.
 
 ## Supported host and prerequisites
@@ -63,7 +65,9 @@ adapter rollback
 
 `validate` must be non-mutating and must prove that the candidate policy is usable before core changes the active release. `health` returns zero only when the deployer and application-owned contract are healthy. `cleanup` may remove only resources carrying the application's exact deployer ownership identity; it must never run global prune or touch unrelated resources. `deploy` reads the active policy and request paths from the documented environment variables and owns application-specific staging, rollout, health, and rollback. `rollback` restores application state compatible with the recorded last-known-good core policy.
 
-Operations have no interactive input. Zero means success; nonzero means failure. The adapter must honor the systemd timeout, avoid child processes that outlive it, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
+Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
+
+Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file as its final successful step. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after that marker exists.
 
 ## Prepare host-local files
 
@@ -134,6 +138,19 @@ CAPABILITY_ID=example-capability-check
 CHECKED_AT=2026-08-08T20:00:00Z
 ```
 
+For production, a separate authorized process must also create evidence such as:
+
+```text
+SCHEMA_VERSION=1
+ENVIRONMENT=production
+TARGET_ID=example-production
+SOURCE_COMMIT=1111111111111111111111111111111111111111
+ARTIFACT_IMAGE=registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+AUTHORIZED_BY=example-production-authorizer
+GATE_ID=production-gate-20260808-1
+AUTHORIZED_AT=2026-08-08T20:00:00Z
+```
+
 Create the bounded configuration. Values cannot contain shell expressions; the installer parses `KEY=VALUE` without sourcing it. Unknown, duplicate, empty, malformed, or missing keys fail closed.
 
 ```bash
@@ -164,7 +181,7 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudo chmod 0600 /etc/ci-fleet-deployer/deployer.conf
 ```
 
-For an external secret manager, use `CREDENTIAL_PROVIDER=external` and a non-secret reference shaped like `external:example-vault:staging/deployer`. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`.
+For an external secret manager, use `CREDENTIAL_PROVIDER=external` and a non-secret reference shaped like `external:example-vault:staging/deployer`. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`. Production additionally requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/production-authorization.conf`.
 
 ## Install, check, repair, upgrade, drain, and rollback
 
@@ -235,9 +252,9 @@ sudo systemctl start ci-fleet-deployer.service
 sudo systemctl status --no-pager ci-fleet-deployer.service
 ```
 
-The runtime serializes operations with flock, writes a mode-`0600` active-operation marker, and removes it on completion. While the adapter runs, `systemd-inhibit` blocks shutdown and sleep; the deploy service has an explicit 45-minute start/stop bound. Upgrade, rollback, drain, and uninstall refuse while that marker belongs to a live or bounded recent process. A root-owned stale marker older than the fixed one-hour recovery bound is removed only by a serialized mutating installer run. Unsafe or malformed stale state fails closed.
+The runtime and read-only checks serialize on the same flock. Deploy writes a mode-`0600` active-operation marker and removes it on completion. While the adapter runs, `systemd-inhibit` blocks shutdown and sleep; the deploy service has an explicit 45-minute start/stop bound. Upgrade, rollback, drain, and uninstall refuse while that marker belongs to a live or bounded recent process. A root-owned stale marker older than the fixed one-hour recovery bound is removed only by a serialized mutating installer run. Unsafe or malformed stale state fails closed.
 
-Health runs every five minutes and cleanup daily. Cleanup is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
+Health runs every five minutes and cleanup daily. Cleanup refuses while drained and is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
 
 ## Verification and reports
 

@@ -15,6 +15,7 @@ request=${CI_FLEET_DEPLOYER_REQUEST:-$(root_path /var/lib/ci-fleet-deployer/requ
 state_root=$(root_path /var/lib/ci-fleet-deployer)
 log_root=$(root_path /var/log/ci-fleet-deployer)
 lock_dir=$(root_path /var/lock/ci-fleet-deployer)
+evidence_dir=$(root_path /etc/ci-fleet-deployer/evidence)
 active=$state_root/active-operation
 drained=$state_root/drained
 last_request=$state_root/last-request.conf
@@ -32,6 +33,10 @@ secure_file() {
 secure_directory() {
   local path=$1 description=$2
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
+}
+inside() {
+  local path=$1 base=$2
+  [[ $(realpath -m -- "$path") == "$(realpath -m -- "$base")/"* ]]
 }
 parse_file() {
   local path=$1 prefix=$2 kind=$3 allowed=$4 line key value
@@ -51,7 +56,7 @@ parse_file() {
 }
 
 secure_file "$config" 'deployer configuration'
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
 for key in ENVIRONMENT TARGET_ID ADAPTER_PATH ADAPTER_SHA256 SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
@@ -72,8 +77,12 @@ case "$operation" in
     chmod 0600 "$temporary"
     mv -Tf "$temporary" "$drained"
     ;;
-  health|cleanup|rollback)
+  health|rollback)
     "${cfg[ADAPTER_PATH]}" "$operation"
+    ;;
+  cleanup)
+    [[ ! -e "$drained" ]] || die 'deployer is drained'
+    "${cfg[ADAPTER_PATH]}" cleanup
     ;;
   deploy)
     [[ ! -e "$drained" ]] || die 'deployer is drained'
@@ -94,6 +103,29 @@ case "$operation" in
     [[ ${req[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ && ${req[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || die 'deployment request is not immutable and qualified'
     for key in APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID; do [[ ${req[$key]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || die "deployment request has an unsafe $key"; done
     [[ ${req[APPROVED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'deployment request has an invalid approval time'
+    [[ -v 'cfg[APPROVAL_EVIDENCE_PATH]' ]] || die 'installed policy is missing approval evidence'
+    inside "${cfg[APPROVAL_EVIDENCE_PATH]}" "$evidence_dir" || die 'approval evidence is outside the protected evidence directory'
+    secure_file "${cfg[APPROVAL_EVIDENCE_PATH]}" 'approval evidence'
+    approval_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
+    parse_file "${cfg[APPROVAL_EVIDENCE_PATH]}" approved 'approval evidence' "$approval_keys"
+    for key in $approval_keys; do
+      [[ -v "approved[$key]" && ${req[$key]} == "${approved[$key]}" ]] || die "deployment request does not match protected approval $key"
+    done
+    if [[ ${cfg[ENVIRONMENT]} == production ]]; then
+      [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || die 'production policy is missing separate authorization evidence'
+      inside "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" "$evidence_dir" || die 'production authorization evidence is outside the protected evidence directory'
+      secure_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" 'production authorization evidence'
+      production_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE AUTHORIZED_BY GATE_ID AUTHORIZED_AT'
+      parse_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" production 'production authorization evidence' "$production_keys"
+      for key in $production_keys; do [[ -v "production[$key]" ]] || die "production authorization evidence is missing $key"; done
+      [[ ${production[SCHEMA_VERSION]} == 1 && ${production[ENVIRONMENT]} == production ]] || die 'production authorization evidence has the wrong scope'
+      [[ ${production[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${production[AUTHORIZED_AT]} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 'production authorization evidence is malformed'
+      for key in ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do
+        [[ -v "production[$key]" && ${req[$key]} == "${production[$key]}" ]] || die "deployment request does not match production authorization $key"
+      done
+    fi
+    if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
+    : >>"$audit_log"
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
@@ -102,7 +134,6 @@ case "$operation" in
     systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
       --why='approved deployment is active' -- "${cfg[ADAPTER_PATH]}" deploy
     mv -Tf "$request" "$last_request"
-    if [[ -e "$audit_log" || -L "$audit_log" ]]; then secure_file "$audit_log" 'deployer audit log'; else install -m 0600 /dev/null "$audit_log"; fi
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s policy=%s result=success\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[POLICY_IDENTITY]}" \
