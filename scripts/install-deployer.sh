@@ -56,7 +56,32 @@ report() {
   printf 'REPORT action=%s result=%s environment=%s target=%s version=%s digest=%s health=%s changed=%s rollback_available=%s next=%s\n' \
     "$action" "$result" "$environment" "$target" "$core_ref" "${artifact#*@}" "$health" "$changed" "$rollback" "$next"
 }
-rollback_available() { [[ -n ${previous_state:-} && -f ${previous_state:-/nonexistent} && -n ${previous_policy:-} && -f ${previous_policy:-/nonexistent} ]] && printf yes || printf no; }
+rollback_available() {
+  [[ -n ${previous_state:-} && -f ${previous_state:-/nonexistent} && ! -L ${previous_state:-/nonexistent} && -n ${previous_policy:-} && -f ${previous_policy:-/nonexistent} && ! -L ${previous_policy:-/nonexistent} ]] || { printf no; return; }
+  [[ $(stat -c '%u:%a' "$previous_state" 2>/dev/null) == "$expected_uid:600" && $(stat -c '%u:%a' "$previous_policy" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
+  python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || { printf no; return; }
+import json, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+policy = {}
+try:
+    for line in open(sys.argv[2], encoding='utf-8'):
+        line = line.rstrip('\n')
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if not sep:
+            raise SystemExit(1)
+        policy[key] = value
+except OSError:
+    raise SystemExit(1)
+pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
+raise SystemExit(0 if all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs) else 1)
+PY
+  printf yes
+}
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
 block() { error_reported=1; printf 'BLOCKED: %s\n' "$*" >&2; report BLOCKED no resolve-precondition "$(rollback_available)" >&2; exit 3; }
 
@@ -167,7 +192,8 @@ validate_config() {
       validated_config=$(mktemp)
       install -m 0600 "$config" "$validated_config"
       config=$validated_config
-      parse_file "$config" cfg configuration "$config_keys"
+      cfg_dump=$(parse_file "$config" cfg configuration "$config_keys" && declare -p cfg) 2>/dev/null || cfg_dump=
+      if [[ -n "$cfg_dump" ]]; then eval "$cfg_dump"; else cfg=(); fi
       if [[ ${cfg[SCHEMA_VERSION]:-} == 1 && ${cfg[ENVIRONMENT]:-} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]:-} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
         environment=${cfg[ENVIRONMENT]}; target=${cfg[TARGET_ID]}
       fi
@@ -553,9 +579,12 @@ finalize_committed_rollback() {
 }
 
 commit_transaction() {
+  local retired
   transaction_committed=1
-  rm -rf -- "$transaction_dir"
+  retired=$state_root/.retired.$$.transaction
+  mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
+  rm -rf -- "$retired"
 }
 
 atomic_replace_directory() {
@@ -685,8 +714,21 @@ policy_adapter_operation() {
   local -A policy_cfg=()
   secure_file "$policy" "$description"
   parse_file "$policy" policy_cfg "$description" "$config_keys"
-  for key in ADAPTER_PATH ADAPTER_SHA256; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
+  for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
+  [[ ${policy_cfg[CREDENTIAL_SCOPE]} == "${policy_cfg[ENVIRONMENT]}" ]] || die "$description credential scope does not match its environment"
+  case ${policy_cfg[CREDENTIAL_PROVIDER]} in
+    file)
+      inside "${policy_cfg[CREDENTIAL_REF]}" "$etc_root/credentials" || die "$description credential reference is outside the approved credential directory"
+      [[ ! -L ${policy_cfg[CREDENTIAL_REF]} && -f ${policy_cfg[CREDENTIAL_REF]} ]] || die "$description credential reference must be a regular file, not a symlink"
+      [[ ${policy_cfg[CREDENTIAL_REF]} == "$(realpath -m -- "${policy_cfg[CREDENTIAL_REF]}")" && $(realpath -e -- "${policy_cfg[CREDENTIAL_REF]}") == "${policy_cfg[CREDENTIAL_REF]}" ]] || die "$description credential reference contains a symlink or non-canonical component"
+      [[ $(stat -c '%u:%a' "${policy_cfg[CREDENTIAL_REF]}") == "$expected_uid:600" ]] || die "$description credential file must be owner-only mode 0600"
+      ;;
+    external)
+      [[ ${policy_cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die "$description has an invalid external secret-manager adapter reference"
+      ;;
+    *) die "$description CREDENTIAL_PROVIDER must be file or external" ;;
+  esac
   run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null 2>&1
 }
 
