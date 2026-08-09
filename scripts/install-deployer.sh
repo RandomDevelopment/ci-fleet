@@ -21,9 +21,15 @@ transaction_dir=
 transaction_committed=0
 recovered_rollback=0
 on_exit() {
-  local status=$?
+  local status=$? recovery_status=0
   if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
-    if [[ -f "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback || true; else restore_transaction || true; fi
+    set +e
+    if [[ -f "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback; recovery_status=$?; else restore_transaction; recovery_status=$?; fi
+    set -e
+    if ((recovery_status != 0)); then
+      status=$recovery_status
+      printf 'ERROR: transaction recovery failed; retained %s for the next installer recovery\n' "$transaction_dir" >&2
+    fi
   fi
   [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
@@ -157,7 +163,7 @@ validate_config() {
   [[ "$candidate_environment" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || block 'invalid explicit environment'
   [[ "$candidate_target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid explicit target identity'
   environment=$candidate_environment; target=$candidate_target
-  if [[ "$mode" == drain || "$mode" == resume || "$mode" == uninstall || "$mode" == rollback ]]; then return; fi
+  if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then return; fi
   secure_directory "$etc_root/adapters" 700 0 || block 'adapter directory is missing'
   secure_directory "$etc_root/credentials" 700 0 || block 'credential directory is missing'
   secure_directory "$etc_root/evidence" 700 0 || block 'evidence directory is missing'
@@ -442,35 +448,35 @@ restore_transaction() {
   local name target_value
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
-  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
-  for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name"; done
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || return
+  for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
       [[ " ${unit_names[*]} " == *" $name "* && -f "$transaction_dir/units/$name" && ! -L "$transaction_dir/units/$name" ]] || block 'transaction unit manifest is unsafe'
-      install -m 0644 "$transaction_dir/units/$name" "$systemd_root/$name"
+      install -m 0644 "$transaction_dir/units/$name" "$systemd_root/$name" || return
     done <"$transaction_dir/units-present"
   fi
-  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do rm -f -- "$state_root/$name"; done
+  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do rm -f -- "$state_root/$name" || return; done
   if [[ -f "$transaction_dir/state-present" ]]; then
     while IFS= read -r name; do
       [[ " install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf " == *" $name "* && -f "$transaction_dir/state/$name" && ! -L "$transaction_dir/state/$name" ]] || block 'transaction state manifest is unsafe'
-      install -m 0600 "$transaction_dir/state/$name" "$state_root/$name"
+      install -m 0600 "$transaction_dir/state/$name" "$state_root/$name" || return
     done <"$transaction_dir/state-present"
   fi
-  rm -f -- "$current" "$install_root/.current.new" "$state_root/.install-state.new" "$active_policy.new" "$state_file.new"
+  rm -f -- "$current" "$install_root/.current.new" "$state_root/.install-state.new" "$active_policy.new" "$state_file.new" || return
   if [[ -f "$transaction_dir/current-target" ]]; then
     target_value=$(<"$transaction_dir/current-target")
     [[ "$target_value" =~ ^releases/[0-9a-f]{40}$ ]] || block 'transaction current pointer is unsafe'
-    ln -s "$target_value" "$current"
+    ln -s "$target_value" "$current" || return
   fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
     while IFS= read -r name; do
       [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
-      systemctl enable --now "$name" >/dev/null 2>&1 || true
+      systemctl enable --now "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-enabled"
   fi
-  rm -rf -- "$transaction_dir"
+  rm -rf -- "$transaction_dir" || return
   transaction_dir=
 }
 
@@ -498,10 +504,10 @@ recover_interrupted_transaction() {
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
-  publish_deployed_snapshot "$active_policy" "$state_file"
-  rm -f "$previous_state" "$previous_policy"
+  publish_deployed_snapshot "$active_policy" "$state_file" || return
+  rm -f "$previous_state" "$previous_policy" || return
   transaction_committed=1
-  rm -rf -- "$transaction_dir"
+  rm -rf -- "$transaction_dir" || return
   transaction_dir=
 }
 
@@ -578,15 +584,15 @@ load_deployed_snapshot() {
 
 publish_deployed_snapshot() {
   local policy=$1 state=$2 snapshot pointer
-  secure_directory "$deployed_root" 700 1
-  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
-  snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
-  chmod 0700 "$snapshot"
-  install -m 0600 "$policy" "$snapshot/policy.conf"
-  install -m 0600 "$state" "$snapshot/state.json"
+  secure_directory "$deployed_root" 700 1 || return
+  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot || return; fi
+  snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
+  chmod 0700 "$snapshot" || return
+  install -m 0600 "$policy" "$snapshot/policy.conf" || return
+  install -m 0600 "$state" "$snapshot/state.json" || return
   pointer=$deployed_root/.current.$$
-  ln -s "${snapshot##*/}" "$pointer"
-  mv -Tf "$pointer" "$deployed_current"
+  ln -s "${snapshot##*/}" "$pointer" || return
+  mv -Tf "$pointer" "$deployed_current" || return
 }
 
 install_units() {
@@ -638,6 +644,11 @@ policy_adapter_operation() {
 }
 
 perform_check() {
+  local transactions=()
+  shopt -s nullglob
+  transactions=("$state_root"/.transaction.*)
+  shopt -u nullglob
+  ((${#transactions[@]} == 0)) || block 'interrupted installer transaction requires recovery'
   if active_deployment; then block 'active deployment prevents a consistent check'; fi
   converged || block 'installed deployer state is absent or drifted'
   policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed'
@@ -655,6 +666,8 @@ v=json.load(open(sys.argv[1])); print(v.get('environment',''),v.get('target','')
 PY
 )
     [[ "$old_environment" == "$environment" && "$old_target" == "$target" ]] || block 'installed environment and target identity cannot change in place'
+    [[ -e "$deployed_current" || -L "$deployed_current" ]] || block 'deployed rollback snapshot is missing; restore it before convergence'
+    load_deployed_snapshot
     if [[ "$mode" == install && -L "$current" ]] && ! state_matches; then block 'install cannot select a new candidate; use --upgrade or --repair'; fi
   elif [[ "$mode" == upgrade ]]; then
     block '--upgrade requires an existing installation'
@@ -693,7 +706,6 @@ PY
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then publish_deployed_snapshot "$active_policy" "$state_file"; fi
   commit_transaction
-  rm -f "$drained"
   health=healthy
   report CHANGED yes run-check "$(rollback_available)"
 }
@@ -742,6 +754,8 @@ perform_resume() {
   if active_deployment; then block 'active deployment prevents resume'; fi
   if [[ ! -e "$drained" && ! -L "$drained" ]]; then report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; fi
   secure_file "$drained" 'drain marker'
+  converged || block 'installed deployer state is absent or drifted; repair before resume'
+  policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed; repair before resume'
   rm -f "$drained"
   report CHANGED yes ready-to-deploy "$(rollback_available)"
 }
@@ -771,7 +785,7 @@ perform_uninstall() {
 }
 
 validate_config
-if [[ "$mode" == drain || "$mode" == resume || "$mode" == uninstall || "$mode" == rollback ]]; then
+if [[ "$mode" == drain || "$mode" == uninstall || "$mode" == rollback ]]; then
   require_maintenance_host
 else
   validate_checkout

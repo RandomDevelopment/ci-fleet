@@ -67,7 +67,7 @@ adapter rollback
 
 Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
-Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file as its final successful step. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after that marker exists.
+Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. Rollback is exposed only through the transactional installer, never as a direct runtime operation. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file as its final successful step. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after core/application alignment. A committed rollback interrupted after the adapter returns is finalized from the retained transaction on the next serialized installer operation.
 
 ## Prepare host-local files
 
@@ -225,7 +225,7 @@ sudo ./scripts/install-deployer.sh \
 sudo systemctl start ci-fleet-deployer-drain.service
 ```
 
-After maintenance, explicitly resume through the same serialized installer boundary. This validates and removes only the managed drain marker and is idempotent:
+After maintenance, explicitly resume through the same serialized installer boundary. This removes the managed drain marker only after full installed-state convergence, role isolation, and active-policy health pass; it is idempotent:
 
 ```bash
 sudo ./scripts/install-deployer.sh \

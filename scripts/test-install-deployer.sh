@@ -51,6 +51,7 @@ set -u
 root=${CI_FLEET_DEPLOYER_ROOT:-}
 log=${FAKE_SYSTEMCTL_LOG:-/dev/null}
 printf '%s\n' "$*" >>"$log"
+[[ -z ${FAKE_SYSTEMCTL_FAIL_COMMAND:-} || ${1:-} != "$FAKE_SYSTEMCTL_FAIL_COMMAND" ]] || exit 1
 case "${1:-}" in
   is-system-running)
     [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1
@@ -349,6 +350,7 @@ printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$interrupted
 printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$interrupted/timers-enabled"
 printf 'interrupted\n' >>"$root/var/lib/ci-fleet-deployer/install-state.json"
 printf 'interrupted\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'interrupted installer transaction requires recovery' "$installer" --check --config "$config" >/dev/null
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$interrupted" ]] || fail 'interrupted transaction was not recovered'
 expect_success "$installer" --check --config "$config" >/dev/null
@@ -434,11 +436,25 @@ approval_error=$(expect_failure 'malformed approval evidence line' "$installer" 
 [[ "$approval_error" != *CANARY_SECRET_VALUE_DO_NOT_PRINT* ]] || fail 'secret content leaked beside evidence failure'
 write_evidence
 
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1)) FAKE_SYSTEMCTL_FAIL_COMMAND=disable
+expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
+unset FAKE_ADAPTER_FAIL_HEALTH_AFTER FAKE_SYSTEMCTL_FAIL_COMMAND
+compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null || fail 'failed restoration deleted its recovery transaction'
+expect_success "$installer" --repair --config "$config" >/dev/null
+if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'retry did not recover the retained transaction'; fi
+
 old_state=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
 new_image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 image=$new_image
 write_evidence
 write_config
+deployed_current=$root/var/lib/ci-fleet-deployer/deployed/current
+deployed_target=$(readlink "$deployed_current")
+rm "$deployed_current"
+expect_failure 'deployed rollback snapshot is missing; restore it before convergence' "$installer" --upgrade --config "$config" >/dev/null
+ln -s "$deployed_target" "$deployed_current"
 export FAKE_ADAPTER_SLEEP_OPERATION=validate CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS=1
 expect_failure 'candidate adapter validation failed' "$installer" --upgrade --config "$config" >/dev/null
 unset FAKE_ADAPTER_SLEEP_OPERATION CI_FLEET_DEPLOYER_TEST_TIMEOUT_SECONDS
@@ -502,6 +518,11 @@ rm "$active"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed resume removed drain state'
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'repair implicitly resumed the deployer'
 resume=$(expect_success "$installer" --resume --config "$config")
 grep -Fq 'result=CHANGED' <<<"$resume" || fail 'resume did not clear drain state'
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'resume retained drain state'
@@ -546,6 +567,12 @@ request=$root/var/lib/ci-fleet-deployer/request.conf
 cp "$approval" "$request"
 chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
+expect_failure 'usage: deployer-runtime.sh health|cleanup|deploy|drain' "$runtime" rollback >/dev/null
+mv "$adapter" "$adapter.saved"
+expect_success "$runtime" drain >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'runtime drain required a healthy adapter'
+rm "$root/var/lib/ci-fleet-deployer/drained"
+mv "$adapter.saved" "$adapter"
 expect_success "$runtime" health >/dev/null
 expect_success "$runtime" cleanup >/dev/null
 mkdir "$root/var/lib/ci-fleet-deployer/.transaction.interrupted"
@@ -562,10 +589,13 @@ rm "$root/var/lib/ci-fleet-deployer/active-operation"
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.late-added.service"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" deploy >/dev/null
 expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" cleanup >/dev/null
+expect_failure 'ordinary GitHub Actions runner service is present' "$runtime" health >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran after role isolation drift'
 [[ $(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true) == "$cleanup_calls_before" ]] || fail 'cleanup ran after role isolation drift'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'health adapter ran after role isolation drift'
 rm "$root/etc/systemd/system/actions.runner.late-added.service"
 python3 - "$approval" "$request" <<'PY'
 from pathlib import Path
