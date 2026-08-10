@@ -38,6 +38,7 @@ on_exit() {
   fi
   [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
   [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
+  [[ -z ${policy_check_snapshot:-} ]] || rm -f -- "$policy_check_snapshot"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
   return "$status"
 }
@@ -153,6 +154,22 @@ valid_utc() {
   local value=$1
   [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && [[ $(date -u -d "$value" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) == "$value" ]]
 }
+credential_reference_safe() {
+  local provider=$1 reference=$2 description=$3
+  case $provider in
+    file)
+      inside "$reference" "$etc_root/credentials" || die "$description credential reference is outside the approved credential directory"
+      [[ ! -L $reference && -f $reference ]] || die "$description credential reference must be a regular file, not a symlink"
+      [[ $reference == "$(realpath -m -- "$reference")" && $(realpath -e -- "$reference") == "$reference" ]] || die "$description credential reference contains a symlink or non-canonical component"
+      [[ $(stat -c '%u:%a' "$reference") == "$expected_uid:600" ]] || die "$description credential file must be owner-only mode 0600"
+      ;;
+    external)
+      [[ $reference =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die "$description has an invalid external secret-manager adapter reference"
+      ;;
+    *) die "$description CREDENTIAL_PROVIDER must be file or external" ;;
+  esac
+}
+
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
   [[ ! -L "$path" && -f "$path" ]] || block "$description must be a regular file, not a symlink"
@@ -809,7 +826,9 @@ policy_adapter_operation() {
   local policy=$1 operation_name=$2 description=$3 marker=${4:-} key snapshot
   local -A policy_cfg=()
   secure_file "$policy" "$description"
+  reject_mixed_role
   snapshot=$(mktemp "$state_root/.policy-check.XXXXXX")
+  policy_check_snapshot=$snapshot
   install -m 0600 "$policy" "$snapshot"
   policy=$snapshot
   parse_file "$policy" policy_cfg "$description" "$config_keys"
@@ -817,22 +836,12 @@ policy_adapter_operation() {
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
   inside "${policy_cfg[ADAPTER_PATH]}" "$etc_root/adapters" || die "$description adapter path is outside the protected adapter directory"
   [[ ${policy_cfg[CREDENTIAL_SCOPE]} == "${policy_cfg[ENVIRONMENT]}" ]] || die "$description credential scope does not match its environment"
-  case ${policy_cfg[CREDENTIAL_PROVIDER]} in
-    file)
-      inside "${policy_cfg[CREDENTIAL_REF]}" "$etc_root/credentials" || die "$description credential reference is outside the approved credential directory"
-      [[ ! -L ${policy_cfg[CREDENTIAL_REF]} && -f ${policy_cfg[CREDENTIAL_REF]} ]] || die "$description credential reference must be a regular file, not a symlink"
-      [[ ${policy_cfg[CREDENTIAL_REF]} == "$(realpath -m -- "${policy_cfg[CREDENTIAL_REF]}")" && $(realpath -e -- "${policy_cfg[CREDENTIAL_REF]}") == "${policy_cfg[CREDENTIAL_REF]}" ]] || die "$description credential reference contains a symlink or non-canonical component"
-      [[ $(stat -c '%u:%a' "${policy_cfg[CREDENTIAL_REF]}") == "$expected_uid:600" ]] || die "$description credential file must be owner-only mode 0600"
-      ;;
-    external)
-      [[ ${policy_cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die "$description has an invalid external secret-manager adapter reference"
-      ;;
-    *) die "$description CREDENTIAL_PROVIDER must be file or external" ;;
-  esac
+  credential_reference_safe "${policy_cfg[CREDENTIAL_PROVIDER]}" "${policy_cfg[CREDENTIAL_REF]}" "$description"
   local status
   run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null 2>&1
   status=$?
   rm -f "$snapshot"
+  policy_check_snapshot=
   return "$status"
 }
 
@@ -887,6 +896,7 @@ PY
     if [[ "$mode" != repair ]]; then policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'; fi
   fi
   reject_mixed_role
+  credential_reference_safe "${cfg[CREDENTIAL_PROVIDER]}" "${cfg[CREDENTIAL_REF]}" 'candidate policy'
   run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
   install_release
   secure_directory "$state_root" 700 1
