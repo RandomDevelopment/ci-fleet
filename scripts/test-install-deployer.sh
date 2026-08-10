@@ -376,6 +376,25 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$interrupted" ]] || fail 'interrupted transaction was not recovered'
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# An unsafe transaction manifest must fail closed before any recovery mutation.
+unsafe_tx=$root/var/lib/ci-fleet-deployer/.transaction.unsafe
+mkdir -m 0700 "$unsafe_tx" "$unsafe_tx/units" "$unsafe_tx/state"
+cp "$root/var/lib/ci-fleet-deployer/install-state.json" "$unsafe_tx/state/install-state.json"
+printf 'install-state.json\n' >"$unsafe_tx/state-present"
+printf 'rogue-unit.service\n' >"$unsafe_tx/units-present"
+units_before_unsafe=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)
+expect_failure 'transaction unit manifest is unsafe' "$installer" --repair --config "$config" >/dev/null
+[[ "$units_before_unsafe" == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)" ]] || fail 'unsafe transaction manifest mutated installed units'
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'unsafe transaction manifest removed the activation pointer'
+rm "$unsafe_tx/units-present"
+printf 'not-a-release\n' >"$unsafe_tx/current-target"
+expect_failure 'transaction current pointer is unsafe' "$installer" --repair --config "$config" >/dev/null
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'unsafe transaction pointer removed the activation pointer'
+rm "$unsafe_tx/current-target"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$unsafe_tx" ]] || fail 'corrected transaction was not recovered'
+expect_success "$installer" --check --config "$config" >/dev/null
+
 rm "$root/etc/systemd/system/ci-fleet-deployer-health.timer"
 expect_failure 'result=BLOCKED' "$installer" --check --config "$config" >/dev/null
 repair=$(expect_success "$installer" --repair --config "$config")
@@ -556,6 +575,21 @@ expect_failure 'active deployer health check failed' "$installer" --check --conf
 expect_failure 'active deployer health check failed' "$installer" --check --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter-health"
 compgen -G "$root/var/lib/ci-fleet-deployer/.policy-check.*" >/dev/null && fail 'failed health validation leaked policy-check snapshots'
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Deployed policy drift in an operational field must block promotion.
+deployed_policy=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")/policy.conf
+python3 - "$deployed_policy" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external'))
+PY
+expect_failure 'deployed rollback snapshot state and policy do not cross-validate' "$installer" --upgrade --config "$config" >/dev/null
+python3 - "$deployed_policy" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=external', 'CREDENTIAL_PROVIDER=file'))
+PY
 expect_success "$installer" --check --config "$config" >/dev/null
 printf 'rollback\n' >"$tmp/fail-rollback"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback

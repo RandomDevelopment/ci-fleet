@@ -165,11 +165,13 @@ secure_directory "$log_root" 'deployer log directory'
 case "$operation" in
   health)
     reject_mixed_role
+    validate_credential
     env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" "$operation"
     ;;
   cleanup)
     not_drained
     reject_mixed_role
+    validate_credential
     env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup
     ;;
   deploy)
@@ -179,7 +181,8 @@ case "$operation" in
     secure_file "$request" 'deployment request'
     request_snapshot=$(mktemp "$state_root/.request.XXXXXX")
     install -m 0600 "$request" "$request_snapshot"
-    trap 'rm -f "${request_snapshot:-}" "${policy_snapshot:-}"' EXIT INT TERM
+    trap 'rm -f "${request_snapshot:-}" "${policy_snapshot:-}"' EXIT
+    trap 'exit 2' INT TERM
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
     parse_file "$request_snapshot" req request "$request_keys"
     for key in SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT; do
@@ -273,6 +276,7 @@ PY
     snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
     snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
     reject_mixed_role
+    validate_credential
     audit_pending=1
     audit_phase=pre-adapter
     adapter_status=
