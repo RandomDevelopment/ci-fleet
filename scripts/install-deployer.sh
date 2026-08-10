@@ -547,25 +547,46 @@ restore_transaction() {
   local name target_value
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
+  if [[ -f "$transaction_dir/units-present" ]]; then
+    while IFS= read -r name; do
+      [[ " ${unit_names[*]} " == *" $name "* && -f "$transaction_dir/units/$name" && ! -L "$transaction_dir/units/$name" ]] || block 'transaction unit manifest is unsafe'
+    done <"$transaction_dir/units-present"
+  fi
+  if [[ -f "$transaction_dir/state-present" ]]; then
+    while IFS= read -r name; do
+      [[ " install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf " == *" $name "* && -f "$transaction_dir/state/$name" && ! -L "$transaction_dir/state/$name" ]] || block 'transaction state manifest is unsafe'
+    done <"$transaction_dir/state-present"
+  fi
+  for name in timers-enabled timers-active; do
+    if [[ -f "$transaction_dir/$name" ]]; then
+      while IFS= read -r target_value; do
+        [[ " ${timer_names[*]} " == *" $target_value "* ]] || block 'transaction timer manifest is unsafe'
+      done <"$transaction_dir/$name"
+    fi
+  done
+  if [[ -f "$transaction_dir/current-target" ]]; then
+    [[ $(<"$transaction_dir/current-target") =~ ^releases/[0-9a-f]{40}$ ]] || block 'transaction current pointer is unsafe'
+  fi
+  if [[ -f "$transaction_dir/deployed-target" ]]; then
+    target_value=$(<"$transaction_dir/deployed-target")
+    [[ "$target_value" == absent || "$target_value" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction deployed pointer is unsafe'
+  fi
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || return
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
-      [[ " ${unit_names[*]} " == *" $name "* && -f "$transaction_dir/units/$name" && ! -L "$transaction_dir/units/$name" ]] || block 'transaction unit manifest is unsafe'
       install -m 0644 "$transaction_dir/units/$name" "$systemd_root/$name" || return
     done <"$transaction_dir/units-present"
   fi
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do rm -f -- "$state_root/$name" || return; done
   if [[ -f "$transaction_dir/state-present" ]]; then
     while IFS= read -r name; do
-      [[ " install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf " == *" $name "* && -f "$transaction_dir/state/$name" && ! -L "$transaction_dir/state/$name" ]] || block 'transaction state manifest is unsafe'
       install -m 0600 "$transaction_dir/state/$name" "$state_root/$name" || return
     done <"$transaction_dir/state-present"
   fi
   rm -f -- "$current" "$install_root/.current.new" "$state_root/.install-state.new" "$active_policy.new" "$state_file.new" || return
   if [[ -f "$transaction_dir/current-target" ]]; then
     target_value=$(<"$transaction_dir/current-target")
-    [[ "$target_value" =~ ^releases/[0-9a-f]{40}$ ]] || block 'transaction current pointer is unsafe'
     ln -s "$target_value" "$current" || return
   fi
   if [[ -f "$transaction_dir/deployed-target" ]]; then
@@ -573,7 +594,6 @@ restore_transaction() {
     if [[ "$target_value" == absent ]]; then
       rm -f -- "$deployed_current" || return
     else
-      [[ "$target_value" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction deployed pointer is unsafe'
       rm -f -- "$deployed_current" || return
       ln -s "$target_value" "$deployed_current" || return
     fi
@@ -581,13 +601,11 @@ restore_transaction() {
   systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
     while IFS= read -r name; do
-      [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
       systemctl enable "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-enabled"
   fi
   if [[ -f "$transaction_dir/timers-active" ]]; then
     while IFS= read -r name; do
-      [[ " ${timer_names[*]} " == *" $name "* ]] || block 'transaction timer manifest is unsafe'
       systemctl start "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-active"
   fi
@@ -646,6 +664,15 @@ ok = (policy.get('SCHEMA_VERSION') == '1'
       and all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
       and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
       and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
+ok = ok and all(policy.get(k) for k in ('ADAPTER_PATH','ADAPTER_SHA256','CREDENTIAL_PROVIDER','CREDENTIAL_REF','CREDENTIAL_SCOPE'))
+ok = ok and bool(re.fullmatch(r'[0-9a-f]{64}', policy.get('ADAPTER_SHA256','')))
+ok = ok and policy.get('ADAPTER_PATH','').startswith('/')
+ok = ok and policy.get('CREDENTIAL_PROVIDER') in ('file','external')
+ok = ok and policy.get('CREDENTIAL_SCOPE') == policy.get('ENVIRONMENT')
+if policy.get('CREDENTIAL_PROVIDER') == 'file':
+    ok = ok and policy.get('CREDENTIAL_REF','').startswith('/')
+else:
+    ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
 PY
   publish_deployed_snapshot "$active_policy" "$state_file" || return
@@ -754,6 +781,15 @@ ok = (policy.get('SCHEMA_VERSION') == '1'
       and all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
       and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
       and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
+ok = ok and all(policy.get(k) for k in ('ADAPTER_PATH','ADAPTER_SHA256','CREDENTIAL_PROVIDER','CREDENTIAL_REF','CREDENTIAL_SCOPE'))
+ok = ok and bool(re.fullmatch(r'[0-9a-f]{64}', policy.get('ADAPTER_SHA256','')))
+ok = ok and policy.get('ADAPTER_PATH','').startswith('/')
+ok = ok and policy.get('CREDENTIAL_PROVIDER') in ('file','external')
+ok = ok and policy.get('CREDENTIAL_SCOPE') == policy.get('ENVIRONMENT')
+if policy.get('CREDENTIAL_PROVIDER') == 'file':
+    ok = ok and policy.get('CREDENTIAL_REF','').startswith('/')
+else:
+    ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
 PY
 }
@@ -823,14 +859,16 @@ run_verified_adapter() {
 }
 
 policy_adapter_operation() {
-  local policy=$1 operation_name=$2 description=$3 marker=${4:-} key snapshot
+  local policy=$1 operation_name=$2 description=$3 marker=${4:-} snapshot=${5:-1} key
   local -A policy_cfg=()
   secure_file "$policy" "$description"
   reject_mixed_role
-  snapshot=$(mktemp "$state_root/.policy-check.XXXXXX")
-  policy_check_snapshot=$snapshot
-  install -m 0600 "$policy" "$snapshot"
-  policy=$snapshot
+  if [[ "$snapshot" == 1 ]]; then
+    snapshot=$(mktemp "$state_root/.policy-check.XXXXXX")
+    policy_check_snapshot=$snapshot
+    install -m 0600 "$policy" "$snapshot"
+    policy=$snapshot
+  fi
   parse_file "$policy" policy_cfg "$description" "$config_keys"
   for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
@@ -838,10 +876,9 @@ policy_adapter_operation() {
   [[ ${policy_cfg[CREDENTIAL_SCOPE]} == "${policy_cfg[ENVIRONMENT]}" ]] || die "$description credential scope does not match its environment"
   credential_reference_safe "${policy_cfg[CREDENTIAL_PROVIDER]}" "${policy_cfg[CREDENTIAL_REF]}" "$description"
   local status
-  run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null 2>&1
+  run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null
   status=$?
-  rm -f "$snapshot"
-  policy_check_snapshot=
+  if [[ "$snapshot" != 0 ]]; then rm -f "$snapshot"; policy_check_snapshot=; fi
   return "$status"
 }
 
@@ -853,7 +890,7 @@ perform_check() {
   ((${#transactions[@]} == 0)) || block 'interrupted installer transaction requires recovery'
   if active_deployment; then block 'active deployment prevents a consistent check'; fi
   converged || block 'installed deployer state is absent or drifted'
-  policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer health check failed'
+  policy_adapter_operation "$active_policy" health 'active policy' '' 0 || block 'active deployer health check failed'
   health=healthy
   report NO_CHANGE no none "$(rollback_available)"
 }
@@ -897,7 +934,7 @@ PY
   fi
   reject_mixed_role
   credential_reference_safe "${cfg[CREDENTIAL_PROVIDER]}" "${cfg[CREDENTIAL_REF]}" 'candidate policy'
-  run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null 2>&1 || die 'candidate adapter validation failed'
+  run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null || die 'candidate adapter validation failed'
   install_release
   secure_directory "$state_root" 700 1
   secure_directory "$log_root" 700 1
