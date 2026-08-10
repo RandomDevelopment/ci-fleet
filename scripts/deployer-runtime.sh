@@ -32,6 +32,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
+  local target
   if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then audit_pending=0; fi
   if [[ ${audit_pending:-0} == 1 ]]; then
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
@@ -41,7 +42,13 @@ deploy_exit() {
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
   rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
-  [[ -z ${snapshot:-} ]] || rm -rf -- "$snapshot" || true
+  if [[ -n ${snapshot_pointer:-} && $snapshot_pointer != "$deployed_current" ]]; then
+    target=$(readlink "$snapshot_pointer" 2>/dev/null || true)
+    if [[ -n $target && ! -e "$deployed_root/$target" ]]; then rm -rf -- "$snapshot"; fi
+    rm -f "$snapshot_pointer"
+  elif [[ -z ${snapshot_pointer:-} ]]; then
+    [[ -z ${snapshot:-} ]] || rm -rf -- "$snapshot"
+  fi
   return "$status"
 }
 expected_uid=0
@@ -282,7 +289,7 @@ PY
     adapter_status=
     trap deploy_exit EXIT
     trap 'exit 2' INT TERM
-    install -m 0600 /dev/null "$consumed_marker" || { audit_pending=0; die 'deployment request consumption marker failed'; }
+    install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
@@ -304,10 +311,12 @@ PY
     secure_file "$snapshot/state.json" 'prepared deployed state'
     [[ $(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1) == "$snapshot_policy_sha" && $(sha256sum "$snapshot/state.json" | cut -d' ' -f1) == "$snapshot_state_sha" ]] || die 'prepared deployed snapshot changed during deployment'
     pointer=$deployed_root/.current.$$
+    snapshot_pointer=$pointer
     retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
-    mv -Tf "$pointer" "$deployed_current" || { rm -f "$pointer"; snapshot=; die 'deployed snapshot publication failed'; }
+    mv -Tf "$pointer" "$deployed_current"
+    snapshot_pointer=$deployed_current
     snapshot=
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
