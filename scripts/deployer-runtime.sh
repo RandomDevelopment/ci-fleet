@@ -302,7 +302,7 @@ PY
     retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
-    mv -Tf "$pointer" "$deployed_current"
+    mv -Tf "$pointer" "$deployed_current" || { rm -f "$pointer"; snapshot=; die 'deployed snapshot publication failed'; }
     snapshot=
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
