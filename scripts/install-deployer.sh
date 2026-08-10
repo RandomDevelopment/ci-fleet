@@ -409,8 +409,9 @@ active_deployment() {
 }
 
 release_complete() {
-  local release=$1 stored actual unit entry
+  local release=$1 stored actual unit entry dir
   [[ -d "$release" && ! -L "$release" && $(stat -c '%u:%a' "$release") == "$expected_uid:755" && -x "$release/scripts/install-deployer.sh" && -x "$release/scripts/deployer-runtime.sh" ]] || return 1
+  for dir in "$release/scripts" "$release/deploy" "$release/deploy/deployer"; do [[ -d "$dir" && ! -L "$dir" && $(stat -c '%u:%a' "$dir") == "$expected_uid:755" ]] || return 1; done
   for entry in "$release/scripts/install-deployer.sh" "$release/scripts/deployer-runtime.sh"; do [[ ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || return 1; done
   [[ -f "$release/.ci-fleet-tree-sha256" ]] || return 1
   stored=$(<"$release/.ci-fleet-tree-sha256")
@@ -443,7 +444,7 @@ units_match() {
 
 current_matches() {
   local target_path=$releases/$core_ref
-  [[ -L "$current" && $(readlink -f "$current") == $(readlink -f "$target_path") ]] || return 1
+  [[ -L "$current" && $(readlink "$current") == "releases/$core_ref" ]] || return 1
   release_complete "$target_path"
 }
 
@@ -453,6 +454,9 @@ managed_boundaries_match() {
     mode=${path##*:}; path=${path%:*}
     [[ -d "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:$mode" ]] || return 1
   done
+  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || return 1
+  mode=$(stat -c %a "$systemd_root")
+  (((8#$mode & 8#022) == 0))
 }
 
 converged() { managed_boundaries_match && current_matches && state_matches && units_match; }
@@ -547,6 +551,9 @@ restore_transaction() {
   local name target_value
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
+  for name in units-present state-present timers-enabled timers-active current-target deployed-target; do
+    [[ ! -e "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || [[ ! -L "$transaction_dir/$name" && -f "$transaction_dir/$name" ]] || block "transaction manifest $name has an unsafe type"
+  done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
       [[ " ${unit_names[*]} " == *" $name "* && -f "$transaction_dir/units/$name" && ! -L "$transaction_dir/units/$name" ]] || block 'transaction unit manifest is unsafe'
@@ -639,7 +646,7 @@ finalize_committed_rollback() {
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
   secure_file "$state_file" 'deployer install state' || return
-  python3 - "$state_file" "$active_policy" <<'PY' >/dev/null 2>&1 || return
+  python3 - "$state_file" "$active_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || return
 import json, re, sys
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
@@ -666,11 +673,11 @@ ok = (policy.get('SCHEMA_VERSION') == '1'
       and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
 ok = ok and all(policy.get(k) for k in ('ADAPTER_PATH','ADAPTER_SHA256','CREDENTIAL_PROVIDER','CREDENTIAL_REF','CREDENTIAL_SCOPE'))
 ok = ok and bool(re.fullmatch(r'[0-9a-f]{64}', policy.get('ADAPTER_SHA256','')))
-ok = ok and policy.get('ADAPTER_PATH','').startswith('/')
+ok = ok and policy.get('ADAPTER_PATH','').startswith(sys.argv[3] + '/')
 ok = ok and policy.get('CREDENTIAL_PROVIDER') in ('file','external')
 ok = ok and policy.get('CREDENTIAL_SCOPE') == policy.get('ENVIRONMENT')
 if policy.get('CREDENTIAL_PROVIDER') == 'file':
-    ok = ok and policy.get('CREDENTIAL_REF','').startswith('/')
+    ok = ok and policy.get('CREDENTIAL_REF','').startswith(sys.argv[4] + '/')
 else:
     ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
@@ -756,7 +763,7 @@ load_deployed_snapshot() {
   secure_file "$snapshot/state.json" 'deployed rollback state'
   deployed_snapshot_policy=$snapshot/policy.conf
   deployed_snapshot_state=$snapshot/state.json
-  python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
+  python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
 import json, re, sys
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
@@ -783,11 +790,11 @@ ok = (policy.get('SCHEMA_VERSION') == '1'
       and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
 ok = ok and all(policy.get(k) for k in ('ADAPTER_PATH','ADAPTER_SHA256','CREDENTIAL_PROVIDER','CREDENTIAL_REF','CREDENTIAL_SCOPE'))
 ok = ok and bool(re.fullmatch(r'[0-9a-f]{64}', policy.get('ADAPTER_SHA256','')))
-ok = ok and policy.get('ADAPTER_PATH','').startswith('/')
+ok = ok and policy.get('ADAPTER_PATH','').startswith(sys.argv[3] + '/')
 ok = ok and policy.get('CREDENTIAL_PROVIDER') in ('file','external')
 ok = ok and policy.get('CREDENTIAL_SCOPE') == policy.get('ENVIRONMENT')
 if policy.get('CREDENTIAL_PROVIDER') == 'file':
-    ok = ok and policy.get('CREDENTIAL_REF','').startswith('/')
+    ok = ok and policy.get('CREDENTIAL_REF','').startswith(sys.argv[4] + '/')
 else:
     ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
@@ -870,6 +877,7 @@ policy_adapter_operation() {
     policy=$snapshot
   fi
   parse_file "$policy" policy_cfg "$description" "$config_keys"
+  [[ ${policy_cfg[SCHEMA_VERSION]:-} == 1 ]] || die "$description has an unsupported or missing schema version"
   for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "policy_cfg[$key]" ]] || die "$description is missing $key"; done
   [[ ${policy_cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die "$description has an invalid adapter digest"
   inside "${policy_cfg[ADAPTER_PATH]}" "$etc_root/adapters" || die "$description adapter path is outside the protected adapter directory"

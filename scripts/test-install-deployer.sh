@@ -391,8 +391,20 @@ printf 'not-a-release\n' >"$unsafe_tx/current-target"
 expect_failure 'transaction current pointer is unsafe' "$installer" --repair --config "$config" >/dev/null
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'unsafe transaction pointer removed the activation pointer'
 rm "$unsafe_tx/current-target"
+mkdir "$unsafe_tx/timers-enabled"
+expect_failure 'transaction manifest timers-enabled has an unsafe type' "$installer" --repair --config "$config" >/dev/null
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'unsafe manifest type removed the activation pointer'
+rmdir "$unsafe_tx/timers-enabled"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$unsafe_tx" ]] || fail 'corrected transaction was not recovered'
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A noncanonical activation pointer must fail convergence instead of certifying it.
+rm "$root/opt/ci-fleet-deployer/current"
+ln -s "$root/opt/ci-fleet-deployer/releases/$core_ref" "$root/opt/ci-fleet-deployer/current"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+rm "$root/opt/ci-fleet-deployer/current"
+ln -s "releases/$core_ref" "$root/opt/ci-fleet-deployer/current"
 expect_success "$installer" --check --config "$config" >/dev/null
 
 rm "$root/etc/systemd/system/ci-fleet-deployer-health.timer"
