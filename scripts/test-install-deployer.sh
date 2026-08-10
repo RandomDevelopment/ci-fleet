@@ -699,10 +699,10 @@ grep -Fq 'result=NO_CHANGE' <<<"$repeat_uninstall" || fail 'repeated uninstall w
 expect_success "$installer" --install --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
 mkdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
-uninstall_before=$(ls -l --time-style=+%s "$root/etc/systemd/system" | sha256sum)
+uninstall_before=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'test setup expected no drain marker before drifted uninstall'
 expect_failure 'managed unit ci-fleet-deployer-drain.service has an unsafe type' "$installer" --uninstall --config "$config" >/dev/null
-[[ "$uninstall_before" == "$(ls -l --time-style=+%s "$root/etc/systemd/system" | sha256sum)" ]] || fail 'unsafe unit type partially mutated the host during uninstall'
+[[ "$uninstall_before" == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'unsafe unit type partially mutated the host during uninstall'
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'failed closed uninstall removed the activation pointer'
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed closed uninstall created the drain marker'
 rmdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
