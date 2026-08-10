@@ -32,6 +32,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
+  if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then audit_pending=0; fi
   if [[ ${audit_pending:-0} == 1 ]]; then
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
@@ -272,12 +273,12 @@ PY
     snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
     snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
     reject_mixed_role
-    install -m 0600 /dev/null "$consumed_marker"
     audit_pending=1
     audit_phase=pre-adapter
     adapter_status=
     trap deploy_exit EXIT
     trap 'exit 2' INT TERM
+    install -m 0600 /dev/null "$consumed_marker" || { audit_pending=0; die 'deployment request consumption marker failed'; }
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"

@@ -134,6 +134,7 @@ if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
   rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
   ln -s "$FAKE_ADAPTER_MUTATE_AUDIT_TARGET" "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
 fi
+if [[ -n ${FAKE_ADAPTER_CHMOD_DURING:-} ]]; then chmod 0644 "$FAKE_ADAPTER_CHMOD_DURING"; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
@@ -523,6 +524,13 @@ chmod 0644 "$credential"
 expect_failure 'credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
 chmod 0600 "$credential"
 
+# Candidate validate must revalidate credentials drifted after configuration validation.
+export FAKE_ADAPTER_CHMOD_DURING=$credential
+expect_failure 'candidate policy credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
+unset FAKE_ADAPTER_CHMOD_DURING
+chmod 0600 "$credential"
+[[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'credential-drifted candidate replaced healthy state'
+
 install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/drained"
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before + 1))
@@ -539,6 +547,16 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 expect_success "$installer" --upgrade --config "$config" >/dev/null
 grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/last-known-good.json" || fail 'second undeployed upgrade replaced the deployed rollback point'
+
+# Failed active-policy health checks must not accumulate policy-check snapshots.
+compgen -G "$root/var/lib/ci-fleet-deployer/.policy-check.*" >/dev/null && fail 'policy-check snapshot leaked before drifted-health regression'
+export FAKE_ADAPTER_FAIL=$tmp/fail-adapter-health
+printf 'health\n' >"$FAKE_ADAPTER_FAIL"
+expect_failure 'active deployer health check failed' "$installer" --check --config "$config" >/dev/null
+expect_failure 'active deployer health check failed' "$installer" --check --config "$config" >/dev/null
+unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter-health"
+compgen -G "$root/var/lib/ci-fleet-deployer/.policy-check.*" >/dev/null && fail 'failed health validation leaked policy-check snapshots'
+expect_success "$installer" --check --config "$config" >/dev/null
 printf 'rollback\n' >"$tmp/fail-rollback"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
