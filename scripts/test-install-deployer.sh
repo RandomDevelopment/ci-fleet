@@ -130,9 +130,9 @@ case "$1" in validate|health|cleanup|deploy|rollback) ;; *) exit 2 ;; esac
 if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
 fi
-if [[ "$1" == deploy && -n ${FAKE_ADAPTER_AUDIT_PATH:-} ]]; then
-  rm -f "$FAKE_ADAPTER_AUDIT_PATH"
-  ln -s "$FAKE_ADAPTER_AUDIT_TARGET" "$FAKE_ADAPTER_AUDIT_PATH"
+if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
+  rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+  ln -s "$FAKE_ADAPTER_MUTATE_AUDIT_TARGET" "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
 fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
@@ -695,6 +695,20 @@ grep -Fq 'result=CHANGED' <<<"$uninstall" || fail 'uninstall did not report chan
 repeat_uninstall=$(expect_success "$installer" --uninstall --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$repeat_uninstall" || fail 'repeated uninstall was not idempotent'
 
+# A drifted managed unit directory must fail closed before any uninstall mutation.
+expect_success "$installer" --install --config "$config" >/dev/null
+rm "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
+mkdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
+uninstall_before=$(ls -l --time-style=+%s "$root/etc/systemd/system" | sha256sum)
+[[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'test setup expected no drain marker before drifted uninstall'
+expect_failure 'managed unit ci-fleet-deployer-drain.service has an unsafe type' "$installer" --uninstall --config "$config" >/dev/null
+[[ "$uninstall_before" == "$(ls -l --time-style=+%s "$root/etc/systemd/system" | sha256sum)" ]] || fail 'unsafe unit type partially mutated the host during uninstall'
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'failed closed uninstall removed the activation pointer'
+[[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed closed uninstall created the drain marker'
+rmdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after correcting unit drift did not uninstall'
+
 # Runtime contract: exact-head request/evidence, drain and scoped adapter calls.
 write_evidence staging example-staging
 write_config staging example-staging
@@ -886,10 +900,25 @@ import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-replacement-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:00Z'))
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
-export FAKE_ADAPTER_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_AUDIT_TARGET=$tmp/unrelated-audit
+export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_TARGET=$tmp/unrelated-audit
 expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
-unset FAKE_ADAPTER_AUDIT_PATH FAKE_ADAPTER_AUDIT_TARGET
+unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
 [[ $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'adapter audit replacement redirected the trusted append'
+rm "$root/var/log/ci-fleet-deployer/audit.log"
+
+# Signal at the deployed-snapshot publication boundary must not delete the published snapshot.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=signal-at-publication-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:06:00Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_TARGET=$tmp/unrelated-audit
+expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
+[[ -L "$deployed_current" && -e "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'post-publication failure left deployed/current dangling'
+cmp -s "$deployed_current/policy.conf" "$config" || fail 'published deployed policy does not match the deployed configuration'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"

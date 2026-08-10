@@ -602,21 +602,50 @@ recover_interrupted_transaction() {
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed retired
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
+  secure_file "$active_policy" 'active policy' || return
+  secure_file "$state_file" 'deployer install state' || return
+  python3 - "$state_file" "$active_policy" <<'PY' >/dev/null 2>&1 || return
+import json, re, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+policy = {}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+try:
+    for line in open(sys.argv[2], encoding='utf-8'):
+        line = line.rstrip('\n')
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if not sep or key in policy or key not in allowed:
+            raise SystemExit(1)
+        policy[key] = value
+except OSError:
+    raise SystemExit(1)
+sha = re.compile(r'^[0-9a-f]{40}$')
+pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
+ok = (policy.get('SCHEMA_VERSION') == '1'
+      and all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
+      and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
+      and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact'])))
+raise SystemExit(0 if ok else 1)
+PY
   publish_deployed_snapshot "$active_policy" "$state_file" || return
   rm -f "$previous_state" "$previous_policy" || return
-  transaction_committed=1
   retired=$state_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
+  transaction_committed=1
   rm -rf -- "$retired"
 }
 
 commit_transaction() {
   local retired
-  transaction_committed=1
   retired=$state_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
+  transaction_committed=1
   rm -rf -- "$retired"
 }
 
@@ -690,13 +719,14 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 policy = {}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
 try:
     for line in open(sys.argv[2], encoding='utf-8'):
         line = line.rstrip('\n')
         if not line or line.startswith('#'):
             continue
         key, sep, value = line.partition('=')
-        if not sep or key in policy:
+        if not sep or key in policy or key not in allowed:
             raise SystemExit(1)
         policy[key] = value
 except OSError:
@@ -712,9 +742,15 @@ PY
 }
 
 publish_deployed_snapshot() {
-  local policy=$1 state=$2 snapshot pointer
+  local policy=$1 state=$2 snapshot pointer retired
   secure_directory "$deployed_root" 700 1 || return
-  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot || return; fi
+  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
+    load_deployed_snapshot || return
+    if cmp -s "$deployed_snapshot_policy" "$policy" && cmp -s "$deployed_snapshot_state" "$state"; then return; fi
+    retired=$(readlink "$deployed_current")
+    [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
+    rm -f -- "$deployed_current" || return
+  fi
   snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
   chmod 0700 "$snapshot" || return
   install -m 0600 "$policy" "$snapshot/policy.conf" || return
@@ -722,6 +758,7 @@ publish_deployed_snapshot() {
   pointer=$deployed_root/.current.$$
   ln -s "${snapshot##*/}" "$pointer" || return
   mv -Tf "$pointer" "$deployed_current" || return
+  if [[ -n ${retired:-} && -d "$deployed_root/$retired" && ! -L "$deployed_root/$retired" ]]; then rm -rf -- "${deployed_root:?}/$retired"; fi
 }
 
 install_units() {
@@ -912,6 +949,7 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   mv -Tf "$install_root/.current.new" "$current"
+  reject_mixed_role
   policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" || die 'application adapter rollback failed'
   finalize_committed_rollback
   recovered_rollback=0
@@ -953,6 +991,7 @@ perform_uninstall() {
   if active_deployment; then block 'active deployment prevents this operation'; fi
   acquire_lock
   secure_directory "$state_root" 700 1
+  for unit in "${unit_names[@]}"; do [[ ! -e "$systemd_root/$unit" || -L "$systemd_root/$unit" || -f "$systemd_root/$unit" ]] || block "managed unit $unit has an unsafe type"; done
   if [[ -e "$drained" || -L "$drained" ]]; then
     secure_file "$drained" 'drain marker'
   else
