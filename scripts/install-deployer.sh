@@ -389,7 +389,7 @@ reject_mixed_role() {
 }
 
 validate_checkout() {
-  local head checkout_uid
+  local head
   head=$(git -C "$repo_root" rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
   [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
   if [[ "$testing" != 1 ]]; then
@@ -398,10 +398,6 @@ validate_checkout() {
   # Pin the reviewed inputs before any privileged copy: archive the exact
   # HEAD commit into a root-controlled directory so a checkout owner cannot
   # substitute bytes after this validation.
-  checkout_uid=$(stat -c %u "$repo_root")
-  if ((checkout_uid != effective_uid)); then
-    [[ -z $(find "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$repo_root/deploy/deployer" -uid "$checkout_uid" -print -quit 2>/dev/null) ]] || block 'non-root-writable checkout boundary is violated'
-  fi
   if [[ -d "$state_root" && ! -L "$state_root" ]]; then
     checkout_snapshot=$(mktemp -d "$state_root/.checkout.XXXXXX")
   else
