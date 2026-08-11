@@ -396,8 +396,11 @@ validate_checkout() {
     git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
   fi
   # Pin the reviewed inputs before any privileged copy: archive the exact
-  # HEAD commit into a root-controlled directory so a checkout owner cannot
-  # substitute bytes after this validation.
+  # HEAD commit into a root-controlled directory, then require every staged
+  # byte to match the clean worktree content observed at validation time, so
+  # neither worktree nor object-database mutation can substitute bytes.
+  local checkout_hashes archived_hashes
+  checkout_hashes=$(cd "$repo_root" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
   if [[ -d "$state_root" && ! -L "$state_root" ]]; then
     checkout_snapshot=$(mktemp -d "$state_root/.checkout.XXXXXX")
   else
@@ -405,12 +408,14 @@ validate_checkout() {
   fi
   chmod 0700 "$checkout_snapshot"
   git -C "$repo_root" archive "$head" scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer | tar -x -C "$checkout_snapshot" || block 'reviewed checkout archival failed'
+  archived_hashes=$(cd "$checkout_snapshot" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
+  [[ $archived_hashes == "$checkout_hashes" ]] || block 'archived checkout bytes differ from the validated worktree'
   repo_root=$checkout_snapshot
   unit_source=$repo_root/deploy/deployer
 }
 
 active_deployment() {
-  local pid started now
+  local pid started now boot_id start_time live_start
   [[ -f "$active_operation" && ! -L "$active_operation" ]] || return 1
   pid=$(awk -F= '$1=="pid" {print $2}' "$active_operation")
   started=$(awk -F= '$1=="started_at" {print $2}' "$active_operation")
@@ -419,6 +424,14 @@ active_deployment() {
     if [[ "$testing" == 1 ]]; then
       [[ -n ${CI_FLEET_DEPLOYER_TEST_LIVE_PID:-} && $pid == "$CI_FLEET_DEPLOYER_TEST_LIVE_PID" ]] && return 0
       return 1
+    fi
+    boot_id=$(awk -F= '$1=="boot_id" {print $2}' "$active_operation")
+    start_time=$(awk -F= '$1=="start_time" {print $2}' "$active_operation")
+    if [[ -n $boot_id && -n $start_time ]]; then
+      [[ $boot_id == "$(</proc/sys/kernel/random/boot_id)" ]] || return 1
+      live_start=$(awk '{print $22}' /proc/"$pid"/stat 2>/dev/null)
+      [[ -n $live_start ]] || return 0
+      [[ $live_start == "$start_time" ]] || return 1
     fi
     return 0
   fi
@@ -459,7 +472,7 @@ units_match() {
     [[ -f "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && $(stat -c '%u:%a' "$systemd_root/$unit") == "$expected_uid:644" ]] || return 1
     cmp -s "$unit_source/$unit" "$systemd_root/$unit" || return 1
   done
-  for unit in "${timer_names[@]}"; do systemctl is-enabled "$unit" >/dev/null 2>&1 && systemctl is-active "$unit" >/dev/null 2>&1 || return 1; done
+  for unit in "${timer_names[@]}"; do [[ $(systemctl is-enabled "$unit" 2>/dev/null) == enabled ]] && systemctl is-active "$unit" >/dev/null 2>&1 || return 1; done
 }
 
 current_matches() {
@@ -479,7 +492,11 @@ managed_boundaries_match() {
   (((8#$mode & 8#022) == 0))
 }
 
-converged() { managed_boundaries_match && current_matches && state_matches && units_match; }
+converged() {
+  [[ -e "$deployed_current" || -L "$deployed_current" ]] || return 1
+  (load_deployed_snapshot) >/dev/null 2>&1 || return 1
+  managed_boundaries_match && current_matches && state_matches && units_match
+}
 
 acquire_lock() {
   local path
@@ -493,6 +510,8 @@ acquire_lock() {
     rm -f "$active_operation"
   fi
   if [[ -d "$releases" ]]; then
+    secure_directory "$install_root" 755 0
+    secure_directory "$releases" 755 0
     shopt -s nullglob
     for path in "$releases"/."$core_ref".staging.*; do
       [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:755" ]] || block 'interrupted release staging state is unsafe'
@@ -784,6 +803,7 @@ with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(dict(zip(keys,values
 
 load_deployed_snapshot() {
   local snapshot deployed_adapter_path deployed_adapter_sha
+  local deployed_credential_provider deployed_credential_ref deployed_credential_scope deployed_environment
   secure_directory "$deployed_root" 700 0 || block 'deployed snapshot directory is missing'
   [[ -L "$deployed_current" ]] || block 'deployed snapshot pointer is absent or unsafe'
   snapshot=$(readlink -f "$deployed_current")
@@ -798,6 +818,12 @@ load_deployed_snapshot() {
   inside "$deployed_adapter_path" "$etc_root/adapters" || block 'deployed rollback adapter is outside the protected adapter directory'
   [[ ! -L "$deployed_adapter_path" && -f "$deployed_adapter_path" && $(stat -c '%u:%a' "$deployed_adapter_path") == "$expected_uid:700" ]] || block 'deployed rollback adapter is missing or unsafe'
   [[ $(sha256sum "$deployed_adapter_path" | cut -d' ' -f1) == "$deployed_adapter_sha" ]] || block 'deployed rollback adapter digest does not match its snapshot policy'
+  deployed_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$deployed_snapshot_policy")
+  deployed_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$deployed_snapshot_policy")
+  credential_reference_safe "$deployed_credential_provider" "$deployed_credential_ref" 'deployed rollback policy'
+  deployed_credential_scope=$(awk -F= '$1=="CREDENTIAL_SCOPE" {print $2}' "$deployed_snapshot_policy")
+  deployed_environment=$(awk -F= '$1=="ENVIRONMENT" {print $2}' "$deployed_snapshot_policy")
+  [[ $deployed_credential_scope == "$deployed_environment" ]] || block 'deployed rollback credential scope does not match its environment'
   python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
 import json, re, sys
 try:

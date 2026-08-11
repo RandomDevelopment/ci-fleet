@@ -297,6 +297,9 @@ PY
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
+    if [[ $testing != 1 ]]; then
+      printf 'boot_id=%s\nstart_time=%s\n' "$(</proc/sys/kernel/random/boot_id)" "$(awk '{print $22}' /proc/$$/stat)" >>"$temporary"
+    fi
     mv -Tf "$temporary" "$active"
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
