@@ -1159,11 +1159,10 @@ expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" c
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"
+release_before=$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")
 printf '# substituted-live-bytes\n' >>"$runtime"
-expect_success "$installer" --repair --config "$config" >/dev/null
-installed_release=$root/opt/ci-fleet-deployer/releases/$core_ref
-if grep -Fq 'substituted-live-bytes' "$installed_release/scripts/deployer-runtime.sh"; then fail 'mutated live checkout bytes entered the trusted release'; fi
-git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$installed_release/scripts/deployer-runtime.sh" || fail 'installed release differs from the reviewed HEAD bytes'
+expect_failure 'archived checkout bytes differ from the validated worktree' "$installer" --repair --config "$config" >/dev/null
+[[ $release_before == "$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")" ]] || fail 'mutated live checkout bytes entered the trusted release'
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
 expect_success "$installer" --check --config "$config" >/dev/null
