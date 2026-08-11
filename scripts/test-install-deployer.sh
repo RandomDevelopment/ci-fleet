@@ -58,7 +58,7 @@ case "${1:-}" in
     printf '%s\n' "${FAKE_SYSTEMD_STATE:-running}"
     [[ ${FAKE_SYSTEMD_STATE:-running} != degraded ]]
     ;;
-  is-enabled|is-active) [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] ;;
+  is-enabled|is-active) [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] && { [[ $1 == is-active ]] || printf '%s\n' "${FAKE_SYSTEMD_IS_ENABLED_OUTPUT:-enabled}"; } ;;
   enable)
     shift
     [[ "${1:-}" != --now ]] || shift
@@ -446,6 +446,31 @@ chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$stale_stage" && ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'bounded stale transaction recovery did not converge'
+
+# A symlinked releases boundary must block before any staging cleanup deletion.
+mv "$root/opt/ci-fleet-deployer/releases" "$tmp/releases.real"
+ln -s "$tmp/releases.real" "$root/opt/ci-fleet-deployer/releases"
+mkdir -m 0755 "$tmp/releases.real/.${core_ref}.staging.decoy"
+expect_failure 'unsafe symlinked managed directory' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$tmp/releases.real/.${core_ref}.staging.decoy" ]] || fail 'symlinked releases boundary allowed staging deletion'
+rm "$root/opt/ci-fleet-deployer/releases"
+mv "$tmp/releases.real" "$root/opt/ci-fleet-deployer/releases"
+rmdir "$root/opt/ci-fleet-deployer/releases/.${core_ref}.staging.decoy"
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A runtime-only timer enablement must not satisfy convergence.
+expect_success "$installer" --check --config "$config" >/dev/null
+export FAKE_SYSTEMD_IS_ENABLED_OUTPUT=enabled-runtime
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+unset FAKE_SYSTEMD_IS_ENABLED_OUTPUT
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A missing deployed rollback snapshot must break convergence before resume.
+deployed_target=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
+rm "$root/var/lib/ci-fleet-deployer/deployed/current"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+ln -s "$deployed_target" "$root/var/lib/ci-fleet-deployer/deployed/current"
+expect_success "$installer" --check --config "$config" >/dev/null
 printf 'pid=%s\nstarted_at=1\n' "$$" >"$root/var/lib/ci-fleet-deployer/active-operation"
 chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
 expect_success "$installer" --repair --config "$config" >/dev/null
@@ -721,6 +746,17 @@ install -m 0600 "$tmp/deployed-policy.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --repair --config "$config" >/dev/null
 if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'digest fixture restoration left a recovery transaction'; fi
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A deployed rollback pair whose credential file drifted must not promote.
+chmod 0644 "$credential"
+lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+expect_failure 'deployed rollback policy credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
+[[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
+expect_failure 'deployed rollback policy credential file must be owner-only mode 0600' "$installer" --rollback --config "$config" >/dev/null
+[[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair reached rollback'
+chmod 0600 "$credential"
+expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # A lost install state with surviving release/units must not be treated as a fresh install.
