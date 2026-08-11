@@ -18,6 +18,7 @@ core_ref=unknown
 artifact=unknown
 health=unknown
 staging_path=
+checkout_snapshot=
 transaction_dir=
 transaction_preparing=0
 transaction_committed=0
@@ -29,7 +30,7 @@ on_exit() {
     transaction_dir=
   elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
-    if [[ -f "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback; recovery_status=$?; else restore_transaction; recovery_status=$?; fi
+    if [[ -e "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback; recovery_status=$?; else restore_transaction; recovery_status=$?; fi
     set -e
     if ((recovery_status != 0)); then
       status=$recovery_status
@@ -37,6 +38,7 @@ on_exit() {
     fi
   fi
   [[ -z ${staging_path:-} ]] || rm -rf -- "$staging_path"
+  [[ -z ${checkout_snapshot:-} ]] || rm -rf -- "$checkout_snapshot"
   [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
   [[ -z ${policy_check_snapshot:-} ]] || rm -f -- "$policy_check_snapshot"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
@@ -387,12 +389,28 @@ reject_mixed_role() {
 }
 
 validate_checkout() {
-  local head
+  local head checkout_uid
   head=$(git -C "$repo_root" rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
   [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
   if [[ "$testing" != 1 ]]; then
     git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
   fi
+  # Pin the reviewed inputs before any privileged copy: archive the exact
+  # HEAD commit into a root-controlled directory so a checkout owner cannot
+  # substitute bytes after this validation.
+  checkout_uid=$(stat -c %u "$repo_root")
+  if ((checkout_uid != effective_uid)); then
+    [[ -z $(find "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$repo_root/deploy/deployer" -uid "$checkout_uid" -print -quit 2>/dev/null) ]] || block 'non-root-writable checkout boundary is violated'
+  fi
+  if [[ -d "$state_root" && ! -L "$state_root" ]]; then
+    checkout_snapshot=$(mktemp -d "$state_root/.checkout.XXXXXX")
+  else
+    checkout_snapshot=$(mktemp -d)
+  fi
+  chmod 0700 "$checkout_snapshot"
+  git -C "$repo_root" archive "$head" scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer | tar -x -C "$checkout_snapshot" || block 'reviewed checkout archival failed'
+  repo_root=$checkout_snapshot
+  unit_source=$repo_root/deploy/deployer
 }
 
 active_deployment() {
@@ -401,10 +419,16 @@ active_deployment() {
   pid=$(awk -F= '$1=="pid" {print $2}' "$active_operation")
   started=$(awk -F= '$1=="started_at" {print $2}' "$active_operation")
   [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ "$testing" == 1 ]]; then
+      [[ -n ${CI_FLEET_DEPLOYER_TEST_LIVE_PID:-} && $pid == "$CI_FLEET_DEPLOYER_TEST_LIVE_PID" ]] && return 0
+      return 1
+    fi
+    return 0
+  fi
   now=$(date +%s)
   ((started <= now)) || return 0
   ((now - started <= 3600)) || return 1
-  kill -0 "$pid" 2>/dev/null || return 0
   return 0
 }
 
@@ -548,7 +572,7 @@ begin_transaction() {
 }
 
 restore_transaction() {
-  local name target_value
+  local name target_value backed_up
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
   for name in units-present state-present timers-enabled timers-active current-target deployed-target; do
@@ -578,6 +602,15 @@ restore_transaction() {
     target_value=$(<"$transaction_dir/deployed-target")
     [[ "$target_value" == absent || "$target_value" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction deployed pointer is unsafe'
   fi
+  for name in units state; do
+    [[ -d "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || block "transaction $name backup directory is unsafe"
+    backed_up=$(cd "$transaction_dir/$name" && shopt -s nullglob; printf '%s\n' * | sort)
+    if [[ -f "$transaction_dir/$name-present" ]]; then
+      [[ $backed_up == "$(sort "$transaction_dir/$name-present")" ]] || block "transaction $name manifest does not match its backup directory"
+    else
+      [[ -z $backed_up ]] || block "transaction $name manifest is missing but backups remain"
+    fi
+  done
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || return
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
@@ -631,7 +664,8 @@ recover_interrupted_transaction() {
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
   transaction_dir=$candidate
-  if [[ -f "$transaction_dir/application-rollback-committed" ]]; then
+  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
+  if [[ -e "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
     finalize_committed_rollback
     recovered_rollback=1
     transaction_committed=0
@@ -753,7 +787,7 @@ with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(dict(zip(keys,values
 }
 
 load_deployed_snapshot() {
-  local snapshot
+  local snapshot deployed_adapter_path deployed_adapter_sha
   secure_directory "$deployed_root" 700 0 || block 'deployed snapshot directory is missing'
   [[ -L "$deployed_current" ]] || block 'deployed snapshot pointer is absent or unsafe'
   snapshot=$(readlink -f "$deployed_current")
@@ -763,6 +797,11 @@ load_deployed_snapshot() {
   secure_file "$snapshot/state.json" 'deployed rollback state'
   deployed_snapshot_policy=$snapshot/policy.conf
   deployed_snapshot_state=$snapshot/state.json
+  deployed_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$deployed_snapshot_policy")
+  deployed_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$deployed_snapshot_policy")
+  inside "$deployed_adapter_path" "$etc_root/adapters" || block 'deployed rollback adapter is outside the protected adapter directory'
+  [[ ! -L "$deployed_adapter_path" && -f "$deployed_adapter_path" && $(stat -c '%u:%a' "$deployed_adapter_path") == "$expected_uid:700" ]] || block 'deployed rollback adapter is missing or unsafe'
+  [[ $(sha256sum "$deployed_adapter_path" | cut -d' ' -f1) == "$deployed_adapter_sha" ]] || block 'deployed rollback adapter digest does not match its snapshot policy'
   python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
 import json, re, sys
 try:

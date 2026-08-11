@@ -29,6 +29,12 @@ audit_log=$log_root/audit.log
 systemd_root=$(root_path /etc/systemd/system)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+if [[ $operation == deploy && -z ${CI_FLEET_DEPLOYER_INHIBITED:-} ]]; then
+  export CI_FLEET_DEPLOYER_INHIBITED=1
+  [[ $testing != 1 || -z ${CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG:-} ]] || printf '%s\n' deploy >>"$CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG"
+  exec systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
+    --why='approved deployment is active' -- "$0" deploy
+fi
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
@@ -42,13 +48,11 @@ deploy_exit() {
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
   rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
-  if [[ -n ${snapshot_pointer:-} && $snapshot_pointer != "$deployed_current" ]]; then
-    target=$(readlink "$snapshot_pointer" 2>/dev/null || true)
-    if [[ -n $target && ! -e "$deployed_root/$target" ]]; then rm -rf -- "$snapshot"; fi
-    rm -f "$snapshot_pointer"
-  elif [[ -z ${snapshot_pointer:-} ]]; then
-    [[ -z ${snapshot:-} ]] || rm -rf -- "$snapshot"
+  if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
+    target=$(readlink "$deployed_current" 2>/dev/null || true)
+    if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
   fi
+  if [[ -n ${snapshot_pointer:-} && $snapshot_pointer != "$deployed_current" ]]; then rm -f "$snapshot_pointer"; fi
   return "$status"
 }
 expected_uid=0
@@ -295,8 +299,7 @@ PY
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     mv -Tf "$temporary" "$active"
     set +e
-    systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='approved deployment is active' -- env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
+    env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
     if ((adapter_status != 0)); then
@@ -315,6 +318,7 @@ PY
     retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
+    [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$
     mv -Tf "$pointer" "$deployed_current"
     snapshot_pointer=$deployed_current
     snapshot=
