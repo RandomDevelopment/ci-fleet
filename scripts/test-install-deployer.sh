@@ -763,6 +763,7 @@ expect_failure 'deployed rollback policy has an invalid external secret-manager 
 [[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair reached rollback'
 install -m 0600 "$tmp/deployed-policy-cred.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # A lost install state with surviving release/units must not be treated as a fresh install.
