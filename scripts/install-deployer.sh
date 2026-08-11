@@ -535,6 +535,7 @@ acquire_check_lock() {
 
 begin_transaction() {
   local name path current_target transaction_name transaction_ready deployed_target enabled_state
+  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -628,6 +629,7 @@ restore_transaction() {
     fi
   done
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || return
+  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
@@ -705,9 +707,18 @@ recover_interrupted_transaction() {
 
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed retired
+  local final_adapter_path final_adapter_sha final_credential_provider final_credential_ref
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
   secure_file "$state_file" 'deployer install state' || return
+  final_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$active_policy")
+  final_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$active_policy")
+  inside "$final_adapter_path" "$etc_root/adapters" || return
+  [[ ! -L "$final_adapter_path" && -f "$final_adapter_path" && $(stat -c '%u:%a' "$final_adapter_path") == "$expected_uid:700" ]] || return
+  [[ $(sha256sum "$final_adapter_path" | cut -d' ' -f1) == "$final_adapter_sha" ]] || return
+  final_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$active_policy")
+  final_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$active_policy")
+  credential_reference_safe "$final_credential_provider" "$final_credential_ref" 'committed rollback policy' || return
   python3 - "$state_file" "$active_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || return
 import json, re, sys
 try:
