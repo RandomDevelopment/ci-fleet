@@ -748,17 +748,20 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'digest fixture restoration left a recovery transaction'; fi
 expect_success "$installer" --check --config "$config" >/dev/null
 
-# A deployed rollback pair whose credential file drifted must not promote.
-mv "$credential" "$credential.saved"
-printf 'CANARY_SECRET_VALUE_DO_NOT_PRINT\n' >"$credential"
-chmod 0644 "$credential"
+# A deployed rollback pair whose credential reference drifted must not promote.
+deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
+cp "$deployed_dir/policy.conf" "$tmp/deployed-policy-cred.saved"
+python3 - "$deployed_dir/policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external').replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=external:bad'))
+PY
 lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
-expect_failure 'credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
+expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --upgrade --config "$config" >/dev/null
 [[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
-expect_failure 'deployed rollback policy credential file must be owner-only mode 0600' "$installer" --rollback --config "$config" >/dev/null
+expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --rollback --config "$config" >/dev/null
 [[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair reached rollback'
-mv "$credential.saved" "$credential"
-chmod 0600 "$credential"
+install -m 0600 "$tmp/deployed-policy-cred.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
