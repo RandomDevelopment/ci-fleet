@@ -395,21 +395,20 @@ validate_checkout() {
   if [[ "$testing" != 1 ]]; then
     git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
   fi
-  # Pin the reviewed inputs before any privileged copy: archive the exact
-  # HEAD commit into a root-controlled directory, then require every staged
-  # byte to match the clean worktree content observed at validation time, so
-  # neither worktree nor object-database mutation can substitute bytes.
-  local checkout_hashes archived_hashes
-  checkout_hashes=$(cd "$repo_root" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
-  if [[ -d "$state_root" && ! -L "$state_root" ]]; then
-    checkout_snapshot=$(mktemp -d "$state_root/.checkout.XXXXXX")
-  else
-    checkout_snapshot=$(mktemp -d)
-  fi
+  # Pin the reviewed inputs before any privileged copy: copy the worktree
+  # bytes once into a root-controlled snapshot outside managed state, then
+  # require each copied file's Git blob identity to equal the pinned commit's
+  # tree entry. The commit SHA is content-addressed, so no mutation of the
+  # worktree, refs, or loose objects can substitute bytes under $head.
+  local path blob
+  checkout_snapshot=$(mktemp -d)
   chmod 0700 "$checkout_snapshot"
-  git -C "$repo_root" archive "$head" scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer | tar -x -C "$checkout_snapshot" || block 'reviewed checkout archival failed'
-  archived_hashes=$(cd "$checkout_snapshot" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
-  [[ $archived_hashes == "$checkout_hashes" ]] || block 'archived checkout bytes differ from the validated worktree'
+  install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
+  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
+  install -m 0644 "$repo_root"/deploy/deployer/* "$checkout_snapshot/deploy/deployer/"
+  while read -r _ _ blob path; do
+    [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
+  done < <(git -C "$repo_root" ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer)
   repo_root=$checkout_snapshot
   unit_source=$repo_root/deploy/deployer
 }
@@ -535,7 +534,7 @@ acquire_check_lock() {
 }
 
 begin_transaction() {
-  local name path current_target transaction_name transaction_ready deployed_target
+  local name path current_target transaction_name transaction_ready deployed_target enabled_state
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -569,7 +568,9 @@ begin_transaction() {
     fi
   done
   for name in "${timer_names[@]}"; do
-    if systemctl is-enabled "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
+    enabled_state=$(systemctl is-enabled "$name" 2>/dev/null) || enabled_state=
+    if [[ $enabled_state == enabled ]]; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled"; fi
+    if [[ $enabled_state == enabled-runtime ]]; then printf '%s\n' "$name" >>"$transaction_dir/timers-enabled-runtime"; fi
     if systemctl is-active "$name" >/dev/null 2>&1; then printf '%s\n' "$name" >>"$transaction_dir/timers-active"; fi
   done
   if [[ -L "$deployed_current" ]]; then
@@ -590,7 +591,7 @@ restore_transaction() {
   local name target_value backed_up
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
-  for name in units-present state-present timers-enabled timers-active current-target deployed-target; do
+  for name in units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
     [[ ! -e "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || [[ ! -L "$transaction_dir/$name" && -f "$transaction_dir/$name" ]] || block "transaction manifest $name has an unsafe type"
   done
   if [[ -f "$transaction_dir/units-present" ]]; then
@@ -603,7 +604,7 @@ restore_transaction() {
       [[ " install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf " == *" $name "* && -f "$transaction_dir/state/$name" && ! -L "$transaction_dir/state/$name" ]] || block 'transaction state manifest is unsafe'
     done <"$transaction_dir/state-present"
   fi
-  for name in timers-enabled timers-active; do
+  for name in timers-enabled timers-enabled-runtime timers-active; do
     if [[ -f "$transaction_dir/$name" ]]; then
       while IFS= read -r target_value; do
         [[ " ${timer_names[*]} " == *" $target_value "* ]] || block 'transaction timer manifest is unsafe'
@@ -653,11 +654,23 @@ restore_transaction() {
       ln -s "$target_value" "$deployed_current" || return
     fi
   fi
+  if [[ -f "$transaction_dir/deployed-created" ]]; then
+    target_value=$(<"$transaction_dir/deployed-created")
+    [[ $target_value =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction created snapshot name is unsafe'
+    if [[ ! -e $deployed_current && ! -L $deployed_current ]] || [[ $(readlink "$deployed_current" 2>/dev/null) != "$target_value" ]]; then
+      [[ ! -d "$deployed_root/$target_value" || -L "$deployed_root/$target_value" ]] || rm -rf -- "${deployed_root:?}/$target_value"
+    fi
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
     while IFS= read -r name; do
       systemctl enable "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-enabled"
+  fi
+  if [[ -f "$transaction_dir/timers-enabled-runtime" ]]; then
+    while IFS= read -r name; do
+      systemctl enable --runtime "$name" >/dev/null 2>&1 || return
+    done <"$transaction_dir/timers-enabled-runtime"
   fi
   if [[ -f "$transaction_dir/timers-active" ]]; then
     while IFS= read -r name; do
@@ -806,6 +819,7 @@ load_deployed_snapshot() {
   local deployed_credential_provider deployed_credential_ref deployed_credential_scope deployed_environment
   secure_directory "$deployed_root" 700 0 || block 'deployed snapshot directory is missing'
   [[ -L "$deployed_current" ]] || block 'deployed snapshot pointer is absent or unsafe'
+  [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'deployed snapshot pointer target is not canonical'
   snapshot=$(readlink -f "$deployed_current")
   inside "$snapshot" "$deployed_root" || block 'deployed snapshot pointer escapes managed state'
   secure_directory "$snapshot" 700 0 || block 'deployed snapshot is unsafe'
@@ -1024,7 +1038,10 @@ PY
   mv -Tf "$state_root/.install-state.new" "$state_file"
   mv -Tf "$install_root/.current.new" "$current"
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
-  if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then publish_deployed_snapshot "$active_policy" "$state_file"; fi
+  if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
+    publish_deployed_snapshot "$active_policy" "$state_file"
+    if [[ -n ${transaction_dir:-} && -d $transaction_dir ]]; then readlink "$deployed_current" >"$transaction_dir/deployed-created"; fi
+  fi
   commit_transaction
   health=healthy
   report CHANGED yes run-check "$(rollback_available)"
@@ -1118,7 +1135,7 @@ perform_uninstall() {
   if active_deployment; then block 'active deployment started while draining'; fi
   if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
-  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
   systemctl daemon-reload >/dev/null 2>&1 || true
   rm -f "$drained" "$active_operation"

@@ -275,6 +275,7 @@ PY
     if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || die 'deployed rollback snapshot is missing'
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
+    [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'
     deployed_snapshot=$(readlink -f "$deployed_current")
     inside "$deployed_snapshot" "$deployed_root" || die 'deployed snapshot pointer escapes managed state'
     secure_directory "$deployed_snapshot" 'deployed snapshot'
@@ -309,6 +310,7 @@ PY
       audit_phase=adapter
       die 'deployment adapter failed after approval consumption'
     fi
+    adapter_status=
     audit_phase=post-adapter
     secure_directory "$deployed_root" 'deployed snapshot directory'
     inside "$snapshot" "$deployed_root" || die 'prepared deployed snapshot escaped managed state'

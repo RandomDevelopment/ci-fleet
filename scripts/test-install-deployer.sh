@@ -58,15 +58,25 @@ case "${1:-}" in
     printf '%s\n' "${FAKE_SYSTEMD_STATE:-running}"
     [[ ${FAKE_SYSTEMD_STATE:-running} != degraded ]]
     ;;
-  is-enabled|is-active) [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] && { [[ $1 == is-active ]] || printf '%s\n' "${FAKE_SYSTEMD_IS_ENABLED_OUTPUT:-enabled}"; } ;;
+  is-enabled|is-active)
+    [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] || exit 1
+    if [[ $1 == is-enabled ]]; then
+      if [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}.runtime" ]]; then printf 'enabled-runtime\n'; else printf '%s\n' "${FAKE_SYSTEMD_IS_ENABLED_OUTPUT:-enabled}"; fi
+    fi
+    ;;
   enable)
     shift
+    runtime_flag=0
+    [[ "${1:-}" != --runtime ]] || { runtime_flag=1; shift; }
     [[ "${1:-}" != --now ]] || shift
-    for unit in "$@"; do : >"$root/var/lib/ci-fleet-deployer/unit-$unit"; done ;;
+    for unit in "$@"; do
+      if ((runtime_flag)); then : >"$root/var/lib/ci-fleet-deployer/unit-$unit.runtime"; else rm -f "$root/var/lib/ci-fleet-deployer/unit-$unit.runtime"; fi
+      : >"$root/var/lib/ci-fleet-deployer/unit-$unit"
+    done ;;
   disable)
     shift
     [[ "${1:-}" != --now ]] || shift
-    for unit in "$@"; do rm -f "$root/var/lib/ci-fleet-deployer/unit-$unit"; done ;;
+    for unit in "$@"; do rm -f "$root/var/lib/ci-fleet-deployer/unit-$unit" "$root/var/lib/ci-fleet-deployer/unit-$unit.runtime"; done ;;
 esac
 exit 0
 EOF
@@ -416,6 +426,47 @@ cp "$root/etc/systemd/system/ci-fleet-deployer.service" "$truncated_tx/units/ci-
 expect_failure 'transaction units manifest is missing but backups remain' "$installer" --repair --config "$config" >/dev/null
 rm -rf -- "$truncated_tx"
 expect_success "$installer" --check --config "$config" >/dev/null
+
+# Transaction recovery must restore runtime-only timer enablement exactly.
+runtime_tx=$root/var/lib/ci-fleet-deployer/.transaction.runtime-enabled
+mkdir -m 0700 "$runtime_tx" "$runtime_tx/units" "$runtime_tx/state"
+: >"$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-health.timer.runtime"
+printf 'ci-fleet-deployer-health.timer\n' >"$runtime_tx/timers-enabled-runtime"
+expect_success "$installer" --repair --config "$config" >/dev/null
+grep -Fq 'enable --runtime ci-fleet-deployer-health.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'recovery did not restore runtime-only enablement'
+rm -f "$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-health.timer.runtime"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Recovery must remove a snapshot published after the transaction began.
+created_tx=$root/var/lib/ci-fleet-deployer/.transaction.created-snapshot
+mkdir -m 0700 "$created_tx" "$created_tx/units" "$created_tx/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$created_tx/state/$name"; printf '%s\n' "$name" >>"$created_tx/state-present"; }
+done
+for path in "$root"/etc/systemd/system/ci-fleet-deployer*; do
+  name=${path##*/}; cp "$path" "$created_tx/units/$name"; printf '%s\n' "$name" >>"$created_tx/units-present"
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$created_tx/current-target"
+printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$created_tx/timers-enabled"
+orphan_snapshot=$root/var/lib/ci-fleet-deployer/deployed/.snapshot.orphaned
+mkdir -m 0700 "$orphan_snapshot"
+install -m 0600 "$root/var/lib/ci-fleet-deployer/active-policy.conf" "$orphan_snapshot/policy.conf"
+install -m 0600 "$root/var/lib/ci-fleet-deployer/install-state.json" "$orphan_snapshot/state.json"
+current_deployed=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
+printf '%s\n' "$current_deployed" >"$created_tx/deployed-target"
+printf '.snapshot.orphaned\n' >"$created_tx/deployed-created"
+rm "$root/var/lib/ci-fleet-deployer/deployed/current"
+ln -s .snapshot.orphaned "$root/var/lib/ci-fleet-deployer/deployed/current"
+deployed_count_before=$(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l)
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$orphan_snapshot" ]] || fail 'recovery retained a snapshot created after the transaction began'
+[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == $((deployed_count_before - 1)) ]] || fail 'recovery removed the wrong snapshot'
+[[ $(readlink "$root/var/lib/ci-fleet-deployer/deployed/current") == "$current_deployed" ]] || fail 'recovery did not restore the prior deployed pointer'
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Read-only checks must not create checkout snapshots inside managed state.
+if compgen -G "$root/var/lib/ci-fleet-deployer/.checkout.*" >/dev/null; then fail 'read-only check left a checkout snapshot in managed state'; fi
 
 # A noncanonical activation pointer must fail convergence instead of certifying it.
 rm "$root/opt/ci-fleet-deployer/current"
@@ -881,6 +932,14 @@ rmdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
 expect_success "$installer" --uninstall --config "$config" >/dev/null
 [[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after correcting unit drift did not uninstall'
 
+# A failed timer shutdown must fail the uninstall before any unit removal.
+expect_success "$installer" --install --config "$config" >/dev/null
+uninstall_before=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
+FAKE_SYSTEMCTL_FAIL_COMMAND=disable expect_failure 'deployer timers did not stop during uninstall' "$installer" --uninstall --config "$config" >/dev/null
+[[ "$uninstall_before" == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'failed timer shutdown partially uninstalled units'
+[[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'failed timer shutdown removed the activation pointer'
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+
 # Runtime contract: exact-head request/evidence, drain and scoped adapter calls.
 write_evidence staging example-staging
 write_config staging example-staging
@@ -1036,6 +1095,14 @@ deployed_target=$(readlink "$deployed_current")
 rm "$deployed_current"
 expect_failure 'deployed rollback snapshot is missing' "$runtime" deploy >/dev/null
 ln -s "$deployed_target" "$deployed_current"
+rm "$deployed_current"
+ln -s "$root/var/lib/ci-fleet-deployer/deployed/$deployed_target" "$deployed_current"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'deployed snapshot pointer target is not canonical' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment consumed approval with a noncanonical deployed pointer'
+[[ ! -e "$active" ]] || fail 'rejected deployment left the active operation marker'
+rm "$deployed_current"
+ln -s "$deployed_target" "$deployed_current"
 chmod 0644 "$credential"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null
@@ -1072,7 +1139,7 @@ cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
 expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
-grep -Fq 'approval=snapshot-mutation-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=post-adapter' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited'
+grep -Fq 'approval=snapshot-mutation-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=post-adapter status=2' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited with its real status'
 [[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'failed publication leaked an unreachable prepared snapshot'
 [[ -e "$deployed_current" ]] || fail 'failed publication dangled the deployed pointer'
 
@@ -1161,7 +1228,7 @@ expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" c
 cp "$runtime" "$tmp/runtime.saved"
 release_before=$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")
 printf '# substituted-live-bytes\n' >>"$runtime"
-expect_failure 'archived checkout bytes differ from the validated worktree' "$installer" --repair --config "$config" >/dev/null
+expect_failure 'differs from the reviewed commit' "$installer" --repair --config "$config" >/dev/null
 [[ $release_before == "$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")" ]] || fail 'mutated live checkout bytes entered the trusted release'
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
