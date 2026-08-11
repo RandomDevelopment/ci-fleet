@@ -645,7 +645,7 @@ from pathlib import Path
 import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external'))
 PY
-expect_failure 'deployed rollback snapshot state and policy do not cross-validate' "$installer" --upgrade --config "$config" >/dev/null
+expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --upgrade --config "$config" >/dev/null
 python3 - "$deployed_policy" <<'PY'
 from pathlib import Path
 import sys
