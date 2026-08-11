@@ -749,12 +749,15 @@ if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then 
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # A deployed rollback pair whose credential file drifted must not promote.
+mv "$credential" "$credential.saved"
+printf 'CANARY_SECRET_VALUE_DO_NOT_PRINT\n' >"$credential"
 chmod 0644 "$credential"
 lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
 expect_failure 'deployed rollback policy credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null
 [[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
 expect_failure 'deployed rollback policy credential file must be owner-only mode 0600' "$installer" --rollback --config "$config" >/dev/null
 [[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair reached rollback'
+mv "$credential.saved" "$credential"
 chmod 0600 "$credential"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
