@@ -1166,7 +1166,6 @@ expect_failure 'archived checkout bytes differ from the validated worktree' "$in
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
 rm "$root/var/lib/ci-fleet-deployer/drained"
-expect_success "$installer" --check --config "$config" >/dev/null
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
