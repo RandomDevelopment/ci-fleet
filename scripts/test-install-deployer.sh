@@ -1165,6 +1165,7 @@ expect_failure 'archived checkout bytes differ from the validated worktree' "$in
 [[ $release_before == "$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")" ]] || fail 'mutated live checkout bytes entered the trusted release'
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
+rm "$root/var/lib/ci-fleet-deployer/drained"
 expect_success "$installer" --check --config "$config" >/dev/null
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
