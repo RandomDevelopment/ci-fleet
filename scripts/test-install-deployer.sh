@@ -139,6 +139,7 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
 fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_SIGNAL_PPID:-} ]]; then kill -TERM "$PPID"; sleep 5; fi
 EOF
 chmod 0700 "$adapter"
 export FAKE_ADAPTER_LOG=$tmp/adapter.log
@@ -399,6 +400,23 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$unsafe_tx" ]] || fail 'corrected transaction was not recovered'
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# A truncated or drifted transaction manifest must block before any recovery mutation.
+truncated_tx=$root/var/lib/ci-fleet-deployer/.transaction.truncated
+mkdir -m 0700 "$truncated_tx" "$truncated_tx/units" "$truncated_tx/state"
+for name in install-state.json active-policy.conf; do
+  cp "$root/var/lib/ci-fleet-deployer/$name" "$truncated_tx/state/$name"
+  printf '%s\n' "$name" >>"$truncated_tx/state-present"
+done
+sed -i '$d' "$truncated_tx/state-present"
+state_before_truncated=$(find "$root/var/lib/ci-fleet-deployer" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)
+expect_failure 'transaction state manifest does not match its backup directory' "$installer" --repair --config "$config" >/dev/null
+[[ "$state_before_truncated" == "$(find "$root/var/lib/ci-fleet-deployer" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)" ]] || fail 'truncated transaction manifest mutated managed state'
+printf 'active-policy.conf\n' >>"$truncated_tx/state-present"
+cp "$root/etc/systemd/system/ci-fleet-deployer.service" "$truncated_tx/units/ci-fleet-deployer.service"
+expect_failure 'transaction units manifest is missing but backups remain' "$installer" --repair --config "$config" >/dev/null
+rm -rf -- "$truncated_tx"
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # A noncanonical activation pointer must fail convergence instead of certifying it.
 rm "$root/opt/ci-fleet-deployer/current"
 ln -s "$root/opt/ci-fleet-deployer/releases/$core_ref" "$root/opt/ci-fleet-deployer/current"
@@ -432,6 +450,12 @@ printf 'pid=%s\nstarted_at=1\n' "$$" >"$root/var/lib/ci-fleet-deployer/active-op
 chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'old operation marker survived PID reuse'
+printf 'pid=%s\nstarted_at=1\n' "$$" >"$root/var/lib/ci-fleet-deployer/active-operation"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
+CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents this operation' "$installer" --repair --config "$config" >/dev/null
+CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'live stale-aged operation marker was expired'
+rm "$root/var/lib/ci-fleet-deployer/active-operation"
 
 exec 8<"$root/var/lock/ci-fleet-deployer"
 flock -n 8 || fail 'fixture could not acquire installer lock'
@@ -603,6 +627,7 @@ import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=external', 'CREDENTIAL_PROVIDER=file'))
 PY
 expect_success "$installer" --check --config "$config" >/dev/null
+
 printf 'rollback\n' >"$tmp/fail-rollback"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
@@ -658,6 +683,46 @@ grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail '
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# An unsafe rollback commit marker type must block before recovery mutation.
+recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.marker-type
+mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
+mkdir "$recovery_transaction/application-rollback-committed"
+units_before_marker=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)
+policy_before_marker=$(sha256sum "$root/var/lib/ci-fleet-deployer/active-policy.conf")
+expect_failure 'application rollback commit marker is unsafe' "$installer" --repair --config "$config" >/dev/null
+[[ $units_before_marker == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)" && $policy_before_marker == "$(sha256sum "$root/var/lib/ci-fleet-deployer/active-policy.conf")" ]] || fail 'directory rollback marker mutated managed state'
+[[ -d "$recovery_transaction" ]] || fail 'blocked rollback marker transaction was discarded'
+rmdir "$recovery_transaction/application-rollback-committed"
+ln -s "$tmp/missing-rollback-target" "$recovery_transaction/application-rollback-committed"
+expect_failure 'application rollback commit marker is unsafe' "$installer" --repair --config "$config" >/dev/null
+[[ $units_before_marker == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)" && $policy_before_marker == "$(sha256sum "$root/var/lib/ci-fleet-deployer/active-policy.conf")" ]] || fail 'broken-symlink rollback marker mutated managed state'
+rm -rf -- "$recovery_transaction"
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A deployed rollback pair whose adapter bytes no longer match its recorded digest must not promote.
+deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
+deployed_target=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
+cp "$deployed_dir/policy.conf" "$tmp/deployed-policy.saved"
+python3 - "$deployed_dir/policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ADAPTER_SHA256=', 'ADAPTER_SHA256=' + 'f'*64 + '\n#', 1))
+PY
+lkg_before_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --upgrade --config "$config" >/dev/null
+[[ $lkg_before_digest == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'digest-mismatched deployed pair replaced last-known-good'
+if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'blocked digest promotion left a recovery transaction'; fi
+expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --rollback --config "$config" >/dev/null
+rollback_tx=$(compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*") || fail 'blocked digest rollback left no recovery transaction'
+[[ $(<"$rollback_tx/deployed-target") == "$deployed_target" ]] || fail 'blocked digest rollback recorded an unexpected deployed target'
+expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --repair --config "$config" >/dev/null
+[[ $lkg_before_digest == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'digest-mismatched deployed pair reached recovery promotion'
+install -m 0600 "$tmp/deployed-policy.saved" "$deployed_dir/policy.conf"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'digest fixture restoration left a recovery transaction'; fi
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # A lost install state with surviving release/units must not be treated as a fresh install.
 mv "$root/var/lib/ci-fleet-deployer/install-state.json" "$tmp/install-state.saved"
 expect_failure 'restore install state before convergence' "$installer" --repair --config "$config" >/dev/null
@@ -710,8 +775,8 @@ expect_failure 'active operation marker is an unsafe symlink' "$installer" --rep
 rm "$active"
 printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$active"
 chmod 0600 "$active"
-expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
-expect_failure 'active deployment prevents drain' "$installer" --drain --config "$config" >/dev/null
+CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
+CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents drain' "$installer" --drain --config "$config" >/dev/null
 rm "$active"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
@@ -916,6 +981,14 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'GitHub capability evidence must be a regular file' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without GitHub capability evidence'
 mv "$capability.saved" "$capability"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+if CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF=TERM "$runtime" deploy >/dev/null 2>&1; then fail 'signaled deployment reported success'; fi
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == $((deploy_calls_before + 1)) ]] || fail 'interrupted runtime did not reach the adapter'
+[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'signal after temporary pointer leaked an unreachable prepared snapshot'
+[[ -e "$deployed_current" ]] || fail 'signal after temporary pointer dangled the deployed pointer'
+[[ ! -e "$active" ]] || fail 'signaled deployment left the active operation marker'
+rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 deployed_target=$(readlink "$deployed_current")
 rm "$deployed_current"
 expect_failure 'deployed rollback snapshot is missing' "$runtime" deploy >/dev/null
@@ -957,6 +1030,26 @@ export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deploye
 expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
 grep -Fq 'approval=snapshot-mutation-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=post-adapter' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited'
+[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'failed publication leaked an unreachable prepared snapshot'
+[[ -e "$deployed_current" ]] || fail 'failed publication dangled the deployed pointer'
+
+# A signal while the adapter runs must remove only the unreachable prepared snapshot.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=signal-mid-adapter-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:04:30Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_SIGNAL_PPID=1
+if "$runtime" deploy >/dev/null 2>&1; then fail 'signaled deployment reported success'; fi
+unset FAKE_ADAPTER_SIGNAL_PPID
+[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'interrupted deployment leaked an unreachable prepared snapshot'
+[[ -e "$deployed_current" ]] || fail 'interrupted deployment dangled the deployed pointer'
+[[ ! -e "$active" ]] || fail 'interrupted deployment left the active operation marker'
+grep -Fq 'approval=signal-mid-adapter-attempt' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'interrupted deployment was not audited as failed'
+rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
@@ -987,8 +1080,10 @@ rm "$root/var/log/ci-fleet-deployer/audit.log"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_FORBID_REQUEST_PATH=$request
+export CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG=$tmp/inhibitor.log
 expect_success "$runtime" deploy >/dev/null
-unset FAKE_ADAPTER_FORBID_REQUEST_PATH
+unset FAKE_ADAPTER_FORBID_REQUEST_PATH CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG
+[[ $(<"$tmp/inhibitor.log") == deploy ]] || fail 'deployment transaction was not enclosed by the shutdown inhibitor'
 [[ ! -e "$request" && -f "$root/var/lib/ci-fleet-deployer/last-request.conf" ]] || fail 'completed request was not consumed atomically'
 deployed_current=$root/var/lib/ci-fleet-deployer/deployed/current
 [[ -L "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'deployed policy/state pair was not published through one pointer'
@@ -1018,6 +1113,17 @@ rm "$root/var/lib/ci-fleet-deployer/drained"
 ln -s "$tmp/missing-drain-target" "$root/var/lib/ci-fleet-deployer/drained"
 expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" cleanup >/dev/null
+
+# Bytes substituted into the live checkout after review must never reach a staged release.
+cp "$runtime" "$tmp/runtime.saved"
+printf '# substituted-live-bytes\n' >>"$runtime"
+expect_success "$installer" --repair --config "$config" >/dev/null
+installed_release=$root/opt/ci-fleet-deployer/releases/$core_ref
+if grep -Fq 'substituted-live-bytes' "$installed_release/scripts/deployer-runtime.sh"; then fail 'mutated live checkout bytes entered the trusted release'; fi
+git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$installed_release/scripts/deployer-runtime.sh" || fail 'installed release differs from the reviewed HEAD bytes'
+cat "$tmp/runtime.saved" >"$runtime"
+git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
+expect_success "$installer" --check --config "$config" >/dev/null
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
