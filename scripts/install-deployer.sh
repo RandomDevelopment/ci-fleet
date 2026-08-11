@@ -1133,9 +1133,9 @@ perform_uninstall() {
     mv -Tf "$temporary" "$drained"
   fi
   if active_deployment; then block 'active deployment started while draining'; fi
+  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
   if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
-  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
   systemctl daemon-reload >/dev/null 2>&1 || true
   rm -f "$drained" "$active_operation"
