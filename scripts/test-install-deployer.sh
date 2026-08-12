@@ -7,14 +7,14 @@ runtime=$repo_root/scripts/deployer-runtime.sh
 
 fail() { printf 'FAIL(line %s): %s\n' "${BASH_LINENO[0]:-?}" "$*" >&2; exit 1; }
 expect_success() {
-  local output
-  output=$("$@" 2>&1) || fail "expected success: $*; output=$output"
+  local output line=${BASH_LINENO[0]}
+  output=$("$@" 2>&1) || { printf 'FAIL(line %s): expected success: %s; output=%s\n' "$line" "$*" "$output" >&2; exit 1; }
   printf '%s\n' "$output"
 }
 expect_failure() {
-  local expected=$1 output
+  local expected=$1 output line=${BASH_LINENO[0]}
   shift
-  if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+  if output=$("$@" 2>&1); then printf 'FAIL(line %s): expected failure: %s; output=%s\n' "$line" "$*" "$output" >&2; exit 1; fi
   grep -Fq -- "$expected" <<<"$output" || fail "missing [$expected]: $output"
   printf '%s\n' "$output"
 }
@@ -846,16 +846,24 @@ if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_bef
 expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --upgrade --config "$config" >/dev/null
 lkg_after_digest=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_digest == "$lkg_after_digest" ]] || fail 'digest-mismatched deployed pair replaced last-known-good'
 if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'blocked digest promotion left a recovery transaction'; fi
-expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --rollback --config "$config" >/dev/null
-rollback_tx=$(compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*") || fail 'blocked digest rollback left no recovery transaction'
-[[ $(<"$rollback_tx/deployed-target") == "$deployed_target" ]] || fail 'blocked digest rollback recorded an unexpected deployed target'
-expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --repair --config "$config" >/dev/null
-lkg_after_digest=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_digest == "$lkg_after_digest" ]] || fail 'digest-mismatched deployed pair reached recovery promotion'
-install -m 0600 "$tmp/deployed-policy.saved" "$deployed_dir/policy.conf"
+# Rollback intentionally publishes the retained pair over the unusable
+# incumbent snapshot: the drifted deployed pair is retired, never promoted.
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'drifted-incumbent rollback lacks the operator reconciliation action'
+[[ ! -e "$deployed_dir" ]] || fail 'drifted deployed snapshot survived its rollback retirement'
 expect_success "$installer" --repair --config "$config" >/dev/null
-expect_success "$installer" --repair --config "$config" >/dev/null
-if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'digest fixture restoration left a recovery transaction'; fi
 expect_success "$installer" --check --config "$config" >/dev/null
+# Rebuild the retained pair consumed by the drifted-incumbent rollback.
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'retained rollback pair was not rebuilt'
 
 # A deployed rollback pair whose credential reference drifted must not promote.
 deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
@@ -868,10 +876,11 @@ PY
 if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_credential=absent; fi
 expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --upgrade --config "$config" >/dev/null
 lkg_after_credential=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_credential == "$lkg_after_credential" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
-expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --rollback --config "$config" >/dev/null
-lkg_after_credential=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_credential == "$lkg_after_credential" ]] || fail 'credential-drifted deployed pair reached rollback'
-install -m 0600 "$tmp/deployed-policy-cred.saved" "$deployed_dir/policy.conf"
-expect_success "$installer" --repair --config "$config" >/dev/null
+# Rollback intentionally publishes the retained pair over the unusable
+# incumbent snapshot: the credential-drifted pair is retired, never promoted.
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$rollback" || fail 'credential-drifted rollback lacks the operator reconciliation action'
+[[ ! -e "$deployed_dir" ]] || fail 'credential-drifted deployed snapshot survived its rollback retirement'
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
@@ -961,7 +970,8 @@ chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
-# Rebuild a retained rollback pair consumed by the finalize recovery fixture.
+# Rebuild a retained rollback pair consumed by the drifted-incumbent rollback
+# and finalize recovery fixtures.
 image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 write_evidence
 write_config
@@ -986,6 +996,17 @@ rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'config-independent rollback did not report change'
 mv "$tmp/config.saved" "$config"; chmod 0600 "$config"
 expect_success "$installer" --repair --config "$config" >/dev/null
+# Rebuild the retained pair consumed by the config-independent rollback.
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'retained rollback pair was not rebuilt'
 printf 'malformed line\n' >"$config"; chmod 0600 "$config"
 rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'malformed-config rollback did not report change'
