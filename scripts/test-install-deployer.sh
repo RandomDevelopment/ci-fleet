@@ -549,6 +549,14 @@ expect_failure 'active operation marker has an unsafe type' "$installer" --repai
 rmdir "$root/var/lib/ci-fleet-deployer/active-operation"
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# A stale marker for a dead process must fail read-only checks until a mutating recovery removes it.
+printf 'pid=999999\nstarted_at=1\n' >"$root/var/lib/ci-fleet-deployer/active-operation"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/active-operation"
+expect_failure 'stale operation marker requires a mutating recovery' "$installer" --check --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'repair retained the stale operation marker'
+expect_success "$installer" --check --config "$config" >/dev/null
+
 exec 8<"$root/var/lock/ci-fleet-deployer"
 flock -n 8 || fail 'fixture could not acquire installer lock'
 expect_failure 'another deployer installer operation is running' "$installer" --repair --config "$config" >/dev/null
@@ -868,6 +876,16 @@ rm "$root/etc/systemd/system"
 mv "$tmp/systemd.real" "$root/etc/systemd/system"
 rm "$root/etc/systemd/system/ci-fleet-deployer.service"
 rm -rf -- "$boundary_tx"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A group- or world-writable systemd boundary must block before transaction backups.
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+chmod 0777 "$root/etc/systemd/system"
+units_before_writable=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
+expect_failure 'systemd unit directory is group- or world-writable' "$installer" --repair --config "$config" >/dev/null
+[[ $units_before_writable == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'writable systemd boundary allowed a transaction backup'
+chmod 0755 "$root/etc/systemd/system"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 

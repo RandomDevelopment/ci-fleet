@@ -540,8 +540,10 @@ acquire_check_lock() {
 }
 
 begin_transaction() {
-  local name path current_target transaction_name transaction_ready deployed_target enabled_state
+  local name path current_target transaction_name transaction_ready deployed_target enabled_state systemd_mode
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
+  systemd_mode=$(stat -c %a "$systemd_root")
+  (((8#$systemd_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -993,6 +995,7 @@ perform_check() {
   shopt -u nullglob
   ((${#transactions[@]} == 0)) || block 'interrupted installer transaction requires recovery'
   if active_deployment; then block 'active deployment prevents a consistent check'; fi
+  if [[ -e "$active_operation" || -L "$active_operation" ]]; then block 'stale operation marker requires a mutating recovery'; fi
   converged || block 'installed deployer state is absent or drifted'
   policy_adapter_operation "$active_policy" health 'active policy' '' 0 || block 'active deployer health check failed'
   health=healthy
@@ -1105,6 +1108,8 @@ PY
   mv -Tf "$install_root/.current.new" "$current"
   reject_mixed_role
   policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" || die 'application adapter rollback failed'
+  sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
+  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || true
   finalize_committed_rollback
   recovered_rollback=0
   health=healthy
