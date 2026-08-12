@@ -899,7 +899,7 @@ boundary_tx=$root/var/lib/ci-fleet-deployer/.transaction.install-boundary
 mkdir -m 0700 "$boundary_tx" "$boundary_tx/units" "$boundary_tx/state"
 mv "$root/opt/ci-fleet-deployer" "$tmp/install-root.real"
 ln -s "$tmp/install-root.real" "$root/opt/ci-fleet-deployer"
-expect_failure 'managed install boundary has an unsafe owner, mode, or type' "$installer" --repair --config "$config" >/dev/null
+expect_failure 'unsafe symlinked managed directory' "$installer" --repair --config "$config" >/dev/null
 [[ -L "$tmp/install-root.real/current" ]] || fail 'symlinked install boundary mutated the activation pointer'
 rm "$root/opt/ci-fleet-deployer"
 mv "$tmp/install-root.real" "$root/opt/ci-fleet-deployer"
