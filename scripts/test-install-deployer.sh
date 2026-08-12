@@ -855,6 +855,18 @@ rm -rf -- "$boundary_tx"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# Rebuild a retained rollback pair consumed by the finalize recovery fixture.
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'retained rollback pair was not rebuilt'
+
 # A lost install state with surviving release/units must not be treated as a fresh install.
 mv "$root/var/lib/ci-fleet-deployer/install-state.json" "$tmp/install-state.saved"
 expect_failure 'restore install state before convergence' "$installer" --repair --config "$config" >/dev/null
