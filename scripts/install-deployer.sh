@@ -99,7 +99,12 @@ PY
   rollback_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$previous_policy")
   rollback_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$previous_policy")
   if [[ $rollback_credential_provider == file ]]; then
+    [[ $rollback_credential_ref == "$etc_root/credentials/"* ]] || { printf no; return; }
     [[ ! -L "$rollback_credential_ref" && -f "$rollback_credential_ref" && $(stat -c '%u:%a' "$rollback_credential_ref" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
+  elif [[ $rollback_credential_provider == external ]]; then
+    [[ $rollback_credential_ref =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || { printf no; return; }
+  else
+    printf no; return
   fi
   printf yes
 }
@@ -417,12 +422,21 @@ validate_checkout() {
   chmod 0700 "$checkout_snapshot"
   install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
   install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
-  install -m 0644 "$repo_root"/deploy/deployer/* "$checkout_snapshot/deploy/deployer/"
+  local entry
+  for entry in "$repo_root"/deploy/deployer/*; do
+    [[ -f "$entry" && ! -L "$entry" ]] || block 'deployer unit source contains an unsafe or untracked entry'
+    install -m 0644 "$entry" "$checkout_snapshot/deploy/deployer/"
+  done
   tree_listing=$(git_checkout --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer) || block 'reviewed commit tree is unreadable'
   [[ -n $tree_listing ]] || block 'reviewed commit tree is unreadable'
   while read -r _ _ blob path; do
     [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
   done <<<"$tree_listing"
+  # The snapshot must contain exactly the reviewed entries: any extra copied
+  # path (for example an untracked symlink target) is unreviewed content.
+  local snapshot_listing
+  snapshot_listing=$(cd "$checkout_snapshot" && find scripts deploy -type f | sort)
+  [[ $snapshot_listing == "$(awk '{print $4}' <<<"$tree_listing" | sort)" ]] || block 'checkout snapshot contains unreviewed entries'
   repo_root=$checkout_snapshot
   unit_source=$repo_root/deploy/deployer
 }
@@ -652,15 +666,15 @@ restore_transaction() {
       [[ -z $backed_up ]] || block "transaction $name manifest is missing but backups remain"
     fi
   done
+  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
+  systemd_restore_mode=$(stat -c %a "$systemd_root")
+  (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
+  [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
   for name in "${timer_names[@]}"; do
     if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]]; then
       systemctl disable --now "$name" >/dev/null 2>&1 || return
     fi
   done
-  [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
-  systemd_restore_mode=$(stat -c %a "$systemd_root")
-  (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
-  [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
@@ -797,9 +811,10 @@ PY
 
 commit_transaction() {
   local retired
-  sync -f "$state_file" "$active_policy" 2>/dev/null || true
-  sync -f "$state_root" 2>/dev/null || true
-  sync -f "$install_root" 2>/dev/null || true
+  sync -f "$state_file" "$active_policy" 2>/dev/null || block 'committed host state is not durable'
+  sync -f "$state_root" 2>/dev/null || block 'committed host state is not durable'
+  sync -f "$install_root" 2>/dev/null || block 'committed install root is not durable'
+  sync -f "$systemd_root" 2>/dev/null || block 'committed systemd boundary is not durable'
   retired=$state_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
@@ -941,7 +956,10 @@ publish_deployed_snapshot() {
   install -m 0600 "$state" "$snapshot/state.json" || return
   pointer=$deployed_root/.current.$$
   ln -s "${snapshot##*/}" "$pointer" || return
+  sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || block 'replacement deployed snapshot is not durable'
+  sync -f "$snapshot" 2>/dev/null || block 'replacement deployed snapshot is not durable'
   mv -Tf "$pointer" "$deployed_current" || return
+  sync -f "$deployed_root" 2>/dev/null || block 'deployed snapshot pointer is not durable'
   if [[ -n ${retired:-} && -d "$deployed_root/$retired" && ! -L "$deployed_root/$retired" ]]; then rm -rf -- "${deployed_root:?}/$retired"; fi
 }
 
@@ -1081,13 +1099,16 @@ PY
     fi
   fi
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
+  # Publish the candidate activation pointer before unit verification so the
+  # units' /opt/ci-fleet-deployer/current/... ExecStart paths resolve on a
+  # fresh install; transaction recovery restores the prior pointer.
+  mv -Tf "$install_root/.current.new" "$current"
   install_units
   install -m 0600 "$config" "$active_policy.new"
   write_state "$state_root/.install-state.new"
   reject_mixed_role
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_root/.install-state.new" "$state_file"
-  mv -Tf "$install_root/.current.new" "$current"
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
     publish_deployed_snapshot "$active_policy" "$state_file"
@@ -1129,10 +1150,12 @@ PY
   release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
   unit_source=$releases/$core_ref/deploy/deployer
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
+  # Publish before unit verification so the units' current/... paths resolve;
+  # transaction recovery restores the prior pointer.
+  mv -Tf "$install_root/.current.new" "$current"
   install_units
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
-  mv -Tf "$install_root/.current.new" "$current"
   reject_mixed_role
   policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" || die 'application adapter rollback failed'
   sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
@@ -1193,7 +1216,10 @@ perform_uninstall() {
       systemctl disable --now "$unit" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
     fi
   done
-  if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
+  if [[ -L "$current" ]]; then
+    [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
+    rm -f "$current"; changed=yes
+  fi
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
   systemctl daemon-reload >/dev/null 2>&1 || true

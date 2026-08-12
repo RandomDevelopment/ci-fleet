@@ -333,6 +333,10 @@ PY
     fi
     adapter_status=
     audit_phase=post-adapter
+    # The adapter change is applied and the approval is consumed; a signal from
+    # here on must not abort before the new snapshot pointer is durable and the
+    # success audit record is written, or later rollback would use stale state.
+    trap '' INT TERM
     secure_directory "$deployed_root" 'deployed snapshot directory'
     inside "$snapshot" "$deployed_root" || die 'prepared deployed snapshot escaped managed state'
     secure_directory "$snapshot" 'prepared deployed snapshot'
