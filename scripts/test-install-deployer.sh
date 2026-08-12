@@ -799,6 +799,27 @@ expect_failure 'application rollback commit marker is unsafe' "$installer" --rep
 rm -rf -- "$recovery_transaction"
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# Finalizing a committed rollback must publish over an unusable incumbent deployed snapshot.
+deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
+cp "$deployed_dir/policy.conf" "$tmp/incumbent-policy.saved"
+python3 - "$deployed_dir/policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ADAPTER_SHA256=', 'ADAPTER_SHA256=' + 'e'*64 + '\n#', 1))
+PY
+recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.unusable-incumbent
+mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
+install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
+recovery=$(expect_success "$installer" --upgrade --config "$config")
+grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'unusable-incumbent recovery lacks the operator reconciliation action'
+[[ ! -e "$recovery_transaction" ]] || fail 'unusable-incumbent recovery retained its transaction'
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # A deployed rollback pair whose adapter bytes no longer match its recorded digest must not promote.
 deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
 deployed_target=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
@@ -911,7 +932,20 @@ expect_success "$installer" --check --config "$config" >/dev/null
 mkdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
 printf '[Service]\nExecStart=\n' >"$root/etc/systemd/system/ci-fleet-deployer.service.d/override.conf"
 expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_failure 'has an unreviewed drop-in override' "$installer" --repair --config "$config" >/dev/null
+[[ -f "$root/etc/systemd/system/ci-fleet-deployer.service.d/override.conf" ]] || fail 'repair discarded an unmanaged drop-in'
 rm -rf "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A group- or world-writable managed unit must block before transaction backup.
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
+units_before_mode=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
+expect_failure 'managed systemd unit has an unsafe owner, mode, or type' "$installer" --repair --config "$config" >/dev/null
+[[ $units_before_mode == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'writable unit allowed a transaction backup'
+chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # Rebuild a retained rollback pair consumed by the finalize recovery fixture.
