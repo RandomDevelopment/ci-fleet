@@ -465,6 +465,15 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 [[ $(readlink "$root/var/lib/ci-fleet-deployer/deployed/current") == "$current_deployed" ]] || fail 'recovery did not restore the prior deployed pointer'
 expect_success "$installer" --check --config "$config" >/dev/null
 
+# Transaction recovery must tolerate timers whose unit files were never installed.
+absent_timer_tx=$root/var/lib/ci-fleet-deployer/.transaction.absent-timer
+mkdir -m 0700 "$absent_timer_tx" "$absent_timer_tx/units" "$absent_timer_tx/state"
+mv "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer" "$tmp/cleanup.timer.saved"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e "$absent_timer_tx" ]] || fail 'absent-timer transaction was not recovered'
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # Read-only checks must not create checkout snapshots inside managed state.
 if compgen -G "$root/var/lib/ci-fleet-deployer/.checkout.*" >/dev/null; then fail 'read-only check left a checkout snapshot in managed state'; fi
 

@@ -295,6 +295,8 @@ PY
     trap deploy_exit EXIT
     trap 'exit 2' INT TERM
     install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
+    sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
+    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || true
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     active_temporary=$temporary
