@@ -400,15 +400,17 @@ validate_checkout() {
   # require each copied file's Git blob identity to equal the pinned commit's
   # tree entry. The commit SHA is content-addressed, so no mutation of the
   # worktree, refs, or loose objects can substitute bytes under $head.
-  local path blob
+  local path blob tree_listing
   checkout_snapshot=$(mktemp -d)
   chmod 0700 "$checkout_snapshot"
   install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
   install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
   install -m 0644 "$repo_root"/deploy/deployer/* "$checkout_snapshot/deploy/deployer/"
+  tree_listing=$(git -C "$repo_root" --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer) || block 'reviewed commit tree is unreadable'
+  [[ -n $tree_listing ]] || block 'reviewed commit tree is unreadable'
   while read -r _ _ blob path; do
     [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
-  done < <(git -C "$repo_root" --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer)
+  done <<<"$tree_listing"
   repo_root=$checkout_snapshot
   unit_source=$repo_root/deploy/deployer
 }
@@ -632,7 +634,11 @@ restore_transaction() {
       [[ -z $backed_up ]] || block "transaction $name manifest is missing but backups remain"
     fi
   done
-  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || return
+  for name in "${timer_names[@]}"; do
+    if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]]; then
+      systemctl disable --now "$name" >/dev/null 2>&1 || return
+    fi
+  done
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
