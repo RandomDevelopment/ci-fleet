@@ -786,10 +786,11 @@ printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_tr
 install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
 cp "$adapter" "$tmp/adapter.saved"
 printf '# drifted\n' >>"$adapter"
-lkg_before_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_finalize=absent; fi
 expect_failure 'adapter digest does not match the protected regular file' "$installer" --repair --config "$config" >/dev/null
 [[ -d "$recovery_transaction" ]] || fail 'failed finalize discarded its recovery transaction'
-[[ $lkg_before_finalize == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'failed finalize deleted the retained rollback pair'
+lkg_after_finalize=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+[[ $lkg_before_finalize == "$lkg_after_finalize" ]] || fail 'failed finalize deleted the retained rollback pair'
 cat "$tmp/adapter.saved" >"$adapter"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --repair --config "$config" >/dev/null
