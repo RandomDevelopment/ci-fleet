@@ -885,8 +885,33 @@ chmod 0777 "$root/etc/systemd/system"
 units_before_writable=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
 expect_failure 'systemd unit directory is group- or world-writable' "$installer" --repair --config "$config" >/dev/null
 [[ $units_before_writable == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'writable systemd boundary allowed a transaction backup'
+boundary_tx=$root/var/lib/ci-fleet-deployer/.transaction.writable-recovery
+mkdir -m 0700 "$boundary_tx" "$boundary_tx/units" "$boundary_tx/state"
+expect_failure 'systemd unit directory is group- or world-writable' "$installer" --repair --config "$config" >/dev/null
+[[ $units_before_writable == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'writable systemd boundary allowed a recovery restore'
+rm -rf -- "$boundary_tx"
 chmod 0755 "$root/etc/systemd/system"
 expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A symlinked install root must block before recovery restores pointers.
+boundary_tx=$root/var/lib/ci-fleet-deployer/.transaction.install-boundary
+mkdir -m 0700 "$boundary_tx" "$boundary_tx/units" "$boundary_tx/state"
+mv "$root/opt/ci-fleet-deployer" "$tmp/install-root.real"
+ln -s "$tmp/install-root.real" "$root/opt/ci-fleet-deployer"
+expect_failure 'managed install boundary has an unsafe owner, mode, or type' "$installer" --repair --config "$config" >/dev/null
+[[ -L "$tmp/install-root.real/current" ]] || fail 'symlinked install boundary mutated the activation pointer'
+rm "$root/opt/ci-fleet-deployer"
+mv "$tmp/install-root.real" "$root/opt/ci-fleet-deployer"
+rm -rf -- "$boundary_tx"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A managed-unit drop-in must break convergence until removed.
+mkdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+printf '[Service]\nExecStart=\n' >"$root/etc/systemd/system/ci-fleet-deployer.service.d/override.conf"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+rm -rf "$root/etc/systemd/system/ci-fleet-deployer.service.d"
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # Rebuild a retained rollback pair consumed by the finalize recovery fixture.
@@ -938,6 +963,18 @@ grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'drifted retained
 chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good.json"
 available_check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid retained pair was not reported rollback_available=yes'
+cp "$adapter" "$tmp/adapter.avail-saved"
+printf '# drifted\n' >>"$adapter"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'digest-drifted adapter still reported rollback_available=yes'
+cat "$tmp/adapter.avail-saved" >"$adapter"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'restored adapter was not reported rollback_available=yes'
+chmod 0644 "$credential"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'drifted credential still reported rollback_available=yes'
+chmod 0600 "$credential"
+expect_success "$installer" --check --config "$config" >/dev/null
 
 write_production_gate
 write_evidence production example-production

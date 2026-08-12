@@ -90,6 +90,17 @@ ok = (all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
       and policy.get('SCHEMA_VERSION') == '1')
 raise SystemExit(0 if ok else 1)
 PY
+  local rollback_adapter_path rollback_adapter_sha rollback_credential_provider rollback_credential_ref
+  rollback_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$previous_policy")
+  rollback_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$previous_policy")
+  [[ $rollback_adapter_path == "$etc_root/adapters/"* ]] || { printf no; return; }
+  [[ ! -L "$rollback_adapter_path" && -f "$rollback_adapter_path" && $(stat -c '%u:%a' "$rollback_adapter_path" 2>/dev/null) == "$expected_uid:700" ]] || { printf no; return; }
+  [[ $(sha256sum "$rollback_adapter_path" 2>/dev/null | cut -d' ' -f1) == "$rollback_adapter_sha" ]] || { printf no; return; }
+  rollback_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$previous_policy")
+  rollback_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$previous_policy")
+  if [[ $rollback_credential_provider == file ]]; then
+    [[ ! -L "$rollback_credential_ref" && -f "$rollback_credential_ref" && $(stat -c '%u:%a' "$rollback_credential_ref" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
+  fi
   printf yes
 }
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
@@ -472,6 +483,7 @@ units_match() {
   for unit in "${unit_names[@]}"; do
     [[ -f "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && $(stat -c '%u:%a' "$systemd_root/$unit") == "$expected_uid:644" ]] || return 1
     cmp -s "$unit_source/$unit" "$systemd_root/$unit" || return 1
+    [[ ! -e "$systemd_root/$unit.d" && ! -L "$systemd_root/$unit.d" ]] || return 1
   done
   for unit in "${timer_names[@]}"; do [[ $(systemctl is-enabled "$unit" 2>/dev/null) == enabled ]] && systemctl is-active "$unit" >/dev/null 2>&1 || return 1; done
 }
@@ -544,6 +556,7 @@ begin_transaction() {
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_mode=$(stat -c %a "$systemd_root")
   (((8#$systemd_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
+  [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:600" ]] || block 'managed transaction state has an unsafe type, owner, or mode'
@@ -591,13 +604,15 @@ begin_transaction() {
   fi
   transaction_name=${transaction_dir##*/}
   transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
+  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || true
   mv "$transaction_dir" "$transaction_ready"
   transaction_dir=$transaction_ready
+  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || true
   transaction_preparing=0
 }
 
 restore_transaction() {
-  local name target_value backed_up
+  local name target_value backed_up systemd_restore_mode
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
   transaction_committed=1
   for name in units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
@@ -642,6 +657,9 @@ restore_transaction() {
     fi
   done
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
+  systemd_restore_mode=$(stat -c %a "$systemd_root")
+  (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
+  [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
   for name in "${unit_names[@]}"; do rm -f -- "$systemd_root/$name" || return; done
   if [[ -f "$transaction_dir/units-present" ]]; then
     while IFS= read -r name; do
