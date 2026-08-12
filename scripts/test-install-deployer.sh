@@ -1127,6 +1127,70 @@ rmdir "$root/etc/systemd/system/ci-fleet-deployer-drain.service"
 expect_success "$installer" --uninstall --config "$config" >/dev/null
 [[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after correcting unit drift did not uninstall'
 
+# A symlinked install root must block uninstall before its target's pointer is touched.
+expect_success "$installer" --install --config "$config" >/dev/null
+mv "$root/opt/ci-fleet-deployer" "$tmp/install-root-uninstall.real"
+ln -s "$tmp/install-root-uninstall.real" "$root/opt/ci-fleet-deployer"
+expect_failure 'unsafe symlinked managed directory' "$installer" --uninstall --config "$config" >/dev/null
+[[ -L "$tmp/install-root-uninstall.real/current" ]] || fail 'uninstall removed a pointer through a symlinked install root'
+rm "$root/opt/ci-fleet-deployer"
+mv "$tmp/install-root-uninstall.real" "$root/opt/ci-fleet-deployer"
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after correcting install-root drift did not uninstall'
+
+# An untracked symlink in the deployer unit source must block checkout validation.
+expect_success "$installer" --install --config "$config" >/dev/null
+ln -s "$credential" "$repo_root/deploy/deployer/leak"
+expect_failure 'deployer unit source contains an unsafe or untracked entry' "$installer" --repair --config "$config" >/dev/null
+[[ $(stat -c %a "$credential") == 600 ]] || fail 'untracked checkout symlink exposed credential bytes'
+rm "$repo_root/deploy/deployer/leak"
+printf 'unreviewed\n' >"$repo_root/deploy/deployer/extra-unit.service"
+expect_failure 'checkout snapshot contains unreviewed entries' "$installer" --repair --config "$config" >/dev/null
+rm "$repo_root/deploy/deployer/extra-unit.service"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A retained policy naming a credential outside the protected directory, or a
+# malformed external reference, must report rollback_available=no.
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" ]] || fail 'test setup expected a retained policy'
+cp "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$tmp/lkg-policy.saved"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external').replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=external:bad'))
+PY
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'malformed external retained credential still reported rollback_available=yes'
+install -m 0600 "$tmp/lkg-policy.saved" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=/etc/hostname'))
+PY
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'out-of-directory retained credential still reported rollback_available=yes'
+install -m 0600 "$tmp/lkg-policy.saved" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'restored retained pair was not reported rollback_available=yes'
+
+# Retained-transaction recovery must validate the systemd boundary before stopping timers.
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+expect_success "$installer" --install --config "$config" >/dev/null
+boundary_recovery=$root/var/lib/ci-fleet-deployer/.transaction.writable-boundary
+mkdir -m 0700 "$boundary_recovery" "$boundary_recovery/units" "$boundary_recovery/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$boundary_recovery/state/$name"; printf '%s\n' "$name" >>"$boundary_recovery/state-present"; }
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$boundary_recovery/current-target"
+printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$boundary_recovery/timers-enabled"
+chmod 0777 "$root/etc/systemd/system"
+expect_failure 'systemd unit directory is group- or world-writable' "$installer" --repair --config "$config" >/dev/null
+[[ $(stat -c %a "$root/etc/systemd/system") == 777 ]] || fail 'writable boundary recovery mutated the unit directory'
+rm -rf -- "$boundary_recovery"
+chmod 0755 "$root/etc/systemd/system"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # A failed timer shutdown must fail the uninstall before any unit removal.
 expect_success "$installer" --install --config "$config" >/dev/null
 uninstall_before=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)
@@ -1281,14 +1345,18 @@ expect_failure 'GitHub capability evidence must be a regular file' "$runtime" de
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran without GitHub capability evidence'
 mv "$capability.saved" "$capability"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
-if CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF=TERM "$runtime" deploy >/dev/null 2>&1; then fail 'signaled deployment reported success'; fi
-[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == $((deploy_calls_before + 1)) ]] || fail 'interrupted runtime did not reach the adapter'
-[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'signal after temporary pointer leaked an unreachable prepared snapshot'
-[[ -e "$deployed_current" ]] || fail 'signal after temporary pointer dangled the deployed pointer'
-[[ ! -e "$active" ]] || fail 'signaled deployment left the active operation marker'
-if compgen -G "$root/var/lib/ci-fleet-deployer/.active.*" >/dev/null; then fail 'signaled deployment left an unpublished active marker temporary'; fi
+# A signal arriving after adapter success must not abort publication: the
+# approval is consumed and the application change is applied, so the runtime
+# masks INT/TERM until the new snapshot pointer and audit record are durable.
+deployed_before_signal=$(readlink "$deployed_current")
+CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF=TERM expect_success "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == $((deploy_calls_before + 1)) ]] || fail 'signaled runtime did not reach the adapter'
+[[ -L "$deployed_current" && $(readlink "$deployed_current") != "$deployed_before_signal" ]] || fail 'masked signal prevented deployed pointer publication'
+[[ ! -e "$active" ]] || fail 'completed deployment left the active operation marker'
+if compgen -G "$root/var/lib/ci-fleet-deployer/.active.*" >/dev/null; then fail 'completed deployment left an unpublished active marker temporary'; fi
 rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+cp "$approval" "$request"; chmod 0600 "$request"
 deployed_target=$(readlink "$deployed_current")
 rm "$deployed_current"
 expect_failure 'deployed rollback snapshot is missing' "$runtime" deploy >/dev/null
