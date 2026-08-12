@@ -390,7 +390,7 @@ reject_mixed_role() {
 
 validate_checkout() {
   local head
-  head=$(git -C "$repo_root" rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
+  head=$(git -C "$repo_root" --no-replace-objects rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
   [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
   if [[ "$testing" != 1 ]]; then
     git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
@@ -408,7 +408,7 @@ validate_checkout() {
   install -m 0644 "$repo_root"/deploy/deployer/* "$checkout_snapshot/deploy/deployer/"
   while read -r _ _ blob path; do
     [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
-  done < <(git -C "$repo_root" ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer)
+  done < <(git -C "$repo_root" --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer)
   repo_root=$checkout_snapshot
   unit_source=$repo_root/deploy/deployer
 }
@@ -504,6 +504,7 @@ acquire_lock() {
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer installer operation is running'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
+  if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
   if [[ -e "$active_operation" ]] && ! active_deployment; then
     [[ ! -L "$active_operation" && -f "$active_operation" && $(stat -c '%u:%a' "$active_operation") == "$expected_uid:600" ]] || block 'stale operation state is unsafe'
     rm -f "$active_operation"
@@ -529,6 +530,9 @@ acquire_lock() {
 
 acquire_check_lock() {
   [[ -d "$lock_root" && ! -L "$lock_root" && $(stat -c '%u:%a' "$lock_root") == "$expected_uid:700" ]] || block 'installed deployer lock boundary is absent or unsafe'
+  if [[ -e "$active_operation" || -L "$active_operation" ]]; then
+    [[ -f "$active_operation" && ! -L "$active_operation" ]] || block 'active operation marker has an unsafe type'
+  fi
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer operation is running'
 }
@@ -1144,7 +1148,11 @@ perform_uninstall() {
     mv -Tf "$temporary" "$drained"
   fi
   if active_deployment; then block 'active deployment started while draining'; fi
-  systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
+  for unit in "${timer_names[@]}"; do
+    if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
+      systemctl disable --now "$unit" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
+    fi
+  done
   if [[ -L "$current" ]]; then rm -f "$current"; changed=yes; fi
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done

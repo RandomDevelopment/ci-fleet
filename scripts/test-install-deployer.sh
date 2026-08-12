@@ -533,6 +533,13 @@ CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents th
 [[ -f "$root/var/lib/ci-fleet-deployer/active-operation" ]] || fail 'live stale-aged operation marker was expired'
 rm "$root/var/lib/ci-fleet-deployer/active-operation"
 
+# An unsafe active-operation marker type must fail checks, not certify them.
+mkdir "$root/var/lib/ci-fleet-deployer/active-operation"
+expect_failure 'active operation marker has an unsafe type' "$installer" --check --config "$config" >/dev/null
+expect_failure 'active operation marker has an unsafe type' "$installer" --repair --config "$config" >/dev/null
+rmdir "$root/var/lib/ci-fleet-deployer/active-operation"
+expect_success "$installer" --check --config "$config" >/dev/null
+
 exec 8<"$root/var/lock/ci-fleet-deployer"
 flock -n 8 || fail 'fixture could not acquire installer lock'
 expect_failure 'another deployer installer operation is running' "$installer" --repair --config "$config" >/dev/null
@@ -989,6 +996,8 @@ FAKE_SYSTEMCTL_FAIL_COMMAND=disable expect_failure 'deployer timers did not stop
 [[ "$uninstall_before" == "$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'failed timer shutdown partially uninstalled units'
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'failed timer shutdown removed the activation pointer'
 expect_success "$installer" --uninstall --config "$config" >/dev/null
+repeat_uninstall=$(expect_success "$installer" --uninstall --config "$config")
+grep -Fq 'result=NO_CHANGE' <<<"$repeat_uninstall" || fail 'repeated uninstall was not idempotent after timer removal'
 
 # Runtime contract: exact-head request/evidence, drain and scoped adapter calls.
 write_evidence staging example-staging
@@ -1139,6 +1148,7 @@ if CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF=TERM "$runtime" deploy >/dev/null 2>&1; th
 [[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'signal after temporary pointer leaked an unreachable prepared snapshot'
 [[ -e "$deployed_current" ]] || fail 'signal after temporary pointer dangled the deployed pointer'
 [[ ! -e "$active" ]] || fail 'signaled deployment left the active operation marker'
+if compgen -G "$root/var/lib/ci-fleet-deployer/.active.*" >/dev/null; then fail 'signaled deployment left an unpublished active marker temporary'; fi
 rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 deployed_target=$(readlink "$deployed_current")
@@ -1280,6 +1290,13 @@ release_before=$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scrip
 printf '# substituted-live-bytes\n' >>"$runtime"
 expect_failure 'differs from the reviewed commit' "$installer" --repair --config "$config" >/dev/null
 [[ $release_before == "$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")" ]] || fail 'mutated live checkout bytes entered the trusted release'
+replacement=$(git -C "$repo_root" commit-tree 'HEAD^{tree}' -m replace-fixture 2>/dev/null || true)
+if [[ -n $replacement ]]; then
+  git -C "$repo_root" replace "$core_ref" "$replacement"
+  expect_failure 'differs from the reviewed commit' "$installer" --repair --config "$config" >/dev/null
+  [[ $release_before == "$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")" ]] || fail 'replacement ref bytes entered the trusted release'
+  git -C "$repo_root" replace -d "$core_ref"
+fi
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
 rm "$root/var/lib/ci-fleet-deployer/drained"

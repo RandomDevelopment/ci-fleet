@@ -47,7 +47,7 @@ deploy_exit() {
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
   fi
-  rm -f "$active" "${request_snapshot:-}" "${policy_snapshot:-}" || true
+  rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
     target=$(readlink "$deployed_current" 2>/dev/null || true)
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
@@ -297,11 +297,13 @@ PY
     install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
+    active_temporary=$temporary
     printf 'pid=%s\nstarted_at=%s\n' "$$" "$(date +%s)" >"$temporary"
     if [[ $testing != 1 ]]; then
       printf 'boot_id=%s\nstart_time=%s\n' "$(</proc/sys/kernel/random/boot_id)" "$(awk '{print $22}' /proc/$$/stat)" >>"$temporary"
     fi
     mv -Tf "$temporary" "$active"
+    active_temporary=
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
