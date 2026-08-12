@@ -822,15 +822,15 @@ from pathlib import Path
 import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ADAPTER_SHA256=', 'ADAPTER_SHA256=' + 'f'*64 + '\n#', 1))
 PY
-lkg_before_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_digest=absent; fi
 expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --upgrade --config "$config" >/dev/null
-[[ $lkg_before_digest == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'digest-mismatched deployed pair replaced last-known-good'
+lkg_after_digest=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_digest == "$lkg_after_digest" ]] || fail 'digest-mismatched deployed pair replaced last-known-good'
 if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'blocked digest promotion left a recovery transaction'; fi
 expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --rollback --config "$config" >/dev/null
 rollback_tx=$(compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*") || fail 'blocked digest rollback left no recovery transaction'
 [[ $(<"$rollback_tx/deployed-target") == "$deployed_target" ]] || fail 'blocked digest rollback recorded an unexpected deployed target'
 expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --repair --config "$config" >/dev/null
-[[ $lkg_before_digest == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'digest-mismatched deployed pair reached recovery promotion'
+lkg_after_digest=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_digest == "$lkg_after_digest" ]] || fail 'digest-mismatched deployed pair reached recovery promotion'
 install -m 0600 "$tmp/deployed-policy.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --repair --config "$config" >/dev/null
@@ -845,11 +845,11 @@ from pathlib import Path
 import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('CREDENTIAL_PROVIDER=file', 'CREDENTIAL_PROVIDER=external').replace(next(x for x in p.read_text().splitlines() if x.startswith('CREDENTIAL_REF=')), 'CREDENTIAL_REF=external:bad'))
 PY
-lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_credential=absent; fi
 expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --upgrade --config "$config" >/dev/null
-[[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
+lkg_after_credential=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_credential == "$lkg_after_credential" ]] || fail 'credential-drifted deployed pair replaced last-known-good'
 expect_failure 'deployed rollback policy has an invalid external secret-manager adapter reference' "$installer" --rollback --config "$config" >/dev/null
-[[ $lkg_before_credential == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'credential-drifted deployed pair reached rollback'
+lkg_after_credential=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_credential == "$lkg_after_credential" ]] || fail 'credential-drifted deployed pair reached rollback'
 install -m 0600 "$tmp/deployed-policy-cred.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --repair --config "$config" >/dev/null
