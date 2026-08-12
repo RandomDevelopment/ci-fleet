@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 installer=$repo_root/scripts/install-deployer.sh
 runtime=$repo_root/scripts/deployer-runtime.sh
 
-fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'FAIL(line %s): %s\n' "${BASH_LINENO[0]:-?}" "$*" >&2; exit 1; }
 expect_success() {
   local output
   output=$("$@" 2>&1) || fail "expected success: $*; output=$output"
@@ -360,6 +360,8 @@ grep -Fq 'REPORT action=check result=NO_CHANGE' <<<"$check" || fail 'check did n
 FAKE_SYSTEMD_STATE=degraded expect_success "$installer" --check --config "$config" >/dev/null
 chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_failure 'managed systemd unit has an unsafe owner, mode, or type' "$installer" --repair --config "$config" >/dev/null
+chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ $(stat -c %a "$root/etc/systemd/system/ci-fleet-deployer.service") == 644 ]] || fail 'repair did not restore unit mode 0644'
 
@@ -579,7 +581,7 @@ unit_path=$root/etc/systemd/system/ci-fleet-deployer.service
 mv "$unit_path" "$unit_path.real"
 printf 'unrelated-unit\n' >"$tmp/unrelated-unit"
 ln -s "$tmp/unrelated-unit" "$unit_path"
-expect_failure 'managed systemd unit has an unsafe owner or type' "$installer" --repair --config "$config" >/dev/null
+expect_failure 'managed systemd unit has an unsafe owner, mode, or type' "$installer" --repair --config "$config" >/dev/null
 [[ $(<"$tmp/unrelated-unit") == unrelated-unit ]] || fail 'systemd unit symlink attack changed an unrelated file'
 rm "$unit_path"; mv "$unit_path.real" "$unit_path"
 
@@ -821,6 +823,17 @@ expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 # A deployed rollback pair whose adapter bytes no longer match its recorded digest must not promote.
+# Rebuild the retained pair consumed by the unusable-incumbent recovery fixture.
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'retained rollback pair was not rebuilt'
 deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
 deployed_target=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
 cp "$deployed_dir/policy.conf" "$tmp/deployed-policy.saved"
@@ -1040,6 +1053,7 @@ mv "$fake_bin/docker.unavailable" "$fake_bin/docker"
 chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'failed resume removed drain state'
+chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'repair implicitly resumed the deployer'
 resume=$(expect_success "$installer" --resume --config "$config")
@@ -1048,6 +1062,7 @@ grep -Fq 'health=healthy' <<<"$resume" || fail 'resume report omitted verified h
 [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'resume retained drain state'
 chmod 0666 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'installed deployer state is absent or drifted; repair before resume' "$installer" --resume --config "$config" >/dev/null
+chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_success "$installer" --repair --config "$config" >/dev/null
 repeat_resume=$(expect_success "$installer" --resume --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$repeat_resume" || fail 'repeated resume was not idempotent'

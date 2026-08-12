@@ -348,7 +348,7 @@ PY
     sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || die 'prepared deployed snapshot is not durable'
     sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || die 'prepared deployed snapshot is not durable'
     mv -Tf "$pointer" "$deployed_current"
-    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable' 
+    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable'
     snapshot_pointer=$deployed_current
     snapshot=
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
