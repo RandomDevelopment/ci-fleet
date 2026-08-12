@@ -149,6 +149,8 @@ if [[ "$operation" == drain ]]; then
   temporary=$(mktemp "$state_root/.drained.XXXXXX")
   chmod 0600 "$temporary"
   mv -Tf "$temporary" "$drained"
+  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || true
+  sync -f "$state_root" 2>/dev/null || true
   exit 0
 fi
 
@@ -343,10 +345,10 @@ PY
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
     [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$
-    sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || true
-    sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || true
+    sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || die 'prepared deployed snapshot is not durable'
+    sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || die 'prepared deployed snapshot is not durable'
     mv -Tf "$pointer" "$deployed_current"
-    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || true
+    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable' 
     snapshot_pointer=$deployed_current
     snapshot=
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
@@ -360,6 +362,7 @@ PY
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       >&8
+    sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment success audit is not durable'
     audit_pending=0
     ;;
 esac

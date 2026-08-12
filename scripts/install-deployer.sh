@@ -401,10 +401,11 @@ reject_mixed_role() {
 
 validate_checkout() {
   local head
-  head=$(git -C "$repo_root" --no-replace-objects rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
+  git_checkout() { git -c core.fsmonitor= -c core.hooksPath=/dev/null -C "$repo_root" "$@"; }
+  head=$(git_checkout --no-replace-objects rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
   [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
   if [[ "$testing" != 1 ]]; then
-    git -C "$repo_root" diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
+    git_checkout diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
   fi
   # Pin the reviewed inputs before any privileged copy: copy the worktree
   # bytes once into a root-controlled snapshot outside managed state, then
@@ -417,7 +418,7 @@ validate_checkout() {
   install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
   install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
   install -m 0644 "$repo_root"/deploy/deployer/* "$checkout_snapshot/deploy/deployer/"
-  tree_listing=$(git -C "$repo_root" --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer) || block 'reviewed commit tree is unreadable'
+  tree_listing=$(git_checkout --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer) || block 'reviewed commit tree is unreadable'
   [[ -n $tree_listing ]] || block 'reviewed commit tree is unreadable'
   while read -r _ _ blob path; do
     [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
@@ -568,7 +569,7 @@ begin_transaction() {
   fi
   for name in "${unit_names[@]}"; do
     path=$systemd_root/$name
-    [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c %u "$path") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
+    [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:644" ]] || block 'managed systemd unit has an unsafe owner, mode, or type'
   done
   transaction_dir=$(mktemp -d "$state_root/.transaction-preparing.XXXXXX")
   transaction_preparing=1
@@ -724,13 +725,13 @@ recover_interrupted_transaction() {
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
   transaction_dir=$candidate
-  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
   if [[ -e "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
     finalize_committed_rollback
     recovered_rollback=1
     transaction_committed=0
     return
   fi
+  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
   restore_transaction
   transaction_committed=0
 }
@@ -796,6 +797,9 @@ PY
 
 commit_transaction() {
   local retired
+  sync -f "$state_file" "$active_policy" 2>/dev/null || true
+  sync -f "$state_root" 2>/dev/null || true
+  sync -f "$install_root" 2>/dev/null || true
   retired=$state_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
@@ -918,11 +922,15 @@ PY
 }
 
 publish_deployed_snapshot() {
-  local policy=$1 state=$2 snapshot pointer retired
+  local policy=$1 state=$2 snapshot pointer retired incumbent
   secure_directory "$deployed_root" 700 1 || return
   if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
-    load_deployed_snapshot || return
-    if cmp -s "$deployed_snapshot_policy" "$policy" && cmp -s "$deployed_snapshot_state" "$state"; then return; fi
+    # An unusable incumbent snapshot must not block publication of a freshly
+    # validated rollback pair; only identical bytes short-circuit.
+    if [[ -L "$deployed_current" ]]; then
+      incumbent=$(readlink -f "$deployed_current")
+      if [[ -f "$incumbent/policy.conf" && -f "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+    fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
     rm -f -- "$deployed_current" || return
@@ -943,6 +951,7 @@ install_units() {
   systemd_mode=$(stat -c %a "$systemd_root")
   (((8#$systemd_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
   for unit in "${unit_names[@]}"; do
+    [[ ! -e "$systemd_root/$unit.d" && ! -L "$systemd_root/$unit.d" ]] || block "managed unit $unit has an unreviewed drop-in override"
     if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
       [[ ! -L "$systemd_root/$unit" && -f "$systemd_root/$unit" && $(stat -c %u "$systemd_root/$unit") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
     fi
@@ -1144,6 +1153,8 @@ perform_drain() {
   temporary=$(mktemp "$state_root/.drained.XXXXXX")
   chmod 0600 "$temporary"
   mv -Tf "$temporary" "$drained"
+  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || true
+  sync -f "$state_root" 2>/dev/null || true
   report CHANGED yes safe-to-maintain "$(rollback_available)"
 }
 
