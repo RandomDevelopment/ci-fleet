@@ -162,6 +162,21 @@ parse_file "$config" cfg configuration "$config_keys"
 for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[SCHEMA_VERSION]:-} == 1 ]] || die 'configuration has an unsupported or missing schema version'
 [[ ${cfg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
+# A concurrent upgrade may switch current between ExecStart resolution and the
+# lock; re-exec the release matching the active policy before trusting it.
+own_realpath=$(realpath -e -- "${BASH_SOURCE[0]}")
+if [[ $own_realpath == */releases/* ]]; then
+  install_prefix=${own_realpath%%/releases/*}
+  own_release=${own_realpath#*/releases/}
+  own_release=${own_release%%/*}
+  if [[ $own_release != "${cfg[CORE_REF]}" ]]; then
+    selected=$install_prefix/releases/${cfg[CORE_REF]}/scripts/deployer-runtime.sh
+    [[ -x $selected && ! -L $selected ]] || die 'active policy revision runtime is unavailable'
+    [[ -z ${CI_FLEET_DEPLOYER_REEXEC:-} ]] || die 'runtime re-exec did not select the active revision'
+    export CI_FLEET_DEPLOYER_REEXEC=1
+    exec "$selected" "$operation"
+  fi
+fi
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 inside "${cfg[ADAPTER_PATH]}" "$(root_path /etc/ci-fleet-deployer/adapters)" || die 'application adapter is outside the protected adapter directory'
@@ -328,7 +343,10 @@ PY
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
     [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$
+    sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || true
+    sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || true
     mv -Tf "$pointer" "$deployed_current"
+    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || true
     snapshot_pointer=$deployed_current
     snapshot=
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
