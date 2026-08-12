@@ -963,17 +963,21 @@ grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'drifted retained
 chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good.json"
 available_check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid retained pair was not reported rollback_available=yes'
-cp "$adapter" "$tmp/adapter.avail-saved"
-printf '# drifted\n' >>"$adapter"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ADAPTER_SHA256=', 'ADAPTER_SHA256=' + 'f'*64 + '\n#', 1))
+PY
 available_check=$(expect_success "$installer" --check --config "$config")
-grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'digest-drifted adapter still reported rollback_available=yes'
-cat "$tmp/adapter.avail-saved" >"$adapter"
-available_check=$(expect_success "$installer" --check --config "$config")
-grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'restored adapter was not reported rollback_available=yes'
-chmod 0644 "$credential"
-available_check=$(expect_success "$installer" --check --config "$config")
-grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'drifted credential still reported rollback_available=yes'
-chmod 0600 "$credential"
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'digest-mismatched retained adapter still reported rollback_available=yes'
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
 write_production_gate
