@@ -775,44 +775,6 @@ expect_failure 'application rollback commit marker is unsafe' "$installer" --rep
 rm -rf -- "$recovery_transaction"
 expect_success "$installer" --check --config "$config" >/dev/null
 
-# Finalizing a committed rollback with drifted adapter bytes must not publish or delete retained state.
-recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.drifted-adapter
-rm -rf "$root/var/lib/ci-fleet-deployer/deployed"
-mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
-for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
-  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
-done
-printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
-install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
-cp "$adapter" "$tmp/adapter.saved"
-printf '# drifted\n' >>"$adapter"
-if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_finalize=absent; fi
-expect_failure 'adapter digest does not match the protected regular file' "$installer" --repair --config "$config" >/dev/null
-[[ -d "$recovery_transaction" ]] || fail 'failed finalize discarded its recovery transaction'
-lkg_after_finalize=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
-[[ $lkg_before_finalize == "$lkg_after_finalize" ]] || fail 'failed finalize deleted the retained rollback pair'
-cat "$tmp/adapter.saved" >"$adapter"
-expect_success "$installer" --repair --config "$config" >/dev/null
-expect_success "$installer" --repair --config "$config" >/dev/null
-expect_success "$installer" --check --config "$config" >/dev/null
-
-# A symlinked systemd boundary must block before transaction recovery deletes through it.
-rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
-boundary_tx=$root/var/lib/ci-fleet-deployer/.transaction.boundary
-mkdir -m 0700 "$boundary_tx" "$boundary_tx/units" "$boundary_tx/state"
-mv "$root/etc/systemd/system" "$tmp/systemd.real"
-ln -s "$tmp/systemd.real" "$root/etc/systemd/system"
-printf 'decoy\n' >"$tmp/systemd.real/ci-fleet-deployer.service"
-expect_failure 'systemd unit directory has an unsafe owner or type' "$installer" --repair --config "$config" >/dev/null
-[[ $(<"$tmp/systemd.real/ci-fleet-deployer.service") == decoy ]] || fail 'recovery deleted through a symlinked systemd boundary'
-[[ -d "$boundary_tx" ]] || fail 'blocked boundary recovery discarded its transaction'
-rm "$root/etc/systemd/system"
-mv "$tmp/systemd.real" "$root/etc/systemd/system"
-rm "$root/etc/systemd/system/ci-fleet-deployer.service"
-rm -rf -- "$boundary_tx"
-expect_success "$installer" --repair --config "$config" >/dev/null
-expect_success "$installer" --check --config "$config" >/dev/null
-
 # A deployed rollback pair whose adapter bytes no longer match its recorded digest must not promote.
 deployed_dir=$(readlink -f "$root/var/lib/ci-fleet-deployer/deployed/current")
 deployed_target=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
@@ -852,6 +814,44 @@ expect_failure 'deployed rollback policy has an invalid external secret-manager 
 lkg_after_credential=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_credential=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_credential == "$lkg_after_credential" ]] || fail 'credential-drifted deployed pair reached rollback'
 install -m 0600 "$tmp/deployed-policy-cred.saved" "$deployed_dir/policy.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Finalizing a committed rollback with drifted adapter bytes must not publish or delete retained state.
+recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.drifted-adapter
+rm -rf "$root/var/lib/ci-fleet-deployer/deployed"
+mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
+install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
+cp "$adapter" "$tmp/adapter.saved"
+printf '# drifted\n' >>"$adapter"
+if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_finalize=absent; fi
+expect_failure 'adapter digest does not match the protected regular file' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$recovery_transaction" ]] || fail 'failed finalize discarded its recovery transaction'
+lkg_after_finalize=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_finalize=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+[[ $lkg_before_finalize == "$lkg_after_finalize" ]] || fail 'failed finalize deleted the retained rollback pair'
+cat "$tmp/adapter.saved" >"$adapter"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# A symlinked systemd boundary must block before transaction recovery deletes through it.
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+boundary_tx=$root/var/lib/ci-fleet-deployer/.transaction.boundary
+mkdir -m 0700 "$boundary_tx" "$boundary_tx/units" "$boundary_tx/state"
+mv "$root/etc/systemd/system" "$tmp/systemd.real"
+ln -s "$tmp/systemd.real" "$root/etc/systemd/system"
+printf 'decoy\n' >"$tmp/systemd.real/ci-fleet-deployer.service"
+expect_failure 'systemd unit directory has an unsafe owner or type' "$installer" --repair --config "$config" >/dev/null
+[[ $(<"$tmp/systemd.real/ci-fleet-deployer.service") == decoy ]] || fail 'recovery deleted through a symlinked systemd boundary'
+[[ -d "$boundary_tx" ]] || fail 'blocked boundary recovery discarded its transaction'
+rm "$root/etc/systemd/system"
+mv "$tmp/systemd.real" "$root/etc/systemd/system"
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+rm -rf -- "$boundary_tx"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
