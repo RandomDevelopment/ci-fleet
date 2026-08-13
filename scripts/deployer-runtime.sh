@@ -39,7 +39,13 @@ deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
   local target
-  if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then audit_pending=0; fi
+  # An adapter that deletes its own consumption marker must not defeat replay
+  # protection; restore the durable marker rather than clearing audit_pending.
+  if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then
+    install -m 0600 /dev/null "$consumed_marker" 2>/dev/null || true
+    sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || status=1
+    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || status=1
+  fi
   if [[ ${audit_pending:-0} == 1 ]]; then
     printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
@@ -89,7 +95,7 @@ reject_mixed_role() {
     [[ -n "$runner_unit" ]] && die 'ordinary GitHub Actions runner service is present'
   done
   shopt -u nullglob
-  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
+  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'ordinary CI controller or runner state is present'
   done
   output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker workload inventory failed'
@@ -298,6 +304,19 @@ PY
     [[ ${cfg[CORE_REF]} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
     if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then secure_directory "$deployed_root" 'deployed snapshot directory'; else install -d -m 0700 "$deployed_root"; fi
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || die 'deployed rollback snapshot is missing'
+    # The rollback path consumes the retained last-known-good pair, not the
+    # deployed snapshot; once that pair exists it must be complete and valid
+    # before approval consumption.
+    previous_state=$state_root/last-known-good.json
+    previous_policy=$state_root/last-known-good-policy.conf
+    if [[ -e "$previous_state" || -L "$previous_state" || -e "$previous_policy" || -L "$previous_policy" ]]; then
+      secure_file "$previous_state" 'last-known-good state'
+      secure_file "$previous_policy" 'last-known-good policy'
+      declare -A lkg_policy=()
+      parse_file "$previous_policy" lkg_policy 'last-known-good policy' "$config_keys"
+      [[ ${lkg_policy[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good policy has an invalid core revision'
+      [[ -x "$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}/scripts/deployer-runtime.sh" ]] || die 'last-known-good release is incomplete'
+    fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'
     deployed_snapshot=$(readlink -f "$deployed_current")
