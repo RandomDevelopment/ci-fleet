@@ -2,7 +2,6 @@
 Description=Run one approved ci-fleet deployment
 After=docker.service network-online.target
 Wants=docker.service network-online.target
-ConditionPathExists=!/var/lib/ci-fleet-deployer/drained
 
 [Service]
 Type=oneshot

@@ -1171,6 +1171,7 @@ perform_rollback() {
   active_deployment && block 'active deployment prevents rollback'
   [[ -f "$previous_state" && -f "$previous_policy" ]] || block 'no last-known-good release is available'
   secure_directory "$state_root" 700 0
+  secure_file "$previous_state" 'last-known-good state'
   secure_file "$previous_policy" 'last-known-good policy'
   parse_file "$previous_policy" rollback_policy 'last-known-good policy' "$config_keys"
   for key in CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "rollback_policy[$key]" ]] || block "last-known-good policy is missing $key"; done
