@@ -49,14 +49,9 @@ deploy_exit() {
     sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || status=1
   fi
   if [[ ${audit_pending:-0} == 1 ]]; then
-    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
-      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
-      "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
-    # If the adapter replaced the audit log, descriptor 8 names an unlinked or
-    # truncated inode; restore the durable prefix copy when present, else the
-    # opened inode, before synchronizing.
+    # If the adapter replaced the audit log, restore the durable prefix copy
+    # (or the opened inode) under its name before appending the terminal
+    # failure record, so the record is never written only to an unlinked inode.
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
       rm -f -- "$audit_log"
       if [[ -n ${audit_prefix_copy:-} && -f $audit_prefix_copy ]]; then
@@ -65,6 +60,17 @@ deploy_exit() {
         cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
       fi
       chmod 0600 "$audit_log" 2>/dev/null || true
+      printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+        "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+        "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
+        "${audit_phase:-post-consumption}" "$recorded_status" >>"$audit_log" || status=1
+    else
+      printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+        "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+        "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
+        "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
     fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
     [[ -z ${audit_prefix_copy:-} ]] || rm -f "$audit_prefix_copy"
@@ -74,12 +80,18 @@ deploy_exit() {
   # was never published. After publication the new pointer is the truth: the
   # application has changed and restoring the incumbent would falsify state.
   if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
+    # Restore the incumbent snapshot content when the adapter deleted it.
+    if [[ -n ${incumbent_backup:-} && ! -e "$deployed_root/$incumbent_pointer/policy.conf" ]]; then
+      mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
+      install -m 0600 "$incumbent_backup/policy.conf" "$incumbent_backup/state.json" "$deployed_root/$incumbent_pointer/" 2>/dev/null || status=1
+    fi
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
       rm -f -- "$deployed_current"
       ln -s "$incumbent_pointer" "$deployed_current" 2>/dev/null || status=1
       sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || status=1
     fi
   fi
+  [[ -z ${incumbent_backup:-} ]] || rm -rf -- "$incumbent_backup"
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
@@ -91,6 +103,11 @@ deploy_exit() {
 }
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
+# Docker checks must target the host's local daemon, not an inherited remote
+# DOCKER_HOST or selected context.
+DOCKER_HOST=unix://$(root_path /run/docker.sock)
+export DOCKER_HOST
+unset DOCKER_CONTEXT
 declare -A production=()
 secure_file() {
   local path=$1 description=$2 mode=${3:-600}
@@ -450,6 +467,8 @@ PY
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
     incumbent_pointer=$(readlink "$deployed_current")
+    incumbent_backup=$(mktemp -d "$state_root/.incumbent.XXXXXX")
+    install -m 0600 "$deployed_current/policy.conf" "$deployed_current/state.json" "$incumbent_backup/"
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
