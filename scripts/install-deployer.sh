@@ -392,6 +392,11 @@ require_host() {
 }
 
 require_maintenance_host() {
+  # Docker checks must target the host's local daemon, not an operator shell's
+  # remote DOCKER_HOST or selected context.
+  DOCKER_HOST=unix://$(root_path /run/docker.sock)
+  export DOCKER_HOST
+  unset DOCKER_CONTEXT
   local command
   for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 systemctl systemd-analyze date; do
     command -v "$command" >/dev/null || block "$command is required for maintenance"
@@ -549,6 +554,11 @@ acquire_lock() {
   if [[ -e "$state_root" || -L "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer installer operation is running'
+  # Role admission is serialized across the controller and deployer installers:
+  # both flock this shared path for their whole mutating run.
+  install -d -m 0755 "$(root_path /run)"
+  exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
+  flock -n 8 || block 'another ci-fleet role installation is already running'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
   if [[ -e "$active_operation" ]] && ! active_deployment; then
@@ -979,7 +989,7 @@ publish_deployed_snapshot() {
     # validated rollback pair; only identical bytes short-circuit.
     if [[ -L "$deployed_current" ]]; then
       incumbent=$(readlink -f "$deployed_current")
-      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && $(stat -c '%u:%a' "$incumbent/policy.conf") == "$expected_uid:600" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" && $(stat -c '%u:%a' "$incumbent/state.json") == "$expected_uid:600" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
     fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
@@ -1215,6 +1225,13 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   reject_mixed_role
+  # The adapter publishes the authoritative commit marker; the rolled-back
+  # core (pointer, units, policy, state) must be durable before that call, or
+  # a power loss could leave the marker durable over reverted core state.
+  sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
+  sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
+  sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
+  sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.

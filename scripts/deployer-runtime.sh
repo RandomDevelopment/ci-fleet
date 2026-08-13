@@ -81,9 +81,13 @@ deploy_exit() {
   # application has changed and restoring the incumbent would falsify state.
   if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     # Restore the incumbent snapshot content when the adapter deleted it.
-    if [[ -n ${incumbent_backup:-} && ! -e "$deployed_root/$incumbent_pointer/policy.conf" ]]; then
-      mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
-      install -m 0600 "$incumbent_backup/policy.conf" "$incumbent_backup/state.json" "$deployed_root/$incumbent_pointer/" 2>/dev/null || status=1
+    if [[ -n ${incumbent_backup:-} ]]; then
+      for incumbent_file in policy.conf state.json; do
+        if [[ ! -f "$deployed_root/$incumbent_pointer/$incumbent_file" || -L "$deployed_root/$incumbent_pointer/$incumbent_file" ]] || ! cmp -s "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file"; then
+          mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
+          install -m 0600 "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
+        fi
+      done
     fi
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
       rm -f -- "$deployed_current"

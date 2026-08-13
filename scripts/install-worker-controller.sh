@@ -1115,6 +1115,12 @@ else
   exec 9>"$lock_file"
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
+# Role admission is serialized across the controller and deployer installers:
+# both flock this shared path for their whole mutating run.
+role_lock=$(root_path /run/ci-fleet-role-admission.lock)
+install -d -m 0755 "$(dirname "$role_lock")"
+exec 8>"$role_lock"
+flock -n 8 || die 'another ci-fleet role installation is already running'
 case "$mode" in
   check|install|adopt|upgrade)
     validate_common_arguments
