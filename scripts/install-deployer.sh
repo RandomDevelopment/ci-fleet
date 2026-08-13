@@ -106,6 +106,13 @@ PY
   else
     printf no; return
   fi
+  local rollback_scope rollback_environment rollback_release
+  rollback_scope=$(awk '$0 ~ /^CREDENTIAL_SCOPE=/ {sub(/^CREDENTIAL_SCOPE=/, ""); print}' "$previous_policy")
+  rollback_environment=$(awk '$0 ~ /^ENVIRONMENT=/ {sub(/^ENVIRONMENT=/, ""); print}' "$previous_policy")
+  [[ $rollback_scope == "$rollback_environment" ]] || { printf no; return; }
+  rollback_release=$(awk '$0 ~ /^CORE_REF=/ {sub(/^CORE_REF=/, ""); print}' "$previous_policy")
+  [[ $rollback_release =~ ^[0-9a-f]{40}$ ]] || { printf no; return; }
+  release_complete "$releases/$rollback_release" 2>/dev/null || { printf no; return; }
   printf yes
 }
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
@@ -387,7 +394,7 @@ require_maintenance_host() {
 
 reject_mixed_role() {
   local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}" runner_unit
-  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service actions.runner.service; do
+  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service ci-fleet-drift.service actions.runner.service; do
     [[ ! -e "$systemd_root/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
@@ -965,7 +972,7 @@ publish_deployed_snapshot() {
     # validated rollback pair; only identical bytes short-circuit.
     if [[ -L "$deployed_current" ]]; then
       incumbent=$(readlink -f "$deployed_current")
-      if [[ -f "$incumbent/policy.conf" && -f "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+      if [[ $incumbent == "$deployed_root"/.snapshot.* && -f "$incumbent/policy.conf" && -f "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
     fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
@@ -1071,7 +1078,7 @@ perform_check() {
 perform_converge() {
   local had_state=0 old_environment old_target candidate_changed=1 old_release
   [[ -f "$state_file" ]] && had_state=1
-  if ((!had_state)) && { [[ -L "$current" ]] || compgen -G "$systemd_root/ci-fleet-deployer*" >/dev/null; }; then
+  if ((!had_state)) && { [[ -L "$current" ]] || compgen -G "$systemd_root/ci-fleet-deployer*" >/dev/null || [[ -e "$active_policy" || -L "$active_policy" || -e "$deployed_current" || -L "$deployed_current" ]]; }; then
     block 'installed deployer state is absent or drifted; restore install state before convergence'
   fi
   if ((had_state)); then
