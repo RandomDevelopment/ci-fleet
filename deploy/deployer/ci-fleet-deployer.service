@@ -11,7 +11,9 @@ ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh deploy
 Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
 Environment=CI_FLEET_DEPLOYER_REQUEST=/var/lib/ci-fleet-deployer/request.conf
 TimeoutStartSec=45min
-TimeoutStopSec=45min
+# A hung adapter must not hold the lock or inhibitor beyond the documented
+# 45-minute deployment bound; stop quickly after TERM and let KILL follow.
+TimeoutStopSec=30s
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -482,7 +482,9 @@ PY
     [[ $(sha256sum "$request_snapshot" | cut -d' ' -f1) == "$request_snapshot_sha" ]] || die 'deployment request snapshot changed during deployment'
     pointer=$(mktemp -u "$deployed_root/.current.XXXXXX")
     snapshot_pointer=$pointer
-    retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
+    # Retire the validated pre-adapter incumbent, never an adapter-writable
+    # pointer target read after the adapter ran.
+    retired_snapshot=$incumbent_pointer
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     ln -s "${snapshot##*/}" "$pointer"
     [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$

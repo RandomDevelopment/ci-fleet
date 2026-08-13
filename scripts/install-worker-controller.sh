@@ -1024,6 +1024,10 @@ perform_check() {
 
 perform_converge() {
   local count existing_status desired_controller_id=$controller_id
+  # A deployer host is a separate role; never start a controller on it.
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" ]]; then
+    die 'deployer host state is present; controller and deployer roles are separate hosts'
+  fi
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
