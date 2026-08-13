@@ -113,6 +113,8 @@ PY
   rollback_release=$(awk '$0 ~ /^CORE_REF=/ {sub(/^CORE_REF=/, ""); print}' "$previous_policy")
   [[ $rollback_release =~ ^[0-9a-f]{40}$ ]] || { printf no; return; }
   release_complete "$releases/$rollback_release" 2>/dev/null || { printf no; return; }
+  # Rollback requires a completed deployment; mirror the perform_rollback gate.
+  [[ -f "$state_root/last-request.conf" && ! -L "$state_root/last-request.conf" ]] || { printf no; return; }
   printf yes
 }
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
@@ -333,7 +335,7 @@ validate_evidence() {
   for key in ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do
     [[ ${approval[$key]} == "${cfg[$key]}" ]] || block "approval evidence does not match exact $key"
   done
-  [[ ${approval[APPROVAL_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[POLICY_IDENTITY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ && ${approval[APPROVAL_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || block 'approval identity is malformed'
+  [[ ${approval[APPROVAL_IDENTITY]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ && ${approval[POLICY_IDENTITY]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ && ${approval[APPROVAL_ID]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || block 'approval identity is malformed'
   valid_utc "${approval[APPROVED_AT]}" || block 'approval timestamp must be UTC RFC3339'
   case ${cfg[APPROVAL_PROVIDER]} in
     manual-exact-head|external-exact-head) ;;
