@@ -229,6 +229,7 @@ case "$operation" in
     secure_file "$request" 'deployment request'
     request_snapshot=$(mktemp "$state_root/.request.XXXXXX")
     install -m 0600 "$request" "$request_snapshot"
+    request_snapshot_sha=$(sha256sum "$request_snapshot" | cut -d' ' -f1)
     trap 'rm -f "${request_snapshot:-}" "${policy_snapshot:-}"' EXIT
     trap 'exit 2' INT TERM
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
@@ -316,6 +317,37 @@ PY
       parse_file "$previous_policy" lkg_policy 'last-known-good policy' "$config_keys"
       [[ ${lkg_policy[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good policy has an invalid core revision'
       [[ -x "$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}/scripts/deployer-runtime.sh" ]] || die 'last-known-good release is incomplete'
+      # Cross-validate the retained pair exactly as the rollback path does:
+      # state must match policy, and the retained adapter must match its pin.
+      python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || die 'last-known-good state and policy do not cross-validate'
+import json, re, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+policy = {}
+try:
+    for line in open(sys.argv[2], encoding='utf-8'):
+        line = line.rstrip('\n')
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if sep and key not in policy:
+            policy[key] = value
+except OSError:
+    raise SystemExit(1)
+sha = re.compile(r'^[0-9a-f]{40}$')
+pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
+ok = all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
+ok = ok and bool(sha.match(state['core_ref'])) and bool(sha.match(state['source_commit']))
+ok = ok and bool(re.search(r'@sha256:[0-9a-f]{64}$', state['artifact']))
+ok = ok and policy.get('CREDENTIAL_SCOPE') == policy.get('ENVIRONMENT')
+raise SystemExit(0 if ok else 1)
+PY
+      [[ -v 'lkg_policy[ADAPTER_PATH]' && -v 'lkg_policy[ADAPTER_SHA256]' ]] || die 'last-known-good policy is missing its adapter pin'
+      inside "${lkg_policy[ADAPTER_PATH]}" "$deployer_etc/adapters" || die 'last-known-good adapter is outside the protected adapter directory'
+      [[ ! -L "${lkg_policy[ADAPTER_PATH]}" && -f "${lkg_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${lkg_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'last-known-good adapter is missing or unsafe'
+      [[ $(sha256sum "${lkg_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${lkg_policy[ADAPTER_SHA256]}" ]] || die 'last-known-good adapter digest does not match its retained policy'
     fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'
@@ -376,10 +408,13 @@ PY
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       >&8 || die 'deployment consumption audit record failed'
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
+    audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
+    # An in-place truncation keeps the same inode; the durable prefix must survive.
+    [[ $(sha256sum "$audit_log" | cut -d' ' -f1) == "$audit_prefix_sha" ]] || die 'deployer audit log changed during deployment'
     if ((adapter_status != 0)); then
       audit_phase=adapter
       die 'deployment adapter failed after approval consumption'
@@ -396,6 +431,10 @@ PY
     secure_file "$snapshot/policy.conf" 'prepared deployed policy'
     secure_file "$snapshot/state.json" 'prepared deployed state'
     [[ $(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1) == "$snapshot_policy_sha" && $(sha256sum "$snapshot/state.json" | cut -d' ' -f1) == "$snapshot_state_sha" ]] || die 'prepared deployed snapshot changed during deployment'
+    # The adapter receives the request snapshot path; only verified bytes may
+    # become the completed-request record.
+    secure_file "$request_snapshot" 'deployment request snapshot'
+    [[ $(sha256sum "$request_snapshot" | cut -d' ' -f1) == "$request_snapshot_sha" ]] || die 'deployment request snapshot changed during deployment'
     pointer=$(mktemp -u "$deployed_root/.current.XXXXXX")
     snapshot_pointer=$pointer
     retired_snapshot=$(readlink "$deployed_current" 2>/dev/null || true)
