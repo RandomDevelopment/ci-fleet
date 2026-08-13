@@ -774,6 +774,10 @@ PY
 expect_success "$installer" --check --config "$config" >/dev/null
 
 printf 'rollback\n' >"$tmp/fail-rollback"
+# A candidate never deployed must not be a rollback target.
+expect_failure 'no completed deployment is available to roll back to' "$installer" --rollback --config "$config" >/dev/null
+# Rollback requires a completed deployment; simulate one for the rollback battery.
+install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/last-request.conf"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
@@ -1583,7 +1587,7 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_TARGET=$tmp/unrelated-audit
-expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+expect_failure 'deployer audit log changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
 [[ $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'adapter audit replacement redirected the trusted append'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
@@ -1629,7 +1633,7 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_TARGET=$tmp/unrelated-audit
-expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
+expect_failure 'deployer audit log changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
 [[ -L "$deployed_current" && -e "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'post-publication failure left deployed/current dangling'
 cmp -s "$deployed_current/policy.conf" "$config" || fail 'published deployed policy does not match the deployed configuration'
