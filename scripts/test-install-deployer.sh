@@ -140,6 +140,7 @@ case "$1" in validate|health|cleanup|deploy|rollback) ;; *) exit 2 ;; esac
 if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
 fi
+if [[ "$1" == rollback && -n ${FAKE_ADAPTER_FAIL_AFTER_MARKER:-} ]]; then exit 42; fi
 if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
   rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
   ln -s "$FAKE_ADAPTER_MUTATE_AUDIT_TARGET" "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
@@ -735,6 +736,26 @@ export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed application rollback did not restore current core state'
+
+# An adapter that commits the rollback marker but exits nonzero must not be
+# reported as an unchanged failure: recovery finalizes the committed rollback.
+marker_rollback=$(FAKE_ADAPTER_FAIL_AFTER_MARKER=1 "$installer" --rollback --config "$config" 2>&1) || true
+printf '%s\n' "$marker_rollback" | grep -Fq 'result=CHANGED' || fail 'marker-committed rollback was reported as an unchanged failure'
+printf '%s\n' "$marker_rollback" | grep -Fq 'next=restore-host-policy-evidence-then-check' || fail 'marker-committed rollback lacks the operator reconciliation action'
+grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'marker-committed rollback did not restore last-known-good state'
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+# Rebuild the retained pair consumed by the marker-committed rollback.
+image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+write_evidence
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'retained rollback pair was not rebuilt'
 rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
 FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'application rollback ran before core rollback staging was proven'
