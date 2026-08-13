@@ -669,6 +669,10 @@ restore_transaction() {
       [[ -z $backed_up ]] || block "transaction $name manifest is missing but backups remain"
     fi
   done
+  # Validate the deployed-state boundary before any pointer mutation follows it.
+  if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then
+    [[ -d "$deployed_root" && ! -L "$deployed_root" && $(stat -c '%u:%a' "$deployed_root") == "$expected_uid:700" ]] || block 'deployed snapshot directory is unsafe'
+  fi
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_restore_mode=$(stat -c %a "$systemd_root")
   (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
@@ -1180,15 +1184,16 @@ PY
   if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && [[ ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
     die 'application adapter rollback failed'
   fi
-  sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
-  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
   # The rollback already replaced the activation pointer and units on possibly
-  # separate filesystems; persist all committed boundaries before finalization
-  # consumes the journal and last-known-good pair.
+  # separate filesystems; the rolled-back core must be durable before the
+  # commit marker, or recovery could treat the marker as authoritative while
+  # the pointer, policy, or units reverted.
   sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
+  sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
+  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
   finalize_committed_rollback
   recovered_rollback=0
   health=healthy
@@ -1245,7 +1250,7 @@ perform_uninstall() {
   fi
   if active_deployment; then block 'active deployment started while draining'; fi
   for unit in "${timer_names[@]}"; do
-    if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
+    if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]] || systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
       systemctl disable --now "$unit" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
     fi
   done
