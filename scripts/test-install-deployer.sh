@@ -620,6 +620,9 @@ rm "$unit_path"; mv "$unit_path.real" "$unit_path"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-health.service"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-health.service"
+printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-drift.timer"
+expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/systemd/system/ci-fleet-drift.timer"
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
 expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
