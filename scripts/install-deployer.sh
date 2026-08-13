@@ -359,6 +359,11 @@ validate_evidence() {
 
 require_host() {
   local command os_id os_version available required systemd_state disk_path
+  # Docker checks must target the host's local daemon, not an operator shell's
+  # remote DOCKER_HOST or selected context.
+  DOCKER_HOST=unix://$(root_path /run/docker.sock)
+  export DOCKER_HOST
+  unset DOCKER_CONTEXT
   for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
@@ -974,7 +979,7 @@ publish_deployed_snapshot() {
     # validated rollback pair; only identical bytes short-circuit.
     if [[ -L "$deployed_current" ]]; then
       incumbent=$(readlink -f "$deployed_current")
-      if [[ $incumbent == "$deployed_root"/.snapshot.* && -f "$incumbent/policy.conf" && -f "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
     fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'

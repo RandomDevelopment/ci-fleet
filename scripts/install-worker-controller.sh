@@ -1022,12 +1022,16 @@ perform_check() {
   note "CHECK_OK controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
 }
 
-perform_converge() {
-  local count existing_status desired_controller_id=$controller_id
-  # A deployer host is a separate role; never start a controller on it.
+reject_deployer_host() {
+  # A deployer host is a separate role; never run controller mutations on it.
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
+}
+
+perform_converge() {
+  local count existing_status desired_controller_id=$controller_id
+  reject_deployer_host
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -1067,6 +1071,7 @@ latest_checkpoint() {
 }
 
 perform_rollback() {
+  reject_deployer_host
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
   load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
