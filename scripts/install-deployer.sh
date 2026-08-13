@@ -622,10 +622,10 @@ begin_transaction() {
   fi
   transaction_name=${transaction_dir##*/}
   transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
-  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || true
+  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || block 'prepared recovery journal is not durable'
   mv "$transaction_dir" "$transaction_ready"
   transaction_dir=$transaction_ready
-  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || true
+  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || block 'published recovery journal is not durable'
   transaction_preparing=0
 }
 
@@ -1181,7 +1181,7 @@ PY
     die 'application adapter rollback failed'
   fi
   sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
-  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || true
+  sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
   # The rollback already replaced the activation pointer and units on possibly
   # separate filesystems; persist all committed boundaries before finalization
   # consumes the journal and last-known-good pair.
@@ -1205,8 +1205,8 @@ perform_drain() {
   temporary=$(mktemp "$state_root/.drained.XXXXXX")
   chmod 0600 "$temporary"
   mv -Tf "$temporary" "$drained"
-  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || true
-  sync -f "$state_root" 2>/dev/null || true
+  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || block 'drain marker is not durable'
+  sync -f "$state_root" 2>/dev/null || block 'drain marker publication is not durable'
   report CHANGED yes safe-to-maintain "$(rollback_available)"
 }
 
@@ -1220,6 +1220,7 @@ perform_resume() {
   health=healthy
   ((was_drained == 1)) || { report NO_CHANGE no ready-to-deploy "$(rollback_available)"; return; }
   rm -f "$drained"
+  sync -f "$state_root" 2>/dev/null || block 'cleared drain marker is not durable'
   report CHANGED yes ready-to-deploy "$(rollback_available)"
 }
 
@@ -1238,6 +1239,9 @@ perform_uninstall() {
     temporary=$(mktemp "$state_root/.drained.XXXXXX")
     chmod 0600 "$temporary"
     mv -Tf "$temporary" "$drained"
+    # The drain guard must be durable before the first mutation beneath it.
+    sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || block 'drain marker is not durable'
+    sync -f "$state_root" 2>/dev/null || block 'drain marker publication is not durable'
   fi
   if active_deployment; then block 'active deployment started while draining'; fi
   for unit in "${timer_names[@]}"; do
@@ -1254,7 +1258,9 @@ perform_uninstall() {
   systemctl daemon-reload >/dev/null 2>&1 || block 'systemd manager reload failed after unit removal'
   # Persist pointer, unit, and timer removals across their filesystems before
   # the drain marker guarding this maintenance window is cleared.
-  sync -f "$install_root" 2>/dev/null || block 'uninstalled install root is not durable'
+  if [[ -d "$install_root" && ! -L "$install_root" ]]; then
+    sync -f "$install_root" 2>/dev/null || block 'uninstalled install root is not durable'
+  fi
   sync -f "$systemd_root" 2>/dev/null || block 'uninstalled systemd boundary is not durable'
   sync -f "$state_root" 2>/dev/null || block 'uninstalled host state is not durable'
   rm -f "$drained" "$active_operation"

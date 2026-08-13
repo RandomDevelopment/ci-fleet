@@ -150,8 +150,8 @@ if [[ "$operation" == drain ]]; then
   temporary=$(mktemp "$state_root/.drained.XXXXXX")
   chmod 0600 "$temporary"
   mv -Tf "$temporary" "$drained"
-  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || true
-  sync -f "$state_root" 2>/dev/null || true
+  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || die 'drain marker is not durable'
+  sync -f "$state_root" 2>/dev/null || die 'drain marker publication is not durable'
   exit 0
 fi
 
@@ -315,7 +315,7 @@ PY
     trap 'exit 2' INT TERM
     install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
     sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
-    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || true
+    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || die 'deployment request consumption is not durable'
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     active_temporary=$temporary
