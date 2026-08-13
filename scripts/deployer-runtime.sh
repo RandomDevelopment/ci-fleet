@@ -45,7 +45,8 @@ deploy_exit() {
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
-      "${audit_phase:-post-consumption}" "$recorded_status" >&8 || true
+      "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
+    sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
@@ -253,9 +254,10 @@ case "$operation" in
         [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || die 'GitHub Environment approval is missing capability evidence'
         inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$evidence_dir" || die 'capability evidence is outside the protected evidence directory'
         secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
-        capability_keys='SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+        capability_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
         parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' "$capability_keys"
         for key in $capability_keys; do [[ -v "capability[$key]" ]] || die "capability evidence is missing $key"; done
+        [[ ${capability[ENVIRONMENT]} == "${req[ENVIRONMENT]}" && ${capability[TARGET_ID]} == "${req[TARGET_ID]}" ]] || die 'GitHub Environment capability evidence does not match this installation'
         [[ ${capability[SCHEMA_VERSION]} == 1 && ${capability[ENVIRONMENT_PROTECTION]} == verified && ${capability[EXACT_HEAD]} == "${req[SOURCE_COMMIT]}" ]] || die 'GitHub Environment capability evidence is not exact-head verified'
         if [[ ! ${capability[CAPABILITY_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]}"; then die 'GitHub Environment capability evidence is malformed'; fi
         ;;
