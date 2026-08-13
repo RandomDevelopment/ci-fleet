@@ -46,6 +46,13 @@ deploy_exit() {
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
+    # If the adapter replaced the audit log, descriptor 8 names an unlinked
+    # inode; restore it under the durable name before synchronizing.
+    if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
+      rm -f -- "$audit_log"
+      cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
+      chmod 0600 "$audit_log" 2>/dev/null || true
+    fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
