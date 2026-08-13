@@ -403,7 +403,7 @@ reject_mixed_role() {
     [[ -n "$runner_unit" ]] && block 'ordinary GitHub Actions runner service is present'
   done
   shopt -u nullglob
-  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
+  for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'ordinary CI controller or runner state is present'
   done
   output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || block 'Docker workload inventory failed'
@@ -1183,6 +1183,9 @@ PY
   [[ "$core_ref" =~ ^[0-9a-f]{40}$ && "$source_commit" =~ ^[0-9a-f]{40}$ && "$artifact" =~ @sha256:[0-9a-f]{64}$ ]] || block 'last-known-good state has unsafe immutable identifiers'
   [[ "$core_ref" == "${rollback_policy[CORE_REF]}" && "$environment" == "${rollback_policy[ENVIRONMENT]}" && "$target" == "${rollback_policy[TARGET_ID]}" && "$source_commit" == "${rollback_policy[SOURCE_COMMIT]}" && "$artifact" == "${rollback_policy[ARTIFACT_IMAGE]}" && "$deployer_identity" == "${rollback_policy[DEPLOYER_IDENTITY]}" ]] || block 'last-known-good state and policy do not match'
   [[ "$environment" =~ ^[a-z][a-z0-9-]{0,31}$ && "$target" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'last-known-good identity is malformed'
+  # Production deployment paths, including application rollback, remain
+  # separately gated; no accepted decision enables them yet.
+  [[ $environment != production ]] || block 'production rollback is not authorized by the current accepted scope'
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
