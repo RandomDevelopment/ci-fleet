@@ -1179,6 +1179,15 @@ unset FAKE_SYSTEMCTL_FAIL_COMMAND
 expect_success "$installer" --uninstall --config "$config" >/dev/null
 [[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after reload failure did not uninstall'
 
+# Uninstall must still remove the deployment surface when the configuration directory is absent.
+expect_success "$installer" --install --config "$config" >/dev/null
+mv "$root/etc/ci-fleet-deployer" "$tmp/etc-deployer.saved"
+uninstall=$(expect_success "$installer" --uninstall --config "$config")
+grep -Fq 'result=CHANGED' <<<"$uninstall" || fail 'uninstall without configuration did not report change'
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'uninstall without configuration retained the activation pointer'
+if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then fail 'uninstall without configuration retained managed units'; fi
+mv "$tmp/etc-deployer.saved" "$root/etc/ci-fleet-deployer"
+
 # An untracked symlink in the deployer unit source must block checkout validation.
 expect_success "$installer" --install --config "$config" >/dev/null
 ln -s "$credential" "$repo_root/deploy/deployer/leak"
