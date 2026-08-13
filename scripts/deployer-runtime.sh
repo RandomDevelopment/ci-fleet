@@ -70,8 +70,10 @@ deploy_exit() {
     [[ -z ${audit_prefix_copy:-} ]] || rm -f "$audit_prefix_copy"
   fi
   # On failure, restore the validated incumbent deployed pointer before the
-  # active-operation guard is durably cleared.
-  if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} ]]; then
+  # active-operation guard is durably cleared — but only when the new pointer
+  # was never published. After publication the new pointer is the truth: the
+  # application has changed and restoring the incumbent would falsify state.
+  if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
       rm -f -- "$deployed_current"
       ln -s "$incumbent_pointer" "$deployed_current" 2>/dev/null || status=1
@@ -501,6 +503,15 @@ PY
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       >&8
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment success audit is not durable'
+    # An adapter that deleted its consumption marker must not weaken replay
+    # protection on success either; ensure the durable marker before the exit
+    # guard is disabled.
+    if [[ ! -e "$consumed_marker" ]]; then
+      [[ -e "$consumed_root" ]] || install -d -m 0700 "$consumed_root"
+      install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
+      sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
+      sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || die 'deployment request consumption is not durable'
+    fi
     # All fallible commit work is done; the incumbent snapshot can be retired.
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
