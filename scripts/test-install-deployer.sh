@@ -227,6 +227,15 @@ EOF
   if [[ "$environment" == production ]]; then printf 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=%s\n' "$production_gate" >>"$root/etc/ci-fleet-deployer/deployer.conf"; fi
   chmod 0600 "$root/etc/ci-fleet-deployer/deployer.conf"
 }
+# snapshot_state <tx-dir>: record the full current managed state into a
+# recovery-transaction fixture so restoration returns to a valid installation.
+snapshot_state() {
+  local tx=$1 name
+  for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+    [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$tx/state/$name"; printf '%s\n' "$name" >>"$tx/state-present"; }
+  done
+  printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$tx/current-target"
+}
 write_evidence
 write_config
 config=$root/etc/ci-fleet-deployer/deployer.conf
@@ -450,6 +459,10 @@ expect_success "$installer" --check --config "$config" >/dev/null
 # Transaction recovery must restore runtime-only timer enablement exactly.
 runtime_tx=$root/var/lib/ci-fleet-deployer/.transaction.runtime-enabled
 mkdir -m 0700 "$runtime_tx" "$runtime_tx/units" "$runtime_tx/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$runtime_tx/state/$name"; printf '%s\n' "$name" >>"$runtime_tx/state-present"; }
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$runtime_tx/current-target"
 : >"$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-health.timer.runtime"
 printf 'ci-fleet-deployer-health.timer\n' >"$runtime_tx/timers-enabled-runtime"
 expect_success "$installer" --repair --config "$config" >/dev/null
@@ -488,6 +501,7 @@ expect_success "$installer" --check --config "$config" >/dev/null
 # Transaction recovery must tolerate timers whose unit files were never installed.
 absent_timer_tx=$root/var/lib/ci-fleet-deployer/.transaction.absent-timer
 mkdir -m 0700 "$absent_timer_tx" "$absent_timer_tx/units" "$absent_timer_tx/state"
+snapshot_state "$absent_timer_tx"
 mv "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer" "$tmp/cleanup.timer.saved"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$absent_timer_tx" ]] || fail 'absent-timer transaction was not recovered'
@@ -1028,6 +1042,16 @@ mv "$tmp/install-state.saved" "$root/var/lib/ci-fleet-deployer/install-state.jso
 chmod 0600 "$root/var/lib/ci-fleet-deployer/install-state.json"
 expect_success "$installer" --repair --config "$config" >/dev/null
 
+# Lost install state with only a retained deployed snapshot is still an installation.
+mv "$root/var/lib/ci-fleet-deployer/install-state.json" "$tmp/install-state.saved"
+rm -f "$root/opt/ci-fleet-deployer/current"
+for stale_unit in "$root"/etc/systemd/system/ci-fleet-deployer*; do rm -f "$stale_unit"; done
+expect_failure 'restore install state before convergence' "$installer" --repair --config "$config" >/dev/null
+mv "$tmp/install-state.saved" "$root/var/lib/ci-fleet-deployer/install-state.json"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/install-state.json"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 # Rollback must work from the retained pair without a usable candidate config.
 mv "$config" "$tmp/config.saved"
 rollback=$(expect_success "$installer" --rollback --config "$config")
@@ -1076,6 +1100,24 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('ADAPTER_SHA256=', 'ADAP
 PY
 available_check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'digest-mismatched retained adapter still reported rollback_available=yes'
+install -m 0600 "$tmp/lkg-policy.saved" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" 2>/dev/null || true
+# A retained pair whose release is missing must report rollback_available=no.
+missing_core=cccccccccccccccccccccccccccccccccccccccc
+cp "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$tmp/lkg-policy-release.saved"
+cp "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$tmp/lkg-state-release.saved"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$missing_core" <<'PY'
+from pathlib import Path
+import json, re, sys
+policy, state, missing = sys.argv[1], sys.argv[2], sys.argv[3]
+p = Path(policy); p.write_text(re.sub(r'(?m)^CORE_REF=[0-9a-f]{40}$', 'CORE_REF=' + missing, p.read_text()))
+s = json.loads(Path(state).read_text()); s['core_ref'] = missing
+Path(state).write_text(json.dumps(s, indent=2, sort_keys=True) + '\n')
+PY
+chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$root/var/lib/ci-fleet-deployer/last-known-good.json"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'release-missing retained pair still reported rollback_available=yes'
+install -m 0600 "$tmp/lkg-policy-release.saved" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf"
+install -m 0600 "$tmp/lkg-state-release.saved" "$root/var/lib/ci-fleet-deployer/last-known-good.json"
 image='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 write_evidence
 write_config
@@ -1294,6 +1336,22 @@ request=$root/var/lib/ci-fleet-deployer/request.conf
 cp "$approval" "$request"
 chmod 0600 "$request"
 export CI_FLEET_DEPLOYER_CONFIG=$config CI_FLEET_DEPLOYER_REQUEST=$request
+# Production deployment remains separately gated: the runtime must reject it.
+cp "$config" "$tmp/config.staging"
+write_production_gate
+write_evidence production example-production
+write_config production example-production
+python3 - "$request" "$approval" <<'PY'
+from pathlib import Path
+import sys
+for name in sys.argv[1:]:
+    p=Path(name); p.write_text(p.read_text().replace('ENVIRONMENT=staging', 'ENVIRONMENT=production').replace('TARGET_ID=example-staging', 'TARGET_ID=example-production'))
+PY
+expect_failure 'production deployment is not authorized by the current accepted scope' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == 0 ]] || fail 'gated production path reached the deployment adapter'
+install -m 0600 "$tmp/config.staging" "$config"
+write_evidence staging example-staging
+cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'usage: deployer-runtime.sh health|cleanup|deploy|drain' "$runtime" rollback >/dev/null
 mv "$adapter" "$adapter.saved"
 expect_success "$runtime" drain >/dev/null
