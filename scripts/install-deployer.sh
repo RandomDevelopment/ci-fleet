@@ -807,6 +807,9 @@ PY
   transaction_dir=
   transaction_committed=1
   rm -rf -- "$retired"
+  # The journal rename and deletion must persist with the finalization, or a
+  # reboot can resurrect the committed-rollback transaction and repeat it.
+  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 commit_transaction() {
@@ -820,6 +823,9 @@ commit_transaction() {
   transaction_dir=
   transaction_committed=1
   rm -rf -- "$retired"
+  # The journal rename and deletion must persist with the commit, or a reboot
+  # can resurrect the pre-operation transaction and restore stale state.
+  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 atomic_replace_directory() {
@@ -1157,9 +1163,21 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   reject_mixed_role
-  policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" || die 'application adapter rollback failed'
+  # The commit marker is authoritative: if the adapter created it but the
+  # wrapper did not observe a zero exit, recovery finalizes the committed
+  # rollback, so the report must not claim failure with no change.
+  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && [[ ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
+    die 'application adapter rollback failed'
+  fi
   sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || true
+  # The rollback already replaced the activation pointer and units on possibly
+  # separate filesystems; persist all committed boundaries before finalization
+  # consumes the journal and last-known-good pair.
+  sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
+  sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
+  sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
+  sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
   finalize_committed_rollback
   recovered_rollback=0
   health=healthy
