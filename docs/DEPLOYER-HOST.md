@@ -132,11 +132,15 @@ For `github-environment`, also create mode-`0600` capability evidence. This file
 
 ```text
 SCHEMA_VERSION=1
+ENVIRONMENT=staging
+TARGET_ID=example-staging
 ENVIRONMENT_PROTECTION=verified
 EXACT_HEAD=1111111111111111111111111111111111111111
 CAPABILITY_ID=example-capability-check
 CHECKED_AT=2026-08-08T20:00:00Z
 ```
+
+The `ENVIRONMENT` and `TARGET_ID` bind the evidence to one installation; capability evidence produced for a different installation is rejected even when the source commit matches.
 
 For production, a separate authorized process must also create evidence such as:
 

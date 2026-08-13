@@ -332,7 +332,8 @@ validate_evidence() {
       [[ -v 'cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]' ]] || block 'GitHub Environment approval requires capability evidence'
       inside "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" "$etc_root/evidence" || block 'capability evidence is outside the approved evidence directory'
       secure_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" 'GitHub capability evidence'
-      parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' 'SCHEMA_VERSION ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+      parse_file "${cfg[APPROVAL_CAPABILITY_EVIDENCE_PATH]}" capability 'capability evidence' 'SCHEMA_VERSION ENVIRONMENT TARGET_ID ENVIRONMENT_PROTECTION EXACT_HEAD CAPABILITY_ID CHECKED_AT'
+      [[ ${capability[ENVIRONMENT]:-} == "${cfg[ENVIRONMENT]}" && ${capability[TARGET_ID]:-} == "${cfg[TARGET_ID]}" ]] || block 'GitHub Environment capability evidence does not match this installation'
       [[ ${capability[SCHEMA_VERSION]:-} == 1 && ${capability[ENVIRONMENT_PROTECTION]:-} == verified && ${capability[EXACT_HEAD]:-} == "${cfg[SOURCE_COMMIT]}" ]] || block 'GitHub Environment capability evidence is not exact-head verified'
       if [[ ! ${capability[CAPABILITY_ID]:-} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${capability[CHECKED_AT]:-}"; then block 'GitHub Environment capability evidence is missing identity or UTC time'; fi
       ;;
@@ -724,8 +725,15 @@ restore_transaction() {
       systemctl start "$name" >/dev/null 2>&1 || return
     done <"$transaction_dir/timers-active"
   fi
+  # Restored state, pointer, and units may live on separate filesystems; make
+  # them durable before the only recovery journal is deleted, then persist the
+  # journal retirement itself.
+  sync -f "$state_root" 2>/dev/null || block 'restored host state is not durable'
+  sync -f "$install_root" 2>/dev/null || block 'restored install root is not durable'
+  sync -f "$systemd_root" 2>/dev/null || block 'restored systemd boundary is not durable'
   rm -rf -- "$transaction_dir" || return
   transaction_dir=
+  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 recover_interrupted_transaction() {
@@ -1240,7 +1248,7 @@ perform_uninstall() {
   fi
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || block 'systemd manager reload failed after unit removal'
   rm -f "$drained" "$active_operation"
   if [[ "$changed" == yes ]]; then report CHANGED yes retained-state "$(rollback_available)"; else report NO_CHANGE no retained-state "$(rollback_available)"; fi
 }
