@@ -56,6 +56,7 @@ deploy_exit() {
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
+  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
     target=$(readlink "$deployed_current" 2>/dev/null || true)
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
@@ -348,6 +349,14 @@ PY
     active_temporary=
     sync -f "$active" 2>/dev/null || sync "$active" 2>/dev/null || die 'active operation marker is not durable'
     sync -f "$state_root" 2>/dev/null || die 'active operation marker publication is not durable'
+    # Record the durably consumed approval before the adapter runs, so even a
+    # SIGKILL or power loss mid-adapter leaves the attempt's identities.
+    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=consumed phase=pre-adapter status=none\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
+      >&8 || die 'deployment consumption audit record failed'
+    sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
