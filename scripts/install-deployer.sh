@@ -1021,6 +1021,14 @@ adapter_deadline() {
 run_adapter() {
   local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds
   seconds=$(adapter_deadline "$operation_name")
+  if [[ -n "$marker" && $testing != 1 ]]; then
+    # The transactional adapter call runs under a shutdown inhibitor, like the
+    # deploy runtime, so a normal shutdown cannot strand a partially applied
+    # rollback between core mutation and commit-marker publication.
+    timeout --signal=TERM --kill-after=10s "${seconds}s" systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
+      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name"
+    return
+  fi
   if [[ -n "$marker" ]]; then
     timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name"
   else
@@ -1192,17 +1200,9 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   reject_mixed_role
-  # Run the transactional rollback under a shutdown inhibitor, like the deploy
-  # runtime, so a normal shutdown cannot strand a partially applied adapter
-  # rollback between core mutation and commit-marker publication.
-  if [[ -z ${CI_FLEET_DEPLOYER_ROLLBACK_INHIBITED:-} && $testing != 1 ]]; then
-    export CI_FLEET_DEPLOYER_ROLLBACK_INHIBITED=1
-    exec systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='transactional rollback is active' -- "$0" --rollback --config "$config"
-  fi
-  # The commit marker is authoritative: if the adapter created it but the
-  # wrapper did not observe a zero exit, recovery finalizes the committed
-  # rollback, so the report must not claim failure with no change.
+  # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
+  # so a normal shutdown cannot strand a partially applied adapter rollback
+  # between core mutation and commit-marker publication.
   if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && [[ ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
     die 'application adapter rollback failed'
   fi
@@ -1283,6 +1283,7 @@ perform_uninstall() {
   for unit in "${timer_names[@]}"; do
     if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]] || systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
       systemctl disable --now "$unit" >/dev/null 2>&1 || block 'deployer timers did not stop during uninstall'
+      changed=yes
     fi
   done
   if [[ -L "$current" ]]; then
