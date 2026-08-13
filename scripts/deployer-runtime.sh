@@ -79,7 +79,7 @@ secure_directory() {
 }
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
-  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service actions.runner.service; do
+  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service ci-fleet-drift.service actions.runner.service; do
     [[ ! -e "$systemd_root/$unit" ]] || die 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
@@ -271,17 +271,9 @@ case "$operation" in
       *) die 'unsupported approval provider' ;;
     esac
     if [[ ${cfg[ENVIRONMENT]} == production ]]; then
-      [[ -v 'cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]' ]] || die 'production policy is missing separate authorization evidence'
-      inside "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" "$evidence_dir" || die 'production authorization evidence is outside the protected evidence directory'
-      secure_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" 'production authorization evidence'
-      production_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE AUTHORIZED_BY GATE_ID AUTHORIZED_AT'
-      parse_file "${cfg[PRODUCTION_AUTHORIZATION_EVIDENCE_PATH]}" production 'production authorization evidence' "$production_keys"
-      for key in $production_keys; do [[ -v "production[$key]" ]] || die "production authorization evidence is missing $key"; done
-      [[ ${production[SCHEMA_VERSION]} == 1 && ${production[ENVIRONMENT]} == production ]] || die 'production authorization evidence has the wrong scope'
-      if [[ ! ${production[AUTHORIZED_BY]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ || ! ${production[GATE_ID]} =~ ^[A-Za-z0-9._:@/-]{1,128}$ ]] || ! valid_utc "${production[AUTHORIZED_AT]}"; then die 'production authorization evidence is malformed'; fi
-      for key in ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE; do
-        [[ -v "production[$key]" && ${req[$key]} == "${production[$key]}" ]] || die "deployment request does not match production authorization $key"
-      done
+      # Production deployment paths remain separately gated
+      # (docs/DESIGN-DECISIONS.md); no accepted decision enables them yet.
+      die 'production deployment is not authorized by the current accepted scope'
     fi
     if [[ -e "$consumed_root" || -L "$consumed_root" ]]; then secure_directory "$consumed_root" 'consumed request directory'; else install -d -m 0700 "$consumed_root"; fi
     request_id=$(for key in $request_keys; do printf '%s=%s\0' "$key" "${req[$key]}"; done | sha256sum | cut -d' ' -f1)
@@ -307,6 +299,23 @@ PY
     secure_directory "$deployed_snapshot" 'deployed snapshot'
     secure_file "$deployed_snapshot/policy.conf" 'deployed rollback policy'
     secure_file "$deployed_snapshot/state.json" 'deployed rollback state'
+    # Deploying consumes the approval; the retained rollback point must be
+    # fully usable first, or the change proceeds with no way back.
+    declare -A deployed_policy=()
+    parse_file "$deployed_snapshot/policy.conf" deployed_policy 'deployed rollback policy' "$config_keys"
+    for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT TARGET_ID; do [[ -v "deployed_policy[$key]" ]] || die "deployed rollback policy is missing $key"; done
+    inside "${deployed_policy[ADAPTER_PATH]}" "$deployer_etc/adapters" || die 'deployed rollback adapter is outside the protected adapter directory'
+    [[ ! -L "${deployed_policy[ADAPTER_PATH]}" && -f "${deployed_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${deployed_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'deployed rollback adapter is missing or unsafe'
+    [[ $(sha256sum "${deployed_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${deployed_policy[ADAPTER_SHA256]}" ]] || die 'deployed rollback adapter digest does not match its snapshot policy'
+    [[ ${deployed_policy[CREDENTIAL_SCOPE]} == "${deployed_policy[ENVIRONMENT]}" ]] || die 'deployed rollback credential scope does not match its environment'
+    if [[ ${deployed_policy[CREDENTIAL_PROVIDER]} == file ]]; then
+      inside "${deployed_policy[CREDENTIAL_REF]}" "$credential_dir" || die 'deployed rollback credential is outside the protected credential directory'
+      secure_file "${deployed_policy[CREDENTIAL_REF]}" 'deployed rollback credential'
+    elif [[ ${deployed_policy[CREDENTIAL_PROVIDER]} == external ]]; then
+      [[ ${deployed_policy[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'deployed rollback policy has an invalid external secret-manager adapter reference'
+    else
+      die 'deployed rollback policy has an unsupported credential provider'
+    fi
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
     chmod 0700 "$snapshot"
     install -m 0600 "$config" "$snapshot/policy.conf"
