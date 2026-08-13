@@ -142,8 +142,12 @@ if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_FAIL_AFTER_MARKER:-} ]]; then exit 42; fi
 if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
-  rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
-  ln -s "$FAKE_ADAPTER_MUTATE_AUDIT_TARGET" "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+  if [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == unlink ]]; then
+    rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"; printf 'adapter-replacement\n' >"$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+  else
+    rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+    ln -s "$FAKE_ADAPTER_MUTATE_AUDIT_TARGET" "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+  fi
 fi
 if [[ -n ${FAKE_ADAPTER_CHMOD_DURING:-} ]]; then chmod 0644 "$FAKE_ADAPTER_CHMOD_DURING"; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
@@ -1188,6 +1192,13 @@ grep -Fq 'result=CHANGED' <<<"$uninstall" || fail 'uninstall without configurati
 if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then fail 'uninstall without configuration retained managed units'; fi
 mv "$tmp/etc-deployer.saved" "$root/etc/ci-fleet-deployer"
 
+# Uninstall must stop a timer whose unit file has drifted away.
+expect_success "$installer" --install --config "$config" >/dev/null
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+FAKE_SYSTEMCTL_LOG=$tmp/systemctl-drift.log expect_success "$installer" --uninstall --config "$config" >/dev/null
+grep -Fq 'disable --now ci-fleet-deployer-cleanup.timer' "$tmp/systemctl-drift.log" || fail 'uninstall left a loaded drifted timer running'
+if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then fail 'drifted-timer uninstall retained managed units'; fi
+
 # An untracked symlink in the deployer unit source must block checkout validation.
 expect_success "$installer" --install --config "$config" >/dev/null
 ln -s "$credential" "$repo_root/deploy/deployer/leak"
@@ -1238,6 +1249,25 @@ expect_failure 'systemd unit directory is group- or world-writable' "$installer"
 [[ $(stat -c %a "$root/etc/systemd/system") == 777 ]] || fail 'writable boundary recovery mutated the unit directory'
 rm -rf -- "$boundary_recovery"
 chmod 0755 "$root/etc/systemd/system"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Retained-transaction recovery must validate the deployed-state boundary before pointer mutation.
+boundary_recovery=$root/var/lib/ci-fleet-deployer/.transaction.deployed-symlink
+mkdir -m 0700 "$boundary_recovery" "$boundary_recovery/units" "$boundary_recovery/state"
+for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$boundary_recovery/state/$name"; printf '%s\n' "$name" >>"$boundary_recovery/state-present"; }
+done
+printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$boundary_recovery/current-target"
+printf 'absent\n' >"$boundary_recovery/deployed-target"
+mv "$root/var/lib/ci-fleet-deployer/deployed" "$tmp/deployed.real"
+mkdir "$tmp/deployed.real-target"; ln -s "$tmp/deployed.real-target" "$root/var/lib/ci-fleet-deployer/deployed"
+printf 'decoy\n' >"$tmp/deployed.real-target/current"
+expect_failure 'deployed snapshot directory is unsafe' "$installer" --repair --config "$config" >/dev/null
+[[ $(<"$tmp/deployed.real-target/current") == decoy ]] || fail 'recovery mutated state through a symlinked deployed directory'
+[[ -d "$boundary_recovery" ]] || fail 'blocked deployed-boundary recovery discarded its transaction'
+rm "$root/var/lib/ci-fleet-deployer/deployed"; mv "$tmp/deployed.real" "$root/var/lib/ci-fleet-deployer/deployed"
+rm -rf -- "$boundary_recovery"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
 
@@ -1487,6 +1517,21 @@ export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log 
 expect_failure 'deployer audit log must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
 [[ $(<"$tmp/unrelated-audit") == unrelated-audit ]] || fail 'adapter audit replacement redirected the trusted append'
+rm "$root/var/log/ci-fleet-deployer/audit.log"
+
+# An adapter that replaces the audit log must not lose the deployment record.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-unlink-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:30Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_MODE=unlink
+expect_failure 'deployer audit log changed during deployment' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_MODE
+grep -Fq 'approval=audit-unlink-attempt' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'adapter audit replacement lost the deployment audit record'
+[[ $(<"$root/var/log/ci-fleet-deployer/audit.log") != *adapter-replacement* ]] || fail 'adapter replacement content entered the trusted audit log'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
 
 # Signal at the deployed-snapshot publication boundary must not delete the published snapshot.
