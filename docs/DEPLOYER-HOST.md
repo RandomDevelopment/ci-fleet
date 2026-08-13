@@ -155,6 +155,8 @@ GATE_ID=production-gate-20260808-1
 AUTHORIZED_AT=2026-08-08T20:00:00Z
 ```
 
+Production deployment is currently disabled: `docs/DESIGN-DECISIONS.md` keeps production deployment paths separately gated, and the runtime rejects every production request until an accepted decision enables them. The evidence above documents the intended record shape only; it does not lift the gate.
+
 Create the bounded configuration. Values cannot contain shell expressions; the installer parses `KEY=VALUE` without sourcing it. Unknown, duplicate, empty, malformed, or missing keys fail closed.
 
 ```bash

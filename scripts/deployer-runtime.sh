@@ -79,8 +79,8 @@ secure_directory() {
 }
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
-  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service ci-fleet-drift.service actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" ]] || die 'ordinary CI controller or runner state is present'
+  for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do

@@ -394,8 +394,8 @@ require_maintenance_host() {
 
 reject_mixed_role() {
   local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}" runner_unit
-  for unit in ci-fleet-health.service ci-fleet-reconcile.service ci-fleet-cleanup.service ci-fleet-drift.service actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" ]] || block 'ordinary CI controller or runner state is present'
+  for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -1240,6 +1240,12 @@ perform_uninstall() {
   local changed=no unit managed_present=no
   if [[ -e "$state_root" || -L "$state_root" || -e "$lock_root" || -L "$lock_root" || -e "$current" || -L "$current" ]]; then managed_present=yes; fi
   for unit in "${unit_names[@]}"; do [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/$unit" ]] || managed_present=yes; done
+  if [[ $managed_present == no ]]; then
+    for unit in "${timer_names[@]}"; do
+      systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1 || continue
+      managed_present=yes
+    done
+  fi
   if [[ "$managed_present" == no ]]; then report NO_CHANGE no retained-state "$(rollback_available)"; return; fi
   if active_deployment; then block 'active deployment prevents this operation'; fi
   acquire_lock
