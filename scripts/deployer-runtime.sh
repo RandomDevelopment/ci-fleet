@@ -80,7 +80,7 @@ secure_directory() {
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -183,6 +183,11 @@ if [[ $own_realpath == */releases/* ]]; then
     selected=$install_prefix/releases/${cfg[CORE_REF]}/scripts/deployer-runtime.sh
     [[ -x $selected && ! -L $selected ]] || die 'active policy revision runtime is unavailable'
     [[ -z ${CI_FLEET_DEPLOYER_REEXEC:-} ]] || die 'runtime re-exec did not select the active revision'
+    # exec replaces this process without running the EXIT trap; the policy
+    # snapshot is passed by content to the new process via the environment, so
+    # remove the unmanaged copy before re-exec.
+    rm -f "$policy_snapshot"
+    policy_snapshot=
     export CI_FLEET_DEPLOYER_REEXEC=1
     exec "$selected" "$operation"
   fi
