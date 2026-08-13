@@ -54,19 +54,23 @@ deploy_exit() {
       "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
       "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
       "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
-    # If the adapter replaced the audit log, descriptor 8 names an unlinked
-    # inode; restore it under the durable name before synchronizing.
+    # If the adapter replaced the audit log, descriptor 8 names an unlinked or
+    # truncated inode; restore the durable prefix copy when present, else the
+    # opened inode, before synchronizing.
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
       rm -f -- "$audit_log"
-      cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
+      if [[ -n ${audit_prefix_copy:-} && -f $audit_prefix_copy ]]; then
+        cat "$audit_prefix_copy" >"$audit_log" 2>/dev/null || status=1
+      else
+        cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
+      fi
       chmod 0600 "$audit_log" 2>/dev/null || true
     fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
+    [[ -z ${audit_prefix_copy:-} ]] || rm -f "$audit_prefix_copy"
   fi
-  rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
-  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
-  # On failure, restore the validated incumbent deployed pointer if the adapter
-  # removed or replaced it.
+  # On failure, restore the validated incumbent deployed pointer before the
+  # active-operation guard is durably cleared.
   if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} ]]; then
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
       rm -f -- "$deployed_current"
@@ -74,6 +78,8 @@ deploy_exit() {
       sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || status=1
     fi
   fi
+  rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
+  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
     target=$(readlink "$deployed_current" 2>/dev/null || true)
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
@@ -163,8 +169,14 @@ validate_credential() {
 
 secure_directory "$state_root" 'deployer state directory'
 secure_directory "$lock_dir" 'deployer lock directory'
-exec 9<"$lock_dir"
-flock -n 9 || die 'another deployer operation is running'
+if [[ -z ${CI_FLEET_DEPLOYER_REEXEC:-} ]]; then
+  exec 9<"$lock_dir"
+  flock -n 9 || die 'another deployer operation is running'
+else
+  # The re-executed process inherits the locked descriptor 9 from its parent;
+  # reopening it would drop the lock during the handoff.
+  :
+fi
 shopt -s nullglob
 transactions=("$state_root"/.transaction.*)
 shopt -u nullglob
@@ -231,6 +243,9 @@ case "$operation" in
     not_drained
     reject_mixed_role
     validate_credential
+    # Scheduled cleanup mutates application-owned resources; production paths
+    # remain separately gated like deploy.
+    [[ ${cfg[ENVIRONMENT]} != production ]] || die 'production cleanup is not authorized by the current accepted scope'
     env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup
     ;;
   deploy)
@@ -328,10 +343,14 @@ PY
       parse_file "$previous_policy" lkg_policy 'last-known-good policy' "$config_keys"
       [[ ${lkg_policy[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good policy has an invalid core revision'
       # Validate the entire retained release as perform_rollback's
-      # release_complete does: tree digest, installer/runtime, and units.
+      # release_complete does: ownership, modes, types, and tree digest.
       lkg_release=$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}
-      [[ -f "$lkg_release/.ci-fleet-tree-sha256" && -x "$lkg_release/scripts/deployer-runtime.sh" && -x "$lkg_release/scripts/install-deployer.sh" ]] || die 'last-known-good release is incomplete'
+      [[ -d "$lkg_release" && ! -L "$lkg_release" && $(stat -c '%u:%a' "$lkg_release") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'
+      for dir in "$lkg_release/scripts" "$lkg_release/deploy" "$lkg_release/deploy/deployer"; do [[ -d "$dir" && ! -L "$dir" && $(stat -c '%u:%a' "$dir") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'; done
+      for entry in "$lkg_release/scripts/install-deployer.sh" "$lkg_release/scripts/deployer-runtime.sh"; do [[ ! -L "$entry" && -f "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'; done
+      [[ -f "$lkg_release/.ci-fleet-tree-sha256" ]] || die 'last-known-good release is incomplete'
       [[ $(<"$lkg_release/.ci-fleet-tree-sha256") == "$(cd "$lkg_release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)" ]] || die 'last-known-good release tree digest mismatch'
+      for entry in "$lkg_release"/deploy/deployer/*; do [[ -f "$entry" && ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:644" ]] || die 'last-known-good release is incomplete'; done
       # Cross-validate the retained pair exactly as the rollback path does:
       # state must match policy, and the retained adapter must match its pin.
       python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || die 'last-known-good state and policy do not cross-validate'
@@ -424,6 +443,8 @@ PY
       >&8 || die 'deployment consumption audit record failed'
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
+    audit_prefix_copy=$(mktemp "$state_root/.audit-prefix.XXXXXX")
+    install -m 0600 "$audit_log" "$audit_prefix_copy"
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
     incumbent_pointer=$(readlink "$deployed_current")
@@ -432,7 +453,11 @@ PY
     adapter_status=$?
     set -e
     # An in-place truncation keeps the same inode; the durable prefix must survive.
-    [[ $(sha256sum "$audit_log" | cut -d' ' -f1) == "$audit_prefix_sha" ]] || die 'deployer audit log changed during deployment'
+    if [[ $(sha256sum "$audit_log" | cut -d' ' -f1) != "$audit_prefix_sha" ]]; then
+      install -m 0600 "$audit_prefix_copy" "$audit_log" 2>/dev/null || true
+      die 'deployer audit log changed during deployment'
+    fi
+    rm -f "$audit_prefix_copy"
     if ((adapter_status != 0)); then
       audit_phase=adapter
       die 'deployment adapter failed after approval consumption'
