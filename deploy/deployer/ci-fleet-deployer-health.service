@@ -1,6 +1,7 @@
 [Unit]
 Description=Check ci-fleet deployer health
 After=docker.service
+Wants=docker.service
 
 [Service]
 Type=oneshot
