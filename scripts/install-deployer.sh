@@ -91,13 +91,13 @@ ok = (all(state.get(k) and state.get(k) == policy.get(p) for k, p in pairs)
 raise SystemExit(0 if ok else 1)
 PY
   local rollback_adapter_path rollback_adapter_sha rollback_credential_provider rollback_credential_ref
-  rollback_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$previous_policy")
-  rollback_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$previous_policy")
+  rollback_adapter_path=$(awk '$0 ~ /^ADAPTER_PATH=/ {sub(/^ADAPTER_PATH=/, ""); print}' "$previous_policy")
+  rollback_adapter_sha=$(awk '$0 ~ /^ADAPTER_SHA256=/ {sub(/^ADAPTER_SHA256=/, ""); print}' "$previous_policy")
   [[ $rollback_adapter_path == "$etc_root/adapters/"* ]] || { printf no; return; }
   [[ ! -L "$rollback_adapter_path" && -f "$rollback_adapter_path" && $(stat -c '%u:%a' "$rollback_adapter_path" 2>/dev/null) == "$expected_uid:700" ]] || { printf no; return; }
   [[ $(sha256sum "$rollback_adapter_path" 2>/dev/null | cut -d' ' -f1) == "$rollback_adapter_sha" ]] || { printf no; return; }
-  rollback_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$previous_policy")
-  rollback_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$previous_policy")
+  rollback_credential_provider=$(awk '$0 ~ /^CREDENTIAL_PROVIDER=/ {sub(/^CREDENTIAL_PROVIDER=/, ""); print}' "$previous_policy")
+  rollback_credential_ref=$(awk '$0 ~ /^CREDENTIAL_REF=/ {sub(/^CREDENTIAL_REF=/, ""); print}' "$previous_policy")
   if [[ $rollback_credential_provider == file ]]; then
     [[ $rollback_credential_ref == "$etc_root/credentials/"* ]] || { printf no; return; }
     [[ ! -L "$rollback_credential_ref" && -f "$rollback_credential_ref" && $(stat -c '%u:%a' "$rollback_credential_ref" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
@@ -225,11 +225,12 @@ parse_file() {
 
 validate_config() {
   inside "$config" "$etc_root" || block "configuration path must be inside $etc_root"
-  secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
   if [[ "$mode" == rollback || "$mode" == uninstall ]]; then
     # Rollback and uninstall must work even when the operator-owned candidate
-    # configuration is missing or malformed.
+    # configuration or its directory is missing or malformed.
     declare -gA cfg=()
+    if [[ ! -e "$etc_root" ]]; then return; fi
+    secure_directory "$etc_root" 700 0 || block 'configuration directory has an unsafe owner, mode, or type'
     if [[ -f "$config" && ! -L "$config" && $(stat -c '%u:%a' "$config" 2>/dev/null) == "$expected_uid:600" ]]; then
       validated_config=$(mktemp)
       install -m 0600 "$config" "$validated_config"
@@ -242,6 +243,7 @@ validate_config() {
     fi
     return
   fi
+  secure_directory "$etc_root" 700 0 || block 'configuration directory is missing'
   secure_file "$config" 'configuration file'
   validated_config=$(mktemp)
   install -m 0600 "$config" "$validated_config"
@@ -753,7 +755,8 @@ recover_interrupted_transaction() {
     transaction_committed=0
     return
   fi
-  if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then load_deployed_snapshot; fi
+  # Restoration does not consume deployed-snapshot dependencies; requiring
+  # them here would wedge recovery behind unrelated deployed drift.
   restore_transaction
   transaction_committed=0
 }
@@ -764,13 +767,13 @@ finalize_committed_rollback() {
   [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
   secure_file "$state_file" 'deployer install state' || return
-  final_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$active_policy")
-  final_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$active_policy")
+  final_adapter_path=$(awk '$0 ~ /^ADAPTER_PATH=/ {sub(/^ADAPTER_PATH=/, ""); print}' "$active_policy")
+  final_adapter_sha=$(awk '$0 ~ /^ADAPTER_SHA256=/ {sub(/^ADAPTER_SHA256=/, ""); print}' "$active_policy")
   inside "$final_adapter_path" "$etc_root/adapters" || return
   [[ ! -L "$final_adapter_path" && -f "$final_adapter_path" && $(stat -c '%u:%a' "$final_adapter_path") == "$expected_uid:700" ]] || return
   [[ $(sha256sum "$final_adapter_path" | cut -d' ' -f1) == "$final_adapter_sha" ]] || return
-  final_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$active_policy")
-  final_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$active_policy")
+  final_credential_provider=$(awk '$0 ~ /^CREDENTIAL_PROVIDER=/ {sub(/^CREDENTIAL_PROVIDER=/, ""); print}' "$active_policy")
+  final_credential_ref=$(awk '$0 ~ /^CREDENTIAL_REF=/ {sub(/^CREDENTIAL_REF=/, ""); print}' "$active_policy")
   credential_reference_safe "$final_credential_provider" "$final_credential_ref" 'committed rollback policy' || return
   python3 - "$state_file" "$active_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || return
 import json, re, sys
@@ -901,16 +904,16 @@ load_deployed_snapshot() {
   secure_file "$snapshot/state.json" 'deployed rollback state'
   deployed_snapshot_policy=$snapshot/policy.conf
   deployed_snapshot_state=$snapshot/state.json
-  deployed_adapter_path=$(awk -F= '$1=="ADAPTER_PATH" {print $2}' "$deployed_snapshot_policy")
-  deployed_adapter_sha=$(awk -F= '$1=="ADAPTER_SHA256" {print $2}' "$deployed_snapshot_policy")
+  deployed_adapter_path=$(awk '$0 ~ /^ADAPTER_PATH=/ {sub(/^ADAPTER_PATH=/, ""); print}' "$deployed_snapshot_policy")
+  deployed_adapter_sha=$(awk '$0 ~ /^ADAPTER_SHA256=/ {sub(/^ADAPTER_SHA256=/, ""); print}' "$deployed_snapshot_policy")
   inside "$deployed_adapter_path" "$etc_root/adapters" || block 'deployed rollback adapter is outside the protected adapter directory'
   [[ ! -L "$deployed_adapter_path" && -f "$deployed_adapter_path" && $(stat -c '%u:%a' "$deployed_adapter_path") == "$expected_uid:700" ]] || block 'deployed rollback adapter is missing or unsafe'
   [[ $(sha256sum "$deployed_adapter_path" | cut -d' ' -f1) == "$deployed_adapter_sha" ]] || block 'deployed rollback adapter digest does not match its snapshot policy'
-  deployed_credential_provider=$(awk -F= '$1=="CREDENTIAL_PROVIDER" {print $2}' "$deployed_snapshot_policy")
-  deployed_credential_ref=$(awk -F= '$1=="CREDENTIAL_REF" {print $2}' "$deployed_snapshot_policy")
+  deployed_credential_provider=$(awk '$0 ~ /^CREDENTIAL_PROVIDER=/ {sub(/^CREDENTIAL_PROVIDER=/, ""); print}' "$deployed_snapshot_policy")
+  deployed_credential_ref=$(awk '$0 ~ /^CREDENTIAL_REF=/ {sub(/^CREDENTIAL_REF=/, ""); print}' "$deployed_snapshot_policy")
   credential_reference_safe "$deployed_credential_provider" "$deployed_credential_ref" 'deployed rollback policy'
-  deployed_credential_scope=$(awk -F= '$1=="CREDENTIAL_SCOPE" {print $2}' "$deployed_snapshot_policy")
-  deployed_environment=$(awk -F= '$1=="ENVIRONMENT" {print $2}' "$deployed_snapshot_policy")
+  deployed_credential_scope=$(awk '$0 ~ /^CREDENTIAL_SCOPE=/ {sub(/^CREDENTIAL_SCOPE=/, ""); print}' "$deployed_snapshot_policy")
+  deployed_environment=$(awk '$0 ~ /^ENVIRONMENT=/ {sub(/^ENVIRONMENT=/, ""); print}' "$deployed_snapshot_policy")
   [[ $deployed_credential_scope == "$deployed_environment" ]] || block 'deployed rollback credential scope does not match its environment'
   python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
 import json, re, sys
@@ -968,7 +971,7 @@ publish_deployed_snapshot() {
   chmod 0700 "$snapshot" || return
   install -m 0600 "$policy" "$snapshot/policy.conf" || return
   install -m 0600 "$state" "$snapshot/state.json" || return
-  pointer=$deployed_root/.current.$$
+  pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
   ln -s "${snapshot##*/}" "$pointer" || return
   sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || block 'replacement deployed snapshot is not durable'
   sync -f "$snapshot" 2>/dev/null || block 'replacement deployed snapshot is not durable'
@@ -1249,7 +1252,13 @@ perform_uninstall() {
   [[ ! -e "$current" ]] || block 'activation pointer has an unsafe type'
   for unit in "${unit_names[@]}"; do if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then rm -f "$systemd_root/$unit"; changed=yes; fi; done
   systemctl daemon-reload >/dev/null 2>&1 || block 'systemd manager reload failed after unit removal'
+  # Persist pointer, unit, and timer removals across their filesystems before
+  # the drain marker guarding this maintenance window is cleared.
+  sync -f "$install_root" 2>/dev/null || block 'uninstalled install root is not durable'
+  sync -f "$systemd_root" 2>/dev/null || block 'uninstalled systemd boundary is not durable'
+  sync -f "$state_root" 2>/dev/null || block 'uninstalled host state is not durable'
   rm -f "$drained" "$active_operation"
+  sync -f "$state_root" 2>/dev/null || block 'cleared drain marker is not durable'
   if [[ "$changed" == yes ]]; then report CHANGED yes retained-state "$(rollback_available)"; else report NO_CHANGE no retained-state "$(rollback_available)"; fi
 }
 
