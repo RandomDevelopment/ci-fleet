@@ -395,7 +395,7 @@ require_maintenance_host() {
 reject_mixed_role() {
   local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}" runner_unit
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -1109,8 +1109,15 @@ PY
   fi
   if [[ -L "$current" ]]; then
     old_release=$(readlink -f "$current")
-    release_complete "$old_release" || block 'active deployer release is incomplete'
-    if [[ "$mode" != repair ]]; then policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'; fi
+    if [[ "$mode" == repair ]]; then
+      # Repair must not trust or execute a damaged old release; the validated
+      # checkout replaces it transactionally below. Upgrade and install still
+      # require a complete active release.
+      release_complete "$old_release" || true
+    else
+      release_complete "$old_release" || block 'active deployer release is incomplete'
+      policy_adapter_operation "$active_policy" health 'active policy' || block 'active deployer is unhealthy; recover or roll back before replacement'
+    fi
   fi
   reject_mixed_role
   credential_reference_safe "${cfg[CREDENTIAL_PROVIDER]}" "${cfg[CREDENTIAL_REF]}" 'candidate policy'

@@ -1,6 +1,7 @@
 [Unit]
 Description=Run application-owned scoped deployer cleanup
 After=docker.service
+Wants=docker.service
 
 [Service]
 Type=oneshot
