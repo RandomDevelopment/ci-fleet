@@ -1186,6 +1186,10 @@ PY
   # Production deployment paths, including application rollback, remain
   # separately gated; no accepted decision enables them yet.
   [[ $environment != production ]] || block 'production rollback is not authorized by the current accepted scope'
+  # A deployed snapshot published at install time describes a candidate that
+  # was never deployed; rollback is meaningful only after a deployment has
+  # completed (the runtime records last-request.conf on success).
+  [[ -f "$state_root/last-request.conf" && ! -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
