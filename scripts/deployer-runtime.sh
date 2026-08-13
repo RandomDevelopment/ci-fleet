@@ -52,6 +52,7 @@ deploy_exit() {
     # If the adapter replaced the audit log, restore the durable prefix copy
     # (or the opened inode) under its name before appending the terminal
     # failure record, so the record is never written only to an unlinked inode.
+    if [[ -e "$audit_log" && ! -L "$audit_log" && $(stat -c '%u:%a' "$audit_log" 2>/dev/null) != "$expected_uid:600" ]]; then chmod 0600 "$audit_log" 2>/dev/null || status=1; fi
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
       rm -f -- "$audit_log"
       if [[ -n ${audit_prefix_copy:-} && -f $audit_prefix_copy ]]; then
@@ -82,10 +83,16 @@ deploy_exit() {
   if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     # Restore the incumbent snapshot content when the adapter deleted it.
     if [[ -n ${incumbent_backup:-} ]]; then
+      if [[ -e "$deployed_root/$incumbent_pointer" || -L "$deployed_root/$incumbent_pointer" ]]; then
+        [[ -d "$deployed_root/$incumbent_pointer" && ! -L "$deployed_root/$incumbent_pointer" ]] || { rm -rf -- "${deployed_root:?}/$incumbent_pointer"; mkdir -m 0700 "$deployed_root/$incumbent_pointer"; }
+        chmod 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
+      fi
       for incumbent_file in policy.conf state.json; do
         if [[ ! -f "$deployed_root/$incumbent_pointer/$incumbent_file" || -L "$deployed_root/$incumbent_pointer/$incumbent_file" ]] || ! cmp -s "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file"; then
           mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
           install -m 0600 "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
+        else
+          chmod 0600 "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
         fi
       done
     fi
@@ -96,6 +103,14 @@ deploy_exit() {
     fi
   fi
   [[ -z ${incumbent_backup:-} ]] || rm -rf -- "$incumbent_backup"
+  if [[ -n ${lkg_backup:-} ]]; then
+    for lkg_file in last-known-good.json last-known-good-policy.conf; do
+      if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
+        install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" 2>/dev/null || status=1
+      fi
+    done
+    rm -rf -- "$lkg_backup"
+  fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
@@ -468,6 +483,12 @@ PY
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
     audit_prefix_copy=$(mktemp "$state_root/.audit-prefix.XXXXXX")
     install -m 0600 "$audit_log" "$audit_prefix_copy"
+    # Preserve the retained rollback pair across the adapter call; the adapter
+    # has write access to the state root.
+    if [[ -f "$previous_state" && -f "$previous_policy" ]]; then
+      lkg_backup=$(mktemp -d "$state_root/.lkg.XXXXXX")
+      install -m 0600 "$previous_state" "$previous_policy" "$lkg_backup/"
+    fi
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
     incumbent_pointer=$(readlink "$deployed_current")
@@ -537,7 +558,18 @@ PY
       sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
       sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || die 'deployment request consumption is not durable'
     fi
-    # All fallible commit work is done; the incumbent snapshot can be retired.
+    # All fallible commit work is done; restore the retained pair if the
+    # adapter touched it, then retire the incumbent snapshot.
+    if [[ -n ${lkg_backup:-} ]]; then
+      for lkg_file in last-known-good.json last-known-good-policy.conf; do
+        if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
+          install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" || die 'retained rollback pair restoration failed'
+        fi
+      done
+      sync -f "$state_root" 2>/dev/null || die 'retained rollback pair restoration is not durable'
+      rm -rf -- "$lkg_backup"
+      lkg_backup=
+    fi
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
     audit_pending=0
