@@ -392,6 +392,13 @@ chmod 0644 "$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ $(stat -c %a "$root/etc/systemd/system/ci-fleet-deployer.service") == 644 ]] || fail 'repair did not restore unit mode 0644'
 
+# Repair must replace a damaged active release from the validated checkout.
+printf 'truncated\n' >"$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh"
+expect_failure 'installed deployer state is absent or drifted' "$installer" --check --config "$config" >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+cmp -s "$repo_root/scripts/deployer-runtime.sh" "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh" || fail 'repair did not replace the damaged release with reviewed bytes'
+expect_success "$installer" --check --config "$config" >/dev/null
+
 preparing=$root/var/lib/ci-fleet-deployer/.transaction-preparing.interrupted
 mkdir -m 0700 "$preparing"
 state_before_preparing=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
