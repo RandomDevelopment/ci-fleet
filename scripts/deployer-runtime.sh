@@ -42,6 +42,8 @@ deploy_exit() {
   # An adapter that deletes its own consumption marker must not defeat replay
   # protection; restore the durable marker rather than clearing audit_pending.
   if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then
+    [[ ! -e "$consumed_root" && ! -L "$consumed_root" ]] || secure_directory "$consumed_root" 'consumed request directory'
+    [[ -e "$consumed_root" ]] || install -d -m 0700 "$consumed_root" 2>/dev/null || true
     install -m 0600 /dev/null "$consumed_marker" 2>/dev/null || true
     sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || status=1
     sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || status=1
@@ -63,6 +65,15 @@ deploy_exit() {
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
+  # On failure, restore the validated incumbent deployed pointer if the adapter
+  # removed or replaced it.
+  if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} ]]; then
+    if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
+      rm -f -- "$deployed_current"
+      ln -s "$incumbent_pointer" "$deployed_current" 2>/dev/null || status=1
+      sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || status=1
+    fi
+  fi
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
     target=$(readlink "$deployed_current" 2>/dev/null || true)
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
@@ -316,7 +327,11 @@ PY
       declare -A lkg_policy=()
       parse_file "$previous_policy" lkg_policy 'last-known-good policy' "$config_keys"
       [[ ${lkg_policy[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good policy has an invalid core revision'
-      [[ -x "$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}/scripts/deployer-runtime.sh" ]] || die 'last-known-good release is incomplete'
+      # Validate the entire retained release as perform_rollback's
+      # release_complete does: tree digest, installer/runtime, and units.
+      lkg_release=$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}
+      [[ -f "$lkg_release/.ci-fleet-tree-sha256" && -x "$lkg_release/scripts/deployer-runtime.sh" && -x "$lkg_release/scripts/install-deployer.sh" ]] || die 'last-known-good release is incomplete'
+      [[ $(<"$lkg_release/.ci-fleet-tree-sha256") == "$(cd "$lkg_release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)" ]] || die 'last-known-good release tree digest mismatch'
       # Cross-validate the retained pair exactly as the rollback path does:
       # state must match policy, and the retained adapter must match its pin.
       python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || die 'last-known-good state and policy do not cross-validate'
@@ -409,6 +424,9 @@ PY
       >&8 || die 'deployment consumption audit record failed'
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
+    # Capture the validated incumbent pointer independently of adapter-writable
+    # state so a failed adapter cannot destroy or falsify the rollback point.
+    incumbent_pointer=$(readlink "$deployed_current")
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
