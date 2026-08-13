@@ -141,7 +141,7 @@ if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_FAIL_AFTER_MARKER:-} ]]; then exit 42; fi
-if [[ -n ${FAKE_ADAPTER_DELETE_CONSUMED_GLOB:-} ]]; then rm -f $FAKE_ADAPTER_DELETE_CONSUMED_GLOB; fi
+if [[ -n ${FAKE_ADAPTER_DELETE_CONSUMED_GLOB:-} ]]; then rm -rf $FAKE_ADAPTER_DELETE_CONSUMED_GLOB; fi
 if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
   if [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == unlink ]]; then
     rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"; printf 'adapter-replacement\n' >"$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
@@ -1620,6 +1620,23 @@ export FAKE_ADAPTER_DELETE_CONSUMED_GLOB="$root/var/lib/ci-fleet-deployer/consum
 expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_FAIL FAKE_ADAPTER_DELETE_CONSUMED_GLOB; rm "$tmp/fail-deploy-marker"
 if ! compgen -G "$root/var/lib/ci-fleet-deployer/consumed-requests/*" >/dev/null; then fail 'adapter-deleted consumption marker was not restored'; fi
+cp "$approval" "$request"; chmod 0600 "$request"
+expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# An adapter that deletes the whole consumption directory and fails must not enable replay.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=dir-delete-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:50Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'deploy\n' >"$tmp/fail-deploy-dir"; export FAKE_ADAPTER_FAIL=$tmp/fail-deploy-dir
+export FAKE_ADAPTER_DELETE_CONSUMED_GLOB="$root/var/lib/ci-fleet-deployer/consumed-requests"
+expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_FAIL FAKE_ADAPTER_DELETE_CONSUMED_GLOB; rm "$tmp/fail-deploy-dir"
+if ! compgen -G "$root/var/lib/ci-fleet-deployer/consumed-requests/*" >/dev/null; then fail 'adapter-deleted consumption directory was not restored with its marker'; fi
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
