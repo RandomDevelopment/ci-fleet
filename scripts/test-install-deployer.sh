@@ -294,6 +294,8 @@ PY
 expect_failure 'GitHub capability evidence must be a regular file' "$installer" --check --config "$config" >/dev/null
 cat >"$capability" <<EOF
 SCHEMA_VERSION=1
+ENVIRONMENT=staging
+TARGET_ID=example-staging
 ENVIRONMENT_PROTECTION=verified
 EXACT_HEAD=$source_ref
 CAPABILITY_ID=example-capability-check
@@ -309,12 +311,23 @@ PY
 expect_failure 'GitHub Environment capability evidence is missing identity or UTC time' "$installer" --check --config "$config" >/dev/null
 cat >"$capability" <<EOF
 SCHEMA_VERSION=1
+ENVIRONMENT=staging
+TARGET_ID=example-staging
 ENVIRONMENT_PROTECTION=verified
 EXACT_HEAD=$source_ref
 CAPABILITY_ID=example-capability-check
 CHECKED_AT=2026-08-08T20:00:00Z
 EOF
 chmod 0600 "$capability"
+# Capability evidence bound to a different installation must be rejected.
+cp "$capability" "$tmp/capability.saved"
+python3 - "$capability" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('TARGET_ID=example-staging', 'TARGET_ID=example-other'))
+PY
+expect_failure 'capability evidence does not match this installation' "$installer" --check --config "$config" >/dev/null
+install -m 0600 "$tmp/capability.saved" "$capability"
 write_config
 python3 - "$config" <<'PY'
 from pathlib import Path
@@ -1159,6 +1172,13 @@ mv "$tmp/install-root-uninstall.real" "$root/opt/ci-fleet-deployer"
 expect_success "$installer" --uninstall --config "$config" >/dev/null
 [[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after correcting install-root drift did not uninstall'
 
+# Uninstall must fail when systemd cannot reload after unit removal.
+expect_success "$installer" --install --config "$config" >/dev/null
+FAKE_SYSTEMCTL_FAIL_COMMAND=daemon-reload expect_failure 'systemd manager reload failed after unit removal' "$installer" --uninstall --config "$config" >/dev/null
+unset FAKE_SYSTEMCTL_FAIL_COMMAND
+expect_success "$installer" --uninstall --config "$config" >/dev/null
+[[ ! -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'retry after reload failure did not uninstall'
+
 # An untracked symlink in the deployer unit source must block checkout validation.
 expect_success "$installer" --install --config "$config" >/dev/null
 ln -s "$credential" "$repo_root/deploy/deployer/leak"
@@ -1513,6 +1533,11 @@ expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" c
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"
+restore_live_checkout() {
+  [[ ! -f "$tmp/runtime.saved" ]] || cat "$tmp/runtime.saved" >"$runtime"
+  git -C "$repo_root" replace -d "$core_ref" 2>/dev/null || true
+}
+trap 'restore_live_checkout; rm -rf "$tmp"' EXIT
 release_before=$(sha256sum "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh")
 printf '# substituted-live-bytes\n' >>"$runtime"
 expect_failure 'differs from the reviewed commit' "$installer" --repair --config "$config" >/dev/null
