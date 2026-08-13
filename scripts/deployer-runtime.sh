@@ -346,6 +346,8 @@ PY
     fi
     mv -Tf "$temporary" "$active"
     active_temporary=
+    sync -f "$active" 2>/dev/null || sync "$active" 2>/dev/null || die 'active operation marker is not durable'
+    sync -f "$state_root" 2>/dev/null || die 'active operation marker publication is not durable'
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?

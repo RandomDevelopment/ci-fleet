@@ -685,7 +685,7 @@ restore_transaction() {
   (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
   [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
   for name in "${timer_names[@]}"; do
-    if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]]; then
+    if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]] || systemctl is-enabled "$name" >/dev/null 2>&1 || systemctl is-active "$name" >/dev/null 2>&1; then
       systemctl disable --now "$name" >/dev/null 2>&1 || return
     fi
   done
@@ -1192,6 +1192,14 @@ PY
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_file.new" "$state_file"
   reject_mixed_role
+  # Run the transactional rollback under a shutdown inhibitor, like the deploy
+  # runtime, so a normal shutdown cannot strand a partially applied adapter
+  # rollback between core mutation and commit-marker publication.
+  if [[ -z ${CI_FLEET_DEPLOYER_ROLLBACK_INHIBITED:-} && $testing != 1 ]]; then
+    export CI_FLEET_DEPLOYER_ROLLBACK_INHIBITED=1
+    exec systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
+      --why='transactional rollback is active' -- "$0" --rollback --config "$config"
+  fi
   # The commit marker is authoritative: if the adapter created it but the
   # wrapper did not observe a zero exit, recovery finalizes the committed
   # rollback, so the report must not claim failure with no change.
@@ -1202,11 +1210,14 @@ PY
   # separate filesystems; the rolled-back core must be durable before the
   # commit marker, or recovery could treat the marker as authoritative while
   # the pointer, policy, or units reverted.
-  sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
-  sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
+  # The authoritative commit marker (on the state filesystem) becomes durable
+  # only after the /opt and /etc boundaries, so recovery can never observe it
+  # over reverted core state.
   sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
+  sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
+  sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
   finalize_committed_rollback
   recovered_rollback=0
