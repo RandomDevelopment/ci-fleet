@@ -52,7 +52,10 @@ deploy_exit() {
     # If the adapter replaced the audit log, restore the durable prefix copy
     # (or the opened inode) under its name before appending the terminal
     # failure record, so the record is never written only to an unlinked inode.
-    if [[ -e "$audit_log" && ! -L "$audit_log" && $(stat -c '%u:%a' "$audit_log" 2>/dev/null) != "$expected_uid:600" ]]; then chmod 0600 "$audit_log" 2>/dev/null || status=1; fi
+    if [[ -e "$audit_log" && ! -L "$audit_log" && $(stat -c '%u:%a' "$audit_log" 2>/dev/null) != "$expected_uid:600" ]]; then
+      chown "$expected_uid" "$audit_log" 2>/dev/null || status=1
+      chmod 0600 "$audit_log" 2>/dev/null || status=1
+    fi
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
       rm -f -- "$audit_log"
       if [[ -n ${audit_prefix_copy:-} && -f $audit_prefix_copy ]]; then
@@ -85,15 +88,16 @@ deploy_exit() {
     if [[ -n ${incumbent_backup:-} ]]; then
       if [[ -e "$deployed_root/$incumbent_pointer" || -L "$deployed_root/$incumbent_pointer" ]]; then
         [[ -d "$deployed_root/$incumbent_pointer" && ! -L "$deployed_root/$incumbent_pointer" ]] || { rm -rf -- "${deployed_root:?}/$incumbent_pointer"; mkdir -m 0700 "$deployed_root/$incumbent_pointer"; }
+        chown "$expected_uid" "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
         chmod 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
       fi
       for incumbent_file in policy.conf state.json; do
         if [[ ! -f "$deployed_root/$incumbent_pointer/$incumbent_file" || -L "$deployed_root/$incumbent_pointer/$incumbent_file" ]] || ! cmp -s "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file"; then
           mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
           install -m 0600 "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
-        else
-          chmod 0600 "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
         fi
+        chown "$expected_uid" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
+        chmod 0600 "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
       done
     fi
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
@@ -108,6 +112,8 @@ deploy_exit() {
       if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
         install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" 2>/dev/null || status=1
       fi
+      chown "$expected_uid" "$state_root/$lkg_file" 2>/dev/null || status=1
+      chmod 0600 "$state_root/$lkg_file" 2>/dev/null || status=1
     done
     rm -rf -- "$lkg_backup"
   fi
@@ -565,6 +571,8 @@ PY
         if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
           install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" || die 'retained rollback pair restoration failed'
         fi
+        chown "$expected_uid" "$state_root/$lkg_file" || die 'retained rollback pair ownership restoration failed'
+        chmod 0600 "$state_root/$lkg_file" || die 'retained rollback pair mode restoration failed'
       done
       sync -f "$state_root" 2>/dev/null || die 'retained rollback pair restoration is not durable'
       rm -rf -- "$lkg_backup"
