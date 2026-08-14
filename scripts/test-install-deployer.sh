@@ -151,11 +151,22 @@ if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
   fi
 fi
 if [[ -n ${FAKE_ADAPTER_CHMOD_DURING:-} ]]; then chmod 0644 "$FAKE_ADAPTER_CHMOD_DURING"; fi
+if [[ -n ${FAKE_ADAPTER_CHOWN_DURING:-} && $EUID == 0 ]]; then chown 65534 "$FAKE_ADAPTER_CHOWN_DURING"; fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_INCUMBENT_PATH:-} ]]; then
+  chmod 0755 "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH"
+  chmod 0644 "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH"/policy.conf "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH"/state.json
+  if ((EUID == 0)); then chown 65534 "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH" "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH"/policy.conf "$FAKE_ADAPTER_MUTATE_INCUMBENT_PATH"/state.json; fi
+fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_LKG_ROOT:-} ]]; then
+  chmod 0644 "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good.json "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good-policy.conf
+  if ((EUID == 0)); then chown 65534 "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good.json "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good-policy.conf; fi
+fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
 fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_SIGNAL_PPID:-} ]]; then kill -TERM "$PPID"; sleep 5; fi
+if [[ -e "${FAKE_ADAPTER_FAIL_AFTER_MUTATION:-/nonexistent}" ]]; then exit 42; fi
 EOF
 chmod 0700 "$adapter"
 export FAKE_ADAPTER_LOG=$tmp/adapter.log
@@ -1640,6 +1651,43 @@ if ! compgen -G "$root/var/lib/ci-fleet-deployer/consumed-requests/*" >/dev/null
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# A failing adapter cannot leave recovery state or the audit log with unsafe metadata.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=metadata-drift-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:55Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+incumbent_dir=$(readlink -f "$deployed_current")
+printf 'deploy\n' >"$tmp/fail-after-metadata"
+export FAKE_ADAPTER_MUTATE_INCUMBENT_PATH=$incumbent_dir
+export FAKE_ADAPTER_MUTATE_LKG_ROOT=$root/var/lib/ci-fleet-deployer
+export FAKE_ADAPTER_CHMOD_DURING=$root/var/log/ci-fleet-deployer/audit.log
+export FAKE_ADAPTER_CHOWN_DURING=$root/var/log/ci-fleet-deployer/audit.log
+export FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-metadata
+expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_MUTATE_INCUMBENT_PATH FAKE_ADAPTER_MUTATE_LKG_ROOT FAKE_ADAPTER_CHMOD_DURING FAKE_ADAPTER_CHOWN_DURING FAKE_ADAPTER_FAIL_AFTER_MUTATION
+expected_uid=$(id -u)
+[[ $(stat -c '%u:%a' "$incumbent_dir") == "$expected_uid:700" ]] || fail 'failed adapter left incumbent directory metadata unsafe'
+for file in "$incumbent_dir"/policy.conf "$incumbent_dir"/state.json "$root/var/lib/ci-fleet-deployer/last-known-good.json "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf "$root/var/log/ci-fleet-deployer/audit.log"; do
+  [[ $(stat -c '%u:%a' "$file") == "$expected_uid:600" ]] || fail "failed adapter left recovery metadata unsafe: $file"
+done
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# A successful adapter also cannot leave the retained rollback pair unsafe.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=lkg-metadata-drift-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:56Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+FAKE_ADAPTER_MUTATE_LKG_ROOT=$root/var/lib/ci-fleet-deployer expect_success "$runtime" deploy >/dev/null
+for file in "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf"; do
+  [[ $(stat -c '%u:%a' "$file") == "$expected_uid:600" ]] || fail "successful adapter left retained rollback metadata unsafe: $file"
+done
 
 # Signal at the deployed-snapshot publication boundary must not delete the published snapshot.
 write_evidence staging example-staging
