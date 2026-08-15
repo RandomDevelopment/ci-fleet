@@ -4,10 +4,11 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 ## Start here
 
-New operator? Follow the [Quickstart](QUICKSTART.md): what ci-fleet does, install one controller, connect one repository, run and verify one job. Everything below is reference.
+New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a supported role and outcome or stop at an explicit product gate. For the current ordinary-CI path, follow the [Quickstart](QUICKSTART.md): what ci-fleet does, install one controller, connect one repository, run and verify one job. Everything below is reference.
 
 | I want to… | Read |
 | --- | --- |
+| Choose a host role and complete or safely stop an operator workflow | [Operator workflows](OPERATOR-WORKFLOWS.md) |
 | Complete the beginner path end to end | [Quickstart](QUICKSTART.md) |
 | Understand the whole system | [Architecture](ARCHITECTURE.md) |
 | Understand how ephemeral runners are created | [Runner controller design](CONTROLLER-DESIGN.md) |
@@ -69,6 +70,7 @@ These pages are normative for compatible projects and hosts:
 
 ## Operator how-tos
 
+- [Choose a role and outcome, then complete or safely stop the workflow](OPERATOR-WORKFLOWS.md)
 - [Run the live pilot](LIVE-PILOT.md)
 - [Add a host](ADDING-A-HOST.md)
 - [Install, adopt, check, upgrade, roll back, or remove a controller](DESIRED-STATE.md)
