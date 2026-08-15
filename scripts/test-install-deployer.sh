@@ -1671,7 +1671,7 @@ expect_failure 'deployment adapter failed after approval consumption' "$runtime"
 unset FAKE_ADAPTER_MUTATE_INCUMBENT_PATH FAKE_ADAPTER_MUTATE_LKG_ROOT FAKE_ADAPTER_CHMOD_DURING FAKE_ADAPTER_CHOWN_DURING FAKE_ADAPTER_FAIL_AFTER_MUTATION
 expected_uid=$(id -u)
 [[ $(stat -c '%u:%a' "$incumbent_dir") == "$expected_uid:700" ]] || fail 'failed adapter left incumbent directory metadata unsafe'
-for file in "$incumbent_dir"/policy.conf "$incumbent_dir"/state.json "$root/var/lib/ci-fleet-deployer/last-known-good.json "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf "$root/var/log/ci-fleet-deployer/audit.log"; do
+for file in "$incumbent_dir"/policy.conf "$incumbent_dir"/state.json "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$root/var/log/ci-fleet-deployer/audit.log"; do
   [[ $(stat -c '%u:%a' "$file") == "$expected_uid:600" ]] || fail "failed adapter left recovery metadata unsafe: $file"
 done
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
