@@ -17,7 +17,7 @@ Use this page to choose an outcome, confirm the responsible role, and either fol
 | Install or converge an ordinary-CI worker/controller | Current, experimental | Prepared Linux Docker host, using reviewed private configuration | Yes | Follow the [worker quickstart](QUICKSTART.md) and [desired-state lifecycle](DESIRED-STATE.md). |
 | Add another worker host or location | Current, experimental | Private configuration, then the new Linux host | Yes | Follow [adding a host](ADDING-A-HOST.md); the application repositories do not change. |
 | Authorize and onboard an application project | Current, experimental | Application repository, private configuration, and GitHub runner-group policy | Yes; no host mutation | Follow [adding a project](ADDING-A-PROJECT.md), then the [migration procedure](MIGRATING-EXISTING-CI.md). |
-| Create controller GitHub credentials and runner-group prerequisites | Current manual procedure | GitHub web UI and the target host | Yes | Follow [GitHub App setup](GITHUB-APP-SETUP.md). Automated target-host bootstrap remains [planned](https://github.com/RandomDevelopment/ci-fleet/issues/27). |
+| Create controller GitHub credentials and runner-group prerequisites | Current manual procedure | GitHub web UI and the target host | Yes | Follow [GitHub App setup](GITHUB-APP-SETUP.md) and the [runner-group procedure](LIVE-PILOT.md#2-create-the-organization-runner-group). Automated target-host bootstrap remains [planned](https://github.com/RandomDevelopment/ci-fleet/issues/27). |
 | Run an isolated first-job proof | Prototype only | GitHub Actions and one isolated worker host | Yes, transiently | Follow the [live pilot](LIVE-PILOT.md). Stop if the matching job queue is not proven empty. |
 | Install a persistent test/staging environment host | Planned | Separate test host | N/A | No supported command exists. Stop at [issue #23](https://github.com/RandomDevelopment/ci-fleet/issues/23); do not adapt the worker installer. |
 | Install a deployment host | In review | Separate deployment host | N/A on the default branch | [Issue #22](https://github.com/RandomDevelopment/ci-fleet/issues/22) and [PR #69](https://github.com/RandomDevelopment/ci-fleet/pull/69) track the installer and its required real-host evidence. Do not install it from the default branch yet. |
@@ -65,7 +65,7 @@ Runs on: the Linux worker host. Mutates state: **no** (`--check`).
 sudo ./scripts/install-worker-controller.sh --check --config-repo example-org/example-fleet-config --ref 1111111111111111111111111111111111111111 --controller example-ci-01
 ```
 
-The same script owns `--adopt`, `--upgrade`, `--repair`, `--rollback`, and `--uninstall`. Read the mode-specific prerequisites, stop conditions, expected report, and rollback behavior in [desired-state lifecycle](DESIRED-STATE.md) before using a mutating mode.
+The same script owns `--adopt`, `--upgrade`, `--rollback`, and `--uninstall`. Read the mode-specific prerequisites, stop conditions, expected report, and rollback behavior in [desired-state lifecycle](DESIRED-STATE.md) before using a mutating mode.
 
 ## End-to-end worker checklist
 

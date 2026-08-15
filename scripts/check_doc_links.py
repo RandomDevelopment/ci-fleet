@@ -11,7 +11,8 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
-HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
+FENCE = re.compile(r"^\s{0,3}([`~]{3,})")
 EXTERNAL_SCHEMES = {"http", "https", "mailto"}
 
 
@@ -32,10 +33,30 @@ def anchor(text: str) -> str:
     return re.sub(r" +", "-", text)
 
 
+def prose_lines(text: str):
+    fence_character = ""
+    fence_length = 0
+    for line_number, line in enumerate(text.splitlines(), 1):
+        match = FENCE.match(line)
+        if match:
+            marker = match.group(1)
+            if not fence_character:
+                fence_character, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                fence_character, fence_length = "", 0
+            continue
+        if not fence_character:
+            yield line_number, line
+
+
 def anchors(path: Path) -> set[str]:
     found: set[str] = set()
     counts: dict[str, int] = {}
-    for heading in HEADING.findall(path.read_text(encoding="utf-8")):
+    for _, line in prose_lines(path.read_text(encoding="utf-8")):
+        match = HEADING.match(line)
+        if not match:
+            continue
+        heading = match.group(1)
         base = anchor(heading)
         count = counts.get(base, 0)
         found.add(base if count == 0 else f"{base}-{count}")
@@ -58,7 +79,7 @@ def main() -> int:
 
     for source in markdown:
         text = source.read_text(encoding="utf-8")
-        for line_number, line in enumerate(text.splitlines(), 1):
+        for line_number, line in prose_lines(text):
             for match in LINK.finditer(line):
                 raw = destination(match.group(1))
                 parsed = urlsplit(raw)
