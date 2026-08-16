@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
+[[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
 if [[ $1 == info ]]; then printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; exit 0; fi
 if [[ $1 == ps ]]; then printf 'fixture-container-id\n'; exit 0; fi
@@ -46,6 +47,7 @@ case ${operation:-} in
       deploy-device) service_extra=',"deploy":{"resources":{"reservations":{"devices":[{"capabilities":["gpu"]}]}}}' ;;
       build) service_extra=',"build":{"context":"/"}' ;;
       changed-model) service_extra=',"pull_policy":"always"' ;;
+      unconfined) security='no-new-privileges:true","seccomp=unconfined' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}

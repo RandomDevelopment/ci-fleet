@@ -24,6 +24,7 @@ EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
+[[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/curl"
@@ -31,6 +32,7 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/getent"
 chmod 0755 "$fake_bin/df" "$fake_bin/systemctl" "$fake_bin/curl" "$fake_bin/getent"
 export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
+export FAKE_TESTER_EVENT_LOG=$tmp/events.log
 
 write_environment() {
   local id=$1 port=$2
@@ -61,7 +63,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp custom-volume volumes-from custom-network replicas lifecycle-hook gpu deploy-device build; do
+for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from custom-network replicas lifecycle-hook gpu deploy-device build; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
@@ -92,7 +94,7 @@ FAKE_TESTER_ROUTE_PORT=18085 "$runtime" --converge --environment immutable-remov
 rm "$root/etc/ci-fleet-tester/definitions/immutable-remove.yaml"
 FAKE_TESTER_ROUTE_PORT=18085 "$runtime" --remove --environment immutable-remove >/dev/null
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --reset --environment preview-a >/dev/null
-grep -q 'down --volumes --remove-orphans' "$tmp/docker.log" || fail 'reset did not remove only the scoped Compose project'
+grep -q 'down --timeout 10 --volumes --remove-orphans' "$tmp/docker.log" || fail 'reset did not use bounded scoped Compose teardown'
 if grep -Eq 'system prune|volume prune|network prune' "$tmp/docker.log"; then fail 'global Docker prune was used'; fi
 write_environment expired-a 18087
 FAKE_TESTER_ROUTE_PORT=18087 "$runtime" --converge --environment expired-a >/dev/null
@@ -164,8 +166,13 @@ printf '# candidate\n' >>"$upgrade_repo/docs/TESTER-HOST.md"
 git -C "$upgrade_repo" add docs/TESTER-HOST.md
 git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: second valid tester candidate'
 valid_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
+: >"$tmp/events.log"
 "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null || fail 'valid upgrade failed'
 [[ ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'corrupt incumbent was recorded as last-known-good'
+disable_line=$(grep -n '^systemctl disable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
+check_line=$(grep -n '^docker info ' "$tmp/events.log" | tail -1 | cut -d: -f1)
+enable_line=$(grep -n '^systemctl enable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
+[[ -n $disable_line && -n $check_line && -n $enable_line && $disable_line -private-repository $check_line && $check_line -private-repository $enable_line ]] || fail 'timers were not quiesced until candidate validation completed'
 
 # Rollback switches only to a complete recorded release and keeps environments intact.
 old=0000000000000000000000000000000000000000
