@@ -14,13 +14,13 @@ EOF
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
-mode=live; organization=; instance=; runner_group=; config_repository=; bind=127.0.0.1; callback_host=127.0.0.1
+mode=live; mode_selected=false; organization=; instance=; runner_group=; config_repository=; bind=127.0.0.1; callback_host=127.0.0.1
 port=8765; timeout=600; run_installer=false; config_repo=; config_ref=
 repositories=()
 while (($#)); do
   case $1 in
-    --dry-run) mode=dry-run; shift ;;
-    --check) mode=check; shift ;;
+    --dry-run) if $mode_selected; then die '--dry-run and --check are mutually exclusive'; fi; mode=dry-run; mode_selected=true; shift ;;
+    --check) if $mode_selected; then die '--dry-run and --check are mutually exclusive'; fi; mode=check; mode_selected=true; shift ;;
     --organization) (($# >= 2)) || die '--organization requires a value'; organization=$2; shift 2 ;;
     --instance) (($# >= 2)) || die '--instance requires a value'; instance=$2; shift 2 ;;
     --runner-group) (($# >= 2)) || die '--runner-group requires a value'; runner_group=$2; shift 2 ;;
@@ -239,7 +239,9 @@ import json,sys
 value=json.load(open(sys.argv[1]))
 if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
 PY
-  then mv -fT "$bootstrap_pending" "$bootstrap_recovery"
+  then
+    [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
+    mv -T "$bootstrap_pending" "$bootstrap_recovery"
   else die "incomplete protected conversion response remains at $bootstrap_pending; do not retry or delete it without owner recovery/abandonment approval"
   fi
 elif [[ -e $bootstrap_pending || -L $bootstrap_pending ]]; then
@@ -301,7 +303,9 @@ import json,sys
 value=json.load(open(sys.argv[1]))
 if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
 PY
-  then mv -fT "$bootstrap_pending" "$bootstrap_recovery"
+  then
+    [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
+    mv -T "$bootstrap_pending" "$bootstrap_recovery"
   else die "manifest conversion did not produce a complete response (curl status $conversion_status); protected pending bytes retained for owner recovery"
   fi
   if [[ ${CI_FLEET_TEST_FAIL_AFTER_CONVERSION:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected failure after manifest conversion'; fi
