@@ -58,43 +58,31 @@ if $run_installer; then
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
 fi
 for command in bash curl openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
-if $run_installer; then
-  command -v git >/dev/null || die 'required command is unavailable: git'
-  git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die '--install requires a local configuration checkout; remote handoff has no pre-mutation credential proof'
-  [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
-  git -C "$config_repo" show "$config_ref:fleet.json" | python3 -c '
-import json,sys
-organization, controller_id, runner_group = sys.argv[1:4]
-repositories=sorted(item.lower() for item in sys.argv[4:])
-value=json.load(sys.stdin)
-controller=value["controllers"][controller_id]
-pool=value["runner_pools"][controller["pool"]]
-if value["organization"]["slug"] != organization or pool["runner_group"] != runner_group or pool.get("public_repositories") is not False or sorted(item.lower() for item in pool["allowed_repositories"]) != repositories: raise SystemExit(1)
-' "$organization" "$instance" "$runner_group" "${repository_names[@]}" || die 'pinned desired-state routing differs from bootstrap arguments'
-fi
-
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-root_prefix=${CI_FLEET_ROOT_PREFIX:-}
-if [[ -n $root_prefix && ${CI_FLEET_TESTING:-0} != 1 ]]; then die 'CI_FLEET_ROOT_PREFIX is test-only'; fi
-root_path() { printf '%s%s' "$root_prefix" "$1"; }
-etc_dir=$(root_path /etc/ci-fleet)
-secret_dir=$etc_dir/secrets
-pem=$secret_dir/github-app.pem
-host_env=$etc_dir/host.env
-bootstrap_state=$etc_dir/bootstrap-app.env
-bootstrap_recovery=$etc_dir/bootstrap-recovery.json
-bootstrap_pending=$etc_dir/bootstrap-recovery.pending
 temporary=$(mktemp -d)
 callback_pid=
 created_group=false
 installation_token=
 group_id=
-expected_uid=0
-[[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
+callback_is_running() {
+  local pid
+  while read -r pid; do [[ $pid == "$callback_pid" ]] && return 0; done < <(jobs -pr)
+  return 1
+}
+reap_callback_if_exited() {
+  [[ -n $callback_pid ]] || return 0
+  callback_is_running && return 0
+  wait "$callback_pid" >/dev/null 2>&1 || true
+  callback_pid=
+}
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  [[ -z $callback_pid ]] || kill "$callback_pid" >/dev/null 2>&1 || true
+  if [[ -n $callback_pid ]]; then
+    if callback_is_running; then kill "$callback_pid" >/dev/null 2>&1 || true; fi
+    wait "$callback_pid" >/dev/null 2>&1 || true
+    callback_pid=
+  fi
   if $created_group && declare -F rollback_new_group >/dev/null; then
     rollback_new_group || printf 'ERROR: automatic rollback of the unverified runner group failed\n' >&2
   fi
@@ -105,6 +93,45 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if $run_installer; then
+  command -v git >/dev/null || die 'required command is unavailable: git'
+  git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die '--install requires a local configuration checkout; remote handoff has no pre-mutation credential proof'
+  [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
+  candidate_config=$temporary/fleet.json
+  tree_paths=$temporary/config-tree-paths
+  git -C "$config_repo" show "$config_ref:fleet.json" >"$candidate_config" || die 'fleet.json is absent at the requested configuration commit'
+  git -C "$config_repo" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
+  validator_args=(--config "$candidate_config" --strict --tree-paths "$tree_paths")
+  if git -C "$config_repo" cat-file -e "$config_ref:engine-rollout-evidence.json" 2>/dev/null; then
+    rollout_evidence=$temporary/engine-rollout-evidence.json
+    git -C "$config_repo" show "$config_ref:engine-rollout-evidence.json" >"$rollout_evidence" || die 'cannot read engine rollout evidence'
+    validator_args+=(--rollout-evidence "$rollout_evidence")
+  fi
+  python3 "$script_dir/../templates/config-repository/scripts/validate.py" "${validator_args[@]}" || die 'pinned configuration commit validation failed'
+  python3 "$script_dir/scan_committed_secrets.py" --repository "$config_repo" --commit "$config_ref" || die 'pinned configuration commit secret scan failed'
+  python3 - "$candidate_config" "$organization" "$instance" "$runner_group" "${repository_names[@]}" <<'PY' || die 'pinned desired-state routing differs from bootstrap arguments'
+import json,sys
+organization, controller_id, runner_group = sys.argv[2:5]
+repositories=sorted(item.lower() for item in sys.argv[5:])
+value=json.load(open(sys.argv[1]))
+controller=value["controllers"][controller_id]
+pool=value["runner_pools"][controller["pool"]]
+if value["organization"]["slug"] != organization or pool["runner_group"] != runner_group or pool.get("public_repositories") is not False or sorted(item.lower() for item in pool["allowed_repositories"]) != repositories: raise SystemExit(1)
+PY
+fi
+
+root_prefix=${CI_FLEET_ROOT_PREFIX:-}
+if [[ -n $root_prefix && ${CI_FLEET_TESTING:-0} != 1 ]]; then die 'CI_FLEET_ROOT_PREFIX is test-only'; fi
+root_path() { printf '%s%s' "$root_prefix" "$1"; }
+etc_dir=$(root_path /etc/ci-fleet)
+secret_dir=$etc_dir/secrets
+pem=$secret_dir/github-app.pem
+host_env=$etc_dir/host.env
+bootstrap_state=$etc_dir/bootstrap-app.env
+bootstrap_recovery=$etc_dir/bootstrap-recovery.json
+bootstrap_pending=$etc_dir/bootstrap-recovery.pending
+expected_uid=0
+[[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 
 if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run live/check bootstrap as root'; fi
 [[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
@@ -243,7 +270,7 @@ PY
   note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
   deadline=$((SECONDS + timeout))
   while [[ ! -f $code_file && $SECONDS -private-repository $deadline ]]; do
-    kill -0 "$callback_pid" 2>/dev/null || die 'registration callback stopped before receiving approval'
+    callback_is_running || { reap_callback_if_exited; die 'registration callback stopped before receiving approval'; }
     sleep 1
   done
   [[ -f $code_file ]] || die 'registration callback timed out'
@@ -295,6 +322,7 @@ verified_app_id=${app_data[1]}
 rm -f "$app_response"
 if [[ -n ${handoff_file:-} ]]; then
   printf 'https://github.com/apps/%s/installations/new\n' "$CI_FLEET_GITHUB_APP_SLUG" >"$handoff_file"
+  reap_callback_if_exited
 fi
 
 installation_id=${CI_FLEET_GITHUB_APP_INSTALLATION_ID:-}
@@ -303,6 +331,7 @@ if [[ -z $installation_id ]]; then
   note 'Install the App for only the listed private repositories, then return here; polling continues automatically.'
   deadline=$((SECONDS + timeout))
   while ((SECONDS < deadline)); do
+    reap_callback_if_exited
     installations=$temporary/installations.json
     make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
     if write_auth_config "$app_jwt" GET https://api.github.com/app/installations "$installations"; then
