@@ -37,6 +37,7 @@ flowchart LR
      --capacity-budget 1 \
      --max-runners 1 \
      --engine-ref REVIEWED_CI_FLEET_COMMIT \
+     --architecture amd64 \
      --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID \
      --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    ```

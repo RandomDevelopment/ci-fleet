@@ -99,6 +99,7 @@ jobs through the Docker socket.
      --capacity-budget 1 \
      --max-runners 1 \
      --engine-ref PINNED_ENGINE_COMMIT \
+     --architecture amd64 \
      --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID \
      --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    # Validate before committing so a rejected file or accidental value

@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
+    parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"), help="architecture of the reviewed image IDs")
     parser.add_argument("--controller-image-digest", required=True, help="reviewed controller image ID (sha256:...)")
     parser.add_argument("--runner-image-digest", required=True, help="reviewed runner image ID (sha256:...)")
     parser.add_argument("--output", type=Path, default=ROOT / "fleet.json", help="output configuration path")
@@ -109,8 +110,10 @@ def main() -> int:
         },
         "managed_images": {
             args.engine_ref: {
-                "controller": args.controller_image_digest,
-                "runner": args.runner_image_digest,
+                args.architecture: {
+                    "controller": args.controller_image_digest,
+                    "runner": args.runner_image_digest,
+                }
             }
         },
         "controllers": {

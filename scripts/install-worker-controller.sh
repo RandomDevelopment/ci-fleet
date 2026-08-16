@@ -686,6 +686,29 @@ build_candidate() {
   managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
 }
 
+capture_legacy_image_ids() {
+  local environment=$1 controller_image runner_image controller_digest runner_digest
+  controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$environment")
+  runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  if [[ -z "$controller_digest" ]]; then
+    controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print $2}' "$environment")
+    [[ -n "$controller_image" ]] || die 'legacy checkpoint cannot identify the installed controller image'
+    controller_digest=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null \
+      || docker image inspect --format '{{.Id}}' "$controller_image" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed controller image ID'
+    printf 'CI_FLEET_CONTROLLER_IMAGE_DIGEST=%s\n' "$controller_digest" >>"$environment"
+  fi
+  if [[ -z "$runner_digest" ]]; then
+    runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {print $2}' "$environment")
+    [[ -n "$runner_image" ]] || die 'legacy checkpoint cannot identify the installed runner image'
+    runner_digest=$(docker image inspect --format '{{.Id}}' "$runner_image" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed runner image ID'
+    printf 'CI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$runner_digest" >>"$environment"
+  fi
+  [[ "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ && "$runner_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die 'legacy checkpoint contains an invalid managed image ID'
+}
+
 make_checkpoint() {
   local timestamp target unit timer final_checkpoint staged_checkpoint
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -695,7 +718,10 @@ make_checkpoint() {
   staging_paths+=("$staged_checkpoint")
   checkpoint_dir=$staged_checkpoint
   install -d -m 0700 "$checkpoint_dir/systemd"
-  [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+  [[ ! -f "$rendered_env" ]] || {
+    install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+    capture_legacy_image_ids "$checkpoint_dir/ci-fleet.env"
+  }
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   target=$(current_runtime_release)
   if [[ -n "$target" ]]; then
@@ -1002,6 +1028,7 @@ restore_checkpoint() {
       fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
+      failed=1
     fi
     if [[ "$restored_state" == active && "$failed" == 0 ]]; then
       if [[ $(managed_runner_count) != 0 ]]; then
