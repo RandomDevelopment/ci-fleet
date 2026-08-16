@@ -132,7 +132,7 @@ class HealthTests(unittest.TestCase):
             history = Path(directory) / "capacity" / "samples.jsonl"
             snapshot = healthy_snapshot()
             snapshot.update({
-                "cpu": {"logical": 8, "used_percent": 10},
+                "cpu": {"logical": 8, "used_percent": 10, "total_ticks": 100, "idle_ticks": 40},
                 "memory": {"total_bytes": 1000, "available_bytes": 600},
                 "swap": {"total_bytes": 100, "used_bytes": 5},
                 "runners": {"current": 1, "busy": 1, "maximum": 2},
@@ -149,11 +149,11 @@ class HealthTests(unittest.TestCase):
             previous_testing = os.environ.get("CI_FLEET_TESTING")
             os.environ["CI_FLEET_TESTING"] = "1"
             try:
-                history.parent.mkdir()
+                history.parent.mkdir(mode=0o700)
                 history.write_text('{"timestamp":999999}\n' * health.CAPACITY_MAX_SAMPLES)
                 history.chmod(0o600)
                 self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_000))
-                snapshot["cpu"]["used_percent"] = 20
+                snapshot["cpu"].update(used_percent=20, total_ticks=200, idle_ticks=50)
                 self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_300))
                 self.assertEqual(len(history.read_text().splitlines()), health.CAPACITY_MAX_SAMPLES)
                 self.assertEqual(history.stat().st_mode & 0o777, 0o600)
@@ -161,10 +161,73 @@ class HealthTests(unittest.TestCase):
                 report = health.capacity_report(history, now=1_000_300)
                 pool = report["pools"]["example-ci-01"]
                 self.assertEqual((pool["samples"], pool["runner_observations"]), (2, 2))
-                self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 10, "p95": 20})
+                self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 90.0, "p95": 90.0})
                 self.assertEqual(pool["metrics"]["runner_cpu_percent"], {"p50": 12.5, "p95": 90.0})
                 snapshot["runners"]["current"] = 0
                 self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_900))
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
+    def test_capacity_prunes_inactive_history_and_ignores_incomplete_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            history.parent.mkdir(mode=0o700)
+            valid = {
+                "timestamp": 999_999, "pool": "example-ci-01",
+                "host": {"memory_used_bytes": 1, "swap_used_bytes": 0, "disk_used_bytes": {"root": 1},
+                         "inode_used": {"root": 1}, "cpu_total_ticks": 10, "cpu_idle_ticks": 5, "cpu_percent": 50.0},
+                "runners": [{"cpu_percent": 1.0, "memory_used_bytes": 1, "memory_limit_bytes": 2}],
+            }
+            history.write_text(json.dumps({**valid, "timestamp": 1}) + "\n" + json.dumps(valid) + "\n")
+            history.chmod(0o600)
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                self.assertFalse(health.record_capacity(history, {"runners": {"current": 0}}, now=1_000_000))
+                self.assertEqual(len(history.read_text().splitlines()), 1)
+                incomplete = {**valid, "timestamp": 999_998, "host": dict(valid["host"])}
+                incomplete.pop("runners")
+                history.write_text(history.read_text() + json.dumps(incomplete) + "\n")
+                report = health.capacity_report(history, now=1_000_000)
+                self.assertEqual(report["pools"]["example-ci-01"]["samples"], 1)
+                redirected = Path(directory) / "redirected"
+                redirected.mkdir(mode=0o700)
+                other = Path(directory) / "other"
+                other.mkdir(mode=0o700)
+                redirected.rmdir()
+                redirected.symlink_to(other, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "directory must be root-owned"):
+                    health.record_capacity(redirected / "samples.jsonl", {"runners": {"current": 0}}, now=1_000_000)
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
+    def test_capacity_surfaces_runner_stat_failures(self) -> None:
+        snapshot = healthy_snapshot()
+        snapshot.update({
+            "cpu": {"logical": 8, "used_percent": 10, "total_ticks": 100, "idle_ticks": 40},
+            "memory": {"total_bytes": 1000, "available_bytes": 600},
+            "swap": {"total_bytes": 0, "used_bytes": 0},
+            "runners": {"current": 1},
+        })
+        for value in snapshot["disks"].values():
+            value.update(used_bytes=1, inode_used=1)
+        def run(args):
+            return health.subprocess.CompletedProcess(args, 0 if args[:3] == ["docker", "ps", "-q"] else 1,
+                                                      "a" * 12 + "\n" if args[:3] == ["docker", "ps", "-q"] else "", "failed")
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            history.parent.mkdir(mode=0o700)
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                with self.assertRaisesRegex(ValueError, "stat collection failed"):
+                    health.record_capacity(history, snapshot, run=run, now=1_000_000)
             finally:
                 if previous_testing is None:
                     os.environ.pop("CI_FLEET_TESTING", None)
@@ -222,8 +285,8 @@ class HealthTests(unittest.TestCase):
                     run=run,
                 )
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
-                self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
-                self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                self.assertEqual(set(snapshot["services"]), {"capacity", "cleanup", "drift"})
+                self.assertEqual(set(snapshot["timers"]), {"health", "capacity", "cleanup", "drift"})
                 (root / "var/lib/ci-fleet/reconcile").mkdir(parents=True)
                 (root / "var/lib/ci-fleet/reconcile/state.json").write_text('{"status":"rolled_back","desired_commit":"","applied_commit":"","health":"healthy"}\n')
                 remote = health.collect_snapshot(
@@ -235,9 +298,9 @@ class HealthTests(unittest.TestCase):
                     root=root,
                     run=run,
                 )
-                self.assertEqual(set(remote["services"]), {"cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["services"]), {"capacity", "cleanup", "drift", "reconcile"})
                 self.assertEqual(set(remote["services"].values()), {"ok"})
-                self.assertEqual(set(remote["timers"]), {"health", "cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["timers"]), {"health", "capacity", "cleanup", "drift", "reconcile"})
                 self.assertEqual(remote["reconciliation"]["status"], "bootstrap")
                 (root / "etc").mkdir()
                 (root / "etc/debian_version").write_text("13\n")
@@ -340,7 +403,7 @@ class HealthTests(unittest.TestCase):
             "software_version": "1" * 40,
             "boot_time": 900,
             "ssh": "disabled",
-            "cpu": {"logical": 8, "used_percent": 25.0},
+            "cpu": {"logical": 8, "used_percent": 25.0, "total_ticks": 0, "idle_ticks": 0},
             "memory": {"total_bytes": 1024, "available_bytes": 768},
             "swap": {"total_bytes": 512, "used_bytes": 0},
             "load": {"one": 0.1, "five": 0.2, "fifteen": 0.3},

@@ -120,6 +120,7 @@ unit_names=(
   ci-fleet-drift.service ci-fleet-drift.timer
 )
 timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
+capacity_unit_names=(ci-fleet-capacity.service ci-fleet-capacity.timer)
 optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
@@ -516,6 +517,9 @@ manager_release_complete() {
   done
   [[ -x "$path/templates/config-repository/scripts/validate.sh" ]] || return 1
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
+  if [[ -e "$path/scripts/capacity-sample.sh" || -e "$path/host/systemd/ci-fleet-capacity.service" || -e "$path/host/systemd/ci-fleet-capacity.timer" ]]; then
+    [[ -x "$path/scripts/capacity-sample.sh" && -f "$path/host/systemd/ci-fleet-capacity.service" && -f "$path/host/systemd/ci-fleet-capacity.timer" ]] || return 1
+  fi
   marker=$(<"$path/.ci-fleet-engine-ref")
   [[ "$marker" == "$expected" ]]
 }
@@ -551,6 +555,14 @@ systemd_matches() {
     systemctl is-enabled --quiet "$unit" || return 1
     systemctl is-active --quiet "$unit" || return 1
   done
+  if [[ -x "$expected_manager/scripts/capacity-sample.sh" ]]; then
+    for unit in "${capacity_unit_names[@]}"; do
+      [[ -f "$systemd_dir/$unit" ]] && cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+    done
+    systemctl is-enabled --quiet ci-fleet-capacity.timer && systemctl is-active --quiet ci-fleet-capacity.timer || return 1
+  else
+    for unit in "${capacity_unit_names[@]}"; do [[ ! -e "$systemd_dir/$unit" ]] || return 1; done
+  fi
 }
 
 drift_count() {
@@ -695,7 +707,7 @@ make_checkpoint() {
     printf '%s\n' "$target" >"$checkpoint_dir/manager-target"
     chmod 0600 "$checkpoint_dir/manager-target"
   fi
-  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+  for unit in "${unit_names[@]}" "${capacity_unit_names[@]}" "${optional_unit_names[@]}"; do
     [[ ! -f "$systemd_dir/$unit" ]] || install -m 0644 "$systemd_dir/$unit" "$checkpoint_dir/systemd/$unit"
   done
   : >"$checkpoint_dir/enabled-timers"
@@ -704,6 +716,8 @@ make_checkpoint() {
     if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/enabled-timers"; fi
     if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/active-timers"; fi
   done
+  if systemctl is-enabled --quiet ci-fleet-capacity.timer 2>/dev/null; then printf '%s\n' ci-fleet-capacity.timer >>"$checkpoint_dir/enabled-timers"; fi
+  if systemctl is-active --quiet ci-fleet-capacity.timer 2>/dev/null; then printf '%s\n' ci-fleet-capacity.timer >>"$checkpoint_dir/active-timers"; fi
   local opt_name
   for opt_name in "${optional_unit_names[@]}"; do
     case "$opt_name" in *.timer)
@@ -790,6 +804,13 @@ install_systemd_units() {
   install -d -m 0755 "$systemd_dir"
   install -m 0644 "$source/host/systemd/ci-fleet-health.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-health.timer" "$systemd_dir/"
+  if [[ -x "$source/scripts/capacity-sample.sh" ]]; then
+    install -m 0644 "$source/host/systemd/ci-fleet-capacity.service" "$systemd_dir/"
+    install -m 0644 "$source/host/systemd/ci-fleet-capacity.timer" "$systemd_dir/"
+  else
+    systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
+    rm -f "$systemd_dir/ci-fleet-capacity.service" "$systemd_dir/ci-fleet-capacity.timer"
+  fi
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
@@ -803,11 +824,12 @@ install_systemd_units() {
 
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
   local unit
   for unit in "${optional_unit_names[@]}"; do
     case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac
   done
-  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
+  for unit in "${unit_names[@]}" "${capacity_unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
   systemctl daemon-reload
 }
 
@@ -887,6 +909,7 @@ PY
   chmod 0600 "$staged_state"
   mv -f "$staged_state" "$state_file"
   systemctl enable --now "${timer_names[@]}" >/dev/null
+  if [[ -f "$systemd_dir/ci-fleet-capacity.timer" ]]; then systemctl enable --now ci-fleet-capacity.timer >/dev/null; fi
   local opt_timer
   for opt_timer in "${optional_unit_names[@]}"; do
     case "$opt_timer" in *.timer)
@@ -906,6 +929,9 @@ restore_systemd_snapshot() {
   local unit timer failed=0
   remove_systemd_units || failed=1
   for unit in "${unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  done
+  for unit in "${capacity_unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
   done
   for unit in "${optional_unit_names[@]}"; do
