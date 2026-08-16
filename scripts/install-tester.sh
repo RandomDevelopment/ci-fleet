@@ -146,7 +146,10 @@ activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
-  if [[ $previous =~ ^[0-9a-f]{40}$ ]]; then systemctl disable --now "${timers[@]}" >/dev/null || die 'could not quiesce tester maintenance timers'; fi
+  if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
+    enable_timers || die 'could not quiesce or restore tester maintenance timers'
+    die 'could not quiesce tester maintenance timers; incumbent timers restored'
+  fi
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
   if ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
