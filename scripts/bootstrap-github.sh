@@ -5,7 +5,8 @@ umask 077
 usage() {
   cat <<'EOF'
 Usage: bootstrap-github.sh [--dry-run|--check] --organization ORG --instance ID
-  --runner-group GROUP --allow-repository ORG/REPO [--allow-repository ORG/REPO ...]
+  --config-repository ORG/PRIVATE_CONFIG_REPO --runner-group GROUP
+  --allow-repository ORG/PROJECT=NUMERIC_ID [--allow-repository ORG/PROJECT=NUMERIC_ID ...]
   [--bind ADDRESS --callback-host HOST --port PORT --timeout SECONDS]
   [--install --config-repo OWNER/REPO_OR_PATH --config-ref COMMIT]
 EOF
@@ -13,7 +14,7 @@ EOF
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
-mode=live; organization=; instance=; runner_group=; bind=127.0.0.1; callback_host=127.0.0.1
+mode=live; organization=; instance=; runner_group=; config_repository=; bind=127.0.0.1; callback_host=127.0.0.1
 port=8765; timeout=600; run_installer=false; config_repo=; config_ref=
 repositories=()
 while (($#)); do
@@ -23,6 +24,7 @@ while (($#)); do
     --organization) (($# >= 2)) || die '--organization requires a value'; organization=$2; shift 2 ;;
     --instance) (($# >= 2)) || die '--instance requires a value'; instance=$2; shift 2 ;;
     --runner-group) (($# >= 2)) || die '--runner-group requires a value'; runner_group=$2; shift 2 ;;
+    --config-repository) (($# >= 2)) || die '--config-repository requires a value'; config_repository=$2; shift 2 ;;
     --allow-repository) (($# >= 2)) || die '--allow-repository requires a value'; repositories+=("$2"); shift 2 ;;
     --bind) (($# >= 2)) || die '--bind requires a value'; bind=$2; shift 2 ;;
     --callback-host) (($# >= 2)) || die '--callback-host requires a value'; callback_host=$2; shift 2 ;;
@@ -35,17 +37,22 @@ while (($#)); do
     *) usage; die "unknown argument: $1" ;;
   esac
 done
-[[ $organization =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || die 'invalid organization'
+[[ $organization =~ ^[a-z0-9][a-z0-9-]{0,38}$ ]] || die 'organization must be lowercase'
 [[ $instance =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'invalid instance identity'
-[[ $runner_group =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ && ${runner_group,,} != default ]] || die 'runner group must be explicit and non-default'
+[[ $runner_group =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $runner_group != default ]] || die 'runner group must be a lowercase schema-v3 slug and non-default'
+[[ $config_repository =~ ^${organization}/[A-Za-z0-9_.-]+$ ]] || die "configuration repository must belong to $organization"
+app_name=ci-fleet-$organization-$instance
+((${#app_name} <= 34)) || die 'generated GitHub App name exceeds 34 characters'
 ((${#repositories[@]} > 0)) || die 'at least one --allow-repository is required'
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die 'invalid callback port'
 [[ $timeout =~ ^[0-9]+$ && $timeout -ge 30 && $timeout -le 1800 ]] || die 'timeout must be 30-1800 seconds'
 for repository in "${repositories[@]}"; do
-  [[ $repository =~ ^${organization}/[A-Za-z0-9_.-]+$ ]] || die "repository must belong to $organization: $repository"
+  [[ $repository =~ ^${organization}/[A-Za-z0-9_.-]+=([1-9][0-9]*)$ ]] || die "project repository must use ORG/REPO=NUMERIC_ID: $repository"
 done
 mapfile -t repositories < <(printf '%s\n' "${repositories[@]}" | LC_ALL=C sort -u)
 ((${#repositories[@]} > 0)) || die 'repository allowlist is empty'
+repository_names=(); repository_id_values=()
+for repository in "${repositories[@]}"; do repository_names+=("${repository%=*}"); repository_id_values+=("${repository##*=}"); done
 if $run_installer; then
   [[ $mode == live ]] || die '--install is available only in live mode'
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
@@ -62,6 +69,7 @@ pem=$secret_dir/github-app.pem
 host_env=$etc_dir/host.env
 bootstrap_state=$etc_dir/bootstrap-app.env
 bootstrap_recovery=$etc_dir/bootstrap-recovery.json
+bootstrap_pending=$etc_dir/bootstrap-recovery.pending
 temporary=$(mktemp -d)
 callback_pid=
 expected_uid=0
@@ -76,13 +84,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run live/check bootstrap as root'; fi
-python3 - "$bind" "$callback_host" <<'PY' || die 'callback bind/host must be the same loopback IP address'
-import ipaddress, sys
-addresses=[ipaddress.ip_address(value) for value in sys.argv[1:]]
-if addresses[0] != addresses[1]: raise SystemExit(1)
-address=addresses[0]
-if not address.is_loopback: raise SystemExit(1)
-PY
+[[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
 
 write_auth_config() {
   local credential=$1 method=$2 url=$3 output=$4 payload=${5:-}
@@ -100,8 +102,10 @@ if payload:
 Path(target).write_text('\n'.join(lines) + '\n')
 PY
   chmod 600 "$config"
-  curl --config "$config"
+  local status=0
+  curl --config "$config" || status=$?
   rm -f "$config"
+  return "$status"
 }
 
 make_app_jwt() {
@@ -168,6 +172,18 @@ for directory in "$etc_dir" "$secret_dir"; do
     install -d -m 0700 "$directory"
   fi
 done
+if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
+  if python3 - "$bootstrap_pending" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
+PY
+  then mv -fT "$bootstrap_pending" "$bootstrap_recovery"
+  else die "incomplete protected conversion response remains at $bootstrap_pending; do not retry or delete it without owner recovery/abandonment approval"
+  fi
+elif [[ -e $bootstrap_pending || -L $bootstrap_pending ]]; then
+  die 'pending conversion response has unsafe ownership, mode, or type'
+fi
 if [[ -e $bootstrap_recovery || -L $bootstrap_recovery ]]; then
   [[ $mode != check ]] || die 'bootstrap credential recovery is pending; rerun live bootstrap first'
   recover_conversion
@@ -201,7 +217,7 @@ PY
   done
   [[ -f $code_file ]] || die 'registration callback timed out'
   conversion_config=$temporary/conversion.conf
-  python3 - "$code_file" "$bootstrap_recovery" "$conversion_config" <<'PY'
+  python3 - "$code_file" "$bootstrap_pending" "$conversion_config" <<'PY'
 from pathlib import Path
 import sys
 code_file, output, config = map(Path, sys.argv[1:])
@@ -212,9 +228,18 @@ config.write_text('\n'.join(['silent','show-error','fail-with-body','request = "
  'header = "Accept: application/vnd.github+json"','header = "X-GitHub-Api-Version: 2022-11-28"']) + '\n')
 PY
   chmod 600 "$conversion_config"
-  if ! curl --config "$conversion_config"; then rm -f "$bootstrap_recovery"; die 'manifest conversion failed'; fi
-  chmod 600 "$bootstrap_recovery"
+  conversion_status=0
+  curl --config "$conversion_config" || conversion_status=$?
+  chmod 600 "$bootstrap_pending"
   rm -f "$code_file" "$conversion_config"
+  if python3 - "$bootstrap_pending" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
+PY
+  then mv -fT "$bootstrap_pending" "$bootstrap_recovery"
+  else die "manifest conversion did not produce a complete response (curl status $conversion_status); protected pending bytes retained for owner recovery"
+  fi
   if [[ ${CI_FLEET_TEST_FAIL_AFTER_CONVERSION:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected failure after manifest conversion'; fi
   recover_conversion
 fi
@@ -295,29 +320,17 @@ PY
 rm -f "$installation_response"
 
 repository_ids=$temporary/repository-ids
-: >"$repository_ids"
-for repository in "${repositories[@]}"; do
-  response=$temporary/repository.json
-  write_auth_config "$installation_token" GET "https://api.github.com/repos/$repository" "$response"
-  python3 - "$response" "$organization" "$repository" >>"$repository_ids" <<'PY'
-import json,sys
-v=json.load(open(sys.argv[1]))
-if v.get('full_name','').lower()!=sys.argv[3].lower() or v.get('owner',{}).get('login','').lower()!=sys.argv[2].lower() or not v.get('private') or v.get('archived'): raise SystemExit(1)
-print(v['id'])
-PY
-  rm -f "$response"
-done
-sort -n -u -o "$repository_ids" "$repository_ids"
+printf '%s\n' "${repository_id_values[@]}" | sort -n -u >"$repository_ids"
+(($(wc -l <"$repository_ids") == ${#repository_id_values[@]})) || die 'duplicate project repository IDs are forbidden'
 
 visible=$temporary/visible.json
 write_auth_config "$installation_token" GET 'https://api.github.com/installation/repositories?per_page=100' "$visible"
-python3 - "$visible" "${repositories[@]}" <<'PY' || die 'App installation repository access is broader or narrower than requested'
+python3 - "$visible" "$config_repository" <<'PY' || die 'App installation must select only the private configuration repository'
 import json,sys
 value=json.load(open(sys.argv[1])); repositories=value.get('repositories',[])
 if value.get('total_count') != len(repositories): raise SystemExit(1)
-actual=sorted(v['full_name'].lower() for v in repositories)
-expected=sorted(v.lower() for v in sys.argv[2:])
-if actual != expected: raise SystemExit(1)
+actual=[v for v in repositories if v.get('full_name','').lower()==sys.argv[2].lower() and v.get('private') and not v.get('archived')]
+if len(repositories)!=1 or len(actual)!=1: raise SystemExit(1)
 PY
 rm -f "$visible"
 
@@ -339,7 +352,7 @@ if [[ -z $group_id ]]; then
 import json,sys
 from pathlib import Path
 ids=[int(v) for v in Path(sys.argv[3]).read_text().splitlines()]
-Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'selected_repository_ids':ids}))
+Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'restricted_to_workflows':False,'selected_repository_ids':ids}))
 PY
   response=$temporary/group.json
   write_auth_config "$installation_token" POST "https://api.github.com/orgs/$organization/actions/runner-groups" "$response" "$payload"
@@ -356,18 +369,19 @@ write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organi
 python3 - "$response" "$runner_group" <<'PY' || die 'existing runner group is broader or has unexpected identity; no change made'
 import json,sys
 v=json.load(open(sys.argv[1]))
-if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('allows_public_repositories') is not False: raise SystemExit(1)
+if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('allows_public_repositories') is not False or v.get('restricted_to_workflows') is not False: raise SystemExit(1)
 PY
 rm -f "$response"
 selected=$temporary/group-repositories.json
 write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories?per_page=100" "$selected"
-python3 - "$selected" "$repository_ids" <<'PY' || die 'existing runner group repository access differs; no change made'
+python3 - "$selected" "$repository_ids" "${repository_names[@]}" <<'PY' || die 'existing runner group repository access differs; no change made'
 import json,sys
 from pathlib import Path
 response=json.load(open(sys.argv[1])); repositories=response.get('repositories',[])
 if response.get('total_count') != len(repositories): raise SystemExit(1)
 actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Path(sys.argv[2]).read_text().splitlines())
-if actual!=expected: raise SystemExit(1)
+actual_names=sorted(v['full_name'].lower() for v in repositories); expected_names=sorted(v.lower() for v in sys.argv[3:])
+if actual!=expected or actual_names!=expected_names: raise SystemExit(1)
 PY
 rm -f "$selected"
 
