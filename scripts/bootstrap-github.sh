@@ -229,11 +229,8 @@ for directory in "$etc_dir" "$secret_dir"; do
   fi
 done
 bootstrap_lock=$etc_dir/bootstrap.lock
-if [[ -e $bootstrap_lock || -L $bootstrap_lock ]]; then
-  [[ -f $bootstrap_lock && ! -L $bootstrap_lock && $(stat -c %a "$bootstrap_lock") == 600 && $(stat -c %u "$bootstrap_lock") == "$expected_uid" ]] || die 'bootstrap lock file is unsafe'
-else
-  install -m 0600 /dev/null "$bootstrap_lock"
-fi
+if [[ ! -e $bootstrap_lock && ! -L $bootstrap_lock ]]; then (set -o noclobber; : >"$bootstrap_lock") 2>/dev/null || true; fi
+[[ -f $bootstrap_lock && ! -L $bootstrap_lock && $(stat -c %a "$bootstrap_lock") == 600 && $(stat -c %u "$bootstrap_lock") == "$expected_uid" ]] || die 'bootstrap lock file is unsafe'
 exec {bootstrap_lock_fd}<>"$bootstrap_lock"
 flock -n "$bootstrap_lock_fd" || die 'another bootstrap transaction is active'
 if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
@@ -273,7 +270,7 @@ PY
 )
   code_file=$temporary/manifest-code
   handoff_file=$temporary/installation-url
-  python3 "$script_dir/bootstrap-github-callback.py" --bind "$bind" --port "$port" --organization "$organization" --state "$state" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
+  python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --bind "$bind" --port "$port" --organization "$organization" --state "$state" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
   callback_pid=$!
   note "REGISTRATION_URL http://$callback_host:$port/"
   note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
@@ -453,18 +450,40 @@ then
   die 'existing runner group is broader or has unexpected identity; no change made'
 fi
 rm -f "$response"
-selected=$temporary/group-repositories.json
-if ! write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories?per_page=100" "$selected"; then
-  if $created_group; then rollback_new_group || die 'new runner group repository inspection and rollback both failed'; die 'runner group repository inspection failed; new group was rolled back'; fi
-  die 'existing runner group repository inspection failed; no change made'
-fi
-if ! python3 - "$selected" "$repository_ids" "${repository_names[@]}" <<'PY'
+selected_pages=()
+selected_total=-1
+selected_seen=0
+page=1
+while :; do
+  selected=$temporary/group-repositories-$page.json
+  if ! write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories?per_page=100&page=$page" "$selected"; then
+    if $created_group; then rollback_new_group || die 'new runner group repository inspection and rollback both failed'; die 'runner group repository inspection failed; new group was rolled back'; fi
+    die 'existing runner group repository inspection failed; no change made'
+  fi
+  selected_pages+=("$selected")
+  stats=$(python3 - "$selected" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1])); repositories=value.get('repositories'); total=value.get('total_count')
+if not isinstance(total,int) or total < 0 or not isinstance(repositories,list) or len(repositories)>100: raise SystemExit(1)
+print(total,len(repositories))
+PY
+  ) || die 'runner group repository page is malformed'
+  read -r page_total page_count <<<"$stats"
+  if ((selected_total < 0)); then selected_total=$page_total; else ((page_total == selected_total)) || die 'runner group repository page totals differ'; fi
+  ((selected_seen += page_count))
+  ((selected_seen <= selected_total)) || die 'runner group repository pages exceed total_count'
+  ((selected_seen < selected_total)) || break
+  ((page_count > 0)) || die 'runner group repository pagination made no progress'
+  ((page += 1))
+done
+if ! python3 - "$repository_ids" "${repository_names[@]}" -- "${selected_pages[@]}" <<'PY'
 import json,sys
 from pathlib import Path
-response=json.load(open(sys.argv[1])); repositories=response.get('repositories',[])
-if response.get('total_count') != len(repositories): raise SystemExit(1)
-actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Path(sys.argv[2]).read_text().splitlines())
-actual_names=sorted(v['full_name'].lower() for v in repositories); expected_names=sorted(v.lower() for v in sys.argv[3:])
+separator=sys.argv.index('--'); expected_names=sorted(v.lower() for v in sys.argv[2:separator]); pages=sys.argv[separator+1:]
+responses=[json.load(open(path)) for path in pages]; repositories=[repository for response in responses for repository in response['repositories']]
+if any(response.get('total_count') != len(repositories) for response in responses): raise SystemExit(1)
+actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Path(sys.argv[1]).read_text().splitlines())
+actual_names=sorted(v['full_name'].lower() for v in repositories)
 if actual!=expected or actual_names!=expected_names or any(v.get('private') is not True or v.get('archived') is not False for v in repositories): raise SystemExit(1)
 PY
 then
@@ -474,7 +493,7 @@ then
   fi
   die 'existing runner group repository access differs; no change made'
 fi
-rm -f "$selected"
+rm -f "${selected_pages[@]}"
 created_group=false
 
 staged=$temporary/host.env

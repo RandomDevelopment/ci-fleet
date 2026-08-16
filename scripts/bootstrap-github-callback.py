@@ -27,8 +27,8 @@ class Callback(http.server.BaseHTTPRequestHandler):
     def app_server(self) -> Server:
         return cast(Server, self.server)
 
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
 
     def reply(self, status: int, body: str) -> None:
         data = body.encode()
@@ -99,6 +99,7 @@ class Callback(http.server.BaseHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", required=True)
+    parser.add_argument("--parent-pid", required=True, type=int)
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--organization", required=True)
     parser.add_argument("--state", required=True)
@@ -109,10 +110,11 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 30 <= args.timeout <= 1800:
         parser.error("invalid port or timeout")
-    parent = os.getppid()
+    if os.getppid() != args.parent_pid:
+        return 2
     if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM) != 0:
         raise OSError(ctypes.get_errno(), "cannot bind callback lifetime to bootstrap")
-    if os.getppid() != parent:
+    if os.getppid() != args.parent_pid:
         return 2
     server = Server((args.bind, args.port), Callback)
     server.organization = args.organization

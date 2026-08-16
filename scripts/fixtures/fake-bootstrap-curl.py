@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import urllib.parse
 
 config = Path(sys.argv[sys.argv.index("--config") + 1]).read_text().splitlines()
 values = {}
@@ -51,7 +52,12 @@ elif endpoint.endswith("/actions/runner-groups"):
     response = {"total_count": len(groups), "runner_groups": groups}
 elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
-    response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}]}
+    page = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("page", ["1"])[0])
+    if os.environ.get("FAKE_BOOTSTRAP_SECOND_GROUP_PAGE") == "1":
+        repositories = [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}] if page == 1 else [{"id": 102, "full_name": "example-org/second-repo", "private": True, "archived": False}] if page == 2 else []
+        response = {"total_count": 2, "repositories": repositories}
+    else:
+        response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}]}
 elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
     kind = "runner-group-delete"
     state.unlink(missing_ok=True)
