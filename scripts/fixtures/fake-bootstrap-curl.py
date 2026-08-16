@@ -50,6 +50,10 @@ elif endpoint.endswith("/actions/runner-groups"):
 elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
     response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True}]}
+elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
+    kind = "runner-group-delete"
+    state.unlink(missing_ok=True)
+    response = {}
 elif endpoint.endswith("/actions/runner-groups/789"):
     kind = "runner-group"
     response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False, "restricted_to_workflows": False}
