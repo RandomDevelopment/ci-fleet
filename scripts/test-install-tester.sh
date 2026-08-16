@@ -207,7 +207,7 @@ rollback_state_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/roll
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state") == "$rollback_state_hash" ]] || fail 'rollback changed active environment state'
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --remove --environment rollback-env >/dev/null
 
-lock_file=$root/run/lock/ci-fleet-tester.lock
+lock_file=$root/run/lock/ci-fleet-tester/runtime.lock
 lock_ready=$tmp/lock-ready
 flock "$lock_file" -c "touch '$lock_ready'; sleep 1" & lock_pid=$!
 while [[ ! -e $lock_ready ]]; do kill -0 "$lock_pid" 2>/dev/null || fail 'could not acquire fixture lifecycle lock'; done
