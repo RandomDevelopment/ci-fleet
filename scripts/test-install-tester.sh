@@ -4,7 +4,8 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 runtime=$repo_root/scripts/tester-runtime.sh
 installer=$repo_root/scripts/install-tester.sh
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup() { chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"; }
+trap cleanup EXIT
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 root=$tmp/root
 fake_bin=$tmp/bin
@@ -112,7 +113,7 @@ for unit in ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet
 release=$root/opt/ci-fleet-tester/releases/$ref
 chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'tampered installed release passed check'; fi
-git -C "$repo_root" show "$ref:scripts/tester-runtime.sh" >"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
+chmod u+w "$release/scripts/tester-runtime.sh"; git -C "$repo_root" show "$ref:scripts/tester-runtime.sh" >"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'restored release failed check'
 
 # A syntactically valid candidate that fails its post-switch check restores the incumbent.

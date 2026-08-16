@@ -187,7 +187,9 @@ case $action in
     ensure_directories
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
     remove_units
-    rm -f -- "$current_link" "$lkg_file"; rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
+    rm -f -- "$current_link" "$lkg_file"
+    [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
+    rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
     report 'UNINSTALL_OK preserved_config=true preserved_definitions=true preserved_secrets=true'
     ;;
 esac
