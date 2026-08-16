@@ -62,20 +62,20 @@ install_mismatch_root=$tmp/install-mismatch-root
 if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$install_mismatch_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --install --config-repo example-org/other --config-ref 1111111111111111111111111111111111111111 >/dev/null 2>&1; then fail 'mismatched installer configuration repository was accepted'; fi
 [[ ! -e $install_mismatch_root ]] || fail 'mismatched installer repository wrote local state before rejection'
 config_checkout=$tmp/config-checkout
+mkdir "$config_checkout"
+cp -a "$repo_root/templates/config-repository/." "$config_checkout/"
+fixture_engine_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["controllers"]["example-ci-01"]["engine_ref"])' "$config_checkout/fleet.json")
+python3 "$repo_root/templates/config-repository/scripts/init.py" --organization acme-org --project example-repo --repository acme-org/example-repo --runner-group example-ci-experimental --controller example-ci-01 --location example-site --engine-ref "$fixture_engine_ref" --output "$config_checkout/fleet.json" --force
 git init -q "$config_checkout"
-python3 - "$config_checkout/fleet.json" <<'PY'
-import json,sys
-json.dump({'organization':{'slug':'example-org'},'controllers':{'example-ci-01':{'pool':'trusted'}},'runner_pools':{'trusted':{'runner_group':'example-ci-experimental','allowed_repositories':['example-org/example-repo'],'public_repositories':False}}},open(sys.argv[1],'w'))
-PY
-git -C "$config_checkout" add fleet.json
+git -C "$config_checkout" add -A
 git -C "$config_checkout" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
 config_ref=$(git -C "$config_checkout" rev-parse HEAD)
 routing_mismatch_root=$tmp/routing-mismatch-root
-if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_mismatch_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group other-group --allow-repository example-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" >/dev/null 2>&1; then fail 'desired-state routing mismatch was accepted'; fi
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_mismatch_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group other-group --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" >/dev/null 2>&1; then fail 'desired-state routing mismatch was accepted'; fi
 [[ ! -e $routing_mismatch_root ]] || fail 'desired-state routing mismatch wrote local state before rejection'
 routing_root=$tmp/routing-root
 routing_port=$(port)
-CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$routing_port" --timeout 30 >"$tmp/routing.out" 2>"$tmp/routing.err" &
+CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$routing_port" --timeout 30 >"$tmp/routing.out" 2>"$tmp/routing.err" &
 routing_pid=$!
 processes+=("$routing_pid")
 wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html"
