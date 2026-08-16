@@ -120,8 +120,10 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc'): raise SystemExit(f'{name}: external namespace/privileged access is forbidden')
-    if service.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket'): raise SystemExit(f'{name}: device/capability/global identity is forbidden')
+    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external namespace/privileged lifecycle access is forbidden')
+    deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
+    if service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: device/capability/external mount/global identity is forbidden')
+    if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
     if not any(re.fullmatch(r'no-new-privileges[:=]true', option) for option in service.get('security_opt',[])): raise SystemExit(f'{name}: no-new-privileges=true is required')
@@ -136,6 +138,7 @@ for section in ('networks','volumes'):
     for name,item in value.get(section,{}).items():
         resolved=item.get('name',f'{project}_{name}')
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
+        if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
 for name,item in value.get('secrets',{}).items():
     path=item.get('file')
