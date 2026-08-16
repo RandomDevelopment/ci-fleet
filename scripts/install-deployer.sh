@@ -364,7 +364,7 @@ require_host() {
   DOCKER_HOST=unix://$(root_path /run/docker.sock)
   export DOCKER_HOST
   unset DOCKER_CONTEXT
-  for command in bash awk cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
+  for command in bash awk base64 cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
   local os_release
