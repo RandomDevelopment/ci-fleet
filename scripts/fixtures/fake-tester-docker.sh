@@ -44,6 +44,8 @@ case ${operation:-} in
       lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
       gpu) service_extra=',"gpus":"all"' ;;
       deploy-device) service_extra=',"deploy":{"resources":{"reservations":{"devices":[{"capabilities":["gpu"]}]}}}' ;;
+      build) service_extra=',"build":{"context":"/"}' ;;
+      changed-model) service_extra=',"pull_policy":"always"' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
