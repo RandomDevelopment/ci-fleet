@@ -74,10 +74,10 @@ The command fails before mutation unless it sees Debian 12 or newer, root, the l
 The runtime command is the one interface for create/update, inspect, reset, and removal:
 
 ```bash
-sudo /opt/ci-fleet-tester/current/scripts/tester-runtime.sh --converge --environment example-preview
-sudo /opt/ci-fleet-tester/current/scripts/tester-runtime.sh --inspect --environment example-preview
-sudo /opt/ci-fleet-tester/current/scripts/tester-runtime.sh --reset --environment example-preview
-sudo /opt/ci-fleet-tester/current/scripts/tester-runtime.sh --remove --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --converge --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --inspect --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --reset --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --remove --environment example-preview
 ```
 
 `--converge` validates the full resolved Compose model before `up --wait`. `--reset` removes only that exact Compose project and its volumes, then recreates it from the approved definition and digest. `--remove` uses the same scoped `compose down --volumes`; no global Docker prune is used. State reports only environment/project/owner, loopback route, expiry, source revision, timestamps, and health—not Compose environment values or secret content.

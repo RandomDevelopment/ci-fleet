@@ -37,6 +37,7 @@ repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --show-toplevel
 opt_dir=$(root_path /opt/ci-fleet-tester)
 release_dir=$opt_dir/releases
 current_link=$opt_dir/current
+stable_launcher=$opt_dir/tester-runtime
 state_root=$(root_path /var/lib/ci-fleet-tester)
 lkg_file=$state_root/last-known-good
 systemd_dir=$(root_path /etc/systemd/system)
@@ -47,7 +48,7 @@ secret_root=$config_root/secrets
 runtime_state=$state_root/environments
 docker_root=$(root_path /var/lib/docker)
 docker_socket=$(root_path /var/run/docker.sock)
-runtime_lock=$(root_path /run/lock/ci-fleet-tester.lock)
+runtime_lock=$(root_path /run/lock/ci-fleet-tester/runtime.lock)
 units=(ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer)
 timers=(ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer)
 
@@ -99,7 +100,7 @@ ensure_directories() {
 
 release_complete() {
   local path=$1 expected=$2 unit
-  [[ -d $path && ! -L $path && $(stat -c %u "$path") == "$expected_uid" && $(stat -c %a "$path") == 555 && -x $path/scripts/tester-runtime.sh && -f $path/.ci-fleet-source-revision ]] || return 1
+  [[ -d $path && ! -L $path && $(stat -c %u "$path") == "$expected_uid" && $(stat -c %a "$path") == 555 && -x $path/scripts/tester-runtime.sh && -x $path/scripts/tester-launcher.sh && -f $path/.ci-fleet-source-revision ]] || return 1
   [[ $(<"$path/.ci-fleet-source-revision") == "$expected" ]] || return 1
   for unit in "${units[@]}"; do [[ -f $path/host/systemd/$unit ]] || return 1; done
   (cd "$path" && sha256sum --status -c .ci-fleet-release.sha256) || return 1
@@ -110,12 +111,12 @@ stage_release() {
   if [[ -e $target ]] && release_complete "$target" "$commit"; then return; fi
   remove_release_tree "$staging"; remove_release_tree "$replaced"; install -d -m 0755 "$staging"
   GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" cat-file -e "$commit^{commit}" 2>/dev/null || die 'requested source commit is unavailable locally'
-  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
+  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh scripts/tester-launcher.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
   printf '%s\n' "$commit" >"$staging/.ci-fleet-source-revision"; chmod 0644 "$staging/.ci-fleet-source-revision"
-  chmod 0755 "$staging/scripts/tester-runtime.sh"; shellcheck "$staging/scripts/tester-runtime.sh"; bash -n "$staging/scripts/tester-runtime.sh"
-  (cd "$staging" && sha256sum scripts/tester-runtime.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
+  chmod 0755 "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; shellcheck "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; bash -n "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"
+  (cd "$staging" && sha256sum scripts/tester-runtime.sh scripts/tester-launcher.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
   chmod 0444 "$staging/.ci-fleet-source-revision" "$staging/.ci-fleet-release.sha256" "$staging"/host/systemd/*
-  chmod 0555 "$staging" "$staging/scripts" "$staging/host" "$staging/host/systemd" "$staging/scripts/tester-runtime.sh"
+  chmod 0555 "$staging" "$staging/scripts" "$staging/host" "$staging/host/systemd" "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"
   [[ ! -e $target ]] || mv -T "$target" "$replaced"
   if ! mv -T "$staging" "$target"; then [[ ! -e $replaced ]] || mv -T "$replaced" "$target"; die 'could not replace tester release'; fi
   remove_release_tree "$replaced"
@@ -129,6 +130,7 @@ install_units() {
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
+install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
   systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
@@ -151,13 +153,13 @@ activate_release() {
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-  if ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
+  if ! install_launcher "$target" || ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-      if ! install_units "$release_dir/$previous" || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; incumbent link retained for recovery'; fi
+      if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; launcher and incumbent link retained for recovery'; fi
     else
       remove_units || die 'candidate activation failed and fresh-install unit teardown also failed; candidate retained for recovery'
-      rm -f -- "$current_link"
+      rm -f -- "$current_link" "$stable_launcher"
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
@@ -191,6 +193,7 @@ case $action in
     secure_file "$(root_path "$config")" 600
     current=$(installed_revision) || die 'tester is not installed'
     release_complete "$release_dir/$current" "$current" || die 'installed release is incomplete'
+    cmp -s "$release_dir/$current/scripts/tester-launcher.sh" "$stable_launcher" || die 'installed launcher differs from active release'
     for unit in "${units[@]}"; do cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"; done
     for timer in "${timers[@]}"; do
       if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then die "timer is inactive: $timer"; fi
@@ -215,7 +218,7 @@ case $action in
     ensure_directories
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
     remove_units || die 'could not stop and disable tester maintenance units'
-    rm -f -- "$current_link" "$lkg_file"
+    rm -f -- "$current_link" "$stable_launcher" "$lkg_file"
     [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
     rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
     report 'UNINSTALL_OK preserved_config=true preserved_definitions=true preserved_secrets=true'

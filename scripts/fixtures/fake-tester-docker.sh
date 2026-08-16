@@ -51,6 +51,8 @@ case ${operation:-} in
       external-links) service_extra=',"external_links":["other-environment-db:db"]' ;;
       userns-host) service_extra=',"userns_mode":"host"' ;;
       cgroup-host) service_extra=',"cgroup":"host"' ;;
+      uts-host) service_extra=',"uts":"host"' ;;
+      remote-logging) service_extra=',"logging":{"driver":"syslog","options":{"syslog-address":"tcp://example.invalid:514"}}' ;;
       interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
