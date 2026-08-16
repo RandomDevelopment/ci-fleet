@@ -28,7 +28,7 @@ elif endpoint.endswith("/app"):
                 "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
 elif endpoint.endswith("/app/installations"):
     kind = "installations"
-    response = [{"id": 456, "account": {"login": "example-org", "type": "Organization"}}]
+    response = [{"id": 456, "repository_selection": "selected", "account": {"login": "example-org", "type": "Organization"}}]
 elif endpoint.endswith("/access_tokens"):
     kind = "installation-token"
     response = {"token": "fixture-installation-token-value"}
@@ -42,19 +42,25 @@ elif "/installation/repositories" in url:
 elif endpoint.endswith("/actions/runner-groups") and method == "POST":
     kind = "runner-group-create"
     state.write_text("created\n")
-    response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False}
+    response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False}
 elif endpoint.endswith("/actions/runner-groups"):
     kind = "runner-groups"
-    groups = [{"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False}] if state.exists() else []
+    groups = [{"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False}] if state.exists() else []
     response = {"total_count": len(groups), "runner_groups": groups}
 elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
     response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True}]}
 elif endpoint.endswith("/actions/runner-groups/789"):
     kind = "runner-group"
-    response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False}
+    response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False}
 else:
     raise SystemExit(f"unexpected fake API request: {method} {url}")
+if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_ALL_REPOSITORIES") == "1":
+    response[0]["repository_selection"] = "all"
+if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_PUBLIC_GROUP") == "1":
+    (response["runner_groups"][0] if kind == "runner-groups" else response)["allows_public_repositories"] = True
+if kind == os.environ.get("FAKE_BOOTSTRAP_TRUNCATE_KIND"):
+    response["total_count"] += 1
 with Path(os.environ["FAKE_BOOTSTRAP_LOG"]).open("a") as log:
     log.write(f"{method} {kind}\n")
 output.write_text(json.dumps(response))

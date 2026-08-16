@@ -51,6 +51,13 @@ grep -Fq 'NO_GITHUB_MUTATION' "$tmp/dry.out" || fail 'dry-run omitted its no-mut
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group Default --allow-repository example-org/example-repo >/dev/null 2>&1; then
   fail 'default runner group was accepted'
 fi
+if "$bootstrap" --dry-run --organization example-org --instance example.ci --runner-group example-ci-experimental --allow-repository example-org/example-repo >/dev/null 2>&1; then
+  fail 'instance outside the installer contract was accepted'
+fi
+if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
+  --allow-repository example-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
+  fail 'plaintext non-loopback callback was accepted'
+fi
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo --bind 0.0.0.0 --callback-host 0.0.0.0 >/dev/null 2>&1; then
   fail 'unspecified callback bind was accepted'
@@ -73,8 +80,8 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$tmp/fixture.
 export FAKE_BOOTSTRAP_STATE=$tmp/group-created FAKE_BOOTSTRAP_PEM_FILE=$tmp/fixture.pem FAKE_BOOTSTRAP_LOG=$tmp/api.log
 live_root=$tmp/live-root
 live_port=$(port)
-PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
-  --runner-group example-ci-experimental --allow-repository example-org/example-repo --port "$live_port" --timeout 30 >"$tmp/live.out" 2>"$tmp/live.err" &
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_FAIL_AFTER_CONVERSION=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --runner-group example-ci-experimental --allow-repository example-org/example-repo --port "$live_port" --timeout 30 >"$tmp/fault.out" 2>"$tmp/fault.err" &
 live_pid=$!
 processes+=("$live_pid")
 wait_http "http://127.0.0.1:$live_port/" "$tmp/live.html"
@@ -88,14 +95,17 @@ PY
 )
 "$real_curl" -fsS --get --data-urlencode code=fixture-conversion-code --data-urlencode "state=$state" \
   "http://127.0.0.1:$live_port/callback" -o "$tmp/live-callback.html"
-wait "$live_pid"
+if wait "$live_pid"; then fail 'injected post-conversion failure succeeded'; fi
+[[ -f $live_root/etc/ci-fleet/bootstrap-recovery.json && ! -e $live_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'converted credentials were not left recoverable'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --runner-group example-ci-experimental --allow-repository example-org/example-repo --port "$live_port" --timeout 30 >"$tmp/live.out" 2>"$tmp/live.err"
 grep -Fq 'BOOTSTRAP_OK organization=example-org instance=example-ci-01 app=ci-fleet-example-org-example-ci-01 app_id=123 installation_id=456 runner_group=example-ci-experimental runner_group_id=789 repositories=1' "$tmp/live.out" || fail 'live bootstrap did not complete'
 host_env=$live_root/etc/ci-fleet/host.env
 pem=$live_root/etc/ci-fleet/secrets/github-app.pem
 [[ -f $host_env && -f $pem && $(stat -c %a "$host_env") == 600 && $(stat -c %a "$pem") == 600 ]] || fail 'credentials were not stored with mode 0600'
 grep -Fxq 'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1FixtureClient' "$host_env" || fail 'client ID was not recorded'
 grep -Fxq 'CI_FLEET_GITHUB_APP_INSTALLATION_ID=456' "$host_env" || fail 'installation ID was not recorded'
-[[ ! -e $live_root/etc/ci-fleet/bootstrap-app.env ]] || fail 'partial bootstrap metadata survived success'
+[[ -f $live_root/etc/ci-fleet/bootstrap-app.env && ! -e $live_root/etc/ci-fleet/bootstrap-recovery.json ]] || fail 'durable identity or recovery cleanup is incorrect'
 if grep -R -F -e fixture-conversion-code -e fixture-client-secret -e fixture-webhook-secret -e fixture-installation-token-value "$tmp/live.out" "$tmp/live.err" "$tmp/api.log"; then
   fail 'bootstrap output exposed sensitive fixture material'
 fi
@@ -107,5 +117,16 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$boot
 [[ $(sha256sum "$host_env" "$pem") == "$before" ]] || fail 'check mode changed credentials'
 grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not verify persisted credentials'
 [[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == 1 ]] || fail 'check mode mutated the runner group'
+
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance other-ci-01 \
+  --runner-group example-ci-experimental --allow-repository example-org/example-repo >/dev/null 2>&1; then fail 'persisted App was rebound to another instance'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_ALL_REPOSITORIES=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --runner-group example-ci-experimental --allow-repository example-org/example-repo >/dev/null 2>&1; then fail 'all-repository installation was accepted'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_PUBLIC_GROUP=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --runner-group example-ci-experimental --allow-repository example-org/example-repo >/dev/null 2>&1; then fail 'public-repository runner group was accepted'; fi
+for kind in installation-repositories runner-groups runner-group-repositories; do
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_TRUNCATE_KIND=$kind "$bootstrap" --check --organization example-org --instance example-ci-01 \
+    --runner-group example-ci-experimental --allow-repository example-org/example-repo >/dev/null 2>&1; then fail "truncated $kind page was accepted"; fi
+done
 
 printf 'BOOTSTRAP_TESTS_OK\n'
