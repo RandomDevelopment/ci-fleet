@@ -36,7 +36,7 @@ while (($#)); do
   esac
 done
 [[ $organization =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || die 'invalid organization'
-[[ $instance =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || die 'invalid instance identity'
+[[ $instance =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'invalid instance identity'
 [[ $runner_group =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ && ${runner_group,,} != default ]] || die 'runner group must be explicit and non-default'
 ((${#repositories[@]} > 0)) || die 'at least one --allow-repository is required'
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die 'invalid callback port'
@@ -61,6 +61,7 @@ secret_dir=$etc_dir/secrets
 pem=$secret_dir/github-app.pem
 host_env=$etc_dir/host.env
 bootstrap_state=$etc_dir/bootstrap-app.env
+bootstrap_recovery=$etc_dir/bootstrap-recovery.json
 temporary=$(mktemp -d)
 callback_pid=
 expected_uid=0
@@ -75,12 +76,12 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run live/check bootstrap as root'; fi
-python3 - "$bind" "$callback_host" <<'PY' || die 'callback bind/host must be loopback or private IP addresses'
+python3 - "$bind" "$callback_host" <<'PY' || die 'callback bind/host must be the same loopback IP address'
 import ipaddress, sys
 addresses=[ipaddress.ip_address(value) for value in sys.argv[1:]]
 if addresses[0] != addresses[1]: raise SystemExit(1)
 address=addresses[0]
-if address.is_unspecified or not (address.is_loopback or address.is_private): raise SystemExit(1)
+if not address.is_loopback: raise SystemExit(1)
 PY
 
 write_auth_config() {
@@ -119,17 +120,38 @@ load_metadata() {
     # shellcheck disable=SC1090
     . "$bootstrap_state"
     [[ ${CI_FLEET_BOOTSTRAP_ORGANIZATION:-} == "$organization" && ${CI_FLEET_BOOTSTRAP_INSTANCE:-} == "$instance" ]] || die 'existing bootstrap state belongs to another identity'
-  elif [[ -f $host_env && ! -L $host_env && $(stat -c %a "$host_env") == 600 && $(stat -c %u "$host_env") == "$expected_uid" ]]; then
-    # shellcheck disable=SC1090
-    . "$host_env"
-    CI_FLEET_GITHUB_APP_ID=${CI_FLEET_GITHUB_APP_CLIENT_ID:-}
-    CI_FLEET_GITHUB_APP_SLUG=
+    if [[ -e $host_env || -L $host_env ]]; then
+      [[ -f $host_env && ! -L $host_env && $(stat -c %a "$host_env") == 600 && $(stat -c %u "$host_env") == "$expected_uid" ]] || die 'existing host configuration is invalid'
+      # shellcheck disable=SC1090
+      . "$host_env"
+    fi
   else
     return 1
   fi
-  [[ ${CI_FLEET_GITHUB_APP_ID:-} =~ ^([0-9]+|(Iv1\.)?[A-Za-z0-9]+)$ && ${CI_FLEET_GITHUB_APP_CLIENT_ID:-} =~ ^(Iv1\.)?[A-Za-z0-9]+$ && ( -z ${CI_FLEET_GITHUB_APP_SLUG:-} || ${CI_FLEET_GITHUB_APP_SLUG:-} =~ ^[a-z0-9-]+$ ) ]] || die 'existing bootstrap state is invalid'
+  [[ ${CI_FLEET_GITHUB_APP_ID:-} =~ ^([0-9]+|(Iv1\.)?[A-Za-z0-9]+)$ && ${CI_FLEET_GITHUB_APP_CLIENT_ID:-} =~ ^(Iv1\.)?[A-Za-z0-9]+$ && ${CI_FLEET_GITHUB_APP_SLUG:-} =~ ^[a-z0-9-]+$ ]] || die 'existing bootstrap state is invalid'
   [[ ${CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE:-/etc/ci-fleet/secrets/github-app.pem} == /etc/ci-fleet/secrets/github-app.pem ]] || die 'existing bootstrap PEM path is unsupported'
   [[ -f $pem && ! -L $pem && $(stat -c %a "$pem") == 600 && $(stat -c %u "$pem") == "$expected_uid" ]] || die 'existing bootstrap PEM is invalid'
+}
+
+recover_conversion() {
+  [[ -f $bootstrap_recovery && ! -L $bootstrap_recovery && $(stat -c %a "$bootstrap_recovery") == 600 && $(stat -c %u "$bootstrap_recovery") == "$expected_uid" ]] || die 'bootstrap recovery record is invalid'
+  local staged_pem=$temporary/recovered.pem staged_state=$temporary/recovered.env
+  python3 - "$bootstrap_recovery" "$staged_pem" "$staged_state" "$organization" "$instance" <<'PY' || die 'bootstrap recovery record is malformed'
+import json, os, re, sys
+from pathlib import Path
+source, pem, state = map(Path, sys.argv[1:4]); organization, instance = sys.argv[4:]
+value=json.loads(source.read_text())
+if not isinstance(value.get('pem'),str) or 'PRIVATE KEY' not in value['pem']: raise SystemExit(1)
+if not isinstance(value.get('id'),int) or not re.fullmatch(r'(Iv1\.)?[A-Za-z0-9]+',str(value.get('client_id',''))): raise SystemExit(1)
+slug=str(value.get('slug',''))
+if slug != f'ci-fleet-{organization}-{instance}' or not re.fullmatch(r'[a-z0-9-]+',slug): raise SystemExit(1)
+pem.write_text(value['pem']); os.chmod(pem,0o600)
+state.write_text(f'CI_FLEET_BOOTSTRAP_ORGANIZATION={organization}\nCI_FLEET_BOOTSTRAP_INSTANCE={instance}\nCI_FLEET_GITHUB_APP_ID={value["id"]}\nCI_FLEET_GITHUB_APP_CLIENT_ID={value["client_id"]}\nCI_FLEET_GITHUB_APP_SLUG={slug}\n'); os.chmod(state,0o600)
+PY
+  install -m 0600 "$staged_pem" "$pem"
+  install -m 0600 "$staged_state" "$bootstrap_state"
+  load_metadata
+  rm -f "$bootstrap_recovery"
 }
 
 if [[ $mode == dry-run ]]; then
@@ -146,6 +168,10 @@ for directory in "$etc_dir" "$secret_dir"; do
     install -d -m 0700 "$directory"
   fi
 done
+if [[ -e $bootstrap_recovery || -L $bootstrap_recovery ]]; then
+  [[ $mode != check ]] || die 'bootstrap credential recovery is pending; rerun live bootstrap first'
+  recover_conversion
+fi
 if ! load_metadata; then
   [[ $mode != check ]] || die 'bootstrap state is missing; run live bootstrap first'
   [[ ! -e $pem && ! -L $pem && ! -e $host_env && ! -L $host_env ]] || die 'existing credentials lack matching bootstrap identity; no replacement made'
@@ -174,9 +200,8 @@ PY
     sleep 1
   done
   [[ -f $code_file ]] || die 'registration callback timed out'
-  conversion=$temporary/conversion.json
   conversion_config=$temporary/conversion.conf
-  python3 - "$code_file" "$conversion" "$conversion_config" <<'PY'
+  python3 - "$code_file" "$bootstrap_recovery" "$conversion_config" <<'PY'
 from pathlib import Path
 import sys
 code_file, output, config = map(Path, sys.argv[1:])
@@ -187,22 +212,11 @@ config.write_text('\n'.join(['silent','show-error','fail-with-body','request = "
  'header = "Accept: application/vnd.github+json"','header = "X-GitHub-Api-Version: 2022-11-28"']) + '\n')
 PY
   chmod 600 "$conversion_config"
-  curl --config "$conversion_config"
+  if ! curl --config "$conversion_config"; then rm -f "$bootstrap_recovery"; die 'manifest conversion failed'; fi
+  chmod 600 "$bootstrap_recovery"
   rm -f "$code_file" "$conversion_config"
-  python3 - "$conversion" "$pem" "$bootstrap_state" "$organization" "$instance" <<'PY'
-import json, os, re, sys
-from pathlib import Path
-source, pem, state = map(Path, sys.argv[1:4]); organization, instance = sys.argv[4:]
-value=json.loads(source.read_text())
-if not isinstance(value.get('pem'),str) or 'PRIVATE KEY' not in value['pem']: raise SystemExit(1)
-if not isinstance(value.get('id'),int) or not re.fullmatch(r'(Iv1\.)?[A-Za-z0-9]+',str(value.get('client_id',''))): raise SystemExit(1)
-slug=str(value.get('slug',''))
-if not re.fullmatch(r'[a-z0-9-]+',slug): raise SystemExit(1)
-pem.write_text(value['pem']); os.chmod(pem,0o600)
-state.write_text(f'CI_FLEET_BOOTSTRAP_ORGANIZATION={organization}\nCI_FLEET_BOOTSTRAP_INSTANCE={instance}\nCI_FLEET_GITHUB_APP_ID={value["id"]}\nCI_FLEET_GITHUB_APP_CLIENT_ID={value["client_id"]}\nCI_FLEET_GITHUB_APP_SLUG={slug}\n'); os.chmod(state,0o600)
-PY
-  rm -f "$conversion"
-  load_metadata
+  if [[ ${CI_FLEET_TEST_FAIL_AFTER_CONVERSION:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected failure after manifest conversion'; fi
+  recover_conversion
 fi
 
 app_jwt=$temporary/app.jwt
@@ -234,12 +248,13 @@ if [[ -z $installation_id ]]; then
   deadline=$((SECONDS + timeout))
   while ((SECONDS < deadline)); do
     installations=$temporary/installations.json
+    make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
     if write_auth_config "$app_jwt" GET https://api.github.com/app/installations "$installations"; then
       installation_id=$(python3 - "$installations" "$organization" <<'PY'
 import json,sys
 for value in json.load(open(sys.argv[1])):
     account=value.get('account',{})
-    if account.get('type')=='Organization' and account.get('login','').lower()==sys.argv[2].lower():
+    if value.get('repository_selection')=='selected' and account.get('type')=='Organization' and account.get('login','').lower()==sys.argv[2].lower():
         print(value['id']); break
 PY
 )
@@ -251,9 +266,23 @@ PY
   [[ $installation_id =~ ^[0-9]+$ ]] || die 'GitHub App installation was not observed before timeout'
 fi
 
+make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
+installations=$temporary/installations.json
+write_auth_config "$app_jwt" GET https://api.github.com/app/installations "$installations"
+python3 - "$installations" "$organization" "$installation_id" <<'PY' || die 'App installation identity or repository selection is unexpected'
+import json,sys
+matches=[]
+for value in json.load(open(sys.argv[1])):
+    account=value.get('account',{})
+    if str(value.get('id'))==sys.argv[3] and account.get('type')=='Organization' and account.get('login','').lower()==sys.argv[2].lower() and value.get('repository_selection')=='selected': matches.append(value)
+if len(matches)!=1: raise SystemExit(1)
+PY
+rm -f "$installations"
+
 installation_response=$temporary/installation-token.json
 empty_payload=$temporary/empty.json
 printf '{}\n' >"$empty_payload"
+make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
 write_auth_config "$app_jwt" POST "https://api.github.com/app/installations/$installation_id/access_tokens" "$installation_response" "$empty_payload"
 installation_token=$temporary/installation.token
 python3 - "$installation_response" "$installation_token" <<'PY'
@@ -284,7 +313,9 @@ visible=$temporary/visible.json
 write_auth_config "$installation_token" GET 'https://api.github.com/installation/repositories?per_page=100' "$visible"
 python3 - "$visible" "${repositories[@]}" <<'PY' || die 'App installation repository access is broader or narrower than requested'
 import json,sys
-actual=sorted(v['full_name'].lower() for v in json.load(open(sys.argv[1])).get('repositories',[]))
+value=json.load(open(sys.argv[1])); repositories=value.get('repositories',[])
+if value.get('total_count') != len(repositories): raise SystemExit(1)
+actual=sorted(v['full_name'].lower() for v in repositories)
 expected=sorted(v.lower() for v in sys.argv[2:])
 if actual != expected: raise SystemExit(1)
 PY
@@ -294,7 +325,9 @@ groups=$temporary/groups.json
 write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups?per_page=100" "$groups"
 group_id=$(python3 - "$groups" "$runner_group" <<'PY'
 import json,sys
-for value in json.load(open(sys.argv[1])).get('runner_groups',[]):
+response=json.load(open(sys.argv[1])); groups=response.get('runner_groups',[])
+if response.get('total_count') != len(groups): raise SystemExit(1)
+for value in groups:
     if value.get('name')==sys.argv[2]: print(value['id']); break
 PY
 )
@@ -306,7 +339,7 @@ if [[ -z $group_id ]]; then
 import json,sys
 from pathlib import Path
 ids=[int(v) for v in Path(sys.argv[3]).read_text().splitlines()]
-Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','selected_repository_ids':ids}))
+Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'selected_repository_ids':ids}))
 PY
   response=$temporary/group.json
   write_auth_config "$installation_token" POST "https://api.github.com/orgs/$organization/actions/runner-groups" "$response" "$payload"
@@ -323,7 +356,7 @@ write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organi
 python3 - "$response" "$runner_group" <<'PY' || die 'existing runner group is broader or has unexpected identity; no change made'
 import json,sys
 v=json.load(open(sys.argv[1]))
-if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default'): raise SystemExit(1)
+if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('allows_public_repositories') is not False: raise SystemExit(1)
 PY
 rm -f "$response"
 selected=$temporary/group-repositories.json
@@ -331,7 +364,9 @@ write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organi
 python3 - "$selected" "$repository_ids" <<'PY' || die 'existing runner group repository access differs; no change made'
 import json,sys
 from pathlib import Path
-actual=sorted(v['id'] for v in json.load(open(sys.argv[1])).get('repositories',[])); expected=sorted(int(v) for v in Path(sys.argv[2]).read_text().splitlines())
+response=json.load(open(sys.argv[1])); repositories=response.get('repositories',[])
+if response.get('total_count') != len(repositories): raise SystemExit(1)
+actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Path(sys.argv[2]).read_text().splitlines())
 if actual!=expected: raise SystemExit(1)
 PY
 rm -f "$selected"
@@ -342,7 +377,6 @@ if [[ $mode == check ]]; then
   cmp -s "$staged" "$host_env" || die 'host configuration differs from verified GitHub state'
 else
   install -m 0600 "$staged" "$host_env"
-  rm -f "$bootstrap_state"
 fi
 note "BOOTSTRAP_OK organization=$organization instance=$instance app=$CI_FLEET_GITHUB_APP_SLUG app_id=$verified_app_id installation_id=$installation_id runner_group=$runner_group runner_group_id=$group_id repositories=${#repositories[@]}"
 if [[ $mode == check ]]; then note "CREDENTIALS_VERIFIED pem=$pem host_config=$host_env"; else note "CREDENTIALS_WRITTEN pem=$pem host_config=$host_env"; fi

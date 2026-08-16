@@ -18,9 +18,9 @@ organization, app name, and configuration repository.
 
 ## Bootstrap on the target host
 
-Run the reviewed checkout on the target Linux Docker host. The callback defaults
-to loopback. For phone-first use, explicitly choose one private address that the
-phone can reach; the script rejects public callback addresses.
+Run the reviewed checkout on the target Linux Docker host. The plaintext callback
+is loopback-only; non-loopback callbacks are rejected because the one-time
+manifest conversion code requires transport confidentiality.
 
 ```bash
 sudo ./scripts/bootstrap-github.sh \
@@ -29,10 +29,6 @@ sudo ./scripts/bootstrap-github.sh \
   --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo
 ```
-
-For phone access, append `--bind PRIVATE_IP --callback-host PRIVATE_IP` using the
-same explicitly selected host-local private address; do not publish that address
-in Git, logs, or support messages.
 
 All names above are fictional. The script prints one non-secret local
 `REGISTRATION_URL`. Open it, press the single registration button, install the
