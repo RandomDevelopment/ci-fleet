@@ -180,11 +180,14 @@ prepare_converge() {
   [[ -f $(state_path "$environment") || $count -private-repository $max_environments ]] || die 'maximum environment count reached'
   prepared_rendered=$(mktemp)
   if ! validate_compose "$prepared_rendered"; then rm -f "$prepared_rendered"; die 'compose policy validation failed'; fi
-  if [[ $action == --converge && -f $(state_path "$environment") ]] && ! cmp -s "$prepared_rendered" "$(deployed_compose_path "$environment")"; then rm -f "$prepared_rendered"; die 'changing an installed Compose model requires reset'; fi
+  if [[ $action == --converge && -f $(state_path "$environment") ]]; then
+    secure_file "$(deployed_compose_path "$environment")" 600
+    if ! cmp -s "$prepared_rendered" "$(deployed_compose_path "$environment")"; then rm -f "$prepared_rendered"; die 'changing an installed Compose model requires reset'; fi
+  fi
 }
 
 apply_converge() {
-  install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
+  [[ -f $(state_path "$environment") ]] || install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
   if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait; then
     rm -f "$prepared_rendered"
@@ -271,10 +274,12 @@ case $action in
     now=$(date +%s); failed=0
     for target in "$state_dir"/*.state; do
       [[ -e $target ]] || continue
-      secure_file "$target" 600
-      expires=$(awk -F= '$1=="EXPIRES_AT"{print $2}' "$target")
-      [[ $expires =~ ^[0-9]+$ ]] || die "invalid expiration in $target"
-      if ((expires <= now)) && ! remove_environment "$(basename "$target" .state)"; then failed=1; fi
+      if ! (
+        secure_file "$target" 600
+        expires=$(awk -F= '$1=="EXPIRES_AT"{print $2}' "$target")
+        [[ $expires =~ ^[0-9]+$ ]] || die "invalid expiration in $target"
+        ((expires > now)) || remove_environment "$(basename "$target" .state)"
+      ); then failed=1; fi
     done
     ((failed == 0)) || die 'one or more expired environments could not be removed'
     report 'CLEANUP_OK'

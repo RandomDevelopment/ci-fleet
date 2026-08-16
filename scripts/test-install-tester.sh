@@ -50,8 +50,10 @@ state=$root/var/lib/ci-fleet-tester/environments/preview-a.state
 [[ -f $state && $(stat -c %a "$state") == 600 ]] || fail 'state was not protected'
 inspect_output=$(FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --inspect --environment preview-a)
 grep -q 'IMAGE_DIGESTS=sha256:[a-f0-9]\{64\}.*STATUS=running DISK_BYTES=[1-9][0-9]*' <<<"$inspect_output" || fail 'inspect did not report health and disk use'
+deployed_inode=$(stat -c %i "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev/null
 [[ $(find "$root/var/lib/ci-fleet-tester/environments" -name '*.state' | wc -l) == 1 ]] || fail 'idempotent converge duplicated state'
+[[ $(stat -c %i "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$deployed_inode" ]] || fail 'idempotent converge replaced the protected Compose snapshot'
 original_expiry=$(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state")
 grep -v '^CI_FLEET_TESTER_EXPIRES_AT=' "$root/etc/ci-fleet-tester/environments/preview-a.env" >"$tmp/spec"
 mv "$tmp/spec" "$root/etc/ci-fleet-tester/environments/preview-a.env"; chmod 600 "$root/etc/ci-fleet-tester/environments/preview-a.env"
@@ -100,6 +102,11 @@ for expired_state in "$state" "$root/var/lib/ci-fleet-tester/environments/expire
   sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$expired_state"
 done
 : >"$tmp/docker.log"
+mv "$root/var/lib/ci-fleet-tester/environments/expired-a.compose.json" "$tmp/expired-a.compose.json"
+if FAKE_TESTER_DOWN_FAIL=1 "$runtime" --cleanup >/dev/null 2>&1; then fail 'cleanup ignored a damaged protected environment'; fi
+for id in preview-a expired-b; do grep -Fq "ci-fleet-test-$id" "$tmp/docker.log" || fail "damaged state stopped cleanup before $id"; done
+mv "$tmp/expired-a.compose.json" "$root/var/lib/ci-fleet-tester/environments/expired-a.compose.json"
+: >"$tmp/docker.log"
 if FAKE_TESTER_DOWN_FAIL=1 "$runtime" --cleanup >/dev/null 2>&1; then fail 'cleanup ignored environment removal failures'; fi
 for id in preview-a expired-a expired-b; do
   grep -Fq "ci-fleet-test-$id" "$tmp/docker.log" || fail "cleanup stopped before attempting $id"
@@ -147,7 +154,8 @@ git -C "$upgrade_repo" add scripts/tester-runtime.sh
 git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: valid tester candidate'
 unit_fail_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 unit_hash_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service")
-if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'unit activation failure succeeded'; fi
+if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >"$tmp/unit-restore.log" 2>&1; then fail 'unit activation failure succeeded'; fi
+grep -Fq 'incumbent unit restore failed' "$tmp/unit-restore.log" || fail 'secondary incumbent restore failure was not surfaced'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" && $(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service") == "$unit_hash_before" ]] || fail 'unit activation failure did not restore incumbent release and units'
 
 # A corrupt incumbent is never recorded as the rollback target.
@@ -186,6 +194,11 @@ timeout 0.2 "$installer" --install --config /etc/ci-fleet-tester/tester.env --re
 lock_rc=$?
 set -e
 [[ $lock_rc == 124 ]] || fail 'installer lifecycle mutation ignored the shared lock'
+set +e
+timeout 0.2 "$installer" --reset --environment absent >/dev/null 2>&1
+reset_lock_rc=$?
+set -e
+[[ $reset_lock_rc == 124 ]] || fail 'reset resolved the active release before acquiring the lifecycle lock'
 wait "$lock_pid"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored systemd teardown failure'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
