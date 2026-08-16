@@ -508,6 +508,12 @@ runtime_release_complete() {
   [[ "$actual_digest" == "$stored_digest" ]]
 }
 
+engine_has_capacity_telemetry() {
+  local path=$1
+  [[ -f "$path/engine-capabilities.json" ]] && python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
+    --manifest "$path/engine-capabilities.json" --require-capacity-telemetry >/dev/null 2>&1
+}
+
 manager_release_complete() {
   local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required unit
   runtime_release_complete "$path" "$expected" "$require_status" "$require_schema" || return 1
@@ -517,7 +523,7 @@ manager_release_complete() {
   done
   [[ -x "$path/templates/config-repository/scripts/validate.sh" ]] || return 1
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
-  if [[ -e "$path/scripts/capacity-sample.sh" || -e "$path/host/systemd/ci-fleet-capacity.service" || -e "$path/host/systemd/ci-fleet-capacity.timer" ]]; then
+  if engine_has_capacity_telemetry "$path" || [[ -e "$path/scripts/capacity-sample.sh" || -e "$path/host/systemd/ci-fleet-capacity.service" || -e "$path/host/systemd/ci-fleet-capacity.timer" ]]; then
     [[ -x "$path/scripts/capacity-sample.sh" && -f "$path/host/systemd/ci-fleet-capacity.service" && -f "$path/host/systemd/ci-fleet-capacity.timer" ]] || return 1
   fi
   marker=$(<"$path/.ci-fleet-engine-ref")
@@ -542,22 +548,27 @@ managed_images_match() {
 }
 
 systemd_matches() {
-  local expected_manager unit
+  local expected_manager manager_commit unit
   expected_manager=$manager_releases/$engine_ref
-  manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$manager_current" ]] || return 1
+  if ! engine_has_capacity_telemetry "$release_dir" && engine_has_capacity_telemetry "$(readlink -f "$manager_current")"; then
+    expected_manager=$(readlink -f "$manager_current")
+  fi
+  [[ -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
+  manager_commit=$(<"$expected_manager/.ci-fleet-engine-ref")
+  manager_release_complete "$expected_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
     [[ -f "$systemd_dir/$unit" ]] || return 1
-    cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+    cmp -s "$release_dir/host/systemd/$unit" "$systemd_dir/$unit" || return 1
   done
   for unit in "${timer_names[@]}"; do
     systemctl is-enabled --quiet "$unit" || return 1
     systemctl is-active --quiet "$unit" || return 1
   done
-  if [[ -x "$expected_manager/scripts/capacity-sample.sh" ]]; then
+  if [[ -x "$release_dir/scripts/capacity-sample.sh" ]]; then
     for unit in "${capacity_unit_names[@]}"; do
-      [[ -f "$systemd_dir/$unit" ]] && cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+      [[ -f "$systemd_dir/$unit" ]] && cmp -s "$release_dir/host/systemd/$unit" "$systemd_dir/$unit" || return 1
     done
     systemctl is-enabled --quiet ci-fleet-capacity.timer && systemctl is-active --quiet ci-fleet-capacity.timer || return 1
   else
@@ -647,8 +658,16 @@ install_release() {
 }
 
 install_manager() {
-  local manager_commit manager_release archive staged_manager
+  local manager_commit manager_release archive staged_manager current_manager current_manager_commit
   manager_commit=$engine_ref
+  current_manager=$(readlink -f "$manager_current" 2>/dev/null || true)
+  current_manager_commit=
+  [[ -z "$current_manager" || ! -f "$current_manager/.ci-fleet-engine-ref" ]] || current_manager_commit=$(<"$current_manager/.ci-fleet-engine-ref")
+  if ! engine_has_capacity_telemetry "$release_dir" && [[ -n "$current_manager_commit" ]] \
+    && engine_has_capacity_telemetry "$current_manager" \
+    && manager_release_complete "$current_manager" "$current_manager_commit" "$status_reporting_required" "$status_reporting_configured"; then
+    return
+  fi
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
   runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
@@ -809,7 +828,7 @@ install_systemd_units() {
     install -m 0644 "$source/host/systemd/ci-fleet-capacity.timer" "$systemd_dir/"
   else
     systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
-    systemctl stop ci-fleet-capacity.service >/dev/null 2>&1 || true
+    [[ ! -f "$systemd_dir/ci-fleet-capacity.service" ]] || systemctl stop ci-fleet-capacity.service
     rm -f "$systemd_dir/ci-fleet-capacity.service" "$systemd_dir/ci-fleet-capacity.timer"
   fi
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
@@ -826,7 +845,7 @@ install_systemd_units() {
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
-  systemctl stop ci-fleet-capacity.service >/dev/null 2>&1 || true
+  [[ ! -f "$systemd_dir/ci-fleet-capacity.service" ]] || systemctl stop ci-fleet-capacity.service
   local unit
   for unit in "${optional_unit_names[@]}"; do
     case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac
@@ -882,7 +901,7 @@ activate_candidate() {
   ln -sfn "$release_dir" "$temporary/current"
   mv -Tf "$temporary/current" "$current_link"
   install_manager
-  install_systemd_units "$(readlink -f "$manager_current")"
+  install_systemd_units "$release_dir"
   if [[ "$target_state" == active ]]; then
     compose "$release_dir" "$rendered_env" up -d --no-deps controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
