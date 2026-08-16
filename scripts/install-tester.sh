@@ -61,6 +61,13 @@ reject_git_replacements() {
   [[ -z $(git -C "$repo_root" for-each-ref --format='%(refname)' refs/replace) && ! -s $common/info/grafts ]] || die 'Git replacement or graft metadata is forbidden'
 }
 
+acquire_lifecycle_lock() {
+  install -d -m 0755 "$(dirname "$runtime_lock")"
+  exec 8>"$runtime_lock"
+  flock -x 8
+  export CI_FLEET_TESTER_LOCK_FD=8
+}
+
 host_preflight() {
   local os_release docker_context actual_root used
   os_release=$(root_path /etc/os-release)
@@ -142,8 +149,8 @@ activate_release() {
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"; install_units "$release_dir/$previous"
     else
+      remove_units || die 'candidate activation failed and fresh-install unit teardown also failed; candidate retained for recovery'
       rm -f -- "$current_link"
-      remove_units || true
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
@@ -157,6 +164,8 @@ installed_revision() {
   [[ $target == "$release_dir"/* ]] || return 1
   basename "$target"
 }
+
+case $action in --install|--upgrade|--check|--rollback|--uninstall) acquire_lifecycle_lock ;; esac
 
 case $action in
   --install|--upgrade)
@@ -197,7 +206,6 @@ case $action in
     ;;
   --uninstall)
     ensure_directories
-    install -d -m 0755 "$(dirname "$runtime_lock")"; exec 8>"$runtime_lock"; flock -x 8
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
     remove_units || die 'could not stop and disable tester maintenance units'
     rm -f -- "$current_link" "$lkg_file"

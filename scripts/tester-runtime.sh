@@ -33,7 +33,7 @@ while (($#)); do
 done
 [[ -n $action ]] || { usage; exit 2; }
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
-for command in awk basename chmod curl date df dirname docker du find flock getent grep install mktemp mv python3 readlink rm stat wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+for command in awk basename chmod cmp curl date df dirname docker du find flock getent grep install mktemp mv python3 readlink rm stat wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 secure_directory() {
   local path=$1 mode=$2
@@ -122,7 +122,7 @@ for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
     if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external namespace/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
-    if service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: device/capability/external mount/global identity is forbidden')
+    if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
@@ -144,7 +144,7 @@ for name,item in value.get('secrets',{}).items():
     path=item.get('file')
     if item.get('external') or not isinstance(path,str) or os.path.realpath(path).rsplit('/',1)[0] != secret_dir: raise SystemExit(f'secrets.{name}: secret must be a host-local file in the environment secret directory')
     metadata=os.lstat(path)
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600: raise SystemExit(f'secrets.{name}: secret must be owner-controlled mode 0600')
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600: raise SystemExit(f'secrets.{name}: secret must be a singly linked owner-controlled mode-0600 file')
 PY
   image_digests=$(python3 - "$rendered" <<'PY'
 import json,sys
@@ -180,6 +180,7 @@ prepare_converge() {
   [[ -f $(state_path "$environment") || $count -private-repository $max_environments ]] || die 'maximum environment count reached'
   prepared_rendered=$(mktemp)
   if ! validate_compose "$prepared_rendered"; then rm -f "$prepared_rendered"; die 'compose policy validation failed'; fi
+  if [[ $action == --converge && -f $(state_path "$environment") ]] && ! cmp -s "$prepared_rendered" "$(deployed_compose_path "$environment")"; then rm -f "$prepared_rendered"; die 'changing an installed Compose model requires reset'; fi
 }
 
 apply_converge() {
@@ -245,9 +246,13 @@ fi
 unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$docker_socket"
 [[ $(docker info --format '{{.DockerRootDir}}') == "$(root_path /var/lib/docker)" ]] || die 'Docker daemon root is not the expected local path'
-install -d -m 0755 "$(dirname "$lock_file")"
-exec 9>"$lock_file"
-flock -x 9
+if [[ ${CI_FLEET_TESTER_LOCK_FD:-} == 8 && -e /proc/$$/fd/8 && $(readlink -f /proc/$$/fd/8) == "$lock_file" ]] && flock -n 8; then
+  unset CI_FLEET_TESTER_LOCK_FD
+else
+  install -d -m 0755 "$(dirname "$lock_file")"
+  exec 9>"$lock_file"
+  flock -x 9
+fi
 case $action in
   --check)
     docker info --format '{{.DockerRootDir}}' >/dev/null
