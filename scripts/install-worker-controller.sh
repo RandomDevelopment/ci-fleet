@@ -1090,7 +1090,7 @@ perform_uninstall() {
   fi
   remove_systemd_units
   rm -f "$current_link" "$rendered_env" "$state_file"
-  rm -rf -- "$state_root/health"
+  rm -rf -- "$state_root/health" "$state_root/capacity"
   rm -f "$manager_current"
   transaction_active=false
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"

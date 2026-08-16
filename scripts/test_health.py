@@ -127,6 +127,50 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(report["configuration"], {"desired_commit": "", "applied_commit": ""})
             self.assertEqual(report["error"]["code"], "reconciliation_invalid")
 
+    def test_capacity_history_is_resource_only_bounded_and_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            snapshot = healthy_snapshot()
+            snapshot.update({
+                "cpu": {"logical": 8, "used_percent": 10},
+                "memory": {"total_bytes": 1000, "available_bytes": 600},
+                "swap": {"total_bytes": 100, "used_bytes": 5},
+                "runners": {"current": 1, "busy": 1, "maximum": 2},
+                "secret": "must-not-be-recorded",
+            })
+            for value in snapshot["disks"].values():
+                value.update(used_bytes=200, inode_used=20)
+            runner_cpu = [12.5, 90.0]
+
+            def run(args):
+                output = "a" * 12 + "\n" if args[:3] == ["docker", "ps", "-q"] else f"{runner_cpu.pop(0)}%\t256MiB / 2GiB\n"
+                return health.subprocess.CompletedProcess(args, 0, output, "")
+
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                history.parent.mkdir()
+                history.write_text('{"timestamp":999999}\n' * health.CAPACITY_MAX_SAMPLES)
+                history.chmod(0o600)
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_000))
+                snapshot["cpu"]["used_percent"] = 20
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_300))
+                self.assertEqual(len(history.read_text().splitlines()), health.CAPACITY_MAX_SAMPLES)
+                self.assertEqual(history.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn("must-not-be-recorded", history.read_text())
+                report = health.capacity_report(history, now=1_000_300)
+                pool = report["pools"]["example-ci-01"]
+                self.assertEqual((pool["samples"], pool["runner_observations"]), (2, 2))
+                self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 10, "p95": 20})
+                self.assertEqual(pool["metrics"]["runner_cpu_percent"], {"p50": 12.5, "p95": 90.0})
+                snapshot["runners"]["current"] = 0
+                self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_900))
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
     def test_external_heartbeats_detect_missing_and_stale_active_hosts(self) -> None:
         controllers = {
             "fresh": {"state": "active", "lifecycle": "stable"},

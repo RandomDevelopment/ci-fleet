@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import http.client
 import json
 import os
@@ -525,6 +526,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
     return {
         "controller_id": instance,
+        "pool_id": values.get("CI_FLEET_POOL", instance),
         "desired_state": values.get("CI_FLEET_CONTROLLER_STATE", "active"),
         "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
         "cpu": _cpu(root),
@@ -582,6 +584,117 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     temporary.write_text(json.dumps(report, sort_keys=True) + "\n")
     os.chmod(temporary, 0o644)
     temporary.replace(path)
+
+
+CAPACITY_RETENTION_SECONDS = 8 * 24 * 60 * 60
+CAPACITY_MAX_SAMPLES = 2500
+
+
+def _quantity_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)", value.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError("invalid Docker memory quantity")
+    units = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+             "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
+    return round(float(match.group(1)) * units[match.group(2).lower()])
+
+
+def _runner_capacity(run: Runner, instance: str) -> list[dict[str, int | float]]:
+    result = run(["docker", "ps", "-q", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true",
+                  "--filter", "label=io.randomdevelopment.ci-fleet.kind=runner",
+                  "--filter", f"label=io.randomdevelopment.ci-fleet.instance={instance}"])
+    ids = [value for value in result.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", value)] if result.returncode == 0 else []
+    if not ids:
+        return []
+    result = run(["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}", *ids])
+    metrics = []
+    for line in result.stdout.splitlines() if result.returncode == 0 else []:
+        try:
+            cpu, memory = line.split("\t", 1)
+            used, limit = memory.split("/", 1)
+            metrics.append({"cpu_percent": float(cpu.removesuffix("%")), "memory_used_bytes": _quantity_bytes(used), "memory_limit_bytes": _quantity_bytes(limit)})
+        except ValueError:
+            continue
+    return metrics
+
+
+def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None) -> bool:
+    if snapshot.get("runners", {}).get("current", 0) < 1:
+        return False
+    timestamp = int(time.time() if now is None else now)
+    memory = snapshot["memory"]
+    sample = {
+        "timestamp": timestamp, "pool": snapshot.get("pool_id", snapshot["controller_id"]),
+        "host": {
+            "cpu_percent": snapshot["cpu"]["used_percent"],
+            "memory_used_bytes": memory["total_bytes"] - memory["available_bytes"],
+            "swap_used_bytes": snapshot["swap"]["used_bytes"],
+            "disk_used_bytes": {name: value["used_bytes"] for name, value in snapshot["disks"].items()},
+            "inode_used": {name: value["inode_used"] for name, value in snapshot["disks"].items()},
+        },
+        "runners": _runner_capacity(run, snapshot["controller_id"]),
+    }
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    retained = []
+    if path.exists():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity history must be root-owned mode 0600")
+        for line in path.read_text().splitlines():
+            try:
+                previous = json.loads(line)
+                if timestamp - CAPACITY_RETENTION_SECONDS <= previous["timestamp"] <= timestamp:
+                    retained.append(previous)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+    retained = (retained + [sample])[-CAPACITY_MAX_SAMPLES:]
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("".join(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n" for value in retained))
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+    return True
+
+
+def _percentiles(values: list[int | float]) -> dict[str, int | float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return {name: ordered[max(0, math.ceil(len(ordered) * percentile) - 1)] for name, percentile in (("p50", 0.50), ("p95", 0.95))}
+
+
+def capacity_report(path: Path, *, now: int | None = None) -> dict[str, Any]:
+    timestamp = int(time.time() if now is None else now)
+    if path.exists():
+        info = path.lstat()
+        expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity history must be root-owned mode 0600")
+    pools: dict[str, dict[str, Any]] = {}
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            sample = json.loads(line)
+            if not timestamp - 7 * 24 * 60 * 60 <= sample["timestamp"] <= timestamp:
+                continue
+            pool = pools.setdefault(sample["pool"], {"samples": 0, "runner_observations": 0, "values": {}})
+            pool["samples"] += 1
+            values = pool["values"]
+            host = sample["host"]
+            for name in ("cpu_percent", "memory_used_bytes", "swap_used_bytes"):
+                values.setdefault(f"host_{name}", []).append(host[name])
+            for kind in ("disk_used_bytes", "inode_used"):
+                for name, value in host[kind].items():
+                    values.setdefault(f"host_{kind}_{name}", []).append(value)
+            for runner in sample["runners"]:
+                pool["runner_observations"] += 1
+                for name, value in runner.items():
+                    values.setdefault(f"runner_{name}", []).append(value)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    for pool in pools.values():
+        pool["metrics"] = {name: _percentiles(values) for name, values in sorted(pool.pop("values").items())}
+    return {"schema_version": 1, "generated_at": timestamp, "period_seconds": 7 * 24 * 60 * 60, "pools": pools}
 
 
 def _send_status(
@@ -688,6 +801,14 @@ def _local(args: argparse.Namespace) -> int:
     report = evaluate(snapshot, thresholds)
     now = int(time.time())
     report["timestamp"] = now
+    try:
+        capacity_history = getattr(args, "capacity_history", None)
+        if capacity_history is not None:
+            record_capacity(capacity_history, snapshot, now=now)
+    except (OSError, UnicodeError, ValueError):
+        report["checks"].append({"id": "capacity_telemetry", "status": "warning"})
+        if report["exit_code"] == 0:
+            report["status"], report["exit_code"] = "warning", 1
     delivery = 0
     if environment.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
         if config_invalid:
@@ -721,6 +842,11 @@ def _heartbeats(args: argparse.Namespace) -> int:
     return int(report["exit_code"])
 
 
+def _capacity(args: argparse.Namespace) -> int:
+    print(json.dumps(capacity_report(args.history), indent=2, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Redacted ci-fleet host health")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -728,6 +854,7 @@ def main() -> int:
     local.add_argument("--json", action="store_true")
     local.add_argument("--monitoring-config", type=Path, default=Path("/etc/ci-fleet/monitoring.env"))
     local.add_argument("--output", type=Path, default=Path("/var/lib/ci-fleet/health/latest.json"))
+    local.add_argument("--capacity-history", type=Path, default=Path("/var/lib/ci-fleet/capacity/samples.jsonl"))
     local.set_defaults(handler=_local)
     heartbeats = commands.add_parser("heartbeats")
     heartbeats.add_argument("--config", type=Path, required=True)
@@ -735,6 +862,9 @@ def main() -> int:
     heartbeats.add_argument("--grace-seconds", type=int, default=900)
     heartbeats.add_argument("--json", action="store_true")
     heartbeats.set_defaults(handler=_heartbeats)
+    capacity = commands.add_parser("capacity-report")
+    capacity.add_argument("--history", type=Path, default=Path("/var/lib/ci-fleet/capacity/samples.jsonl"))
+    capacity.set_defaults(handler=_capacity)
     args = parser.parse_args()
     try:
         return args.handler(args)

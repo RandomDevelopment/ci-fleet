@@ -186,6 +186,7 @@ def build_rendered_env(
         "CI_FLEET_LABELS": ",".join(pool["routing_labels"]),
         "CI_FLEET_MAX_RUNNERS": str(effective_max),
         "CI_FLEET_MIN_RUNNERS": str(controller["min_runners"] if state == "active" else 0),
+        "CI_FLEET_POOL": controller["pool"],
         "CI_FLEET_RUNNER_CPUS": str(controller["runner_resources"]["cpu_cores"]),
         "CI_FLEET_RUNNER_GROUP": pool["runner_group"],
         "CI_FLEET_RUNNER_IMAGE": f"ci-fleet-runner:{short_commit}",
