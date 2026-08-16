@@ -694,7 +694,10 @@ legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
+export FAKE_SYSTEMCTL_LOG=$tmp/legacy-systemctl.log
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
+grep -Fxq 'stop ci-fleet-capacity.service' "$FAKE_SYSTEMCTL_LOG" || fail 'legacy upgrade did not stop the in-flight capacity service'
+unset FAKE_SYSTEMCTL_LOG
 [[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
