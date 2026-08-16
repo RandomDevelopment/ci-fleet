@@ -60,7 +60,9 @@ The bootstrap:
 - rejects public, archived, wrong-organization, broader App installation, and
   default/broad runner-group access;
 - creates a missing selected-repository runner group, but never changes an
-  existing group whose identity or access differs;
+  existing group whose identity or access differs. A group created by the
+  current invocation is automatically deleted if inspection, routing
+  verification, or cancellation occurs before verification completes;
 - destroys the conversion code, JWTs, installation token, callback state, and
   temporary curl configurations on exit. After a successful conversion, a
   protected mode-`0600` `bootstrap-recovery.json` (or atomic-publication
@@ -84,11 +86,15 @@ After success, rerun the same command with `--check` to verify App ownership,
 permissions, exact selected private repositories, exact runner-group access,
 and host-local credential modes without changing the App or runner group.
 
-Pass `--install --config-repo OWNER/REPO --config-ref REVIEWED_COMMIT` on the
-initial live command for direct handoff to the idempotent host installer. Without
-it, the redacted final report prints the exact installer shape. Externally
-provisioned credentials remain supported; the generic installer never requires
-this bootstrap on every run.
+Pass `--install --config-repo /PATH/TO/PINNED/CHECKOUT --config-ref REVIEWED_COMMIT`
+on the initial live command for direct handoff to the idempotent host installer.
+Bootstrap requires the commit in that local checkout and verifies that its
+selected controller pool exactly matches the requested organization, runner
+group, and project allowlist before any GitHub mutation. Remote `OWNER/REPO`
+handoff is rejected because a fresh host has no independently verified Git
+credential before App creation. Without `--install`, the redacted final report
+prints the installer shape. Externally provisioned credentials remain supported;
+the generic installer never requires this bootstrap on every run.
 
 The controller exchanges a short-lived JWT signed with the PEM for an
 installation token at runtime (`scripts/github-app-token.sh`). No token is
@@ -135,14 +141,17 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 
 ## Accidental creation rollback
 
-The bootstrap never replaces or broadens an existing App or runner group. If a
-new object was approved accidentally, stop before running the installer. An
+The bootstrap never replaces or broadens an existing App or runner group. A new
+runner group is automatically deleted only when the same invocation cannot
+verify its identity/access or is cancelled before verification; it never deletes
+a pre-existing group. If another new object was approved accidentally, stop
+before running the installer. An
 organization owner must compare the App slug/ID and group name in the redacted
 bootstrap report with GitHub's settings, verify the new group has no runners,
 then remove only those exact newly created objects. Preserve and investigate any
-pre-existing or mismatched object. App/group deletion and owner approval are live
-GitHub-setting mutations and therefore require separate authorization; this
-repository command does not automate them.
+pre-existing or mismatched object. App deletion and deletion of any group outside
+the bounded automatic rollback above are live GitHub-setting mutations and
+therefore require separate authorization; this command does not automate them.
 
 ## Rotation
 

@@ -49,7 +49,7 @@ elif endpoint.endswith("/actions/runner-groups"):
     response = {"total_count": len(groups), "runner_groups": groups}
 elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
-    response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True}]}
+    response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}]}
 elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
     kind = "runner-group-delete"
     state.unlink(missing_ok=True)
@@ -71,6 +71,9 @@ if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_
     (response["runner_groups"][0] if kind == "runner-groups" else response)["allows_public_repositories"] = True
 if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_RESTRICTED_GROUP") == "1":
     (response["runner_groups"][0] if kind == "runner-groups" else response)["restricted_to_workflows"] = True
+if kind == "runner-group-repositories" and os.environ.get("FAKE_BOOTSTRAP_ARCHIVED_REPOSITORY") == "1":
+    assert isinstance(response, dict)
+    response["repositories"][0]["archived"] = True
 if kind == os.environ.get("FAKE_BOOTSTRAP_TRUNCATE_KIND"):
     response["total_count"] += 1
 transient = state.with_suffix(".transient")
