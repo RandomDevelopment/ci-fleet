@@ -140,6 +140,7 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+[[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
 fi
@@ -577,7 +578,10 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upg
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 rm -f "$root/var/lib/ci-fleet/install-state.json" "$root/etc/ci-fleet/ci-fleet.env"
+export FAKE_SYSTEMCTL_LOG=$tmp/rollback-systemctl.log
 expect_success "$installer" --rollback >/dev/null
+grep -Fxq 'start ci-fleet-capacity.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'rollback did not restore the active capacity timer'
+unset FAKE_SYSTEMCTL_LOG
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
 

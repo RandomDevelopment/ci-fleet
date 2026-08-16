@@ -243,7 +243,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         },
         "runners": snapshot.get("runners", {"current": 0, "busy": 0, "maximum": 0}),
         "metrics": {
-            "cpu": snapshot.get("cpu", {"logical": 1, "used_percent": 0}),
+            "cpu": {name: snapshot.get("cpu", {}).get(name, default) for name, default in (("logical", 1), ("used_percent", 0))},
             "memory": snapshot.get("memory", {"total_bytes": 0, "available_bytes": 0}),
             "swap": snapshot.get("swap", {"total_bytes": 0, "used_bytes": 0}),
             "disk": {name: {"total_bytes": value.get("total_bytes", 0), "used_bytes": value.get("used_bytes", 0)} for name, value in disks.items()},
@@ -587,7 +587,7 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
 
 
 CAPACITY_RETENTION_SECONDS = 8 * 24 * 60 * 60
-CAPACITY_MAX_SAMPLES = 2500
+CAPACITY_MAX_SAMPLES = 24000
 
 
 def _quantity_bytes(value: str) -> int:
@@ -658,14 +658,44 @@ def _write_capacity(path: Path, samples: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _update_cpu_baseline(path: Path, timestamp: int, cpu: dict[str, Any]) -> dict[str, int] | None:
+    baseline = path.with_suffix(path.suffix + ".cpu")
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    previous = None
+    if baseline.exists():
+        info = baseline.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity CPU baseline must be root-owned mode 0600")
+        try:
+            value = json.loads(baseline.read_text())
+            if set(value) != {"timestamp", "total_ticks", "idle_ticks"} or any(type(value[name]) is not int or value[name] < 0 for name in value):
+                raise ValueError
+            if value["idle_ticks"] > value["total_ticks"]:
+                raise ValueError
+            previous = value
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("capacity CPU baseline is invalid") from error
+    current = {"timestamp": timestamp, "total_ticks": cpu.get("total_ticks"), "idle_ticks": cpu.get("idle_ticks")}
+    if any(type(current[name]) is not int or current[name] < 0 for name in current) or current["idle_ticks"] > current["total_ticks"]:
+        raise ValueError("current CPU counters are invalid")
+    temporary = baseline.with_suffix(baseline.suffix + ".tmp")
+    temporary.write_text(json.dumps(current, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(baseline)
+    if previous and 0 < timestamp - previous["timestamp"] <= 120 and current["total_ticks"] >= previous["total_ticks"] and current["idle_ticks"] >= previous["idle_ticks"]:
+        return previous
+    return None
+
+
 def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None) -> bool:
     timestamp = int(time.time() if now is None else now)
     retained = _capacity_state(path, timestamp)
+    cpu = snapshot["cpu"]
+    previous_host = _update_cpu_baseline(path, timestamp, cpu)
     if snapshot.get("runners", {}).get("current", 0) < 1:
         _write_capacity(path, retained)
         return False
     pool_id = snapshot.get("pool_id", snapshot["controller_id"])
-    cpu = snapshot["cpu"]
     memory = snapshot["memory"]
     host = {
         "memory_used_bytes": memory["total_bytes"] - memory["available_bytes"],
@@ -675,12 +705,9 @@ def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run,
         "cpu_total_ticks": cpu["total_ticks"],
         "cpu_idle_ticks": cpu["idle_ticks"],
     }
-    previous_host = next((value.get("host") for value in reversed(retained)
-                          if isinstance(value, dict) and value.get("pool") == pool_id and isinstance(value.get("host"), dict)
-                          and type(value["host"].get("cpu_total_ticks")) is int and type(value["host"].get("cpu_idle_ticks")) is int), None)
     if previous_host:
-        total_delta = cpu["total_ticks"] - previous_host["cpu_total_ticks"]
-        idle_delta = cpu["idle_ticks"] - previous_host["cpu_idle_ticks"]
+        total_delta = cpu["total_ticks"] - previous_host["total_ticks"]
+        idle_delta = cpu["idle_ticks"] - previous_host["idle_ticks"]
         if total_delta > 0 and 0 <= idle_delta <= total_delta:
             host["cpu_percent"] = round(100 * (total_delta - idle_delta) / total_delta, 1)
     sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": _runner_capacity(run, snapshot["controller_id"])}
@@ -705,6 +732,9 @@ def _sample_values(sample: Any, timestamp: int) -> tuple[str, dict[str, list[int
     host, runners = sample["host"], sample["runners"]
     required_host = {"memory_used_bytes", "swap_used_bytes", "disk_used_bytes", "inode_used", "cpu_total_ticks", "cpu_idle_ticks"}
     if not isinstance(host, dict) or not required_host <= set(host) <= required_host | {"cpu_percent"} or not isinstance(runners, list):
+        return None
+    total_ticks, idle_ticks = host["cpu_total_ticks"], host["cpu_idle_ticks"]
+    if any(type(value) is not int or value < 0 for value in (total_ticks, idle_ticks)) or idle_ticks > total_ticks:
         return None
     values: dict[str, list[int | float]] = {}
     for name in ("memory_used_bytes", "swap_used_bytes"):

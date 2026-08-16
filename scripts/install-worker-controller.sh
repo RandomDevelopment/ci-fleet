@@ -938,7 +938,7 @@ restore_systemd_snapshot() {
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
   done
   systemctl daemon-reload || failed=1
-  for timer in "${timer_names[@]}"; do
+  for timer in "${timer_names[@]}" ci-fleet-capacity.timer; do
     if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
     if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
   done
