@@ -527,13 +527,24 @@ release_matches() {
 }
 
 managed_images_match() {
-  local image provenance
+  local environment=${1:-$candidate_env} digest expected_engine image provenance
   local -a expected_images=()
-  mapfile -t expected_images < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" || $1 == "CI_FLEET_RUNNER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+  expected_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  [[ "$expected_engine" =~ ^[0-9a-f]{40}$ ]] || return 1
+  mapfile -t expected_images < <(awk -F= '
+    $1 == "CI_FLEET_CONTROLLER_IMAGE" {controller=$2}
+    $1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {controller_digest=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE" {runner=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {runner_digest=$2}
+    END {if (controller && controller_digest && runner && runner_digest) {print controller " " controller_digest; print runner " " runner_digest}}
+  ' "$environment")
   [[ ${#expected_images[@]} == 2 ]] || return 1
-  for image in "${expected_images[@]}"; do
+  for expected in "${expected_images[@]}"; do
+    read -r image digest <<<"$expected"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
     provenance=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image" 2>/dev/null) || return 1
-    [[ "$provenance" == "$engine_ref" ]] || return 1
+    [[ "$provenance" == "$expected_engine" ]] || return 1
+    [[ $(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) == "$digest" ]] || return 1
   done
 }
 
@@ -672,6 +683,7 @@ build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
   compose "$release_dir" "$candidate_env" build runner-image controller
+  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
 }
 
 make_checkpoint() {
@@ -983,6 +995,14 @@ restore_checkpoint() {
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
+    if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
+      if ! managed_images_match "$rendered_env"; then
+        compose "$release_dir" "$rendered_env" build runner-image controller || failed=1
+        if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
+      fi
+    else
+      note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
+    fi
     if [[ "$restored_state" == active && "$failed" == 0 ]]; then
       if [[ $(managed_runner_count) != 0 ]]; then
         failed=1

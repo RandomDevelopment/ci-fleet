@@ -98,7 +98,9 @@ jobs through the Docker socket.
      --runner-group YOUR-CREATED-RUNNER-GROUP \
      --capacity-budget 1 \
      --max-runners 1 \
-     --engine-ref PINNED_ENGINE_COMMIT
+     --engine-ref PINNED_ENGINE_COMMIT \
+     --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID \
+     --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    # Validate before committing so a rejected file or accidental value
    # never enters branch history, then commit the initialized result:
    ./scripts/validate.sh --strict

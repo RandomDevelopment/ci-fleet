@@ -59,6 +59,8 @@ class PolicyTests(unittest.TestCase):
 
     def assert_engine_ref_contract(self, value: str, accepted: bool) -> None:
         config = copy.deepcopy(reference_config())
+        images = next(iter(config["managed_images"].values()))
+        config["managed_images"] = {value: images}
         first_controller(config)["engine_ref"] = value
         self.assertEqual(schema_accepts_engine_ref(value), accepted)
         self.assertEqual(errors_for(config) == [], accepted)
@@ -83,7 +85,10 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
-                "--engine-ref", "1" * 40, "--output", str(output),
+                "--engine-ref", "1" * 40,
+                "--controller-image-digest", "sha256:" + "1" * 64,
+                "--runner-image-digest", "sha256:" + "2" * 64,
+                "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)

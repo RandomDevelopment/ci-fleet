@@ -16,6 +16,7 @@ SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 ORG_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 IMAGE = re.compile(r"^[a-z0-9.-]+/[a-z0-9._/-]+$")
+IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 HIGH_CONFIDENCE_SECRET_PATTERNS = (
@@ -181,6 +182,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         "schema_version",
         "organization",
         "runner_pools",
+        "managed_images",
         "controllers",
         "host_groups",
         "environments",
@@ -251,6 +253,18 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             pool_capacity[name] = budget
         validation.require(pool.get("job_submission_policy") == "all-independent-jobs", f"{path}.job_submission_policy", "must submit every independent job and leave capacity control to infrastructure")
 
+    managed_images = config.get("managed_images")
+    if not isinstance(managed_images, dict) or not managed_images:
+        validation.errors.append("$.managed_images: must be a non-empty object")
+        managed_images = {}
+    for engine_ref, images in managed_images.items():
+        path = f"$.managed_images.{engine_ref}"
+        validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, path, "key must be a nonzero full lowercase engine commit SHA")
+        if validation.exact_keys(images, path, {"controller", "runner"}):
+            for name in ("controller", "runner"):
+                digest = images.get(name)
+                validation.require(isinstance(digest, str) and bool(IMAGE_DIGEST.fullmatch(digest)) and digest != "sha256:" + "0" * 64, f"{path}.{name}", "must be a nonzero sha256 image digest")
+
     controllers = config.get("controllers")
     if not isinstance(controllers, dict) or not controllers:
         validation.errors.append("$.controllers: must be a non-empty object")
@@ -294,6 +308,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
                 scale_sets[scale_set] = name
         validation.require(lifecycle in {"experimental", "stable", "retiring"}, f"{path}.lifecycle", "must be experimental, stable, or retiring")
         validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
+        validation.require(engine_ref in managed_images, f"{path}.engine_ref", "must have reviewed controller and runner digests in $.managed_images")
         validation.require(type(minimum) is int and minimum >= 0, f"{path}.min_runners", "must be a non-negative integer")
         validation.require(type(maximum) is int and maximum > 0, f"{path}.max_runners", "must be a positive integer")
         if type(minimum) is int and type(maximum) is int:

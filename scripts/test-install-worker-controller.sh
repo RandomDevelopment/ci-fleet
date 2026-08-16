@@ -67,7 +67,7 @@ case "${1:-}" in
       exit 1
     fi
     [[ -f "$image_state" ]] || exit 1
-    if [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%s\n' "$(<"$image_state")"; else cat "$image_state"; fi
+    if [[ "$*" == *'org.opencontainers.image.revision'* ]]; then printf '%s\n' "${FAKE_ENGINE_REF:?}"; elif [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%s\n' "$(<"$image_state")"; else cat "$image_state"; fi
     ;;
   rm)
     (($# >= 2)) || exit 1
@@ -100,7 +100,10 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || printf 'sha256:%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+        if [[ -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]]; then
+          controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$env_file")
+          printf '%s\n' "$controller_digest" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+        fi
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
@@ -127,8 +130,10 @@ case "${1:-}" in
         [[ -z "$paused_state" ]] || rm -f "$paused_state"
         ;;
       build)
-        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
+        runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$env_file")
+        controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$env_file")
+        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${runner_digest#sha256:}" >"$FAKE_RUNNER_IMAGE_STATE"
+        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${controller_digest#sha256:}" >"$FAKE_CONTROLLER_IMAGE_STATE"
         ;;
       config|logs) ;;
       *) exit 1 ;;
@@ -218,6 +223,8 @@ expect_command_failure() {
 }
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
+controller_image_digest=$(printf '1%.0s' {1..64})
+runner_image_digest=$(printf '2%.0s' {1..64})
 export FAKE_ENGINE_REF=$engine_ref
 runner_image="ci-fleet-runner:${engine_ref:0:12}"
 export FAKE_RUNNER_IMAGE=$runner_image
@@ -249,6 +256,7 @@ value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
+value["managed_images"] = {engine_ref: {"controller": "sha256:" + "1" * 64, "runner": "sha256:" + "2" * 64}}
 controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
@@ -408,10 +416,10 @@ printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] || fail 'controller convergence did not restore running image provenance'
-printf 'sha256:%040d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+printf 'sha256:%064d\n' 3 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "sha256:$engine_ref" ]] || fail 'controller convergence did not restore live image identity'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "sha256:$controller_image_digest" ]] || fail 'controller convergence did not restore live image identity'
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_MAX_RUNNERS=1", "CI_FLEET_MAX_RUNNERS=9"))' "$FAKE_CONTROLLER_ENV_FILE"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-environment fixture did not mutate'
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -427,10 +435,10 @@ rm -f "$FAKE_CONTROLLER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$FAKE_RUNNER_IMAGE_STATE" && -f "$FAKE_CONTROLLER_IMAGE_STATE" ]] || fail 'candidate build did not restore the controller image'
-printf '%040d\n' 0 >"$FAKE_RUNNER_IMAGE_STATE"
+printf '%064d\n' 3 >"$FAKE_RUNNER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-[[ $(<"$FAKE_RUNNER_IMAGE_STATE") == "$engine_ref" && $(<"$FAKE_CONTROLLER_IMAGE_STATE") == "$engine_ref" ]] || fail 'candidate build did not restore managed image provenance'
+[[ $(<"$FAKE_RUNNER_IMAGE_STATE") == "$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_STATE") == "$controller_image_digest" ]] || fail 'candidate build did not restore reviewed managed image digests'
 if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
 : >"$FAKE_IMAGE_INSPECT_LOG"
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null

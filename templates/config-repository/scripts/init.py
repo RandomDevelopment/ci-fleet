@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ORG_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 
@@ -41,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
+    parser.add_argument("--controller-image-digest", required=True, help="reviewed controller image ID (sha256:...)")
+    parser.add_argument("--runner-image-digest", required=True, help="reviewed runner image ID (sha256:...)")
     parser.add_argument("--output", type=Path, default=ROOT / "fleet.json", help="output configuration path")
     parser.add_argument("--force", action="store_true", help="replace an existing non-example output file")
     return parser.parse_args()
@@ -65,6 +68,9 @@ def main() -> int:
             fail(f"{option} must be a lowercase slug")
     if not COMMIT_SHA.fullmatch(args.engine_ref) or args.engine_ref == "0" * 40:
         fail("--engine-ref must be a nonzero full lowercase commit SHA")
+    for option, digest in (("--controller-image-digest", args.controller_image_digest), ("--runner-image-digest", args.runner_image_digest)):
+        if not IMAGE_DIGEST.fullmatch(digest) or digest == "sha256:" + "0" * 64:
+            fail(f"{option} must be a nonzero sha256 image digest")
     if args.max_runners > args.capacity_budget:
         fail("--max-runners must not exceed --capacity-budget")
     if args.runner_memory_mib < 512:
@@ -99,6 +105,12 @@ def main() -> int:
                 "public_repositories": False,
                 "capacity_budget": args.capacity_budget,
                 "job_submission_policy": "all-independent-jobs",
+            }
+        },
+        "managed_images": {
+            args.engine_ref: {
+                "controller": args.controller_image_digest,
+                "runner": args.runner_image_digest,
             }
         },
         "controllers": {
