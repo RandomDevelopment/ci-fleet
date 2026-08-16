@@ -161,6 +161,7 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_LKG_ROOT:-} ]]; then
   chmod 0644 "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good.json "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good-policy.conf
   if ((EUID == 0)); then chown 65534 "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good.json "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good-policy.conf; fi
 fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_DELETE_STATE_ROOT:-} ]]; then rm -rf -- "$FAKE_ADAPTER_DELETE_STATE_ROOT"; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
@@ -1739,6 +1740,42 @@ rm "$root/var/lib/ci-fleet-deployer/drained"
 ln -s "$tmp/missing-drain-target" "$root/var/lib/ci-fleet-deployer/drained"
 expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" deploy >/dev/null
 expect_failure 'drain marker must be a regular file, not a symlink' "$runtime" cleanup >/dev/null
+rm "$root/var/lib/ci-fleet-deployer/drained"
+
+# Adapter upgrades use immutable versioned paths so the deployed policy keeps
+# real rollback bytes while the candidate is validated and activated.
+old_adapter=$adapter
+old_adapter_sha=$(sha256sum "$old_adapter" | cut -d' ' -f1)
+adapter=$root/etc/ci-fleet-deployer/adapters/application-adapter.v2
+cp "$old_adapter" "$adapter"
+# shellcheck disable=SC2016 # Write literal adapter variables into the fixture.
+printf '\nprintf "adapter-v2:%%s\\n" "$1" >>"${FAKE_ADAPTER_LOG:?}"\n' >>"$adapter"
+chmod 0700 "$adapter"
+write_config
+expect_success "$installer" --upgrade --config "$config" >/dev/null
+grep -Fxq "ADAPTER_PATH=$old_adapter" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" || fail 'adapter upgrade did not retain the old adapter path for rollback'
+grep -Fxq "ADAPTER_SHA256=$old_adapter_sha" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" || fail 'adapter upgrade did not retain the old adapter digest for rollback'
+check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=yes' <<<"$check" || fail 'versioned adapter upgrade is not rollback-capable'
+
+# Recursive adapter cleanup of the writable state root must not destroy the
+# retained rollback pair: its backup lives only in unexported process memory.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=state-root-delete-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:07:00Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+lkg_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
+lkg_policy_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf")
+printf 'deploy\n' >"$tmp/fail-after-state-delete"
+export FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-state-delete
+expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+unset FAKE_ADAPTER_DELETE_STATE_ROOT FAKE_ADAPTER_FAIL_AFTER_MUTATION
+[[ $lkg_state_before == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'recursive state cleanup destroyed retained rollback state'
+[[ $lkg_policy_before == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf")" ]] || fail 'recursive state cleanup destroyed retained rollback policy'
+compgen -G "$root/var/lib/ci-fleet-deployer/.lkg.*" >/dev/null && fail 'rollback backup remained inside adapter-writable state'
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"
@@ -1760,7 +1797,7 @@ if [[ -n $replacement ]]; then
 fi
 cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
-rm "$root/var/lib/ci-fleet-deployer/drained"
+rm -f "$root/var/lib/ci-fleet-deployer/drained"
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'

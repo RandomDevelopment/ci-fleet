@@ -81,8 +81,9 @@ sudo install -d -o root -g root -m 0700 \
   /etc/ci-fleet-deployer/adapters \
   /etc/ci-fleet-deployer/credentials \
   /etc/ci-fleet-deployer/evidence
+adapter_sha=$(sha256sum ./application-adapter | cut -d' ' -f1)
 sudo install -o root -g root -m 0700 ./application-adapter \
-  /etc/ci-fleet-deployer/adapters/application-adapter
+  "/etc/ci-fleet-deployer/adapters/application-adapter.$adapter_sha"
 sudo install -o root -g root -m 0600 /dev/null \
   /etc/ci-fleet-deployer/credentials/application.credential
 sudoedit /etc/ci-fleet-deployer/credentials/application.credential
@@ -163,7 +164,8 @@ Create the bounded configuration. Values cannot contain shell expressions; the i
 
 ```bash
 core_ref=$(git rev-parse HEAD)
-adapter_sha=$(sudo sha256sum /etc/ci-fleet-deployer/adapters/application-adapter | cut -d' ' -f1)
+adapter_sha=$(sha256sum ./application-adapter | cut -d' ' -f1)
+adapter_path=/etc/ci-fleet-deployer/adapters/application-adapter.$adapter_sha
 sudo install -o root -g root -m 0600 /dev/null \
   /etc/ci-fleet-deployer/deployer.conf
 {
@@ -172,7 +174,7 @@ sudo install -o root -g root -m 0600 /dev/null \
   printf 'ENVIRONMENT=staging\n'
   printf 'TARGET_ID=example-staging\n'
   printf 'DEPLOYER_IDENTITY=staging-deployer-01\n'
-  printf 'ADAPTER_PATH=/etc/ci-fleet-deployer/adapters/application-adapter\n'
+  printf 'ADAPTER_PATH=%s\n' "$adapter_path"
   printf 'ADAPTER_SHA256=%s\n' "$adapter_sha"
   printf 'CREDENTIAL_PROVIDER=file\n'
   printf 'CREDENTIAL_REF=/etc/ci-fleet-deployer/credentials/application.credential\n'
@@ -216,7 +218,7 @@ sudo ./scripts/install-deployer.sh \
   --repair --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
-Upgrade after updating the exact core/source/artifact/approval/checkpoint fields; changes the host transactionally:
+Upgrade after updating the exact core/source/artifact/approval/checkpoint fields; changes the host transactionally. Adapter bytes are immutable too: install changed bytes at a new digest-suffixed path, update `ADAPTER_PATH` and `ADAPTER_SHA256` together, and retain the old path while any deployed or last-known-good policy names it. Never overwrite the adapter at its existing path; pre-convergence verification intentionally requires those old bytes so rollback remains executable.
 
 ```bash
 sudo ./scripts/install-deployer.sh \

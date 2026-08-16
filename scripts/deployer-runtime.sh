@@ -29,6 +29,14 @@ audit_log=$log_root/audit.log
 systemd_root=$(root_path /etc/systemd/system)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+restore_encoded_file() {
+  local destination=$1 encoded=$2 temporary
+  temporary=$(mktemp "$state_root/.restore.XXXXXX") || return
+  printf '%s' "$encoded" | base64 -d >"$temporary" || { rm -f "$temporary"; return 1; }
+  chown "$expected_uid" "$temporary" || { rm -f "$temporary"; return 1; }
+  chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -Tf "$temporary" "$destination"
+}
 if [[ $operation == deploy && -z ${CI_FLEET_DEPLOYER_INHIBITED:-} ]]; then
   export CI_FLEET_DEPLOYER_INHIBITED=1
   [[ $testing != 1 || -z ${CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG:-} ]] || printf '%s\n' deploy >>"$CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG"
@@ -38,7 +46,15 @@ fi
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
-  local target
+  local target state_root_safe=1
+  # The adapter may recursively clear its writable state root. Recreate only
+  # an absent boundary; an unsafe replacement remains a hard failure.
+  if [[ ${audit_pending:-0} == 1 && ! -e "$state_root" && ! -L "$state_root" ]]; then
+    install -d -m 0700 "$state_root" 2>/dev/null || { status=1; state_root_safe=0; }
+  fi
+  if [[ -e "$state_root" || -L "$state_root" ]]; then
+    [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]] || { status=1; state_root_safe=0; }
+  fi
   # An adapter that deletes its own consumption marker must not defeat replay
   # protection; restore the durable marker rather than clearing audit_pending.
   if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then
@@ -107,15 +123,9 @@ deploy_exit() {
     fi
   fi
   [[ -z ${incumbent_backup:-} ]] || rm -rf -- "$incumbent_backup"
-  if [[ -n ${lkg_backup:-} ]]; then
-    for lkg_file in last-known-good.json last-known-good-policy.conf; do
-      if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
-        install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" 2>/dev/null || status=1
-      fi
-      chown "$expected_uid" "$state_root/$lkg_file" 2>/dev/null || status=1
-      chmod 0600 "$state_root/$lkg_file" 2>/dev/null || status=1
-    done
-    rm -rf -- "$lkg_backup"
+  if [[ ${lkg_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
+    restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" 2>/dev/null || status=1
+    restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" 2>/dev/null || status=1
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
@@ -489,11 +499,13 @@ PY
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
     audit_prefix_copy=$(mktemp "$state_root/.audit-prefix.XXXXXX")
     install -m 0600 "$audit_log" "$audit_prefix_copy"
-    # Preserve the retained rollback pair across the adapter call; the adapter
-    # has write access to the state root.
+    # Preserve the retained rollback pair in unexported process memory. A
+    # filesystem backup under the adapter-writable state root would be lost to
+    # the same recursive cleanup as the retained files.
     if [[ -f "$previous_state" && -f "$previous_policy" ]]; then
-      lkg_backup=$(mktemp -d "$state_root/.lkg.XXXXXX")
-      install -m 0600 "$previous_state" "$previous_policy" "$lkg_backup/"
+      lkg_state_backup=$(base64 -w0 "$previous_state")
+      lkg_policy_backup=$(base64 -w0 "$previous_policy")
+      lkg_backed_up=1
     fi
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
@@ -566,17 +578,11 @@ PY
     fi
     # All fallible commit work is done; restore the retained pair if the
     # adapter touched it, then retire the incumbent snapshot.
-    if [[ -n ${lkg_backup:-} ]]; then
-      for lkg_file in last-known-good.json last-known-good-policy.conf; do
-        if [[ ! -f "$state_root/$lkg_file" || -L "$state_root/$lkg_file" ]] || ! cmp -s "$lkg_backup/$lkg_file" "$state_root/$lkg_file"; then
-          install -m 0600 "$lkg_backup/$lkg_file" "$state_root/$lkg_file" || die 'retained rollback pair restoration failed'
-        fi
-        chown "$expected_uid" "$state_root/$lkg_file" || die 'retained rollback pair ownership restoration failed'
-        chmod 0600 "$state_root/$lkg_file" || die 'retained rollback pair mode restoration failed'
-      done
+    if [[ ${lkg_backed_up:-0} == 1 ]]; then
+      restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" || die 'retained rollback state restoration failed'
+      restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" || die 'retained rollback policy restoration failed'
       sync -f "$state_root" 2>/dev/null || die 'retained rollback pair restoration is not durable'
-      rm -rf -- "$lkg_backup"
-      lkg_backup=
+      lkg_backed_up=0
     fi
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
