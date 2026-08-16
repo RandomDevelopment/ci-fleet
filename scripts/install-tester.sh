@@ -126,8 +126,9 @@ install_units() {
   for unit in "${units[@]}"; do install -m 0644 "$source/host/systemd/$unit" "$systemd_dir/$unit.new" || return 1; done
   for unit in "${units[@]}"; do mv -fT "$systemd_dir/$unit.new" "$systemd_dir/$unit" || return 1; done
   systemctl daemon-reload || return 1
-  systemctl enable --now "${timers[@]}" >/dev/null || return 1
 }
+
+enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
 
 remove_units() {
   systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
@@ -145,11 +146,12 @@ activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
+  if [[ $previous =~ ^[0-9a-f]{40}$ ]]; then systemctl disable --now "${timers[@]}" >/dev/null || die 'could not quiesce tester maintenance timers'; fi
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-  if ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health; then
+  if ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-      install_units "$release_dir/$previous" || die 'candidate activation failed and incumbent unit restore failed; incumbent link retained for recovery'
+      if ! install_units "$release_dir/$previous" || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; incumbent link retained for recovery'; fi
     else
       remove_units || die 'candidate activation failed and fresh-install unit teardown also failed; candidate retained for recovery'
       rm -f -- "$current_link"

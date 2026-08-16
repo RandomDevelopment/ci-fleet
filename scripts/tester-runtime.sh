@@ -126,7 +126,7 @@ for name,service in services.items():
     if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
-    if not any(re.fullmatch(r'no-new-privileges[:=]true', option) for option in service.get('security_opt',[])): raise SystemExit(f'{name}: no-new-privileges=true is required')
+    if service.get('security_opt') not in (['no-new-privileges:true'],['no-new-privileges=true']): raise SystemExit(f'{name}: no-new-privileges=true must be the only security option')
     for mount in service.get('volumes',[]):
         if isinstance(mount,str) or mount.get('type') not in ('volume','tmpfs'): raise SystemExit(f'{name}: host bind mounts are forbidden')
     for port in service.get('ports',[]):
@@ -207,7 +207,7 @@ remove_environment() {
     compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
     [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
     secure_file "$compose" 600
-    docker compose -p "$(project_name "$id")" -f "$compose" down --volumes --remove-orphans || return 1
+    docker compose -p "$(project_name "$id")" -f "$compose" down --timeout 10 --volumes --remove-orphans || return 1
     rm -f -- "$target" "$(deployed_compose_path "$id")"
   fi
   report "REMOVED environment=$id"
