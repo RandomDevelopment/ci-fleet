@@ -61,6 +61,26 @@ if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --
 install_mismatch_root=$tmp/install-mismatch-root
 if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$install_mismatch_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --install --config-repo example-org/other --config-ref 1111111111111111111111111111111111111111 >/dev/null 2>&1; then fail 'mismatched installer configuration repository was accepted'; fi
 [[ ! -e $install_mismatch_root ]] || fail 'mismatched installer repository wrote local state before rejection'
+config_checkout=$tmp/config-checkout
+git init -q "$config_checkout"
+python3 - "$config_checkout/fleet.json" <<'PY'
+import json,sys
+json.dump({'organization':{'slug':'example-org'},'controllers':{'example-ci-01':{'pool':'trusted'}},'runner_pools':{'trusted':{'runner_group':'example-ci-experimental','allowed_repositories':['example-org/example-repo'],'public_repositories':False}}},open(sys.argv[1],'w'))
+PY
+git -C "$config_checkout" add fleet.json
+git -C "$config_checkout" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
+config_ref=$(git -C "$config_checkout" rev-parse HEAD)
+routing_mismatch_root=$tmp/routing-mismatch-root
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_mismatch_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group other-group --allow-repository example-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" >/dev/null 2>&1; then fail 'desired-state routing mismatch was accepted'; fi
+[[ ! -e $routing_mismatch_root ]] || fail 'desired-state routing mismatch wrote local state before rejection'
+routing_root=$tmp/routing-root
+routing_port=$(port)
+CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$routing_port" --timeout 30 >"$tmp/routing.out" 2>"$tmp/routing.err" &
+routing_pid=$!
+processes+=("$routing_pid")
+wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html"
+kill -TERM "$routing_pid"
+if wait "$routing_pid"; then fail 'cancelled matching desired-state bootstrap succeeded'; fi
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
   fail 'plaintext non-loopback callback was accepted'
@@ -122,6 +142,10 @@ rm -f "$FAKE_BOOTSTRAP_STATE"
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=999 >/dev/null 2>&1; then fail 'mismatched project repository name/ID pair was accepted'; fi
 [[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$((create_count + 1))" && $(grep -c '^DELETE runner-group-delete$' "$tmp/api.log") == 1 && ! -e $FAKE_BOOTSTRAP_STATE ]] || fail 'invalid repository pair was not rolled back'
+cancel_delete_count=$(grep -c '^DELETE runner-group-delete$' "$tmp/api.log")
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'injected cancellation after group creation succeeded'; fi
+[[ $(grep -c '^DELETE runner-group-delete$' "$tmp/api.log") == "$((cancel_delete_count + 1))" && ! -e $FAKE_BOOTSTRAP_STATE ]] || fail 'cancellation did not roll back the new runner group'
 printf 'created\n' >"$FAKE_BOOTSTRAP_STATE"
 post_rollback_create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
 
@@ -140,6 +164,8 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'public-repository runner group was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_RESTRICTED_GROUP=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'workflow-restricted runner group was accepted'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_ARCHIVED_REPOSITORY=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'archived project repository was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'mismatched App client ID was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_NO_CONTENTS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \

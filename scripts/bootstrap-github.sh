@@ -8,7 +8,7 @@ Usage: bootstrap-github.sh [--dry-run|--check] --organization ORG --instance ID
   --config-repository ORG/PRIVATE_CONFIG_REPO --runner-group GROUP
   --allow-repository ORG/PROJECT=NUMERIC_ID [--allow-repository ORG/PROJECT=NUMERIC_ID ...]
   [--bind ADDRESS --callback-host HOST --port PORT --timeout SECONDS]
-  [--install --config-repo OWNER/REPO_OR_PATH --config-ref COMMIT]
+  [--install --config-repo LOCAL_CHECKOUT --config-ref COMMIT]
 EOF
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -60,11 +60,17 @@ fi
 for command in bash curl openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 if $run_installer; then
   command -v git >/dev/null || die 'required command is unavailable: git'
-  if git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
-  else
-    [[ ${config_repo,,} == "${config_repository,,}" ]] || die '--config-repo must match --config-repository unless it is a pinned local checkout'
-  fi
+  git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die '--install requires a local configuration checkout; remote handoff has no pre-mutation credential proof'
+  [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
+  git -C "$config_repo" show "$config_ref:fleet.json" | python3 -c '
+import json,sys
+organization, controller_id, runner_group = sys.argv[1:4]
+repositories=sorted(item.lower() for item in sys.argv[4:])
+value=json.load(sys.stdin)
+controller=value["controllers"][controller_id]
+pool=value["runner_pools"][controller["pool"]]
+if value["organization"]["slug"] != organization or pool["runner_group"] != runner_group or pool.get("public_repositories") is not False or sorted(item.lower() for item in pool["allowed_repositories"]) != repositories: raise SystemExit(1)
+' "$organization" "$instance" "$runner_group" "${repository_names[@]}" || die 'pinned desired-state routing differs from bootstrap arguments'
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -80,16 +86,25 @@ bootstrap_recovery=$etc_dir/bootstrap-recovery.json
 bootstrap_pending=$etc_dir/bootstrap-recovery.pending
 temporary=$(mktemp -d)
 callback_pid=
+created_group=false
+installation_token=
+group_id=
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 cleanup() {
   local status=$?
-  trap - EXIT INT TERM HUP
+  trap - EXIT HUP INT TERM
   [[ -z $callback_pid ]] || kill "$callback_pid" >/dev/null 2>&1 || true
+  if $created_group && declare -F rollback_new_group >/dev/null; then
+    rollback_new_group || printf 'ERROR: automatic rollback of the unverified runner group failed\n' >&2
+  fi
   rm -rf "$temporary"
   exit "$status"
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run live/check bootstrap as root'; fi
 [[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
@@ -114,6 +129,14 @@ PY
   curl --config "$config" || status=$?
   rm -f "$config"
   return "$status"
+}
+
+rollback_new_group() {
+  $created_group || return 0
+  local deleted=$temporary/group-delete.json
+  write_auth_config "$installation_token" DELETE "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$deleted" || return 1
+  rm -f "$deleted"
+  created_group=false
 }
 
 make_app_jwt() {
@@ -371,16 +394,10 @@ print(json.load(open(sys.argv[1]))['id'])
 PY
 )
   created_group=true
+  if [[ ${CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then kill -TERM "$$"; fi
   rm -f "$payload" "$response"
 fi
 [[ $group_id =~ ^[0-9]+$ ]] || die 'runner group ID is invalid'
-rollback_new_group() {
-  $created_group || return 0
-  local deleted=$temporary/group-delete.json
-  write_auth_config "$installation_token" DELETE "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$deleted" || return 1
-  rm -f "$deleted"
-  created_group=false
-}
 response=$temporary/group.json
 if ! write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$response"; then
   if $created_group; then rollback_new_group || die 'new runner group inspection and rollback both failed'; die 'runner group inspection failed; new group was rolled back'; fi
@@ -408,7 +425,7 @@ response=json.load(open(sys.argv[1])); repositories=response.get('repositories',
 if response.get('total_count') != len(repositories): raise SystemExit(1)
 actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Path(sys.argv[2]).read_text().splitlines())
 actual_names=sorted(v['full_name'].lower() for v in repositories); expected_names=sorted(v.lower() for v in sys.argv[3:])
-if actual!=expected or actual_names!=expected_names: raise SystemExit(1)
+if actual!=expected or actual_names!=expected_names or any(v.get('private') is not True or v.get('archived') is not False for v in repositories): raise SystemExit(1)
 PY
 then
   if $created_group; then
@@ -418,6 +435,7 @@ then
   die 'existing runner group repository access differs; no change made'
 fi
 rm -f "$selected"
+created_group=false
 
 staged=$temporary/host.env
 printf '%s\n' "CI_FLEET_GITHUB_APP_CLIENT_ID=$CI_FLEET_GITHUB_APP_CLIENT_ID" "CI_FLEET_GITHUB_APP_INSTALLATION_ID=$installation_id" "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/secrets/github-app.pem" 'CI_FLEET_RUNNER_TTL=6h' >"$staged"
@@ -429,7 +447,7 @@ fi
 note "BOOTSTRAP_OK organization=$organization instance=$instance app=$CI_FLEET_GITHUB_APP_SLUG app_id=$verified_app_id installation_id=$installation_id runner_group=$runner_group runner_group_id=$group_id repositories=${#repositories[@]}"
 if [[ $mode == check ]]; then note "CREDENTIALS_VERIFIED pem=$pem host_config=$host_env"; else note "CREDENTIALS_WRITTEN pem=$pem host_config=$host_env"; fi
 if $run_installer; then
-  "$script_dir/install-worker-controller.sh" --install --config-repo "$config_repo" --controller "$instance" --ref "$config_ref"
+  "$script_dir/install-worker-controller.sh" --install --config-repo "$config_repo" --config-identity "$config_repository" --controller "$instance" --ref "$config_ref"
 else
   note "NEXT sudo $script_dir/install-worker-controller.sh --install --config-repo OWNER/REPO --controller $instance --ref REVIEWED_COMMIT"
 fi
