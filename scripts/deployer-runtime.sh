@@ -127,6 +127,9 @@ deploy_exit() {
     restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" 2>/dev/null || status=1
     restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" 2>/dev/null || status=1
   fi
+  if [[ ${audit_pending:-0} == 1 && ${last_request_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
+    restore_encoded_file "$last_request" "$last_request_backup" 2>/dev/null || status=1
+  fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
   if [[ -n ${snapshot:-} && -d $snapshot && ! -L $snapshot ]]; then
@@ -506,6 +509,10 @@ PY
       lkg_state_backup=$(base64 -w0 "$previous_state")
       lkg_policy_backup=$(base64 -w0 "$previous_policy")
       lkg_backed_up=1
+    fi
+    if [[ -f "$last_request" && ! -L "$last_request" ]]; then
+      last_request_backup=$(base64 -w0 "$last_request")
+      last_request_backed_up=1
     fi
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
