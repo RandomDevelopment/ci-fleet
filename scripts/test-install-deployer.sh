@@ -1769,13 +1769,17 @@ PY
 cp "$approval" "$request"; chmod 0600 "$request"
 lkg_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")
 lkg_policy_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf")
+last_request_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-request.conf")
 printf 'deploy\n' >"$tmp/fail-after-state-delete"
 export FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-state-delete
 expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_DELETE_STATE_ROOT FAKE_ADAPTER_FAIL_AFTER_MUTATION
 [[ $lkg_state_before == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json")" ]] || fail 'recursive state cleanup destroyed retained rollback state'
 [[ $lkg_policy_before == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf")" ]] || fail 'recursive state cleanup destroyed retained rollback policy'
+[[ $last_request_before == "$(sha256sum "$root/var/lib/ci-fleet-deployer/last-request.conf")" ]] || fail 'recursive state cleanup destroyed completed-deployment rollback marker'
 compgen -G "$root/var/lib/ci-fleet-deployer/.lkg.*" >/dev/null && fail 'rollback backup remained inside adapter-writable state'
+rollback=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'rollback after recursive state cleanup did not complete'
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"
