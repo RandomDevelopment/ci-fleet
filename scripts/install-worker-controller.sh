@@ -809,6 +809,7 @@ install_systemd_units() {
     install -m 0644 "$source/host/systemd/ci-fleet-capacity.timer" "$systemd_dir/"
   else
     systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
+    systemctl stop ci-fleet-capacity.service >/dev/null 2>&1 || true
     rm -f "$systemd_dir/ci-fleet-capacity.service" "$systemd_dir/ci-fleet-capacity.timer"
   fi
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
