@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+sys.dont_write_bytecode = True
 from status_auth import sign_headers
 
 
@@ -642,8 +643,11 @@ def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tupl
         raise ValueError("capacity history directory must be root-owned mode 0700")
     retained = []
     dirty = False
-    if path.exists():
+    try:
         info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
             raise ValueError("capacity history must be root-owned mode 0600")
         for line in path.read_text().splitlines():

@@ -216,6 +216,12 @@ class HealthTests(unittest.TestCase):
                 redirected.symlink_to(other, target_is_directory=True)
                 with self.assertRaisesRegex(ValueError, "directory must be root-owned"):
                     health.record_capacity(redirected / "samples.jsonl", {"runners": {"current": 0}}, now=1_000_000)
+                dangling_target = Path(directory) / "outside.jsonl"
+                dangling = history.parent / "dangling.jsonl"
+                dangling.symlink_to(dangling_target)
+                with self.assertRaisesRegex(ValueError, "history must be root-owned"):
+                    health.record_capacity(dangling, {"runners": {"current": 0}}, now=1_000_000)
+                self.assertFalse(dangling_target.exists())
             finally:
                 if previous_testing is None:
                     os.environ.pop("CI_FLEET_TESTING", None)
