@@ -36,7 +36,9 @@ flowchart LR
      --location primary-site \
      --capacity-budget 1 \
      --max-runners 1 \
-     --engine-ref <reviewed-ci-fleet-commit>
+     --engine-ref REVIEWED_CI_FLEET_COMMIT \
+     --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID \
+     --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    ```
 
 3. Edit `fleet.json` to add the organization's real logical mappings.

@@ -10,11 +10,21 @@
   "runner_pools": {
     "trusted-ci": {
       "runner_group": "example-trusted-ci",
-      "routing_labels": ["docker-ci"],
-      "allowed_repositories": ["example-org/example-app"],
+      "routing_labels": [
+        "docker-ci"
+      ],
+      "allowed_repositories": [
+        "example-org/example-app"
+      ],
       "public_repositories": false,
       "capacity_budget": 1,
       "job_submission_policy": "all-independent-jobs"
+    }
+  },
+  "managed_images": {
+    "254b98a10ea200e39f19bbe75ab9a822de2d5966": {
+      "controller": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "runner": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
     }
   },
   "controllers": {
@@ -48,13 +58,17 @@
       "host_group": "development-apps",
       "automatic": true,
       "requires_approval": false,
-      "required_secret_names": ["DEPLOY_AUTH"]
+      "required_secret_names": [
+        "DEPLOY_AUTH"
+      ]
     },
     "production": {
       "host_group": "production-apps",
       "automatic": false,
       "requires_approval": true,
-      "required_secret_names": ["DEPLOY_AUTH"]
+      "required_secret_names": [
+        "DEPLOY_AUTH"
+      ]
     }
   },
   "projects": {
@@ -73,7 +87,10 @@
         "max_job_minutes": 5,
         "shard_target_minutes": 4
       },
-      "deployments": ["development", "production"]
+      "deployments": [
+        "development",
+        "production"
+      ]
     }
   }
 }
