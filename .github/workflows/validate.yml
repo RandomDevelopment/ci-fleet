@@ -81,6 +81,7 @@ jobs:
             --project test-app \
             --registry BAD \
             --engine-ref "$(git rev-parse HEAD)" \
+            --architecture amd64 \
             --controller-image-digest "sha256:$(printf '1%.0s' {1..64})" \
             --runner-image-digest "sha256:$(printf '2%.0s' {1..64})" \
             --output "${temporary_directory}/invalid.json"; then
@@ -92,6 +93,7 @@ jobs:
             --organization test-company \
             --project test-app \
             --engine-ref "$(git rev-parse HEAD)" \
+            --architecture amd64 \
             --controller-image-digest "sha256:$(printf '1%.0s' {1..64})" \
             --runner-image-digest "sha256:$(printf '2%.0s' {1..64})" \
             --output "${temporary_directory}/fleet.json"

@@ -2,8 +2,9 @@
 FROM golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd AS build
 ARG SOURCE_DATE_EPOCH=1786752000
 WORKDIR /src
-COPY go.mod *.go ./
-RUN go mod tidy && go mod verify
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+COPY *.go ./
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev
 ARG CI_FLEET_COMMIT=unknown

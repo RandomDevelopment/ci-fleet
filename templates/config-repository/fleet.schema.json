@@ -64,6 +64,15 @@
     "managed_images": {
       "type": "object",
       "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "amd64": {"$ref": "#/$defs/managed_image_ids"},
+        "arm64": {"$ref": "#/$defs/managed_image_ids"}
+      }
+    },
+    "managed_image_ids": {
+      "type": "object",
+      "additionalProperties": false,
       "required": ["controller", "runner"],
       "properties": {
         "controller": {"$ref": "#/$defs/image_digest"},

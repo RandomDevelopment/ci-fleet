@@ -260,10 +260,17 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     for engine_ref, images in managed_images.items():
         path = f"$.managed_images.{engine_ref}"
         validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, path, "key must be a nonzero full lowercase engine commit SHA")
-        if validation.exact_keys(images, path, {"controller", "runner"}):
-            for name in ("controller", "runner"):
-                digest = images.get(name)
-                validation.require(isinstance(digest, str) and bool(IMAGE_DIGEST.fullmatch(digest)) and digest != "sha256:" + "0" * 64, f"{path}.{name}", "must be a nonzero sha256 image digest")
+        if not isinstance(images, dict) or not images:
+            validation.errors.append(f"{path}: must declare at least one architecture")
+            continue
+        unsupported = sorted(set(images) - {"amd64", "arm64"})
+        validation.require(not unsupported, path, "contains unsupported architecture keys")
+        for architecture, identifiers in images.items():
+            architecture_path = f"{path}.{architecture}"
+            if validation.exact_keys(identifiers, architecture_path, {"controller", "runner"}):
+                for name in ("controller", "runner"):
+                    digest = identifiers.get(name)
+                    validation.require(isinstance(digest, str) and bool(IMAGE_DIGEST.fullmatch(digest)) and digest != "sha256:" + "0" * 64, f"{architecture_path}.{name}", "must be a nonzero sha256 image digest")
 
     controllers = config.get("controllers")
     if not isinstance(controllers, dict) or not controllers:

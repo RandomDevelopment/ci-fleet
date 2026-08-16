@@ -86,12 +86,22 @@ class PolicyTests(unittest.TestCase):
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
                 "--engine-ref", "1" * 40,
+                "--architecture", "amd64",
                 "--controller-image-digest", "sha256:" + "1" * 64,
                 "--runner-image-digest", "sha256:" + "2" * 64,
                 "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
+
+    def test_managed_image_ids_require_an_architecture_key(self) -> None:
+        config = copy.deepcopy(reference_config())
+        engine_ref = first_controller(config)["engine_ref"]
+        config["managed_images"][engine_ref] = {
+            "controller": "sha256:" + "1" * 64,
+            "runner": "sha256:" + "2" * 64,
+        }
+        self.assert_rejected(config, "architecture")
 
     def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
         previous = reference_config()

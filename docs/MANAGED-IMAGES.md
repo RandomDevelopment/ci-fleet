@@ -38,13 +38,19 @@ docker image inspect --format '{{.Id}}' \
   "ci-fleet-runner:${CI_FLEET_COMMIT:0:12}"
 ```
 
-After the repeated IDs match, add one private desired-state entry:
+Repeat the build on every supported host architecture. After each architecture's repeated IDs match, add them to one private desired-state entry:
 
 ```json
 "managed_images": {
   "FULL_ENGINE_COMMIT": {
-    "controller": "sha256:REVIEWED_CONTROLLER_IMAGE_ID",
-    "runner": "sha256:REVIEWED_RUNNER_IMAGE_ID"
+    "amd64": {
+      "controller": "sha256:REVIEWED_AMD64_CONTROLLER_IMAGE_ID",
+      "runner": "sha256:REVIEWED_AMD64_RUNNER_IMAGE_ID"
+    },
+    "arm64": {
+      "controller": "sha256:REVIEWED_ARM64_CONTROLLER_IMAGE_ID",
+      "runner": "sha256:REVIEWED_ARM64_RUNNER_IMAGE_ID"
+    }
   }
 }
 ```

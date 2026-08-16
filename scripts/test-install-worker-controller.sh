@@ -256,7 +256,7 @@ value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
-value["managed_images"] = {engine_ref: {"controller": "sha256:" + "1" * 64, "runner": "sha256:" + "2" * 64}}
+value["managed_images"] = {engine_ref: {"amd64": {"controller": "sha256:" + "1" * 64, "runner": "sha256:" + "2" * 64}}}
 controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
@@ -660,11 +660,14 @@ printf '%s\n' \
   "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$adopt_pem" \
   'CI_FLEET_RUNNER_TTL=6h' \
   'CI_FLEET_CONTROLLER_STATE=active' \
+  "CI_FLEET_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE" \
+  "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" \
   'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75\n' >"$adopt_root/etc/ci-fleet/monitoring.env"
 chmod 600 "$adopt_root/etc/ci-fleet/monitoring.env"
 : >"$FAKE_DOCKER_STATE"
+printf 'sha256:%s\n' "$controller_image_digest" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
@@ -674,6 +677,8 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed controller image ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed runner image ID'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'

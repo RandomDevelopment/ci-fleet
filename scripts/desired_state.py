@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import os
+import platform
 import re
 import stat
 import sys
@@ -155,6 +156,7 @@ def build_rendered_env(
     config_repository: str,
     config_ref: str,
     docker_gid: int,
+    machine: str | None = None,
     engine_capabilities: set[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     controller, pool = select_controller(config, controller_id)
@@ -170,7 +172,13 @@ def build_rendered_env(
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
     short_commit = engine_commit[:12]
-    images = config["managed_images"][engine_commit]
+    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine or platform.machine())
+    if architecture is None:
+        raise DesiredStateError("host architecture is unsupported for managed images")
+    try:
+        images = config["managed_images"][engine_commit][architecture]
+    except KeyError as error:
+        raise DesiredStateError(f"reviewed managed image IDs are missing for {architecture}") from error
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
         "CI_FLEET_COMMIT": engine_commit,
@@ -223,6 +231,7 @@ def build_rendered_env(
         "config_ref": config_ref,
         "engine_ref": engine_commit,
         "engine_repository": config["organization"]["delivery_engine"],
+        "architecture": architecture,
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
     }
