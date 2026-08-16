@@ -58,6 +58,9 @@ if "$bootstrap" --dry-run --organization Example-org --instance example-ci-01 --
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example_group --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'runner group outside schema-v3 slug contract was accepted'; fi
 if "$bootstrap" --dry-run --organization example-organization --instance example-instance --config-repository example-organization/config --runner-group example-group --allow-repository example-organization/repo=101 >/dev/null 2>&1; then fail 'overlong generated App name was accepted'; fi
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --bind ::1 --callback-host ::1 >/dev/null 2>&1; then fail 'unsupported IPv6 callback was accepted'; fi
+install_mismatch_root=$tmp/install-mismatch-root
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$install_mismatch_root "$bootstrap" --organization example-org --instance example-ci-01 --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --install --config-repo example-org/other --config-ref 1111111111111111111111111111111111111111 >/dev/null 2>&1; then fail 'mismatched installer configuration repository was accepted'; fi
+[[ ! -e $install_mismatch_root ]] || fail 'mismatched installer repository wrote local state before rejection'
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
   fail 'plaintext non-loopback callback was accepted'
@@ -114,6 +117,10 @@ if grep -R -F -e fixture-conversion-code -e fixture-client-secret -e fixture-web
   fail 'bootstrap output exposed sensitive fixture material'
 fi
 grep -Fxq 'POST runner-group-create' "$tmp/api.log" || fail 'runner group was not created in the mocked live flow'
+create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=999 >/dev/null 2>&1; then fail 'mismatched project repository name/ID pair was accepted'; fi
+[[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$create_count" ]] || fail 'invalid repository pair mutated the runner group'
 
 before=$(sha256sum "$host_env" "$pem")
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance example-ci-01 \
@@ -130,6 +137,10 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'public-repository runner group was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_RESTRICTED_GROUP=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'workflow-restricted runner group was accepted'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'mismatched App client ID was accepted'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_NO_CONTENTS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'installation token without contents permission was accepted'; fi
 for kind in installation-repositories runner-groups runner-group-repositories; do
   if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_TRUNCATE_KIND=$kind "$bootstrap" --check --organization example-org --instance example-ci-01 \
     --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail "truncated $kind page was accepted"; fi

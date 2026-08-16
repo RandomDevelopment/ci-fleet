@@ -58,6 +58,14 @@ if $run_installer; then
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
 fi
 for command in bash curl openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+if $run_installer; then
+  command -v git >/dev/null || die 'required command is unavailable: git'
+  if git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
+  else
+    [[ ${config_repo,,} == "${config_repository,,}" ]] || die '--config-repo must match --config-repository unless it is a pinned local checkout'
+  fi
+fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root_prefix=${CI_FLEET_ROOT_PREFIX:-}
@@ -248,10 +256,10 @@ app_jwt=$temporary/app.jwt
 make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
 app_response=$temporary/app.json
 write_auth_config "$app_jwt" GET https://api.github.com/app "$app_response"
-mapfile -t app_data < <(python3 - "$app_response" "$organization" "$CI_FLEET_GITHUB_APP_SLUG" <<'PY'
+mapfile -t app_data < <(python3 - "$app_response" "$organization" "$CI_FLEET_GITHUB_APP_SLUG" "$CI_FLEET_GITHUB_APP_CLIENT_ID" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1])); owner=v.get('owner',{}); expected=sys.argv[3]
-if (expected and v.get('slug') != expected) or owner.get('login','').lower() != sys.argv[2].lower() or owner.get('type') != 'Organization': raise SystemExit(1)
+if (expected and v.get('slug') != expected) or v.get('client_id') != sys.argv[4] or owner.get('login','').lower() != sys.argv[2].lower() or owner.get('type') != 'Organization': raise SystemExit(1)
 permissions=v.get('permissions',{})
 expected_permissions={'contents':'read','metadata':'read','organization_self_hosted_runners':'write'}
 if permissions != expected_permissions or v.get('events') not in ([], None) or v.get('public') is not False: raise SystemExit(1)
@@ -314,7 +322,7 @@ python3 - "$installation_response" "$installation_token" <<'PY'
 import json,os,sys
 from pathlib import Path
 value=json.load(open(sys.argv[1])); token=value.get('token')
-if not isinstance(token,str) or len(token)<20: raise SystemExit(1)
+if not isinstance(token,str) or len(token)<20 or value.get('permissions',{}).get('contents') != 'read': raise SystemExit(1)
 Path(sys.argv[2]).write_text(token); os.chmod(sys.argv[2],0o600)
 PY
 rm -f "$installation_response"
@@ -333,6 +341,19 @@ actual=[v for v in repositories if v.get('full_name','').lower()==sys.argv[2].lo
 if len(repositories)!=1 or len(actual)!=1: raise SystemExit(1)
 PY
 rm -f "$visible"
+
+for repository in "${repositories[@]}"; do
+  repository_name=${repository%=*}
+  repository_id=${repository##*=}
+  response=$temporary/repository.json
+  write_auth_config "$installation_token" GET "https://api.github.com/repos/$repository_name" "$response"
+  python3 - "$response" "$repository_name" "$repository_id" "$organization" <<'PY' || die "project repository name/ID pair is invalid: $repository_name"
+import json,sys
+value=json.load(open(sys.argv[1])); owner=value.get('owner',{})
+if str(value.get('id')) != sys.argv[3] or value.get('full_name','').lower() != sys.argv[2].lower() or owner.get('login','').lower() != sys.argv[4].lower() or not value.get('private') or value.get('archived'): raise SystemExit(1)
+PY
+  rm -f "$response"
+done
 
 groups=$temporary/groups.json
 write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups?per_page=100" "$groups"
