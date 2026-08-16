@@ -118,16 +118,19 @@ if grep -R -F -e fixture-conversion-code -e fixture-client-secret -e fixture-web
 fi
 grep -Fxq 'POST runner-group-create' "$tmp/api.log" || fail 'runner group was not created in the mocked live flow'
 create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
+rm -f "$FAKE_BOOTSTRAP_STATE"
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=999 >/dev/null 2>&1; then fail 'mismatched project repository name/ID pair was accepted'; fi
-[[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$create_count" ]] || fail 'invalid repository pair mutated the runner group'
+[[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$((create_count + 1))" && $(grep -c '^DELETE runner-group-delete$' "$tmp/api.log") == 1 && ! -e $FAKE_BOOTSTRAP_STATE ]] || fail 'invalid repository pair was not rolled back'
+printf 'created\n' >"$FAKE_BOOTSTRAP_STATE"
+post_rollback_create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
 
 before=$(sha256sum "$host_env" "$pem")
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >"$tmp/check.out" 2>"$tmp/check.err"
 [[ $(sha256sum "$host_env" "$pem") == "$before" ]] || fail 'check mode changed credentials'
 grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not verify persisted credentials'
-[[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == 1 ]] || fail 'check mode mutated the runner group'
+[[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$post_rollback_create_count" ]] || fail 'check mode mutated the runner group'
 
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance other-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'persisted App was rebound to another instance'; fi

@@ -342,19 +342,6 @@ if len(repositories)!=1 or len(actual)!=1: raise SystemExit(1)
 PY
 rm -f "$visible"
 
-for repository in "${repositories[@]}"; do
-  repository_name=${repository%=*}
-  repository_id=${repository##*=}
-  response=$temporary/repository.json
-  write_auth_config "$installation_token" GET "https://api.github.com/repos/$repository_name" "$response"
-  python3 - "$response" "$repository_name" "$repository_id" "$organization" <<'PY' || die "project repository name/ID pair is invalid: $repository_name"
-import json,sys
-value=json.load(open(sys.argv[1])); owner=value.get('owner',{})
-if str(value.get('id')) != sys.argv[3] or value.get('full_name','').lower() != sys.argv[2].lower() or owner.get('login','').lower() != sys.argv[4].lower() or not value.get('private') or value.get('archived'): raise SystemExit(1)
-PY
-  rm -f "$response"
-done
-
 groups=$temporary/groups.json
 write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups?per_page=100" "$groups"
 group_id=$(python3 - "$groups" "$runner_group" <<'PY'
@@ -366,6 +353,7 @@ for value in groups:
 PY
 )
 rm -f "$groups"
+created_group=false
 if [[ -z $group_id ]]; then
   [[ $mode != check ]] || die 'runner group is missing'
   payload=$temporary/group-create.json
@@ -382,20 +370,38 @@ import json,sys
 print(json.load(open(sys.argv[1]))['id'])
 PY
 )
+  created_group=true
   rm -f "$payload" "$response"
 fi
 [[ $group_id =~ ^[0-9]+$ ]] || die 'runner group ID is invalid'
+rollback_new_group() {
+  $created_group || return 0
+  local deleted=$temporary/group-delete.json
+  write_auth_config "$installation_token" DELETE "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$deleted" || return 1
+  rm -f "$deleted"
+  created_group=false
+}
 response=$temporary/group.json
-write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$response"
-python3 - "$response" "$runner_group" <<'PY' || die 'existing runner group is broader or has unexpected identity; no change made'
+if ! write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$response"; then
+  if $created_group; then rollback_new_group || die 'new runner group inspection and rollback both failed'; die 'runner group inspection failed; new group was rolled back'; fi
+  die 'existing runner group inspection failed; no change made'
+fi
+if ! python3 - "$response" "$runner_group" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1]))
 if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('allows_public_repositories') is not False or v.get('restricted_to_workflows') is not False: raise SystemExit(1)
 PY
+then
+  if $created_group; then rollback_new_group || die 'new runner group failed identity verification and rollback failed'; die 'new runner group failed identity verification and was rolled back'; fi
+  die 'existing runner group is broader or has unexpected identity; no change made'
+fi
 rm -f "$response"
 selected=$temporary/group-repositories.json
-write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories?per_page=100" "$selected"
-python3 - "$selected" "$repository_ids" "${repository_names[@]}" <<'PY' || die 'existing runner group repository access differs; no change made'
+if ! write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories?per_page=100" "$selected"; then
+  if $created_group; then rollback_new_group || die 'new runner group repository inspection and rollback both failed'; die 'runner group repository inspection failed; new group was rolled back'; fi
+  die 'existing runner group repository inspection failed; no change made'
+fi
+if ! python3 - "$selected" "$repository_ids" "${repository_names[@]}" <<'PY'
 import json,sys
 from pathlib import Path
 response=json.load(open(sys.argv[1])); repositories=response.get('repositories',[])
@@ -404,6 +410,13 @@ actual=sorted(v['id'] for v in repositories); expected=sorted(int(v) for v in Pa
 actual_names=sorted(v['full_name'].lower() for v in repositories); expected_names=sorted(v.lower() for v in sys.argv[3:])
 if actual!=expected or actual_names!=expected_names: raise SystemExit(1)
 PY
+then
+  if $created_group; then
+    rollback_new_group || die 'new runner group failed verification and rollback failed'
+    die 'new runner group repository access differed and was rolled back'
+  fi
+  die 'existing runner group repository access differs; no change made'
+fi
 rm -f "$selected"
 
 staged=$temporary/host.env
