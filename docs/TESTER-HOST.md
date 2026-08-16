@@ -13,7 +13,7 @@ A tester host accepts only:
 - application images addressed by an immutable `sha256` digest;
 - environment secrets stored below that environment's fixed host-local secret directory.
 
-It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, privileged containers, added capabilities, host namespaces, global container names, and credentials outside the environment secret boundary. Every service must be read-only, drop all capabilities, and set `no-new-privileges`. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something a repository script can prove.
+It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, custom volume drivers/options, privileged containers, added capabilities, host or shared namespaces, Docker API access, global container names, and credentials outside the environment secret boundary. Compose environment variables, env files, and configs are forbidden credential channels; use only fixed mode-`0600` Compose secrets. Every service must be read-only, drop all capabilities, and set `no-new-privileges=true`. The validated rendered Compose model is copied into protected runtime state before activation, so partial starts remain tracked and later cleanup does not depend on a mutable or deleted source definition. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something this repository-only change can prove.
 
 ## Prepare host-local configuration
 
