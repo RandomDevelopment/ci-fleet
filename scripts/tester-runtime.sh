@@ -80,6 +80,7 @@ load_global() {
 
 project_name() { printf 'ci-fleet-test-%s' "$1"; }
 state_path() { printf '%s/%s.state' "$state_dir" "$1"; }
+deployed_compose_path() { printf '%s/%s.compose.json' "$state_dir" "$1"; }
 spec_path() { printf '%s/%s.env' "$environment_dir" "$1"; }
 
 load_spec() {
@@ -95,6 +96,7 @@ load_spec() {
   route_port=${ENV_VALUES[CI_FLEET_TESTER_ROUTE_PORT]:-}
   [[ $project =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $owner =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$ ]] || die 'project or owner is invalid'
   [[ $route_service =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $route_port =~ ^[0-9]+$ && $route_port -ge 1024 && $route_port -le 65535 ]] || die 'route service/port is invalid'
+  if [[ -z $expires_at && -f $(state_path "$id") ]]; then expires_at=$(awk -F= '$1=="EXPIRES_AT"{print $2}' "$(state_path "$id")"); fi
   if [[ -z $expires_at ]]; then expires_at=$(($(date +%s) + default_ttl)); fi
   [[ $expires_at =~ ^[0-9]+$ && $expires_at -gt $(date +%s) && $expires_at -le $(($(date +%s) + 604800)) ]] || die 'expiration must be in the future and at most seven days away'
   canonical=$(readlink -f -- "$compose_file") || die 'compose file is unavailable'
@@ -118,21 +120,23 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('network_mode')=='host' or service.get('pid')=='host' or service.get('ipc')=='host': raise SystemExit(f'{name}: host/privileged access is forbidden')
-    if service.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname'): raise SystemExit(f'{name}: device/capability/global identity is forbidden')
+    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc'): raise SystemExit(f'{name}: external namespace/privileged access is forbidden')
+    if service.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket'): raise SystemExit(f'{name}: device/capability/global identity is forbidden')
+    if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
-    security=' '.join(service.get('security_opt',[]))
-    if 'no-new-privileges' not in security: raise SystemExit(f'{name}: no-new-privileges is required')
+    if not any(re.fullmatch(r'no-new-privileges[:=]true', option) for option in service.get('security_opt',[])): raise SystemExit(f'{name}: no-new-privileges=true is required')
     for mount in service.get('volumes',[]):
         if isinstance(mount,str) or mount.get('type') not in ('volume','tmpfs'): raise SystemExit(f'{name}: host bind mounts are forbidden')
     for port in service.get('ports',[]):
         if not isinstance(port,dict) or str(port.get('host_ip','')) != '127.0.0.1': raise SystemExit(f'{name}: published ports must bind loopback')
         ports.append((name,int(port.get('published',0)),int(port.get('target',0))))
 if ports != [(route_service,route_port,ports[0][2] if ports else 0)] or not ports or ports[0][2] < 1: raise SystemExit('exactly one declared loopback route is required')
+if value.get('configs'): raise SystemExit('top-level configs are forbidden')
 for section in ('networks','volumes'):
     for name,item in value.get(section,{}).items():
         resolved=item.get('name',f'{project}_{name}')
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
+        if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
 for name,item in value.get('secrets',{}).items():
     path=item.get('file')
     if item.get('external') or not isinstance(path,str) or os.path.realpath(path).rsplit('/',1)[0] != secret_dir: raise SystemExit(f'secrets.{name}: secret must be a host-local file in the environment secret directory')
@@ -161,23 +165,32 @@ write_state() {
   local target tmp
   target=$(state_path "$environment"); tmp=$target.new
   printf 'ENVIRONMENT=%s\nPROJECT=%s\nOWNER=%s\nCOMPOSE_FILE=%s\nROUTE_SERVICE=%s\nROUTE_PORT=%s\nEXPIRES_AT=%s\nSOURCE_REVISION=%s\nIMAGE_DIGESTS=%s\nUPDATED_AT=%s\n' \
-    "$environment" "$project" "$owner" "$compose_file" "$route_service" "$route_port" "$expires_at" "$source_revision" "$image_digests" "$(date +%s)" >"$tmp"
+    "$environment" "$project" "$owner" "$(deployed_compose_path "$environment")" "$route_service" "$route_port" "$expires_at" "$source_revision" "$image_digests" "$(date +%s)" >"$tmp"
   chmod 600 "$tmp"; mv -fT "$tmp" "$target"
 }
 
-converge() {
-  local rendered count
+prepare_converge() {
+  local count
   load_spec "$environment"
   check_port_unique
   count=$(find "$state_dir" -maxdepth 1 -type f -name '*.state' | wc -l)
   [[ -f $(state_path "$environment") || $count -private-repository $max_environments ]] || die 'maximum environment count reached'
-  rendered=$(mktemp)
-  if ! validate_compose "$rendered"; then rm -f "$rendered"; die 'compose policy validation failed'; fi
-  rm -f "$rendered"
-  docker compose -p "$compose_project" -f "$compose_file" up -d --remove-orphans --wait
+  prepared_rendered=$(mktemp)
+  if ! validate_compose "$prepared_rendered"; then rm -f "$prepared_rendered"; die 'compose policy validation failed'; fi
+}
+
+apply_converge() {
+  install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
+  if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait; then
+    rm -f "$prepared_rendered"
+    die 'environment activation failed; tracked state retained for cleanup'
+  fi
+  rm -f "$prepared_rendered"
   report "CONVERGED environment=$environment project=$project owner=$owner route=loopback:$route_port expires_at=$expires_at"
 }
+
+converge() { prepare_converge; apply_converge; }
 
 remove_environment() {
   local target compose id=$1
@@ -185,21 +198,29 @@ remove_environment() {
   if [[ -f $target ]]; then
     secure_file "$target" 600
     compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
-    [[ $(readlink -f -- "$compose") == "$definition_dir"/* ]] || die 'stored compose path escaped definitions directory'
+    [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
+    secure_file "$compose" 600
     docker compose -p "$(project_name "$id")" -f "$compose" down --volumes --remove-orphans
-    rm -f -- "$target"
+    rm -f -- "$target" "$(deployed_compose_path "$id")"
   fi
   report "REMOVED environment=$id"
 }
 
 inspect_environment() {
-  local target=$1 id compose status resource value bytes=0 mount
+  local target=$1 id compose status=running resource value bytes=0 mount expected running_state
+  local -a containers=()
   id=$(basename "$target" .state); secure_file "$target" 600
   while IFS='=' read -r key value; do
     case $key in ENVIRONMENT|PROJECT|OWNER|ROUTE_PORT|EXPIRES_AT|SOURCE_REVISION|IMAGE_DIGESTS|UPDATED_AT) printf '%s=%s ' "$key" "$value" ;; esac
   done <"$target"
   compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
-  if docker compose -p "$(project_name "$id")" -f "$compose" ps --status running -q | grep -q .; then status=running; else status=unhealthy; fi
+  expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
+  mapfile -t containers < <(docker compose -p "$(project_name "$id")" -f "$compose" ps -q)
+  [[ ${#containers[@]} == "$expected" ]] || status=unhealthy
+  for resource in "${containers[@]}"; do
+    running_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$resource")
+    [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
+  done
   while IFS= read -r resource; do
     [[ -n $resource ]] || continue
     value=$(docker inspect --size --format '{{.SizeRw}}' "$resource"); [[ $value =~ ^[0-9]+$ ]] || die 'container disk size is invalid'; bytes=$((bytes + value))
@@ -235,18 +256,19 @@ case $action in
     report "CHECK_OK max_environments=$max_environments disk_used_percent=$used"
     ;;
   --converge) converge ;;
-  --reset) remove_environment "$environment"; converge ;;
+  --reset) prepare_converge; remove_environment "$environment"; apply_converge ;;
   --remove) remove_environment "$environment" ;;
   --inspect) [[ -f $(state_path "$environment") ]] || die 'environment is not installed'; inspect_environment "$(state_path "$environment")" ;;
   --cleanup)
-    now=$(date +%s)
+    now=$(date +%s); failed=0
     for target in "$state_dir"/*.state; do
       [[ -e $target ]] || continue
       secure_file "$target" 600
       expires=$(awk -F= '$1=="EXPIRES_AT"{print $2}' "$target")
       [[ $expires =~ ^[0-9]+$ ]] || die "invalid expiration in $target"
-      if ((expires <= now)); then remove_environment "$(basename "$target" .state)"; fi
+      if ((expires <= now)) && ! remove_environment "$(basename "$target" .state)"; then failed=1; fi
     done
+    ((failed == 0)) || die 'one or more expired environments could not be removed'
     report 'CLEANUP_OK'
     ;;
   --health)

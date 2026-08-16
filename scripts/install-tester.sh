@@ -31,7 +31,7 @@ root_path() { printf '%s%s' "$root_prefix" "$1"; }
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 if [[ ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run installer as root'; fi
-for command in awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm shellcheck stat systemctl tar wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+for command in awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat systemctl tar wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --show-toplevel 2>/dev/null) || die 'installer must run from a Git checkout'
 opt_dir=$(root_path /opt/ci-fleet-tester)
@@ -60,6 +60,9 @@ host_preflight() {
   # shellcheck disable=SC1090
   . "$os_release"
   [[ ${ID:-} == debian && ${VERSION_ID:-} =~ ^[0-9]+$ && ${VERSION_ID%%.*} -ge 12 ]] || die 'tester hosts require Debian 12 or newer'
+  [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die 'Docker environment selectors are forbidden'
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST="unix://$docker_socket"
   docker_context=$(docker context show); [[ $docker_context == default ]] || die 'tester requires the local default Docker context'
   [[ -S $docker_socket || ( ${CI_FLEET_TESTING:-0} == 1 && -e $docker_socket ) ]] || die 'local Docker socket is unavailable'
   actual_root=$(docker info --format '{{.DockerRootDir}}'); [[ $actual_root == "$docker_root" ]] || die 'Docker root does not match the local managed root'
@@ -81,9 +84,10 @@ ensure_directories() {
 
 release_complete() {
   local path=$1 expected=$2 unit
-  [[ -d $path && ! -L $path && -x $path/scripts/tester-runtime.sh && -f $path/.ci-fleet-source-revision ]] || return 1
+  [[ -d $path && ! -L $path && $(stat -c %u "$path") == "$expected_uid" && $(stat -c %a "$path") == 555 && -x $path/scripts/tester-runtime.sh && -f $path/.ci-fleet-source-revision ]] || return 1
   [[ $(<"$path/.ci-fleet-source-revision") == "$expected" ]] || return 1
   for unit in "${units[@]}"; do [[ -f $path/host/systemd/$unit ]] || return 1; done
+  (cd "$path" && sha256sum --status -c .ci-fleet-release.sha256) || return 1
 }
 
 stage_release() {
@@ -94,14 +98,29 @@ stage_release() {
   git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
   printf '%s\n' "$commit" >"$staging/.ci-fleet-source-revision"; chmod 0644 "$staging/.ci-fleet-source-revision"
   chmod 0755 "$staging/scripts/tester-runtime.sh"; shellcheck "$staging/scripts/tester-runtime.sh"; bash -n "$staging/scripts/tester-runtime.sh"
+  (cd "$staging" && sha256sum scripts/tester-runtime.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
+  chmod 0444 "$staging/.ci-fleet-source-revision" "$staging/.ci-fleet-release.sha256" "$staging"/host/systemd/*
+  chmod 0555 "$staging" "$staging/scripts" "$staging/host" "$staging/host/systemd" "$staging/scripts/tester-runtime.sh"
   mv -T "$staging" "$target"
 }
 
 install_units() {
   local source=$1 unit
-  for unit in "${units[@]}"; do install -m 0644 "$source/host/systemd/$unit" "$systemd_dir/$unit"; done
-  systemctl daemon-reload
-  systemctl enable --now "${timers[@]}" >/dev/null
+  for unit in "${units[@]}"; do install -m 0644 "$source/host/systemd/$unit" "$systemd_dir/$unit" || return 1; done
+  systemctl daemon-reload || return 1
+  systemctl enable --now "${timers[@]}" >/dev/null || return 1
+}
+
+remove_units() {
+  systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || true
+  local unit; for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit"; done
+  systemctl daemon-reload || true
+}
+
+write_lkg() {
+  printf '%s\n' "$1" >"$lkg_file.new"
+  chmod 0600 "$lkg_file.new"
+  mv -fT "$lkg_file.new" "$lkg_file"
 }
 
 activate_release() {
@@ -109,14 +128,16 @@ activate_release() {
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-  install_units "$target"
-  if ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health; then
+  if ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"; install_units "$release_dir/$previous"
+    else
+      rm -f -- "$current_link"
+      remove_units
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
-  [[ ! $previous =~ ^[0-9a-f]{40}$ || $previous == "$commit" ]] || printf '%s\n' "$previous" >"$lkg_file"
+  [[ ! $previous =~ ^[0-9a-f]{40}$ || $previous == "$commit" ]] || write_lkg "$previous"
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 
@@ -159,15 +180,13 @@ case $action in
     target=$(<"$lkg_file"); [[ $target =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good revision is invalid'
     current=$(installed_revision || true)
     activate_release "$target"
-    [[ ! $current =~ ^[0-9a-f]{40}$ || $current == "$target" ]] || printf '%s\n' "$current" >"$lkg_file"
+    [[ ! $current =~ ^[0-9a-f]{40}$ || $current == "$target" ]] || write_lkg "$current"
     report "ROLLBACK_OK source_revision=$target"
     ;;
   --uninstall)
     ensure_directories
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
-    systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || true
-    for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit"; done
-    systemctl daemon-reload
+    remove_units
     rm -f -- "$current_link" "$lkg_file"; rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
     report 'UNINSTALL_OK preserved_config=true preserved_definitions=true preserved_secrets=true'
     ;;
