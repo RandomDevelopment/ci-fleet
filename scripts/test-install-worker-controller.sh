@@ -330,6 +330,8 @@ git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
+expect_failure 'alternate Docker endpoints are not supported' env DOCKER_HOST=tcp://example.invalid:2376 "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_failure 'alternate Docker contexts are not supported' env DOCKER_CONTEXT=remote "$installer" --check "${base_args[@]}" --ref "$ref_one"
 printf 'ID=example\nVERSION_ID="1"\n' >"$root/etc/os-release"
 expect_failure 'supported Linux is Debian 12 or newer' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
