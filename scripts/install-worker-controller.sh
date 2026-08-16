@@ -135,12 +135,29 @@ cleanup_temporary() {
 trap cleanup_temporary EXIT
 
 require_commands() {
-  local command
+  local command docker_root disk_used os_id os_release os_version socket
   for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock mktemp; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+  [[ "$mode" == rollback || "$mode" == uninstall ]] && return
+
+  for command in curl jq df; do command -v "$command" >/dev/null || die "$command is required"; done
+  os_release=$(root_path /etc/os-release)
+  [[ -r "$os_release" ]] || die 'supported Linux release metadata is unavailable'
+  os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")
+  os_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' "$os_release")
+  [[ "$os_id" == debian && "$os_version" =~ ^[0-9]+$ ]] || die 'supported Linux is Debian 12 or newer'
+  ((10#$os_version >= 12)) || die 'supported Linux is Debian 12 or newer'
+  [[ -r $(root_path /etc/ssl/certs/ca-certificates.crt) ]] || die 'CA certificate bundle is unavailable'
+  socket=$(root_path /var/run/docker.sock)
+  [[ -S "$socket" && -r "$socket" && -w "$socket" || "$testing" == 1 && -e "$socket" ]] || die 'Docker socket is unavailable or inaccessible'
+  docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) || die 'Docker root directory is unavailable'
+  [[ "$docker_root" == /* ]] || die 'Docker root directory is invalid'
+  disk_used=$(df -P "$docker_root" 2>/dev/null | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
+  [[ "$disk_used" =~ ^[0-9]{1,3}$ ]] || die 'Docker disk capacity could not be determined'
+  ((disk_used < 80)) || die 'Docker filesystem must remain below 80% utilization'
 }
 
 validate_common_arguments() {
