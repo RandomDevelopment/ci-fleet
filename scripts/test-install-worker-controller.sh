@@ -711,6 +711,9 @@ unset FAKE_SYSTEMCTL_LOG
 [[ $(readlink -f "$adopt_root/opt/ci-fleet/manager/current") == "$adopt_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'legacy downgrade replaced the forward-compatible manager'
 [[ ! -e "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'legacy runtime retained capacity units'
 retained_installer=$adopt_root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+export FAKE_ENGINE_REF=$engine_ref
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
 expect_success "$retained_installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'upgrade back from legacy did not restore capacity units'
 grep -Fq 'CI_FLEET_POOL=trusted-ci' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade back from legacy did not restore the telemetry pool'
