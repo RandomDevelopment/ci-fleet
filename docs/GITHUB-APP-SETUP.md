@@ -26,16 +26,28 @@ manifest conversion code requires transport confidentiality.
 sudo ./scripts/bootstrap-github.sh \
   --organization example-org \
   --instance example-ci-01 \
+  --config-repository example-org/config \
   --runner-group example-ci-experimental \
-  --allow-repository example-org/example-repo
+  --allow-repository example-org/example-repo=123456
 ```
 
 All names above are fictional. The script prints one non-secret local
 `REGISTRATION_URL`. Open it, press the single registration button, install the
-new App for **only** the requested private repositories, and return to the
+new App for **only** the private configuration repository, and return to the
 terminal. The target host receives and exchanges the temporary code itself.
 Neither the code nor any credential is copied through a phone, clipboard, chat,
 email, issue, or second computer.
+
+For a headless remote host, establish an authenticated SSH local forward from
+the management workstation first: `ssh -L 8765:127.0.0.1:8765 HOST`. Keep that
+session open, run bootstrap on `HOST`, and open `http://127.0.0.1:8765/` on the
+workstation. Close the SSH session immediately after bootstrap. Do not expose
+the callback listener or forward on a shared workstation.
+
+Each project argument includes its numeric repository ID, obtained and reviewed
+by the organization owner. The App itself receives access only to the separate
+configuration repository; the project name/ID pairs scope runner-group routing
+without granting the controller App project source access.
 
 The bootstrap:
 
@@ -49,16 +61,23 @@ The bootstrap:
   default/broad runner-group access;
 - creates a missing selected-repository runner group, but never changes an
   existing group whose identity or access differs;
-- destroys the conversion code, conversion response, JWTs, installation token,
-  callback state, and temporary curl configurations on every exit.
+- destroys the conversion code, JWTs, installation token, callback state, and
+  temporary curl configurations on exit. After a successful conversion, a
+  protected mode-`0600` `bootstrap-recovery.json` (or atomic-publication
+  `bootstrap-recovery.pending`) is deliberately retained until the PEM and
+  identity record are installed. Rerun the identical live command to recover.
+  If bootstrap is abandoned, an organization owner must first revoke/delete the
+  exact newly created App, then explicitly remove those recovery files; ordinary
+  cleanup never discards potentially unique credentials.
 
 Inspect a request without local writes or GitHub calls:
 
 ```bash
 sudo ./scripts/bootstrap-github.sh --dry-run \
   --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config \
   --runner-group example-ci-experimental \
-  --allow-repository example-org/example-repo
+  --allow-repository example-org/example-repo=123456
 ```
 
 After success, rerun the same command with `--check` to verify App ownership,
