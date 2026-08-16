@@ -10,6 +10,7 @@ fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 root=$tmp/root
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin" "$root/etc/ci-fleet-tester/environments" "$root/etc/ci-fleet-tester/definitions" "$root/etc/ci-fleet-tester/secrets" "$root/var/lib/ci-fleet-tester/environments" "$root/var/lib/docker" "$root/var/lib/fake-tester-volume" "$root/var/run" "$root/etc/systemd/system"
+mkdir -p "$root/run/lock"; chmod 1777 "$root/run/lock"
 chmod 700 "$root/etc/ci-fleet-tester" "$root/etc/ci-fleet-tester/environments" "$root/etc/ci-fleet-tester/definitions" "$root/etc/ci-fleet-tester/secrets" "$root/var/lib/ci-fleet-tester" "$root/var/lib/ci-fleet-tester/environments"
 printf 'ID=debian\nVERSION_ID=13\n' >"$root/etc/os-release"
 : >"$root/var/run/docker.sock"
@@ -45,6 +46,7 @@ write_environment() {
 }
 
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
+[[ $(stat -c %a "$root/run/lock") == 1777 && $(stat -c %a "$root/run/lock/ci-fleet-tester") == 755 ]] || fail 'runtime changed shared lock-directory permissions'
 if FAKE_TESTER_DOCKER_ROOT=/remote/docker "$runtime" --check >/dev/null 2>&1; then fail 'remote Docker daemon was accepted'; fi
 write_environment preview-a 18080
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a | grep -Fq CONVERGED || fail 'converge failed'
@@ -63,10 +65,13 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host custom-network replicas lifecycle-hook gpu deploy-device build; do
+for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network replicas lifecycle-hook gpu deploy-device build; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
+write_environment bad-include 18091
+printf 'include:\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
+if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'Compose include was accepted before rendering'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -126,6 +131,8 @@ ref=$(git -C "$repo_root" rev-parse HEAD)
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'fresh install failed'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'current release link is wrong'
+[[ -x $root/opt/ci-fleet-tester/tester-runtime ]] || fail 'stable tester launcher was not installed'
+for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do grep -Fq 'ExecStart=/opt/ci-fleet-tester/tester-runtime' "$root/etc/systemd/system/$service" || fail "$service bypasses stable launcher"; done
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null
 check_output=$("$installer" --check --config /etc/ci-fleet-tester/tester.env)
 grep -Fq CHECK_OK <<<"$check_output" || fail 'installed check failed'
@@ -188,7 +195,7 @@ cp -a "$root/opt/ci-fleet-tester/releases/$ref" "$root/opt/ci-fleet-tester/relea
 chmod 0755 "$root/opt/ci-fleet-tester/releases/$old"
 chmod 0644 "$root/opt/ci-fleet-tester/releases/$old/.ci-fleet-source-revision" "$root/opt/ci-fleet-tester/releases/$old/.ci-fleet-release.sha256"
 printf '%s\n' "$old" >"$root/opt/ci-fleet-tester/releases/$old/.ci-fleet-source-revision"
-(cd "$root/opt/ci-fleet-tester/releases/$old" && sha256sum scripts/tester-runtime.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
+(cd "$root/opt/ci-fleet-tester/releases/$old" && sha256sum scripts/tester-runtime.sh scripts/tester-launcher.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
 chmod 0444 "$root/opt/ci-fleet-tester/releases/$old/.ci-fleet-source-revision" "$root/opt/ci-fleet-tester/releases/$old/.ci-fleet-release.sha256"
 chmod 0555 "$root/opt/ci-fleet-tester/releases/$old"
 printf '%s\n' "$old" >"$root/var/lib/ci-fleet-tester/last-known-good"; chmod 600 "$root/var/lib/ci-fleet-tester/last-known-good"
@@ -214,6 +221,11 @@ timeout 0.2 "$installer" --reset --environment absent >/dev/null 2>&1
 reset_lock_rc=$?
 set -e
 [[ $reset_lock_rc == 124 ]] || fail 'reset resolved the active release before acquiring the lifecycle lock'
+set +e
+timeout 0.2 "$root/opt/ci-fleet-tester/tester-runtime" --inspect --environment absent >/dev/null 2>&1
+launcher_lock_rc=$?
+set -e
+[[ $launcher_lock_rc == 124 ]] || fail 'stable launcher resolved the active release before acquiring the lifecycle lock'
 wait "$lock_pid"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored systemd teardown failure'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
