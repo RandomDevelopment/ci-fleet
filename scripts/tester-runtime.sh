@@ -200,7 +200,7 @@ remove_environment() {
     compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
     [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
     secure_file "$compose" 600
-    docker compose -p "$(project_name "$id")" -f "$compose" down --volumes --remove-orphans
+    docker compose -p "$(project_name "$id")" -f "$compose" down --volumes --remove-orphans || return 1
     rm -f -- "$target" "$(deployed_compose_path "$id")"
   fi
   report "REMOVED environment=$id"

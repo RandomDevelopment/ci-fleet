@@ -85,9 +85,20 @@ FAKE_TESTER_ROUTE_PORT=18085 "$runtime" --remove --environment immutable-remove 
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --reset --environment preview-a >/dev/null
 grep -q 'down --volumes --remove-orphans' "$tmp/docker.log" || fail 'reset did not remove only the scoped Compose project'
 if grep -Eq 'system prune|volume prune|network prune' "$tmp/docker.log"; then fail 'global Docker prune was used'; fi
-sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$state"
+write_environment expired-a 18087
+FAKE_TESTER_ROUTE_PORT=18087 "$runtime" --converge --environment expired-a >/dev/null
+write_environment expired-b 18088
+FAKE_TESTER_ROUTE_PORT=18088 "$runtime" --converge --environment expired-b >/dev/null
+for expired_state in "$state" "$root/var/lib/ci-fleet-tester/environments/expired-a.state" "$root/var/lib/ci-fleet-tester/environments/expired-b.state"; do
+  sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$expired_state"
+done
+: >"$tmp/docker.log"
+if FAKE_TESTER_DOWN_FAIL=1 "$runtime" --cleanup >/dev/null 2>&1; then fail 'cleanup ignored environment removal failures'; fi
+for id in preview-a expired-a expired-b; do
+  grep -Fq "ci-fleet-test-$id" "$tmp/docker.log" || fail "cleanup stopped before attempting $id"
+done
 "$runtime" --cleanup >/dev/null
-[[ ! -e $state ]] || fail 'expired environment survived cleanup'
+[[ ! -e $state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-a.state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-b.state ]] || fail 'expired environment survived cleanup'
 
 # Commit-backed installer tests run after the implementation commit exists.
 ref=$(git -C "$repo_root" rev-parse HEAD)
