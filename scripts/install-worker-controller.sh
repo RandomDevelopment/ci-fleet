@@ -687,9 +687,15 @@ build_candidate() {
 }
 
 capture_legacy_image_ids() {
-  local environment=$1 controller_image runner_image controller_digest runner_digest
+  local environment=$1 controller_image runner_image controller_digest runner_digest engine_ref
+  engine_ref=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
   controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$environment")
   runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  if [[ -z "$engine_ref" ]]; then
+    engine_ref=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed engine revision'
+    printf 'CI_FLEET_ENGINE_REF=%s\n' "$engine_ref" >>"$environment"
+  fi
   if [[ -z "$controller_digest" ]]; then
     controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print $2}' "$environment")
     [[ -n "$controller_image" ]] || die 'legacy checkpoint cannot identify the installed controller image'
@@ -705,8 +711,8 @@ capture_legacy_image_ids() {
       || die 'legacy checkpoint cannot capture the installed runner image ID'
     printf 'CI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$runner_digest" >>"$environment"
   fi
-  [[ "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ && "$runner_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || die 'legacy checkpoint contains an invalid managed image ID'
+  [[ "$engine_ref" =~ ^[0-9a-f]{40}$ && "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ && "$runner_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die 'legacy checkpoint contains an invalid engine revision or managed image ID'
 }
 
 make_checkpoint() {
