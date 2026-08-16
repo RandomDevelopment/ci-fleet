@@ -155,9 +155,11 @@ class HealthTests(unittest.TestCase):
                 history.write_text('{"timestamp":999999}\n' * health.CAPACITY_MAX_SAMPLES)
                 history.chmod(0o600)
                 self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_000))
+                history_inode = history.stat().st_ino
                 snapshot["cpu"].update(used_percent=20, total_ticks=200, idle_ticks=50)
                 self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_030))
-                self.assertEqual(len(history.read_text().splitlines()), health.CAPACITY_MAX_SAMPLES)
+                self.assertLessEqual(len(history.read_text().splitlines()), health.CAPACITY_COMPACT_SAMPLES)
+                self.assertEqual(history.stat().st_ino, history_inode)
                 self.assertEqual(history.stat().st_mode & 0o777, 0o600)
                 self.assertNotIn("must-not-be-recorded", history.read_text())
                 report = health.capacity_report(history, now=1_000_030)
@@ -166,7 +168,9 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 90.0, "p95": 90.0})
                 self.assertEqual(pool["metrics"]["runner_cpu_percent"], {"p50": 12.5, "p95": 90.0})
                 snapshot["runners"]["current"] = 0
+                history_before_idle = history.read_bytes()
                 self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_900))
+                self.assertEqual(history.read_bytes(), history_before_idle)
                 snapshot["runners"]["current"] = 1
                 snapshot["cpu"].update(total_ticks=300, idle_ticks=70)
                 runner_cpu.append(25.0)
@@ -181,6 +185,9 @@ class HealthTests(unittest.TestCase):
     def test_capacity_prunes_inactive_history_and_ignores_incomplete_samples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             history = Path(directory) / "capacity" / "samples.jsonl"
+            missing = Path(directory) / "missing" / "samples.jsonl"
+            self.assertEqual(health.capacity_report(missing, now=1_000_000)["pools"], {})
+            self.assertFalse(missing.parent.exists())
             history.parent.mkdir(mode=0o700)
             valid = {
                 "timestamp": 999_999, "pool": "example-ci-01",
@@ -293,8 +300,10 @@ class HealthTests(unittest.TestCase):
                     run=run,
                 )
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
-                self.assertEqual(set(snapshot["services"]), {"capacity", "cleanup", "drift"})
-                self.assertEqual(set(snapshot["timers"]), {"health", "capacity", "cleanup", "drift"})
+                self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
+                self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                (root / "etc/systemd/system").mkdir(parents=True)
+                (root / "etc/systemd/system/ci-fleet-capacity.timer").write_text("fixture\n")
                 (root / "var/lib/ci-fleet/reconcile").mkdir(parents=True)
                 (root / "var/lib/ci-fleet/reconcile/state.json").write_text('{"status":"rolled_back","desired_commit":"","applied_commit":"","health":"healthy"}\n')
                 remote = health.collect_snapshot(
@@ -310,7 +319,7 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(set(remote["services"].values()), {"ok"})
                 self.assertEqual(set(remote["timers"]), {"health", "capacity", "cleanup", "drift", "reconcile"})
                 self.assertEqual(remote["reconciliation"]["status"], "bootstrap")
-                (root / "etc").mkdir()
+                (root / "etc").mkdir(exist_ok=True)
                 (root / "etc/debian_version").write_text("13\n")
                 debian = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)
                 self.assertIn("updates", debian["services"])
