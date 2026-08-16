@@ -113,8 +113,12 @@ for unit in ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet
 release=$root/opt/ci-fleet-tester/releases/$ref
 chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'tampered installed release passed check'; fi
-chmod u+w "$release/scripts/tester-runtime.sh"; git -C "$repo_root" show "$ref:scripts/tester-runtime.sh" >"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
-"$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'restored release failed check'
+"$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
+"$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'repaired release failed check'
+installed_unit=$root/etc/systemd/system/ci-fleet-tester-health.service
+printf '# drift\n' >>"$installed_unit"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
+cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"
 
 # A syntactically valid candidate that fails its post-switch check restores the incumbent.
 upgrade_repo=$tmp/upgrade-repo
@@ -125,6 +129,11 @@ git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.exampl
 bad_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 if "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'failed candidate activation succeeded'; fi
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'failed upgrade did not restore incumbent release'
+git -C "$upgrade_repo" checkout --quiet "$ref"
+git -C "$upgrade_repo" replace "$ref" "$bad_ref"
+if "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null 2>&1; then fail 'Git replacement metadata was accepted'; fi
+git -C "$upgrade_repo" replace -d "$ref" >/dev/null
+git -C "$upgrade_repo" checkout --quiet "$bad_ref"
 
 # Unit activation failures restore the incumbent symlink and units.
 git -C "$upgrade_repo" show "$ref:scripts/tester-runtime.sh" >"$upgrade_repo/scripts/tester-runtime.sh"; chmod 0755 "$upgrade_repo/scripts/tester-runtime.sh"
@@ -134,6 +143,15 @@ unit_fail_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 unit_hash_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service")
 if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'unit activation failure succeeded'; fi
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" && $(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service") == "$unit_hash_before" ]] || fail 'unit activation failure did not restore incumbent release and units'
+
+# A corrupt incumbent is never recorded as the rollback target.
+chmod u+w "$release/scripts/tester-runtime.sh"; printf '# corrupt incumbent\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
+printf '# candidate\n' >>"$upgrade_repo/docs/TESTER-HOST.md"
+git -C "$upgrade_repo" add docs/TESTER-HOST.md
+git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: second valid tester candidate'
+valid_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
+"$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null || fail 'valid upgrade failed'
+[[ ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'corrupt incumbent was recorded as last-known-good'
 
 # Rollback switches only to a complete recorded release and keeps environments intact.
 old=0000000000000000000000000000000000000000
@@ -153,6 +171,14 @@ rollback_state_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/roll
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state") == "$rollback_state_hash" ]] || fail 'rollback changed active environment state'
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --remove --environment rollback-env >/dev/null
 
+lock_file=$root/run/lock/ci-fleet-tester.lock
+lock_ready=$tmp/lock-ready
+flock "$lock_file" -c "touch '$lock_ready'; sleep 1" & lock_pid=$!
+while [[ ! -e $lock_ready ]]; do kill -0 "$lock_pid" 2>/dev/null || fail 'could not acquire fixture lifecycle lock'; done
+if timeout 0.2 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored the runtime lifecycle lock'; fi
+wait "$lock_pid"
+if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored systemd teardown failure'; fi
+[[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed'
 [[ -f $root/etc/ci-fleet-tester/tester.env && ! -L $root/opt/ci-fleet-tester/current ]] || fail 'uninstall did not preserve config/remove runtime'
 printf 'TESTER_INSTALLER_TESTS_OK\n'
