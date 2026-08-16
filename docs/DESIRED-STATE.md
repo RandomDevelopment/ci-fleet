@@ -62,6 +62,8 @@ GitHub App and runner-group creation remain the bootstrap responsibility tracked
 
 ## Install a fresh controller
 
+The managed installer supports Debian 12 or newer. Before reading configuration or changing the host, it verifies Docker Engine and Compose v2, Git, curl, jq, the system CA bundle, direct Docker-socket access, and that the Docker filesystem is below the documented 80% warning threshold. It rejects alternate Docker endpoints and contexts, then pins every lifecycle command to the verified local Unix socket. Rollback and uninstall require only their recovery tools, not Git, tar, cmp, host-release metadata, CA bootstrap, or capacity checks.
+
 Run the command from a reviewed checkout of ci-fleet on the target Linux Docker machine:
 
 ```bash
