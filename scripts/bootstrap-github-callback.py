@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import html
 import http.server
 import os
 import secrets
+import signal
 import urllib.parse
 from typing import cast
 
@@ -107,6 +109,11 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 30 <= args.timeout <= 1800:
         parser.error("invalid port or timeout")
+    parent = os.getppid()
+    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM) != 0:
+        raise OSError(ctypes.get_errno(), "cannot bind callback lifetime to bootstrap")
+    if os.getppid() != parent:
+        return 2
     server = Server((args.bind, args.port), Callback)
     server.organization = args.organization
     server.state = args.state

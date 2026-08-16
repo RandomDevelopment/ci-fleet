@@ -81,6 +81,11 @@ processes+=("$routing_pid")
 wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html"
 kill -TERM "$routing_pid"
 if wait "$routing_pid"; then fail 'cancelled matching desired-state bootstrap succeeded'; fi
+for _ in {1..100}; do
+  if ! "$real_curl" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then break; fi
+  sleep 0.05
+done
+if "$real_curl" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then fail 'callback outlived its bootstrap parent'; fi
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
   fail 'plaintext non-loopback callback was accepted'
@@ -96,6 +101,13 @@ if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$unsafe_root "$bootstrap" --check --o
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then
   fail 'symlinked protected directory was accepted'
 fi
+unsafe_state_root=$tmp/unsafe-state-root
+mkdir -p "$unsafe_state_root/etc/ci-fleet/secrets"
+chmod 700 "$unsafe_state_root/etc/ci-fleet" "$unsafe_state_root/etc/ci-fleet/secrets"
+mkdir "$unsafe_state_root/etc/ci-fleet/bootstrap-app.env"
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$unsafe_state_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'unsafe bootstrap state was accepted'; fi
+[[ ! -e $unsafe_state_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'unsafe bootstrap state was rejected after credential mutation'
 
 # Mock the GitHub API while exercising the complete local callback, conversion, persistence,
 # exact private-repository/group checks, idempotent check, and redaction paths.
@@ -137,6 +149,12 @@ if grep -R -F -e fixture-conversion-code -e fixture-client-secret -e fixture-web
   fail 'bootstrap output exposed sensitive fixture material'
 fi
 grep -Fxq 'POST runner-group-create' "$tmp/api.log" || fail 'runner group was not created in the mocked live flow'
+exec {held_bootstrap_lock}<>"$live_root/etc/ci-fleet/bootstrap.lock"
+flock -n "$held_bootstrap_lock"
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'concurrent bootstrap transaction was accepted'; fi
+flock -u "$held_bootstrap_lock"
+exec {held_bootstrap_lock}>&-
 create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
 rm -f "$FAKE_BOOTSTRAP_STATE"
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \

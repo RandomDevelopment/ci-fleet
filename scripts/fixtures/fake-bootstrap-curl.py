@@ -10,6 +10,8 @@ for line in config:
     if " = " in line:
         key, value = line.split(" = ", 1)
         values.setdefault(key, []).append(value.strip().strip('"'))
+if "connect-timeout" not in values or "max-time" not in values:
+    raise SystemExit("fake API request lacks transfer bounds")
 url = values["url"][0]
 endpoint = url.split("?", 1)[0]
 method = values.get("request", ["GET"])[0]
