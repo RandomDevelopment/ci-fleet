@@ -136,9 +136,17 @@ trap cleanup_temporary EXIT
 
 require_commands() {
   local command docker_root disk_used os_id os_release os_version socket
-  for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock mktemp; do
+  local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp)
+  if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(git tar cmp); fi
+  for command in "${required[@]}"; do
     command -v "$command" >/dev/null || die "$command is required"
   done
+  socket=$(root_path /var/run/docker.sock)
+  [[ -z ${DOCKER_HOST:-} || ${DOCKER_HOST} == "unix://$socket" ]] || die 'alternate Docker endpoints are not supported; use the local Docker socket'
+  [[ -z ${DOCKER_CONTEXT:-} ]] || die 'alternate Docker contexts are not supported; use the local Docker socket'
+  DOCKER_HOST=unix://$socket
+  export DOCKER_HOST
+  unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
   [[ "$mode" == rollback || "$mode" == uninstall ]] && return
@@ -151,7 +159,6 @@ require_commands() {
   [[ "$os_id" == debian && "$os_version" =~ ^[0-9]+$ ]] || die 'supported Linux is Debian 12 or newer'
   ((10#$os_version >= 12)) || die 'supported Linux is Debian 12 or newer'
   [[ -r $(root_path /etc/ssl/certs/ca-certificates.crt) ]] || die 'CA certificate bundle is unavailable'
-  socket=$(root_path /var/run/docker.sock)
   [[ -S "$socket" && -r "$socket" && -w "$socket" || "$testing" == 1 && -e "$socket" ]] || die 'Docker socket is unavailable or inaccessible'
   docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) || die 'Docker root directory is unavailable'
   [[ "$docker_root" == /* ]] || die 'Docker root directory is invalid'
