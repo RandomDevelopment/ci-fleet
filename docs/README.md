@@ -15,6 +15,7 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Decide whether it fits my infrastructure | [Architecture](ARCHITECTURE.md) and the root [README](../README.md) |
 | Try the experimental implementation safely | [Live pilot runbook](LIVE-PILOT.md) |
 | Add another Docker host, VM, computer, or VPS | [Adding a host](ADDING-A-HOST.md) |
+| Install an isolated deployed-application test host | [Test-environment host](TESTER-HOST.md) |
 | Manage controller configuration from Git | [Git-authored controller desired state](DESIRED-STATE.md) |
 | Create the controller GitHub App identity | [GitHub App setup](GITHUB-APP-SETUP.md) |
 | Add a private project to the shared runner pool | [Adding a project](ADDING-A-PROJECT.md) |
