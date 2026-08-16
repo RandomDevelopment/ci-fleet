@@ -677,6 +677,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+grep -Fxq "CI_FLEET_ENGINE_REF=$engine_ref" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed engine revision'
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed controller image ID'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed runner image ID'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
