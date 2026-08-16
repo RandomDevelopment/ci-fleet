@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "capabilities": {
+    "capacity_telemetry": true,
     "status_reporting_config": true,
     "required_status_reporting": true
   }

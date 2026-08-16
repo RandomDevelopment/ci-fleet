@@ -123,9 +123,11 @@ class HealthTests(unittest.TestCase):
             snapshot = healthy_snapshot()
             snapshot["controller_id"] = "example-ci-01"
             snapshot["reconciliation"] = reconciliation
+            snapshot["cpu"] = {"logical": 8, "used_percent": 10, "total_ticks": 123, "idle_ticks": 45}
             report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
             self.assertEqual(report["configuration"], {"desired_commit": "", "applied_commit": ""})
             self.assertEqual(report["error"]["code"], "reconciliation_invalid")
+            self.assertEqual(set(report["metrics"]["cpu"]), {"logical", "used_percent"})
 
     def test_capacity_history_is_resource_only_bounded_and_aggregated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -154,17 +156,22 @@ class HealthTests(unittest.TestCase):
                 history.chmod(0o600)
                 self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_000))
                 snapshot["cpu"].update(used_percent=20, total_ticks=200, idle_ticks=50)
-                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_300))
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_030))
                 self.assertEqual(len(history.read_text().splitlines()), health.CAPACITY_MAX_SAMPLES)
                 self.assertEqual(history.stat().st_mode & 0o777, 0o600)
                 self.assertNotIn("must-not-be-recorded", history.read_text())
-                report = health.capacity_report(history, now=1_000_300)
+                report = health.capacity_report(history, now=1_000_030)
                 pool = report["pools"]["example-ci-01"]
                 self.assertEqual((pool["samples"], pool["runner_observations"]), (2, 2))
                 self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 90.0, "p95": 90.0})
                 self.assertEqual(pool["metrics"]["runner_cpu_percent"], {"p50": 12.5, "p95": 90.0})
                 snapshot["runners"]["current"] = 0
                 self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_900))
+                snapshot["runners"]["current"] = 1
+                snapshot["cpu"].update(total_ticks=300, idle_ticks=70)
+                runner_cpu.append(25.0)
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_930))
+                self.assertEqual(json.loads(history.read_text().splitlines()[-1])["host"]["cpu_percent"], 80.0)
             finally:
                 if previous_testing is None:
                     os.environ.pop("CI_FLEET_TESTING", None)
@@ -186,11 +193,12 @@ class HealthTests(unittest.TestCase):
             previous_testing = os.environ.get("CI_FLEET_TESTING")
             os.environ["CI_FLEET_TESTING"] = "1"
             try:
-                self.assertFalse(health.record_capacity(history, {"runners": {"current": 0}}, now=1_000_000))
+                self.assertFalse(health.record_capacity(history, {"runners": {"current": 0}, "cpu": {"total_ticks": 20, "idle_ticks": 10}}, now=1_000_000))
                 self.assertEqual(len(history.read_text().splitlines()), 1)
                 incomplete = {**valid, "timestamp": 999_998, "host": dict(valid["host"])}
                 incomplete.pop("runners")
-                history.write_text(history.read_text() + json.dumps(incomplete) + "\n")
+                malformed_counters = {**valid, "timestamp": 999_997, "host": {**valid["host"], "cpu_total_ticks": "10"}}
+                history.write_text(history.read_text() + json.dumps(incomplete) + "\n" + json.dumps(malformed_counters) + "\n")
                 report = health.capacity_report(history, now=1_000_000)
                 self.assertEqual(report["pools"]["example-ci-01"]["samples"], 1)
                 redirected = Path(directory) / "redirected"

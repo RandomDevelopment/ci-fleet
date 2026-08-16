@@ -30,6 +30,7 @@ HOST_REQUIRED = {
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
+CAPACITY_TELEMETRY_CAPABILITY = "capacity_telemetry"
 
 
 class DesiredStateError(ValueError):
@@ -186,7 +187,6 @@ def build_rendered_env(
         "CI_FLEET_LABELS": ",".join(pool["routing_labels"]),
         "CI_FLEET_MAX_RUNNERS": str(effective_max),
         "CI_FLEET_MIN_RUNNERS": str(controller["min_runners"] if state == "active" else 0),
-        "CI_FLEET_POOL": controller["pool"],
         "CI_FLEET_RUNNER_CPUS": str(controller["runner_resources"]["cpu_cores"]),
         "CI_FLEET_RUNNER_GROUP": pool["runner_group"],
         "CI_FLEET_RUNNER_IMAGE": f"ci-fleet-runner:{short_commit}",
@@ -195,6 +195,8 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if CAPACITY_TELEMETRY_CAPABILITY in (engine_capabilities or set()):
+        rendered["CI_FLEET_POOL"] = controller["pool"]
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
