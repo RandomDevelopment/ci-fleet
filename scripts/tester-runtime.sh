@@ -33,7 +33,7 @@ while (($#)); do
 done
 [[ -n $action ]] || { usage; exit 2; }
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
-for command in awk basename chmod cmp curl date df dirname docker du find flock getent grep install mktemp mv python3 readlink rm stat wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+for command in awk basename chmod cmp curl date df dirname docker du env find flock getent grep install mktemp mv python3 readlink rm stat wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 secure_directory() {
   local path=$1 mode=$2
@@ -108,8 +108,12 @@ load_spec() {
 }
 
 validate_compose() {
-  local rendered=$1
-  docker compose -p "$compose_project" -f "$compose_file" config --format json >"$rendered" || return 1
+  local rendered=$1 empty_env variable
+  local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST")
+  if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
+  empty_env=$(mktemp); chmod 600 "$empty_env"
+  if ! "${clean_environment[@]}" docker compose --env-file "$empty_env" -p "$compose_project" -f "$compose_file" config --format json >"$rendered"; then rm -f "$empty_env"; return 1; fi
+  rm -f "$empty_env"
   chmod 600 "$rendered"
   python3 - "$rendered" "$route_service" "$route_port" "$compose_project" "$secret_dir" "$expected_uid" <<'PY' || return 1
 import json,os,re,stat,sys
@@ -120,7 +124,7 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external namespace/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external namespace/link/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
@@ -189,7 +193,7 @@ prepare_converge() {
 apply_converge() {
   [[ -f $(state_path "$environment") ]] || install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
-  if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait; then
+  if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait --wait-timeout 60; then
     rm -f "$prepared_rendered"
     die 'environment activation failed; tracked state retained for cleanup'
   fi

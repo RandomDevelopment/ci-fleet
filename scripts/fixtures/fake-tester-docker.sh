@@ -48,6 +48,10 @@ case ${operation:-} in
       build) service_extra=',"build":{"context":"/"}' ;;
       changed-model) service_extra=',"pull_policy":"always"' ;;
       unconfined) security='no-new-privileges:true","seccomp=unconfined' ;;
+      external-links) service_extra=',"external_links":["other-environment-db:db"]' ;;
+      userns-host) service_extra=',"userns_mode":"host"' ;;
+      cgroup-host) service_extra=',"cgroup":"host"' ;;
+      interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
