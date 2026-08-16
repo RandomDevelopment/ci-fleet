@@ -28,7 +28,7 @@ wait_http() {
 callback_port=$(port)
 code_file=$tmp/callback-code
 handoff_file=$tmp/callback-handoff
-python3 "$callback" --bind 127.0.0.1 --port "$callback_port" --organization example-org --state fixture-state \
+python3 "$callback" --parent-pid "$$" --bind 127.0.0.1 --port "$callback_port" --organization example-org --state fixture-state \
   --manifest '{"name":"fixture"}' --output "$code_file" --handoff "$handoff_file" --timeout 30 >"$tmp/callback.out" 2>"$tmp/callback.err" &
 processes+=("$!")
 wait_http "http://127.0.0.1:$callback_port/" "$tmp/callback.html"
@@ -41,6 +41,9 @@ wait "${processes[-1]}"
 [[ $(<"$code_file") == fixture-code && $(stat -c %a "$code_file") == 600 ]] || fail 'callback did not protect the conversion code'
 [[ ! -s $tmp/callback.out && ! -s $tmp/callback.err ]] || fail 'callback logged request material'
 grep -Fq 'https://github.com/apps/example-fixture/installations/new' "$tmp/next.html" || fail 'callback did not provide the installation approval link'
+orphan_port=$(port)
+if python3 "$callback" --parent-pid 1 --bind 127.0.0.1 --port "$orphan_port" --organization example-org --state fixture-state --manifest '{"name":"fixture"}' --output "$tmp/orphan-code" --handoff "$tmp/orphan-handoff" --timeout 30 >/dev/null 2>&1; then fail 'callback accepted a mismatched bootstrap parent'; fi
+if "$real_curl" -fsS "http://127.0.0.1:$orphan_port/" -o /dev/null 2>/dev/null; then fail 'orphaned callback opened a listener'; fi
 
 # Dry-run validates a complete fictional request and performs no write or API call.
 dry_root=$tmp/dry-root
@@ -79,6 +82,9 @@ CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organizatio
 routing_pid=$!
 processes+=("$routing_pid")
 wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html"
+second_routing_port=$(port)
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$second_routing_port" --timeout 30 >/dev/null 2>&1; then fail 'concurrent first-time bootstrap was accepted'; fi
+if "$real_curl" -fsS "http://127.0.0.1:$second_routing_port/" -o /dev/null 2>/dev/null; then fail 'concurrent bootstrap reached callback registration'; fi
 kill -TERM "$routing_pid"
 if wait "$routing_pid"; then fail 'cancelled matching desired-state bootstrap succeeded'; fi
 for _ in {1..100}; do
@@ -173,6 +179,8 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$boot
 [[ $(sha256sum "$host_env" "$pem") == "$before" ]] || fail 'check mode changed credentials'
 grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not verify persisted credentials'
 [[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$post_rollback_create_count" ]] || fail 'check mode mutated the runner group'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_GROUP_PAGE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --allow-repository example-org/second-repo=102 >/dev/null 2>&1 || fail 'valid second runner-group repository page was rejected'
 
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance other-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'persisted App was rebound to another instance'; fi
