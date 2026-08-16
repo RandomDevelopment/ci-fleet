@@ -24,14 +24,14 @@ if "/app-manifests/" in url:
                 "client_secret": "fixture-client-secret", "webhook_secret": "fixture-webhook-secret"}
 elif endpoint.endswith("/app"):
     kind = "app"
-    response = {"id": 123, "slug": "ci-fleet-example-org-example-ci-01", "public": False, "events": [], "owner": {"login": "example-org", "type": "Organization"},
+    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-example-org-example-ci-01", "public": False, "events": [], "owner": {"login": "example-org", "type": "Organization"},
                 "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
 elif endpoint.endswith("/app/installations"):
     kind = "installations"
     response = [{"id": 456, "repository_selection": "selected", "account": {"login": "example-org", "type": "Organization"}}]
 elif endpoint.endswith("/access_tokens"):
     kind = "installation-token"
-    response = {"token": "fixture-installation-token-value"}
+    response = {"token": "fixture-installation-token-value", "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
 elif "/repos/example-org/example-repo" in url:
     kind = "repository"
     response = {"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False,
@@ -57,6 +57,12 @@ else:
     raise SystemExit(f"unexpected fake API request: {method} {url}")
 if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_ALL_REPOSITORIES") == "1":
     response[0]["repository_selection"] = "all"
+if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID") == "1":
+    assert isinstance(response, dict)
+    response["client_id"] = "Iv1DifferentClient"
+if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_CONTENTS") == "1":
+    assert isinstance(response, dict)
+    response["permissions"].pop("contents")
 if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_PUBLIC_GROUP") == "1":
     (response["runner_groups"][0] if kind == "runner-groups" else response)["allows_public_repositories"] = True
 if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_RESTRICTED_GROUP") == "1":
