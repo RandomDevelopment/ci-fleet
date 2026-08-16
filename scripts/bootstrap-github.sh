@@ -57,7 +57,7 @@ if $run_installer; then
   [[ $mode == live ]] || die '--install is available only in live mode'
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
 fi
-for command in bash curl openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+for command in bash curl flock openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 temporary=$(mktemp -d)
 callback_pid=
@@ -78,11 +78,9 @@ reap_callback_if_exited() {
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
-  if [[ -n $callback_pid ]]; then
-    if callback_is_running; then kill "$callback_pid" >/dev/null 2>&1 || true; fi
-    wait "$callback_pid" >/dev/null 2>&1 || true
-    callback_pid=
-  fi
+  # The callback binds its lifetime to this process with PR_SET_PDEATHSIG; never
+  # signal a stale numeric PID from cleanup.
+  reap_callback_if_exited
   if $created_group && declare -F rollback_new_group >/dev/null; then
     rollback_new_group || printf 'ERROR: automatic rollback of the unverified runner group failed\n' >&2
   fi
@@ -137,14 +135,14 @@ if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0
 [[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
 
 write_auth_config() {
-  local credential=$1 method=$2 url=$3 output=$4 payload=${5:-}
+  local credential=$1 method=$2 url=$3 output=$4 payload=${5:-} transfer_timeout=${6:-30}
   local config=$temporary/curl.$RANDOM.conf
-  python3 - "$credential" "$method" "$url" "$output" "$payload" "$config" <<'PY'
+  python3 - "$credential" "$method" "$url" "$output" "$payload" "$config" "$transfer_timeout" <<'PY'
 from pathlib import Path
 import sys
-credential, method, url, output, payload, target = sys.argv[1:]
+credential, method, url, output, payload, target, transfer_timeout = sys.argv[1:]
 token = Path(credential).read_text().strip()
-lines = ['silent', 'show-error', 'fail-with-body', f'request = "{method}"', f'url = "{url}"',
+lines = ['silent', 'show-error', 'fail-with-body', 'connect-timeout = "10"', f'max-time = "{transfer_timeout}"', f'request = "{method}"', f'url = "{url}"',
          f'output = "{output}"', 'header = "Accept: application/vnd.github+json"',
          'header = "X-GitHub-Api-Version: 2022-11-28"', f'header = "Authorization: Bearer {token}"']
 if payload:
@@ -230,6 +228,14 @@ for directory in "$etc_dir" "$secret_dir"; do
     install -d -m 0700 "$directory"
   fi
 done
+bootstrap_lock=$etc_dir/bootstrap.lock
+if [[ -e $bootstrap_lock || -L $bootstrap_lock ]]; then
+  [[ -f $bootstrap_lock && ! -L $bootstrap_lock && $(stat -c %a "$bootstrap_lock") == 600 && $(stat -c %u "$bootstrap_lock") == "$expected_uid" ]] || die 'bootstrap lock file is unsafe'
+else
+  install -m 0600 /dev/null "$bootstrap_lock"
+fi
+exec {bootstrap_lock_fd}<>"$bootstrap_lock"
+flock -n "$bootstrap_lock_fd" || die 'another bootstrap transaction is active'
 if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
   if python3 - "$bootstrap_pending" <<'PY'
 import json,sys
@@ -245,6 +251,9 @@ fi
 if [[ -e $bootstrap_recovery || -L $bootstrap_recovery ]]; then
   [[ $mode != check ]] || die 'bootstrap credential recovery is pending; rerun live bootstrap first'
   recover_conversion
+fi
+if [[ -e $bootstrap_state || -L $bootstrap_state ]]; then
+  [[ -f $bootstrap_state && ! -L $bootstrap_state && $(stat -c %a "$bootstrap_state") == 600 && $(stat -c %u "$bootstrap_state") == "$expected_uid" ]] || die 'existing bootstrap state is unsafe'
 fi
 if ! load_metadata; then
   [[ $mode != check ]] || die 'bootstrap state is missing; run live bootstrap first'
@@ -281,7 +290,7 @@ import sys
 code_file, output, config = map(Path, sys.argv[1:])
 code = code_file.read_text().strip()
 if not code or len(code) > 512 or any(ch.isspace() for ch in code): raise SystemExit(1)
-config.write_text('\n'.join(['silent','show-error','fail-with-body','request = "POST"',
+config.write_text('\n'.join(['silent','show-error','fail-with-body','connect-timeout = "10"','max-time = "30"','request = "POST"',
  f'url = "https://api.github.com/app-manifests/{code}/conversions"', f'output = "{output}"',
  'header = "Accept: application/vnd.github+json"','header = "X-GitHub-Api-Version: 2022-11-28"']) + '\n')
 PY
@@ -334,7 +343,9 @@ if [[ -z $installation_id ]]; then
     reap_callback_if_exited
     installations=$temporary/installations.json
     make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
-    if write_auth_config "$app_jwt" GET https://api.github.com/app/installations "$installations"; then
+    remaining=$((deadline - SECONDS)); ((remaining > 0)) || break
+    request_timeout=$((remaining < 30 ? remaining : 30))
+    if write_auth_config "$app_jwt" GET https://api.github.com/app/installations "$installations" '' "$request_timeout"; then
       installation_id=$(python3 - "$installations" "$organization" <<'PY'
 import json,sys
 for value in json.load(open(sys.argv[1])):
