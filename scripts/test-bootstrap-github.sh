@@ -51,6 +51,10 @@ CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$dry_root "$bootstrap" --dry-run --organ
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >"$tmp/dry.out"
 grep -Fq 'NO_GITHUB_MUTATION' "$tmp/dry.out" || fail 'dry-run omitted its no-mutation result'
 [[ ! -e $dry_root ]] || fail 'dry-run wrote host state'
+conflicting_root=$tmp/conflicting-mode-root
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$conflicting_root "$bootstrap" --dry-run --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'conflicting dry-run/check modes were accepted'; fi
+[[ ! -e $conflicting_root ]] || fail 'conflicting mode rejection wrote local state'
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group Default --allow-repository example-org/example-repo >/dev/null 2>&1; then
   fail 'default runner group was accepted'
 fi
@@ -114,6 +118,16 @@ mkdir "$unsafe_state_root/etc/ci-fleet/bootstrap-app.env"
 if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$unsafe_state_root "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'unsafe bootstrap state was accepted'; fi
 [[ ! -e $unsafe_state_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'unsafe bootstrap state was rejected after credential mutation'
+dual_record_root=$tmp/dual-record-root
+mkdir -p "$dual_record_root/etc/ci-fleet/secrets"
+chmod 700 "$dual_record_root/etc/ci-fleet" "$dual_record_root/etc/ci-fleet/secrets"
+printf '%s\n' '{"id":1,"client_id":"Iv1.pending","pem":"pending","slug":"pending"}' >"$dual_record_root/etc/ci-fleet/bootstrap-recovery.pending"
+printf '%s\n' '{"id":2,"client_id":"Iv1.recovery","pem":"recovery","slug":"recovery"}' >"$dual_record_root/etc/ci-fleet/bootstrap-recovery.json"
+chmod 600 "$dual_record_root/etc/ci-fleet/bootstrap-recovery.pending" "$dual_record_root/etc/ci-fleet/bootstrap-recovery.json"
+dual_before=$(sha256sum "$dual_record_root/etc/ci-fleet/bootstrap-recovery.pending" "$dual_record_root/etc/ci-fleet/bootstrap-recovery.json")
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$dual_record_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'ambiguous dual recovery records were accepted'; fi
+[[ $(sha256sum "$dual_record_root/etc/ci-fleet/bootstrap-recovery.pending" "$dual_record_root/etc/ci-fleet/bootstrap-recovery.json") == "$dual_before" ]] || fail 'ambiguous recovery records were overwritten'
 
 # Mock the GitHub API while exercising the complete local callback, conversion, persistence,
 # exact private-repository/group checks, idempotent check, and redaction paths.
