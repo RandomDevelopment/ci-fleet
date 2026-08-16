@@ -497,7 +497,10 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["unhealthy"] += int("unhealthy" in status)
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
-    timer_ages = {"health": 900, "capacity": 120, "cleanup": 172800, "drift": 3600}
+    timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    capacity_installed = (root / "etc/systemd/system/ci-fleet-capacity.timer").is_file()
+    if capacity_installed:
+        timer_ages["capacity"] = 120
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
     if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
@@ -505,11 +508,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     if remote_config:
         timer_ages["reconcile"] = 900
     timers = {name: _unit_state(run, f"ci-fleet-{name}.timer", timer=True, max_age_seconds=age) for name, age in timer_ages.items()}
-    service_units = {
-        "capacity": "ci-fleet-capacity.service",
-        "cleanup": "ci-fleet-cleanup.service",
-        "drift": "ci-fleet-drift.service",
-    }
+    service_units = {"cleanup": "ci-fleet-cleanup.service", "drift": "ci-fleet-drift.service"}
+    if capacity_installed:
+        service_units["capacity"] = "ci-fleet-capacity.service"
     if remote_config:
         service_units["reconcile"] = "ci-fleet-reconcile.service"
     services = {name: _unit_state(run, unit) for name, unit in service_units.items()}
@@ -588,6 +589,7 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
 
 CAPACITY_RETENTION_SECONDS = 8 * 24 * 60 * 60
 CAPACITY_MAX_SAMPLES = 24000
+CAPACITY_COMPACT_SAMPLES = 26000
 
 
 def _quantity_bytes(value: str) -> int:
@@ -627,16 +629,19 @@ def _runner_capacity(run: Runner, instance: str) -> list[dict[str, int | float]]
     return metrics
 
 
-def _capacity_state(path: Path, timestamp: int) -> list[dict[str, Any]]:
+def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tuple[list[dict[str, Any]], bool]:
     expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
     try:
         parent = path.parent.lstat()
     except FileNotFoundError:
+        if not create:
+            return [], False
         path.parent.mkdir(parents=True, mode=0o700)
         parent = path.parent.lstat()
     if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != expected_owner or stat.S_IMODE(parent.st_mode) != 0o700:
         raise ValueError("capacity history directory must be root-owned mode 0700")
     retained = []
+    dirty = False
     if path.exists():
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
@@ -646,9 +651,15 @@ def _capacity_state(path: Path, timestamp: int) -> list[dict[str, Any]]:
                 previous = json.loads(line)
                 if timestamp - CAPACITY_RETENTION_SECONDS <= previous["timestamp"] <= timestamp:
                     retained.append(previous)
+                else:
+                    dirty = True
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                dirty = True
                 continue
-    return retained[-CAPACITY_MAX_SAMPLES:]
+    if len(retained) >= CAPACITY_COMPACT_SAMPLES:
+        retained = retained[-CAPACITY_COMPACT_SAMPLES:]
+        dirty = True
+    return retained, dirty
 
 
 def _write_capacity(path: Path, samples: list[dict[str, Any]]) -> None:
@@ -656,6 +667,12 @@ def _write_capacity(path: Path, samples: list[dict[str, Any]]) -> None:
     temporary.write_text("".join(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n" for value in samples))
     os.chmod(temporary, 0o600)
     temporary.replace(path)
+
+
+def _append_capacity(path: Path, sample: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sample, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(path, 0o600)
 
 
 def _update_cpu_baseline(path: Path, timestamp: int, cpu: dict[str, Any]) -> dict[str, int] | None:
@@ -689,11 +706,12 @@ def _update_cpu_baseline(path: Path, timestamp: int, cpu: dict[str, Any]) -> dic
 
 def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None) -> bool:
     timestamp = int(time.time() if now is None else now)
-    retained = _capacity_state(path, timestamp)
+    retained, dirty = _capacity_state(path, timestamp, create=True)
     cpu = snapshot["cpu"]
     previous_host = _update_cpu_baseline(path, timestamp, cpu)
     if snapshot.get("runners", {}).get("current", 0) < 1:
-        _write_capacity(path, retained)
+        if dirty:
+            _write_capacity(path, retained[-CAPACITY_MAX_SAMPLES:])
         return False
     pool_id = snapshot.get("pool_id", snapshot["controller_id"])
     memory = snapshot["memory"]
@@ -711,7 +729,10 @@ def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run,
         if total_delta > 0 and 0 <= idle_delta <= total_delta:
             host["cpu_percent"] = round(100 * (total_delta - idle_delta) / total_delta, 1)
     sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": _runner_capacity(run, snapshot["controller_id"])}
-    _write_capacity(path, (retained + [sample])[-CAPACITY_MAX_SAMPLES:])
+    if dirty or len(retained) >= CAPACITY_COMPACT_SAMPLES:
+        _write_capacity(path, (retained + [sample])[-CAPACITY_MAX_SAMPLES:])
+    else:
+        _append_capacity(path, sample)
     return True
 
 
@@ -769,7 +790,8 @@ def _sample_values(sample: Any, timestamp: int) -> tuple[str, dict[str, list[int
 def capacity_report(path: Path, *, now: int | None = None) -> dict[str, Any]:
     timestamp = int(time.time() if now is None else now)
     pools: dict[str, dict[str, Any]] = {}
-    for sample in _capacity_state(path, timestamp):
+    samples, _ = _capacity_state(path, timestamp)
+    for sample in samples:
         parsed = _sample_values(sample, timestamp)
         if parsed is None:
             continue

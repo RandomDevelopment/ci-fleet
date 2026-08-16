@@ -8,7 +8,7 @@ Each sample contains only:
 - interval host CPU utilization plus memory, swap, disk-byte, and inode counters;
 - anonymous per-runner CPU percentage and memory use/limit.
 
-Container IDs, names, repositories, jobs, logs, environment variables, source, network counters, and credentials are not stored. The history directory must be a root-owned, non-symlink mode-`0700` directory and the file must be mode `0600`. Malformed records are ignored atomically, records older than eight days are discarded even while the pool is idle, and at most 24,000 samples (slightly more than eight days at the scheduled 30-second interval) are retained. Uninstall removes this fleet-owned local history. Runner-stat failures fail the capacity service and appear in the normal health report instead of being recorded as zero observations.
+Container IDs, names, repositories, jobs, logs, environment variables, source, network counters, and credentials are not stored. The history directory must be a root-owned, non-symlink mode-`0700` directory and the file must be mode `0600`. Malformed records are ignored atomically, records older than eight days are discarded even while the pool is idle, and history is compacted from at most 26,000 records back to 24,000 (more than eight days at the scheduled 30-second interval). Normal samples append one record; compaction rewrites only when retention, malformed input, or the rotation threshold requires it. Uninstall removes this fleet-owned local history. Runner-stat failures fail the capacity service and appear in the normal health report instead of being recorded as zero observations.
 
 ## Weekly report
 

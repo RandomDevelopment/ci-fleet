@@ -825,6 +825,7 @@ install_systemd_units() {
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
+  systemctl stop ci-fleet-capacity.service >/dev/null 2>&1 || true
   local unit
   for unit in "${optional_unit_names[@]}"; do
     case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac
