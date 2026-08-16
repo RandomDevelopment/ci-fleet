@@ -47,11 +47,19 @@ secret_root=$config_root/secrets
 runtime_state=$state_root/environments
 docker_root=$(root_path /var/lib/docker)
 docker_socket=$(root_path /var/run/docker.sock)
+runtime_lock=$(root_path /run/lock/ci-fleet-tester.lock)
 units=(ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer)
 timers=(ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer)
 
 secure_file() { [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected file is unsafe: $1"; }
 secure_dir() { [[ -d $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected directory is unsafe: $1"; }
+remove_release_tree() { [[ ! -e $1 ]] || { [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$1"; rm -rf -- "$1"; }; }
+
+reject_git_replacements() {
+  local common
+  common=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)
+  [[ -z $(git -C "$repo_root" for-each-ref --format='%(refname)' refs/replace) && ! -s $common/info/grafts ]] || die 'Git replacement or graft metadata is forbidden'
+}
 
 host_preflight() {
   local os_release docker_context actual_root used
@@ -91,17 +99,19 @@ release_complete() {
 }
 
 stage_release() {
-  local commit=$1 target=$release_dir/$1 staging=$release_dir/.staging-$1
-  if [[ -e $target ]]; then release_complete "$target" "$commit" || die 'existing tester release is incomplete'; return; fi
-  rm -rf -- "$staging"; install -d -m 0755 "$staging"
-  git -C "$repo_root" cat-file -e "$commit^{commit}" 2>/dev/null || die 'requested source commit is unavailable locally'
-  git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
+  local commit=$1 target=$release_dir/$1 staging=$release_dir/.staging-$1 replaced=$release_dir/.replaced-$1
+  if [[ -e $target ]] && release_complete "$target" "$commit"; then return; fi
+  remove_release_tree "$staging"; remove_release_tree "$replaced"; install -d -m 0755 "$staging"
+  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" cat-file -e "$commit^{commit}" 2>/dev/null || die 'requested source commit is unavailable locally'
+  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
   printf '%s\n' "$commit" >"$staging/.ci-fleet-source-revision"; chmod 0644 "$staging/.ci-fleet-source-revision"
   chmod 0755 "$staging/scripts/tester-runtime.sh"; shellcheck "$staging/scripts/tester-runtime.sh"; bash -n "$staging/scripts/tester-runtime.sh"
   (cd "$staging" && sha256sum scripts/tester-runtime.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
   chmod 0444 "$staging/.ci-fleet-source-revision" "$staging/.ci-fleet-release.sha256" "$staging"/host/systemd/*
   chmod 0555 "$staging" "$staging/scripts" "$staging/host" "$staging/host/systemd" "$staging/scripts/tester-runtime.sh"
-  mv -T "$staging" "$target"
+  [[ ! -e $target ]] || mv -T "$target" "$replaced"
+  if ! mv -T "$staging" "$target"; then [[ ! -e $replaced ]] || mv -T "$replaced" "$target"; die 'could not replace tester release'; fi
+  remove_release_tree "$replaced"
 }
 
 install_units() {
@@ -112,9 +122,9 @@ install_units() {
 }
 
 remove_units() {
-  systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || true
-  local unit; for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit"; done
-  systemctl daemon-reload || true
+  systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
+  local unit; for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
+  systemctl daemon-reload
 }
 
 write_lkg() {
@@ -133,11 +143,11 @@ activate_release() {
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"; install_units "$release_dir/$previous"
     else
       rm -f -- "$current_link"
-      remove_units
+      remove_units || true
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
-  [[ ! $previous =~ ^[0-9a-f]{40}$ || $previous == "$commit" ]] || write_lkg "$previous"
+  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous"; then write_lkg "$previous"; fi
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 
@@ -152,7 +162,8 @@ case $action in
   --install|--upgrade)
     host_preflight; ensure_directories
     secure_file "$(root_path "$config")" 600
-    [[ $(git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$ref" ]] || die 'reviewed checkout HEAD does not match --ref'
+    reject_git_replacements
+    [[ $(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$ref" ]] || die 'reviewed checkout HEAD does not match --ref'
     if ! git -C "$repo_root" diff --quiet || ! git -C "$repo_root" diff --cached --quiet; then die 'reviewed checkout has tracked changes'; fi
     current=$(installed_revision || true)
     [[ $action != --install || -z $current || $current == "$ref" ]] || die 'tester is already installed at another revision; use --upgrade'
@@ -164,6 +175,7 @@ case $action in
     secure_file "$(root_path "$config")" 600
     current=$(installed_revision) || die 'tester is not installed'
     release_complete "$release_dir/$current" "$current" || die 'installed release is incomplete'
+    for unit in "${units[@]}"; do cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"; done
     for timer in "${timers[@]}"; do
       if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then die "timer is inactive: $timer"; fi
     done
@@ -185,8 +197,9 @@ case $action in
     ;;
   --uninstall)
     ensure_directories
+    install -d -m 0755 "$(dirname "$runtime_lock")"; exec 8>"$runtime_lock"; flock -x 8
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
-    remove_units
+    remove_units || die 'could not stop and disable tester maintenance units'
     rm -f -- "$current_link" "$lkg_file"
     [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
     rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
