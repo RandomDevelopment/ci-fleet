@@ -25,7 +25,7 @@ done
 case ${operation:-} in
   config)
     digest=$(printf 'a%.0s' {1..64})
-    privileged=false; read_only=true; host_ip=127.0.0.1; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=; top_extra=; volume_extra=; security='no-new-privileges:true'
+    privileged=false; read_only=true; host_ip=127.0.0.1; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
     case ${FAKE_TESTER_POLICY:-valid} in
       mutable) image=registry.example/example/app:latest ;;
       privileged) privileged=true ;;
@@ -38,11 +38,17 @@ case ${operation:-} in
       namespace-share) service_extra=',"network_mode":"service:other"' ;;
       false-nnp) security='no-new-privileges:false' ;;
       custom-volume) volume_extra=',"driver":"local"' ;;
+      volumes-from) service_extra=',"volumes_from":["container:other:rw"]' ;;
+      custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
+      replicas) service_extra=',"deploy":{"replicas":2}' ;;
+      lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
+      gpu) service_extra=',"gpus":"all"' ;;
+      deploy-device) service_extra=',"deploy":{"resources":{"reservations":{"devices":[{"capabilities":["gpu"]}]}}}' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
-    printf '{"services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"tcp"}]%s}},"networks":{"default":{"name":"%s"}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
-      "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$service_extra" "$network_name" "$project" "$volume_extra" "$secrets" "$top_extra"
+    printf '{"services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"tcp"}]%s}},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
+      "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$service_extra" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
     ;;
   up) [[ ${FAKE_TESTER_UP_FAIL:-0} != 1 ]] ;;
   down) [[ ${FAKE_TESTER_DOWN_FAIL:-0} != 1 ]] ;;
