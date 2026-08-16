@@ -717,6 +717,13 @@ export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
 expect_success "$retained_installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'upgrade back from legacy did not restore capacity units'
 grep -Fq 'CI_FLEET_POOL=trusted-ci' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade back from legacy did not restore the telemetry pool'
+rollback_stop_ref=$(write_config active 2 2)
+export FAKE_FAIL_UP_ONCE=$tmp/rollback-stop-fail-up
+export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/rollback-stop-failure
+: >"$FAKE_FAIL_UP_ONCE"
+: >"$FAKE_FAIL_CAPACITY_STOP_ONCE"
+expect_failure 'ROLLBACK_FAILED' "$retained_installer" --upgrade "${base_args[@]}" --ref "$rollback_stop_ref"
+unset FAKE_FAIL_UP_ONCE FAKE_FAIL_CAPACITY_STOP_ONCE
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi
