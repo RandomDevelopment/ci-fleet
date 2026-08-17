@@ -133,8 +133,12 @@ enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
-  local unit; for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
+  local unit present=0
+  for unit in "${units[@]}"; do [[ ! -e $systemd_dir/$unit ]] || present=1; done
+  if ((present)); then systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
+  else systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || true
+  fi
+  for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
   systemctl daemon-reload
 }
 
