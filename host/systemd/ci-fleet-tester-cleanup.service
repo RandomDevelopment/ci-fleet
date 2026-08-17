@@ -1,0 +1,20 @@
+[Unit]
+Description=Remove expired ci-fleet test environments
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/etc/ci-fleet-tester/tester.env
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci-fleet-tester/tester-runtime --cleanup
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ci-fleet-tester -/run/lock/ci-fleet-tester
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
