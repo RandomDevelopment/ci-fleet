@@ -246,7 +246,7 @@ grep -Fq 'RUN --mount=type=bind,from=build,source=/out,target=/out' "$repo_root/
 [[ $(grep -Fhc '# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf' "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile" | grep -Fc 1) -eq 2 ]] || fail 'Dockerfile frontend is not digest-pinned'
 grep -Fq 'Acquire::Check-Valid-Until "false";' "$repo_root/runner/Dockerfile" || fail 'runner snapshot validity override is not persistent'
 grep -Fq 'useradd --create-home --no-log-init' "$repo_root/runner/Dockerfile" || fail 'runner account initialization writes time-dependent login logs'
-grep -Fq 'chage -d "$((SOURCE_DATE_EPOCH / 86400))" runner' "$repo_root/runner/Dockerfile" || fail 'runner shadow date is not deterministic'
+grep -Fq "chage -d \"\$((SOURCE_DATE_EPOCH / 86400))\" runner" "$repo_root/runner/Dockerfile" || fail 'runner shadow date is not deterministic'
 [[ $(grep -Fc "find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt \"@\${SOURCE_DATE_EPOCH}\"" "$repo_root/runner/Dockerfile") -eq 3 ]] || fail 'runner filesystem timestamps are not normalized after every mutating step'
 [[ $(grep -Fc '/var/cache/ldconfig/aux-cache' "$repo_root/runner/Dockerfile") -eq 2 ]] || fail 'runner build preserves nondeterministic ldconfig cache content'
 config_repo=$tmp/config-repo
