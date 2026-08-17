@@ -28,10 +28,10 @@ The Dockerfiles fail closed if an upstream artifact no longer matches. Updating 
 
 Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
 
-1. Merge and reconcile a staging desired-state revision that changes only `engine_ref` and omits `managed_images`.
-2. After every target controller reports the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs.
+1. Merge and reconcile a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged.
+2. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime.
 
-This engine accepts the omitted key only for that staging transition. Once `managed_images` is present, every controller engine reference must have reviewed IDs; do not combine the two revisions.
+Fresh installation, field removal after enforcement, unrelated staging changes, and runtime activation without reviewed IDs all fail closed.
 
 ## Record image IDs for an engine commit
 
@@ -64,7 +64,7 @@ docker image inspect --format '{{.Id}}' \
   "ci-fleet-runner:$CI_FLEET_VERSION"
 ```
 
-Managed installation also rejects BuildKit backends older than v0.11, the first release that implements `SOURCE_DATE_EPOCH` output timestamp rewriting.
+Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes the temporary builder afterward.
 
 Repeat the build on every supported host architecture. After each architecture's repeated IDs match, add them to one private desired-state entry:
 

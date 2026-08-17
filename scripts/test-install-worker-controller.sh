@@ -28,7 +28,17 @@ case "${1:-}" in
   buildx)
     case "${2:-}" in
       version) printf 'github.com/docker/buildx v0.32.1\n' ;;
-      inspect) printf 'Name: default\nDriver: docker\nNodes:\nBuildKit version: v0.27.0\n' ;;
+      inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: v0.32.2\n' ;;
+      create|rm) ;;
+      build)
+        if [[ "$*" == *ci-fleet-runner:* ]]; then
+          [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${CI_FLEET_RUNNER_IMAGE_DIGEST#sha256:}" >"$FAKE_RUNNER_IMAGE_STATE"
+        elif [[ "$*" == *ci-fleet-controller:* ]]; then
+          [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${CI_FLEET_CONTROLLER_IMAGE_DIGEST#sha256:}" >"$FAKE_CONTROLLER_IMAGE_STATE"
+        else
+          exit 1
+        fi
+        ;;
       *) exit 1 ;;
     esac
     ;;
