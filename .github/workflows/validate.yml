@@ -82,8 +82,8 @@ jobs:
             --registry BAD \
             --engine-ref "$(git rev-parse HEAD)" \
             --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '1%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '2%.0s' {1..64})" \
+            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
+            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --output "${temporary_directory}/invalid.json"; then
             echo 'initializer accepted an invalid registry' >&2
             exit 1
@@ -94,7 +94,7 @@ jobs:
             --project test-app \
             --engine-ref "$(git rev-parse HEAD)" \
             --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '1%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '2%.0s' {1..64})" \
+            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
+            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --output "${temporary_directory}/fleet.json"
           test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644
