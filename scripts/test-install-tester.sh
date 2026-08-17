@@ -48,6 +48,10 @@ write_environment() {
 
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
 [[ $(stat -c %a "$root/run/lock") == 1777 && $(stat -c %a "$root/run/lock/ci-fleet-tester") == 755 ]] || fail 'runtime changed shared lock-directory permissions'
+rm -rf "$root/run/lock/ci-fleet-tester"; mkdir "$tmp/lock-target"; chmod 700 "$tmp/lock-target"; ln -s "$tmp/lock-target" "$root/run/lock/ci-fleet-tester"
+if "$runtime" --check >/dev/null 2>&1; then fail 'symlinked lifecycle lock directory was accepted'; fi
+[[ $(stat -c %a "$tmp/lock-target") == 700 ]] || fail 'symlinked lock target permissions changed'
+rm "$root/run/lock/ci-fleet-tester"
 if FAKE_TESTER_DOCKER_ROOT=/remote/docker "$runtime" --check >/dev/null 2>&1; then fail 'remote Docker daemon was accepted'; fi
 write_environment preview-a 18080
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a | grep -Fq CONVERGED || fail 'converge failed'
@@ -55,6 +59,8 @@ state=$root/var/lib/ci-fleet-tester/environments/preview-a.state
 [[ -f $state && $(stat -c %a "$state") == 600 ]] || fail 'state was not protected'
 inspect_output=$(FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --inspect --environment preview-a)
 grep -q 'IMAGE_DIGESTS=sha256:[a-f0-9]\{64\}.*STATUS=running DISK_BYTES=[1-9][0-9]*' <<<"$inspect_output" || fail 'inspect did not report health and disk use'
+if FAKE_TESTER_PS_FAIL=1 "$runtime" --inspect --environment preview-a >/dev/null 2>&1; then fail 'container inventory failure was hidden'; fi
+if FAKE_TESTER_VOLUME_LS_FAIL=1 "$runtime" --inspect --environment preview-a >/dev/null 2>&1; then fail 'volume inventory failure was hidden'; fi
 deployed_inode=$(stat -c %i "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev/null
 [[ $(find "$root/var/lib/ci-fleet-tester/environments" -name '*.state' | wc -l) == 1 ]] || fail 'idempotent converge duplicated state'
@@ -73,6 +79,8 @@ done
 write_environment bad-include 18091
 printf 'include:\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
 if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'Compose include was accepted before rendering'; fi
+printf '"incl\\u0075de": [{path: /etc/passwd}]\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
+if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'escaped Compose include was accepted'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -131,6 +139,8 @@ done
 ref=$(git -C "$repo_root" rev-parse HEAD)
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'fresh install failed'
+rm -rf "$root/run/lock/ci-fleet-tester"
+"$root/opt/ci-fleet-tester/tester-runtime" --health >/dev/null || fail 'stable launcher did not recreate the volatile lock directory'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'current release link is wrong'
 [[ -x $root/opt/ci-fleet-tester/tester-runtime ]] || fail 'stable tester launcher was not installed'
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do grep -Fq 'ExecStart=/opt/ci-fleet-tester/tester-runtime' "$root/etc/systemd/system/$service" || fail "$service bypasses stable launcher"; done

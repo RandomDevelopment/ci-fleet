@@ -63,7 +63,8 @@ reject_git_replacements() {
 }
 
 acquire_lifecycle_lock() {
-  install -d -m 0755 "$(dirname "$runtime_lock")"
+  mkdir -m 0755 "$(dirname "$runtime_lock")" 2>/dev/null || true
+  secure_dir "$(dirname "$runtime_lock")" 755
   exec 8>"$runtime_lock"
   flock -x 8
   export CI_FLEET_TESTER_LOCK_FD=8
@@ -83,6 +84,8 @@ host_preflight() {
   [[ -S $docker_socket || ( ${CI_FLEET_TESTING:-0} == 1 && -e $docker_socket ) ]] || die 'local Docker socket is unavailable'
   actual_root=$(docker info --format '{{.DockerRootDir}}'); [[ $actual_root == "$docker_root" ]] || die 'Docker root does not match the local managed root'
   docker compose version >/dev/null
+  printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
+  docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
   used=$(df -P "$docker_root" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
   [[ $used =~ ^[0-9]+$ && $used -private-repository 80 ]] || die 'Docker storage is at or above 80%'
 }
@@ -152,6 +155,7 @@ activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
+  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous"; then write_lkg "$previous"; fi
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
@@ -167,7 +171,6 @@ activate_release() {
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
-  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous"; then write_lkg "$previous"; fi
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 

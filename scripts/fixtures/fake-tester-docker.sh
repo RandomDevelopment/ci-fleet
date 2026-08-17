@@ -4,14 +4,15 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
 if [[ $1 == info ]]; then printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; exit 0; fi
-if [[ $1 == ps ]]; then printf 'fixture-container-id\n'; exit 0; fi
+if [[ $1 == ps ]]; then [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9; printf 'fixture-container-id\n'; exit 0; fi
 if [[ $1 == inspect ]]; then
   if [[ " $* " == *' --size '* ]]; then printf '1024\n'; else printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"; fi
   exit 0
 fi
-if [[ $1 == volume && $2 == ls ]]; then printf 'fixture-volume\n'; exit 0; fi
+if [[ $1 == volume && $2 == ls ]]; then [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9; printf 'fixture-volume\n'; exit 0; fi
 if [[ $1 == volume && $2 == inspect ]]; then printf '%s\n' "${FAKE_TESTER_VOLUME_ROOT:?}"; exit 0; fi
 if [[ $1 == compose && $2 == version ]]; then printf 'Docker Compose version v2.fixture\n'; exit 0; fi
+if [[ $1 == compose && $2 == up && ${3:-} == --help ]]; then [[ ${FAKE_TESTER_NO_WAIT_TIMEOUT:-0} != 1 ]] && printf '%s\n' '  --wait-timeout int'; exit 0; fi
 if [[ $1 != compose ]]; then exit 2; fi
 shift
 project=
