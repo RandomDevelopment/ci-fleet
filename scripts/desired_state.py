@@ -175,10 +175,14 @@ def build_rendered_env(
     architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine or platform.machine())
     if architecture is None:
         raise DesiredStateError("host architecture is unsupported for managed images")
-    try:
-        images = config["managed_images"][engine_commit][architecture]
-    except KeyError as error:
-        raise DesiredStateError(f"reviewed managed image IDs are missing for {architecture}") from error
+    managed_images = config.get("managed_images")
+    if managed_images is None:
+        images = None
+    else:
+        try:
+            images = managed_images[engine_commit][architecture]
+        except KeyError as error:
+            raise DesiredStateError(f"reviewed managed image IDs are missing for {architecture}") from error
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
         "CI_FLEET_COMMIT": engine_commit,
@@ -186,7 +190,7 @@ def build_rendered_env(
         "CI_FLEET_CONFIG_REF": config_ref,
         "CI_FLEET_CONFIG_REPOSITORY": config_repository,
         "CI_FLEET_CONTROLLER_IMAGE": f"ci-fleet-controller:{short_commit}",
-        "CI_FLEET_CONTROLLER_IMAGE_DIGEST": images["controller"],
+
         "CI_FLEET_CONTROLLER_STATE": state,
         "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
         "CI_FLEET_DOCKER_GID": str(docker_gid),
@@ -199,12 +203,15 @@ def build_rendered_env(
         "CI_FLEET_RUNNER_CPUS": str(controller["runner_resources"]["cpu_cores"]),
         "CI_FLEET_RUNNER_GROUP": pool["runner_group"],
         "CI_FLEET_RUNNER_IMAGE": f"ci-fleet-runner:{short_commit}",
-        "CI_FLEET_RUNNER_IMAGE_DIGEST": images["runner"],
+
         "CI_FLEET_RUNNER_MEMORY_MIB": str(controller["runner_resources"]["memory_mib"]),
         "CI_FLEET_SCALE_SET_NAME": controller["scale_set_name"],
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if images is not None:
+        rendered["CI_FLEET_CONTROLLER_IMAGE_DIGEST"] = images["controller"]
+        rendered["CI_FLEET_RUNNER_IMAGE_DIGEST"] = images["runner"]
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
