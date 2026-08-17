@@ -286,13 +286,6 @@ cp "$root/etc/os-release" "$tmp/os-release"
 printf 'ID=alpine\nVERSION_ID=3.20\n' >"$root/etc/os-release"
 expect_failure 'unsupported Linux distribution or release' "$installer" --check --config "$config" >/dev/null
 cp "$tmp/os-release" "$root/etc/os-release"
-mkdir -p "$root/usr/lib"
-cp "$root/etc/os-release" "$root/usr/lib/os-release"
-rm "$root/etc/os-release"
-ln -s ../usr/lib/os-release "$root/etc/os-release"
-"$installer" --check --config "$config" >/dev/null || fail 'canonical Debian os-release symlink was rejected'
-rm "$root/etc/os-release" "$root/usr/lib/os-release"
-cp "$tmp/os-release" "$root/etc/os-release"
 FAKE_TIME_SYNC=no expect_failure 'host time is not synchronized' "$installer" --check --config "$config" >/dev/null
 FAKE_SYSTEMD_FAIL=1 expect_failure 'systemd is unavailable' "$installer" --check --config "$config" >/dev/null
 FAKE_DOCKER_INFO_EXIT=1 expect_failure 'Docker Engine is unavailable' "$installer" --check --config "$config" >/dev/null
@@ -391,9 +384,15 @@ fresh_uninstall=$(expect_success "$installer" --uninstall --config "$config")
 [[ "$after" == "$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)" ]] || fail 'fresh uninstall mutated an unmanaged host'
 grep -Fq 'result=NO_CHANGE' <<<"$fresh_uninstall" || fail 'fresh uninstall did not report NO_CHANGE'
 
+mkdir -p "$root/usr/lib"
+cp "$root/etc/os-release" "$root/usr/lib/os-release"
+rm "$root/etc/os-release"
+ln -s ../usr/lib/os-release "$root/etc/os-release"
 export FAKE_ADAPTER_FORBID_CONFIG_PATH=$config
 first=$(expect_success "$installer" --install --config "$config")
 unset FAKE_ADAPTER_FORBID_CONFIG_PATH
+rm "$root/etc/os-release" "$root/usr/lib/os-release"
+cp "$tmp/os-release" "$root/etc/os-release"
 grep -Fq 'REPORT action=install result=CHANGED environment=staging' <<<"$first" || fail 'fresh install report is incomplete'
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'fresh install lacks atomic current release'
 [[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/install-state.json") == 600 ]] || fail 'install state mode is not 0600'
