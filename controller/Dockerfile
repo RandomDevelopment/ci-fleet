@@ -23,7 +23,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && apt-get install -y --no-install-recommends ca-certificates \
     && install -d -o 65532 -g 65532 /run/ci-fleet \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
-    && find / -xdev -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 COPY --from=build /out/ci-fleet-controller /usr/local/bin/ci-fleet-controller
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ci-fleet-controller"]
