@@ -32,7 +32,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && printf '%s  docker-cli.deb\n%s  compose.deb\n' "$docker_sha" "$compose_sha" | sha256sum -c - \
     && apt-get install -y --no-install-recommends ./docker-cli.deb ./compose.deb \
     && rm docker-cli.deb compose.deb \
-    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
+    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
@@ -51,7 +51,7 @@ RUN case "${TARGETARCH}" in \
     && rm actions-runner.tar.gz \
     && ./bin/installdependencies.sh \
     && chown -R runner:runner /home/runner \
-    && rm -rf /var/log/apt/* /var/log/dpkg.log \
+    && rm -rf /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 ENV RUNNER_ALLOW_RUNASROOT=0
