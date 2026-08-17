@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.18
+# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 FROM debian:13.6-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 ARG TARGETARCH
@@ -20,7 +20,8 @@ LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" >/etc/apt/sources.list \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && printf 'Acquire::Check-Valid-Until "false";\n' >/etc/apt/apt.conf.d/99-ci-fleet-snapshot \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git jq sudo \
     && case "$TARGETARCH" in \
       amd64) docker_sha="$DOCKER_CLI_SHA256_AMD64"; compose_sha="$COMPOSE_SHA256_AMD64" ;; \
@@ -35,7 +36,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
-RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
+RUN useradd --create-home --no-log-init --uid 1001 --shell /bin/bash runner \
+    && chage -d "$((SOURCE_DATE_EPOCH / 86400))" runner \
     && install -d -o runner -g runner /home/runner/_work \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
