@@ -140,6 +140,11 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+[[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
+if [[ -n "${FAKE_FAIL_CAPACITY_STOP_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_STOP_ONCE" && "$*" == 'stop ci-fleet-capacity.service' ]]; then
+  rm -f "$FAKE_FAIL_CAPACITY_STOP_ONCE"
+  exit 96
+fi
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
 fi
@@ -231,6 +236,7 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
+grep -Fq 'sys.dont_write_bytecode = True' "$repo_root/scripts/health.py" || fail 'manual capacity reports may write Python bytecode into the immutable runtime release'
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
@@ -577,7 +583,10 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upg
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 rm -f "$root/var/lib/ci-fleet/install-state.json" "$root/etc/ci-fleet/ci-fleet.env"
+export FAKE_SYSTEMCTL_LOG=$tmp/rollback-systemctl.log
 expect_success "$installer" --rollback >/dev/null
+grep -Fxq 'start ci-fleet-capacity.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'rollback did not restore the active capacity timer'
+unset FAKE_SYSTEMCTL_LOG
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
 
@@ -690,8 +699,31 @@ legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
+export FAKE_SYSTEMCTL_LOG=$tmp/legacy-systemctl.log
+export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/fail-capacity-stop-once
+: >"$FAKE_FAIL_CAPACITY_STOP_ONCE"
+expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref"
+unset FAKE_FAIL_CAPACITY_STOP_ONCE
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
+grep -Fxq 'stop ci-fleet-capacity.service' "$FAKE_SYSTEMCTL_LOG" || fail 'legacy upgrade did not stop the in-flight capacity service'
+unset FAKE_SYSTEMCTL_LOG
 [[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
+[[ $(readlink -f "$adopt_root/opt/ci-fleet/manager/current") == "$adopt_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'legacy downgrade replaced the forward-compatible manager'
+[[ ! -e "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'legacy runtime retained capacity units'
+retained_installer=$adopt_root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+export FAKE_ENGINE_REF=$engine_ref
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
+expect_success "$retained_installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'upgrade back from legacy did not restore capacity units'
+grep -Fq 'CI_FLEET_POOL=trusted-ci' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade back from legacy did not restore the telemetry pool'
+rollback_stop_ref=$(write_config active 2 2)
+export FAKE_FAIL_UP_ONCE=$tmp/rollback-stop-fail-up
+export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/rollback-stop-failure
+: >"$FAKE_FAIL_UP_ONCE"
+: >"$FAKE_FAIL_CAPACITY_STOP_ONCE"
+expect_failure 'ROLLBACK_FAILED' "$retained_installer" --upgrade "${base_args[@]}" --ref "$rollback_stop_ref"
+unset FAKE_FAIL_UP_ONCE FAKE_FAIL_CAPACITY_STOP_ONCE
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi

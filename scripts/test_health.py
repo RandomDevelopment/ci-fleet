@@ -123,9 +123,137 @@ class HealthTests(unittest.TestCase):
             snapshot = healthy_snapshot()
             snapshot["controller_id"] = "example-ci-01"
             snapshot["reconciliation"] = reconciliation
+            snapshot["cpu"] = {"logical": 8, "used_percent": 10, "total_ticks": 123, "idle_ticks": 45}
             report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
             self.assertEqual(report["configuration"], {"desired_commit": "", "applied_commit": ""})
             self.assertEqual(report["error"]["code"], "reconciliation_invalid")
+            self.assertEqual(set(report["metrics"]["cpu"]), {"logical", "used_percent"})
+
+    def test_capacity_history_is_resource_only_bounded_and_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            snapshot = healthy_snapshot()
+            snapshot.update({
+                "cpu": {"logical": 8, "used_percent": 10, "total_ticks": 100, "idle_ticks": 40},
+                "memory": {"total_bytes": 1000, "available_bytes": 600},
+                "swap": {"total_bytes": 100, "used_bytes": 5},
+                "runners": {"current": 1, "busy": 1, "maximum": 2},
+                "secret": "must-not-be-recorded",
+            })
+            for value in snapshot["disks"].values():
+                value.update(used_bytes=200, inode_used=20)
+            runner_cpu = [12.5, 90.0]
+
+            def run(args):
+                output = "a" * 12 + "\n" if args[:3] == ["docker", "ps", "-q"] else f"{runner_cpu.pop(0)}%\t256MiB / 2GiB\n"
+                return health.subprocess.CompletedProcess(args, 0, output, "")
+
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                history.parent.mkdir(mode=0o700)
+                history.write_text('{"timestamp":999999}\n' * health.CAPACITY_MAX_SAMPLES)
+                history.chmod(0o600)
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_000))
+                history_inode = history.stat().st_ino
+                snapshot["cpu"].update(used_percent=20, total_ticks=200, idle_ticks=50)
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_030))
+                self.assertLessEqual(len(history.read_text().splitlines()), health.CAPACITY_COMPACT_SAMPLES)
+                self.assertEqual(history.stat().st_ino, history_inode)
+                self.assertEqual(history.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn("must-not-be-recorded", history.read_text())
+                report = health.capacity_report(history, now=1_000_030)
+                pool = report["pools"]["example-ci-01"]
+                self.assertEqual((pool["samples"], pool["runner_observations"]), (2, 2))
+                self.assertEqual(pool["metrics"]["host_cpu_percent"], {"p50": 90.0, "p95": 90.0})
+                self.assertEqual(pool["metrics"]["runner_cpu_percent"], {"p50": 12.5, "p95": 90.0})
+                snapshot["runners"]["current"] = 0
+                history_before_idle = history.read_bytes()
+                self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_900))
+                self.assertEqual(history.read_bytes(), history_before_idle)
+                snapshot["runners"]["current"] = 1
+                snapshot["cpu"].update(total_ticks=300, idle_ticks=70)
+                runner_cpu.append(25.0)
+                self.assertTrue(health.record_capacity(history, snapshot, run=run, now=1_000_930))
+                self.assertEqual(json.loads(history.read_text().splitlines()[-1])["host"]["cpu_percent"], 80.0)
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
+    def test_capacity_prunes_inactive_history_and_ignores_incomplete_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            missing = Path(directory) / "missing" / "samples.jsonl"
+            self.assertEqual(health.capacity_report(missing, now=1_000_000)["pools"], {})
+            self.assertFalse(missing.parent.exists())
+            history.parent.mkdir(mode=0o700)
+            valid = {
+                "timestamp": 999_999, "pool": "example-ci-01",
+                "host": {"memory_used_bytes": 1, "swap_used_bytes": 0, "disk_used_bytes": {"root": 1},
+                         "inode_used": {"root": 1}, "cpu_total_ticks": 10, "cpu_idle_ticks": 5, "cpu_percent": 50.0},
+                "runners": [{"cpu_percent": 1.0, "memory_used_bytes": 1, "memory_limit_bytes": 2}],
+            }
+            history.write_text(json.dumps({**valid, "timestamp": 1}) + "\n" + json.dumps(valid) + "\n")
+            history.chmod(0o600)
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                self.assertFalse(health.record_capacity(history, {"runners": {"current": 0}, "cpu": {"total_ticks": 20, "idle_ticks": 10}}, now=1_000_000))
+                self.assertEqual(len(history.read_text().splitlines()), 1)
+                incomplete = {**valid, "timestamp": 999_998, "host": dict(valid["host"])}
+                incomplete.pop("runners")
+                malformed_counters = {**valid, "timestamp": 999_997, "host": {**valid["host"], "cpu_total_ticks": "10"}}
+                history.write_text(history.read_text() + json.dumps(incomplete) + "\n" + json.dumps(malformed_counters) + "\n")
+                report = health.capacity_report(history, now=1_000_000)
+                self.assertEqual(report["pools"]["example-ci-01"]["samples"], 1)
+                redirected = Path(directory) / "redirected"
+                redirected.mkdir(mode=0o700)
+                other = Path(directory) / "other"
+                other.mkdir(mode=0o700)
+                redirected.rmdir()
+                redirected.symlink_to(other, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "directory must be root-owned"):
+                    health.record_capacity(redirected / "samples.jsonl", {"runners": {"current": 0}}, now=1_000_000)
+                dangling_target = Path(directory) / "outside.jsonl"
+                dangling = history.parent / "dangling.jsonl"
+                dangling.symlink_to(dangling_target)
+                with self.assertRaisesRegex(ValueError, "history must be root-owned"):
+                    health.record_capacity(dangling, {"runners": {"current": 0}}, now=1_000_000)
+                self.assertFalse(dangling_target.exists())
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
+    def test_capacity_surfaces_runner_stat_failures(self) -> None:
+        snapshot = healthy_snapshot()
+        snapshot.update({
+            "cpu": {"logical": 8, "used_percent": 10, "total_ticks": 100, "idle_ticks": 40},
+            "memory": {"total_bytes": 1000, "available_bytes": 600},
+            "swap": {"total_bytes": 0, "used_bytes": 0},
+            "runners": {"current": 1},
+        })
+        for value in snapshot["disks"].values():
+            value.update(used_bytes=1, inode_used=1)
+        def run(args):
+            return health.subprocess.CompletedProcess(args, 0 if args[:3] == ["docker", "ps", "-q"] else 1,
+                                                      "a" * 12 + "\n" if args[:3] == ["docker", "ps", "-q"] else "", "failed")
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            history.parent.mkdir(mode=0o700)
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                with self.assertRaisesRegex(ValueError, "stat collection failed"):
+                    health.record_capacity(history, snapshot, run=run, now=1_000_000)
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
 
     def test_external_heartbeats_detect_missing_and_stale_active_hosts(self) -> None:
         controllers = {
@@ -180,6 +308,8 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual((snapshot["load_per_cpu"], snapshot["swap_used_percent"]), (3.0, 50))
                 self.assertEqual(set(snapshot["services"]), {"cleanup", "drift"})
                 self.assertEqual(set(snapshot["timers"]), {"health", "cleanup", "drift"})
+                (root / "etc/systemd/system").mkdir(parents=True)
+                (root / "etc/systemd/system/ci-fleet-capacity.timer").write_text("fixture\n")
                 (root / "var/lib/ci-fleet/reconcile").mkdir(parents=True)
                 (root / "var/lib/ci-fleet/reconcile/state.json").write_text('{"status":"rolled_back","desired_commit":"","applied_commit":"","health":"healthy"}\n')
                 remote = health.collect_snapshot(
@@ -191,11 +321,11 @@ class HealthTests(unittest.TestCase):
                     root=root,
                     run=run,
                 )
-                self.assertEqual(set(remote["services"]), {"cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["services"]), {"capacity", "cleanup", "drift", "reconcile"})
                 self.assertEqual(set(remote["services"].values()), {"ok"})
-                self.assertEqual(set(remote["timers"]), {"health", "cleanup", "drift", "reconcile"})
+                self.assertEqual(set(remote["timers"]), {"health", "capacity", "cleanup", "drift", "reconcile"})
                 self.assertEqual(remote["reconciliation"]["status"], "bootstrap")
-                (root / "etc").mkdir()
+                (root / "etc").mkdir(exist_ok=True)
                 (root / "etc/debian_version").write_text("13\n")
                 debian = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled", "CI_FLEET_HEALTH_BOOTSTRAP": "1"}, root=root, run=run)
                 self.assertIn("updates", debian["services"])
@@ -296,7 +426,7 @@ class HealthTests(unittest.TestCase):
             "software_version": "1" * 40,
             "boot_time": 900,
             "ssh": "disabled",
-            "cpu": {"logical": 8, "used_percent": 25.0},
+            "cpu": {"logical": 8, "used_percent": 25.0, "total_ticks": 0, "idle_ticks": 0},
             "memory": {"total_bytes": 1024, "available_bytes": 768},
             "swap": {"total_bytes": 512, "used_bytes": 0},
             "load": {"one": 0.1, "five": 0.2, "fifteen": 0.3},

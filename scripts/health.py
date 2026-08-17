@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import http.client
 import json
 import os
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+sys.dont_write_bytecode = True
 from status_auth import sign_headers
 
 
@@ -242,7 +244,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         },
         "runners": snapshot.get("runners", {"current": 0, "busy": 0, "maximum": 0}),
         "metrics": {
-            "cpu": snapshot.get("cpu", {"logical": 1, "used_percent": 0}),
+            "cpu": {name: snapshot.get("cpu", {}).get(name, default) for name, default in (("logical", 1), ("used_percent", 0))},
             "memory": snapshot.get("memory", {"total_bytes": 0, "available_bytes": 0}),
             "swap": snapshot.get("swap", {"total_bytes": 0, "used_bytes": 0}),
             "disk": {name: {"total_bytes": value.get("total_bytes", 0), "used_bytes": value.get("used_bytes", 0)} for name, value in disks.items()},
@@ -383,16 +385,15 @@ def _memory(root: Path) -> tuple[int, int]:
 
 
 def _cpu(root: Path) -> dict[str, float | int]:
-    # ponytail: cumulative boot-average CPU; persist the prior sample if interval utilization becomes necessary.
     try:
         fields = next(line for line in (root / "proc/stat").read_text().splitlines() if line.startswith("cpu ")).split()[1:]
         counters = [int(value) for value in fields]
         total = sum(counters[:8])
-        used = total - counters[3]
-        percent = round(100 * used / max(total, 1), 1)
+        idle = counters[3]
+        percent = round(100 * (total - idle) / max(total, 1), 1)
     except (OSError, ValueError, IndexError, StopIteration):
-        percent = 0.0
-    return {"logical": max(os.cpu_count() or 1, 1), "used_percent": percent}
+        total, idle, percent = 0, 0, 0.0
+    return {"logical": max(os.cpu_count() or 1, 1), "used_percent": percent, "total_ticks": total, "idle_ticks": idle}
 
 
 def _boot_time(root: Path) -> int:
@@ -498,6 +499,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
     timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    capacity_installed = (root / "etc/systemd/system/ci-fleet-capacity.timer").is_file()
+    if capacity_installed:
+        timer_ages["capacity"] = 120
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
     if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
@@ -505,10 +509,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     if remote_config:
         timer_ages["reconcile"] = 900
     timers = {name: _unit_state(run, f"ci-fleet-{name}.timer", timer=True, max_age_seconds=age) for name, age in timer_ages.items()}
-    service_units = {
-        "cleanup": "ci-fleet-cleanup.service",
-        "drift": "ci-fleet-drift.service",
-    }
+    service_units = {"cleanup": "ci-fleet-cleanup.service", "drift": "ci-fleet-drift.service"}
+    if capacity_installed:
+        service_units["capacity"] = "ci-fleet-capacity.service"
     if remote_config:
         service_units["reconcile"] = "ci-fleet-reconcile.service"
     services = {name: _unit_state(run, unit) for name, unit in service_units.items()}
@@ -525,6 +528,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
     return {
         "controller_id": instance,
+        "pool_id": values.get("CI_FLEET_POOL", instance),
         "desired_state": values.get("CI_FLEET_CONTROLLER_STATE", "active"),
         "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
         "cpu": _cpu(root),
@@ -582,6 +586,254 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     temporary.write_text(json.dumps(report, sort_keys=True) + "\n")
     os.chmod(temporary, 0o644)
     temporary.replace(path)
+
+
+CAPACITY_RETENTION_SECONDS = 8 * 24 * 60 * 60
+CAPACITY_MAX_SAMPLES = 24000
+CAPACITY_COMPACT_SAMPLES = 26000
+
+
+def _quantity_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)", value.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError("invalid Docker memory quantity")
+    units = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+             "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
+    return round(float(match.group(1)) * units[match.group(2).lower()])
+
+
+def _runner_capacity(run: Runner, instance: str) -> list[dict[str, int | float]]:
+    result = run(["docker", "ps", "-q", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true",
+                  "--filter", "label=io.randomdevelopment.ci-fleet.kind=runner",
+                  "--filter", f"label=io.randomdevelopment.ci-fleet.instance={instance}"])
+    if result.returncode != 0:
+        raise ValueError("managed runner discovery failed")
+    ids = [value for value in result.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
+    if not ids:
+        raise ValueError("active managed runners have no stat targets")
+    result = run(["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}", *ids])
+    if result.returncode != 0:
+        raise ValueError("managed runner stat collection failed")
+    metrics = []
+    for line in result.stdout.splitlines():
+        try:
+            cpu, memory = line.split("\t", 1)
+            used, limit = memory.split("/", 1)
+            cpu_percent = float(cpu.removesuffix("%"))
+            if not math.isfinite(cpu_percent) or cpu_percent < 0:
+                raise ValueError
+            metrics.append({"cpu_percent": cpu_percent, "memory_used_bytes": _quantity_bytes(used), "memory_limit_bytes": _quantity_bytes(limit)})
+        except ValueError as error:
+            raise ValueError("managed runner stat output is invalid") from error
+    if len(metrics) != len(ids):
+        raise ValueError("managed runner stat output is incomplete")
+    return metrics
+
+
+def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tuple[list[dict[str, Any]], bool]:
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError:
+        if not create:
+            return [], False
+        path.parent.mkdir(parents=True, mode=0o700)
+        parent = path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != expected_owner or stat.S_IMODE(parent.st_mode) != 0o700:
+        raise ValueError("capacity history directory must be root-owned mode 0700")
+    retained = []
+    dirty = False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity history must be root-owned mode 0600")
+        for line in path.read_text().splitlines():
+            try:
+                previous = json.loads(line)
+                if timestamp - CAPACITY_RETENTION_SECONDS <= previous["timestamp"] <= timestamp:
+                    retained.append(previous)
+                else:
+                    dirty = True
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                dirty = True
+                continue
+    if len(retained) >= CAPACITY_COMPACT_SAMPLES:
+        retained = retained[-CAPACITY_COMPACT_SAMPLES:]
+        dirty = True
+    return retained, dirty
+
+
+def _write_capacity(path: Path, samples: list[dict[str, Any]]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("".join(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n" for value in samples))
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+def _append_capacity(path: Path, sample: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sample, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(path, 0o600)
+
+
+def _update_cpu_baseline(path: Path, timestamp: int, cpu: dict[str, Any]) -> dict[str, int] | None:
+    baseline = path.with_suffix(path.suffix + ".cpu")
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    previous = None
+    if baseline.exists():
+        info = baseline.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity CPU baseline must be root-owned mode 0600")
+        try:
+            value = json.loads(baseline.read_text())
+            if set(value) != {"timestamp", "total_ticks", "idle_ticks"} or any(type(value[name]) is not int or value[name] < 0 for name in value):
+                raise ValueError
+            if value["idle_ticks"] > value["total_ticks"]:
+                raise ValueError
+            previous = value
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("capacity CPU baseline is invalid") from error
+    current = {"timestamp": timestamp, "total_ticks": cpu.get("total_ticks"), "idle_ticks": cpu.get("idle_ticks")}
+    if any(type(current[name]) is not int or current[name] < 0 for name in current) or current["idle_ticks"] > current["total_ticks"]:
+        raise ValueError("current CPU counters are invalid")
+    temporary = baseline.with_suffix(baseline.suffix + ".tmp")
+    temporary.write_text(json.dumps(current, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(baseline)
+    if previous and 0 < timestamp - previous["timestamp"] <= 120 and current["total_ticks"] >= previous["total_ticks"] and current["idle_ticks"] >= previous["idle_ticks"]:
+        return previous
+    return None
+
+
+def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None) -> bool:
+    timestamp = int(time.time() if now is None else now)
+    retained, dirty = _capacity_state(path, timestamp, create=True)
+    cpu = snapshot["cpu"]
+    previous_host = _update_cpu_baseline(path, timestamp, cpu)
+    if snapshot.get("runners", {}).get("current", 0) < 1:
+        if dirty:
+            _write_capacity(path, retained[-CAPACITY_MAX_SAMPLES:])
+        return False
+    pool_id = snapshot.get("pool_id", snapshot["controller_id"])
+    memory = snapshot["memory"]
+    host = {
+        "memory_used_bytes": memory["total_bytes"] - memory["available_bytes"],
+        "swap_used_bytes": snapshot["swap"]["used_bytes"],
+        "disk_used_bytes": {name: value["used_bytes"] for name, value in snapshot["disks"].items()},
+        "inode_used": {name: value["inode_used"] for name, value in snapshot["disks"].items()},
+        "cpu_total_ticks": cpu["total_ticks"],
+        "cpu_idle_ticks": cpu["idle_ticks"],
+    }
+    if previous_host:
+        total_delta = cpu["total_ticks"] - previous_host["total_ticks"]
+        idle_delta = cpu["idle_ticks"] - previous_host["idle_ticks"]
+        if total_delta > 0 and 0 <= idle_delta <= total_delta:
+            host["cpu_percent"] = round(100 * (total_delta - idle_delta) / total_delta, 1)
+    sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": _runner_capacity(run, snapshot["controller_id"])}
+    if dirty or len(retained) >= CAPACITY_COMPACT_SAMPLES:
+        _write_capacity(path, (retained + [sample])[-CAPACITY_MAX_SAMPLES:])
+    else:
+        _append_capacity(path, sample)
+    return True
+
+
+def _percentiles(values: list[int | float]) -> dict[str, int | float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return {name: ordered[max(0, math.ceil(len(ordered) * percentile) - 1)] for name, percentile in (("p50", 0.50), ("p95", 0.95))}
+
+
+def _sample_values(sample: Any, timestamp: int) -> tuple[str, dict[str, list[int | float]], int] | None:
+    if not isinstance(sample, dict) or set(sample) != {"timestamp", "pool", "host", "runners"}:
+        return None
+    if type(sample["timestamp"]) is not int or not timestamp - 7 * 24 * 60 * 60 <= sample["timestamp"] <= timestamp:
+        return None
+    if not isinstance(sample["pool"], str) or not re.fullmatch(r"[A-Za-z0-9._-]+", sample["pool"]):
+        return None
+    host, runners = sample["host"], sample["runners"]
+    required_host = {"memory_used_bytes", "swap_used_bytes", "disk_used_bytes", "inode_used", "cpu_total_ticks", "cpu_idle_ticks"}
+    if not isinstance(host, dict) or not required_host <= set(host) <= required_host | {"cpu_percent"} or not isinstance(runners, list):
+        return None
+    total_ticks, idle_ticks = host["cpu_total_ticks"], host["cpu_idle_ticks"]
+    if any(type(value) is not int or value < 0 for value in (total_ticks, idle_ticks)) or idle_ticks > total_ticks:
+        return None
+    values: dict[str, list[int | float]] = {}
+    for name in ("memory_used_bytes", "swap_used_bytes"):
+        if type(host[name]) is not int or host[name] < 0:
+            return None
+        values[f"host_{name}"] = [host[name]]
+    if "cpu_percent" in host:
+        if type(host["cpu_percent"]) not in (int, float) or not math.isfinite(host["cpu_percent"]) or not 0 <= host["cpu_percent"] <= 100:
+            return None
+        values["host_cpu_percent"] = [host["cpu_percent"]]
+    for kind in ("disk_used_bytes", "inode_used"):
+        if not isinstance(host[kind], dict):
+            return None
+        for name, value in host[kind].items():
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name) or type(value) is not int or value < 0:
+                return None
+            values[f"host_{kind}_{name}"] = [value]
+    runner_count = 0
+    for runner in runners:
+        if not isinstance(runner, dict) or set(runner) != {"cpu_percent", "memory_used_bytes", "memory_limit_bytes"}:
+            return None
+        if type(runner["cpu_percent"]) not in (int, float) or not math.isfinite(runner["cpu_percent"]) or runner["cpu_percent"] < 0:
+            return None
+        if any(type(runner[name]) is not int or runner[name] < 0 for name in ("memory_used_bytes", "memory_limit_bytes")):
+            return None
+        runner_count += 1
+        for name, value in runner.items():
+            values.setdefault(f"runner_{name}", []).append(value)
+    return sample["pool"], values, runner_count
+
+
+def capacity_report(path: Path, *, now: int | None = None) -> dict[str, Any]:
+    timestamp = int(time.time() if now is None else now)
+    pools: dict[str, dict[str, Any]] = {}
+    samples, _ = _capacity_state(path, timestamp)
+    for sample in samples:
+        parsed = _sample_values(sample, timestamp)
+        if parsed is None:
+            continue
+        pool_name, sample_values, runner_count = parsed
+        pool = pools.setdefault(pool_name, {"samples": 0, "runner_observations": 0, "values": {}})
+        pool["samples"] += 1
+        pool["runner_observations"] += runner_count
+        for name, observed in sample_values.items():
+            pool["values"].setdefault(name, []).extend(observed)
+    for pool in pools.values():
+        pool["metrics"] = {name: _percentiles(values) for name, values in sorted(pool.pop("values").items())}
+    return {"schema_version": 1, "generated_at": timestamp, "period_seconds": 7 * 24 * 60 * 60, "pools": pools}
+
+
+def collect_capacity_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Runner = _run) -> dict[str, Any]:
+    instance = values.get("CI_FLEET_INSTANCE", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", instance):
+        raise ValueError("controller identity is invalid")
+    docker_root_result = run(["docker", "info", "--format", "{{.DockerRootDir}}"])
+    docker_root = docker_root_result.stdout.strip()
+    if docker_root_result.returncode != 0 or not docker_root.startswith("/"):
+        raise ValueError("Docker root directory is unavailable")
+    runners = run(["docker", "ps", "-q", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true",
+                   "--filter", "label=io.randomdevelopment.ci-fleet.kind=runner",
+                   "--filter", f"label=io.randomdevelopment.ci-fleet.instance={instance}"])
+    if runners.returncode != 0:
+        raise ValueError("managed runner discovery failed")
+    current = len([value for value in runners.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", value)])
+    memory, swap = _memory_details(root)
+    return {
+        "controller_id": instance,
+        "pool_id": values.get("CI_FLEET_POOL", instance),
+        "cpu": _cpu(root),
+        "memory": memory,
+        "swap": swap,
+        "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
+        "runners": {"current": current},
+    }
 
 
 def _send_status(
@@ -721,6 +973,18 @@ def _heartbeats(args: argparse.Namespace) -> int:
     return int(report["exit_code"])
 
 
+def _capacity(args: argparse.Namespace) -> int:
+    print(json.dumps(capacity_report(args.history), indent=2, sort_keys=True))
+    return 0
+
+
+def _capacity_sample(args: argparse.Namespace) -> int:
+    snapshot = collect_capacity_snapshot(dict(os.environ), root=args.root)
+    recorded = record_capacity(args.history, snapshot)
+    print(f"CAPACITY_SAMPLE recorded={str(recorded).lower()}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Redacted ci-fleet host health")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -735,6 +999,13 @@ def main() -> int:
     heartbeats.add_argument("--grace-seconds", type=int, default=900)
     heartbeats.add_argument("--json", action="store_true")
     heartbeats.set_defaults(handler=_heartbeats)
+    capacity = commands.add_parser("capacity-report")
+    capacity.add_argument("--history", type=Path, default=Path("/var/lib/ci-fleet/capacity/samples.jsonl"))
+    capacity.set_defaults(handler=_capacity)
+    sample = commands.add_parser("capacity-sample")
+    sample.add_argument("--history", type=Path, default=Path("/var/lib/ci-fleet/capacity/samples.jsonl"))
+    sample.add_argument("--root", type=Path, default=Path("/"))
+    sample.set_defaults(handler=_capacity_sample)
     args = parser.parse_args()
     try:
         return args.handler(args)

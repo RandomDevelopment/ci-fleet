@@ -88,7 +88,7 @@ The installer:
 10. starts the controller only when its desired state is active and verifies runtime health;
 11. atomically records redacted installation state, then enables the maintenance timers.
 
-A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. A successful engine upgrade advances both the runtime release and the maintenance installer-manager to the same pinned commit; rollback restores both.
+A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. Engine upgrades advance the runtime release and maintenance installer-manager together. A deliberate runtime downgrade retains a newer compatible manager so a later reviewed upgrade can still be rendered and activated; maintenance units always come from the selected runtime. Rollback restores both.
 
 ## Adopt an existing controller
 

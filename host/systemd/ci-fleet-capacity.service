@@ -1,0 +1,21 @@
+[Unit]
+Description=Sample local ci-fleet capacity
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/etc/ci-fleet/ci-fleet.env
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci-fleet/current/scripts/capacity-sample.sh
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ci-fleet
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0077

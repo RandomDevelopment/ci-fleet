@@ -120,6 +120,7 @@ unit_names=(
   ci-fleet-drift.service ci-fleet-drift.timer
 )
 timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
+capacity_unit_names=(ci-fleet-capacity.service ci-fleet-capacity.timer)
 optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
@@ -507,6 +508,12 @@ runtime_release_complete() {
   [[ "$actual_digest" == "$stored_digest" ]]
 }
 
+engine_has_capacity_telemetry() {
+  local path=$1
+  [[ -f "$path/engine-capabilities.json" ]] && python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
+    --manifest "$path/engine-capabilities.json" --require-capacity-telemetry >/dev/null 2>&1
+}
+
 manager_release_complete() {
   local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required unit
   runtime_release_complete "$path" "$expected" "$require_status" "$require_schema" || return 1
@@ -516,6 +523,9 @@ manager_release_complete() {
   done
   [[ -x "$path/templates/config-repository/scripts/validate.sh" ]] || return 1
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
+  if engine_has_capacity_telemetry "$path" || [[ -e "$path/scripts/capacity-sample.sh" || -e "$path/host/systemd/ci-fleet-capacity.service" || -e "$path/host/systemd/ci-fleet-capacity.timer" ]]; then
+    [[ -x "$path/scripts/capacity-sample.sh" && -f "$path/host/systemd/ci-fleet-capacity.service" && -f "$path/host/systemd/ci-fleet-capacity.timer" ]] || return 1
+  fi
   marker=$(<"$path/.ci-fleet-engine-ref")
   [[ "$marker" == "$expected" ]]
 }
@@ -538,19 +548,32 @@ managed_images_match() {
 }
 
 systemd_matches() {
-  local expected_manager unit
+  local expected_manager manager_commit unit
   expected_manager=$manager_releases/$engine_ref
-  manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$manager_current" ]] || return 1
+  if ! engine_has_capacity_telemetry "$release_dir" && engine_has_capacity_telemetry "$(readlink -f "$manager_current")"; then
+    expected_manager=$(readlink -f "$manager_current")
+  fi
+  [[ -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
+  manager_commit=$(<"$expected_manager/.ci-fleet-engine-ref")
+  manager_release_complete "$expected_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
     [[ -f "$systemd_dir/$unit" ]] || return 1
-    cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+    cmp -s "$release_dir/host/systemd/$unit" "$systemd_dir/$unit" || return 1
   done
   for unit in "${timer_names[@]}"; do
     systemctl is-enabled --quiet "$unit" || return 1
     systemctl is-active --quiet "$unit" || return 1
   done
+  if [[ -x "$release_dir/scripts/capacity-sample.sh" ]]; then
+    for unit in "${capacity_unit_names[@]}"; do
+      [[ -f "$systemd_dir/$unit" ]] && cmp -s "$release_dir/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+    done
+    systemctl is-enabled --quiet ci-fleet-capacity.timer && systemctl is-active --quiet ci-fleet-capacity.timer || return 1
+  else
+    for unit in "${capacity_unit_names[@]}"; do [[ ! -e "$systemd_dir/$unit" ]] || return 1; done
+  fi
 }
 
 drift_count() {
@@ -635,8 +658,16 @@ install_release() {
 }
 
 install_manager() {
-  local manager_commit manager_release archive staged_manager
+  local manager_commit manager_release archive staged_manager current_manager current_manager_commit
   manager_commit=$engine_ref
+  current_manager=$(readlink -f "$manager_current" 2>/dev/null || true)
+  current_manager_commit=
+  [[ -z "$current_manager" || ! -f "$current_manager/.ci-fleet-engine-ref" ]] || current_manager_commit=$(<"$current_manager/.ci-fleet-engine-ref")
+  if ! engine_has_capacity_telemetry "$release_dir" && [[ -n "$current_manager_commit" ]] \
+    && engine_has_capacity_telemetry "$current_manager" \
+    && manager_release_complete "$current_manager" "$current_manager_commit" "$status_reporting_required" "$status_reporting_configured"; then
+    return
+  fi
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
   runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
@@ -695,7 +726,7 @@ make_checkpoint() {
     printf '%s\n' "$target" >"$checkpoint_dir/manager-target"
     chmod 0600 "$checkpoint_dir/manager-target"
   fi
-  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+  for unit in "${unit_names[@]}" "${capacity_unit_names[@]}" "${optional_unit_names[@]}"; do
     [[ ! -f "$systemd_dir/$unit" ]] || install -m 0644 "$systemd_dir/$unit" "$checkpoint_dir/systemd/$unit"
   done
   : >"$checkpoint_dir/enabled-timers"
@@ -704,6 +735,8 @@ make_checkpoint() {
     if systemctl is-enabled --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/enabled-timers"; fi
     if systemctl is-active --quiet "$timer" 2>/dev/null; then printf '%s\n' "$timer" >>"$checkpoint_dir/active-timers"; fi
   done
+  if systemctl is-enabled --quiet ci-fleet-capacity.timer 2>/dev/null; then printf '%s\n' ci-fleet-capacity.timer >>"$checkpoint_dir/enabled-timers"; fi
+  if systemctl is-active --quiet ci-fleet-capacity.timer 2>/dev/null; then printf '%s\n' ci-fleet-capacity.timer >>"$checkpoint_dir/active-timers"; fi
   local opt_name
   for opt_name in "${optional_unit_names[@]}"; do
     case "$opt_name" in *.timer)
@@ -790,6 +823,16 @@ install_systemd_units() {
   install -d -m 0755 "$systemd_dir"
   install -m 0644 "$source/host/systemd/ci-fleet-health.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-health.timer" "$systemd_dir/"
+  if [[ -x "$source/scripts/capacity-sample.sh" ]]; then
+    install -m 0644 "$source/host/systemd/ci-fleet-capacity.service" "$systemd_dir/"
+    install -m 0644 "$source/host/systemd/ci-fleet-capacity.timer" "$systemd_dir/"
+  else
+    systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
+    if [[ -f "$systemd_dir/ci-fleet-capacity.service" ]] && ! systemctl stop ci-fleet-capacity.service; then
+      return 1
+    fi
+    rm -f "$systemd_dir/ci-fleet-capacity.service" "$systemd_dir/ci-fleet-capacity.timer"
+  fi
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.timer" "$systemd_dir/"
   install -m 0644 "$source/host/systemd/ci-fleet-drift.service" "$systemd_dir/"
@@ -803,11 +846,15 @@ install_systemd_units() {
 
 remove_systemd_units() {
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
+  systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
+  if [[ -f "$systemd_dir/ci-fleet-capacity.service" ]] && ! systemctl stop ci-fleet-capacity.service; then
+    return 1
+  fi
   local unit
   for unit in "${optional_unit_names[@]}"; do
     case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac
   done
-  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
+  for unit in "${unit_names[@]}" "${capacity_unit_names[@]}" "${optional_unit_names[@]}"; do rm -f "$systemd_dir/$unit"; done
   systemctl daemon-reload
 }
 
@@ -858,7 +905,7 @@ activate_candidate() {
   ln -sfn "$release_dir" "$temporary/current"
   mv -Tf "$temporary/current" "$current_link"
   install_manager
-  install_systemd_units "$(readlink -f "$manager_current")"
+  install_systemd_units "$release_dir"
   if [[ "$target_state" == active ]]; then
     compose "$release_dir" "$rendered_env" up -d --no-deps controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
@@ -887,6 +934,7 @@ PY
   chmod 0600 "$staged_state"
   mv -f "$staged_state" "$state_file"
   systemctl enable --now "${timer_names[@]}" >/dev/null
+  if [[ -f "$systemd_dir/ci-fleet-capacity.timer" ]]; then systemctl enable --now ci-fleet-capacity.timer >/dev/null; fi
   local opt_timer
   for opt_timer in "${optional_unit_names[@]}"; do
     case "$opt_timer" in *.timer)
@@ -908,11 +956,14 @@ restore_systemd_snapshot() {
   for unit in "${unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
   done
+  for unit in "${capacity_unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  done
   for unit in "${optional_unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
   done
   systemctl daemon-reload || failed=1
-  for timer in "${timer_names[@]}"; do
+  for timer in "${timer_names[@]}" ci-fleet-capacity.timer; do
     if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
     if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
   done
@@ -1090,7 +1141,7 @@ perform_uninstall() {
   fi
   remove_systemd_units
   rm -f "$current_link" "$rendered_env" "$state_file"
-  rm -rf -- "$state_root/health"
+  rm -rf -- "$state_root/health" "$state_root/capacity"
   rm -f "$manager_current"
   transaction_active=false
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"
