@@ -114,7 +114,8 @@ validate_compose() {
 import re,sys
 text=open(sys.argv[1],encoding='utf-8').read()
 key=r'(?:!!str[ \t]+)?(?:include|"include"|\x27include\x27)[ \t]*:'
-if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text): raise SystemExit('Compose include is forbidden')
+escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
+if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text): raise SystemExit('Compose include or escaped mapping key is forbidden')
 PY
   then return 1; fi
   if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
@@ -239,14 +240,16 @@ inspect_environment() {
     running_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$resource")
     [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
   done
+  inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$(project_name "$id")") || die 'container inventory failed'
   while IFS= read -r resource; do
     [[ -n $resource ]] || continue
     value=$(docker inspect --size --format '{{.SizeRw}}' "$resource"); [[ $value =~ ^[0-9]+$ ]] || die 'container disk size is invalid'; bytes=$((bytes + value))
-  done < <(docker ps -aq --filter "label=com.docker.compose.project=$(project_name "$id")")
+  done <<<"$inventory"
+  inventory=$(docker volume ls -q --filter "label=com.docker.compose.project=$(project_name "$id")") || die 'volume inventory failed'
   while IFS= read -r resource; do
     [[ -n $resource ]] || continue
     mount=$(docker volume inspect --format '{{.Mountpoint}}' "$resource"); value=$(du -sb "$mount" | awk '{print $1}'); [[ $value =~ ^[0-9]+$ ]] || die 'volume disk size is invalid'; bytes=$((bytes + value))
-  done < <(docker volume ls -q --filter "label=com.docker.compose.project=$(project_name "$id")")
+  done <<<"$inventory"
   printf 'STATUS=%s DISK_BYTES=%s\n' "$status" "$bytes"
 }
 
@@ -263,7 +266,8 @@ export DOCKER_HOST="unix://$docker_socket"
 if [[ ${CI_FLEET_TESTER_LOCK_FD:-} == 8 && -e /proc/$$/fd/8 && $(readlink -f /proc/$$/fd/8) == "$lock_file" ]] && flock -n 8; then
   unset CI_FLEET_TESTER_LOCK_FD
 else
-  install -d -m 0755 "$(dirname "$lock_file")"
+  mkdir -m 0755 "$(dirname "$lock_file")" 2>/dev/null || true
+  secure_directory "$(dirname "$lock_file")" 755
   exec 9>"$lock_file"
   flock -x 9
 fi

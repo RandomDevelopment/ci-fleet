@@ -11,6 +11,7 @@ release_dir=$(root_path /opt/ci-fleet-tester/releases)
 current_link=$(root_path /opt/ci-fleet-tester/current)
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
+mkdir -m 0755 "$lock_dir" 2>/dev/null || true
 [[ -d $lock_dir && ! -L $lock_dir && $(stat -c %u "$lock_dir") == "$expected_uid" && $(stat -c %a "$lock_dir") == 755 ]] || { printf 'ERROR: tester lock directory is unsafe\n' >&2; exit 1; }
 exec 8>"$lock_file"
 flock -x 8
