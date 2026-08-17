@@ -33,11 +33,11 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && apt-get install -y --no-install-recommends ./docker-cli.deb ./compose.deb \
     && rm docker-cli.deb compose.deb \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
-    && find /etc /home /run /usr /var -xdev -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
     && install -d -o runner -g runner /home/runner/_work \
-    && find /etc /home /run /usr /var -xdev -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 WORKDIR /home/runner
 RUN case "${TARGETARCH}" in \
@@ -52,7 +52,7 @@ RUN case "${TARGETARCH}" in \
     && ./bin/installdependencies.sh \
     && chown -R runner:runner /home/runner \
     && rm -rf /var/log/apt/* /var/log/dpkg.log \
-    && find /etc /home /run /usr /var -xdev -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 ENV RUNNER_ALLOW_RUNASROOT=0
 USER runner
