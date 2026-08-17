@@ -123,6 +123,8 @@ timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
 optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
+managed_builder=ci-fleet-managed
+managed_buildkit='moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
 
 temporary=$(mktemp -d)
 cleanup_temporary() {
@@ -135,22 +137,13 @@ cleanup_temporary() {
 trap cleanup_temporary EXIT
 
 require_commands() {
-  local command buildkit_version
+  local command
   for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock mktemp; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
   docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable'
-  buildkit_version=$(docker buildx inspect --bootstrap 2>/dev/null | awk '$1 == "BuildKit" && $2 == "version:" {sub(/^v/, "", $3); print $3; exit}')
-  [[ -n "$buildkit_version" ]] || die 'BuildKit backend version is unavailable'
-  python3 - "$buildkit_version" <<'PY' || die 'BuildKit v0.11 or newer is required'
-import re
-import sys
-
-match = re.match(r"^(\d+)\.(\d+)", sys.argv[1])
-raise SystemExit(0 if match and tuple(map(int, match.groups())) >= (0, 11) else 1)
-PY
 }
 
 validate_common_arguments() {
@@ -351,6 +344,29 @@ compose() {
     for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done
   fi
   "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
+}
+
+build_managed_images() {
+  local release=$1 environment=$2
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$environment"
+    set +a
+    cleanup_builder() { docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true; }
+    trap cleanup_builder EXIT
+    cleanup_builder
+    docker buildx create --name "$managed_builder" --driver docker-container \
+      --driver-opt "image=$managed_buildkit" --bootstrap >/dev/null
+    [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit" && $2 == "version:" {print $3; exit}') == v0.32.2 ]] \
+      || die 'reviewed BuildKit backend v0.32.2 is unavailable'
+    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
+      --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH \
+      --tag "$CI_FLEET_RUNNER_IMAGE" "$release/runner"
+    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
+      --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION --build-arg SOURCE_DATE_EPOCH \
+      --tag "$CI_FLEET_CONTROLLER_IMAGE" "$release/controller"
+  )
 }
 
 controller_status() {
@@ -559,9 +575,8 @@ managed_images_match() {
 }
 
 managed_image_ids_configured() {
-  local environment=${1:-$candidate_env}
-  grep -Eq '^CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$environment" \
-    && grep -Eq '^CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$environment"
+  grep -Eq '^CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$candidate_env" \
+    && grep -Eq '^CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$candidate_env"
 }
 
 systemd_matches() {
@@ -700,12 +715,8 @@ run_candidate_preflight() {
 build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
-  compose "$release_dir" "$candidate_env" build runner-image controller
-  if managed_image_ids_configured "$candidate_env"; then
-    managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
-  else
-    note 'MANAGED_IMAGES_STAGING no_reviewed_ids=true'
-  fi
+  build_managed_images "$release_dir" "$candidate_env"
+  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
 }
 
 capture_legacy_image_ids() {
@@ -1051,7 +1062,7 @@ restore_checkpoint() {
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
       if ! managed_images_match "$rendered_env"; then
-        compose "$release_dir" "$rendered_env" build runner-image controller || failed=1
+        build_managed_images "$release_dir" "$rendered_env" || failed=1
         if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
       fi
     else
@@ -1088,6 +1099,13 @@ trap on_error ERR
 perform_check() {
   local count
   display_last_health
+  if ! managed_image_ids_configured; then
+    [[ -L "$manager_current" && $(readlink -f "$manager_current") == "$manager_releases/$engine_ref" ]] \
+      || die 'manager-only staging is incomplete'
+    [[ $(current_runtime_release) != "$release_dir" ]] || die 'manager-only staging activated an unreviewed runtime'
+    note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
+    return
+  fi
   drift_count
   count=$DRIFT_COUNT
   if ((count > 0)); then
@@ -1098,7 +1116,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status desired_controller_id=$controller_id
+  local count existing_status installed_engine desired_controller_id=$controller_id
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -1108,6 +1126,20 @@ perform_converge() {
   fi
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
+  fi
+  if ! managed_image_ids_configured; then
+    [[ "$mode" == upgrade && -f "$state_file" && -f "$rendered_env" ]] \
+      || die 'managed_images may be omitted only for an existing managed engine upgrade'
+    ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
+      || die 'managed_images cannot be removed after image enforcement'
+    installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
+    [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "$installed_engine" != "$engine_ref" ]] \
+      || die 'manager-only staging requires a new engine revision'
+    install_release
+    install_manager
+    install_systemd_units "$(readlink -f "$manager_current")"
+    note "MANAGER_STAGED engine_ref=$engine_ref runtime_ref=$installed_engine"
+    return
   fi
   drift_count
   count=$DRIFT_COUNT

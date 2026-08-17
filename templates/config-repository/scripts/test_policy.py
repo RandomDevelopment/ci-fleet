@@ -80,6 +80,25 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(errors_for(config), [])
         self.assertNotIn("managed_images", contract_schema()["required"])
 
+    def test_manager_only_staging_transition_is_engine_ref_only(self) -> None:
+        previous = copy.deepcopy(reference_config())
+        previous.pop("managed_images")
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+        current["organization"]["slug"] = "other-org"
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("may change only" in error for error in validation.errors), validation.errors)
+
+        enforced = copy.deepcopy(reference_config())
+        validation = Validation()
+        validate_transition(enforced, previous, {}, validation)
+        self.assertTrue(any("cannot be removed" in error for error in validation.errors), validation.errors)
+
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
         config = copy.deepcopy(reference_config())
         self.assert_rejected(config, "replace the fixture image digest", strict=True)

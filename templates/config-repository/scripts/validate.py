@@ -505,6 +505,29 @@ def validate_transition(
     new_controllers = current.get("controllers")
     if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
         return
+    if "managed_images" not in current:
+        validation.require("managed_images" not in previous, "$.managed_images", "cannot be removed after image enforcement")
+        validation.require(
+            {key: value for key, value in previous.items() if key != "controllers"}
+            == {key: value for key, value in current.items() if key != "controllers"},
+            "$",
+            "manager-only staging may change only controller engine_ref values",
+        )
+        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "manager-only staging cannot add or remove controllers")
+        changed_engine = False
+        for name in set(old_controllers) & set(new_controllers):
+            old = old_controllers[name]
+            new = new_controllers[name]
+            if not isinstance(old, dict) or not isinstance(new, dict):
+                continue
+            validation.require(
+                {key: value for key, value in old.items() if key != "engine_ref"}
+                == {key: value for key, value in new.items() if key != "engine_ref"},
+                f"$.controllers.{name}",
+                "manager-only staging may change only engine_ref",
+            )
+            changed_engine = changed_engine or old.get("engine_ref") != new.get("engine_ref")
+        validation.require(changed_engine, "$.controllers", "manager-only staging requires an engine_ref change")
     for name, new in new_controllers.items():
         old = old_controllers.get(name)
         if not isinstance(new, dict):
