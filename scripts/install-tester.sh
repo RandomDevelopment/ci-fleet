@@ -155,7 +155,6 @@ activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
-  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous"; then write_lkg "$previous"; fi
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
@@ -170,6 +169,11 @@ activate_release() {
       rm -f -- "$current_link" "$stable_launcher"
     fi
     die 'candidate tester activation failed; previous release restored when available'
+  fi
+  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous" && ! write_lkg "$previous"; then
+    ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
+    if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! enable_timers; then die 'last-known-good recording failed and incumbent restore failed; incumbent link retained for recovery'; fi
+    die 'last-known-good recording failed; previous release restored'
   fi
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
