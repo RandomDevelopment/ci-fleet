@@ -32,6 +32,12 @@
       "propertyNames": {"$ref": "#/$defs/slug"},
       "additionalProperties": {"$ref": "#/$defs/controller"}
     },
+    "managed_images": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
+      "additionalProperties": {"$ref": "#/$defs/managed_images"}
+    },
     "host_groups": {
       "type": "object",
       "minProperties": 1,
@@ -54,6 +60,25 @@
   "$defs": {
     "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"},
     "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "image_digest": {"type": "string", "pattern": "^sha256:(?!0{64}$)[0-9a-f]{64}$"},
+    "managed_images": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "amd64": {"$ref": "#/$defs/managed_image_ids"},
+        "arm64": {"$ref": "#/$defs/managed_image_ids"}
+      }
+    },
+    "managed_image_ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["controller", "runner"],
+      "properties": {
+        "controller": {"$ref": "#/$defs/image_digest"},
+        "runner": {"$ref": "#/$defs/image_digest"}
+      }
+    },
     "runner_pool": {
       "type": "object",
       "additionalProperties": false,

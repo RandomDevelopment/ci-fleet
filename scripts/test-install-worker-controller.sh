@@ -25,6 +25,23 @@ status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
 case "${1:-}" in
   info) exit 0 ;;
+  buildx)
+    case "${2:-}" in
+      version) printf 'github.com/docker/buildx v0.32.1\n' ;;
+      inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: v0.32.2\n' ;;
+      create|rm) ;;
+      build)
+        if [[ "$*" == *ci-fleet-runner:* ]]; then
+          [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${CI_FLEET_RUNNER_IMAGE_DIGEST#sha256:}" >"$FAKE_RUNNER_IMAGE_STATE"
+        elif [[ "$*" == *ci-fleet-controller:* ]]; then
+          [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${CI_FLEET_CONTROLLER_IMAGE_DIGEST#sha256:}" >"$FAKE_CONTROLLER_IMAGE_STATE"
+        else
+          exit 1
+        fi
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
   inspect)
     [[ -f "$state" ]] || exit 1
     if [[ "$*" == *'.Config.Env'* ]]; then
@@ -67,7 +84,7 @@ case "${1:-}" in
       exit 1
     fi
     [[ -f "$image_state" ]] || exit 1
-    if [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%s\n' "$(<"$image_state")"; else cat "$image_state"; fi
+    if [[ "$*" == *'org.opencontainers.image.revision'* ]]; then printf '%s\n' "${FAKE_ENGINE_REF:?}"; elif [[ "$*" == *'{{.Id}}'* ]]; then printf 'sha256:%s\n' "$(<"$image_state")"; else cat "$image_state"; fi
     ;;
   rm)
     (($# >= 2)) || exit 1
@@ -100,7 +117,10 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || printf 'sha256:%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+        if [[ -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]]; then
+          controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$env_file")
+          printf '%s\n' "$controller_digest" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+        fi
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
@@ -127,8 +147,10 @@ case "${1:-}" in
         [[ -z "$paused_state" ]] || rm -f "$paused_state"
         ;;
       build)
-        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
+        runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$env_file")
+        controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$env_file")
+        [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${runner_digest#sha256:}" >"$FAKE_RUNNER_IMAGE_STATE"
+        [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${controller_digest#sha256:}" >"$FAKE_CONTROLLER_IMAGE_STATE"
         ;;
       config|logs) ;;
       *) exit 1 ;;
@@ -218,6 +240,8 @@ expect_command_failure() {
 }
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
+controller_image_digest=$(printf '3%.0s' {1..64})
+runner_image_digest=$(printf '4%.0s' {1..64})
 export FAKE_ENGINE_REF=$engine_ref
 runner_image="ci-fleet-runner:${engine_ref:0:12}"
 export FAKE_RUNNER_IMAGE=$runner_image
@@ -233,6 +257,15 @@ grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller 
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
+[[ $(grep -Fc "SOURCE_DATE_EPOCH: \${SOURCE_DATE_EPOCH:-1786752000}" "$repo_root/deploy/compose.yaml") -eq 2 ]] || fail 'managed builds do not pass the reproducible timestamp to BuildKit'
+grep -Fq "touch -d \"@\${SOURCE_DATE_EPOCH}\" /out/ci-fleet-controller" "$repo_root/controller/Dockerfile" || fail 'controller binary timestamp is not normalized'
+grep -Fq 'RUN --mount=type=bind,from=build,source=/out,target=/out' "$repo_root/controller/Dockerfile" || fail 'controller binary is not installed in the normalized runtime layer'
+[[ $(grep -Fhc '# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf' "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfile" | grep -Fc 1) -eq 2 ]] || fail 'Dockerfile frontend is not digest-pinned'
+grep -Fq 'Acquire::Check-Valid-Until "false";' "$repo_root/runner/Dockerfile" || fail 'runner snapshot validity override is not persistent'
+grep -Fq 'useradd --create-home --no-log-init' "$repo_root/runner/Dockerfile" || fail 'runner account initialization writes time-dependent login logs'
+grep -Fq "chage -d \"\$((SOURCE_DATE_EPOCH / 86400))\" runner" "$repo_root/runner/Dockerfile" || fail 'runner shadow date is not deterministic'
+[[ $(grep -Fc "find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt \"@\${SOURCE_DATE_EPOCH}\"" "$repo_root/runner/Dockerfile") -eq 3 ]] || fail 'runner filesystem timestamps are not normalized after every mutating step'
+[[ $(grep -Fc '/var/cache/ldconfig/aux-cache' "$repo_root/runner/Dockerfile") -eq 2 ]] || fail 'runner build preserves nondeterministic ldconfig cache content'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
@@ -249,6 +282,7 @@ value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
+value["managed_images"] = {engine_ref: {"amd64": {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "4" * 64}}}
 controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state
@@ -408,10 +442,10 @@ printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] || fail 'controller convergence did not restore running image provenance'
-printf 'sha256:%040d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+printf 'sha256:%064d\n' 3 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "sha256:$engine_ref" ]] || fail 'controller convergence did not restore live image identity'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "sha256:$controller_image_digest" ]] || fail 'controller convergence did not restore live image identity'
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_MAX_RUNNERS=1", "CI_FLEET_MAX_RUNNERS=9"))' "$FAKE_CONTROLLER_ENV_FILE"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-environment fixture did not mutate'
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -427,10 +461,10 @@ rm -f "$FAKE_CONTROLLER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$FAKE_RUNNER_IMAGE_STATE" && -f "$FAKE_CONTROLLER_IMAGE_STATE" ]] || fail 'candidate build did not restore the controller image'
-printf '%040d\n' 0 >"$FAKE_RUNNER_IMAGE_STATE"
+printf '%064d\n' 3 >"$FAKE_RUNNER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-[[ $(<"$FAKE_RUNNER_IMAGE_STATE") == "$engine_ref" && $(<"$FAKE_CONTROLLER_IMAGE_STATE") == "$engine_ref" ]] || fail 'candidate build did not restore managed image provenance'
+[[ $(<"$FAKE_RUNNER_IMAGE_STATE") == "$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_STATE") == "$controller_image_digest" ]] || fail 'candidate build did not restore reviewed managed image digests'
 if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
 : >"$FAKE_IMAGE_INSPECT_LOG"
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -652,11 +686,14 @@ printf '%s\n' \
   "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$adopt_pem" \
   'CI_FLEET_RUNNER_TTL=6h' \
   'CI_FLEET_CONTROLLER_STATE=active' \
+  "CI_FLEET_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE" \
+  "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" \
   'CI_FLEET_INSTANCE=legacy-ci-01' >"$adopt_root/etc/ci-fleet/ci-fleet.env"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 printf 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75\n' >"$adopt_root/etc/ci-fleet/monitoring.env"
 chmod 600 "$adopt_root/etc/ci-fleet/monitoring.env"
 : >"$FAKE_DOCKER_STATE"
+printf 'sha256:%s\n' "$controller_image_digest" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 chmod 644 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 expect_failure 'rendered environment must be owned by root with mode 0600' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
 chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
@@ -666,6 +703,9 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+grep -Fxq "CI_FLEET_ENGINE_REF=$engine_ref" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed engine revision'
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed controller image ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed runner image ID'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'

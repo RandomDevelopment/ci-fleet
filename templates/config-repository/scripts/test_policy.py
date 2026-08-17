@@ -59,6 +59,8 @@ class PolicyTests(unittest.TestCase):
 
     def assert_engine_ref_contract(self, value: str, accepted: bool) -> None:
         config = copy.deepcopy(reference_config())
+        images = next(iter(config["managed_images"].values()))
+        config["managed_images"] = {value: images}
         first_controller(config)["engine_ref"] = value
         self.assertEqual(schema_accepts_engine_ref(value), accepted)
         self.assertEqual(errors_for(config) == [], accepted)
@@ -72,6 +74,35 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_managed_images_may_be_omitted_for_staged_engine_upgrade(self) -> None:
+        config = copy.deepcopy(reference_config())
+        config.pop("managed_images")
+        self.assertEqual(errors_for(config), [])
+        self.assertNotIn("managed_images", contract_schema()["required"])
+
+    def test_manager_only_staging_transition_is_engine_ref_only(self) -> None:
+        previous = copy.deepcopy(reference_config())
+        previous.pop("managed_images")
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+        current["organization"]["slug"] = "other-org"
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("may change only" in error for error in validation.errors), validation.errors)
+
+        enforced = copy.deepcopy(reference_config())
+        validation = Validation()
+        validate_transition(enforced, previous, {}, validation)
+        self.assertTrue(any("cannot be removed" in error for error in validation.errors), validation.errors)
+
+    def test_strict_validation_rejects_fixture_image_ids(self) -> None:
+        config = copy.deepcopy(reference_config())
+        self.assert_rejected(config, "replace the fixture image digest", strict=True)
+
     def test_status_reporting_null_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["status_reporting"] = None
@@ -83,10 +114,23 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
-                "--engine-ref", "1" * 40, "--output", str(output),
+                "--engine-ref", "1" * 40,
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
+                "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
+
+    def test_managed_image_ids_require_an_architecture_key(self) -> None:
+        config = copy.deepcopy(reference_config())
+        engine_ref = first_controller(config)["engine_ref"]
+        config["managed_images"][engine_ref] = {
+            "controller": "sha256:" + "1" * 64,
+            "runner": "sha256:" + "2" * 64,
+        }
+        self.assert_rejected(config, "architecture")
 
     def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
         previous = reference_config()

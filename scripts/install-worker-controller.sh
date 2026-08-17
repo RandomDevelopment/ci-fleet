@@ -123,6 +123,8 @@ timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
 optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
+managed_builder=ci-fleet-managed
+managed_buildkit='moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
 
 temporary=$(mktemp -d)
 cleanup_temporary() {
@@ -141,6 +143,7 @@ require_commands() {
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+  docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable'
 }
 
 validate_common_arguments() {
@@ -343,6 +346,29 @@ compose() {
   "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
 }
 
+build_managed_images() {
+  local release=$1 environment=$2
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$environment"
+    set +a
+    cleanup_builder() { docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true; }
+    trap cleanup_builder EXIT
+    cleanup_builder
+    docker buildx create --name "$managed_builder" --driver docker-container \
+      --driver-opt "image=$managed_buildkit" --bootstrap >/dev/null
+    [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit" && $2 == "version:" {print $3; exit}') == v0.32.2 ]] \
+      || die 'reviewed BuildKit backend v0.32.2 is unavailable'
+    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
+      --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH \
+      --tag "$CI_FLEET_RUNNER_IMAGE" "$release/runner"
+    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
+      --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION --build-arg SOURCE_DATE_EPOCH \
+      --tag "$CI_FLEET_CONTROLLER_IMAGE" "$release/controller"
+  )
+}
+
 controller_status() {
   docker inspect --format '{{.State.Status}}' "$controller_container" 2>/dev/null || true
 }
@@ -527,14 +553,30 @@ release_matches() {
 }
 
 managed_images_match() {
-  local image provenance
+  local environment=${1:-$candidate_env} digest expected_engine image provenance
   local -a expected_images=()
-  mapfile -t expected_images < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" || $1 == "CI_FLEET_RUNNER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+  expected_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  [[ "$expected_engine" =~ ^[0-9a-f]{40}$ ]] || return 1
+  mapfile -t expected_images < <(awk -F= '
+    $1 == "CI_FLEET_CONTROLLER_IMAGE" {controller=$2}
+    $1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {controller_digest=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE" {runner=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {runner_digest=$2}
+    END {if (controller && controller_digest && runner && runner_digest) {print controller " " controller_digest; print runner " " runner_digest}}
+  ' "$environment")
   [[ ${#expected_images[@]} == 2 ]] || return 1
-  for image in "${expected_images[@]}"; do
+  for expected in "${expected_images[@]}"; do
+    read -r image digest <<<"$expected"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
     provenance=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image" 2>/dev/null) || return 1
-    [[ "$provenance" == "$engine_ref" ]] || return 1
+    [[ "$provenance" == "$expected_engine" ]] || return 1
+    [[ $(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) == "$digest" ]] || return 1
   done
+}
+
+managed_image_ids_configured() {
+  grep -Eq '^CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$candidate_env" \
+    && grep -Eq '^CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$candidate_env"
 }
 
 systemd_matches() {
@@ -570,7 +612,9 @@ drift_count() {
     note 'DRIFT managed_runners'
     count=$((count + 1))
   fi
-  managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
+  if managed_image_ids_configured; then
+    managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
+  fi
   systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
   DRIFT_COUNT=$count
 }
@@ -671,7 +715,37 @@ run_candidate_preflight() {
 build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
-  compose "$release_dir" "$candidate_env" build runner-image controller
+  build_managed_images "$release_dir" "$candidate_env"
+  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
+}
+
+capture_legacy_image_ids() {
+  local environment=$1 controller_image runner_image controller_digest runner_digest engine_ref
+  engine_ref=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  controller_digest=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$environment")
+  runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  if [[ -z "$engine_ref" ]]; then
+    engine_ref=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed engine revision'
+    printf 'CI_FLEET_ENGINE_REF=%s\n' "$engine_ref" >>"$environment"
+  fi
+  if [[ -z "$controller_digest" ]]; then
+    controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print $2}' "$environment")
+    [[ -n "$controller_image" ]] || die 'legacy checkpoint cannot identify the installed controller image'
+    controller_digest=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null \
+      || docker image inspect --format '{{.Id}}' "$controller_image" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed controller image ID'
+    printf 'CI_FLEET_CONTROLLER_IMAGE_DIGEST=%s\n' "$controller_digest" >>"$environment"
+  fi
+  if [[ -z "$runner_digest" ]]; then
+    runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {print $2}' "$environment")
+    [[ -n "$runner_image" ]] || die 'legacy checkpoint cannot identify the installed runner image'
+    runner_digest=$(docker image inspect --format '{{.Id}}' "$runner_image" 2>/dev/null) \
+      || die 'legacy checkpoint cannot capture the installed runner image ID'
+    printf 'CI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$runner_digest" >>"$environment"
+  fi
+  [[ "$engine_ref" =~ ^[0-9a-f]{40}$ && "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ && "$runner_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die 'legacy checkpoint contains an invalid engine revision or managed image ID'
 }
 
 make_checkpoint() {
@@ -683,7 +757,10 @@ make_checkpoint() {
   staging_paths+=("$staged_checkpoint")
   checkpoint_dir=$staged_checkpoint
   install -d -m 0700 "$checkpoint_dir/systemd"
-  [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+  [[ ! -f "$rendered_env" ]] || {
+    install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+    capture_legacy_image_ids "$checkpoint_dir/ci-fleet.env"
+  }
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   target=$(current_runtime_release)
   if [[ -n "$target" ]]; then
@@ -983,6 +1060,15 @@ restore_checkpoint() {
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
+    if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
+      if ! managed_images_match "$rendered_env"; then
+        build_managed_images "$release_dir" "$rendered_env" || failed=1
+        if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
+      fi
+    else
+      note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
+      failed=1
+    fi
     if [[ "$restored_state" == active && "$failed" == 0 ]]; then
       if [[ $(managed_runner_count) != 0 ]]; then
         failed=1
@@ -1013,6 +1099,13 @@ trap on_error ERR
 perform_check() {
   local count
   display_last_health
+  if ! managed_image_ids_configured; then
+    [[ -L "$manager_current" && $(readlink -f "$manager_current") == "$manager_releases/$engine_ref" ]] \
+      || die 'manager-only staging is incomplete'
+    [[ $(current_runtime_release) != "$release_dir" ]] || die 'manager-only staging activated an unreviewed runtime'
+    note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
+    return
+  fi
   drift_count
   count=$DRIFT_COUNT
   if ((count > 0)); then
@@ -1023,7 +1116,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status desired_controller_id=$controller_id
+  local count existing_status installed_engine desired_controller_id=$controller_id
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -1033,6 +1126,20 @@ perform_converge() {
   fi
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
+  fi
+  if ! managed_image_ids_configured; then
+    [[ "$mode" == upgrade && -f "$state_file" && -f "$rendered_env" ]] \
+      || die 'managed_images may be omitted only for an existing managed engine upgrade'
+    ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
+      || die 'managed_images cannot be removed after image enforcement'
+    installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
+    [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "$installed_engine" != "$engine_ref" ]] \
+      || die 'manager-only staging requires a new engine revision'
+    install_release
+    install_manager
+    install_systemd_units "$(readlink -f "$manager_current")"
+    note "MANAGER_STAGED engine_ref=$engine_ref runtime_ref=$installed_engine"
+    return
   fi
   drift_count
   count=$DRIFT_COUNT
