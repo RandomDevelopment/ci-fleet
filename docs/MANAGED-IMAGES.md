@@ -31,7 +31,8 @@ From a reviewed engine checkout on an authorized isolated build host, build both
 ```bash
 CI_FLEET_COMMIT=$(git rev-parse 'HEAD^{commit}')
 CI_FLEET_VERSION=$(git rev-parse --short=12 HEAD)
-export CI_FLEET_COMMIT CI_FLEET_VERSION
+SOURCE_DATE_EPOCH=1786752000
+export CI_FLEET_COMMIT CI_FLEET_VERSION SOURCE_DATE_EPOCH
 docker compose -f deploy/compose.yaml build --no-cache runner-image controller
 docker image inspect --format '{{.Id}}' \
   "ci-fleet-controller:${CI_FLEET_COMMIT:0:12}" \

@@ -240,6 +240,7 @@ grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller 
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
+[[ $(grep -Fc 'SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-1786752000}' "$repo_root/deploy/compose.yaml") -eq 2 ]] || fail 'managed builds do not pass the reproducible timestamp to BuildKit'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
