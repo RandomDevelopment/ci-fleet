@@ -17,13 +17,14 @@ ARG DEBIAN_SNAPSHOT=20260815T000000Z
 ARG CI_FLEET_COMMIT=unknown
 LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
       io.randomdevelopment.ci-fleet.managed="true"
-RUN rm -f /etc/apt/sources.list.d/debian.sources \
+RUN --mount=type=bind,from=build,source=/out,target=/out \
+    rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" >/etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends ca-certificates \
+    && install -m 0755 /out/ci-fleet-controller /usr/local/bin/ci-fleet-controller \
     && install -d -o 65532 -g 65532 /run/ci-fleet \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
-COPY --from=build /out/ci-fleet-controller /usr/local/bin/ci-fleet-controller
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ci-fleet-controller"]
