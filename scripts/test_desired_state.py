@@ -79,13 +79,20 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(environment["CI_FLEET_CONTROLLER_IMAGE_DIGEST"], "sha256:" + "3" * 64)
         self.assertEqual(environment["CI_FLEET_RUNNER_IMAGE_DIGEST"], "sha256:" + "4" * 64)
 
+    def test_staged_engine_upgrade_omits_image_digest_enforcement(self) -> None:
+        value = config()
+        value.pop("managed_images")
+        environment, _ = self.render(value)
+        self.assertNotIn("CI_FLEET_CONTROLLER_IMAGE_DIGEST", environment)
+        self.assertNotIn("CI_FLEET_RUNNER_IMAGE_DIGEST", environment)
+
     def test_requires_reviewed_image_digests_for_engine(self) -> None:
         value = config()
         value["managed_images"].clear()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fleet.json"
             path.write_text(json.dumps(value), encoding="utf-8")
-            with self.assertRaisesRegex(DesiredStateError, "reviewed controller and runner digests"):
+            with self.assertRaisesRegex(DesiredStateError, "non-empty"):
                 load_and_validate_config(path)
 
     def test_status_reporting_requires_fixed_host_local_configuration(self) -> None:

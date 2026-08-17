@@ -25,6 +25,13 @@ status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
 case "${1:-}" in
   info) exit 0 ;;
+  buildx)
+    case "${2:-}" in
+      version) printf 'github.com/docker/buildx v0.32.1\n' ;;
+      inspect) printf 'Name: default\nDriver: docker\nNodes:\nBuildKit version: v0.27.0\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
   inspect)
     [[ -f "$state" ]] || exit 1
     if [[ "$*" == *'.Config.Env'* ]]; then
@@ -223,8 +230,8 @@ expect_command_failure() {
 }
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
-controller_image_digest=$(printf '1%.0s' {1..64})
-runner_image_digest=$(printf '2%.0s' {1..64})
+controller_image_digest=$(printf '3%.0s' {1..64})
+runner_image_digest=$(printf '4%.0s' {1..64})
 export FAKE_ENGINE_REF=$engine_ref
 runner_image="ci-fleet-runner:${engine_ref:0:12}"
 export FAKE_RUNNER_IMAGE=$runner_image
@@ -265,7 +272,7 @@ value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
-value["managed_images"] = {engine_ref: {"amd64": {"controller": "sha256:" + "1" * 64, "runner": "sha256:" + "2" * 64}}}
+value["managed_images"] = {engine_ref: {"amd64": {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "4" * 64}}}
 controller = value["controllers"]["example-ci-01"]
 controller["engine_ref"] = engine_ref
 controller["state"] = state

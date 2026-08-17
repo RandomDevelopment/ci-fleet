@@ -74,6 +74,16 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_managed_images_may_be_omitted_for_staged_engine_upgrade(self) -> None:
+        config = copy.deepcopy(reference_config())
+        config.pop("managed_images")
+        self.assertEqual(errors_for(config), [])
+        self.assertNotIn("managed_images", contract_schema()["required"])
+
+    def test_strict_validation_rejects_fixture_image_ids(self) -> None:
+        config = copy.deepcopy(reference_config())
+        self.assert_rejected(config, "replace the fixture image digest", strict=True)
+
     def test_status_reporting_null_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["status_reporting"] = None
@@ -87,8 +97,8 @@ class PolicyTests(unittest.TestCase):
                 "--organization", "sample-org", "--project", "sample-app",
                 "--engine-ref", "1" * 40,
                 "--architecture", "amd64",
-                "--controller-image-digest", "sha256:" + "1" * 64,
-                "--runner-image-digest", "sha256:" + "2" * 64,
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))

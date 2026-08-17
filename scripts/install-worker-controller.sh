@@ -135,12 +135,22 @@ cleanup_temporary() {
 trap cleanup_temporary EXIT
 
 require_commands() {
-  local command
+  local command buildkit_version
   for command in git python3 docker tar install cmp readlink systemctl stat awk grep date flock mktemp; do
     command -v "$command" >/dev/null || die "$command is required"
   done
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+  docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable'
+  buildkit_version=$(docker buildx inspect --bootstrap 2>/dev/null | awk '$1 == "BuildKit" && $2 == "version:" {sub(/^v/, "", $3); print $3; exit}')
+  [[ -n "$buildkit_version" ]] || die 'BuildKit backend version is unavailable'
+  python3 - "$buildkit_version" <<'PY' || die 'BuildKit v0.11 or newer is required'
+import re
+import sys
+
+match = re.match(r"^(\d+)\.(\d+)", sys.argv[1])
+raise SystemExit(0 if match and tuple(map(int, match.groups())) >= (0, 11) else 1)
+PY
 }
 
 validate_common_arguments() {
@@ -548,6 +558,12 @@ managed_images_match() {
   done
 }
 
+managed_image_ids_configured() {
+  local environment=${1:-$candidate_env}
+  grep -Eq '^CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$environment" \
+    && grep -Eq '^CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$environment"
+}
+
 systemd_matches() {
   local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
@@ -581,7 +597,9 @@ drift_count() {
     note 'DRIFT managed_runners'
     count=$((count + 1))
   fi
-  managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
+  if managed_image_ids_configured; then
+    managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
+  fi
   systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
   DRIFT_COUNT=$count
 }
@@ -683,7 +701,11 @@ build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
   compose "$release_dir" "$candidate_env" build runner-image controller
-  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
+  if managed_image_ids_configured "$candidate_env"; then
+    managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
+  else
+    note 'MANAGED_IMAGES_STAGING no_reviewed_ids=true'
+  fi
 }
 
 capture_legacy_image_ids() {

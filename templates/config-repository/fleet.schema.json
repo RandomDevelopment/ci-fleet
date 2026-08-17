@@ -4,7 +4,7 @@
   "title": "ci-fleet organization configuration",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "organization", "runner_pools", "managed_images", "controllers", "host_groups", "environments", "projects"],
+  "required": ["schema_version", "organization", "runner_pools", "controllers", "host_groups", "environments", "projects"],
   "properties": {
     "$schema": {"type": "string"},
     "schema_version": {"const": 3},

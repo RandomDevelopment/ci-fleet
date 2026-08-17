@@ -24,20 +24,47 @@ Reviewed on 2026-08-16 from official upstream endpoints:
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.
 
+## Two-step desired-state rollout
+
+Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
+
+1. Merge and reconcile a staging desired-state revision that changes only `engine_ref` and omits `managed_images`.
+2. After every target controller reports the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs.
+
+This engine accepts the omitted key only for that staging transition. Once `managed_images` is present, every controller engine reference must have reviewed IDs; do not combine the two revisions.
+
 ## Record image IDs for an engine commit
 
-From a reviewed engine checkout on an authorized isolated build host, build both images twice from clean BuildKit state and compare IDs:
+From a reviewed engine checkout on an authorized isolated build host, build each host architecture twice from clean state using the reviewed BuildKit backend:
 
 ```bash
 CI_FLEET_COMMIT=$(git rev-parse 'HEAD^{commit}')
-CI_FLEET_VERSION=$(git rev-parse --short=12 HEAD)
+CI_FLEET_VERSION=${CI_FLEET_COMMIT:0:12}
 SOURCE_DATE_EPOCH=1786752000
+BUILDKIT_IMAGE=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+BUILDER=ci-fleet-managed-review
 export CI_FLEET_COMMIT CI_FLEET_VERSION SOURCE_DATE_EPOCH
-docker compose -f deploy/compose.yaml build --no-cache runner-image controller
+cleanup() { docker buildx rm --force "$BUILDER" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
+docker buildx create --name "$BUILDER" --driver docker-container \
+  --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap
+
+docker buildx build --builder "$BUILDER" --no-cache --load \
+  --provenance=false --sbom=false \
+  --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH \
+  --tag "ci-fleet-runner:$CI_FLEET_VERSION" runner
+docker buildx build --builder "$BUILDER" --no-cache --load \
+  --provenance=false --sbom=false \
+  --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION \
+  --build-arg SOURCE_DATE_EPOCH \
+  --tag "ci-fleet-controller:$CI_FLEET_VERSION" controller
 docker image inspect --format '{{.Id}}' \
-  "ci-fleet-controller:${CI_FLEET_COMMIT:0:12}" \
-  "ci-fleet-runner:${CI_FLEET_COMMIT:0:12}"
+  "ci-fleet-controller:$CI_FLEET_VERSION" \
+  "ci-fleet-runner:$CI_FLEET_VERSION"
 ```
+
+Managed installation also rejects BuildKit backends older than v0.11, the first release that implements `SOURCE_DATE_EPOCH` output timestamp rewriting.
 
 Repeat the build on every supported host architecture. After each architecture's repeated IDs match, add them to one private desired-state entry:
 
