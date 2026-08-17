@@ -358,7 +358,7 @@ validate_evidence() {
 }
 
 require_host() {
-  local command os_id os_version available required systemd_state disk_path
+  local command os_id os_version available required systemd_state disk_path canonical
   # Docker checks must target the host's local daemon, not an operator shell's
   # remote DOCKER_HOST or selected context.
   DOCKER_HOST=unix://$(root_path /run/docker.sock)
@@ -369,6 +369,11 @@ require_host() {
   done
   local os_release
   os_release=$(root_path /etc/os-release)
+  if [[ -L "$os_release" ]]; then
+    canonical=$(readlink -f -- "$os_release")
+    [[ "$canonical" == "$(root_path /usr/lib/os-release)" ]] || block 'supported Linux os-release metadata is missing'
+    os_release=$canonical
+  fi
   [[ -f "$os_release" && ! -L "$os_release" ]] || block 'supported Linux os-release metadata is missing'
   os_id=$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2}' "$os_release")
   os_version=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2}' "$os_release")

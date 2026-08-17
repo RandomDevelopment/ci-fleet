@@ -286,6 +286,13 @@ cp "$root/etc/os-release" "$tmp/os-release"
 printf 'ID=alpine\nVERSION_ID=3.20\n' >"$root/etc/os-release"
 expect_failure 'unsupported Linux distribution or release' "$installer" --check --config "$config" >/dev/null
 cp "$tmp/os-release" "$root/etc/os-release"
+mkdir -p "$root/usr/lib"
+cp "$root/etc/os-release" "$root/usr/lib/os-release"
+rm "$root/etc/os-release"
+ln -s ../usr/lib/os-release "$root/etc/os-release"
+"$installer" --check --config "$config" >/dev/null || fail 'canonical Debian os-release symlink was rejected'
+rm "$root/etc/os-release" "$root/usr/lib/os-release"
+cp "$tmp/os-release" "$root/etc/os-release"
 FAKE_TIME_SYNC=no expect_failure 'host time is not synchronized' "$installer" --check --config "$config" >/dev/null
 FAKE_SYSTEMD_FAIL=1 expect_failure 'systemd is unavailable' "$installer" --check --config "$config" >/dev/null
 FAKE_DOCKER_INFO_EXIT=1 expect_failure 'Docker Engine is unavailable' "$installer" --check --config "$config" >/dev/null
