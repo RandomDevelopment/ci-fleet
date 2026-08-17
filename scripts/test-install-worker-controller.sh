@@ -244,6 +244,7 @@ grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/comp
 grep -Fq "touch -d \"@\${SOURCE_DATE_EPOCH}\" /out/ci-fleet-controller" "$repo_root/controller/Dockerfile" || fail 'controller binary timestamp is not normalized'
 grep -Fq 'RUN --mount=type=bind,from=build,source=/out,target=/out' "$repo_root/controller/Dockerfile" || fail 'controller binary is not installed in the normalized runtime layer'
 [[ $(grep -Fc "find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt \"@\${SOURCE_DATE_EPOCH}\"" "$repo_root/runner/Dockerfile") -eq 3 ]] || fail 'runner filesystem timestamps are not normalized after every mutating step'
+[[ $(grep -Fc '/var/cache/ldconfig/aux-cache' "$repo_root/runner/Dockerfile") -eq 2 ]] || fail 'runner build preserves nondeterministic ldconfig cache content'
 config_repo=$tmp/config-repo
 git init -q "$config_repo"
 git -C "$config_repo" config user.name fixture
