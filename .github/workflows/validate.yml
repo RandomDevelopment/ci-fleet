@@ -14,8 +14,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  commit-convention:
+    name: Enforce conventional commits and pull-request title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate pull-request title
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          python3 scripts/validate_commits.py --pr-title "${{ github.event.pull_request.title }}"
+
+      - name: Validate proposed commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Validate only commits proposed on this ref (base..head). Commits
+          # already on the base branch are never re-checked. The validator is
+          # shallow-clone safe: an empty base or empty range falls back to the
+          # head commit alone.
+          python3 scripts/validate_commits.py --base "$BASE_SHA" --head "$HEAD_SHA"
+
   validate:
     name: Build without registering a runner
+    needs: commit-convention
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

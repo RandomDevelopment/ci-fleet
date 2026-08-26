@@ -22,6 +22,7 @@ python3 scripts/test_desired_state.py
 python3 scripts/test_health.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
+python3 scripts/test_validate_commits.py
 python3 -m json.tool schemas/status-report-v1.json >/dev/null
 python3 scripts/desired_state.py validate-engine-capabilities --manifest engine-capabilities.json --require-status-reporting-config --require-status-reporting >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
