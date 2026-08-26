@@ -90,14 +90,21 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         # git-backed variants).
         self.assertTrue(vc.validate_message("Merge pull request #77 from RandomDevelopment/docs/x"))
 
-    def test_chore_deps_is_exempt(self) -> None:
+    def test_chore_deps_is_validated_by_grammar(self) -> None:
+        # Dependabot prefixes are configured in .github/dependabot.yml; the
+        # messages themselves must satisfy the normal grammar, not bypass it.
         self.assertEqual(vc.validate_message("chore(deps): bump golang"), [])
+        self.assertTrue(vc.validate_message("CHORE(DEPS): Totally invalid"))
+        self.assertTrue(vc.validate_message("chore(deps): Bump golang"))
 
     def test_empty_message_is_rejected(self) -> None:
         self.assertTrue(vc.validate_message(""))
 
     def test_body_without_blank_separator_is_rejected(self) -> None:
         self.assertTrue(vc.validate_message("feat: add telemetry\nno blank line here"))
+
+    def test_double_blank_separator_is_rejected(self) -> None:
+        self.assertTrue(vc.validate_message("feat: add telemetry\n\n\nbody here"))
 
     def test_breaking_detection_without_exclaim(self) -> None:
         message = "feat: drop legacy command\n\nBREAKING CHANGE: removed\n"

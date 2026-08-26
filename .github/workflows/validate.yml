@@ -31,13 +31,18 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          # Run the PR's copy only if the base branch already has one; otherwise
-          # use the trusted base revision so a PR cannot weaken its own check.
-          validator=scripts/validate_commits.py
+          # The convention checks must run trusted code: a PR can edit its own
+          # copy of the validator, so extract it from the base revision when it
+          # exists there. This first PR bootstraps the gate before the script
+          # exists on main; until then the checkout copy is the only available
+          # implementation, and this same commit lands it so the next merge
+          # base contains it and later PRs are fully trusted.
+          validator="$RUNNER_TEMP/trusted-validator.py"
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          if git cat-file -e "$BASE_SHA:$validator" 2>/dev/null; then
-            git show "$BASE_SHA:$validator" >"$RUNNER_TEMP/trusted-validator.py"
-            validator="$RUNNER_TEMP/trusted-validator.py"
+          if git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
+          else
+            cp scripts/validate_commits.py "$validator"
           fi
           python3 "$validator" --pr-title "$PR_TITLE"
 
@@ -54,11 +59,13 @@ jobs:
           #
           # Like the secret scanner below, the validator itself is extracted
           # from the trusted base revision when available, so a PR cannot pass
-          # these gates by editing its own copy of the script.
-          validator=scripts/validate_commits.py
-          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$validator" 2>/dev/null; then
-            git show "$BASE_SHA:$validator" >"$RUNNER_TEMP/trusted-validator.py"
-            validator="$RUNNER_TEMP/trusted-validator.py"
+          # these gates by editing its own copy of the script. Until the script
+          # exists on the base branch (bootstrap PR), the checkout copy runs.
+          validator="$RUNNER_TEMP/trusted-validator.py"
+          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
+          else
+            cp scripts/validate_commits.py "$validator"
           fi
           python3 "$validator" --base "$BASE_SHA" --head "$HEAD_SHA"
 

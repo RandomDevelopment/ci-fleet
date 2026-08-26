@@ -31,9 +31,10 @@ and agents editing this repository.
   `perf`, `refactor`, `revert`, `style`, `test`.
 - The `<scope>` is optional and nested in parentheses, e.g. `feat(runner):`.
 - Append `!` before the colon to mark a breaking change.
-- The `<description>` is a single line of <=100 characters beginning with a
-  lowercase letter (lowercase ASCII type + scope is the convention; the subject
-  itself may contain capitals for identifiers).
+- The `<description>` is a single line; the complete subject (type, scope,
+  marker, separator, and description) is limited to <=100 characters and the
+  description begins with a lowercase letter (lowercase ASCII type + scope is
+  the convention; the subject itself may contain capitals for identifiers).
 - Separate the subject from the body with exactly one blank line.
 - Footers use `Token: value` form. A breaking change MAY also be declared with
   a `BREAKING CHANGE:` footer (uppercase, per spec).

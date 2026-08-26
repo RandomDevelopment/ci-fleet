@@ -79,7 +79,7 @@ TRAILER_RE = re.compile(
 # subject prefix alone only exempts plumbing lines like "Revert \"...".
 MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
 PLUMBING_RE = re.compile(
-    r"^(?:Revert \"|chore\(deps\):)",
+    r"^Revert \"",
     re.IGNORECASE,
 )
 
@@ -213,8 +213,8 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
 
     if skip_merge:
         if PLUMBING_RE.match(header):
-            # Pure plumbing lines (Revert "...", chore(deps):) are exempt
-            # unconditionally; everything else must be conventional.
+            # Pure plumbing lines (Revert "...") are exempt unconditionally;
+            # everything else must be conventional.
             return errors
         if MERGE_RE.match(header):
             # "Merge " prefix alone is not proof: a single-parent commit can be
@@ -233,6 +233,9 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
     # Body, if present, must follow the header after exactly one blank line.
     if len(lines) > 1 and lines[1].strip() != "":
         errors.append("header must be followed by a blank line before the body")
+    elif len(lines) > 2 and lines[2].strip() == "":
+        # lines[1] is blank and so is lines[2]: more than one separator line.
+        errors.append("exactly one blank line must separate the header from the body")
 
     return errors
 
