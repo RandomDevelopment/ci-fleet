@@ -2,6 +2,9 @@ name: Validate ci-fleet prototype
 
 on:
   pull_request:
+    # `edited` revalidates the title when a contributor retitles the PR: the
+    # required check would otherwise stay green for the same head SHA.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
     tags: ['**']
@@ -73,8 +76,11 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         env:
           TAG_NAME: ${{ github.ref_name }}
+          TAG_COMMIT: ${{ github.sha }}
         run: |
-          python3 scripts/validate_commits.py --version "$TAG_NAME"
+          # Stable tags must point into the main line (fetch-depth 0 gives us
+          # origin/main); prerelease tags may stay branch-local.
+          python3 scripts/validate_commits.py --version "$TAG_NAME" --tag-commit "$TAG_COMMIT"
 
   validate:
     name: Build without registering a runner

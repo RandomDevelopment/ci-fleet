@@ -112,6 +112,33 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         self.assertIsNotNone(bump, "expected a bump from a BREAKING CHANGE commit")
         self.assertEqual(bump, "MAJOR")
 
+    def test_revert_shaped_subject_without_plumbing_form_is_validated(self) -> None:
+        # A revert must use the approved `revert:` type; the git-generated
+        # `Revert "<subject>"` plumbing form is exempt, nothing else.
+        self.assertTrue(vc.validate_message('Revert "skip validation"'))
+        self.assertEqual(vc.validate_message("revert: skip validation"), [])
+
+    def test_breaking_marker_in_body_text_is_not_a_footer(self) -> None:
+        # A footer-shaped line directly after body text (no second blank-line
+        # separator) is body prose, not a footer.
+        message = (
+            "feat: add guard rails\n"
+            "\n"
+            "Body text explaining the change.\n"
+            "BREAKING CHANGE: this line is really more body prose.\n"
+        )
+        self.assertEqual(vc.bump_kind(message), "MINOR")
+
+    def test_footer_after_body_still_counts(self) -> None:
+        message = (
+            "feat: add guard rails\n"
+            "\n"
+            "Body text explaining the change.\n"
+            "\n"
+            "BREAKING CHANGE: the old flag is gone.\n"
+        )
+        self.assertEqual(vc.bump_kind(message), "MAJOR")
+
 
 class PullRequestTitleTests(unittest.TestCase):
     def test_conventional_pr_title_passes(self) -> None:
@@ -164,6 +191,11 @@ class SemVerValidationTests(unittest.TestCase):
 
     def test_invalid_empty(self) -> None:
         self.assertTrue(vc.validate_version(""))
+
+    def test_trailing_newline_is_rejected(self) -> None:
+        # '$' matches before a final newline; SemVer must match the exact string.
+        self.assertTrue(vc.validate_version("1.2.3\n"))
+        self.assertIsNone(vc.parse_version("v1.2.3\n"))
 
     def test_zero_major_detection(self) -> None:
         self.assertTrue(vc.is_zero_major("0.1.0"))
@@ -232,6 +264,21 @@ class CliTests(unittest.TestCase):
     def test_pr_title_flag_invalid(self) -> None:
         result = self._run("--pr-title", "Random PR title")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_explicitly_empty_flags_fail_closed(self) -> None:
+        # An explicitly empty value must be validated (and fail), not fall
+        # through to the default range validation.
+        for flag in ("--version", "--pr-title"):
+            result = self._run(flag, "")
+            self.assertNotEqual(result.returncode, 0, f"{flag} '' must fail")
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("")
+            path = handle.name
+        try:
+            result = self._run("--message", path)
+            self.assertNotEqual(result.returncode, 0)
+        finally:
+            os.unlink(path)
 
     @staticmethod
     def _git_env() -> dict[str, str]:
@@ -328,6 +375,36 @@ class CliTests(unittest.TestCase):
             self._commit(directory, "Old non-conventional commit")
             head_sha = self._commit(directory, "feat: new feature")
             result = self._run("--base", "", "--head", head_sha, cwd=directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stable_tag_must_reach_main(self) -> None:
+        # A stable (non-prerelease) tag must point into the main line.
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            main_sha = self._commit(directory, "feat: base commit")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            self.assertTrue(vc.is_ancestor(main_sha, "origin/main", directory))
+            head_sha = self._commit(directory, "feat: feature work")
+            # HEAD is not on origin/main: stable fails, prerelease passes.
+            result = self._run("--version", "v1.2.3", "--tag-commit", head_sha, cwd=directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not reachable", result.stderr)
+            result = self._run("--version", "v1.2.3-rc.1", "--tag-commit", head_sha, cwd=directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self._run("--version", "v1.2.3+build.7", "--tag-commit", head_sha, cwd=directory)
+            self.assertNotEqual(result.returncode, 0)
+        # And a stable tag pointing into main passes.
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            main_sha = self._commit(directory, "feat: base commit")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            result = self._run("--version", "v0.2.0", "--tag-commit", main_sha, cwd=directory)
             self.assertEqual(result.returncode, 0, result.stderr)
 
 

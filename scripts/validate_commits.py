@@ -73,15 +73,17 @@ TRAILER_RE = re.compile(
     r"^(?:" + FOOTER_TOKEN + r": " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
 )
 
-# Merge and pure-git commits are exempt: they are generated, not authored per
-# the contract, and existing base-branch commits are never re-checked here.
+# Git-generated plumbing commits are exempt: they are produced by git itself,
+# not authored per the contract, and existing base-branch commits are never
+# re-checked here.
+#
 # A real merge is verified by parent count (see is_true_merge_commit); the
-# subject prefix alone only exempts plumbing lines like "Revert \"...".
+# subject prefix alone only exempts git's own generated revert form
+# `Revert "<sha>"`, where <sha> is a full 40-hex commit id. Any other
+# "Revert ..." shape (including `Revert "<subject>"` with arbitrary text) is
+# ordinary authored content and must use the approved `revert:` type.
 MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
-PLUMBING_RE = re.compile(
-    r"^Revert \"",
-    re.IGNORECASE,
-)
+PLUMBING_RE = re.compile(r'^Revert "[0-9a-fA-F]{40}"$')
 
 def is_true_merge_commit(sha: str, workspace: str = ".") -> bool:
     """Return True if the commit is a true merge commit (has 2+ parents)."""
@@ -116,12 +118,12 @@ SEMVER_RE = re.compile(
 
 def is_semver(value: str) -> bool:
     """Return True when `value` is a valid SemVer 2.0.0 string."""
-    return SEMVER_RE.match(value) is not None
+    return SEMVER_RE.fullmatch(value) is not None
 
 
 def parse_version(value: str) -> tuple[int, int, int] | None:
     """Return (major, minor, patch) for a valid SemVer string, else None."""
-    match = SEMVER_RE.match(value)
+    match = SEMVER_RE.fullmatch(value)
     if match is None:
         return None
     major, minor, patch = match.group(1), match.group(2), match.group(3)
@@ -186,16 +188,23 @@ def has_breaking_change(message: str) -> bool:
     if not message:
         return False
     lines = message.splitlines()
-    in_footer = False
-    for line in lines[1:]:
-        if line.strip() == "":
-            in_footer = True
-            continue
-        if in_footer:
-            trailer = TRAILER_RE.match(line)
-            if trailer and (line.startswith(BREAKING_HEADER) or line.startswith(BREAKING_HEADER_ALT)):
-                return True
-    return False
+    # The footer block is separated from the subject/body by a blank line and
+    # begins with a trailer ("Token: value"); footer values may span
+    # continuation lines until the next trailer. A "BREAKING CHANGE:"-shaped
+    # line glued to body text without that separator is body prose, not a
+    # footer.
+    try:
+        last_blank = len(lines) - 1 - lines[::-1].index("")
+    except ValueError:
+        return False
+    footer = lines[last_blank + 1:]
+    if not footer or not TRAILER_RE.match(footer[0]):
+        return False
+    return any(
+        line.startswith(BREAKING_HEADER) or line.startswith(BREAKING_HEADER_ALT)
+        for line in footer
+        if TRAILER_RE.match(line)
+    )
 
 
 def validate_message(message: str, *, skip_merge: bool = True, sha: str | None = None, workspace: str = ".") -> list[str]:
@@ -213,8 +222,8 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
 
     if skip_merge:
         if PLUMBING_RE.match(header):
-            # Pure plumbing lines (Revert "...") are exempt unconditionally;
-            # everything else must be conventional.
+            # Only git's own generated revert form (`Revert "<sha>"`, full
+            # 40-hex id) is exempt; anything else must be conventional.
             return errors
         if MERGE_RE.match(header):
             # "Merge " prefix alone is not proof: a single-parent commit can be
@@ -249,6 +258,15 @@ def validate_title(title: str) -> list[str]:
     if not is_conventional_header(title):
         return [f"PR title is not conventional: '{title}'"]
     return []
+
+
+def is_ancestor(commit: str, ancestor: str, workspace: str = ".") -> bool:
+    """Return True when `commit` is reachable from `ancestor` (or equal to it)."""
+    result = subprocess.run(
+        ["git", "-C", workspace, "merge-base", "--is-ancestor", commit, ancestor],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return result.returncode == 0
 
 
 def validate_version(value: str) -> list[str]:
@@ -338,6 +356,16 @@ def main() -> int:
         help="validate a SemVer 2.0.0 version string (optional leading v)",
     )
     parser.add_argument(
+        "--tag-commit", default=os.environ.get("TAG_COMMIT"),
+        help="commit the version tag points at; with --version, a stable "
+        "(non-prerelease) tag must point into the main line (MAIN_REF, "
+        "default 'origin/main')",
+    )
+    parser.add_argument(
+        "--main-ref", default=os.environ.get("MAIN_REF", "origin/main"),
+        help="ref representing the main line for stable-tag reachability",
+    )
+    parser.add_argument(
         "--suggest-bump", action="store_true",
         help="print the recommended SemVer bump from the base..head range",
     )
@@ -345,8 +373,20 @@ def main() -> int:
 
     failures: list[str] = []
 
-    if args.version:
+    if args.version is not None:
         failures.extend(validate_version(args.version))
+        # A stable (non-prerelease) tag must point into the main line;
+        # prerelease and build-metadata tags may stay branch-local.
+        if not failures and args.tag_commit is not None:
+            match = SEMVER_RE.match(args.version)
+            assert match is not None
+            if match.group(4) is None:  # no prerelease component => stable
+                if not is_ancestor(args.tag_commit, args.main_ref):
+                    failures.append(
+                        f"stable tag '{args.version}' points at a commit that is "
+                        f"not reachable from '{args.main_ref}'; stable versions "
+                        "are tagged on main (prereleases may stay branch-local)"
+                    )
         if failures:
             for failure in failures:
                 print(f"version: {failure}", file=sys.stderr)
@@ -354,7 +394,7 @@ def main() -> int:
         print(f"OK: '{args.version}' is a valid SemVer 2.0.0 version")
         return 0
 
-    if args.message:
+    if args.message is not None:
         message = sys.stdin.read() if args.message == "-" else open(args.message, encoding="utf-8").read()
         failures.extend(validate_message(message))
         if failures:
@@ -364,7 +404,7 @@ def main() -> int:
         print("OK: conventional commit message")
         return 0
 
-    if args.pr_title:
+    if args.pr_title is not None:
         failures.extend(validate_title(args.pr_title))
         if failures:
             for failure in failures:
