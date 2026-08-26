@@ -123,6 +123,42 @@ class HealthTests(unittest.TestCase):
         report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": snapshot["docker_network_headroom"]}, health.Thresholds())
         self.assertEqual(report["status"], "warning")
 
+    def test_builtin_addressless_networks_are_ignored_but_custom_ones_are_legacy(self) -> None:
+        networks = {name: [{"IPAM": {"Config": []}}] for name in ("host", "none", "custom")}
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "host\nnone\ncustom\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual(result["legacy"], 1)
+
+    def test_broader_network_consumes_all_allocation_slots(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broad\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/24"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["state"]), (16, 0, "critical"))
+
+    def test_ipv6_ipam_is_ignored_without_hiding_ipv4(self) -> None:
+        networks = {
+            "dual": [{"IPAM": {"Config": [{"Subnet": "2001:db8::/64"}, {"Subnet": "198.51.100.0/28"}]}}],
+            "v6-only": [{"IPAM": {"Config": [{"Subnet": "2001:db8:1::/64"}]}}],
+        }
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "dual\nv6-only\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (1, 0, "healthy"))
+
+    def test_malformed_ipv4_ipam_fails_inspection(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broken\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.999/28"}]}}]), "")
+        self.assertEqual(health._docker_network_headroom(run, network_policy_values(), docker_ok=True)["state"], "unavailable")
+
     def test_status_report_redacts_network_addresses(self) -> None:
         snapshot = {**healthy_snapshot(), "docker_network_headroom": {"configured": 16, "used": 2, "free": 14, "reserve": 1, "legacy": 1, "state": "warning"}}
         report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)

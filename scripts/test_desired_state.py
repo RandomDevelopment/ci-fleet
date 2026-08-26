@@ -139,6 +139,13 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(metadata["docker_network_default_address_pools"], 1)
         self.assertEqual(metadata["docker_network_reserve_subnets"], 1)
 
+    def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"].pop("docker_network_policy", None)
+        environment, metadata = self.render(value)
+        self.assertNotIn("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", environment)
+        self.assertFalse(metadata["docker_network_policy_configured"])
+
     def test_docker_network_policy_requires_capacity_for_reserve(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"]["max_runners"] = 2

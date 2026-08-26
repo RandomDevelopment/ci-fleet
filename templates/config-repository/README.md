@@ -91,6 +91,11 @@ must provide at least `max_runners + reserve_subnets` subnets. Real pool values
 belong in the private configuration; this template uses RFC 5737 documentation
 ranges only.
 
+The field is optional solely for staged upgrades from older schema-v3 engines.
+First pin and activate this compatible engine without adding the field. In a
+second reviewed desired-state commit, add the reviewed policy. The older engine
+rejects the new key, so combining those steps prevents reconciliation.
+
 The public engine renders these values only for read-only health inspection.
 This phase detects low water, exhaustion, failed inspection, and legacy
 networks; it does not configure or restart Docker, create/delete networks,

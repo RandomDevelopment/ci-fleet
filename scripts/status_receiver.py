@@ -239,8 +239,13 @@ class StatusReceiver:
         if not exact(load, {"one", "five", "fifteen"}) or not all(number(value) for value in load.values()):
             raise StatusError(400, "invalid_report")
         docker = report["docker"]
-        if not exact(docker, {"healthy", "oom"}) or not all(isinstance(value, bool) for value in docker.values()):
+        if set(docker) not in ({"healthy", "oom"}, {"healthy", "oom", "network"}) or not all(isinstance(docker[key], bool) for key in ("healthy", "oom")):
             raise StatusError(400, "invalid_report")
+        network = docker.get("network")
+        if network is not None:
+            keys = {"configured", "used", "free", "legacy"}
+            if not exact(network, keys) or not all(integer(network[key]) for key in keys) or network["used"] + network["free"] != network["configured"]:
+                raise StatusError(400, "invalid_report")
         error = report["error"]
         if error is not None and (not exact(error, {"code", "message"}) or not isinstance(error["code"], str) or not re.fullmatch(r"[a-z0-9_]{1,64}", error["code"]) or error["message"] != error["code"].replace("_", " ")):
             raise StatusError(400, "invalid_report")

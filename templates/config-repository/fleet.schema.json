@@ -70,7 +70,7 @@
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pool", "location", "state", "scale_set_name", "lifecycle", "engine_ref", "min_runners", "max_runners", "runner_resources", "docker_network_policy"],
+      "required": ["pool", "location", "state", "scale_set_name", "lifecycle", "engine_ref", "min_runners", "max_runners", "runner_resources"],
       "properties": {
         "pool": {"$ref": "#/$defs/slug"},
         "location": {"$ref": "#/$defs/slug"},

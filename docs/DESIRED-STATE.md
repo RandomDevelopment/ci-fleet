@@ -45,6 +45,13 @@ valid policy but do not reserve runner subnet capacity. Real pool values belong
 only in the private desired-state repository; public examples use RFC 5737
 documentation ranges.
 
+`docker_network_policy` is optional only to preserve a staged upgrade path from
+older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
+an existing controller in two reviewed desired-state commits: first change only
+`engine_ref` and verify that this compatible engine is active; then add the
+reviewed network policy in a second commit. Do not add the field while the old
+engine still performs reconciliation.
+
 This phase renders the policy solely for read-only health inspection. It does
 not write `daemon.json`, restart Docker, create or remove networks, prune
 resources, drain runners, or alter controller scale. Circuit breaking,

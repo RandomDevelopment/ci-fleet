@@ -82,14 +82,18 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(errors_for(reference_config()), [])
 
     def test_schema_defines_docker_network_policy_contract(self) -> None:
-        controller = contract_schema()["$defs"]["controller"]["properties"]["docker_network_policy"]
+        controller_schema = contract_schema()["$defs"]["controller"]
+        self.assertNotIn("docker_network_policy", controller_schema["required"])
+        controller = controller_schema["properties"]["docker_network_policy"]
         self.assertEqual(set(controller), {"type", "additionalProperties", "required", "properties"})
         self.assertEqual(controller["required"], ["default_address_pools", "reserve_subnets"])
         pool = controller["properties"]["default_address_pools"]["items"]
         self.assertEqual(set(pool["properties"]), {"base", "size"})
 
-    def test_docker_network_policy_is_required_and_capacity_checked(self) -> None:
+    def test_docker_network_policy_is_optional_and_capacity_checked_when_present(self) -> None:
         config = copy.deepcopy(reference_config())
+        first_controller(config).pop("docker_network_policy")
+        self.assertEqual(errors_for(config), [])
         first_controller(config)["docker_network_policy"] = docker_network_policy()
         self.assertEqual(errors_for(config), [])
 
@@ -126,6 +130,31 @@ class PolicyTests(unittest.TestCase):
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
+
+    def test_initializer_sizes_policy_for_sixteen_runners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--max-runners", "16",
+                "--capacity-budget", "16", "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            config = json.loads(output.read_text())
+        self.assertEqual(errors_for(config), [])
+        policy = first_controller(config)["docker_network_policy"]
+        self.assertGreaterEqual(1 << (policy["default_address_pools"][0]["size"] - 24), 17)
+
+    def test_initializer_rejects_more_than_documentation_pool_can_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--max-runners", "256",
+                "--capacity-budget", "256", "--output", str(Path(directory) / "fleet.json"),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not exceed 255", result.stderr)
 
     def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
         previous = reference_config()

@@ -222,12 +222,14 @@ def build_rendered_env(
     state = controller["state"]
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
-    network_policy = controller.get("docker_network_policy") or {}
-    configured_subnets, reserve_subnets, parsed_pools = validate_docker_network_policy(
-        network_policy,
-        path=f"$.controllers.{controller_id}.docker_network_policy",
-        max_runners=configured_max if state != "disabled" else 0,
-    )
+    network_policy = controller.get("docker_network_policy")
+    configured_subnets, reserve_subnets, parsed_pools = (0, 0, [])
+    if network_policy is not None:
+        configured_subnets, reserve_subnets, parsed_pools = validate_docker_network_policy(
+            network_policy,
+            path=f"$.controllers.{controller_id}.docker_network_policy",
+            max_runners=configured_max if state != "disabled" else 0,
+        )
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
@@ -238,8 +240,6 @@ def build_rendered_env(
         "CI_FLEET_CONTROLLER_IMAGE": f"ci-fleet-controller:{short_commit}",
         "CI_FLEET_CONTROLLER_STATE": state,
         "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
-        "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": str(len(parsed_pools)),
-        "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": str(reserve_subnets),
         "CI_FLEET_DOCKER_GID": str(docker_gid),
         "CI_FLEET_ENGINE_REF": engine_commit,
         "CI_FLEET_GITHUB_URL": f"https://github.com/{config['organization']['slug']}",
@@ -255,9 +255,12 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
-    for index, pool_config in enumerate(parsed_pools):
-        rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
-        rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
+    if network_policy is not None:
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
+        rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"] = str(reserve_subnets)
+        for index, pool_config in enumerate(parsed_pools):
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
@@ -286,7 +289,7 @@ def build_rendered_env(
         "engine_repository": config["organization"]["delivery_engine"],
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
-        "docker_network_policy_configured": True,
+        "docker_network_policy_configured": network_policy is not None,
         "docker_network_default_address_pools": len(parsed_pools),
         "docker_network_reserve_subnets": reserve_subnets,
         "docker_network_configured_subnets": configured_subnets,

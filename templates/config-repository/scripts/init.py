@@ -67,6 +67,8 @@ def main() -> int:
         fail("--engine-ref must be a nonzero full lowercase commit SHA")
     if args.max_runners > args.capacity_budget:
         fail("--max-runners must not exceed --capacity-budget")
+    if args.max_runners > 255:
+        fail("--max-runners must not exceed 255 for the fictional /24 Docker address pool")
     if args.runner_memory_mib < 512:
         fail("--runner-memory-mib must be at least 512")
 
@@ -118,7 +120,7 @@ def main() -> int:
                 "docker_network_policy": {
                     "reserve_subnets": 1,
                     "default_address_pools": [
-                        {"base": "198.51.100.0/24", "size": 28},
+                        {"base": "198.51.100.0/24", "size": 24 + args.max_runners.bit_length()},
                     ],
                 },
             }

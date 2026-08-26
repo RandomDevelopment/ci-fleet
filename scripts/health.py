@@ -321,24 +321,19 @@ def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
     return stale
 
 
-def _parse_network_pool(values: dict[str, str], index: int) -> ipaddress.IPv4Network | None:
+def _parse_network_pool(values: dict[str, str], index: int) -> tuple[ipaddress.IPv4Network, int] | None:
     base = values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE")
     size = values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE")
     if not base or not size:
         return None
     try:
         network = ipaddress.ip_network(base, strict=True)
-    except ValueError:
-        return None
-    if network.version != 4:
-        return None
-    try:
         subnet_size = int(size)
     except ValueError:
         return None
-    if subnet_size < network.prefixlen or subnet_size > 32:
+    if network.version != 4 or subnet_size < network.prefixlen or subnet_size > 32:
         return None
-    return network
+    return network, subnet_size
 
 
 def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: bool) -> dict[str, Any]:
@@ -352,7 +347,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         return empty
     if configured_count == 0 and "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" not in values:
         return {**empty, "state": "not_configured"}
-    pools: list[ipaddress.IPv4Network] = []
+    pools: list[tuple[ipaddress.IPv4Network, int]] = []
     for index in range(configured_count):
         pool = _parse_network_pool(values, index)
         if pool is None:
@@ -363,7 +358,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     listed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
     if listed.returncode != 0:
         return empty
-    configured = sum(1 << (int(values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE", "0")) - pools[index].prefixlen) for index in range(len(pools)))
+    configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
     used_subnets: set[str] = set()
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
@@ -377,6 +372,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         if not isinstance(payload, list) or not payload:
             return empty
         subnets: list[ipaddress.IPv4Network] = []
+        saw_ipv6 = False
         for entry in payload:
             configs = entry.get("IPAM", {}).get("Config", []) if isinstance(entry, dict) else []
             if not isinstance(configs, list):
@@ -389,17 +385,26 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
                     network = ipaddress.ip_network(subnet, strict=False)
                 except ValueError:
                     return empty
-                if network.version != 4:
-                    return empty
+                if network.version == 6:
+                    saw_ipv6 = True
+                    continue
                 subnets.append(network)
         if not subnets:
+            if saw_ipv6 or name in {"host", "none"}:
+                continue
             legacy_networks += 1
             continue
         network_legacy = False
         for subnet in subnets:
-            if any(subnet.subnet_of(pool) for pool in pools):
-                used_subnets.add(str(subnet))
+            match = next(((pool, size) for pool, size in pools if subnet.subnet_of(pool)), None)
+            if match is None:
+                network_legacy = True
+                continue
+            pool, size = match
+            if subnet.prefixlen <= size:
+                used_subnets.update(str(slot) for slot in subnet.subnets(new_prefix=size))
             else:
+                used_subnets.add(str(subnet.supernet(new_prefix=size)))
                 network_legacy = True
         if network_legacy:
             legacy_networks += 1

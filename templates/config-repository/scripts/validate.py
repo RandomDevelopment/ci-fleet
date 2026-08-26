@@ -334,7 +334,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     for name, controller in controllers.items():
         path = f"$.controllers.{name}"
         validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "controller ID must be a unique lowercase slug")
-        if not validation.exact_keys(controller, path, controller_keys, {"status_reporting"}):
+        if not validation.exact_keys(controller, path, controller_keys - {"docker_network_policy"}, {"status_reporting", "docker_network_policy"}):
             continue
         pool_name = controller.get("pool")
         location = controller.get("location")
@@ -374,7 +374,8 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
         network_policy = controller.get("docker_network_policy")
         capacity_maximum = maximum if state != "disabled" and type(maximum) is int and maximum > 0 else 0
-        validate_docker_network_policy(network_policy, f"{path}.docker_network_policy", capacity_maximum, validation)
+        if network_policy is not None:
+            validate_docker_network_policy(network_policy, f"{path}.docker_network_policy", capacity_maximum, validation)
         if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 
