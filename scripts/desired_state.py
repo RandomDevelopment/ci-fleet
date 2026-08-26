@@ -31,6 +31,7 @@ HOST_REQUIRED = {
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
+DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
 
 
 class DesiredStateError(ValueError):
@@ -224,14 +225,17 @@ def build_rendered_env(
     state = controller["state"]
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
+    network_policy_configured = "docker_network_policy" in controller
     network_policy = controller.get("docker_network_policy")
     configured_subnets, reserve_subnets, parsed_pools = (0, 0, [])
-    if network_policy is not None:
+    if network_policy_configured:
         configured_subnets, reserve_subnets, parsed_pools = validate_docker_network_policy(
             network_policy,
             path=f"$.controllers.{controller_id}.docker_network_policy",
             max_runners=configured_max if state != "disabled" else 0,
         )
+        if DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support Docker network policy configuration")
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
@@ -257,7 +261,7 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
-    if network_policy is not None:
+    if network_policy_configured:
         rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
         rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"] = str(reserve_subnets)
         for index, pool_config in enumerate(parsed_pools):
@@ -291,7 +295,7 @@ def build_rendered_env(
         "engine_repository": config["organization"]["delivery_engine"],
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
-        "docker_network_policy_configured": network_policy is not None,
+        "docker_network_policy_configured": network_policy_configured,
         "docker_network_default_address_pools": len(parsed_pools),
         "docker_network_reserve_subnets": reserve_subnets,
         "docker_network_configured_subnets": configured_subnets,
@@ -361,6 +365,8 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
+    if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support Docker network policy configuration")
     if args.require_status_reporting_config and STATUS_REPORTING_CONFIG_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
@@ -400,6 +406,7 @@ def parse_args() -> argparse.Namespace:
 
     capabilities = subparsers.add_parser("validate-engine-capabilities", help="validate an engine capability declaration")
     capabilities.add_argument("--manifest", type=Path, required=True)
+    capabilities.add_argument("--require-docker-network-policy-config", action="store_true")
     capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)

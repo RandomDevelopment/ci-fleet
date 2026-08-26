@@ -391,7 +391,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
         network_policy = controller.get("docker_network_policy")
         capacity_maximum = maximum if state != "disabled" and type(maximum) is int and maximum > 0 else 0
-        if network_policy is not None:
+        if "docker_network_policy" in controller:
             validate_docker_network_policy(
                 network_policy,
                 f"{path}.docker_network_policy",
@@ -514,21 +514,32 @@ def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, d
         path = f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}"
         controller_valid = bool(SLUG.fullmatch(controller))
         validation.require(controller_valid, path, "controller ID must be a lowercase slug")
-        if not validation.exact_keys(evidence, path, {"engine_ref", "status_reporting_config", "required_status_reporting"}):
+        if not validation.exact_keys(
+            evidence,
+            path,
+            {"engine_ref", "status_reporting_config", "required_status_reporting"},
+            {"docker_network_policy_config"},
+        ):
             continue
         ref = evidence.get("engine_ref")
         configured = evidence.get("status_reporting_config")
         required = evidence.get("required_status_reporting")
+        network_policy = evidence.get("docker_network_policy_config")
         ref_valid = isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40
         validation.require(ref_valid, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
         validation.require(type(configured) is bool, f"{path}.status_reporting_config", "must be a boolean")
         validation.require(type(required) is bool, f"{path}.required_status_reporting", "must be a boolean")
-        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool:
+        if "docker_network_policy_config" in evidence:
+            validation.require(type(network_policy) is bool, f"{path}.docker_network_policy_config", "must be a boolean")
+        network_policy_valid = "docker_network_policy_config" not in evidence or type(network_policy) is bool
+        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid:
             valid[controller] = {
                 "engine_ref": ref,
                 "status_reporting_config": configured,
                 "required_status_reporting": required,
             }
+            if "docker_network_policy_config" in evidence:
+                valid[controller]["docker_network_policy_config"] = network_policy
     return valid
 
 
@@ -595,6 +606,18 @@ def validate_transition(
                 old.get("engine_ref") == new.get("engine_ref"),
                 f"$.controllers.{name}.docker_network_policy",
                 "must be introduced in a later commit after the compatible engine_ref is active",
+            )
+            validation.require(
+                previous_evidence.get("engine_ref") == new.get("engine_ref")
+                and previous_evidence.get("docker_network_policy_config") is True,
+                f"$.controllers.{name}.docker_network_policy",
+                "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with Docker network policy configuration capability",
+            )
+            validation.require(
+                current_evidence.get("engine_ref") == new.get("engine_ref")
+                and current_evidence.get("docker_network_policy_config") is True,
+                f"$.controllers.{name}.docker_network_policy",
+                "requires retaining Docker network policy rollout evidence for this controller and engine_ref",
             )
         staged_capability_required = (
             "status_reporting" not in old

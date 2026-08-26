@@ -103,6 +103,11 @@ class PolicyTests(unittest.TestCase):
         }
         self.assert_rejected(config, "capacity")
 
+    def test_present_null_docker_network_policy_is_rejected(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["docker_network_policy"] = None
+        self.assert_rejected(config, "must be an object")
+
     def test_docker_network_policy_reserves_controller_compose_subnet(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["docker_network_policy"] = {
@@ -234,13 +239,42 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, {}, validation)
         self.assertTrue(any("docker_network_policy" in error and "later commit" in error for error in validation.errors), validation.errors)
 
-    def test_docker_network_policy_accepts_an_unchanged_staged_engine(self) -> None:
+    def test_docker_network_policy_requires_previous_applied_engine_evidence(self) -> None:
         previous = reference_config()
         first_controller(previous).pop("docker_network_policy")
         current = copy.deepcopy(previous)
         first_controller(current)["docker_network_policy"] = docker_network_policy()
+        controller = next(iter(current["controllers"]))
+        evidence = {
+            controller: {
+                "engine_ref": first_controller(current)["engine_ref"],
+                "status_reporting_config": False,
+                "required_status_reporting": False,
+                "docker_network_policy_config": True,
+            }
+        }
+
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, evidence, validation, {})
+        self.assertTrue(any("previous integrated" in error for error in validation.errors), validation.errors)
+
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation, evidence)
+        self.assertEqual(validation.errors, [])
+
+    def test_rollout_evidence_accepts_network_policy_capability(self) -> None:
+        evidence = {
+            "engine_ref": "1" * 40,
+            "status_reporting_config": False,
+            "required_status_reporting": False,
+            "docker_network_policy_config": True,
+        }
+        validation = Validation()
+        refs = validate_rollout_evidence({
+            "schema_version": 1,
+            "status_reporting_engine_capabilities": {"example-ci-01": evidence},
+        }, validation)
+        self.assertEqual(refs, {"example-ci-01": evidence})
         self.assertEqual(validation.errors, [])
 
     def test_retained_reporting_requires_target_engine_capabilities(self) -> None:

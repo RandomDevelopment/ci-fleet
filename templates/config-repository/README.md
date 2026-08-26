@@ -78,6 +78,20 @@ This staging prevents an older active manager from rejecting the new property be
 can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
+The same per-controller evidence record may declare
+`docker_network_policy_config`. Existing status-reporting records may omit this
+new boolean, so their behavior does not change. A complete record has this shape
+after an operator has verified the named engine is active:
+
+```json
+{
+  "engine_ref": "1111111111111111111111111111111111111111",
+  "status_reporting_config": false,
+  "required_status_reporting": false,
+  "docker_network_policy_config": true
+}
+```
+
 The controller ID is how a target host selects its declaration. A location is a non-sensitive logical slug such as `primary-site` or `remote-site`, never an address. Runtime-generated configuration and credentials remain host-local.
 
 ### Pool capacity is infrastructure policy
@@ -96,10 +110,13 @@ Strict validation rejects them until the private configuration uses a reviewed
 non-overlapping pool.
 
 The field is optional solely for staged upgrades from older schema-v3 engines.
-First pin and activate this compatible engine without adding the field. In a
-second reviewed desired-state commit, add the reviewed policy. The older engine
-rejects the new key, so combining those steps prevents reconciliation. Transition
-validation enforces the separate commits for existing controllers.
+First pin and activate a compatible engine without adding the field. In a second
+reviewed desired-state commit, record the active ref and
+`docker_network_policy_config: true` in `engine-rollout-evidence.json`. Add the
+reviewed policy in a third commit, retaining the same ref and evidence. The older
+engine rejects the new key, so skipped commits must not satisfy the gate.
+Transition validation requires the activation evidence to exist in the previous
+integrated state.
 
 The public engine renders these values only for read-only health inspection.
 This phase detects low water, exhaustion, failed inspection, and legacy

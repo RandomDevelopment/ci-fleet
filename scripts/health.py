@@ -362,6 +362,8 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
+        if name == "bridge":
+            continue
         inspected = run(["docker", "network", "inspect", name])
         if inspected.returncode != 0:
             refreshed = run(["docker", "network", "ls", "--format", "{{.Name}}"])

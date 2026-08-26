@@ -55,7 +55,7 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config"} if capabilities is None else capabilities,
+            engine_capabilities={"status_reporting_config", "docker_network_policy_config"} if capabilities is None else capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -72,7 +72,10 @@ class DesiredStateTests(unittest.TestCase):
             "enabled": True,
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
-        environment, _ = self.render(value, {"status_reporting_config", "required_status_reporting"})
+        environment, _ = self.render(
+            value,
+            {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+        )
         self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
         value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
         with tempfile.TemporaryDirectory() as directory:
@@ -94,7 +97,7 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
-            self.render(value, set())
+            self.render(value, {"docker_network_policy_config"})
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "engine-capabilities.json"
             manifest.write_text("not json", encoding="utf-8")
@@ -110,7 +113,7 @@ class DesiredStateTests(unittest.TestCase):
     def test_omitted_status_reporting_accepts_older_engine(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"].pop("status_reporting", None)
-        environment, metadata = self.render(value, set())
+        environment, metadata = self.render(value, {"docker_network_policy_config"})
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertFalse(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
@@ -122,8 +125,8 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
-            self.render(value, set())
-        environment, metadata = self.render(value, {"status_reporting_config"})
+            self.render(value, {"docker_network_policy_config"})
+        environment, metadata = self.render(value, {"status_reporting_config", "docker_network_policy_config"})
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertTrue(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
@@ -143,9 +146,19 @@ class DesiredStateTests(unittest.TestCase):
     def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"].pop("docker_network_policy", None)
-        environment, metadata = self.render(value)
+        environment, metadata = self.render(value, set())
         self.assertNotIn("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", environment)
         self.assertFalse(metadata["docker_network_policy_configured"])
+
+    def test_docker_network_policy_requires_engine_capability(self) -> None:
+        with self.assertRaisesRegex(DesiredStateError, "network policy configuration"):
+            self.render(config(), {"status_reporting_config"})
+
+    def test_render_rejects_present_null_docker_network_policy(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = None
+        with self.assertRaisesRegex(DesiredStateError, "must be an object"):
+            self.render(value)
 
     def test_docker_network_policy_requires_capacity_for_reserve(self) -> None:
         value = config()

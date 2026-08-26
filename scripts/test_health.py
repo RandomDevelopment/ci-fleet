@@ -143,6 +143,18 @@ class HealthTests(unittest.TestCase):
         result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
         self.assertEqual(result["legacy"], 1)
 
+    def test_builtin_bridge_is_ignored_but_similar_user_network_is_legacy(self) -> None:
+        inspected = json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}])
+        for name, expected in (("bridge", (0, "healthy")), ("bridge-copy", (1, "warning"))):
+            with self.subTest(name=name):
+                def run(args):
+                    if args[:3] == ["docker", "network", "ls"]:
+                        return health.subprocess.CompletedProcess(args, 0, f"{name}\n", "")
+                    return health.subprocess.CompletedProcess(args, 0, inspected, "")
+
+                result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+                self.assertEqual((result["legacy"], result["state"]), expected)
+
     def test_broader_network_consumes_all_allocation_slots(self) -> None:
         def run(args):
             if args[:3] == ["docker", "network", "ls"]:

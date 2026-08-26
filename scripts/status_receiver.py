@@ -242,7 +242,7 @@ class StatusReceiver:
         if not isinstance(docker, dict) or set(docker) not in ({"healthy", "oom"}, {"healthy", "oom", "network"}) or not all(isinstance(docker[key], bool) for key in ("healthy", "oom")):
             raise StatusError(400, "invalid_report")
         network = docker.get("network")
-        if network is not None:
+        if "network" in docker:
             keys = {"configured", "used", "free", "legacy"}
             if not exact(network, keys) or not all(integer(network[key]) for key in keys) or network["used"] + network["free"] != network["configured"]:
                 raise StatusError(400, "invalid_report")

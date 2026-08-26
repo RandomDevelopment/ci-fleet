@@ -49,11 +49,14 @@ validation rejects until the operator supplies a reviewed non-overlapping pool.
 
 `docker_network_policy` is optional only to preserve a staged upgrade path from
 older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
-an existing controller in two reviewed desired-state commits: first change only
-`engine_ref` and verify that this compatible engine is active; then add the
-reviewed network policy in a second commit. Do not add the field while the old
-engine still performs reconciliation. Transition validation rejects a commit
-that changes `engine_ref` while introducing the policy.
+an existing controller in three reviewed desired-state commits. First change
+only `engine_ref`. After routine reconciliation shows that exact engine is active,
+record `docker_network_policy_config: true` for that controller and ref in
+`engine-rollout-evidence.json`. Only then add the reviewed network policy without
+changing the engine or evidence. Transition validation reads the evidence from
+the previous integrated state, so a commit that adds evidence and policy together
+cannot satisfy the gate. Do not add the field while the old engine still performs
+reconciliation.
 
 This phase renders the policy solely for read-only health inspection. It does
 not write `daemon.json`, restart Docker, create or remove networks, prune
