@@ -108,6 +108,16 @@ class StatusReceiverTests(unittest.TestCase):
             report["docker"]["network"] = malformed
             self.assert_status_error(400, "invalid_report", lambda report=report: self.submit(report, timestamp=1_001, nonce="b" * 32))
 
+    def test_non_object_docker_sections_are_rejected_cleanly(self) -> None:
+        for index, malformed in enumerate((None, [], "docker", 1)):
+            report = valid_report(generated_at=1_010 + index)
+            report["docker"] = malformed
+            self.assert_status_error(
+                400,
+                "invalid_report",
+                lambda report=report, index=index: self.submit(report, timestamp=1_010 + index, nonce=f"{index:032x}"),
+            )
+
     def test_concurrent_report_writes_are_serialized(self) -> None:
         body, headers = self.signed(
             valid_report("other-ci-01"), controller="other-ci-01", key=b"other-key"

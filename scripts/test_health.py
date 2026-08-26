@@ -140,6 +140,50 @@ class HealthTests(unittest.TestCase):
         result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
         self.assertEqual((result["used"], result["free"], result["state"]), (16, 0, "critical"))
 
+    def test_network_containing_pool_consumes_all_intersecting_slots(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "inverse\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/23"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["state"]), (16, 0, "critical"))
+
+    def test_large_pool_gap_counts_overlaps_without_materializing_slots(self) -> None:
+        values = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "10.0.0.0/8",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "32",
+            "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
+        }
+        networks = {
+            "broad": [{"IPAM": {"Config": [{"Subnet": "10.0.0.0/8"}]}}],
+            "duplicate": [{"IPAM": {"Config": [{"Subnet": "10.0.0.0/9"}]}}],
+        }
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broad\nduplicate\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual((result["configured"], result["used"], result["free"]), (1 << 24, 1 << 24, 0))
+
+    def test_network_removed_during_inspection_is_skipped_after_refresh(self) -> None:
+        listings = iter(("vanished\nmanaged\n", "managed\n"))
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, next(listings), "")
+            if args[-1] == "vanished":
+                return health.subprocess.CompletedProcess(args, 1, "", "not found")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["state"]), (1, "healthy"))
+
+    def test_network_inspection_error_fails_closed_when_network_still_exists(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broken\n", "")
+            return health.subprocess.CompletedProcess(args, 1, "", "permission denied")
+        self.assertEqual(health._docker_network_headroom(run, network_policy_values(), docker_ok=True)["state"], "unavailable")
+
     def test_ipv6_ipam_is_ignored_without_hiding_ipv4(self) -> None:
         networks = {
             "dual": [{"IPAM": {"Config": [{"Subnet": "2001:db8::/64"}, {"Subnet": "198.51.100.0/28"}]}}],

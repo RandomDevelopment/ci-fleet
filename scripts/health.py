@@ -359,11 +359,16 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     if listed.returncode != 0:
         return empty
     configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
-    used_subnets: set[str] = set()
+    occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
         inspected = run(["docker", "network", "inspect", name])
         if inspected.returncode != 0:
+            refreshed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
+            if refreshed.returncode != 0:
+                return empty
+            if name not in {line.strip() for line in refreshed.stdout.splitlines() if line.strip()}:
+                continue
             return empty
         try:
             payload = json.loads(inspected.stdout)
@@ -396,19 +401,31 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
             continue
         network_legacy = False
         for subnet in subnets:
-            match = next(((pool, size) for pool, size in pools if subnet.subnet_of(pool)), None)
-            if match is None:
+            overlaps = 0
+            for index, (pool, size) in enumerate(pools):
+                first = max(int(subnet.network_address), int(pool.network_address))
+                last = min(int(subnet.broadcast_address), int(pool.broadcast_address))
+                if first > last:
+                    continue
+                block_size = 1 << (32 - size)
+                pool_start = int(pool.network_address)
+                occupied[index].append(((first - pool_start) // block_size, (last - pool_start) // block_size))
+                overlaps += 1
+            if overlaps == 0:
                 network_legacy = True
-                continue
-            pool, size = match
-            if subnet.prefixlen <= size:
-                used_subnets.update(str(slot) for slot in subnet.subnets(new_prefix=size))
-            else:
-                used_subnets.add(str(subnet.supernet(new_prefix=size)))
+            elif overlaps != 1 or not any(subnet.subnet_of(pool) and subnet.prefixlen == size for pool, size in pools):
                 network_legacy = True
         if network_legacy:
             legacy_networks += 1
-    used = len(used_subnets)
+    used = 0
+    for intervals in occupied:
+        end = -1
+        for start, stop in sorted(intervals):
+            if start > end:
+                used += stop - start + 1
+            elif stop > end:
+                used += stop - end
+            end = max(end, stop)
     free = max(configured - used, 0)
     if free == 0:
         state = "critical"
