@@ -30,6 +30,15 @@
       "runner_resources": {
         "cpu_cores": 2,
         "memory_mib": 4096
+      },
+      "docker_network_policy": {
+        "reserve_subnets": 1,
+        "default_address_pools": [
+          {
+            "base": "198.51.100.0/24",
+            "size": 28
+          }
+        ]
       }
     }
   },

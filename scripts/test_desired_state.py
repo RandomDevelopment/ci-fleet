@@ -36,6 +36,15 @@ def host_values() -> dict[str, str]:
     }
 
 
+def docker_network_policy() -> dict:
+    return {
+        "reserve_subnets": 1,
+        "default_address_pools": [
+            {"base": "198.51.100.0/24", "size": 28},
+        ],
+    }
+
+
 class DesiredStateTests(unittest.TestCase):
     def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
@@ -117,6 +126,31 @@ class DesiredStateTests(unittest.TestCase):
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertTrue(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
+
+    def test_docker_network_policy_renders_read_only_inspection_values(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
+        environment, metadata = self.render(value)
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"], "1")
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"], "198.51.100.0/24")
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"], "28")
+        self.assertEqual(environment["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"], "1")
+        self.assertTrue(metadata["docker_network_policy_configured"])
+        self.assertEqual(metadata["docker_network_default_address_pools"], 1)
+        self.assertEqual(metadata["docker_network_reserve_subnets"], 1)
+
+    def test_docker_network_policy_requires_capacity_for_reserve(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["max_runners"] = 2
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = {
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/30", "size": 30}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "capacity"):
+                load_and_validate_config(path)
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

@@ -115,6 +115,12 @@ def main() -> int:
                     "cpu_cores": args.runner_cpu_cores,
                     "memory_mib": args.runner_memory_mib,
                 },
+                "docker_network_policy": {
+                    "reserve_subnets": 1,
+                    "default_address_pools": [
+                        {"base": "198.51.100.0/24", "size": 28},
+                    ],
+                },
             }
         },
         "host_groups": {

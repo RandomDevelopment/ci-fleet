@@ -32,9 +32,25 @@ Each controller has a unique object key and declares:
 - `experimental`, `stable`, or `retiring` lifecycle;
 - a full pinned ci-fleet engine commit;
 - a zero managed minimum and reviewed maximum runner capacity;
-- CPU cores and memory per ephemeral runner.
+- CPU cores and memory per ephemeral runner;
+- reviewed Docker default-address pools and a reserved subnet count.
 
 Active and drained controllers reserve their configured maximum against the pool budget. A drained controller has zero effective runtime capacity but keeps its reservation, so an undrain cannot silently overcommit the pool. Disabled controllers reserve no capacity.
+
+The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
+prefix `size`. Validation rejects malformed or overlapping pools, impossible
+prefix relationships, and active or drained policies with fewer subnets than
+`max_runners + reserve_subnets`. Disabled controllers retain a structurally
+valid policy but do not reserve runner subnet capacity. Real pool values belong
+only in the private desired-state repository; public examples use RFC 5737
+documentation ranges.
+
+This phase renders the policy solely for read-only health inspection. It does
+not write `daemon.json`, restart Docker, create or remove networks, prune
+resources, drain runners, or alter controller scale. Circuit breaking,
+frequent orphan reconciliation, daemon configuration rollout, transactional
+exhausted-pool recovery, and MTFM/TF2 consumer-label changes remain later
+issue #81 slices.
 
 Managed prewarmed runners are not currently supported: `min_runners` is fixed at zero in schema, semantic validation, rendering, and preflight. This keeps idle privileged workers absent and prevents reviewed configuration from passing validation only to fail host adoption.
 

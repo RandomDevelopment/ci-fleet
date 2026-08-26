@@ -60,7 +60,8 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - an `experimental`, `stable`, or `retiring` lifecycle;
 - the full reviewed ci-fleet commit SHA it runs;
 - a zero managed minimum and reviewed maximum runner capacity;
-- CPU and memory available to each ephemeral runner.
+- CPU and memory available to each ephemeral runner;
+- Docker default-address pools and a reserved subnet count for health inspection.
 
 `status_reporting` is deliberately omitted from initialized and reference
 configurations. For an existing controller, roll out schema support in three
@@ -83,6 +84,19 @@ The controller ID is how a target host selects its declaration. A location is a 
 Each runner pool has a `capacity_budget` and a runner group that must not be assigned to any other pool. Unique runner-group assignment keeps routing and repository authorization unambiguous. The semantic validator enforces this cross-object rule because JSON Schema cannot compare values stored in separate object properties.
 
 The validator totals the maximum capacity of every active or drained controller assigned to the pool and rejects overcommit. Drained capacity remains reserved so an undrain cannot silently exceed the reviewed budget. Disabled controllers do not reserve capacity.
+
+For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
+subnet prefix `size`. Pools must not overlap, and active or drained controllers
+must provide at least `max_runners + reserve_subnets` subnets. Real pool values
+belong in the private configuration; this template uses RFC 5737 documentation
+ranges only.
+
+The public engine renders these values only for read-only health inspection.
+This phase detects low water, exhaustion, failed inspection, and legacy
+networks; it does not configure or restart Docker, create/delete networks,
+clean resources, drain runners, or change controller scale. Circuit breaking,
+frequent orphan reconciliation, daemon mutation, transactional recovery, and
+consumer-label changes are later issue #81 slices.
 
 Application repositories do not encode the number of available workers. They submit all independent tasks and shards. Do not use GitHub Actions `strategy.max-parallel` to model fleet size; controllers and the private configuration decide how many jobs run simultaneously. An application may limit concurrency only for a separately documented external-system constraint, not worker availability.
 

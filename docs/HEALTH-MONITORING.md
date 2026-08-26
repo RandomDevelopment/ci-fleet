@@ -17,6 +17,7 @@ The check covers:
 - root and Docker filesystem space and inodes;
 - available memory, swap use, per-CPU load, and OOM evidence from the last 24 hours;
 - Docker availability, controller state/restarts, and configured versus effective capacity;
+- configured/used/free Docker subnet headroom and legacy networks, without exposing addresses;
 - inactive, unhealthy, restarting, and stale fleet-labelled resources, including week-old build cache;
 - cleanup, drift, health, and update services/timers;
 - failed package state, pending reboot, and clock synchronization;
@@ -24,6 +25,17 @@ The check covers:
 - optional authenticated outbound status delivery.
 
 It reports but never prunes, restarts, or repairs resources. Project source, logs, environment values, tokens, and private keys are never included.
+
+Docker network inspection is read-only. Healthy headroom is reported when free
+subnets remain above the reviewed reserve, low water and legacy/nonconforming
+networks are warnings, and exhaustion is critical. A malformed policy or failed
+Docker network listing/inspection is critical rather than falsely healthy.
+Only aggregate configured, used, free, and legacy counts enter status reports.
+
+This detection-only phase does not mutate the Docker daemon or networks.
+Controller circuit breaking, frequent orphan reconciliation, daemon policy
+application, transactional recovery, cleanup, and consumer-label migrations
+remain later issue #81 work.
 
 ## Threshold overrides and hooks
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -137,6 +138,58 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     }
 
 
+def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        raise DesiredStateError(f"{path}: must be an object")
+    required = {"default_address_pools", "reserve_subnets"}
+    if set(policy) != required:
+        unknown = sorted(set(policy) - required)
+        missing = sorted(required - set(policy))
+        messages: list[str] = []
+        if missing:
+            messages.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            messages.append(f"unknown keys: {', '.join(unknown)}")
+        raise DesiredStateError(f"{path}: " + "; ".join(messages))
+    reserve = policy.get("reserve_subnets")
+    if type(reserve) is not int or reserve < 1:
+        raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
+    pools = policy.get("default_address_pools")
+    if type(pools) is not list or not pools:
+        raise DesiredStateError(f"{path}.default_address_pools: must be a non-empty list")
+    parsed: list[dict[str, Any]] = []
+    for index, pool in enumerate(pools):
+        pool_path = f"{path}.default_address_pools[{index}]"
+        if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
+            raise DesiredStateError(f"{pool_path}: must contain only base and size")
+        base = pool.get("base")
+        size = pool.get("size")
+        if not isinstance(base, str):
+            raise DesiredStateError(f"{pool_path}.base: must be a CIDR prefix")
+        if type(size) is not int or size < 0 or size > 32:
+            raise DesiredStateError(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 32")
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError as exc:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix") from exc
+        if network.version != 4:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix")
+        if size < network.prefixlen:
+            raise DesiredStateError(f"{pool_path}.size: impossible subnet count for {base}")
+        parsed.append({"base": base, "network": network, "size": size})
+    for left, item in enumerate(parsed):
+        for right in range(left + 1, len(parsed)):
+            other = parsed[right]
+            if item["network"].overlaps(other["network"]):
+                raise DesiredStateError(
+                    f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}"
+                )
+    configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
+    if configured < max_runners + reserve:
+        raise DesiredStateError(f"{path}: policy cannot satisfy max_runners plus reserve")
+    return configured, reserve, parsed
+
+
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     controllers = config["controllers"]
     if controller_id not in controllers:
@@ -169,6 +222,12 @@ def build_rendered_env(
     state = controller["state"]
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
+    network_policy = controller.get("docker_network_policy") or {}
+    configured_subnets, reserve_subnets, parsed_pools = validate_docker_network_policy(
+        network_policy,
+        path=f"$.controllers.{controller_id}.docker_network_policy",
+        max_runners=configured_max if state != "disabled" else 0,
+    )
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
@@ -179,6 +238,8 @@ def build_rendered_env(
         "CI_FLEET_CONTROLLER_IMAGE": f"ci-fleet-controller:{short_commit}",
         "CI_FLEET_CONTROLLER_STATE": state,
         "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
+        "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": str(len(parsed_pools)),
+        "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": str(reserve_subnets),
         "CI_FLEET_DOCKER_GID": str(docker_gid),
         "CI_FLEET_ENGINE_REF": engine_commit,
         "CI_FLEET_GITHUB_URL": f"https://github.com/{config['organization']['slug']}",
@@ -194,6 +255,9 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    for index, pool_config in enumerate(parsed_pools):
+        rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
+        rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
@@ -222,6 +286,10 @@ def build_rendered_env(
         "engine_repository": config["organization"]["delivery_engine"],
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
+        "docker_network_policy_configured": True,
+        "docker_network_default_address_pools": len(parsed_pools),
+        "docker_network_reserve_subnets": reserve_subnets,
+        "docker_network_configured_subnets": configured_subnets,
     }
     return rendered, metadata
 

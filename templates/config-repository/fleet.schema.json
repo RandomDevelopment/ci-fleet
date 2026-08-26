@@ -70,7 +70,7 @@
     "controller": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pool", "location", "state", "scale_set_name", "lifecycle", "engine_ref", "min_runners", "max_runners", "runner_resources"],
+      "required": ["pool", "location", "state", "scale_set_name", "lifecycle", "engine_ref", "min_runners", "max_runners", "runner_resources", "docker_network_policy"],
       "properties": {
         "pool": {"$ref": "#/$defs/slug"},
         "location": {"$ref": "#/$defs/slug"},
@@ -81,6 +81,27 @@
         "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
         "runner_resources": {"$ref": "#/$defs/runner_resources"},
+        "docker_network_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default_address_pools", "reserve_subnets"],
+          "properties": {
+            "reserve_subnets": {"type": "integer", "minimum": 1},
+            "default_address_pools": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base", "size"],
+                "properties": {
+                  "base": {"type": "string"},
+                  "size": {"type": "integer", "minimum": 0, "maximum": 32}
+                }
+              }
+            }
+          }
+        },
         "status_reporting": {
           "type": "object",
           "additionalProperties": false,

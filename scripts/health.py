@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -133,6 +134,21 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     add("swap", "critical" if swap >= thresholds.swap_critical_percent else "warning" if swap >= thresholds.swap_warn_percent else "ok", used_percent=swap)
     add("oom", "critical" if snapshot["recent_oom"] or snapshot["controller"]["oom_killed"] else "ok")
     add("docker", "ok" if snapshot["docker_available"] else "critical")
+    network = snapshot.get("docker_network_headroom")
+    if network and network.get("state") != "not_configured":
+        if network.get("state") == "unavailable":
+            add("docker_network_inspection", "critical")
+        else:
+            severity = {"healthy": "ok", "warning": "warning", "critical": "critical"}.get(network.get("state"), "critical")
+            add(
+                "docker_network_headroom",
+                severity,
+                configured=network.get("configured", 0),
+                used=network.get("used", 0),
+                free=network.get("free", 0),
+                reserve=network.get("reserve", 0),
+            )
+            add("docker_network_legacy", "warning" if network.get("legacy", 0) else "ok", count=network.get("legacy", 0))
 
     desired = snapshot["desired_state"]
     controller_state = snapshot["controller"]["state"]
@@ -252,6 +268,10 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         "docker": {
             "healthy": bool(snapshot.get("docker_available")),
             "oom": bool(snapshot.get("recent_oom") or snapshot["controller"].get("oom_killed")),
+            "network": {
+                key: snapshot.get("docker_network_headroom", {}).get(key, 0)
+                for key in ("configured", "used", "free", "legacy")
+            },
         },
         "error": error,
         "generated_at": generated_at,
@@ -299,6 +319,106 @@ def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
             if match:
                 stale[f"{match.group(1)}s"] += 1
     return stale
+
+
+def _parse_network_pool(values: dict[str, str], index: int) -> ipaddress.IPv4Network | None:
+    base = values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE")
+    size = values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE")
+    if not base or not size:
+        return None
+    try:
+        network = ipaddress.ip_network(base, strict=True)
+    except ValueError:
+        return None
+    if network.version != 4:
+        return None
+    try:
+        subnet_size = int(size)
+    except ValueError:
+        return None
+    if subnet_size < network.prefixlen or subnet_size > 32:
+        return None
+    return network
+
+
+def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: bool) -> dict[str, Any]:
+    empty = {"configured": 0, "used": 0, "free": 0, "reserve": 0, "legacy": 0, "state": "unavailable"}
+    if not docker_ok:
+        return empty
+    try:
+        configured_count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
+        reserve = int(values.get("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", "0"))
+    except ValueError:
+        return empty
+    if configured_count == 0 and "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" not in values:
+        return {**empty, "state": "not_configured"}
+    pools: list[ipaddress.IPv4Network] = []
+    for index in range(configured_count):
+        pool = _parse_network_pool(values, index)
+        if pool is None:
+            return empty
+        pools.append(pool)
+    if not pools or reserve < 1:
+        return empty
+    listed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
+    if listed.returncode != 0:
+        return empty
+    configured = sum(1 << (int(values.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE", "0")) - pools[index].prefixlen) for index in range(len(pools)))
+    used_subnets: set[str] = set()
+    legacy_networks = 0
+    for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
+        inspected = run(["docker", "network", "inspect", name])
+        if inspected.returncode != 0:
+            return empty
+        try:
+            payload = json.loads(inspected.stdout)
+        except json.JSONDecodeError:
+            return empty
+        if not isinstance(payload, list) or not payload:
+            return empty
+        subnets: list[ipaddress.IPv4Network] = []
+        for entry in payload:
+            configs = entry.get("IPAM", {}).get("Config", []) if isinstance(entry, dict) else []
+            if not isinstance(configs, list):
+                return empty
+            for config in configs:
+                subnet = config.get("Subnet") if isinstance(config, dict) else None
+                if not isinstance(subnet, str):
+                    return empty
+                try:
+                    network = ipaddress.ip_network(subnet, strict=False)
+                except ValueError:
+                    return empty
+                if network.version != 4:
+                    return empty
+                subnets.append(network)
+        if not subnets:
+            legacy_networks += 1
+            continue
+        network_legacy = False
+        for subnet in subnets:
+            if any(subnet.subnet_of(pool) for pool in pools):
+                used_subnets.add(str(subnet))
+            else:
+                network_legacy = True
+        if network_legacy:
+            legacy_networks += 1
+    used = len(used_subnets)
+    free = max(configured - used, 0)
+    if free == 0:
+        state = "critical"
+    elif legacy_networks > 0 or free <= reserve:
+        state = "warning"
+    else:
+        state = "healthy"
+    return {
+        "configured": configured,
+        "used": used,
+        "free": free,
+        "reserve": reserve,
+        "legacy": legacy_networks,
+        "state": state,
+    }
 
 
 def _timespan_seconds(value: str) -> float | None:
@@ -523,6 +643,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0}
     stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"]) if docker_ok else 0
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
+    docker_network_headroom = _docker_network_headroom(run, values, docker_ok=docker_ok)
     return {
         "controller_id": instance,
         "desired_state": values.get("CI_FLEET_CONTROLLER_STATE", "active"),
@@ -553,6 +674,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "clock_synchronized": run(["timedatectl", "show", "--property=NTPSynchronized", "--value"]).stdout.strip() == "yes",
         "backup": _backup_state(values, run),
         "reconciliation": reconciliation,
+        "docker_network_headroom": docker_network_headroom,
     }
 
 

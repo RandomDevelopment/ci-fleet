@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -140,6 +141,67 @@ def scan_secret_material(config: Any, validation: Validation) -> None:
                 break
 
 
+def validate_docker_network_policy(policy: Any, path: str, max_runners: int, validation: Validation) -> tuple[int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        validation.errors.append(f"{path}: must be an object")
+        return 0, 0, []
+    required = {"default_address_pools", "reserve_subnets"}
+    keys = set(policy)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required)
+    if missing or unknown:
+        parts = []
+        if missing:
+            parts.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            parts.append(f"unknown keys: {', '.join(unknown)}")
+        validation.errors.append(f"{path}: {'; '.join(parts)}")
+        return 0, 0, []
+    reserve = policy["reserve_subnets"]
+    if type(reserve) is not int or reserve < 1:
+        validation.errors.append(f"{path}.reserve_subnets: must be a positive integer")
+        return 0, 0, []
+    pools = policy["default_address_pools"]
+    if type(pools) is not list or not pools:
+        validation.errors.append(f"{path}.default_address_pools: must be a non-empty list")
+        return 0, 0, []
+    parsed: list[dict[str, Any]] = []
+    for index, pool in enumerate(pools):
+        pool_path = f"{path}.default_address_pools[{index}]"
+        if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
+            validation.errors.append(f"{pool_path}: must contain only base and size")
+            return 0, 0, []
+        base = pool["base"]
+        size = pool["size"]
+        if not isinstance(base, str):
+            validation.errors.append(f"{pool_path}.base: must be a CIDR prefix")
+            return 0, 0, []
+        if type(size) is not int or size < 0 or size > 32:
+            validation.errors.append(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 32")
+            return 0, 0, []
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError:
+            validation.errors.append(f"{pool_path}.base: malformed address pool IPv4 prefix")
+            return 0, 0, []
+        if network.version != 4:
+            validation.errors.append(f"{pool_path}.base: malformed address pool IPv4 prefix")
+            return 0, 0, []
+        if size < network.prefixlen:
+            validation.errors.append(f"{pool_path}.size: impossible subnet count for {base}")
+            return 0, 0, []
+        parsed.append({"base": base, "network": network, "size": size})
+    for left, item in enumerate(parsed):
+        for right in range(left + 1, len(parsed)):
+            if item["network"].overlaps(parsed[right]["network"]):
+                validation.errors.append(f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}")
+                return 0, 0, []
+    configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
+    if configured < max_runners + reserve:
+        validation.errors.append(f"{path}: network capacity cannot satisfy max_runners plus reserve")
+    return configured, reserve, parsed
+
+
 def scan_forbidden_paths(repo_root: Path, validation: Validation) -> None:
     for path in repo_root.rglob("*"):
         try:
@@ -267,6 +329,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         "min_runners",
         "max_runners",
         "runner_resources",
+        "docker_network_policy",
     }
     for name, controller in controllers.items():
         path = f"$.controllers.{name}"
@@ -309,6 +372,9 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             memory = resources.get("memory_mib")
             validation.require(type(cpu) is int and cpu > 0, f"{path}.runner_resources.cpu_cores", "must be a positive integer")
             validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
+        network_policy = controller.get("docker_network_policy")
+        capacity_maximum = maximum if state != "disabled" and type(maximum) is int and maximum > 0 else 0
+        validate_docker_network_policy(network_policy, f"{path}.docker_network_policy", capacity_maximum, validation)
         if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 

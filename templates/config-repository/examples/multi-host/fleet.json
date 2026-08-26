@@ -30,6 +30,10 @@
       "runner_resources": {
         "cpu_cores": 4,
         "memory_mib": 8192
+      },
+      "docker_network_policy": {
+        "default_address_pools": [{"base": "198.51.100.0/24", "size": 28}],
+        "reserve_subnets": 1
       }
     },
     "sample-ci-remote": {
@@ -44,6 +48,10 @@
       "runner_resources": {
         "cpu_cores": 2,
         "memory_mib": 4096
+      },
+      "docker_network_policy": {
+        "default_address_pools": [{"base": "203.0.113.0/24", "size": 28}],
+        "reserve_subnets": 1
       }
     }
   },

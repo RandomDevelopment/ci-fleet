@@ -52,6 +52,15 @@ def first_controller(config: dict) -> dict:
     return next(iter(config["controllers"].values()))
 
 
+def docker_network_policy() -> dict:
+    return {
+        "reserve_subnets": 1,
+        "default_address_pools": [
+            {"base": "198.51.100.0/24", "size": 28},
+        ],
+    }
+
+
 class PolicyTests(unittest.TestCase):
     def assert_rejected(self, config: dict, expected: str, *, strict: bool = False) -> None:
         errors = errors_for(config, strict=strict)
@@ -71,6 +80,36 @@ class PolicyTests(unittest.TestCase):
 
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
+
+    def test_schema_defines_docker_network_policy_contract(self) -> None:
+        controller = contract_schema()["$defs"]["controller"]["properties"]["docker_network_policy"]
+        self.assertEqual(set(controller), {"type", "additionalProperties", "required", "properties"})
+        self.assertEqual(controller["required"], ["default_address_pools", "reserve_subnets"])
+        pool = controller["properties"]["default_address_pools"]["items"]
+        self.assertEqual(set(pool["properties"]), {"base", "size"})
+
+    def test_docker_network_policy_is_required_and_capacity_checked(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["docker_network_policy"] = docker_network_policy()
+        self.assertEqual(errors_for(config), [])
+
+        first_controller(config)["docker_network_policy"] = {
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/30", "size": 30}],
+        }
+        self.assert_rejected(config, "capacity")
+
+    def test_docker_network_policy_rejects_overlapping_or_malformed_pools(self) -> None:
+        config = copy.deepcopy(reference_config())
+        policy = docker_network_policy()
+        policy["default_address_pools"] = [
+            {"base": "198.51.100.0/24", "size": 28},
+            {"base": "198.51.100.128/25", "size": 28},
+        ]
+        first_controller(config)["docker_network_policy"] = policy
+        self.assert_rejected(config, "overlap")
+        policy["default_address_pools"] = [{"base": "not-a-subnet", "size": 28}]
+        self.assert_rejected(config, "address pool")
 
     def test_status_reporting_null_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
