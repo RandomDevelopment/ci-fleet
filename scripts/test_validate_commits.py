@@ -136,6 +136,19 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         # line it must satisfy the normal grammar.
         self.assertTrue(vc.validate_message('Revert "skip validation"'))
 
+    def test_git_generated_merge_revert_is_exempt(self) -> None:
+        # `git revert -m 1 --no-edit <merge>` produces a two-line proof
+        # ("This reverts commit <sha>, reversing" / "changes made to <N>."),
+        # so the proof line does not end with a period.
+        message = (
+            'Revert "Merge branch \'feature\'"\n'
+            "\n"
+            "This reverts commit 1234567890abcdef1234567890abcdef12345678, reversing\n"
+            "changes made to 1.\n"
+        )
+        self.assertEqual(vc.validate_message(message), [])
+        self.assertIsNone(vc.bump_kind(message))
+
     def test_revert_proof_line_without_generated_subject_is_validated(self) -> None:
         message = (
             "revert: skip validation\n"
@@ -420,6 +433,24 @@ class CliTests(unittest.TestCase):
             errors = vc.validate_message("Merge definitely not conventional", sha=fake_merge_sha)
             self.assertTrue(errors, "single-parent 'Merge ...' commit must not be exempt")
 
+    def test_fabricated_revert_reference_in_range_is_rejected(self) -> None:
+        # In range validation (sha + workspace available), the referenced
+        # commit must exist; a fabricated or all-zero reference is not proof.
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            self._commit(directory, "feat: base commit")
+            fabricated = (
+                'Revert "feat: never happened"\n'
+                "\n"
+                "This reverts commit ffffffffffffffffffffffffffffffffffffffff.\n"
+            )
+            sha = self._commit(directory, fabricated)
+            result = self._range_result(directory, "HEAD", sha)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a revert referencing a nonexistent commit must be rejected",
+            )
+
     def test_empty_base_validates_head_commit_only(self) -> None:
         # workflow_dispatch path: empty base must not enumerate all history.
         with tempfile.TemporaryDirectory() as directory:
@@ -458,6 +489,51 @@ class CliTests(unittest.TestCase):
             )
             result = self._run("--version", "v0.2.0", "--tag-commit", main_sha, cwd=directory)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prerelease_tag_on_main_is_rejected(self) -> None:
+        # docs/CONTRIBUTING.md: prereleases are not used for `main`-sourced
+        # tags. A prerelease tag pointing into the main line must fail even
+        # though its ancestry branch is skipped for branch-local tags.
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            main_sha = self._commit(directory, "feat: base commit")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            result = self._run("--version", "v0.2.0-rc.1", "--tag-commit", main_sha, cwd=directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("prerelease", result.stderr)
+
+    def test_required_bump_enforced_for_tag(self) -> None:
+        # Once a prior release exists, a new tag must implement at least the
+        # bump its commit range requires (feat! => MAJOR; patch tag fails).
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            base_sha = self._commit(directory, "chore: bootstrap")
+            subprocess.run(
+                ["git", "-C", directory, "tag", "v0.1.0"],
+                check=True,
+            )
+            self._commit(directory, "feat!: break contract")
+            head_sha = self._commit(directory, "fix: follow-up")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", directory, "branch", "-f", "origin/main", head_sha],
+                check=True,
+            )
+            result = self._run(
+                "--version", "v0.1.1",
+                "--tag-commit", head_sha,
+                "--base", base_sha,
+                "--head", head_sha,
+                cwd=directory,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MAJOR", result.stderr)
 
 
 class LowercaseDescriptionTests(unittest.TestCase):

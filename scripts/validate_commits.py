@@ -100,7 +100,12 @@ MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
 # `Revert "..."` subject without it still goes through normal validation and
 # must use the approved `revert:` type.
 REVERT_SUBJECT_RE = re.compile(r'^Revert ".+"$')
-REVERT_BODY_PROOF_RE = re.compile(r"^This reverts commit [0-9a-fA-F]{40}\.$")
+# The generated proof line ends with a period for ordinary reverts; for
+# merge reverts (`git revert -m 1`) it ends with ", reversing" and is
+# followed by a "changes made to <N>." continuation line.
+REVERT_BODY_PROOF_RE = re.compile(
+    r"^This reverts commit ([0-9a-fA-F]{40})(?:\.$|, reversing$)"
+)
 
 def is_true_merge_commit(sha: str, workspace: str = ".") -> bool:
     """Return True if the commit is a true merge commit (has 2+ parents)."""
@@ -155,19 +160,57 @@ def is_zero_major(version: str) -> bool:
     return parsed[0] == 0
 
 
-def is_git_generated_revert(message: str) -> bool:
+def referenced_revert_commit(message: str) -> str | None:
+    """Return the 40-hex sha from git's generated revert proof line, if any.
+
+    Matches both the ordinary form (`...<sha>.`) and the merge-revert form
+    (`...<sha>, reversing`).
+    """
+    match = REVERT_BODY_PROOF_RE.match
+    for line in message.splitlines()[1:]:
+        found = match(line)
+        if found:
+            return found.group(1)
+    return None
+
+
+def referenced_commit_exists(sha: str, workspace: str = ".") -> bool:
+    """Return True when `sha` resolves to a commit object in `workspace`."""
+    result = subprocess.run(
+        ["git", "-C", workspace, "cat-file", "-e", sha + "^{commit}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return result.returncode == 0
+
+
+def is_git_generated_revert(
+    message: str, *, workspace: str = ".", verify_reference: bool = False,
+) -> bool:
     """Return True only for git's own generated revert form.
 
     Requires the `Revert "<original subject>"` subject AND the
     `This reverts commit <sha>.` proof line in the body, matching what
     `git revert` produces (docs/CONTRIBUTING.md instructs its use).
+
+    With verify_reference=True the referenced commit must actually exist in
+    the repository; this closes the fabricated-reference bypass in range
+    validation where a workspace is always available.
     """
     lines = message.splitlines()
-    return (
-        bool(lines)
-        and bool(REVERT_SUBJECT_RE.match(lines[0]))
-        and any(REVERT_BODY_PROOF_RE.match(line) for line in lines[1:])
-    )
+    if not lines or not REVERT_SUBJECT_RE.match(lines[0]):
+        return False
+    if not any(REVERT_BODY_PROOF_RE.match(line) for line in lines[1:]):
+        return False
+    if verify_reference:
+        referenced = referenced_revert_commit(message)
+        # An all-zero reference is never a real commit object.
+        if (
+            referenced is None
+            or set(referenced) == {"0"}
+            or not referenced_commit_exists(referenced, workspace)
+        ):
+            return False
+    return True
 
 
 def bump_kind(message: str) -> str | None:
@@ -253,9 +296,14 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
     header = lines[0]
 
     if skip_merge:
-        if is_git_generated_revert(message):
+        if is_git_generated_revert(
+            message, workspace=workspace, verify_reference=bool(sha),
+        ):
             # Only git's own generated revert form (subject + body proof line)
-            # is exempt; anything else must be conventional.
+            # is exempt; anything else must be conventional. When a sha is
+            # available (range validation), the referenced commit must exist,
+            # so an authored commit cannot forge the proof with a fabricated
+            # reference.
             return errors
         if MERGE_RE.match(header):
             # "Merge " prefix alone is not proof: a single-parent commit can be
@@ -306,6 +354,50 @@ def validate_version(value: str) -> list[str]:
     if is_semver(value):
         return []
     return [f"not a valid SemVer 2.0.0 version: '{value}'"]
+
+
+def check_required_bump(
+    version: str, base: str, head: str, workspace: str = ".",
+) -> list[str]:
+    """Reject `version` when it does not implement the required SemVer bump.
+
+    The required bump is computed from the conventional classification of the
+    release range base..head (docs/CONTRIBUTING.md release gate: "the SemVer
+    bump matches the Conventional Commits classification"). With no prior
+    release tag, any version above 0.0.0 satisfies the pre-1.0 gate.
+    ponytail: compares only major.minor.patch; prerelease/build metadata of
+    the candidate is ignored, upgrade if tag-vs-range metadata ever matters.
+    """
+    parsed = parse_version(version)
+    if parsed is None:
+        return []
+    prior = latest_release_tag(workspace)
+    if prior is None:
+        return []
+    required = suggest_bump(msg for _, msg in commit_messages(base, head, workspace=workspace))
+    candidate = parse_version(version)
+    assert candidate is not None and prior is not None
+    old_major, old_minor, old_patch = prior
+    new_major, new_minor, new_patch = candidate
+
+    def _bumped(level: str) -> bool:
+        """True when the candidate implements exactly `level` over prior."""
+        if level == "MAJOR":
+            return new_major > old_major
+        if level == "MINOR":
+            # MINOR keeps major and increases minor (0.y.z included).
+            return new_major == old_major and new_minor > old_minor
+        # PATCH: same major.minor, higher patch.
+        return (new_major, new_minor) == (old_major, old_minor) and new_patch > old_patch
+
+    satisfied = _bumped(required)
+    if not satisfied:
+        return [
+            f"version '{version}' does not implement the required {required} "
+            f"bump over released '{prior[0]}.{prior[1]}.{prior[2]}' for range "
+            f"{base}..{head}"
+        ]
+    return []
 
 
 def git_revision_list(base: str | None, head: str, *, workspace: str = ".") -> list[str]:
@@ -364,6 +456,31 @@ def commit_messages(
     return [(sha, commit_message(workspace, sha)) for sha in commits]
 
 
+def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> tuple[int, int, int] | None:
+    """Return the highest released stable SemVer reachable from main_ref.
+
+    Stable means no prerelease component (prereleases are branch-local and
+    never releases per docs/CONTRIBUTING.md). Returns None when no release
+    tag exists yet.
+    """
+    result = subprocess.run(
+        ["git", "-C", workspace, "tag", "--list", "--merged", main_ref],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    best: tuple[tuple[int, int, int], str] | None = None
+    for tag in result.stdout.split():
+        match = SEMVER_RE.match(tag)
+        if match is not None and match.group(4) is None:
+            parsed = parse_version(tag)
+            assert parsed is not None
+            key = (parsed, tag)
+            if best is None or key[0] > best[0]:
+                best = (parsed, tag)
+    return best[0] if best else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -407,18 +524,33 @@ def main() -> int:
 
     if args.version is not None:
         failures.extend(validate_version(args.version))
-        # A stable (non-prerelease) tag must point into the main line;
-        # prerelease and build-metadata tags may stay branch-local.
         if not failures and args.tag_commit is not None:
             match = SEMVER_RE.match(args.version)
             assert match is not None
-            if match.group(4) is None:  # no prerelease component => stable
-                if not is_ancestor(args.tag_commit, args.main_ref):
+            on_main = is_ancestor(args.tag_commit, args.main_ref)
+            if match.group(4) is not None:
+                # docs/CONTRIBUTING.md reserves prerelease identifiers for
+                # branch-local tags; they are never main-sourced.
+                if on_main:
                     failures.append(
-                        f"stable tag '{args.version}' points at a commit that is "
-                        f"not reachable from '{args.main_ref}'; stable versions "
-                        "are tagged on main (prereleases may stay branch-local)"
+                        f"prerelease tag '{args.version}' points at a commit "
+                        f"reachable from '{args.main_ref}'; prereleases are "
+                        "branch-local only (docs/CONTRIBUTING.md)"
                     )
+            elif not on_main:
+                # Stable tags must point into the main line.
+                failures.append(
+                    f"stable tag '{args.version}' points at a commit that is "
+                    f"not reachable from '{args.main_ref}'; stable versions "
+                    "are tagged on main (prereleases may stay branch-local)"
+                )
+        if (
+            not failures
+            and args.tag_commit is not None
+            and args.base
+            and args.head
+        ):
+            failures.extend(check_required_bump(args.version, args.base, args.head))
         if failures:
             for failure in failures:
                 print(f"version: {failure}", file=sys.stderr)
