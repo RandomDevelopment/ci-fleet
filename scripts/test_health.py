@@ -151,13 +151,13 @@ class HealthTests(unittest.TestCase):
     def test_large_pool_gap_counts_overlaps_without_materializing_slots(self) -> None:
         values = {
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
-            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "10.0.0.0/8",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "240.0.0.0/8",
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "32",
             "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
         }
         networks = {
-            "broad": [{"IPAM": {"Config": [{"Subnet": "10.0.0.0/8"}]}}],
-            "duplicate": [{"IPAM": {"Config": [{"Subnet": "10.0.0.0/9"}]}}],
+            "broad": [{"IPAM": {"Config": [{"Subnet": "240.0.0.0/8"}]}}],
+            "duplicate": [{"IPAM": {"Config": [{"Subnet": "240.0.0.0/9"}]}}],
         }
         def run(args):
             if args[:3] == ["docker", "network", "ls"]:
