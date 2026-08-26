@@ -53,32 +53,47 @@ SCOPE = r"[a-zA-Z0-9_ -]+"
 SUBJECT = r"^(.{1,100})$"
 FOOTER_TOKEN = r"[A-Z][A-Z0-9_]+"
 FOOTER_VALUE = r"[^\n]+"
-# "BREAKING CHANGE:" must be exactly uppercase (CC 1.0.0).
+# "BREAKING CHANGE:" and "BREAKING-CHANGE:" must be exactly uppercase (CC 1.0.0).
 BREAKING_HEADER = "BREAKING CHANGE:"
+BREAKING_HEADER_ALT = "BREAKING-CHANGE:"
 # Trailers use the "Token: value" form.
 FOOTER_LINE = re.compile(rf"^{FOOTER_TOKEN}: {FOOTER_VALUE}$")
 
 # Full conventional-commit header regex (not multiline; applied per message).
+# Requires exactly one space after the colon and a description beginning with
+# a lowercase letter, per CC 1.0.0 and docs/CONTRIBUTING.md.
 CONVENTIONAL_HEADER = re.compile(
-    r"^(" + "|".join(sorted(ALLOWED_TYPES)) + r")(?:\((" + SCOPE + r"\))|" + r")(!)?: .+$",
+    r"^(" + "|".join(sorted(ALLOWED_TYPES)) + r")(?:\(" + SCOPE + r"\))?" + r"(!)?: [a-z].*$",
     re.UNICODE,
 )
 
 # Git trailers (e.g. "Reviewed-by: ...", "Signed-off-by: ...") and the
-# BREAKING CHANGE trailer. Trailers are optional.
+# BREAKING CHANGE / BREAKING-CHANGE trailer. Trailers are optional.
 TRAILER_RE = re.compile(
-    r"^(?:" + FOOTER_TOKEN + r": " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r")$"
+    r"^(?:" + FOOTER_TOKEN + r": " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
 )
 
 # Merge and pure-git commits are exempt: they are generated, not authored per
 # the contract, and existing base-branch commits are never re-checked here.
+# A real merge is verified by parent count (see is_true_merge_commit); the
+# subject prefix alone only exempts plumbing lines like "Revert \"...".
 MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
-# A commit with no body/footer that is purely a git plumbing line.
 PLUMBING_RE = re.compile(
-    r"^(?:Merge (?:pull request|remote-tracking branch|branch)|"
-    r"Revert \"|chore\(deps\):)",
+    r"^(?:Revert \"|chore\(deps\):)",
     re.IGNORECASE,
 )
+
+def is_true_merge_commit(sha: str, workspace: str = ".") -> bool:
+    """Return True if the commit is a true merge commit (has 2+ parents)."""
+    result = subprocess.run(
+        ["git", "-C", workspace, "rev-list", "--parents", "-n", "1", sha],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    parts = result.stdout.strip().split()
+    # First part is the commit SHA, rest are parents
+    return len(parts) >= 3  # commit SHA + at least 2 parents
 
 # ---------------------------------------------------------------------------
 # Semantic Versioning 2.0.0
@@ -92,9 +107,9 @@ PLUMBING_RE = re.compile(
 # itself must be valid SemVer.
 SEMVER_RE = re.compile(
     r"^v?"
-    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 
@@ -132,7 +147,11 @@ def bump_kind(message: str) -> str | None:
         return None
     if not is_conventional_header(header):
         return None
-    if has_breaking_change(message) or "!" in header:
+    # Check for explicit breaking marker "!" after type/scope (e.g., "feat!: ...")
+    match = CONVENTIONAL_HEADER.match(header)
+    if match and match.group(2):  # group(2) is the breaking marker "!"
+        return "MAJOR"
+    if has_breaking_change(message):
         return "MAJOR"
     if header.split(":", 1)[0].split("(")[0] == "feat":
         return "MINOR"
@@ -141,7 +160,11 @@ def bump_kind(message: str) -> str | None:
 
 def suggest_bump(messages: Iterable[str]) -> str:
     """Recommend a SemVer bump from a list of conventional commit messages."""
-    kinds = [k for message in messages if (k := bump_kind(message))]
+    kinds = []
+    for message in messages:
+        k = bump_kind(message)
+        if k:
+            kinds.append(k)
     if not kinds:
         return "PATCH"
     if "MAJOR" in kinds:
@@ -159,7 +182,7 @@ def is_conventional_header(header: str) -> bool:
 
 
 def has_breaking_change(message: str) -> bool:
-    """Detect a BREAKING CHANGE footer (case-sensitive per spec)."""
+    """Detect a BREAKING CHANGE or BREAKING-CHANGE footer (case-sensitive per spec)."""
     if not message:
         return False
     lines = message.splitlines()
@@ -170,12 +193,12 @@ def has_breaking_change(message: str) -> bool:
             continue
         if in_footer:
             trailer = TRAILER_RE.match(line)
-            if trailer and line.startswith(BREAKING_HEADER):
+            if trailer and (line.startswith(BREAKING_HEADER) or line.startswith(BREAKING_HEADER_ALT)):
                 return True
     return False
 
 
-def validate_message(message: str, *, skip_merge: bool = True) -> list[str]:
+def validate_message(message: str, *, skip_merge: bool = True, sha: str | None = None, workspace: str = ".") -> list[str]:
     """Validate one commit message against Conventional Commits 1.0.0.
 
     Returns a list of human-readable error strings (empty == valid).
@@ -188,8 +211,17 @@ def validate_message(message: str, *, skip_merge: bool = True) -> list[str]:
     lines = message.splitlines()
     header = lines[0]
 
-    if skip_merge and (MERGE_RE.match(header) or PLUMBING_RE.match(header)):
-        return errors
+    if skip_merge:
+        if PLUMBING_RE.match(header):
+            # Pure plumbing lines (Revert "...", chore(deps):) are exempt
+            # unconditionally; everything else must be conventional.
+            return errors
+        if MERGE_RE.match(header):
+            # "Merge " prefix alone is not proof: a single-parent commit can be
+            # named anything. Only true merges (2+ parents, verified via sha)
+            # are exempt. Without a sha we cannot verify, so do not exempt.
+            if sha and is_true_merge_commit(sha, workspace):
+                return errors
 
     if not header or not is_conventional_header(header):
         errors.append(
@@ -228,11 +260,13 @@ def git_revision_list(base: str | None, head: str, *, workspace: str = ".") -> l
 
     Falls back to single-commit resolution when git range semantics are not
     available (shallow clones, single-commit histories).
+    For workflow_dispatch (empty base), validate only the HEAD commit.
     """
-    if base:
+    if base and base.strip():
         spec = f"{base}..{head}"
     else:
-        spec = head
+        # Empty base (workflow_dispatch): validate only HEAD
+        spec = f"{head}^..{head}"
     result = subprocess.run(
         ["git", "-C", workspace, "rev-list", "--reverse", spec],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -265,14 +299,16 @@ def commit_messages(
     head: str,
     *,
     workspace: str = ".",
-) -> list[str]:
+) -> list[tuple[str, str]]:
     """Return the full commit messages for every commit in base..head.
+
+    Returns a list of (sha, message) tuples.
 
     Falls back to resolving the head SHA alone when the range is empty
     (shallow clones, single-commit histories).
     """
     commits = git_revision_list(base, head, workspace=workspace)
-    return [commit_message(workspace, sha) for sha in commits]
+    return [(sha, commit_message(workspace, sha)) for sha in commits]
 
 
 def main() -> int:
@@ -335,19 +371,18 @@ def main() -> int:
         return 0
 
     if args.suggest_bump:
-        messages = commit_messages(args.base, args.head)
+        messages = [msg for _, msg in commit_messages(args.base, args.head)]
         print(f"bump: {suggest_bump(messages)}")
         return 0
 
     # Default: validate every commit in base..head.
-    commits = git_revision_list(args.base, args.head)
+    commits = commit_messages(args.base, args.head)
     if not commits:
         print("no commits found to validate; pass --base/--head or --message", file=sys.stderr)
         return 1
 
-    for sha in commits:
-        message = commit_message(".", sha)
-        errors = validate_message(message)
+    for sha, message in commits:
+        errors = validate_message(message, sha=sha, workspace=".")
         for error in errors:
             print(f"{sha[:8]}: {error}", file=sys.stderr)
             failures.append(error)

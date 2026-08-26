@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['**']
   workflow_dispatch:
 
 permissions:
@@ -27,19 +28,46 @@ jobs:
 
       - name: Validate pull-request title
         if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          python3 scripts/validate_commits.py --pr-title "${{ github.event.pull_request.title }}"
+          # Run the PR's copy only if the base branch already has one; otherwise
+          # use the trusted base revision so a PR cannot weaken its own check.
+          validator=scripts/validate_commits.py
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if git cat-file -e "$BASE_SHA:$validator" 2>/dev/null; then
+            git show "$BASE_SHA:$validator" >"$RUNNER_TEMP/trusted-validator.py"
+            validator="$RUNNER_TEMP/trusted-validator.py"
+          fi
+          python3 "$validator" --pr-title "$PR_TITLE"
 
       - name: Validate proposed commit messages
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           # Validate only commits proposed on this ref (base..head). Commits
           # already on the base branch are never re-checked. The validator is
           # shallow-clone safe: an empty base or empty range falls back to the
-          # head commit alone.
-          python3 scripts/validate_commits.py --base "$BASE_SHA" --head "$HEAD_SHA"
+          # head commit alone. For workflow_dispatch, validate only HEAD.
+          #
+          # Like the secret scanner below, the validator itself is extracted
+          # from the trusted base revision when available, so a PR cannot pass
+          # these gates by editing its own copy of the script.
+          validator=scripts/validate_commits.py
+          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$validator" 2>/dev/null; then
+            git show "$BASE_SHA:$validator" >"$RUNNER_TEMP/trusted-validator.py"
+            validator="$RUNNER_TEMP/trusted-validator.py"
+          fi
+          python3 "$validator" --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Validate release tags are SemVer 2.0.0
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python3 scripts/validate_commits.py --version "$TAG_NAME"
 
   validate:
     name: Build without registering a runner
