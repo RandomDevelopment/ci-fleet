@@ -292,7 +292,7 @@ class CliTests(unittest.TestCase):
             result = subprocess.run(
                 ["git", "-C", directory, "merge", "--no-ff", "feature",
                  "-m", "Merge branch 'feature'"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, env=self._git_env(),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             merge_sha = subprocess.run(
