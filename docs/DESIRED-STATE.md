@@ -40,17 +40,20 @@ Active and drained controllers reserve their configured maximum against the pool
 The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
 prefix `size`. Validation rejects malformed or overlapping pools, impossible
 prefix relationships, and active or drained policies with fewer subnets than
-`max_runners + reserve_subnets`. Disabled controllers retain a structurally
-valid policy but do not reserve runner subnet capacity. Real pool values belong
-only in the private desired-state repository; public examples use RFC 5737
-documentation ranges.
+`max_runners + reserve_subnets + 1`. The final subnet is reserved for the
+persistent controller Compose network. Disabled controllers do not reserve
+runner subnet capacity, but their retained policy must still cover the reserve
+and controller network. Real pool values belong only in the private desired-state
+repository. Public examples use RFC 5737 documentation ranges, which strict
+validation rejects until the operator supplies a reviewed non-overlapping pool.
 
 `docker_network_policy` is optional only to preserve a staged upgrade path from
 older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
 an existing controller in two reviewed desired-state commits: first change only
 `engine_ref` and verify that this compatible engine is active; then add the
 reviewed network policy in a second commit. Do not add the field while the old
-engine still performs reconciliation.
+engine still performs reconciliation. Transition validation rejects a commit
+that changes `engine_ref` while introducing the policy.
 
 This phase renders the policy solely for read-only health inspection. It does
 not write `daemon.json`, restart Docker, create or remove networks, prune

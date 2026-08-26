@@ -39,7 +39,8 @@ flowchart LR
      --engine-ref <reviewed-ci-fleet-commit>
    ```
 
-3. Edit `fleet.json` to add the organization's real logical mappings.
+3. Edit `fleet.json` to add the organization's real logical mappings and replace
+   the generated RFC 5737 Docker pool with a reviewed non-overlapping pool.
 4. Run the strict policy check:
 
    ```bash
@@ -48,7 +49,7 @@ flowchart LR
 
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
-The initializer refuses to replace a configured file unless `--force` is explicit. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, resource, and output options.
+The initializer refuses to replace a configured file unless `--force` is explicit. It accepts at most 30 runners so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, resource, and output options.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -87,14 +88,18 @@ The validator totals the maximum capacity of every active or drained controller 
 
 For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
 subnet prefix `size`. Pools must not overlap, and active or drained controllers
-must provide at least `max_runners + reserve_subnets` subnets. Real pool values
-belong in the private configuration; this template uses RFC 5737 documentation
-ranges only.
+must provide at least `max_runners + reserve_subnets + 1` subnets. The final
+subnet is reserved for the persistent controller Compose network. Real pool
+values belong in the private configuration; this template uses RFC 5737
+documentation ranges only. Non-strict validation accepts those public examples.
+Strict validation rejects them until the private configuration uses a reviewed
+non-overlapping pool.
 
 The field is optional solely for staged upgrades from older schema-v3 engines.
 First pin and activate this compatible engine without adding the field. In a
 second reviewed desired-state commit, add the reviewed policy. The older engine
-rejects the new key, so combining those steps prevents reconciliation.
+rejects the new key, so combining those steps prevents reconciliation. Transition
+validation enforces the separate commits for existing controllers.
 
 The public engine renders these values only for read-only health inspection.
 This phase detects low water, exhaustion, failed inspection, and legacy

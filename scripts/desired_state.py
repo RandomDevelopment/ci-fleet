@@ -185,8 +185,10 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
                     f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}"
                 )
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
-    if configured < max_runners + reserve:
-        raise DesiredStateError(f"{path}: policy cannot satisfy max_runners plus reserve")
+    if configured < max_runners + reserve + 1:
+        raise DesiredStateError(
+            f"{path}: network capacity cannot satisfy max_runners + reserve_subnets + one controller Compose network"
+        )
     return configured, reserve, parsed
 
 

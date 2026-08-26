@@ -250,6 +250,7 @@ value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
 controller = value["controllers"]["example-ci-01"]
+controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)

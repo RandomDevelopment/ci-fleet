@@ -232,6 +232,13 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
     last_success = reconciliation.get("last_success_at")
     if not isinstance(last_success, int) or isinstance(last_success, bool) or last_success > generated_at:
         last_success = None
+    docker = {
+        "healthy": bool(snapshot.get("docker_available")),
+        "oom": bool(snapshot.get("recent_oom") or snapshot["controller"].get("oom_killed")),
+    }
+    network = snapshot.get("docker_network_headroom")
+    if network and network.get("state") != "not_configured":
+        docker["network"] = {key: network.get(key, 0) for key in ("configured", "used", "free", "legacy")}
     return {
         "schema_version": 1,
         "controller": {
@@ -265,14 +272,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
             "inodes": {name: {"total": value.get("inode_total", 0), "used": value.get("inode_used", 0)} for name, value in disks.items()},
             "load": snapshot.get("load", {"one": 0, "five": 0, "fifteen": 0}),
         },
-        "docker": {
-            "healthy": bool(snapshot.get("docker_available")),
-            "oom": bool(snapshot.get("recent_oom") or snapshot["controller"].get("oom_killed")),
-            "network": {
-                key: snapshot.get("docker_network_headroom", {}).get(key, 0)
-                for key in ("configured", "used", "free", "legacy")
-            },
-        },
+        "docker": docker,
         "error": error,
         "generated_at": generated_at,
     }
@@ -338,8 +338,6 @@ def _parse_network_pool(values: dict[str, str], index: int) -> tuple[ipaddress.I
 
 def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: bool) -> dict[str, Any]:
     empty = {"configured": 0, "used": 0, "free": 0, "reserve": 0, "legacy": 0, "state": "unavailable"}
-    if not docker_ok:
-        return empty
     try:
         configured_count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
         reserve = int(values.get("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", "0"))
@@ -347,6 +345,8 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         return empty
     if configured_count == 0 and "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" not in values:
         return {**empty, "state": "not_configured"}
+    if not docker_ok:
+        return empty
     pools: list[tuple[ipaddress.IPv4Network, int]] = []
     for index in range(configured_count):
         pool = _parse_network_pool(values, index)

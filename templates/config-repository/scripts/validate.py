@@ -56,6 +56,9 @@ FORBIDDEN_INFRASTRUCTURE_KEYS = {
 }
 FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\..+)?|host\.env|ci-fleet\.env)$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
 FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
+RFC_5737_NETWORKS = tuple(
+    ipaddress.ip_network(value) for value in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+)
 
 
 class Validation:
@@ -141,7 +144,14 @@ def scan_secret_material(config: Any, validation: Validation) -> None:
                 break
 
 
-def validate_docker_network_policy(policy: Any, path: str, max_runners: int, validation: Validation) -> tuple[int, int, list[dict[str, Any]]]:
+def validate_docker_network_policy(
+    policy: Any,
+    path: str,
+    max_runners: int,
+    validation: Validation,
+    *,
+    strict: bool = False,
+) -> tuple[int, int, list[dict[str, Any]]]:
     if not isinstance(policy, dict):
         validation.errors.append(f"{path}: must be an object")
         return 0, 0, []
@@ -187,6 +197,11 @@ def validate_docker_network_policy(policy: Any, path: str, max_runners: int, val
         if network.version != 4:
             validation.errors.append(f"{pool_path}.base: malformed address pool IPv4 prefix")
             return 0, 0, []
+        if strict and any(network.overlaps(documentation) for documentation in RFC_5737_NETWORKS):
+            validation.errors.append(
+                f"{pool_path}.base: replace the RFC 5737 documentation address pool with a reviewed non-overlapping pool"
+            )
+            return 0, 0, []
         if size < network.prefixlen:
             validation.errors.append(f"{pool_path}.size: impossible subnet count for {base}")
             return 0, 0, []
@@ -197,8 +212,10 @@ def validate_docker_network_policy(policy: Any, path: str, max_runners: int, val
                 validation.errors.append(f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}")
                 return 0, 0, []
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
-    if configured < max_runners + reserve:
-        validation.errors.append(f"{path}: network capacity cannot satisfy max_runners plus reserve")
+    if configured < max_runners + reserve + 1:
+        validation.errors.append(
+            f"{path}: network capacity cannot satisfy max_runners + reserve_subnets + one controller Compose network"
+        )
     return configured, reserve, parsed
 
 
@@ -375,7 +392,13 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         network_policy = controller.get("docker_network_policy")
         capacity_maximum = maximum if state != "disabled" and type(maximum) is int and maximum > 0 else 0
         if network_policy is not None:
-            validate_docker_network_policy(network_policy, f"{path}.docker_network_policy", capacity_maximum, validation)
+            validate_docker_network_policy(
+                network_policy,
+                f"{path}.docker_network_policy",
+                capacity_maximum,
+                validation,
+                strict=strict,
+            )
         if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 
@@ -567,6 +590,12 @@ def validate_transition(
         previous_evidence = previous_evidence_source.get(name, {})
         old_reporting = old.get("status_reporting")
         new_reporting = new.get("status_reporting")
+        if "docker_network_policy" not in old and "docker_network_policy" in new:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.docker_network_policy",
+                "must be introduced in a later commit after the compatible engine_ref is active",
+            )
         staged_capability_required = (
             "status_reporting" not in old
             or (

@@ -15,6 +15,7 @@ from desired_state import (
     load_engine_capabilities,
     load_and_validate_config,
     parse_env,
+    validate_docker_network_policy,
     validate_host_values,
 )
 
@@ -158,6 +159,17 @@ class DesiredStateTests(unittest.TestCase):
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(DesiredStateError, "capacity"):
                 load_and_validate_config(path)
+
+    def test_docker_network_policy_reserves_controller_compose_subnet(self) -> None:
+        with self.assertRaisesRegex(DesiredStateError, "controller Compose network"):
+            validate_docker_network_policy(
+                {
+                    "reserve_subnets": 1,
+                    "default_address_pools": [{"base": "198.51.100.0/30", "size": 31}],
+                },
+                path="$.controllers.example-ci-01.docker_network_policy",
+                max_runners=1,
+            )
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

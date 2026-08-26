@@ -103,6 +103,17 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(network["state"], "not_configured")
         self.assertNotIn("docker_network_inspection", {check["id"] for check in report["checks"]})
 
+    def test_legacy_status_report_omits_unconfigured_docker_network(self) -> None:
+        for docker_ok in (True, False):
+            with self.subTest(docker_ok=docker_ok):
+                network = health._docker_network_headroom(
+                    lambda args: health.subprocess.CompletedProcess(args, 0, "", ""), {}, docker_ok=docker_ok
+                )
+                snapshot = {**healthy_snapshot(), "docker_network_headroom": network}
+                report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+                self.assertEqual(network["state"], "not_configured")
+                self.assertNotIn("network", report["docker"])
+
     def test_docker_network_headroom_collection_counts_legacy_networks(self) -> None:
         networks = {
             "managed": [{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}],

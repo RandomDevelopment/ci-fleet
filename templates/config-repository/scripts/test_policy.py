@@ -103,6 +103,14 @@ class PolicyTests(unittest.TestCase):
         }
         self.assert_rejected(config, "capacity")
 
+    def test_docker_network_policy_reserves_controller_compose_subnet(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["docker_network_policy"] = {
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/30", "size": 31}],
+        }
+        self.assert_rejected(config, "controller Compose network")
+
     def test_docker_network_policy_rejects_overlapping_or_malformed_pools(self) -> None:
         config = copy.deepcopy(reference_config())
         policy = docker_network_policy()
@@ -143,7 +151,30 @@ class PolicyTests(unittest.TestCase):
             config = json.loads(output.read_text())
         self.assertEqual(errors_for(config), [])
         policy = first_controller(config)["docker_network_policy"]
-        self.assertGreaterEqual(1 << (policy["default_address_pools"][0]["size"] - 24), 17)
+        self.assertGreaterEqual(1 << (policy["default_address_pools"][0]["size"] - 24), 18)
+
+    def test_initializer_accepts_largest_practical_network_allocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--max-runners", "30",
+                "--capacity-budget", "30", "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            config = json.loads(output.read_text())
+        self.assertEqual(first_controller(config)["docker_network_policy"]["default_address_pools"][0]["size"], 29)
+
+    def test_initializer_rejects_impractically_small_network_allocations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--max-runners", "31",
+                "--capacity-budget", "31", "--output", str(Path(directory) / "fleet.json"),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("generated Docker networks stay at /29 or larger with reserved capacity", result.stderr)
 
     def test_initializer_rejects_more_than_documentation_pool_can_hold(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -154,7 +185,7 @@ class PolicyTests(unittest.TestCase):
                 "--capacity-budget", "256", "--output", str(Path(directory) / "fleet.json"),
             ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must not exceed 255", result.stderr)
+        self.assertIn("must not exceed 30", result.stderr)
 
     def test_status_reporting_requires_a_separate_engine_rollout(self) -> None:
         previous = reference_config()
@@ -192,6 +223,25 @@ class PolicyTests(unittest.TestCase):
             },
         }, validation, {})
         self.assertTrue(any("capability evidence" in error for error in validation.errors), validation.errors)
+
+    def test_docker_network_policy_requires_a_separate_engine_rollout(self) -> None:
+        previous = reference_config()
+        first_controller(previous).pop("docker_network_policy")
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        first_controller(current)["docker_network_policy"] = docker_network_policy()
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("docker_network_policy" in error and "later commit" in error for error in validation.errors), validation.errors)
+
+    def test_docker_network_policy_accepts_an_unchanged_staged_engine(self) -> None:
+        previous = reference_config()
+        first_controller(previous).pop("docker_network_policy")
+        current = copy.deepcopy(previous)
+        first_controller(current)["docker_network_policy"] = docker_network_policy()
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
 
     def test_retained_reporting_requires_target_engine_capabilities(self) -> None:
         previous = reference_config()
@@ -796,6 +846,19 @@ class PolicyTests(unittest.TestCase):
         config["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["example-org/example-app"]
         project["repository"] = "example-org/example-app"
         self.assert_rejected(config, "replace the example organization", strict=True)
+
+    def test_strict_mode_requires_replacing_documentation_address_pools(self) -> None:
+        config = copy.deepcopy(reference_config())
+        project = first_project(config)
+        config["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+        config["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
+        project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+        for base in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"):
+            with self.subTest(base=base):
+                first_controller(config)["docker_network_policy"]["default_address_pools"][0]["base"] = base
+                self.assert_rejected(config, "replace the RFC 5737 documentation address pool", strict=True)
+        first_controller(config)["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+        self.assertEqual(errors_for(config, strict=True), [])
 
     def test_nonstandard_ci_entrypoint_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
