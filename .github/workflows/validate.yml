@@ -70,6 +70,15 @@ jobs:
           else
             cp scripts/validate_commits.py "$validator"
           fi
+          # A newly created tag reports an all-zero `before`, which makes
+          # `git rev-list <zero>..<tag>` fail and silently reduce validation
+          # to the tagged commit alone. Derive the real range start from the
+          # merge base with origin/main so every commit behind a branch-local
+          # (prerelease) tag is validated too. workflow_dispatch keeps its
+          # intentional HEAD-only behavior.
+          if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
+            BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+          fi
           python3 "$validator" --base "$BASE_SHA" --head "$HEAD_SHA"
 
       - name: Validate release tags are SemVer 2.0.0

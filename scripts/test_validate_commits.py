@@ -113,10 +113,44 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         self.assertEqual(bump, "MAJOR")
 
     def test_revert_shaped_subject_without_plumbing_form_is_validated(self) -> None:
-        # A revert must use the approved `revert:` type; the git-generated
-        # `Revert "<subject>"` plumbing form is exempt, nothing else.
+        # A revert must use the approved `revert:` type; only git's own
+        # generated form (subject + "This reverts commit <sha>." proof) is
+        # exempt, and the proof line alone is not enough.
         self.assertTrue(vc.validate_message('Revert "skip validation"'))
         self.assertEqual(vc.validate_message("revert: skip validation"), [])
+
+    def test_git_generated_revert_form_with_body_proof_is_exempt(self) -> None:
+        # `git revert --no-edit` produces `Revert "<original subject>"` with
+        # a `This reverts commit <sha>.` body line; docs/CONTRIBUTING.md
+        # instructs its use, so this exact pair is exempt.
+        message = (
+            'Revert "feat: add capacity telemetry"\n'
+            "\n"
+            "This reverts commit 1234567890abcdef1234567890abcdef12345678.\n"
+        )
+        self.assertEqual(vc.validate_message(message), [])
+        self.assertIsNone(vc.bump_kind(message))
+
+    def test_revert_subject_without_body_proof_is_validated(self) -> None:
+        # The subject shape alone proves nothing: without the generated body
+        # line it must satisfy the normal grammar.
+        self.assertTrue(vc.validate_message('Revert "skip validation"'))
+
+    def test_revert_proof_line_without_generated_subject_is_validated(self) -> None:
+        message = (
+            "revert: skip validation\n"
+            "\n"
+            "This reverts commit 1234567890abcdef1234567890abcdef12345678.\n"
+        )
+        self.assertEqual(vc.validate_message(message), [])  # conventional anyway
+        self.assertEqual(
+            vc.validate_message("not conventional\n\nThis reverts commit "
+                                "1234567890abcdef1234567890abcdef12345678.\n"),
+            ["header is not conventional: 'not conventional'. "
+             "Expected '<type>[scope][!]: <description>' from "
+             "['build', 'chore', 'ci', 'docs', 'feat', 'fix', 'perf', "
+             "'refactor', 'revert', 'style', 'test']"],
+        )
 
     def test_breaking_marker_in_body_text_is_not_a_footer(self) -> None:
         # A footer-shaped line directly after body text (no second blank-line
@@ -138,6 +172,24 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
             "BREAKING CHANGE: the old flag is gone.\n"
         )
         self.assertEqual(vc.bump_kind(message), "MAJOR")
+
+    def test_git_trailer_first_then_breaking_change_counts(self) -> None:
+        # A footer block may begin with a conventional git trailer
+        # (lowercase-with-hyphen token); a later BREAKING CHANGE trailer in
+        # the same block still classifies MAJOR.
+        for opener in (
+            "Reviewed-by: An Operator <an-operator@example.org>\n",
+            "Closes #42\n",
+            "Co-authored-by: Someone <someone@example.org>\n",
+        ):
+            message = (
+                "feat: add guard rails\n"
+                "\n"
+                "\n" + opener +
+                "\nBREAKING CHANGE: the old flag is gone.\n"
+            ).replace("\n\n\n", "\n\n")
+            self.assertEqual(vc.validate_message(message), [], message)
+            self.assertEqual(vc.bump_kind(message), "MAJOR", message)
 
 
 class PullRequestTitleTests(unittest.TestCase):
@@ -421,6 +473,29 @@ class LowercaseDescriptionTests(unittest.TestCase):
 
     def test_capitals_after_first_word_are_allowed(self) -> None:
         self.assertEqual(vc.validate_message("feat: retain the GitHub App token"), [])
+
+    def test_uppercase_scope_is_rejected(self) -> None:
+        # docs/CONTRIBUTING.md: lowercase ASCII scope.
+        self.assertTrue(vc.validate_message("feat(Runner): add x"))
+        self.assertTrue(vc.validate_title("feat(Runner): add x"))
+
+    def test_spaces_in_scope_are_rejected(self) -> None:
+        self.assertTrue(vc.validate_message("feat(a b): add x"))
+        self.assertTrue(vc.validate_title("feat(a b): add x"))
+
+    def test_empty_scope_is_rejected(self) -> None:
+        self.assertTrue(vc.validate_message("feat( ): add x"))
+        self.assertTrue(vc.validate_message("feat(): add x"))
+
+    def test_lowercase_scopes_still_pass(self) -> None:
+        for subject in (
+            "feat(runner): add shard expansion",
+            "fix(ci-runner): close leak",
+            "ci(gha2): bump pin",
+            "feat(runner/shard): expand matrix",
+        ):
+            self.assertEqual(vc.validate_message(subject), [], subject)
+            self.assertEqual(vc.validate_title(subject), [], subject)
 
 
 class BreakingChangeSynonymTests(unittest.TestCase):

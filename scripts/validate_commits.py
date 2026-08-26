@@ -47,9 +47,10 @@ ALLOWED_TYPES = frozenset({
     "test",
 })
 
-# A scope is optional and nested in parentheses. Keep the character class broad
-# but disallow parentheses/newlines to avoid structural ambiguity.
-SCOPE = r"[a-zA-Z0-9_ -]+"
+# A scope is optional and nested in parentheses. docs/CONTRIBUTING.md requires
+# lowercase ASCII scope components; allow hyphens, underscores, and digits
+# inside a component but never uppercase letters or spaces.
+SCOPE = r"[a-z0-9_-]+(?:/[a-z0-9_-]+)*"
 SUBJECT = r"^(.{1,100})$"
 FOOTER_TOKEN = r"[A-Z][A-Z0-9_]+"
 FOOTER_VALUE = r"[^\n]+"
@@ -69,8 +70,17 @@ CONVENTIONAL_HEADER = re.compile(
 
 # Git trailers (e.g. "Reviewed-by: ...", "Signed-off-by: ...") and the
 # BREAKING CHANGE / BREAKING-CHANGE trailer. Trailers are optional.
+#
+# Trailer tokens follow git's own grammar (trailing-attrs): a token of three
+# or more alphanumerics with an inner hyphen permitted, followed by ": ".
+# This accepts conventional trailers like "Reviewed-by" and "Co-authored-by"
+# that the uppercase-only FOOTER_TOKEN class would reject, so a footer block
+# beginning with them is still recognized as footers by has_breaking_change().
+TRAILER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]")
 TRAILER_RE = re.compile(
-    r"^(?:" + FOOTER_TOKEN + r": " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|" + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
+    r"^(?:" + TRAILER_TOKEN_RE.pattern + r": " + FOOTER_VALUE + r"|"
+    + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|"
+    + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
 )
 
 # Git-generated plumbing commits are exempt: they are produced by git itself,
@@ -83,7 +93,14 @@ TRAILER_RE = re.compile(
 # "Revert ..." shape (including `Revert "<subject>"` with arbitrary text) is
 # ordinary authored content and must use the approved `revert:` type.
 MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
-PLUMBING_RE = re.compile(r'^Revert "[0-9a-fA-F]{40}"$')
+# Git's own generated revert subject is `Revert "<original subject>"` with a
+# body containing `This reverts commit <40-hex sha>.` (see git-revert(1) and
+# the revert instruction in docs/CONTRIBUTING.md). Exempt only that exact
+# subject/body pair: the body line carries the proof, so an authored
+# `Revert "..."` subject without it still goes through normal validation and
+# must use the approved `revert:` type.
+REVERT_SUBJECT_RE = re.compile(r'^Revert ".+"$')
+REVERT_BODY_PROOF_RE = re.compile(r"^This reverts commit [0-9a-fA-F]{40}\.$")
 
 def is_true_merge_commit(sha: str, workspace: str = ".") -> bool:
     """Return True if the commit is a true merge commit (has 2+ parents)."""
@@ -138,6 +155,21 @@ def is_zero_major(version: str) -> bool:
     return parsed[0] == 0
 
 
+def is_git_generated_revert(message: str) -> bool:
+    """Return True only for git's own generated revert form.
+
+    Requires the `Revert "<original subject>"` subject AND the
+    `This reverts commit <sha>.` proof line in the body, matching what
+    `git revert` produces (docs/CONTRIBUTING.md instructs its use).
+    """
+    lines = message.splitlines()
+    return (
+        bool(lines)
+        and bool(REVERT_SUBJECT_RE.match(lines[0]))
+        and any(REVERT_BODY_PROOF_RE.match(line) for line in lines[1:])
+    )
+
+
 def bump_kind(message: str) -> str | None:
     """Classify a single conventional commit for SemVer bump selection.
 
@@ -145,7 +177,7 @@ def bump_kind(message: str) -> str | None:
     conventional change (e.g. a merge or refactor-only commit carries no bump).
     """
     header = message.splitlines()[0] if message else ""
-    if PLUMBING_RE.match(header):
+    if is_git_generated_revert(message):
         return None
     if not is_conventional_header(header):
         return None
@@ -221,9 +253,9 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
     header = lines[0]
 
     if skip_merge:
-        if PLUMBING_RE.match(header):
-            # Only git's own generated revert form (`Revert "<sha>"`, full
-            # 40-hex id) is exempt; anything else must be conventional.
+        if is_git_generated_revert(message):
+            # Only git's own generated revert form (subject + body proof line)
+            # is exempt; anything else must be conventional.
             return errors
         if MERGE_RE.match(header):
             # "Merge " prefix alone is not proof: a single-parent commit can be
@@ -253,7 +285,7 @@ def validate_title(title: str) -> list[str]:
     """Validate a PR title (treated as a single conventional subject)."""
     if not title:
         return ["PR title is empty"]
-    if PLUMBING_RE.match(title) or MERGE_RE.match(title):
+    if REVERT_SUBJECT_RE.match(title) or MERGE_RE.match(title):
         return ["PR title must be a conventional commit subject, not a merge/plumbing title"]
     if not is_conventional_header(title):
         return [f"PR title is not conventional: '{title}'"]
