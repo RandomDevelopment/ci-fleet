@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -55,6 +56,9 @@ FORBIDDEN_INFRASTRUCTURE_KEYS = {
 }
 FORBIDDEN_FILENAMES = re.compile(r"(?:^|/)(?:\.env(?:\..+)?|host\.env|ci-fleet\.env)$|\.(?:key|pem|p12|pfx)$", re.IGNORECASE)
 FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
+RFC_5737_NETWORKS = tuple(
+    ipaddress.ip_network(value) for value in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+)
 
 
 class Validation:
@@ -138,6 +142,85 @@ def scan_secret_material(config: Any, validation: Validation) -> None:
             if pattern.search(value):
                 validation.errors.append(f"{path}: probable secret material is forbidden")
                 break
+
+
+def validate_docker_network_policy(
+    policy: Any,
+    path: str,
+    max_runners: int,
+    validation: Validation,
+    *,
+    strict: bool = False,
+) -> tuple[int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        validation.errors.append(f"{path}: must be an object")
+        return 0, 0, []
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
+    keys = set(policy)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required)
+    if missing or unknown:
+        parts = []
+        if missing:
+            parts.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            parts.append(f"unknown keys: {', '.join(unknown)}")
+        validation.errors.append(f"{path}: {'; '.join(parts)}")
+        return 0, 0, []
+    reserve = policy["reserve_subnets"]
+    if type(reserve) is not int or reserve < 1:
+        validation.errors.append(f"{path}.reserve_subnets: must be a positive integer")
+        return 0, 0, []
+    networks_per_runner = policy["networks_per_runner"]
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        validation.errors.append(f"{path}.networks_per_runner: must be a positive integer")
+        return 0, 0, []
+    pools = policy["default_address_pools"]
+    if type(pools) is not list or not pools:
+        validation.errors.append(f"{path}.default_address_pools: must be a non-empty list")
+        return 0, 0, []
+    parsed: list[dict[str, Any]] = []
+    for index, pool in enumerate(pools):
+        pool_path = f"{path}.default_address_pools[{index}]"
+        if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
+            validation.errors.append(f"{pool_path}: must contain only base and size")
+            return 0, 0, []
+        base = pool["base"]
+        size = pool["size"]
+        if not isinstance(base, str):
+            validation.errors.append(f"{pool_path}.base: must be a CIDR prefix")
+            return 0, 0, []
+        if type(size) is not int or size < 0 or size > 29:
+            validation.errors.append(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 29")
+            return 0, 0, []
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError:
+            validation.errors.append(f"{pool_path}.base: malformed address pool IPv4 prefix")
+            return 0, 0, []
+        if network.version != 4:
+            validation.errors.append(f"{pool_path}.base: malformed address pool IPv4 prefix")
+            return 0, 0, []
+        if strict and any(network.overlaps(documentation) for documentation in RFC_5737_NETWORKS):
+            validation.errors.append(
+                f"{pool_path}.base: replace the RFC 5737 documentation address pool with a reviewed operational Docker pool CIDR"
+            )
+            return 0, 0, []
+        if size < network.prefixlen:
+            validation.errors.append(f"{pool_path}.size: impossible subnet count for {base}")
+            return 0, 0, []
+        parsed.append({"base": base, "network": network, "size": size})
+    for left, item in enumerate(parsed):
+        for right in range(left + 1, len(parsed)):
+            if item["network"].overlaps(parsed[right]["network"]):
+                validation.errors.append(f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}")
+                return 0, 0, []
+    configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
+    if configured < max_runners * networks_per_runner + reserve + 1:
+        validation.errors.append(
+            f"{path}: network capacity cannot satisfy max_runners * networks_per_runner + reserve_subnets + one controller Compose network"
+        )
+    return configured, reserve, parsed
 
 
 def scan_forbidden_paths(repo_root: Path, validation: Validation) -> None:
@@ -267,11 +350,12 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         "min_runners",
         "max_runners",
         "runner_resources",
+        "docker_network_policy",
     }
     for name, controller in controllers.items():
         path = f"$.controllers.{name}"
         validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "controller ID must be a unique lowercase slug")
-        if not validation.exact_keys(controller, path, controller_keys, {"status_reporting"}):
+        if not validation.exact_keys(controller, path, controller_keys - {"docker_network_policy"}, {"status_reporting", "docker_network_policy"}):
             continue
         pool_name = controller.get("pool")
         location = controller.get("location")
@@ -309,6 +393,16 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             memory = resources.get("memory_mib")
             validation.require(type(cpu) is int and cpu > 0, f"{path}.runner_resources.cpu_cores", "must be a positive integer")
             validation.require(type(memory) is int and memory >= 512, f"{path}.runner_resources.memory_mib", "must be at least 512 MiB")
+        network_policy = controller.get("docker_network_policy")
+        capacity_maximum = maximum if state != "disabled" and type(maximum) is int and maximum > 0 else 0
+        if "docker_network_policy" in controller:
+            validate_docker_network_policy(
+                network_policy,
+                f"{path}.docker_network_policy",
+                capacity_maximum,
+                validation,
+                strict=strict,
+            )
         if isinstance(pool_name, str) and pool_name in pools and state != "disabled" and type(maximum) is int and maximum > 0:
             reserved_capacity[pool_name] += maximum
 
@@ -424,21 +518,32 @@ def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, d
         path = f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}"
         controller_valid = bool(SLUG.fullmatch(controller))
         validation.require(controller_valid, path, "controller ID must be a lowercase slug")
-        if not validation.exact_keys(evidence, path, {"engine_ref", "status_reporting_config", "required_status_reporting"}):
+        if not validation.exact_keys(
+            evidence,
+            path,
+            {"engine_ref", "status_reporting_config", "required_status_reporting"},
+            {"docker_network_policy_config"},
+        ):
             continue
         ref = evidence.get("engine_ref")
         configured = evidence.get("status_reporting_config")
         required = evidence.get("required_status_reporting")
+        network_policy = evidence.get("docker_network_policy_config")
         ref_valid = isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40
         validation.require(ref_valid, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
         validation.require(type(configured) is bool, f"{path}.status_reporting_config", "must be a boolean")
         validation.require(type(required) is bool, f"{path}.required_status_reporting", "must be a boolean")
-        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool:
+        if "docker_network_policy_config" in evidence:
+            validation.require(type(network_policy) is bool, f"{path}.docker_network_policy_config", "must be a boolean")
+        network_policy_valid = "docker_network_policy_config" not in evidence or type(network_policy) is bool
+        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid:
             valid[controller] = {
                 "engine_ref": ref,
                 "status_reporting_config": configured,
                 "required_status_reporting": required,
             }
+            if "docker_network_policy_config" in evidence:
+                valid[controller]["docker_network_policy_config"] = network_policy
     return valid
 
 
@@ -500,6 +605,25 @@ def validate_transition(
         previous_evidence = previous_evidence_source.get(name, {})
         old_reporting = old.get("status_reporting")
         new_reporting = new.get("status_reporting")
+        if "docker_network_policy" not in old and "docker_network_policy" in new:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.docker_network_policy",
+                "must be introduced in a later commit after the compatible engine_ref is active",
+            )
+            validation.require(
+                previous_evidence.get("engine_ref") == new.get("engine_ref")
+                and previous_evidence.get("docker_network_policy_config") is True,
+                f"$.controllers.{name}.docker_network_policy",
+                "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with Docker network policy configuration capability",
+            )
+        if "docker_network_policy" in new:
+            validation.require(
+                current_evidence.get("engine_ref") == new.get("engine_ref")
+                and current_evidence.get("docker_network_policy_config") is True,
+                f"$.controllers.{name}.docker_network_policy",
+                "requires Docker network policy configuration capability evidence for this controller and engine_ref",
+            )
         staged_capability_required = (
             "status_reporting" not in old
             or (
