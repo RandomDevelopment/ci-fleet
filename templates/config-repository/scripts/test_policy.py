@@ -54,6 +54,7 @@ def first_controller(config: dict) -> dict:
 
 def docker_network_policy() -> dict:
     return {
+        "networks_per_runner": 1,
         "reserve_subnets": 1,
         "default_address_pools": [
             {"base": "198.51.100.0/24", "size": 28},
@@ -86,9 +87,11 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("docker_network_policy", controller_schema["required"])
         controller = controller_schema["properties"]["docker_network_policy"]
         self.assertEqual(set(controller), {"type", "additionalProperties", "required", "properties"})
-        self.assertEqual(controller["required"], ["default_address_pools", "reserve_subnets"])
+        self.assertEqual(controller["required"], ["default_address_pools", "networks_per_runner", "reserve_subnets"])
+        self.assertEqual(controller["properties"]["networks_per_runner"], {"type": "integer", "minimum": 1})
         pool = controller["properties"]["default_address_pools"]["items"]
         self.assertEqual(set(pool["properties"]), {"base", "size"})
+        self.assertEqual(pool["properties"]["size"]["maximum"], 29)
 
     def test_docker_network_policy_is_optional_and_capacity_checked_when_present(self) -> None:
         config = copy.deepcopy(reference_config())
@@ -98,8 +101,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(errors_for(config), [])
 
         first_controller(config)["docker_network_policy"] = {
+            "networks_per_runner": 1,
             "reserve_subnets": 1,
-            "default_address_pools": [{"base": "198.51.100.0/30", "size": 30}],
+            "default_address_pools": [{"base": "198.51.100.0/29", "size": 29}],
         }
         self.assert_rejected(config, "capacity")
 
@@ -111,10 +115,48 @@ class PolicyTests(unittest.TestCase):
     def test_docker_network_policy_reserves_controller_compose_subnet(self) -> None:
         config = copy.deepcopy(reference_config())
         first_controller(config)["docker_network_policy"] = {
+            "networks_per_runner": 1,
             "reserve_subnets": 1,
-            "default_address_pools": [{"base": "198.51.100.0/30", "size": 31}],
+            "default_address_pools": [{"base": "198.51.100.0/28", "size": 29}],
         }
         self.assert_rejected(config, "controller Compose network")
+
+    def test_docker_network_policy_accepts_29_and_rejects_smaller_allocations(self) -> None:
+        config = copy.deepcopy(reference_config())
+        pool = first_controller(config)["docker_network_policy"]["default_address_pools"][0]
+        pool["size"] = 29
+        self.assertEqual(errors_for(config), [])
+        for size in (30, 31, 32):
+            with self.subTest(size=size):
+                pool["size"] = size
+                self.assert_rejected(config, "between 0 and 29")
+
+    def test_docker_network_policy_accounts_for_every_runner_network(self) -> None:
+        config = copy.deepcopy(reference_config())
+        controller = first_controller(config)
+        controller["max_runners"] = 2
+        config["runner_pools"][controller["pool"]]["capacity_budget"] = 2
+        controller["docker_network_policy"] = {
+            "networks_per_runner": 2,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/27", "size": 29}],
+        }
+        self.assert_rejected(config, "max_runners * networks_per_runner")
+        controller["docker_network_policy"]["default_address_pools"].append(
+            {"base": "203.0.113.0/28", "size": 29}
+        )
+        self.assertEqual(errors_for(config), [])
+
+    def test_disabled_docker_network_policy_keeps_reserve_and_controller_capacity(self) -> None:
+        config = copy.deepcopy(reference_config())
+        controller = first_controller(config)
+        controller["state"] = "disabled"
+        controller["docker_network_policy"] = {
+            "networks_per_runner": 100,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/28", "size": 29}],
+        }
+        self.assertEqual(errors_for(config), [])
 
     def test_docker_network_policy_rejects_overlapping_or_malformed_pools(self) -> None:
         config = copy.deepcopy(reference_config())
@@ -157,6 +199,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(errors_for(config), [])
         policy = first_controller(config)["docker_network_policy"]
         self.assertGreaterEqual(1 << (policy["default_address_pools"][0]["size"] - 24), 18)
+
+    def test_initializer_sizes_policy_for_networks_per_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--max-runners", "2",
+                "--capacity-budget", "2", "--networks-per-runner", "2",
+                "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            config = json.loads(output.read_text())
+        policy = first_controller(config)["docker_network_policy"]
+        self.assertEqual(policy["networks_per_runner"], 2)
+        self.assertGreaterEqual(1 << (policy["default_address_pools"][0]["size"] - 24), 6)
 
     def test_initializer_accepts_largest_practical_network_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -890,9 +947,27 @@ class PolicyTests(unittest.TestCase):
         for base in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"):
             with self.subTest(base=base):
                 first_controller(config)["docker_network_policy"]["default_address_pools"][0]["base"] = base
-                self.assert_rejected(config, "replace the RFC 5737 documentation address pool", strict=True)
+                self.assert_rejected(config, "reviewed operational Docker pool CIDR", strict=True)
         first_controller(config)["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
         self.assertEqual(errors_for(config, strict=True), [])
+
+    def test_private_address_pool_exception_is_narrow_and_documented(self) -> None:
+        repository_root = ROOT.parents[1]
+        for path in (
+            repository_root / "AGENTS.md",
+            repository_root / "README.md",
+            repository_root / "docs" / "DESIRED-STATE.md",
+            ROOT / "AGENTS.md",
+            ROOT / "README.md",
+        ):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("default_address_pools[].base", text)
+                self.assertIn("host addresses", text.lower())
+
+        config = copy.deepcopy(reference_config())
+        config["host_address"] = "10.0.0.1"
+        self.assert_rejected(config, "host-local infrastructure details are forbidden", strict=True)
 
     def test_nonstandard_ci_entrypoint_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())

@@ -331,7 +331,7 @@ def _parse_network_pool(values: dict[str, str], index: int) -> tuple[ipaddress.I
         subnet_size = int(size)
     except ValueError:
         return None
-    if network.version != 4 or subnet_size < network.prefixlen or subnet_size > 32:
+    if network.version != 4 or subnet_size < network.prefixlen or subnet_size > 29:
         return None
     return network, subnet_size
 
@@ -340,6 +340,8 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     empty = {"configured": 0, "used": 0, "free": 0, "reserve": 0, "legacy": 0, "state": "unavailable"}
     try:
         configured_count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
+        configured_max = int(values.get("CI_FLEET_CONFIGURED_MAX_RUNNERS", values.get("CI_FLEET_MAX_RUNNERS", "0")))
+        networks_per_runner = int(values.get("CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "1"))
         reserve = int(values.get("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", "0"))
     except ValueError:
         return empty
@@ -353,17 +355,16 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         if pool is None:
             return empty
         pools.append(pool)
-    if not pools or reserve < 1:
+    if not pools or configured_max < 0 or networks_per_runner < 1 or reserve < 1:
         return empty
     listed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
     if listed.returncode != 0:
         return empty
     configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
     occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
+    bridge_occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
-        if name == "bridge":
-            continue
         inspected = run(["docker", "network", "inspect", name])
         if inspected.returncode != 0:
             refreshed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
@@ -397,7 +398,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
                     continue
                 subnets.append(network)
         if not subnets:
-            if saw_ipv6 or name in {"host", "none"}:
+            if saw_ipv6 or name in {"bridge", "host", "none"}:
                 continue
             legacy_networks += 1
             continue
@@ -411,13 +412,16 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
                     continue
                 block_size = 1 << (32 - size)
                 pool_start = int(pool.network_address)
-                occupied[index].append(((first - pool_start) // block_size, (last - pool_start) // block_size))
+                interval = ((first - pool_start) // block_size, (last - pool_start) // block_size)
+                occupied[index].append(interval)
+                if name == "bridge":
+                    bridge_occupied[index].append(interval)
                 overlaps += 1
             if overlaps == 0:
                 network_legacy = True
             elif overlaps != 1 or not any(subnet.subnet_of(pool) and subnet.prefixlen == size for pool, size in pools):
                 network_legacy = True
-        if network_legacy:
+        if network_legacy and name != "bridge":
             legacy_networks += 1
     used = 0
     for intervals in occupied:
@@ -428,10 +432,21 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
             elif stop > end:
                 used += stop - end
             end = max(end, stop)
+    bridge_used = 0
+    for intervals in bridge_occupied:
+        end = -1
+        for start, stop in sorted(intervals):
+            if start > end:
+                bridge_used += stop - start + 1
+            elif stop > end:
+                bridge_used += stop - end
+            end = max(end, stop)
     free = max(configured - used, 0)
+    policy_max = 0 if values.get("CI_FLEET_CONTROLLER_STATE") == "disabled" else configured_max
+    required = policy_max * networks_per_runner + reserve + 1
     if free == 0:
         state = "critical"
-    elif legacy_networks > 0 or free <= reserve:
+    elif legacy_networks > 0 or configured - bridge_used < required or free <= reserve:
         state = "warning"
     else:
         state = "healthy"

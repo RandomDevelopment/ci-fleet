@@ -139,10 +139,10 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     }
 
 
-def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, list[dict[str, Any]]]:
+def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, int, list[dict[str, Any]]]:
     if not isinstance(policy, dict):
         raise DesiredStateError(f"{path}: must be an object")
-    required = {"default_address_pools", "reserve_subnets"}
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
     if set(policy) != required:
         unknown = sorted(set(policy) - required)
         missing = sorted(required - set(policy))
@@ -155,6 +155,9 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
     reserve = policy.get("reserve_subnets")
     if type(reserve) is not int or reserve < 1:
         raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
+    networks_per_runner = policy.get("networks_per_runner")
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        raise DesiredStateError(f"{path}.networks_per_runner: must be a positive integer")
     pools = policy.get("default_address_pools")
     if type(pools) is not list or not pools:
         raise DesiredStateError(f"{path}.default_address_pools: must be a non-empty list")
@@ -167,8 +170,8 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
         size = pool.get("size")
         if not isinstance(base, str):
             raise DesiredStateError(f"{pool_path}.base: must be a CIDR prefix")
-        if type(size) is not int or size < 0 or size > 32:
-            raise DesiredStateError(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 32")
+        if type(size) is not int or size < 0 or size > 29:
+            raise DesiredStateError(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 29")
         try:
             network = ipaddress.ip_network(base, strict=True)
         except ValueError as exc:
@@ -186,11 +189,11 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
                     f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}"
                 )
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
-    if configured < max_runners + reserve + 1:
+    if configured < max_runners * networks_per_runner + reserve + 1:
         raise DesiredStateError(
-            f"{path}: network capacity cannot satisfy max_runners + reserve_subnets + one controller Compose network"
+            f"{path}: network capacity cannot satisfy max_runners * networks_per_runner + reserve_subnets + one controller Compose network"
         )
-    return configured, reserve, parsed
+    return configured, reserve, networks_per_runner, parsed
 
 
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -227,9 +230,9 @@ def build_rendered_env(
     effective_max = configured_max if state == "active" else 0
     network_policy_configured = "docker_network_policy" in controller
     network_policy = controller.get("docker_network_policy")
-    configured_subnets, reserve_subnets, parsed_pools = (0, 0, [])
+    configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = (0, 0, 0, [])
     if network_policy_configured:
-        configured_subnets, reserve_subnets, parsed_pools = validate_docker_network_policy(
+        configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = validate_docker_network_policy(
             network_policy,
             path=f"$.controllers.{controller_id}.docker_network_policy",
             max_runners=configured_max if state != "disabled" else 0,
@@ -263,6 +266,7 @@ def build_rendered_env(
     }
     if network_policy_configured:
         rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
+        rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"] = str(networks_per_runner)
         rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"] = str(reserve_subnets)
         for index, pool_config in enumerate(parsed_pools):
             rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
@@ -297,6 +301,7 @@ def build_rendered_env(
         "status_reporting_required": reporting_required,
         "docker_network_policy_configured": network_policy_configured,
         "docker_network_default_address_pools": len(parsed_pools),
+        "docker_networks_per_runner": networks_per_runner,
         "docker_network_reserve_subnets": reserve_subnets,
         "docker_network_configured_subnets": configured_subnets,
     }

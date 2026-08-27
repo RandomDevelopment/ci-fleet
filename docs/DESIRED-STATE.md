@@ -13,6 +13,13 @@ Schema v3 makes a reviewed private configuration repository the authority for co
 
 Host addresses, VM IDs, storage names, backup identifiers, SSH details, tokens, private keys, and rendered `.env` files are rejected from the Git-authored configuration.
 
+Private policy has one explicit address exception. Each reviewed
+`docker_network_policy.default_address_pools[].base` CIDR is committed because
+the controller must render and inspect that exact allocation pool. It is capacity
+policy, not a host address, host identity, credential, or routable service
+endpoint. The exception does not admit any other infrastructure address or
+runtime detail.
+
 ## Schema v3
 
 Each runner pool declares:
@@ -33,19 +40,22 @@ Each controller has a unique object key and declares:
 - a full pinned ci-fleet engine commit;
 - a zero managed minimum and reviewed maximum runner capacity;
 - CPU cores and memory per ephemeral runner;
-- reviewed Docker default-address pools and a reserved subnet count.
+- reviewed Docker default-address pools, a positive per-runner network bound,
+  and a reserved subnet count.
 
 Active and drained controllers reserve their configured maximum against the pool budget. A drained controller has zero effective runtime capacity but keeps its reservation, so an undrain cannot silently overcommit the pool. Disabled controllers reserve no capacity.
 
 The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
-prefix `size`. Validation rejects malformed or overlapping pools, impossible
-prefix relationships, and active or drained policies with fewer subnets than
-`max_runners + reserve_subnets + 1`. The final subnet is reserved for the
+prefix `size` no longer than `/29`, which leaves enough addresses for an
+ordinary Compose network. Validation rejects malformed or overlapping pools,
+allocation prefixes broader than their base, and active or drained policies with fewer subnets than
+`max_runners * networks_per_runner + reserve_subnets + 1`. The final subnet is reserved for the
 persistent controller Compose network. Disabled controllers do not reserve
 runner subnet capacity, but their retained policy must still cover the reserve
 and controller network. Real pool values belong only in the private desired-state
-repository. Public examples use RFC 5737 documentation ranges, which strict
-validation rejects until the operator supplies a reviewed non-overlapping pool.
+repository under the narrow address-pool exception above. Public examples use
+RFC 5737 documentation ranges, which strict validation rejects until the operator
+supplies a reviewed operational Docker pool CIDR.
 
 `docker_network_policy` is optional only to preserve a staged upgrade path from
 older schema-v3 engines whose exact-key validator does not recognize it. Upgrade

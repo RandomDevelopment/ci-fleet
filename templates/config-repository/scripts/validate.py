@@ -155,7 +155,7 @@ def validate_docker_network_policy(
     if not isinstance(policy, dict):
         validation.errors.append(f"{path}: must be an object")
         return 0, 0, []
-    required = {"default_address_pools", "reserve_subnets"}
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
     keys = set(policy)
     missing = sorted(required - keys)
     unknown = sorted(keys - required)
@@ -170,6 +170,10 @@ def validate_docker_network_policy(
     reserve = policy["reserve_subnets"]
     if type(reserve) is not int or reserve < 1:
         validation.errors.append(f"{path}.reserve_subnets: must be a positive integer")
+        return 0, 0, []
+    networks_per_runner = policy["networks_per_runner"]
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        validation.errors.append(f"{path}.networks_per_runner: must be a positive integer")
         return 0, 0, []
     pools = policy["default_address_pools"]
     if type(pools) is not list or not pools:
@@ -186,8 +190,8 @@ def validate_docker_network_policy(
         if not isinstance(base, str):
             validation.errors.append(f"{pool_path}.base: must be a CIDR prefix")
             return 0, 0, []
-        if type(size) is not int or size < 0 or size > 32:
-            validation.errors.append(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 32")
+        if type(size) is not int or size < 0 or size > 29:
+            validation.errors.append(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 29")
             return 0, 0, []
         try:
             network = ipaddress.ip_network(base, strict=True)
@@ -199,7 +203,7 @@ def validate_docker_network_policy(
             return 0, 0, []
         if strict and any(network.overlaps(documentation) for documentation in RFC_5737_NETWORKS):
             validation.errors.append(
-                f"{pool_path}.base: replace the RFC 5737 documentation address pool with a reviewed non-overlapping pool"
+                f"{pool_path}.base: replace the RFC 5737 documentation address pool with a reviewed operational Docker pool CIDR"
             )
             return 0, 0, []
         if size < network.prefixlen:
@@ -212,9 +216,9 @@ def validate_docker_network_policy(
                 validation.errors.append(f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}")
                 return 0, 0, []
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
-    if configured < max_runners + reserve + 1:
+    if configured < max_runners * networks_per_runner + reserve + 1:
         validation.errors.append(
-            f"{path}: network capacity cannot satisfy max_runners + reserve_subnets + one controller Compose network"
+            f"{path}: network capacity cannot satisfy max_runners * networks_per_runner + reserve_subnets + one controller Compose network"
         )
     return configured, reserve, parsed
 

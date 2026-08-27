@@ -33,6 +33,7 @@
       },
       "docker_network_policy": {
         "default_address_pools": [{"base": "198.51.100.0/24", "size": 28}],
+        "networks_per_runner": 1,
         "reserve_subnets": 1
       }
     },
@@ -51,6 +52,7 @@
       },
       "docker_network_policy": {
         "default_address_pools": [{"base": "203.0.113.0/24", "size": 28}],
+        "networks_per_runner": 1,
         "reserve_subnets": 1
       }
     }

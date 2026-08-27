@@ -44,6 +44,7 @@ def network_policy_values() -> dict[str, str]:
         "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
         "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/24",
         "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "28",
+        "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER": "1",
         "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
     }
 
@@ -114,6 +115,17 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(network["state"], "not_configured")
                 self.assertNotIn("network", report["docker"])
 
+    def test_network_pool_parser_accepts_29_and_rejects_smaller_allocations(self) -> None:
+        values = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/24",
+        }
+        values["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"] = "29"
+        self.assertIsNotNone(health._parse_network_pool(values, 0))
+        for size in (30, 31, 32):
+            with self.subTest(size=size):
+                values["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"] = str(size)
+                self.assertIsNone(health._parse_network_pool(values, 0))
+
     def test_docker_network_headroom_collection_counts_legacy_networks(self) -> None:
         networks = {
             "managed": [{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}],
@@ -143,17 +155,48 @@ class HealthTests(unittest.TestCase):
         result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
         self.assertEqual(result["legacy"], 1)
 
-    def test_builtin_bridge_is_ignored_but_similar_user_network_is_legacy(self) -> None:
-        inspected = json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}])
-        for name, expected in (("bridge", (0, "healthy")), ("bridge-copy", (1, "warning"))):
-            with self.subTest(name=name):
-                def run(args):
-                    if args[:3] == ["docker", "network", "ls"]:
-                        return health.subprocess.CompletedProcess(args, 0, f"{name}\n", "")
-                    return health.subprocess.CompletedProcess(args, 0, inspected, "")
+    def test_overlapping_builtin_bridge_consumes_allocation_without_legacy_warning(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["legacy"], result["state"]), (1, 15, 0, "healthy"))
 
-                result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
-                self.assertEqual((result["legacy"], result["state"]), expected)
+    def test_overlapping_builtin_bridge_warns_when_it_breaks_reviewed_capacity(self) -> None:
+        values = network_policy_values()
+        values.update({
+            "CI_FLEET_CONFIGURED_MAX_RUNNERS": "1",
+            "CI_FLEET_CONTROLLER_STATE": "active",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/27",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
+            "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER": "2",
+        })
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/29"}]}}]), "")
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual((result["configured"], result["used"], result["free"], result["legacy"], result["state"]), (4, 1, 3, 0, "warning"))
+
+    def test_non_overlapping_builtin_bridge_is_not_legacy(self) -> None:
+        inspected = []
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            inspected.append(args[-1])
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (0, 0, "healthy"))
+        self.assertEqual(inspected, ["bridge"])
+
+    def test_similar_user_network_is_legacy(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge-copy\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (0, 1, "warning"))
 
     def test_broader_network_consumes_all_allocation_slots(self) -> None:
         def run(args):
@@ -175,7 +218,7 @@ class HealthTests(unittest.TestCase):
         values = {
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "240.0.0.0/8",
-            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "32",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
             "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
         }
         networks = {
@@ -187,7 +230,7 @@ class HealthTests(unittest.TestCase):
                 return health.subprocess.CompletedProcess(args, 0, "broad\nduplicate\n", "")
             return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
         result = health._docker_network_headroom(run, values, docker_ok=True)
-        self.assertEqual((result["configured"], result["used"], result["free"]), (1 << 24, 1 << 24, 0))
+        self.assertEqual((result["configured"], result["used"], result["free"]), (1 << 21, 1 << 21, 0))
 
     def test_network_removed_during_inspection_is_skipped_after_refresh(self) -> None:
         listings = iter(("vanished\nmanaged\n", "managed\n"))

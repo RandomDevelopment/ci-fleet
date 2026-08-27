@@ -84,8 +84,9 @@
         "docker_network_policy": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["default_address_pools", "reserve_subnets"],
+          "required": ["default_address_pools", "networks_per_runner", "reserve_subnets"],
           "properties": {
+            "networks_per_runner": {"type": "integer", "minimum": 1},
             "reserve_subnets": {"type": "integer", "minimum": 1},
             "default_address_pools": {
               "type": "array",
@@ -96,7 +97,7 @@
                 "required": ["base", "size"],
                 "properties": {
                   "base": {"type": "string"},
-                  "size": {"type": "integer", "minimum": 0, "maximum": 32}
+                  "size": {"type": "integer", "minimum": 0, "maximum": 29}
                 }
               }
             }

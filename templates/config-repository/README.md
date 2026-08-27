@@ -4,6 +4,13 @@ This is the public, secret-free starting point for an organization's private `ci
 
 It does **not** contain runner registration tokens, deploy credentials, private keys, host addresses, VM IDs, storage names, backup identifiers, or `.env` files.
 
+One explicit exception permits reviewed operational Docker
+`default_address_pools[].base` CIDRs in this private Git-authored policy. The
+controller must render and inspect those exact capacity ranges. They are not host
+addresses, credentials, host identity, or routable service endpoints. All VM,
+storage, backup, SSH, rendered runtime, and unrelated infrastructure details stay
+outside Git.
+
 ```mermaid
 flowchart LR
   E[Public ci-fleet engine] -->|pinned engine commit| C[Private configuration]
@@ -36,11 +43,12 @@ flowchart LR
      --location primary-site \
      --capacity-budget 1 \
      --max-runners 1 \
+     --networks-per-runner 1 \
      --engine-ref <reviewed-ci-fleet-commit>
    ```
 
 3. Edit `fleet.json` to add the organization's real logical mappings and replace
-   the generated RFC 5737 Docker pool with a reviewed non-overlapping pool.
+   the generated RFC 5737 Docker pool with a reviewed operational Docker pool.
 4. Run the strict policy check:
 
    ```bash
@@ -49,7 +57,7 @@ flowchart LR
 
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
-The initializer refuses to replace a configured file unless `--force` is explicit. It accepts at most 30 runners so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, resource, and output options.
+The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, resource, and output options.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -62,7 +70,8 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - the full reviewed ci-fleet commit SHA it runs;
 - a zero managed minimum and reviewed maximum runner capacity;
 - CPU and memory available to each ephemeral runner;
-- Docker default-address pools and a reserved subnet count for health inspection.
+- Docker default-address pools, a positive reviewed maximum number of Compose
+  networks per runner, and a reserved subnet count for health inspection.
 
 `status_reporting` is deliberately omitted from initialized and reference
 configurations. For an existing controller, roll out schema support in three
@@ -101,13 +110,16 @@ Each runner pool has a `capacity_budget` and a runner group that must not be ass
 The validator totals the maximum capacity of every active or drained controller assigned to the pool and rejects overcommit. Drained capacity remains reserved so an undrain cannot silently exceed the reviewed budget. Disabled controllers do not reserve capacity.
 
 For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
-subnet prefix `size`. Pools must not overlap, and active or drained controllers
-must provide at least `max_runners + reserve_subnets + 1` subnets. The final
+subnet prefix `size`. The size must be no longer than `/29` and cannot be
+broader than its base. Pools must not overlap, and active or drained controllers
+must provide at least `max_runners * networks_per_runner + reserve_subnets + 1`
+subnets. The final
 subnet is reserved for the persistent controller Compose network. Real pool
 values belong in the private configuration; this template uses RFC 5737
 documentation ranges only. Non-strict validation accepts those public examples.
 Strict validation rejects them until the private configuration uses a reviewed
-non-overlapping pool.
+operational Docker pool CIDR. This is the narrow capacity-policy exception
+described above, not permission to commit host or service addresses.
 
 The field is optional solely for staged upgrades from older schema-v3 engines.
 First pin and activate a compatible engine without adding the field. In a second

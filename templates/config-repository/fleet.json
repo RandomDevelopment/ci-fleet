@@ -32,6 +32,7 @@
         "memory_mib": 4096
       },
       "docker_network_policy": {
+        "networks_per_runner": 1,
         "reserve_subnets": 1,
         "default_address_pools": [
           {
