@@ -30,7 +30,10 @@ Docker network inspection is read-only. Healthy headroom is reported when free
 subnets remain above the reviewed reserve, low water and legacy/nonconforming
 networks are warnings, and exhaustion is critical. A malformed policy or failed
 Docker network listing/inspection is critical rather than falsely healthy.
-Only aggregate configured, used, free, and legacy counts enter status reports.
+When policy parsing succeeds during an inspection outage, the local snapshot
+retains the configured subnet count and reserve without inventing usage counts.
+Status reports include aggregate configured, used, free, and legacy counts only
+after a successful measurement; otherwise they omit the optional network field.
 
 This detection-only phase does not mutate the Docker daemon or networks.
 Controller circuit breaking, frequent orphan reconciliation, daemon policy

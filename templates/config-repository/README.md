@@ -88,9 +88,10 @@ can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
 The same per-controller evidence record may declare
-`docker_network_policy_config`. Existing status-reporting records may omit this
-new boolean, so their behavior does not change. A complete record has this shape
-after an operator has verified the named engine is active:
+`docker_network_policy_config`. A controller may omit this boolean only while it
+omits `docker_network_policy`. A retained policy requires current evidence for
+the selected engine with this boolean set to `true`. A complete record has this
+shape after an operator has verified the named engine is active:
 
 ```json
 {
@@ -128,7 +129,9 @@ reviewed desired-state commit, record the active ref and
 reviewed policy in a third commit, retaining the same ref and evidence. The older
 engine rejects the new key, so skipped commits must not satisfy the gate.
 Transition validation requires the activation evidence to exist in the previous
-integrated state.
+integrated state when introducing the policy. It also requires matching current
+evidence whenever a controller retains the policy, including across engine
+changes or rollbacks.
 
 The public engine renders these values only for read-only health inspection.
 This phase detects low water, exhaustion, failed inspection, and legacy

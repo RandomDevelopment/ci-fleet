@@ -617,11 +617,12 @@ def validate_transition(
                 f"$.controllers.{name}.docker_network_policy",
                 "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with Docker network policy configuration capability",
             )
+        if "docker_network_policy" in new:
             validation.require(
                 current_evidence.get("engine_ref") == new.get("engine_ref")
                 and current_evidence.get("docker_network_policy_config") is True,
                 f"$.controllers.{name}.docker_network_policy",
-                "requires retaining Docker network policy rollout evidence for this controller and engine_ref",
+                "requires Docker network policy configuration capability evidence for this controller and engine_ref",
             )
         staged_capability_required = (
             "status_reporting" not in old

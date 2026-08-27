@@ -66,7 +66,9 @@ record `docker_network_policy_config: true` for that controller and ref in
 changing the engine or evidence. Transition validation reads the evidence from
 the previous integrated state, so a commit that adds evidence and policy together
 cannot satisfy the gate. Do not add the field while the old engine still performs
-reconciliation.
+reconciliation. Once present, the policy requires current evidence naming the
+selected engine and declaring `docker_network_policy_config: true`; remove the
+policy before selecting an engine without that evidence.
 
 This phase renders the policy solely for read-only health inspection. It does
 not write `daemon.json`, restart Docker, create or remove networks, prune

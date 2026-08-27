@@ -273,6 +273,7 @@ class PolicyTests(unittest.TestCase):
                 "engine_ref": first_controller(staged)["engine_ref"],
                 "status_reporting_config": True,
                 "required_status_reporting": False,
+                "docker_network_policy_config": True,
             },
         }, validation)
         self.assertEqual(validation.errors, [])
@@ -282,6 +283,7 @@ class PolicyTests(unittest.TestCase):
                 "engine_ref": first_controller(staged)["engine_ref"],
                 "status_reporting_config": True,
                 "required_status_reporting": False,
+                "docker_network_policy_config": True,
             },
         }, validation, {})
         self.assertTrue(any("capability evidence" in error for error in validation.errors), validation.errors)
@@ -348,6 +350,7 @@ class PolicyTests(unittest.TestCase):
                 "engine_ref": "2" * 40,
                 "status_reporting_config": True,
                 "required_status_reporting": False,
+                "docker_network_policy_config": True,
             }
         }
         validation = Validation()
@@ -373,8 +376,84 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, compatible, validation)
         self.assertEqual(validation.errors, [])
 
+    def test_retained_network_policy_requires_target_engine_capability(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "2" * 40
+        controller = next(iter(current["controllers"]))
+        compatible = {
+            controller: {
+                "engine_ref": "2" * 40,
+                "status_reporting_config": False,
+                "required_status_reporting": False,
+                "docker_network_policy_config": True,
+            }
+        }
+
+        validation = Validation()
+        validate_transition(previous, current, compatible, validation)
+        self.assertEqual(validation.errors, [])
+
+        for evidence in (
+            {},
+            {controller: {**compatible[controller], "engine_ref": "3" * 40}},
+            {controller: {**compatible[controller], "docker_network_policy_config": False}},
+        ):
+            with self.subTest(evidence=evidence):
+                validation = Validation()
+                validate_transition(previous, current, evidence, validation)
+                self.assertTrue(any("Docker network policy configuration capability" in error for error in validation.errors), validation.errors)
+
+    def test_network_policy_removal_needs_no_capability_evidence(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current).pop("docker_network_policy")
+        first_controller(current)["engine_ref"] = "2" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+    def test_cli_retained_network_policy_uses_current_rollout_evidence(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        controller = next(iter(current["controllers"]))
+        engine_ref = first_controller(current)["engine_ref"]
+        previous_evidence = {
+            "schema_version": 1,
+            "status_reporting_engine_capabilities": {
+                controller: {
+                    "engine_ref": engine_ref,
+                    "status_reporting_config": False,
+                    "required_status_reporting": False,
+                    "docker_network_policy_config": True,
+                },
+            },
+        }
+        current_evidence = copy.deepcopy(previous_evidence)
+        current_evidence["status_reporting_engine_capabilities"][controller]["docker_network_policy_config"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in (
+                ("previous.json", previous),
+                ("current.json", current),
+                ("previous-evidence.json", previous_evidence),
+                ("evidence.json", current_evidence),
+            ):
+                (root / name).write_text(json.dumps(value), encoding="utf-8")
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "validate.py"),
+                "--config", str(root / "current.json"),
+                "--previous-config", str(root / "previous.json"),
+                "--rollout-evidence", str(root / "evidence.json"),
+                "--previous-rollout-evidence", str(root / "previous-evidence.json"),
+                "--skip-path-scan",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docker network policy configuration capability", result.stderr)
+
     def test_reporting_removal_before_engine_change_needs_no_evidence(self) -> None:
         previous = reference_config()
+        first_controller(previous).pop("docker_network_policy")
         first_controller(previous)["status_reporting"] = {
             "enabled": True,
             "config_file": "/etc/ci-fleet/monitoring.env",
@@ -538,6 +617,7 @@ class PolicyTests(unittest.TestCase):
                     "engine_ref": first_controller(previous)["engine_ref"],
                     "status_reporting_config": True,
                     "required_status_reporting": False,
+                    "docker_network_policy_config": True,
                 },
             },
         }
@@ -566,6 +646,7 @@ class PolicyTests(unittest.TestCase):
                 "engine_ref": first_controller(previous)["engine_ref"],
                 "status_reporting_config": True,
                 "required_status_reporting": True,
+                "docker_network_policy_config": True,
             },
         }, validation)
         self.assertEqual(validation.errors, [])

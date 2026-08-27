@@ -24,7 +24,7 @@ The machine-readable contract is `schemas/status-report-v1.json`. It reports:
 - reconciliation, drift, health, and cleanup timer states;
 - current, busy, and configured-maximum runner counts;
 - CPU use, logical CPU count, memory, swap, root/Docker disk and inode use, and 1/5/15-minute load;
-- Docker availability, OOM evidence, and aggregate configured/used/free/legacy subnet counts;
+- Docker availability, OOM evidence, and optional measured configured/used/free/legacy subnet counts;
 - one controlled error code/message, report generation time, and schema version.
 
 All times are Unix seconds. Commit values are empty when unavailable. Receiver validation rejects unknown fields and unsupported schema versions rather than guessing at compatibility.
@@ -32,6 +32,9 @@ All times are Unix seconds. Commit values are empty when unavailable. Receiver v
 `error.message` is derived only from a controlled error code (`_` becomes a space). Raw exception text is never transmitted.
 Docker pool prefixes and network addresses are intentionally absent from the
 status contract; they remain in private desired state and host-local inspection.
+The reporter omits the optional `docker.network` aggregate when Docker network
+inspection is unavailable. It does not publish zero usage or capacity as a
+substitute for missing measurements.
 
 ## Authentication
 

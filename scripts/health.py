@@ -237,7 +237,7 @@ def build_status_report(snapshot: dict[str, Any], health_report: dict[str, Any],
         "oom": bool(snapshot.get("recent_oom") or snapshot["controller"].get("oom_killed")),
     }
     network = snapshot.get("docker_network_headroom")
-    if network and network.get("state") != "not_configured":
+    if network and network.get("state") in {"healthy", "warning", "critical"}:
         docker["network"] = {key: network.get(key, 0) for key in ("configured", "used", "free", "legacy")}
     return {
         "schema_version": 1,
@@ -337,30 +337,31 @@ def _parse_network_pool(values: dict[str, str], index: int) -> tuple[ipaddress.I
 
 
 def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: bool) -> dict[str, Any]:
-    empty = {"configured": 0, "used": 0, "free": 0, "reserve": 0, "legacy": 0, "state": "unavailable"}
+    unavailable = {"state": "unavailable"}
     try:
         configured_count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
         configured_max = int(values.get("CI_FLEET_CONFIGURED_MAX_RUNNERS", values.get("CI_FLEET_MAX_RUNNERS", "0")))
         networks_per_runner = int(values.get("CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "1"))
         reserve = int(values.get("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", "0"))
     except ValueError:
-        return empty
+        return unavailable
     if configured_count == 0 and "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" not in values:
-        return {**empty, "state": "not_configured"}
-    if not docker_ok:
-        return empty
+        return {"state": "not_configured"}
     pools: list[tuple[ipaddress.IPv4Network, int]] = []
     for index in range(configured_count):
         pool = _parse_network_pool(values, index)
         if pool is None:
-            return empty
+            return unavailable
         pools.append(pool)
     if not pools or configured_max < 0 or networks_per_runner < 1 or reserve < 1:
-        return empty
+        return unavailable
+    configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
+    unavailable = {"configured": configured, "reserve": reserve, "state": "unavailable"}
+    if not docker_ok:
+        return unavailable
     listed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
     if listed.returncode != 0:
-        return empty
-    configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
+        return unavailable
     occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     bridge_occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     legacy_networks = 0
@@ -369,30 +370,30 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         if inspected.returncode != 0:
             refreshed = run(["docker", "network", "ls", "--format", "{{.Name}}"])
             if refreshed.returncode != 0:
-                return empty
+                return unavailable
             if name not in {line.strip() for line in refreshed.stdout.splitlines() if line.strip()}:
                 continue
-            return empty
+            return unavailable
         try:
             payload = json.loads(inspected.stdout)
         except json.JSONDecodeError:
-            return empty
+            return unavailable
         if not isinstance(payload, list) or not payload:
-            return empty
+            return unavailable
         subnets: list[ipaddress.IPv4Network] = []
         saw_ipv6 = False
         for entry in payload:
             configs = entry.get("IPAM", {}).get("Config", []) if isinstance(entry, dict) else []
             if not isinstance(configs, list):
-                return empty
+                return unavailable
             for config in configs:
                 subnet = config.get("Subnet") if isinstance(config, dict) else None
                 if not isinstance(subnet, str):
-                    return empty
+                    return unavailable
                 try:
                     network = ipaddress.ip_network(subnet, strict=False)
                 except ValueError:
-                    return empty
+                    return unavailable
                 if network.version == 6:
                     saw_ipv6 = True
                     continue
