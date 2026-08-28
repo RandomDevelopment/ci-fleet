@@ -51,6 +51,8 @@ docker_socket=$(root_path /var/run/docker.sock)
 runtime_lock=$(root_path /run/lock/ci-fleet-tester/runtime.lock)
 units=(ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer)
 timers=(ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer)
+tmpfiles_conf=ci-fleet-tester-lock.conf
+tmpfiles_dir=$(root_path /usr/lib/tmpfiles.d)
 
 secure_file() { [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected file is unsafe: $1"; }
 secure_dir() { [[ -d $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected directory is unsafe: $1"; }
@@ -87,7 +89,7 @@ host_preflight() {
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
   docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
   used=$(df -P "$docker_root" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
-  [[ $used =~ ^[0-9]+$ && $used -private-repository 80 ]] || die 'Docker storage is at or above 80%'
+  [[ $used =~ ^[0-9]+$ && $used -lt 80 ]] || die 'Docker storage is at or above 80%'
 }
 
 ensure_directories() {
@@ -114,7 +116,12 @@ stage_release() {
   if [[ -e $target ]] && release_complete "$target" "$commit"; then return; fi
   remove_release_tree "$staging"; remove_release_tree "$replaced"; install -d -m 0755 "$staging"
   GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" cat-file -e "$commit^{commit}" 2>/dev/null || die 'requested source commit is unavailable locally'
-  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh scripts/tester-launcher.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer | tar -x -C "$staging"
+  GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" archive "$commit" scripts/tester-runtime.sh scripts/tester-launcher.sh host/systemd/ci-fleet-tester-health.service host/systemd/ci-fleet-tester-health.timer host/systemd/ci-fleet-tester-cleanup.service host/systemd/ci-fleet-tester-cleanup.timer host/systemd/ci-fleet-tester-lock.conf | tar -x -C "$staging"
+  # Reject any non-regular or symlinked member before chmod can dereference it
+  # (chmod follows symlinks and would change the host target's permissions).
+  while IFS= read -r -d '' entry; do
+    if [[ -L $entry || ! -f $entry ]]; then remove_release_tree "$staging"; die "release archive contains a non-regular or symlinked member: $entry"; fi
+  done < <(find "$staging" -type f -print0)
   printf '%s\n' "$commit" >"$staging/.ci-fleet-source-revision"; chmod 0644 "$staging/.ci-fleet-source-revision"
   chmod 0755 "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; shellcheck "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; bash -n "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"
   (cd "$staging" && sha256sum scripts/tester-runtime.sh scripts/tester-launcher.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
@@ -129,19 +136,35 @@ install_units() {
   local source=$1 unit
   for unit in "${units[@]}"; do install -m 0644 "$source/host/systemd/$unit" "$systemd_dir/$unit.new" || return 1; done
   for unit in "${units[@]}"; do mv -fT "$systemd_dir/$unit.new" "$systemd_dir/$unit" || return 1; done
+  install -d -m 0755 "$tmpfiles_dir"
+  install -m 0644 "$source/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf.new" || return 1
+  mv -fT "$tmpfiles_dir/$tmpfiles_conf.new" "$tmpfiles_dir/$tmpfiles_conf" || return 1
   systemctl daemon-reload || return 1
+}
+
+create_tmpfiles() {
+  # Recreate the volatile tester lock directory at install time (and at boot via
+  # the installed tmpfiles.d drop-in) so maintenance units work after a reboot.
+  mkdir -m 0755 "$(dirname "$runtime_lock")" 2>/dev/null || true
+  secure_dir "$(dirname "$runtime_lock")" 755
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then systemd-tmpfiles --create "$tmpfiles_dir/$tmpfiles_conf" 2>/dev/null || true; fi
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  local unit present=0
-  for unit in "${units[@]}"; do [[ ! -e $systemd_dir/$unit ]] || present=1; done
-  if ((present)); then systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || return 1
-  else systemctl disable --now "${timers[@]}" >/dev/null 2>&1 || true
+  local unit present_units=() present_timers=()
+  for unit in "${units[@]}"; do
+    [[ ! -e $systemd_dir/$unit ]] || present_units+=("$unit")
+  done
+  for unit in "${timers[@]}"; do
+    [[ ! -e $systemd_dir/$unit ]] || present_timers+=("$unit")
+  done
+  if (( ${#present_timers[@]} )); then
+    systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
   fi
-  for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
+  for unit in "${present_units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
   systemctl daemon-reload
 }
 
@@ -160,10 +183,10 @@ activate_release() {
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-  if ! install_launcher "$target" || ! install_units "$target" || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
+  if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-      if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; launcher and incumbent link retained for recovery'; fi
+      if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; launcher and incumbent link retained for recovery'; fi
     else
       remove_units || die 'candidate activation failed and fresh-install unit teardown also failed; candidate retained for recovery'
       rm -f -- "$current_link" "$stable_launcher"

@@ -42,6 +42,7 @@ case ${operation:-} in
       custom-volume) volume_extra=',"driver":"local"' ;;
       volumes-from) service_extra=',"volumes_from":["container:other:rw"]' ;;
       custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
+      ipam) network_extra=',"ipam":{"config":[{"subnet":"172.30.0.0/24"}]}' ;;
       replicas) service_extra=',"deploy":{"replicas":2}' ;;
       lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
       gpu) service_extra=',"gpus":"all"' ;;
@@ -55,6 +56,8 @@ case ${operation:-} in
       uts-host) service_extra=',"uts":"host"' ;;
       remote-logging) service_extra=',"logging":{"driver":"syslog","options":{"syslog-address":"tcp://example.invalid:514"}}' ;;
       interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
+      profiles) service_extra=',"profiles":["extra"]' ;;
+      label-file) service_extra=',"label_file":"/root/credential.env"' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}

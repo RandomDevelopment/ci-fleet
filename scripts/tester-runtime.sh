@@ -114,8 +114,9 @@ validate_compose() {
 import re,sys
 text=open(sys.argv[1],encoding='utf-8').read()
 key=r'(?:!!str[ \t]+)?(?:include|"include"|\x27include\x27)[ \t]*:'
+explicit_key=r'(?m)^[ \t]*\?[ \t]*(?:include|"include"|\x27include\x27)[ \t]*:?$'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
-if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text): raise SystemExit('Compose include or escaped mapping key is forbidden')
+if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text): raise SystemExit('Compose include or escaped mapping key is forbidden')
 PY
   then return 1; fi
   if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
@@ -137,6 +138,8 @@ for name,service in services.items():
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
+    if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
+    if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
     if service.get('security_opt') not in (['no-new-privileges:true'],['no-new-privileges=true']): raise SystemExit(f'{name}: no-new-privileges=true must be the only security option')
     for mount in service.get('volumes',[]):
@@ -151,6 +154,7 @@ for section in ('networks','volumes'):
         resolved=item.get('name',f'{project}_{name}')
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
         if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
+        if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
 for name,item in value.get('secrets',{}).items():
     path=item.get('file')
@@ -189,7 +193,7 @@ prepare_converge() {
   load_spec "$environment"
   check_port_unique
   count=$(find "$state_dir" -maxdepth 1 -type f -name '*.state' | wc -l)
-  [[ -f $(state_path "$environment") || $count -private-repository $max_environments ]] || die 'maximum environment count reached'
+  [[ -f $(state_path "$environment") || $count -lt $max_environments ]] || die 'maximum environment count reached'
   prepared_rendered=$(mktemp)
   if ! validate_compose "$prepared_rendered"; then rm -f "$prepared_rendered"; die 'compose policy validation failed'; fi
   if [[ $action == --converge && -f $(state_path "$environment") ]]; then
@@ -278,7 +282,7 @@ case $action in
     getent ahosts "$probe_host" >/dev/null || die 'test-host DNS probe failed'
     curl --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
     used=$(df -P "$(root_path /var/lib/docker)" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
-    [[ $used =~ ^[0-9]+$ && $used -private-repository $disk_warn ]] || die 'Docker storage exceeds configured warning threshold'
+    [[ $used =~ ^[0-9]+$ && $used -lt $disk_warn ]] || die 'Docker storage exceeds configured warning threshold'
     report "CHECK_OK max_environments=$max_environments disk_used_percent=$used"
     ;;
   --converge) converge ;;

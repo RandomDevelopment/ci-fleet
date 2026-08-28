@@ -15,6 +15,7 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/ci-fleet-tester -/run/lock/ci-fleet-tester
+TimeoutStartSec=300
 RestrictAddressFamilies=AF_UNIX
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

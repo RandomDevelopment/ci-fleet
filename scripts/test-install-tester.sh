@@ -72,7 +72,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network replicas lifecycle-hook gpu deploy-device build; do
+for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas lifecycle-hook gpu deploy-device build profiles label-file; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
@@ -81,6 +81,10 @@ printf 'include:\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-fleet-te
 if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'Compose include was accepted before rendering'; fi
 printf '"incl\\u0075de": [{path: /etc/passwd}]\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
 if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'escaped Compose include was accepted'; fi
+printf '? "include":\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
+if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'explicit-key Compose include was accepted'; fi
+printf "? 'include':\n  - path: /etc/passwd\nservices: {}\n" >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
+if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'single-quoted explicit-key Compose include was accepted'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -137,6 +141,23 @@ done
 
 # Commit-backed installer tests run after the implementation commit exists.
 ref=$(git -C "$repo_root" rev-parse HEAD)
+# A release archive containing a symlinked or non-regular member must be rejected
+# before chmod can dereference it and alter a host-side target's permissions.
+symlink_repo=$tmp/symlink-repo
+git init --quiet "$symlink_repo"
+git -C "$symlink_repo" config user.name Example
+git -C "$symlink_repo" config user.email example@invalid.example
+mkdir -p "$symlink_repo/scripts" "$symlink_repo/host/systemd"
+cp "$repo_root/scripts/tester-runtime.sh" "$symlink_repo/scripts/tester-runtime.sh"
+cp "$repo_root/scripts/tester-launcher.sh" "$symlink_repo/scripts/tester-launcher.sh"
+cp "$repo_root"/host/systemd/ci-fleet-tester-*.service "$repo_root"/host/systemd/ci-fleet-tester-*.timer "$symlink_repo/host/systemd/"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$symlink_repo/scripts/host-evil"; chmod 0755 "$symlink_repo/scripts/host-evil"
+rm -f "$symlink_repo/scripts/tester-runtime.sh"
+ln -s host-evil "$symlink_repo/scripts/tester-runtime.sh"
+git -C "$symlink_repo" add -A
+git -C "$symlink_repo" commit --quiet -m 'fixture: symlinked release member'
+symlink_ref=$(git -C "$symlink_repo" rev-parse HEAD)
+if "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$symlink_ref" >/dev/null 2>&1; then fail 'install accepted a release archive with a symlinked member'; fi
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'fresh install failed'
 rm -rf "$root/run/lock/ci-fleet-tester"
@@ -148,7 +169,17 @@ for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; d
 check_output=$("$installer" --check --config /etc/ci-fleet-tester/tester.env)
 grep -Fq CHECK_OK <<<"$check_output" || fail 'installed check failed'
 for unit in ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer; do [[ -f $root/etc/systemd/system/$unit ]] || fail "unit missing: $unit"; done
+for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
+  grep -Fq 'TimeoutStartSec=300' "$root/etc/systemd/system/$service" || fail "$service does not bound oneshot start time"
+done
 release=$root/opt/ci-fleet-tester/releases/$ref
+# Reboot-creatable lock path: the tmpfiles.d drop-in ships in the release and
+# recreates the volatile lock directory, so maintenance units survive a reboot.
+[[ -f $release/host/systemd/ci-fleet-tester-lock.conf ]] || fail 'tmpfiles.d lock drop-in is missing from the release'
+grep -Eq '^d /run/lock/ci-fleet-tester 0755' "$release/host/systemd/ci-fleet-tester-lock.conf" || fail 'tmpfiles.d drop-in does not recreate the tester lock directory'
+rm -rf "$root/run/lock/ci-fleet-tester"
+if "$release/scripts/tester-runtime.sh" --health >/dev/null 2>&1; then :; fi
+[[ -d $root/run/lock/ci-fleet-tester && ! -L $root/run/lock/ci-fleet-tester && $(stat -c %a "$root/run/lock/ci-fleet-tester") == 755 ]] || fail 'stable launcher did not recreate the volatile lock directory'
 chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'tampered installed release passed check'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
@@ -198,7 +229,7 @@ grep -Fq 'enable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.time
 disable_line=$(grep -n '^systemctl disable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
 check_line=$(grep -n '^docker info ' "$tmp/events.log" | tail -1 | cut -d: -f1)
 enable_line=$(grep -n '^systemctl enable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
-[[ -n $disable_line && -n $check_line && -n $enable_line && $disable_line -private-repository $check_line && $check_line -private-repository $enable_line ]] || fail 'timers were not quiesced until candidate validation completed'
+[[ -n $disable_line && -n $check_line && -n $enable_line && $disable_line -lt $check_line && $check_line -lt $enable_line ]] || fail 'timers were not quiesced until candidate validation completed'
 
 # Rollback switches only to a complete recorded release and keeps environments intact.
 old=0000000000000000000000000000000000000000
@@ -247,4 +278,10 @@ git -C "$upgrade_repo" checkout --quiet "$bad_ref"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'invalid fresh install succeeded'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed fresh-install teardown removed the recovery link'
 "$upgrade_repo/scripts/install-tester.sh" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null
+# Partial unit set (interrupted install) must still uninstall cleanly rather
+# than failing because a timer unit file is missing.
+"$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'fresh install failed before partial-unit test'
+rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.timer"
+"$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed on a partial unit set'
+[[ -L $root/opt/ci-fleet-tester/current ]] && fail 'partial uninstall left the active release link'
 printf 'TESTER_INSTALLER_TESTS_OK\n'
