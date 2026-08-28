@@ -15,6 +15,7 @@ from desired_state import (
     load_engine_capabilities,
     load_and_validate_config,
     parse_env,
+    validate_docker_network_policy,
     validate_host_values,
 )
 
@@ -36,6 +37,16 @@ def host_values() -> dict[str, str]:
     }
 
 
+def docker_network_policy() -> dict:
+    return {
+        "networks_per_runner": 1,
+        "reserve_subnets": 1,
+        "default_address_pools": [
+            {"base": "198.51.100.0/24", "size": 28},
+        ],
+    }
+
+
 class DesiredStateTests(unittest.TestCase):
     def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
@@ -45,7 +56,7 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config"} if capabilities is None else capabilities,
+            engine_capabilities={"status_reporting_config", "docker_network_policy_config"} if capabilities is None else capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -62,7 +73,10 @@ class DesiredStateTests(unittest.TestCase):
             "enabled": True,
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
-        environment, _ = self.render(value, {"status_reporting_config", "required_status_reporting"})
+        environment, _ = self.render(
+            value,
+            {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+        )
         self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
         value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
         with tempfile.TemporaryDirectory() as directory:
@@ -84,7 +98,7 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
-            self.render(value, set())
+            self.render(value, {"docker_network_policy_config"})
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "engine-capabilities.json"
             manifest.write_text("not json", encoding="utf-8")
@@ -100,7 +114,7 @@ class DesiredStateTests(unittest.TestCase):
     def test_omitted_status_reporting_accepts_older_engine(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"].pop("status_reporting", None)
-        environment, metadata = self.render(value, set())
+        environment, metadata = self.render(value, {"docker_network_policy_config"})
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertFalse(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
@@ -112,11 +126,123 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
-            self.render(value, set())
-        environment, metadata = self.render(value, {"status_reporting_config"})
+            self.render(value, {"docker_network_policy_config"})
+        environment, metadata = self.render(value, {"status_reporting_config", "docker_network_policy_config"})
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertTrue(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
+
+    def test_docker_network_policy_renders_read_only_inspection_values(self) -> None:
+        value = config()
+        policy = docker_network_policy()
+        policy["networks_per_runner"] = 2
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = policy
+        environment, metadata = self.render(value)
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"], "1")
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"], "198.51.100.0/24")
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"], "28")
+        self.assertEqual(environment["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"], "2")
+        self.assertEqual(environment["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"], "1")
+        self.assertTrue(metadata["docker_network_policy_configured"])
+        self.assertEqual(metadata["docker_network_default_address_pools"], 1)
+        self.assertEqual(metadata["docker_networks_per_runner"], 2)
+        self.assertEqual(metadata["docker_network_reserve_subnets"], 1)
+
+    def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"].pop("docker_network_policy", None)
+        environment, metadata = self.render(value, set())
+        self.assertNotIn("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", environment)
+        self.assertFalse(metadata["docker_network_policy_configured"])
+
+    def test_docker_network_policy_requires_engine_capability(self) -> None:
+        with self.assertRaisesRegex(DesiredStateError, "network policy configuration"):
+            self.render(config(), {"status_reporting_config"})
+
+    def test_render_rejects_present_null_docker_network_policy(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = None
+        with self.assertRaisesRegex(DesiredStateError, "must be an object"):
+            self.render(value)
+
+    def test_docker_network_policy_requires_capacity_for_reserve(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["max_runners"] = 2
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = {
+            "networks_per_runner": 1,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/29", "size": 29}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(DesiredStateError, "capacity"):
+                load_and_validate_config(path)
+
+    def test_docker_network_policy_reserves_controller_compose_subnet(self) -> None:
+        with self.assertRaisesRegex(DesiredStateError, "controller Compose network"):
+            validate_docker_network_policy(
+                {
+                    "networks_per_runner": 1,
+                    "reserve_subnets": 1,
+                    "default_address_pools": [{"base": "198.51.100.0/28", "size": 29}],
+                },
+                path="$.controllers.example-ci-01.docker_network_policy",
+                max_runners=1,
+            )
+
+    def test_docker_network_policy_accepts_29_and_rejects_smaller_allocations(self) -> None:
+        policy = {
+            "networks_per_runner": 1,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/24", "size": 29}],
+        }
+        validate_docker_network_policy(
+            policy,
+            path="$.controllers.example-ci-01.docker_network_policy",
+            max_runners=1,
+        )
+        for size in (30, 31, 32):
+            with self.subTest(size=size):
+                policy["default_address_pools"][0]["size"] = size
+                with self.assertRaisesRegex(DesiredStateError, "between 0 and 29"):
+                    validate_docker_network_policy(
+                        policy,
+                        path="$.controllers.example-ci-01.docker_network_policy",
+                        max_runners=1,
+                    )
+
+    def test_docker_network_policy_accounts_for_every_runner_network(self) -> None:
+        policy = {
+            "networks_per_runner": 2,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/27", "size": 29}],
+        }
+        with self.assertRaisesRegex(DesiredStateError, r"max_runners \* networks_per_runner"):
+            validate_docker_network_policy(
+                policy,
+                path="$.controllers.example-ci-01.docker_network_policy",
+                max_runners=2,
+            )
+        policy["default_address_pools"].append({"base": "203.0.113.0/28", "size": 29})
+        configured, reserve, networks_per_runner, _ = validate_docker_network_policy(
+            policy,
+            path="$.controllers.example-ci-01.docker_network_policy",
+            max_runners=2,
+        )
+        self.assertEqual((configured, reserve, networks_per_runner), (6, 1, 2))
+
+    def test_disabled_docker_network_policy_keeps_reserve_and_controller_capacity(self) -> None:
+        configured, _, _, _ = validate_docker_network_policy(
+            {
+                "networks_per_runner": 100,
+                "reserve_subnets": 1,
+                "default_address_pools": [{"base": "198.51.100.0/28", "size": 29}],
+            },
+            path="$.controllers.example-ci-01.docker_network_policy",
+            max_runners=0,
+        )
+        self.assertEqual(configured, 2)
 
     def test_drained_controller_renders_zero_effective_capacity(self) -> None:
         value = config()

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -30,6 +31,7 @@ HOST_REQUIRED = {
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
+DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
 
 
 class DesiredStateError(ValueError):
@@ -137,6 +139,63 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     }
 
 
+def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        raise DesiredStateError(f"{path}: must be an object")
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
+    if set(policy) != required:
+        unknown = sorted(set(policy) - required)
+        missing = sorted(required - set(policy))
+        messages: list[str] = []
+        if missing:
+            messages.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            messages.append(f"unknown keys: {', '.join(unknown)}")
+        raise DesiredStateError(f"{path}: " + "; ".join(messages))
+    reserve = policy.get("reserve_subnets")
+    if type(reserve) is not int or reserve < 1:
+        raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
+    networks_per_runner = policy.get("networks_per_runner")
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        raise DesiredStateError(f"{path}.networks_per_runner: must be a positive integer")
+    pools = policy.get("default_address_pools")
+    if type(pools) is not list or not pools:
+        raise DesiredStateError(f"{path}.default_address_pools: must be a non-empty list")
+    parsed: list[dict[str, Any]] = []
+    for index, pool in enumerate(pools):
+        pool_path = f"{path}.default_address_pools[{index}]"
+        if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
+            raise DesiredStateError(f"{pool_path}: must contain only base and size")
+        base = pool.get("base")
+        size = pool.get("size")
+        if not isinstance(base, str):
+            raise DesiredStateError(f"{pool_path}.base: must be a CIDR prefix")
+        if type(size) is not int or size < 0 or size > 29:
+            raise DesiredStateError(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 29")
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError as exc:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix") from exc
+        if network.version != 4:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix")
+        if size < network.prefixlen:
+            raise DesiredStateError(f"{pool_path}.size: impossible subnet count for {base}")
+        parsed.append({"base": base, "network": network, "size": size})
+    for left, item in enumerate(parsed):
+        for right in range(left + 1, len(parsed)):
+            other = parsed[right]
+            if item["network"].overlaps(other["network"]):
+                raise DesiredStateError(
+                    f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}"
+                )
+    configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
+    if configured < max_runners * networks_per_runner + reserve + 1:
+        raise DesiredStateError(
+            f"{path}: network capacity cannot satisfy max_runners * networks_per_runner + reserve_subnets + one controller Compose network"
+        )
+    return configured, reserve, networks_per_runner, parsed
+
+
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     controllers = config["controllers"]
     if controller_id not in controllers:
@@ -169,6 +228,17 @@ def build_rendered_env(
     state = controller["state"]
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
+    network_policy_configured = "docker_network_policy" in controller
+    network_policy = controller.get("docker_network_policy")
+    configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = (0, 0, 0, [])
+    if network_policy_configured:
+        configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = validate_docker_network_policy(
+            network_policy,
+            path=f"$.controllers.{controller_id}.docker_network_policy",
+            max_runners=configured_max if state != "disabled" else 0,
+        )
+        if DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support Docker network policy configuration")
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
@@ -194,6 +264,13 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if network_policy_configured:
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
+        rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"] = str(networks_per_runner)
+        rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"] = str(reserve_subnets)
+        for index, pool_config in enumerate(parsed_pools):
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
@@ -222,6 +299,11 @@ def build_rendered_env(
         "engine_repository": config["organization"]["delivery_engine"],
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
+        "docker_network_policy_configured": network_policy_configured,
+        "docker_network_default_address_pools": len(parsed_pools),
+        "docker_networks_per_runner": networks_per_runner,
+        "docker_network_reserve_subnets": reserve_subnets,
+        "docker_network_configured_subnets": configured_subnets,
     }
     return rendered, metadata
 
@@ -288,6 +370,8 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
+    if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support Docker network policy configuration")
     if args.require_status_reporting_config and STATUS_REPORTING_CONFIG_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
@@ -327,6 +411,7 @@ def parse_args() -> argparse.Namespace:
 
     capabilities = subparsers.add_parser("validate-engine-capabilities", help="validate an engine capability declaration")
     capabilities.add_argument("--manifest", type=Path, required=True)
+    capabilities.add_argument("--require-docker-network-policy-config", action="store_true")
     capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)

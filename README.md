@@ -95,6 +95,12 @@ GitHub runner-group policy decides which repositories may schedule work. A share
 | Project repository | Test Dockerfile, services, fixtures, migrations, test plan, `scripts/ci/run.sh` | Fleet controller credentials or host-specific setup |
 | Private installation configuration | Organization settings, repository authorization, logical controller state, capacity budgets, network policy, and required secret names | Secret values, host addresses, project runtime dependencies, or test logic |
 
+One narrow exception lets a private installation configuration commit exact,
+reviewed Docker `default_address_pools[].base` CIDRs. These ranges are allocation
+capacity policy, not host addresses, credentials, host identity, or routable
+service endpoints. VM, storage, backup, SSH, rendered runtime, and unrelated
+infrastructure details remain outside Git.
+
 A public application can use the same fleet indirectly. Its public repository keeps pull-request validation unprivileged, while a separate private delivery repository checks out an approved immutable commit and performs protected CI, release, or deployment work. The public repository itself never receives privileged runner-group access or fleet credentials. See [Public projects, private delivery, and private configuration](docs/PUBLIC-PRIVATE-CONFIGURATION.md).
 
 ## What makes it different?

@@ -4,6 +4,13 @@ This is the public, secret-free starting point for an organization's private `ci
 
 It does **not** contain runner registration tokens, deploy credentials, private keys, host addresses, VM IDs, storage names, backup identifiers, or `.env` files.
 
+One explicit exception permits reviewed operational Docker
+`default_address_pools[].base` CIDRs in this private Git-authored policy. The
+controller must render and inspect those exact capacity ranges. They are not host
+addresses, credentials, host identity, or routable service endpoints. All VM,
+storage, backup, SSH, rendered runtime, and unrelated infrastructure details stay
+outside Git.
+
 ```mermaid
 flowchart LR
   E[Public ci-fleet engine] -->|pinned engine commit| C[Private configuration]
@@ -36,10 +43,12 @@ flowchart LR
      --location primary-site \
      --capacity-budget 1 \
      --max-runners 1 \
+     --networks-per-runner 1 \
      --engine-ref <reviewed-ci-fleet-commit>
    ```
 
-3. Edit `fleet.json` to add the organization's real logical mappings.
+3. Edit `fleet.json` to add the organization's real logical mappings and replace
+   the generated RFC 5737 Docker pool with a reviewed operational Docker pool.
 4. Run the strict policy check:
 
    ```bash
@@ -48,7 +57,7 @@ flowchart LR
 
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
-The initializer refuses to replace a configured file unless `--force` is explicit. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, resource, and output options.
+The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, resource, and output options.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -60,7 +69,9 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - an `experimental`, `stable`, or `retiring` lifecycle;
 - the full reviewed ci-fleet commit SHA it runs;
 - a zero managed minimum and reviewed maximum runner capacity;
-- CPU and memory available to each ephemeral runner.
+- CPU and memory available to each ephemeral runner;
+- Docker default-address pools, a positive reviewed maximum number of Compose
+  networks per runner, and a reserved subnet count for health inspection.
 
 `status_reporting` is deliberately omitted from initialized and reference
 configurations. For an existing controller, roll out schema support in three
@@ -76,6 +87,21 @@ This staging prevents an older active manager from rejecting the new property be
 can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
+The same per-controller evidence record may declare
+`docker_network_policy_config`. A controller may omit this boolean only while it
+omits `docker_network_policy`. A retained policy requires current evidence for
+the selected engine with this boolean set to `true`. A complete record has this
+shape after an operator has verified the named engine is active:
+
+```json
+{
+  "engine_ref": "1111111111111111111111111111111111111111",
+  "status_reporting_config": false,
+  "required_status_reporting": false,
+  "docker_network_policy_config": true
+}
+```
+
 The controller ID is how a target host selects its declaration. A location is a non-sensitive logical slug such as `primary-site` or `remote-site`, never an address. Runtime-generated configuration and credentials remain host-local.
 
 ### Pool capacity is infrastructure policy
@@ -83,6 +109,36 @@ The controller ID is how a target host selects its declaration. A location is a 
 Each runner pool has a `capacity_budget` and a runner group that must not be assigned to any other pool. Unique runner-group assignment keeps routing and repository authorization unambiguous. The semantic validator enforces this cross-object rule because JSON Schema cannot compare values stored in separate object properties.
 
 The validator totals the maximum capacity of every active or drained controller assigned to the pool and rejects overcommit. Drained capacity remains reserved so an undrain cannot silently exceed the reviewed budget. Disabled controllers do not reserve capacity.
+
+For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
+subnet prefix `size`. The size must be no longer than `/29` and cannot be
+broader than its base. Pools must not overlap, and active or drained controllers
+must provide at least `max_runners * networks_per_runner + reserve_subnets + 1`
+subnets. The final
+subnet is reserved for the persistent controller Compose network. Real pool
+values belong in the private configuration; this template uses RFC 5737
+documentation ranges only. Non-strict validation accepts those public examples.
+Strict validation rejects them until the private configuration uses a reviewed
+operational Docker pool CIDR. This is the narrow capacity-policy exception
+described above, not permission to commit host or service addresses.
+
+The field is optional solely for staged upgrades from older schema-v3 engines.
+First pin and activate a compatible engine without adding the field. In a second
+reviewed desired-state commit, record the active ref and
+`docker_network_policy_config: true` in `engine-rollout-evidence.json`. Add the
+reviewed policy in a third commit, retaining the same ref and evidence. The older
+engine rejects the new key, so skipped commits must not satisfy the gate.
+Transition validation requires the activation evidence to exist in the previous
+integrated state when introducing the policy. It also requires matching current
+evidence whenever a controller retains the policy, including across engine
+changes or rollbacks.
+
+The public engine renders these values only for read-only health inspection.
+This phase detects low water, exhaustion, failed inspection, and legacy
+networks; it does not configure or restart Docker, create/delete networks,
+clean resources, drain runners, or change controller scale. Circuit breaking,
+frequent orphan reconciliation, daemon mutation, transactional recovery, and
+consumer-label changes are later issue #81 slices.
 
 Application repositories do not encode the number of available workers. They submit all independent tasks and shards. Do not use GitHub Actions `strategy.max-parallel` to model fleet size; controllers and the private configuration decide how many jobs run simultaneously. An application may limit concurrency only for a separately documented external-system constraint, not worker availability.
 
