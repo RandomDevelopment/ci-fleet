@@ -151,7 +151,7 @@ require_commands() {
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
   [[ "$mode" == rollback || "$mode" == uninstall ]] && return
 
-  for command in curl jq df; do command -v "$command" >/dev/null || die "$command is required"; done
+  for command in curl jq df openssl; do command -v "$command" >/dev/null || die "$command is required"; done
   os_release=$(root_path /etc/os-release)
   [[ -r "$os_release" ]] || die 'supported Linux release metadata is unavailable'
   os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' "$os_release")

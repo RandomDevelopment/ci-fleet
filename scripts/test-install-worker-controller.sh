@@ -202,6 +202,23 @@ EOF
 chmod 700 "$fake_bin/df"
 
 export PATH="$fake_bin:$PATH"
+
+# Build a PATH that mirrors the real one but omits openssl, so the
+# installer's command-presence preflight can be exercised for the
+# remote-reconciliation dependency without disturbing the rest of the test.
+no_ssl_dir=$tmp/bin-no-ssl
+mkdir -p "$no_ssl_dir"
+IFS=: read -ra path_dirs <<< "$PATH"
+for dir in "${path_dirs[@]}"; do
+  [[ -d "$dir" ]] || continue
+  for entry in "$dir"/*; do
+    base=$(basename "$entry")
+    [[ "$base" == openssl ]] && continue
+    [[ -e "$no_ssl_dir/$base" ]] || ln -sf "$entry" "$no_ssl_dir/$base" 2>/dev/null
+  done
+done
+export NO_SSL_PATH="$no_ssl_dir"
+
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
 export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
@@ -338,6 +355,11 @@ printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 export FAKE_DISK_USED_PERCENT=80
 expect_failure 'Docker filesystem must remain below 80% utilization' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 unset FAKE_DISK_USED_PERCENT
+
+# Remote reconciliation enables the ci-fleet-reconcile timer during install,
+# and reconciliation signs the GitHub App JWT with openssl. Require openssl
+# before install/check so the enabled timer cannot fail at runtime.
+expect_failure 'openssl is required' env PATH="$NO_SSL_PATH" "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
 staged_checkpoint="$root/var/lib/ci-fleet/checkpoints/.checkpoint.staging.interrupted"
 mkdir -p "$staged_checkpoint"
