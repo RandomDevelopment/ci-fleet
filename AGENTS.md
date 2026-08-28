@@ -25,7 +25,7 @@ Agents modifying this repository or adapting a project MUST apply these document
 - Keep original project code compatible with the Unlicense.
 - Do not copy GPL-licensed implementation code into this repository.
 - Preserve required notices for third-party code or substantial examples.
-- Never commit credentials, registration tokens, private keys, real environment files, internal host inventories, private IP addresses, or unredacted infrastructure reports.
+- Never commit credentials, registration tokens, private keys, real environment files, internal host inventories, host addresses, service addresses, or unredacted infrastructure reports. The sole address exception is reviewed Docker `default_address_pools[].base` CIDRs in private Git-authored fleet policy because they are required capacity policy. This exception does not allow credentials, SSH details, secrets, VM, storage, or backup identifiers, unrelated infrastructure addresses, or rendered runtime configuration.
 - Use examples and placeholders for organization-specific configuration.
 - Store long-lived GitHub credentials only in a controller or external secret manager.
 - Do not expose long-lived controller credentials to job runner containers.
