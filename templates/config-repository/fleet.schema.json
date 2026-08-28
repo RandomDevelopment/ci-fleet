@@ -81,6 +81,28 @@
         "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
         "runner_resources": {"$ref": "#/$defs/runner_resources"},
+        "docker_network_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default_address_pools", "networks_per_runner", "reserve_subnets"],
+          "properties": {
+            "networks_per_runner": {"type": "integer", "minimum": 1},
+            "reserve_subnets": {"type": "integer", "minimum": 1},
+            "default_address_pools": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base", "size"],
+                "properties": {
+                  "base": {"type": "string"},
+                  "size": {"type": "integer", "minimum": 0, "maximum": 29}
+                }
+              }
+            }
+          }
+        },
         "status_reporting": {
           "type": "object",
           "additionalProperties": false,

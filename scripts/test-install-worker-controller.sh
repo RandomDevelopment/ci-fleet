@@ -240,19 +240,22 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref} reporting=${5:-false}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" <<'PY'
 import json
 import sys
-source, target, evidence_target, engine_ref, state, maximum, budget, reporting = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
 controller = value["controllers"]["example-ci-01"]
+controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)
+if network_policy == "omit":
+    controller.pop("docker_network_policy")
 if reporting == "omit":
     controller.pop("status_reporting", None)
 else:
@@ -272,6 +275,7 @@ with open(evidence_target, "w", encoding="utf-8") as handle:
                 "engine_ref": engine_ref,
                 "status_reporting_config": True,
                 "required_status_reporting": True,
+                "docker_network_policy_config": network_policy != "omit",
             },
         },
     }, handle, indent=2)
@@ -682,11 +686,11 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 
 # Public pre-health engine fixture; do not depend on a local remote-tracking ref.
 legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
-legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false)
+legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
-legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true)
+legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
-legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
+legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit omit)
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}

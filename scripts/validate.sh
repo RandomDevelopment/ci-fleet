@@ -26,7 +26,7 @@ python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
 scripts/test-bootstrap-github.sh
 python3 -m json.tool schemas/status-report-v1.json >/dev/null
-python3 scripts/desired_state.py validate-engine-capabilities --manifest engine-capabilities.json --require-status-reporting-config --require-status-reporting >/dev/null
+python3 scripts/desired_state.py validate-engine-capabilities --manifest engine-capabilities.json --require-docker-network-policy-config --require-status-reporting-config --require-status-reporting >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
