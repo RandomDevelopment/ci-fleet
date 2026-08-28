@@ -277,7 +277,7 @@ PY
   note "REGISTRATION_URL http://$callback_host:$port/"
   note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
   deadline=$((SECONDS + timeout))
-  while [[ ! -f $code_file && $SECONDS -private-repository $deadline ]]; do
+  while [[ ! -f $code_file && $SECONDS -lt $deadline ]]; do
     callback_is_running || { reap_callback_if_exited; die 'registration callback stopped before receiving approval'; }
     sleep 1
   done
