@@ -39,7 +39,23 @@ def healthy_snapshot():
     }
 
 
+def network_policy_values() -> dict[str, str]:
+    return {
+        "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+        "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/24",
+        "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "28",
+        "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER": "1",
+        "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
+    }
+
+
 class HealthTests(unittest.TestCase):
+    def assert_unavailable_network(self, network: dict) -> None:
+        self.assertEqual(network, {"configured": 16, "reserve": 1, "state": "unavailable"})
+        snapshot = {**healthy_snapshot(), "docker_network_headroom": network}
+        report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+        self.assertNotIn("network", report["docker"])
+
     def test_healthy_active_host(self) -> None:
         report = health.evaluate(healthy_snapshot(), health.Thresholds())
         self.assertEqual(report["status"], "healthy")
@@ -58,6 +74,241 @@ class HealthTests(unittest.TestCase):
         report = health.evaluate(critical, health.Thresholds())
         self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
         self.assertIn("disk_docker", {check["id"] for check in report["checks"] if check["status"] == "critical"})
+
+    def test_docker_network_headroom_reports_low_water_exhaustion_and_legacy_networks(self) -> None:
+        healthy = health.evaluate({**healthy_snapshot(), "docker_network_headroom": {"configured": 16, "used": 2, "free": 14, "reserve": 1, "legacy": 0, "state": "healthy"}}, health.Thresholds())
+        self.assertEqual(healthy["status"], "healthy")
+        self.assertIn("docker_network_headroom", {check["id"] for check in healthy["checks"] if check["status"] == "ok"})
+
+        warning = health.evaluate({**healthy_snapshot(), "docker_network_headroom": {"configured": 2, "used": 1, "free": 1, "reserve": 1, "legacy": 0, "state": "warning"}}, health.Thresholds())
+        self.assertEqual((warning["status"], warning["exit_code"]), ("warning", 1))
+        self.assertIn("docker_network_headroom", {check["id"] for check in warning["checks"] if check["status"] == "warning"})
+
+        critical = health.evaluate({**healthy_snapshot(), "docker_network_headroom": {"configured": 1, "used": 1, "free": 0, "reserve": 1, "legacy": 0, "state": "critical"}}, health.Thresholds())
+        self.assertEqual((critical["status"], critical["exit_code"]), ("unhealthy", 2))
+        self.assertIn("docker_network_headroom", {check["id"] for check in critical["checks"] if check["status"] == "critical"})
+
+        legacy = health.evaluate({**healthy_snapshot(), "docker_network_headroom": {"configured": 2, "used": 0, "free": 2, "reserve": 1, "legacy": 1, "state": "warning"}}, health.Thresholds())
+        self.assertEqual(legacy["status"], "warning")
+        self.assertIn("docker_network_legacy", {check["id"] for check in legacy["checks"] if check["status"] == "warning"})
+
+    def test_docker_network_headroom_collection_handles_inspection_failure(self) -> None:
+        def run(args):
+            if args[:2] == ["docker", "info"]:
+                return health.subprocess.CompletedProcess(args, 0, "", "")
+            return health.subprocess.CompletedProcess(args, 1, "", "")
+
+        snapshot = health.collect_snapshot({**network_policy_values(), "CI_FLEET_CONTROLLER_STATE": "active", "CI_FLEET_INSTANCE": "example-ci-01"}, run=run)
+        self.assert_unavailable_network(snapshot["docker_network_headroom"])
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": snapshot["docker_network_headroom"]}, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("unhealthy", 2))
+        self.assertIn("docker_network_inspection", {check["id"] for check in report["checks"] if check["status"] == "critical"})
+
+    def test_legacy_rendered_state_without_network_policy_remains_compatible(self) -> None:
+        network = health._docker_network_headroom(lambda args: health.subprocess.CompletedProcess(args, 0, "", ""), {}, docker_ok=True)
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": network}, health.Thresholds())
+        self.assertEqual(network["state"], "not_configured")
+        self.assertNotIn("docker_network_inspection", {check["id"] for check in report["checks"]})
+
+    def test_legacy_status_report_omits_unconfigured_docker_network(self) -> None:
+        for docker_ok in (True, False):
+            with self.subTest(docker_ok=docker_ok):
+                network = health._docker_network_headroom(
+                    lambda args: health.subprocess.CompletedProcess(args, 0, "", ""), {}, docker_ok=docker_ok
+                )
+                snapshot = {**healthy_snapshot(), "docker_network_headroom": network}
+                report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+                self.assertEqual(network["state"], "not_configured")
+                self.assertNotIn("network", report["docker"])
+
+    def test_docker_unavailable_preserves_configured_network_policy_only_locally(self) -> None:
+        network = health._docker_network_headroom(
+            lambda args: health.subprocess.CompletedProcess(args, 0, "", ""),
+            network_policy_values(),
+            docker_ok=False,
+        )
+        self.assert_unavailable_network(network)
+
+    def test_network_pool_parser_accepts_29_and_rejects_smaller_allocations(self) -> None:
+        values = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/24",
+        }
+        values["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"] = "29"
+        self.assertIsNotNone(health._parse_network_pool(values, 0))
+        for size in (30, 31, 32):
+            with self.subTest(size=size):
+                values["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"] = str(size)
+                self.assertIsNone(health._parse_network_pool(values, 0))
+
+    def test_incomplete_network_policy_does_not_fabricate_an_aggregate(self) -> None:
+        values = network_policy_values()
+        values.pop("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE")
+        self.assertEqual(
+            health._docker_network_headroom(lambda args: health.subprocess.CompletedProcess(args, 0, "", ""), values, docker_ok=True),
+            {"state": "unavailable"},
+        )
+
+    def test_docker_network_headroom_collection_counts_legacy_networks(self) -> None:
+        networks = {
+            "managed": [{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}],
+            "legacy": [{"IPAM": {"Config": [{"Subnet": "10.0.0.0/24"}]}}],
+        }
+
+        def run(args):
+            if args[:2] == ["docker", "info"]:
+                return health.subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "managed\nlegacy\n", "")
+            if args[:3] == ["docker", "network", "inspect"]:
+                return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+            return health.subprocess.CompletedProcess(args, 0, "", "")
+
+        snapshot = health.collect_snapshot({**network_policy_values(), "CI_FLEET_CONTROLLER_STATE": "active", "CI_FLEET_INSTANCE": "example-ci-01"}, run=run)
+        self.assertEqual(snapshot["docker_network_headroom"], {"configured": 16, "used": 1, "free": 15, "reserve": 1, "legacy": 1, "state": "warning"})
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": snapshot["docker_network_headroom"]}, health.Thresholds())
+        self.assertEqual(report["status"], "warning")
+        external = health.build_status_report({**healthy_snapshot(), "docker_network_headroom": snapshot["docker_network_headroom"]}, report, generated_at=1_000)
+        self.assertEqual(external["docker"]["network"], {"configured": 16, "used": 1, "free": 15, "legacy": 1})
+
+    def test_builtin_addressless_networks_are_ignored_but_custom_ones_are_legacy(self) -> None:
+        networks = {name: [{"IPAM": {"Config": []}}] for name in ("host", "none", "custom")}
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "host\nnone\ncustom\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual(result["legacy"], 1)
+
+    def test_overlapping_builtin_bridge_consumes_allocation_without_legacy_warning(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["legacy"], result["state"]), (1, 15, 0, "healthy"))
+
+    def test_overlapping_builtin_bridge_warns_when_it_breaks_reviewed_capacity(self) -> None:
+        values = network_policy_values()
+        values.update({
+            "CI_FLEET_CONFIGURED_MAX_RUNNERS": "1",
+            "CI_FLEET_CONTROLLER_STATE": "active",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/27",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
+            "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER": "2",
+        })
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/29"}]}}]), "")
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual((result["configured"], result["used"], result["free"], result["legacy"], result["state"]), (4, 1, 3, 0, "warning"))
+
+    def test_non_overlapping_builtin_bridge_is_not_legacy(self) -> None:
+        inspected = []
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            inspected.append(args[-1])
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (0, 0, "healthy"))
+        self.assertEqual(inspected, ["bridge"])
+
+    def test_similar_user_network_is_legacy(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge-copy\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (0, 1, "warning"))
+
+    def test_broader_network_consumes_all_allocation_slots(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broad\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/24"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["state"]), (16, 0, "critical"))
+
+    def test_network_containing_pool_consumes_all_intersecting_slots(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "inverse\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/23"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["free"], result["state"]), (16, 0, "critical"))
+
+    def test_large_pool_gap_counts_overlaps_without_materializing_slots(self) -> None:
+        values = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "240.0.0.0/8",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
+            "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS": "1",
+        }
+        networks = {
+            "broad": [{"IPAM": {"Config": [{"Subnet": "240.0.0.0/8"}]}}],
+            "duplicate": [{"IPAM": {"Config": [{"Subnet": "240.0.0.0/9"}]}}],
+        }
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broad\nduplicate\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual((result["configured"], result["used"], result["free"]), (1 << 21, 1 << 21, 0))
+
+    def test_network_removed_during_inspection_is_skipped_after_refresh(self) -> None:
+        listings = iter(("vanished\nmanaged\n", "managed\n"))
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, next(listings), "")
+            if args[-1] == "vanished":
+                return health.subprocess.CompletedProcess(args, 1, "", "not found")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["state"]), (1, "healthy"))
+
+    def test_disappearing_network_retry_failure_preserves_only_policy_counts(self) -> None:
+        listings = iter(((0, "vanished\n"), (1, "")))
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                returncode, stdout = next(listings)
+                return health.subprocess.CompletedProcess(args, returncode, stdout, "")
+            return health.subprocess.CompletedProcess(args, 1, "", "not found")
+        self.assert_unavailable_network(health._docker_network_headroom(run, network_policy_values(), docker_ok=True))
+
+    def test_network_inspection_error_fails_closed_when_network_still_exists(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broken\n", "")
+            return health.subprocess.CompletedProcess(args, 1, "", "permission denied")
+        self.assert_unavailable_network(health._docker_network_headroom(run, network_policy_values(), docker_ok=True))
+
+    def test_ipv6_ipam_is_ignored_without_hiding_ipv4(self) -> None:
+        networks = {
+            "dual": [{"IPAM": {"Config": [{"Subnet": "2001:db8::/64"}, {"Subnet": "198.51.100.0/28"}]}}],
+            "v6-only": [{"IPAM": {"Config": [{"Subnet": "2001:db8:1::/64"}]}}],
+        }
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "dual\nv6-only\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+        result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual((result["used"], result["legacy"], result["state"]), (1, 0, "healthy"))
+
+    def test_malformed_ipv4_ipam_fails_inspection(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "broken\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": "198.51.100.999/28"}]}}]), "")
+        self.assert_unavailable_network(health._docker_network_headroom(run, network_policy_values(), docker_ok=True))
+
+    def test_status_report_publishes_all_measured_network_states_without_addresses(self) -> None:
+        for state in ("healthy", "warning", "critical"):
+            with self.subTest(state=state):
+                snapshot = {**healthy_snapshot(), "docker_network_headroom": {"configured": 16, "used": 2, "free": 14, "reserve": 1, "legacy": 1, "state": state}}
+                report = health.build_status_report(snapshot, health.evaluate(snapshot, health.Thresholds()), generated_at=1_000)
+                self.assertEqual(report["docker"]["network"], {"configured": 16, "used": 2, "free": 14, "legacy": 1})
+                self.assertNotIn("198.51.100", json.dumps(report))
 
     def test_health_contract_classifies_host_failures(self) -> None:
         cases = {
