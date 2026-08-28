@@ -25,6 +25,13 @@ set -u
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
+if [[ -n ${FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT:-} ]]; then
+  expected_socket=${CI_FLEET_ROOT_PREFIX:-}/var/run/docker.sock
+  [[ ${DOCKER_HOST:-} == "unix://$expected_socket" ]] || {
+    printf 'expected local Docker socket %s, got %s\n' "unix://$expected_socket" "${DOCKER_HOST:-<unset>}" >&2
+    exit 91
+  }
+fi
 case "${1:-}" in
   info)
     [[ "$*" != *DockerRootDir* ]] || printf '%s\n' "${CI_FLEET_DOCKER_ROOT:?}"
@@ -360,6 +367,12 @@ export FAKE_DISK_USED_PERCENT=80
 expect_failure 'Docker filesystem must remain below 80% utilization' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 unset FAKE_DISK_USED_PERCENT
 
+# The installed maintenance scripts must pin the local Docker daemon themselves,
+# not just inherit it from the installer.
+export FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT=1
+expect_success "$repo_root/scripts/cleanup.sh" --apply
+unset FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT
+
 # Remote reconciliation enables the ci-fleet-reconcile timer during install,
 # and reconciliation signs the GitHub App JWT with openssl. Require openssl
 # before install/check so the enabled timer cannot fail at runtime.
@@ -380,6 +393,7 @@ unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+expect_success env DOCKER_CONTEXT=default "$installer" --check "${base_args[@]}" --ref "$ref_one"
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
@@ -395,9 +409,11 @@ chmod 644 "$rendered_env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c %a "$rendered_env") == 600 ]] || fail 'convergence did not repair rendered-environment mode'
+export FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT=1
 manual_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || manual_health_result=$?
 ((manual_health_result < 2)) || fail 'manual healthcheck did not source rendered capacity'
+unset FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck disable=SC1091
+source "$repo_root/scripts/docker-local-env.sh"
+use_local_docker
+
 apply=false
 instance="${CI_FLEET_INSTANCE:-}"
 
@@ -17,6 +22,8 @@ while (($#)); do
   esac
   shift
 done
+
+use_local_docker
 
 command -v docker >/dev/null || { echo "ERROR docker is unavailable" >&2; exit 1; }
 docker info >/dev/null

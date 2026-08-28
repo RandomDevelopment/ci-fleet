@@ -142,8 +142,8 @@ require_commands() {
     command -v "$command" >/dev/null || die "$command is required"
   done
   socket=$(root_path /var/run/docker.sock)
+  [[ -z ${DOCKER_CONTEXT:-} || ${DOCKER_CONTEXT} == default ]] || die 'alternate Docker contexts are not supported; use the local Docker socket'
   [[ -z ${DOCKER_HOST:-} || ${DOCKER_HOST} == "unix://$socket" ]] || die 'alternate Docker endpoints are not supported; use the local Docker socket'
-  [[ -z ${DOCKER_CONTEXT:-} ]] || die 'alternate Docker contexts are not supported; use the local Docker socket'
   DOCKER_HOST=unix://$socket
   export DOCKER_HOST
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
