@@ -16,6 +16,8 @@ export REAL_TAR
 REAL_TAR=$(command -v tar)
 export REAL_GIT
 REAL_GIT=$(command -v git)
+export REAL_DF
+REAL_DF=$(command -v df)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -23,8 +25,18 @@ set -u
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
+if [[ -n ${FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT:-} ]]; then
+  expected_socket=${CI_FLEET_ROOT_PREFIX:-}/var/run/docker.sock
+  [[ ${DOCKER_HOST:-} == "unix://$expected_socket" ]] || {
+    printf 'expected local Docker socket %s, got %s\n' "unix://$expected_socket" "${DOCKER_HOST:-<unset>}" >&2
+    exit 91
+  }
+fi
 case "${1:-}" in
-  info) exit 0 ;;
+  info)
+    [[ "$*" != *DockerRootDir* ]] || printf '%s\n' "${CI_FLEET_DOCKER_ROOT:?}"
+    exit 0
+    ;;
   inspect)
     [[ -f "$state" ]] || exit 1
     if [[ "$*" == *'.Config.Env'* ]]; then
@@ -185,7 +197,35 @@ exec "$REAL_GIT" "$@"
 EOF
 chmod 700 "$fake_bin/git"
 
+cat >"$fake_bin/df" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${FAKE_DISK_USED_PERCENT:-} ]]; then
+  printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+  printf 'fixture 100 90 10 %s%% /fixture\n' "$FAKE_DISK_USED_PERCENT"
+  exit 0
+fi
+exec "$REAL_DF" "$@"
+EOF
+chmod 700 "$fake_bin/df"
+
 export PATH="$fake_bin:$PATH"
+
+# Build a PATH that mirrors the real one but omits openssl, so the
+# installer's command-presence preflight can be exercised for the
+# remote-reconciliation dependency without disturbing the rest of the test.
+no_ssl_dir=$tmp/bin-no-ssl
+mkdir -p "$no_ssl_dir"
+IFS=: read -ra path_dirs <<< "$PATH"
+for dir in "${path_dirs[@]}"; do
+  [[ -d "$dir" ]] || continue
+  for entry in "$dir"/*; do
+    base=$(basename "$entry")
+    [[ "$base" == openssl ]] && continue
+    [[ -e "$no_ssl_dir/$base" ]] || ln -sf "$entry" "$no_ssl_dir/$base" 2>/dev/null
+  done
+done
+export NO_SSL_PATH="$no_ssl_dir"
+
 export FAKE_DOCKER_STATE=$tmp/docker-controller-running
 export FAKE_CONTROLLER_STATUS_FILE=$tmp/docker-controller-status
 export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
@@ -289,7 +329,10 @@ PY
 root=$tmp/host
 export CI_FLEET_ROOT_PREFIX=$root
 export CI_FLEET_DOCKER_ROOT=$root/var/lib/docker
-mkdir -p "$root/etc/ci-fleet/secrets" "$CI_FLEET_DOCKER_ROOT"
+mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
+printf 'fixture CA bundle\n' >"$root/etc/ssl/certs/ca-certificates.crt"
+: >"$root/var/run/docker.sock"
 pem=$root/etc/ci-fleet/secrets/github-app.pem
 printf 'fixture only\n' >"$pem"
 chmod 600 "$pem"
@@ -315,10 +358,32 @@ git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 
+expect_failure 'alternate Docker endpoints are not supported' env DOCKER_HOST=tcp://example.invalid:2376 "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_failure 'alternate Docker contexts are not supported' env DOCKER_CONTEXT=remote "$installer" --check "${base_args[@]}" --ref "$ref_one"
+printf 'ID=example\nVERSION_ID="1"\n' >"$root/etc/os-release"
+expect_failure 'supported Linux is Debian 12 or newer' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
+export FAKE_DISK_USED_PERCENT=80
+expect_failure 'Docker filesystem must remain below 80% utilization' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+unset FAKE_DISK_USED_PERCENT
+
+# The installed maintenance scripts must pin the local Docker daemon themselves,
+# not just inherit it from the installer.
+export FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT=1
+expect_success "$repo_root/scripts/cleanup.sh" --apply
+unset FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT
+
+# Remote reconciliation enables the ci-fleet-reconcile timer during install,
+# and reconciliation signs the GitHub App JWT with openssl. Require openssl
+# before install/check so the enabled timer cannot fail at runtime.
+expect_failure 'openssl is required' env PATH="$NO_SSL_PATH" "$installer" --check "${base_args[@]}" --ref "$ref_one"
+
 staged_checkpoint="$root/var/lib/ci-fleet/checkpoints/.checkpoint.staging.interrupted"
 mkdir -p "$staged_checkpoint"
 : >"$staged_checkpoint/.complete"
+mv "$root/etc/os-release" "$root/etc/os-release.missing"
 expect_failure 'no controller checkpoint is available' "$installer" --rollback
+mv "$root/etc/os-release.missing" "$root/etc/os-release"
 rm -rf "$staged_checkpoint"
 expect_failure 'secret-bearing files are forbidden' "$installer" --check "${base_args[@]}" --ref "$forbidden_ref"
 expect_failure 'possible committed secret detected' "$installer" --check "${base_args[@]}" --ref "$secret_ref"
@@ -328,6 +393,7 @@ unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+expect_success env DOCKER_CONTEXT=default "$installer" --check "${base_args[@]}" --ref "$ref_one"
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
@@ -343,9 +409,11 @@ chmod 644 "$rendered_env"
 expect_failure 'DRIFT rendered_environment' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(stat -c %a "$rendered_env") == 600 ]] || fail 'convergence did not repair rendered-environment mode'
+export FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT=1
 manual_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || manual_health_result=$?
 ((manual_health_result < 2)) || fail 'manual healthcheck did not source rendered capacity'
+unset FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT
 export FAKE_WRONG_INSTALL_STATE_OWNER=$install_state
 expect_failure 'install state must be owned by root with mode 0600' env CI_FLEET_INSTALL_STATE_FILE="$install_state" CI_FLEET_INSTALLER="$installer" "$repo_root/scripts/check-installed-state.sh"
 unset FAKE_WRONG_INSTALL_STATE_OWNER
@@ -640,7 +708,10 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
 export FAKE_DOCKER_STATE=$tmp/adopt-controller-running
-mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
+mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$adopt_root/etc/os-release"
+printf 'fixture CA bundle\n' >"$adopt_root/etc/ssl/certs/ca-certificates.crt"
+: >"$adopt_root/var/run/docker.sock"
 adopt_pem=$adopt_root/etc/ci-fleet/secrets/github-app.pem
 printf 'fixture only\n' >"$adopt_pem"
 chmod 600 "$adopt_pem"
