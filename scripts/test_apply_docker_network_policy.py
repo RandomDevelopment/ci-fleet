@@ -156,6 +156,73 @@ class HealthcheckScriptTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_selected_env_does_not_inherit_removed_pool_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate.env"
+            candidate.write_text(
+                f"CI_FLEET_TESTING=1\nCI_FLEET_ROOT_PREFIX={tmp}\n",
+                encoding="utf-8",
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ -z ${CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT+x} ]] || exit 1\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                CI_FLEET_TESTING="1",
+                CI_FLEET_ROOT_PREFIX=tmp,
+                CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT="2",
+                PATH=f"{fake_bin}:{env['PATH']}",
+            )
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_selected_env_preserves_health_delivery_suppression(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate.env"
+            candidate.write_text(f"CI_FLEET_TESTING=1\nCI_FLEET_ROOT_PREFIX={tmp}\n", encoding="utf-8")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ ${CI_FLEET_HEALTH_SUPPRESS_DELIVERY:-} == 1 ]]\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                CI_FLEET_HEALTH_SUPPRESS_DELIVERY="1",
+                CI_FLEET_TESTING="1",
+                CI_FLEET_ROOT_PREFIX=tmp,
+                PATH=f"{fake_bin}:{env['PATH']}",
+            )
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
 
 class ApplyScriptTests(unittest.TestCase):
     """Integration tests for scripts/apply-docker-network-policy.sh.
@@ -330,6 +397,213 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("checkpoint backup is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_injected_hooks_require_absolute_canonical_regular_executables(self) -> None:
+        env_file = self._write_env_file(self._rendered_with_policy())
+        hook_names = (
+            "CI_FLEET_DOCKER_DRAIN_COMMAND",
+            "CI_FLEET_DOCKER_RESTART_COMMAND",
+            "CI_FLEET_DOCKER_NETWORK_PROBE",
+            "CI_FLEET_HEALTH_CHECK_COMMAND",
+        )
+        self._write_success_commands()
+        target = Path(self.tmp) / "hook-target.sh"
+        target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        for hook_name in hook_names:
+            with self.subTest(hook_name=hook_name):
+                daemon = self._write_daemon("{}\n")
+                link = Path(self.tmp) / f"{hook_name}.sh"
+                link.symlink_to(target)
+                checkpoint = Path(self.tmp) / f"checkpoint-{hook_name}"
+
+                result = subprocess.run(
+                    [
+                        str(SCRIPTS / "apply-docker-network-policy.sh"),
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--env",
+                        str(env_file),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=self._env(**{hook_name: str(link)}),
+                    timeout=30,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(daemon.read_text(encoding="utf-8"), "{}\n")
+                self.assertFalse(checkpoint.exists())
+                link.unlink()
+
+    def test_all_hooks_use_kill_grace_and_suppress_output(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        timeout_log = Path(self.tmp) / "timeout.log"
+        hook_log = Path(self.tmp) / "hooks.log"
+        fake_bin = Path(self.tmp) / "fake-bin"
+        fake_bin.mkdir()
+        fake_timeout = fake_bin / "timeout"
+        fake_timeout.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> {timeout_log}\n"
+            "[[ $1 != --kill-after=* ]] || shift\n"
+            "shift\n"
+            '"$@"\n',
+            encoding="utf-8",
+        )
+        fake_timeout.chmod(0o755)
+        hooks = {
+            "CI_FLEET_DOCKER_DRAIN_COMMAND": self.drain_command,
+            "CI_FLEET_DOCKER_RESTART_COMMAND": Path(self.tmp) / "restart.sh",
+            "CI_FLEET_DOCKER_NETWORK_PROBE": Path(self.tmp) / "probe.sh",
+            "CI_FLEET_HEALTH_CHECK_COMMAND": Path(self.tmp) / "health.sh",
+        }
+        for path in hooks.values():
+            path.write_text(
+                "#!/usr/bin/env bash\n"
+                f"echo {path.name} >> {hook_log}\n"
+                "echo private-hook-output\n"
+                "echo private-hook-error >&2\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+
+        run_env = self._env(PATH=f"{fake_bin}:{os.environ['PATH']}", **{name: str(path) for name, path in hooks.items()})
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-timeout"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("private-hook", result.stdout + result.stderr)
+        lines = timeout_log.read_text(encoding="utf-8").splitlines()
+        for path in hooks.values():
+            self.assertTrue(any(line.startswith(f"--kill-after=5 300 {path}") for line in lines), path)
+        self.assertEqual(sorted(hook_log.read_text(encoding="utf-8").splitlines()), sorted(path.name for path in hooks.values()))
+
+    def test_health_accepts_only_success_and_warning_results(self) -> None:
+        env_file = self._write_env_file(self._rendered_with_policy())
+        cases = {
+            "healthy": ("#!/usr/bin/env bash\nexit 0\n", True),
+            "warning": ("#!/usr/bin/env bash\nexit 1\n", True),
+            "critical": ("#!/usr/bin/env bash\nexit 2\n", False),
+            "signal": ("#!/usr/bin/env bash\nkill -TERM $$\n", False),
+            "timeout": ("#!/usr/bin/env bash\nsleep 10\n", False),
+            "execution": ("not an executable format\n", False),
+        }
+        for name, (script, accepted) in cases.items():
+            with self.subTest(name=name):
+                self._write_daemon("{}\n")
+                checkpoint = Path(self.tmp) / f"checkpoint-health-{name}"
+                shutil.rmtree(checkpoint, ignore_errors=True)
+                self._write_success_commands()
+                health = Path(self.tmp) / "health.sh"
+                health.write_text(script, encoding="utf-8")
+                health.chmod(0o755)
+
+                result = subprocess.run(
+                    [
+                        str(SCRIPTS / "apply-docker-network-policy.sh"),
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--env",
+                        str(env_file),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=self._env(CI_FLEET_COMMAND_TIMEOUT_SECONDS="1"),
+                    timeout=15,
+                )
+
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_transactional_health_suppresses_delivery(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        health_log = Path(self.tmp) / "health-suppression.log"
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"${{CI_FLEET_HEALTH_SUPPRESS_DELIVERY:-unset}}\" >> {health_log}\n"
+            f"(( $(wc -l < {health_log}) > 1 )) || exit 2\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["1", "1"])
+
+    def test_env_file_is_trusted_and_snapshotted_before_mutation(self) -> None:
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        env_file.chmod(0o666)
+        drain_marker = Path(self.tmp) / "untrusted-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        rejected = self._run(str(env_file))
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertFalse(drain_marker.exists())
+
+        env_file.chmod(0o600)
+        health_log = Path(self.tmp) / "snapshot-health.log"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf 'CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=0\\n' > {env_file}\n",
+            encoding="utf-8",
+        )
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ $1 == --env && $2 != {env_file} ]] || exit 2\n"
+            '[[ $(stat -c %a "$2") == 600 && $(stat -c %a "$(dirname "$2")") == 700 ]] || exit 2\n'
+            'grep -Fqx "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=2" "$2" || exit 2\n'
+            f"printf '%s\\n' \"$2\" > {health_log}\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+
+        applied = self._run(str(env_file), checkpoint_dir=str(Path(self.tmp) / "checkpoint-snapshot"))
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertNotEqual(health_log.read_text(encoding="utf-8").strip(), str(env_file))
+        daemon = json.loads((self.daemon_dir / "daemon.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(daemon["default-address-pools"]), 2)
+
+    def test_renderer_failure_suppresses_private_stderr(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        private_pool = "10.77.88.0/24"
+        env_file = self._write_env_file(
+            {
+                "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+                "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": private_pool,
+                "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "16",
+            }
+        )
+        drain_marker = Path(self.tmp) / "renderer-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(private_pool, result.stdout + result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
 
     def test_policy_requires_drain_command(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
@@ -599,7 +873,7 @@ class ApplyScriptTests(unittest.TestCase):
         health = Path(self.tmp) / "health.sh"
         health.write_text(
             "#!/usr/bin/env bash\n"
-            f"[[ $1 == --env && $2 == {self.tmp}/ci-fleet.env ]] || exit 1\n"
+            f"[[ $1 == --env && $2 != {self.tmp}/ci-fleet.env ]] || exit 2\n"
             f"echo health >> {health_log}\n",
             encoding="utf-8",
         )
@@ -725,7 +999,7 @@ class ApplyScriptTests(unittest.TestCase):
         health = Path(self.tmp) / "health.sh"
         health.write_text(
             "#!/usr/bin/env bash\n"
-            f"[[ $1 == --env && $2 == {self.tmp}/ci-fleet.env ]] || exit 1\n"
+            f"[[ $1 == --env && $2 != {self.tmp}/ci-fleet.env ]] || exit 2\n"
             f"printf '%s\\n' \"$2\" >> {health_log}\n",
             encoding="utf-8",
         )
@@ -735,7 +1009,9 @@ class ApplyScriptTests(unittest.TestCase):
         result = self._run(str(env_file))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), [str(env_file)])
+        health_paths = health_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(health_paths), 1)
+        self.assertNotEqual(health_paths[0], str(env_file))
 
     def test_health_failure_evidence_excludes_command_output(self) -> None:
         self._write_daemon("{}\n")
@@ -748,7 +1024,7 @@ class ApplyScriptTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
             "echo 'health-secret-error' >&2\n"
-            "exit 1\n",
+            "exit 2\n",
             encoding="utf-8",
         )
         health.chmod(0o755)
@@ -986,7 +1262,8 @@ class ApplyScriptTests(unittest.TestCase):
                 health = Path(self.tmp) / "health.sh"
                 health.write_text(
                     "#!/usr/bin/env bash\n"
-                    f"[[ $1 == --env && $2 == {no_policy_env} ]] || exit 1\n"
+                    f"[[ $1 == --env && $2 != {no_policy_env} ]] || exit 2\n"
+                    'grep -Fqx "CI_FLEET_INSTANCE=example-ci-01" "$2" || exit 2\n'
                     f"echo health.sh >> {command_log}\n",
                     encoding="utf-8",
                 )
@@ -1029,7 +1306,7 @@ class ApplyScriptTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
             "echo removal-health-secret >&2\n"
-            "exit 1\n",
+            "exit 2\n",
             encoding="utf-8",
         )
         health.chmod(0o755)

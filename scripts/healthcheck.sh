@@ -14,11 +14,15 @@ if [[ ${1:-} == --env ]]; then
   environment=$2
   shift 2
 fi
-if [[ -r $environment ]]; then
+selected_environment=$environment
+health_suppress_delivery=${CI_FLEET_HEALTH_SUPPRESS_DELIVERY-}
+while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable CI_FLEET_)
+if [[ -r $selected_environment ]]; then
   set -a
   # shellcheck disable=SC1090
-  . "$environment"
+  . "$selected_environment"
   set +a
 fi
+[[ -z $health_suppress_delivery ]] || export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery
 use_local_docker
 exec python3 "$repo_root/scripts/health.py" "${args[@]}" "$@"
