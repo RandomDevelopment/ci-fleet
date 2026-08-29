@@ -196,6 +196,45 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
     return configured, reserve, networks_per_runner, parsed
 
 
+def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
+    """Build the Docker daemon.json ``default-address-pools`` block from rendered env.
+
+    Reads only the already-validated ``CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_*``
+    values produced by ``build_rendered_env``. Returns a dict suitable for
+    merging into ``daemon.json``. When no policy was rendered, returns an empty
+    dict (no ``default-address-pools`` key).
+    """
+    count_str = rendered.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0")
+    try:
+        count = int(count_str)
+    except ValueError as exc:
+        raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be an integer, got {count_str!r}") from exc
+    if count == 0 and "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" not in rendered:
+        return {}
+    if count < 0:
+        raise ValueError("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be non-negative")
+    pools: list[dict[str, Any]] = []
+    for index in range(count):
+        base = rendered.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE")
+        size_str = rendered.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE")
+        if base is None or size_str is None:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE/SIZE: both required when count > 0")
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: malformed CIDR {base!r}") from exc
+        try:
+            size = int(size_str)
+        except ValueError as exc:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: must be an integer, got {size_str!r}") from exc
+        if not isinstance(size, int) or size < 0 or size > 29:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: must be between 0 and 29")
+        if size < network.prefixlen:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count for {base!r}")
+        pools.append({"base": base, "size": size})
+    return {"default-address-pools": [{"base": p["base"], "size": p["size"]} for p in pools]}
+
+
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     controllers = config["controllers"]
     if controller_id not in controllers:
