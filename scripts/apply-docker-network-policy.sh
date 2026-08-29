@@ -133,12 +133,28 @@ else
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
 
+checkpoint_owner=0
+[[ "$testing" != 1 ]] || checkpoint_owner=$(id -u)
+if [[ -e "$checkpoint_dir" || -L "$checkpoint_dir" ]]; then
+  [[ -d "$checkpoint_dir" && ! -L "$checkpoint_dir" && $(stat -c %u "$checkpoint_dir") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_dir") == 700 ]] ||
+    die "checkpoint directory must be owned by root with mode 0700: $checkpoint_dir"
+  for checkpoint_file in "$checkpoint_dir/docker-network-policy.json" "$checkpoint_dir/daemon.json"; do
+    if [[ -e "$checkpoint_file" || -L "$checkpoint_file" ]]; then
+      [[ -f "$checkpoint_file" && ! -L "$checkpoint_file" && $(stat -c %u "$checkpoint_file") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_file") == 600 ]] ||
+        die "checkpoint files must be owned by root with mode 0600: $checkpoint_file"
+    fi
+  done
+fi
+
 [[ ! -L "$daemon_config" ]] || die "daemon.json must not be a symlink: $daemon_config"
 
 # --- Ownership guard (relaxed in testing) ---
 daemon_mode=644
+daemon_gid=0
+[[ "$testing" != 1 ]] || daemon_gid=$(id -g)
 if [[ -f "$daemon_config" ]]; then
   daemon_mode=$(stat -c %a "$daemon_config")
+  daemon_gid=$(stat -c %g "$daemon_config")
 fi
 if [[ "$testing" != 1 ]]; then
   [[ -w "$(dirname "$daemon_config")" ]] || die "daemon config directory is not writable: $(dirname "$daemon_config")"
@@ -149,6 +165,31 @@ if [[ "$testing" != 1 ]]; then
 else
   : # testing mode — skip root checks
 fi
+daemon_dir=$(dirname "$daemon_config")
+
+atomic_replace_daemon() {
+  python3 - "$1" "$daemon_dir" "$daemon_config" "$2" "$3" <<'PY'
+import os, shutil, sys, tempfile
+_, source, daemon_dir, target, mode, gid = sys.argv
+fd, tmp = tempfile.mkstemp(prefix=".daemon.json.", dir=daemon_dir)
+try:
+    with open(source, "rb") as source_handle, os.fdopen(fd, "wb") as staged:
+        shutil.copyfileobj(source_handle, staged)
+        os.fchmod(staged.fileno(), int(mode, 8))
+        os.fchown(staged.fileno(), -1, int(gid))
+        staged.flush()
+        os.fsync(staged.fileno())
+    os.replace(tmp, target)
+    directory_fd = os.open(daemon_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
 
 if [[ "$removing" == true ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || die 'network-policy checkpoint state is invalid'
@@ -175,13 +216,14 @@ PY
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
     [[ -f "$checkpoint_dir/daemon.json" && ! -L "$checkpoint_dir/daemon.json" ]] || die 'network-policy checkpoint backup is invalid'
+    prior_gid=$(stat -c %g "$checkpoint_dir/daemon.json")
   fi
   [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
 
   managed_daemon=$work_dir/daemon.json.managed
   cp -p "$daemon_config" "$managed_daemon"
   managed_mode=$(stat -c %a "$daemon_config")
-  daemon_dir=$(dirname "$daemon_config")
+  managed_gid=$(stat -c %g "$daemon_config")
 
   if ! run_command "$drain_command"; then
     rm -rf "$work_dir"
@@ -192,8 +234,7 @@ PY
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
   rollback_removal() {
     local failed=0
-    cp -p "$managed_daemon" "$daemon_config" || failed=1
-    chmod "$managed_mode" "$daemon_config" || failed=1
+    atomic_replace_daemon "$managed_daemon" "$managed_mode" "$managed_gid" || failed=1
     cmp -s "$managed_daemon" "$daemon_config" || failed=1
     run_command "$restart_command" "$daemon_dir" || failed=1
     return "$failed"
@@ -216,8 +257,7 @@ PY
   trap removal_on_exit EXIT
 
   if [[ "$prior_present" == true ]]; then
-    cp -p "$checkpoint_dir/daemon.json" "$daemon_config" || { removal_failure='failed to restore prior daemon.json'; exit 2; }
-    chmod "$prior_mode" "$daemon_config" || { removal_failure='failed to restore prior daemon.json mode'; exit 2; }
+    atomic_replace_daemon "$checkpoint_dir/daemon.json" "$prior_mode" "$prior_gid" || { removal_failure='failed to restore prior daemon.json'; exit 2; }
     cmp -s "$checkpoint_dir/daemon.json" "$daemon_config" || { removal_failure='failed to verify prior daemon.json'; exit 2; }
   else
     rm -f "$daemon_config" || { removal_failure='failed to restore absent daemon.json'; exit 2; }
@@ -330,8 +370,6 @@ if [[ -f "$daemon_config" ]]; then
   cp -p "$daemon_config" "$backup_dir/$backup_name"
 fi
 
-daemon_dir=$(dirname "$daemon_config")
-
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 if ! run_command "$drain_command"; then
   rm -rf "$work_dir"
@@ -343,7 +381,8 @@ fi
 if [[ "$managed_before" == false ]]; then
   install -d -m 0700 "$checkpoint_dir"
   if [[ "$had_prior" == true ]]; then
-    cp -p "$backup_dir/$backup_name" "$checkpoint_dir/daemon.json"
+    install -m 0600 "$backup_dir/$backup_name" "$checkpoint_dir/daemon.json"
+    chgrp "$daemon_gid" "$checkpoint_dir/daemon.json"
   fi
   python3 - "$state_file" "$had_prior" "$daemon_mode" <<'PY' || { rm -rf "$work_dir"; die 'failed to record network-policy checkpoint state'; }
 import json, os, sys, tempfile
@@ -358,8 +397,15 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    os.chmod(tmp, 0o600)
+        os.fchmod(handle.fileno(), 0o600)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
+    directory_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
@@ -368,7 +414,7 @@ fi
 
 restore_daemon() {
   if [[ "$had_prior" == true ]]; then
-    cp -p "$backup_dir/$backup_name" "$daemon_config"
+    atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
   else
     rm -f "$daemon_config"
   fi
@@ -410,20 +456,8 @@ fail_after_apply() {
 }
 
 # --- Transaction: apply → restart → probe → health, with rollback ---
-# Apply daemon.json atomically (rename within same directory)
-python3 - "$staging_daemon" "$daemon_dir" "$daemon_config" "$daemon_mode" <<'PY' || { transaction_failure='failed to apply daemon.json'; exit 2; }
-import os, shutil, sys, tempfile
-_, _, daemon_dir, target, daemon_mode = sys.argv
-fd, tmp = tempfile.mkstemp(prefix=".daemon.json.", dir=daemon_dir)
-try:
-    with open(sys.argv[1], "rb") as source, os.fdopen(fd, "wb") as staged:
-        shutil.copyfileobj(source, staged)
-    os.chmod(tmp, int(daemon_mode, 8))
-    os.replace(tmp, target)
-finally:
-    if os.path.exists(tmp):
-        os.unlink(tmp)
-PY
+# Apply daemon.json atomically (rename within same directory).
+atomic_replace_daemon "$staging_daemon" "$daemon_mode" "$daemon_gid" || { transaction_failure='failed to apply daemon.json'; exit 2; }
 
 # Restart Docker through the injected command boundary (never host-direct).
 if ! run_command "$restart_command" "$daemon_dir"; then

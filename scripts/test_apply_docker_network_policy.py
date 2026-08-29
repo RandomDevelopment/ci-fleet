@@ -315,6 +315,22 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
 
+    def test_rejects_unsafe_preexisting_checkpoint_before_drain(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "unsafe-checkpoint"
+        checkpoint.mkdir(mode=0o755)
+        drain_marker = Path(self.tmp) / "unsafe-checkpoint-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint directory must be owned by root with mode 0700", result.stderr)
+        self.assertEqual(daemon.read_text(encoding="utf-8"), "{}\n")
+        self.assertFalse(drain_marker.exists())
+
     def test_successful_apply_records_managed_original_presence_and_mode(self) -> None:
         for prior_present in (False, True):
             with self.subTest(prior_present=prior_present):
@@ -350,11 +366,13 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
         prior = daemon.read_bytes()
         checkpoint = Path(self.tmp) / "checkpoint-missing-backup"
-        checkpoint.mkdir()
-        (checkpoint / "docker-network-policy.json").write_text(
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
             json.dumps({"managed": True, "prior_mode": "600", "prior_present": True}),
             encoding="utf-8",
         )
+        state_file.chmod(0o600)
         markers = []
         for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
             marker = Path(self.tmp) / f"missing-backup-{name}.marker"
@@ -376,12 +394,16 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
         prior = daemon.read_bytes()
         checkpoint = Path(self.tmp) / "checkpoint-unexpected-backup"
-        checkpoint.mkdir()
-        (checkpoint / "docker-network-policy.json").write_text(
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
             json.dumps({"managed": True, "prior_mode": None, "prior_present": False}),
             encoding="utf-8",
         )
-        (checkpoint / "daemon.json").write_text("{}\n", encoding="utf-8")
+        state_file.chmod(0o600)
+        backup_file = checkpoint / "daemon.json"
+        backup_file.write_text("{}\n", encoding="utf-8")
+        backup_file.chmod(0o600)
         markers = []
         for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
             marker = Path(self.tmp) / f"unexpected-backup-{name}.marker"
@@ -1084,6 +1106,66 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon["bip"], "172.17.0.1/16")
         self.assertIn("default-address-pools", daemon)
 
+    def test_fsyncs_staged_file_and_daemon_directory_around_replace(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        audit_dir = Path(self.tmp) / "audit-python"
+        audit_dir.mkdir()
+        audit_log = Path(self.tmp) / "fsync.log"
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_fsync = os.fsync\n"
+            "_replace = os.replace\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def fsync(fd):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle:\n"
+            "        handle.write('F ' + os.readlink(f'/proc/self/fd/{fd}') + '\\n')\n"
+            "    return _fsync(fd)\n"
+            "def replace(source, target):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle:\n"
+            "        handle.write(f'R {source} {target}\\n')\n"
+            "    return _replace(source, target)\n"
+            "os.fsync = fsync\n"
+            "os.replace = replace\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-fsync"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir), FSYNC_AUDIT_LOG=str(audit_log)),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        replace_indexes = [i for i, event in enumerate(events) if event.startswith("R ")]
+        for replace_index in replace_indexes:
+            source = events[replace_index].split(" ", 2)[1]
+            self.assertIn(f"F {source}", events[:replace_index])
+        daemon_replace = next(i for i in replace_indexes if events[i].endswith(f" {daemon}"))
+        self.assertEqual(events[daemon_replace + 1], f"F {self.daemon_dir}")
+
+    @unittest.skipUnless(os.geteuid() == 0, "changing file GID requires root")
+    def test_preserves_existing_daemon_config_gid(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        daemon.chmod(0o640)
+        os.chown(daemon, -1, 1)
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(daemon.stat().st_gid, 1)
+
     def test_preserves_restrictive_daemon_config_mode(self) -> None:
         daemon = self._write_daemon("{}\n")
         daemon.chmod(0o600)
@@ -1233,6 +1315,47 @@ class ApplyScriptTests(unittest.TestCase):
         backup = checkpoint_dir / "daemon.json"
         self.assertTrue(backup.exists())
         self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), prior)
+
+    def test_managed_policy_removal_restores_backup_without_copying_over_daemon(self) -> None:
+        prior = b'{"icc":false}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        daemon.chmod(0o640)
+        checkpoint = Path(self.tmp) / "checkpoint-atomic-removal"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+
+        no_policy_env = Path(self.tmp) / "no-policy-atomic-removal.env"
+        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        fake_bin = Path(self.tmp) / "fake-cp-bin"
+        fake_bin.mkdir()
+        fake_cp = fake_bin / "cp"
+        fake_cp.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ ${{*: -1}} != {daemon} ]] || exit 99\n"
+            f"exec {shutil.which('cp')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_cp.chmod(0o755)
+        removed = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(no_policy_env),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertEqual(daemon.stat().st_mode & 0o777, 0o640)
 
     def test_managed_policy_removal_restores_original_state_and_clears_only_marker(self) -> None:
         for prior_present in (False, True):
