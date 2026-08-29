@@ -268,7 +268,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
         result = self._run(str(env_file))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((Path(self.tmp) / "restart.log").exists())
+        self.assertTrue((self.daemon_dir / "restart.log").exists())
 
     def test_failure_evidence_excludes_secrets(self) -> None:
         """GREEN: failure evidence must not contain secrets or CIDRs."""
