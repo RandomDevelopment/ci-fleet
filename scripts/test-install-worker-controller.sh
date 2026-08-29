@@ -604,6 +604,7 @@ chmod 600 "$root/etc/ci-fleet/monitoring.env"
 warning_output=$tmp/warning-upgrade.out
 "$installer" --upgrade "${base_args[@]}" --ref "$warning_ref" >"$warning_output" 2>&1
 warning_upgrade=$(<"$warning_output")
+if grep -Fq 'ERROR: alternate Docker endpoints are not supported' <<<"$warning_upgrade"; then fail 'healthcheck lost its test root while clearing candidate environment'; fi
 grep -Fq 'WARNING disk_root' <<<"$warning_upgrade" || fail 'warning health fixture did not produce a warning result'
 if grep -Fq 'WARNING status_delivery' <<<"$warning_upgrade"; then fail 'ad-hoc reconciliation health check submitted duplicate status'; fi
 grep -Fq 'CONVERGED mode=upgrade' <<<"$warning_upgrade" || fail 'warning health result did not report convergence'
