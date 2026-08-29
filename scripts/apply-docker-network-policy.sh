@@ -279,7 +279,31 @@ PY
   [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
 
   managed_daemon=$work_dir/daemon.json.managed
-  cp -p "$daemon_config" "$managed_daemon"
+  removal_daemon=$work_dir/daemon.json.removal
+  python3 - "$daemon_config" "$state_file" "$managed_daemon" "$removal_daemon" 2>/dev/null <<'PY' || {
+import json, sys
+daemon_path, state_path, managed_path, removal_path = sys.argv[1:]
+try:
+    current = json.load(open(daemon_path, encoding="utf-8"))
+    state = json.load(open(state_path, encoding="utf-8"))
+    if not isinstance(current, dict):
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+with open(managed_path, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+if state["prior_default_address_pools_present"]:
+    current["default-address-pools"] = state["prior_default_address_pools"]
+else:
+    current.pop("default-address-pools", None)
+with open(removal_path, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+    rm -rf "$work_dir"
+    die 'managed daemon.json is not a valid JSON object'
+  }
   managed_mode=$(stat -c %a "$daemon_config")
   managed_gid=$(stat -c %g "$daemon_config")
 
@@ -335,25 +359,6 @@ PY
   trap removal_on_exit EXIT
   set_verified_generation "" || { removal_failure='failed to mark network-policy verification pending'; exit 2; }
 
-  removal_daemon=$work_dir/daemon.json.removal
-  python3 - "$daemon_config" "$state_file" "$removal_daemon" <<'PY' || { removal_failure='failed to stage network-policy removal'; exit 2; }
-import json, sys
-daemon_path, state_path, output_path = sys.argv[1:]
-try:
-    current = json.load(open(daemon_path, encoding="utf-8"))
-    state = json.load(open(state_path, encoding="utf-8"))
-    if not isinstance(current, dict):
-        raise ValueError
-except (OSError, json.JSONDecodeError, ValueError):
-    raise SystemExit(1)
-if state["prior_default_address_pools_present"]:
-    current["default-address-pools"] = state["prior_default_address_pools"]
-else:
-    current.pop("default-address-pools", None)
-with open(output_path, "w", encoding="utf-8") as handle:
-    json.dump(current, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
   if [[ "$prior_present" == false ]] && python3 - "$removal_daemon" <<'PY'
 import json, sys
 raise SystemExit(bool(json.load(open(sys.argv[1], encoding="utf-8"))))

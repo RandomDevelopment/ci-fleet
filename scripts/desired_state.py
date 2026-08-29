@@ -223,6 +223,8 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
             network = ipaddress.ip_network(base, strict=True)
         except ValueError as exc:
             raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: malformed CIDR {base!r}") from exc
+        if network.version != 4:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: must be IPv4")
         try:
             size = int(size_str)
         except ValueError as exc:

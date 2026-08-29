@@ -110,6 +110,15 @@ class RenderDaemonConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be an integer"):
             render_docker_daemon_config(env)
 
+    def test_rejects_ipv6_pool(self) -> None:
+        env = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "2001:db8::/29",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
+        }
+        with self.assertRaisesRegex(ValueError, "must be IPv4"):
+            render_docker_daemon_config(env)
+
     def test_not_configured_returns_empty(self) -> None:
         # No network policy rendered -> no pools key.
         daemon = render_docker_daemon_config({})
@@ -1497,6 +1506,57 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("secret.example.invalid", combined)
         self.assertNotIn("credential", combined)
         self.assertNotIn("restart-secret-error", combined)
+
+    def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-non-object-removal"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        prior_state = state_file.read_bytes()
+        daemon.write_text("[]\n", encoding="utf-8")
+        copy_marker = Path(self.tmp) / "non-object-copy.marker"
+        command_markers = []
+        for name in ("drain.sh", "restart.sh", "resume.sh", "health.sh"):
+            marker = Path(self.tmp) / f"non-object-{name}.marker"
+            command_markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        fake_bin = Path(self.tmp) / "non-object-bin"
+        fake_bin.mkdir()
+        fake_cp = fake_bin / "cp"
+        fake_cp.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ ${{2:-}} != {daemon} ]] || touch {copy_marker}\n"
+            f"exec {shutil.which('cp')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_cp.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(no_policy_env),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("managed daemon.json is not a valid JSON object", removed.stderr)
+        self.assertEqual(daemon.read_text(encoding="utf-8"), "[]\n")
+        self.assertEqual(state_file.read_bytes(), prior_state)
+        self.assertFalse(copy_marker.exists())
+        self.assertFalse(any(marker.exists() for marker in command_markers))
 
     def test_removal_restores_prior_pools_and_preserves_current_unrelated_keys(self) -> None:
         prior_pools = [{"base": "192.0.2.0/24", "size": 28}]
