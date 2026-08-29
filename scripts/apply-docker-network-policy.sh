@@ -7,9 +7,11 @@
 #
 # Environment variables (all injected, never host-defaulted):
 #   CI_FLEET_DOCKER_DAEMON_CONFIG   absolute path to daemon.json
+#   CI_FLEET_DOCKER_DRAIN_COMMAND   path to a host drain script (runs before mutation)
 #   CI_FLEET_DOCKER_RESTART_COMMAND path to a Docker restart script
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
+#   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
 #   CI_FLEET_TESTING                when 1, relaxes root/strict checks
 set -Eeuo pipefail
 
@@ -68,15 +70,19 @@ fi
 
 # --- Resolve required injected commands ---
 daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
+drain_command=${CI_FLEET_DOCKER_DRAIN_COMMAND:-}
 restart_command=${CI_FLEET_DOCKER_RESTART_COMMAND:-}
 probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
+command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 
+[[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 [[ -n "$restart_command" ]] || die 'CI_FLEET_DOCKER_RESTART_COMMAND is required when a network policy is configured'
 [[ -n "$probe_command" ]] || die 'CI_FLEET_DOCKER_NETWORK_PROBE is required when a network policy is configured'
 [[ -n "$health_command" ]] || die 'CI_FLEET_HEALTH_CHECK_COMMAND is required when a network policy is configured'
 [[ -x "$restart_command" ]] || die "restart command is not executable: $restart_command"
+[[ -z "$drain_command" || -x "$drain_command" ]] || die "drain command is not executable: $drain_command"
 [[ -x "$probe_command" ]] || die "network probe is not executable: $probe_command"
 [[ -x "$health_command" ]] || die "health-check command is not executable: $health_command"
 
@@ -112,6 +118,11 @@ PY
 if [[ "$desired_pools_json" == "{}" ]]; then
   printf 'NETWORK_POLICY_NOOP\n'
   exit 0
+fi
+
+# --- Drain before any daemon.json mutation or restart ---
+if [[ -n "$drain_command" ]] && ! timeout "$command_timeout" "$drain_command" 2>&1; then
+  die "drain command failed before network-policy apply"
 fi
 
 # --- Stage merged daemon.json (preserve unrelated keys) ---
@@ -150,46 +161,65 @@ else
   backup_dir="$prior_daemon"
   backup_name="daemon.json.before"
 fi
+had_prior=false
 if [[ -f "$daemon_config" ]]; then
+  had_prior=true
   cp -p "$daemon_config" "$backup_dir/$backup_name"
 fi
 
+daemon_dir=$(dirname "$daemon_config")
+
 restore_daemon() {
-  local backup_file="$backup_dir/$backup_name"
-  if [[ -f "$backup_file" ]]; then
-    cp -p "$backup_file" "$daemon_config"
+  if [[ "$had_prior" == true ]]; then
+    cp -p "$backup_dir/$backup_name" "$daemon_config"
+  else
+    rm -f "$daemon_config"
   fi
 }
 
-# --- Transaction: apply → restart → probe → health, with rollback ---
-daemon_dir=$(dirname "$daemon_config")
+# Rollback: restore prior config, restart through the boundary, run health check.
+# Failure evidence is surfaced through exit code only — no CIDRs or secrets leaked.
+rollback_daemon() {
+  local failed=0
+  restore_daemon || failed=1
+  timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || failed=1
+  timeout "$command_timeout" "$health_command" >/dev/null 2>&1 || failed=1
+  return "$failed"
+}
 
+# --- Transaction: apply → restart → probe → health, with rollback ---
 # Apply daemon.json atomically (rename within same directory)
 python3 - "$staging_daemon" "$daemon_dir" "$daemon_config" <<'PY' || { restore_daemon; rm -rf "$work_dir"; die "failed to apply daemon.json"; }
-import os, sys
+import os, shutil, sys, tempfile
 _, _, daemon_dir, target = sys.argv
-tmp = os.path.join(daemon_dir, ".daemon.json.tmp")
-os.replace(sys.argv[1], tmp)
-os.replace(tmp, target)
+fd, tmp = tempfile.mkstemp(prefix=".daemon.json.", dir=daemon_dir)
+try:
+    with open(sys.argv[1], "rb") as source, os.fdopen(fd, "wb") as staged:
+        shutil.copyfileobj(source, staged)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, target)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
 PY
 
-# Restart Docker through the injected command boundary (never host-direct)
-if ! "$restart_command" "$daemon_dir" 2>&1; then
-  restore_daemon
+# Restart Docker through the injected command boundary (never host-direct).
+if ! timeout "$command_timeout" "$restart_command" "$daemon_dir" 2>&1; then
+  rollback_daemon || true
   rm -rf "$work_dir"
   die "Docker restart command failed; prior daemon.json restored"
 fi
 
 # Bounded capacity probe
-if ! "$probe_command" 2>&1; then
-  restore_daemon
+if ! timeout "$command_timeout" "$probe_command" 2>&1; then
+  rollback_daemon || true
   rm -rf "$work_dir"
   die "capacity probe failed after network-policy restart; prior daemon.json restored"
 fi
 
 # Health verification
-if ! "$health_command" 2>&1; then
-  restore_daemon
+if ! timeout "$command_timeout" "$health_command" 2>&1; then
+  rollback_daemon || true
   rm -rf "$work_dir"
   die "health check failed after network-policy restart; prior daemon.json restored"
 fi

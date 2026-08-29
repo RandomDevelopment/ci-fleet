@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -176,20 +177,155 @@ class ApplyScriptTests(unittest.TestCase):
         )
 
     def test_validates_policy_before_mutation(self) -> None:
-        """RED: script must reject a malformed daemon config before applying."""
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
         bad_env = Path(self.tmp) / "bad.env"
         bad_env.write_text(
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=1\n"
-            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE=198.51.100.0/24\n"
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE=not-a-cidr\n"
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE=29\n",
             encoding="utf-8",
         )
-        # With a valid restart/probe, this should succeed — but we inject a
-        # probe that reports exhaustion to force rollback. That tests the
-        # rollback path, not validation-before-mutation.
-        # For validation-before-mutation, we test render_docker_daemon_config
-        # raises on malformed input (covered above).
-        pass  # covered by RenderDaemonConfigTests
+        drain_marker = Path(self.tmp) / "drain.marker"
+        restart_marker = Path(self.tmp) / "restart.marker"
+        for name, marker in (("drain.sh", drain_marker), ("restart.sh", restart_marker)):
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        for name in ("probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(bad_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(Path(self.tmp) / "drain.sh")),
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+        self.assertFalse(restart_marker.exists())
+
+    def test_drain_failure_prevents_mutation_and_restart(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        drain = Path(self.tmp) / "drain.sh"
+        drain.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        drain.chmod(0o755)
+        restart_marker = Path(self.tmp) / "restart.marker"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\ntouch {restart_marker}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        for name in ("probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(drain)),
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(restart_marker.exists())
+
+    def test_probe_failure_restores_absent_config_and_restarts(self) -> None:
+        restart_log = Path(self.tmp) / "restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\necho restart >> {restart_log}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+        health_log = Path(self.tmp) / "health.log"
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(f"#!/usr/bin/env bash\necho health >> {health_log}\n", encoding="utf-8")
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        result = self._run(str(env_file), expected_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.daemon_dir / "daemon.json").exists())
+        self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
+        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
+
+    def test_probe_failure_rolls_back_restarts_and_health_checks(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16","icc":false}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        restart_log = Path(self.tmp) / "restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]] || {{ echo '198.51.100.0/24 super-secret'; exit 1; }}\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+        health_log = Path(self.tmp) / "health.log"
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(f"#!/usr/bin/env bash\necho health >> {health_log}\n", encoding="utf-8")
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        result = self._run(str(env_file), expected_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
+        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
+        self.assertNotIn("198.51.100.0/24", result.stdout + result.stderr)
+        self.assertNotIn("super-secret", result.stdout + result.stderr)
+
+    def test_sleeping_probe_times_out(self) -> None:
+        self._write_daemon("{}\n")
+        for name in ("drain.sh", "restart.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nsleep 10\n", encoding="utf-8")
+        probe.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                CI_FLEET_DOCKER_DRAIN_COMMAND=str(Path(self.tmp) / "drain.sh"),
+                CI_FLEET_COMMAND_TIMEOUT_SECONDS="1",
+            ),
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 5)
+
+    @unittest.skipUnless(Path("/dev/shm").is_dir(), "/dev/shm is unavailable")
+    def test_apply_works_across_temp_filesystems(self) -> None:
+        self._write_daemon(json.dumps({"bip": "172.17.0.1/16"}))
+        for name in ("restart.sh", "probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_TEMP_DIR="/dev/shm"),
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        daemon = json.loads((self.daemon_dir / "daemon.json").read_text(encoding="utf-8"))
+        self.assertEqual(daemon["bip"], "172.17.0.1/16")
+        self.assertIn("default-address-pools", daemon)
 
     def test_applies_daemon_config_preserving_unrelated_keys(self) -> None:
         """GREEN: applying a policy preserves unrelated daemon.json keys."""
