@@ -59,7 +59,18 @@ while (($#)); do
 done
 
 [[ -n "$env_file" ]] || die '--env is required'
-[[ -r "$env_file" ]] || die "rendered env is unreadable: $env_file"
+[[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] || die "rendered env must be a readable regular file: $env_file"
+env_owner=$(stat -c %u "$env_file")
+expected_env_owner=0
+[[ "$testing" != 1 ]] || expected_env_owner=$(id -u)
+[[ "$env_owner" == "$expected_env_owner" ]] || die "rendered env has an untrusted owner: $env_file"
+env_mode=$(stat -c %a "$env_file")
+(( (8#$env_mode & 8#022) == 0 )) || die "rendered env must not be group/world writable: $env_file"
+work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
+chmod 0700 "$work_dir"
+trap 'rm -rf "$work_dir"' EXIT
+install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
+env_file=$work_dir/ci-fleet.env
 
 # --- No-op when no network policy is rendered ---
 count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
@@ -83,17 +94,31 @@ probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 
+validate_command() {
+  local name=$1 path=$2 canonical
+  [[ -n "$path" ]] || die "$name is required when network policy is managed"
+  [[ "$path" == /* && -f "$path" && ! -L "$path" && -x "$path" ]] || die "$name must be an absolute canonical regular executable path"
+  canonical=$(readlink -f -- "$path") || die "$name must be an absolute canonical regular executable path"
+  [[ "$path" == "$canonical" ]] || die "$name must be an absolute canonical regular executable path"
+}
+
+run_command() {
+  timeout --kill-after=5 "$command_timeout" "$@" >/dev/null 2>&1
+}
+
+run_health() {
+  local status=0
+  CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1 run_command "$health_command" --env "$1" || status=$?
+  ((status < 2))
+}
+
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
-[[ -n "$drain_command" ]] || die 'CI_FLEET_DOCKER_DRAIN_COMMAND is required when a network policy is configured'
-[[ -n "$restart_command" ]] || die 'CI_FLEET_DOCKER_RESTART_COMMAND is required when network policy is managed'
-[[ -n "$health_command" ]] || die 'CI_FLEET_HEALTH_CHECK_COMMAND is required when network policy is managed'
-[[ -x "$restart_command" ]] || die "restart command is not executable: $restart_command"
-[[ -x "$drain_command" ]] || die "drain command is not executable: $drain_command"
-[[ -x "$health_command" ]] || die "health-check command is not executable: $health_command"
+validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
+validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
+validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
 if [[ "$removing" == false ]]; then
-  [[ -n "$probe_command" ]] || die 'CI_FLEET_DOCKER_NETWORK_PROBE is required when a network policy is configured'
-  [[ -x "$probe_command" ]] || die "network probe is not executable: $probe_command"
+  validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
 fi
 
 # Serialize with installer mutations using the installer's host-local lock.
@@ -153,13 +178,12 @@ PY
   fi
   [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
 
-  work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-remove.XXXXXX")
   managed_daemon=$work_dir/daemon.json.managed
   cp -p "$daemon_config" "$managed_daemon"
   managed_mode=$(stat -c %a "$daemon_config")
   daemon_dir=$(dirname "$daemon_config")
 
-  if ! timeout "$command_timeout" "$drain_command" >/dev/null 2>&1; then
+  if ! run_command "$drain_command"; then
     rm -rf "$work_dir"
     die 'drain command failed before network-policy removal'
   fi
@@ -171,7 +195,7 @@ PY
     cp -p "$managed_daemon" "$daemon_config" || failed=1
     chmod "$managed_mode" "$daemon_config" || failed=1
     cmp -s "$managed_daemon" "$daemon_config" || failed=1
-    timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || failed=1
+    run_command "$restart_command" "$daemon_dir" || failed=1
     return "$failed"
   }
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
@@ -199,8 +223,8 @@ PY
     rm -f "$daemon_config" || { removal_failure='failed to restore absent daemon.json'; exit 2; }
     [[ ! -e "$daemon_config" ]] || { removal_failure='failed to verify absent daemon.json'; exit 2; }
   fi
-  timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
-  timeout "$command_timeout" "$health_command" --env "$env_file" >/dev/null 2>&1 || { removal_failure='health check failed after network-policy removal'; exit 2; }
+  run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
+  run_health "$env_file" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 
   # Marker deletion commits removal. Ignore catchable signals across the atomic
   # unlink so failure still rolls back and success cannot leave a stale marker.
@@ -216,7 +240,7 @@ PY
 fi
 
 # --- Render desired daemon config block via shared validator ---
-desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" <<'PY'
+desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, os, sys
 env_path, scripts_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, scripts_dir)
@@ -239,7 +263,6 @@ if [[ "$desired_pools_json" == "{}" ]]; then
 fi
 
 # --- Stage merged daemon.json (preserve unrelated keys) ---
-work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
 staging_daemon="$work_dir/daemon.json"
 
 python3 - "$env_file" "$daemon_config" "$staging_daemon" "$desired_pools_json" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
@@ -310,7 +333,7 @@ fi
 daemon_dir=$(dirname "$daemon_config")
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
-if ! timeout "$command_timeout" "$drain_command" >/dev/null 2>&1; then
+if ! run_command "$drain_command"; then
   rm -rf "$work_dir"
   die "drain command failed before network-policy apply"
 fi
@@ -356,8 +379,8 @@ restore_daemon() {
 rollback_daemon() {
   local failed=0
   restore_daemon || failed=1
-  timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || failed=1
-  timeout "$command_timeout" "$health_command" --env "$env_file" >/dev/null 2>&1 || failed=1
+  run_command "$restart_command" "$daemon_dir" || failed=1
+  run_health "$env_file" || failed=1
   return "$failed"
 }
 
@@ -403,17 +426,17 @@ finally:
 PY
 
 # Restart Docker through the injected command boundary (never host-direct).
-if ! timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1; then
+if ! run_command "$restart_command" "$daemon_dir"; then
   fail_after_apply "Docker restart command failed"
 fi
 
 # Bounded capacity probe
-if ! timeout "$command_timeout" "$probe_command" >/dev/null 2>&1; then
+if ! run_command "$probe_command"; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
 # Health verification
-if ! timeout "$command_timeout" "$health_command" --env "$env_file" >/dev/null 2>&1; then
+if ! run_health "$env_file"; then
   fail_after_apply "health check failed after network-policy restart"
 fi
 
