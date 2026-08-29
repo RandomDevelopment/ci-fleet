@@ -151,12 +151,13 @@ checkpoint_owner=0
 if [[ -e "$checkpoint_dir" || -L "$checkpoint_dir" ]]; then
   [[ -d "$checkpoint_dir" && ! -L "$checkpoint_dir" && $(stat -c %u "$checkpoint_dir") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_dir") == 700 ]] ||
     die "checkpoint directory must be owned by root with mode 0700: $checkpoint_dir"
-  for checkpoint_file in "$checkpoint_dir/docker-network-policy.json" "$checkpoint_dir/daemon.json"; do
-    if [[ -e "$checkpoint_file" || -L "$checkpoint_file" ]]; then
-      [[ -f "$checkpoint_file" && ! -L "$checkpoint_file" && $(stat -c %u "$checkpoint_file") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_file") == 600 ]] ||
-        die "checkpoint files must be owned by root with mode 0600: $checkpoint_file"
-    fi
-  done
+  checkpoint_file=$checkpoint_dir/docker-network-policy.json
+  if [[ -e "$checkpoint_file" || -L "$checkpoint_file" ]]; then
+    [[ -f "$checkpoint_file" && ! -L "$checkpoint_file" && $(stat -c %u "$checkpoint_file") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_file") == 600 ]] ||
+      die "checkpoint files must be owned by root with mode 0600: $checkpoint_file"
+  fi
+  [[ ! -e "$checkpoint_dir/daemon.json" && ! -L "$checkpoint_dir/daemon.json" ]] ||
+    die 'network-policy checkpoint state is invalid'
 fi
 
 [[ ! -L "$daemon_config" ]] || die "daemon.json must not be a symlink: $daemon_config"
@@ -243,12 +244,19 @@ if [[ "$removing" == true ]]; then
   mapfile -t managed_state < <(python3 - "$state_file" <<'PY'
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-if set(state) not in ({"managed", "prior_mode", "prior_present"}, {"managed", "prior_mode", "prior_present", "verified_generation"}) or state["managed"] is not True:
+required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
+if set(state) not in (required, required | {"verified_generation"}) or state["managed"] is not True:
     raise SystemExit(1)
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
+    raise SystemExit(1)
+if not isinstance(state["prior_default_address_pools_present"], bool):
+    raise SystemExit(1)
+if state["prior_default_address_pools_present"] and not state["prior_present"]:
+    raise SystemExit(1)
+if not state["prior_default_address_pools_present"] and state["prior_default_address_pools"] is not None:
     raise SystemExit(1)
 mode = state["prior_mode"]
 if state["prior_present"]:
@@ -267,8 +275,6 @@ PY
   prior_verified_generation=${managed_state[2]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
-    [[ -f "$checkpoint_dir/daemon.json" && ! -L "$checkpoint_dir/daemon.json" ]] || die 'network-policy checkpoint backup is invalid'
-    prior_gid=$(stat -c %g "$checkpoint_dir/daemon.json")
   fi
   [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
 
@@ -285,9 +291,26 @@ PY
   removal_failure='network-policy removal interrupted'
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
   rollback_removal() {
-    local failed=0
-    atomic_replace_daemon "$managed_daemon" "$managed_mode" "$managed_gid" || failed=1
-    cmp -s "$managed_daemon" "$daemon_config" || failed=1
+    local failed=0 rollback_daemon=$work_dir/daemon.json.rollback
+    python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" <<'PY' || failed=1
+import json, os, sys
+current_path, managed_path, output_path = sys.argv[1:]
+try:
+    current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
+    managed = json.load(open(managed_path, encoding="utf-8"))
+    if not isinstance(current, dict) or not isinstance(managed, dict) or "default-address-pools" not in managed:
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+current["default-address-pools"] = managed["default-address-pools"]
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+    if ((failed == 0)); then
+      atomic_replace_daemon "$rollback_daemon" "$managed_mode" "$managed_gid" || failed=1
+      cmp -s "$rollback_daemon" "$daemon_config" || failed=1
+    fi
     run_command "$restart_command" "$daemon_dir" || failed=1
     run_command "$resume_command" --env "$prior_env" || failed=1
     run_health "$prior_env" || failed=1
@@ -312,12 +335,45 @@ PY
   trap removal_on_exit EXIT
   set_verified_generation "" || { removal_failure='failed to mark network-policy verification pending'; exit 2; }
 
-  if [[ "$prior_present" == true ]]; then
-    atomic_replace_daemon "$checkpoint_dir/daemon.json" "$prior_mode" "$prior_gid" || { removal_failure='failed to restore prior daemon.json'; exit 2; }
-    cmp -s "$checkpoint_dir/daemon.json" "$daemon_config" || { removal_failure='failed to verify prior daemon.json'; exit 2; }
+  removal_daemon=$work_dir/daemon.json.removal
+  python3 - "$daemon_config" "$state_file" "$removal_daemon" <<'PY' || { removal_failure='failed to stage network-policy removal'; exit 2; }
+import json, sys
+daemon_path, state_path, output_path = sys.argv[1:]
+try:
+    current = json.load(open(daemon_path, encoding="utf-8"))
+    state = json.load(open(state_path, encoding="utf-8"))
+    if not isinstance(current, dict):
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+if state["prior_default_address_pools_present"]:
+    current["default-address-pools"] = state["prior_default_address_pools"]
+else:
+    current.pop("default-address-pools", None)
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  if [[ "$prior_present" == false ]] && python3 - "$removal_daemon" <<'PY'
+import json, sys
+raise SystemExit(bool(json.load(open(sys.argv[1], encoding="utf-8"))))
+PY
+  then
+    python3 - "$daemon_config" "$daemon_dir" <<'PY' || { removal_failure='failed to remove empty daemon config'; exit 2; }
+import os, sys
+try:
+    os.unlink(sys.argv[1])
+except FileNotFoundError:
+    pass
+directory_fd = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
   else
-    rm -f "$daemon_config" || { removal_failure='failed to restore absent daemon.json'; exit 2; }
-    [[ ! -e "$daemon_config" ]] || { removal_failure='failed to verify absent daemon.json'; exit 2; }
+    atomic_replace_daemon "$removal_daemon" "$managed_mode" "$managed_gid" || { removal_failure='failed to install prior network-policy key state'; exit 2; }
+    cmp -s "$removal_daemon" "$daemon_config" || { removal_failure='failed to verify prior network-policy key state'; exit 2; }
   fi
   run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
   run_command "$resume_command" --env "$env_file" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
@@ -389,26 +445,31 @@ prior_verified_generation=
 if [[ -e "$state_file" ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
   prior_verified_generation=$(
-    python3 - "$state_file" "$checkpoint_dir/daemon.json" <<'PY'
-import json, os, re, sys
+    python3 - "$state_file" <<'PY'
+import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-if set(state) not in ({"managed", "prior_mode", "prior_present"}, {"managed", "prior_mode", "prior_present", "verified_generation"}) or state["managed"] is not True:
+required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
+if set(state) not in (required, required | {"verified_generation"}) or state["managed"] is not True:
     raise SystemExit(1)
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
+if not isinstance(state["prior_default_address_pools_present"], bool):
+    raise SystemExit(1)
+if state["prior_default_address_pools_present"] and not state["prior_present"]:
+    raise SystemExit(1)
+if not state["prior_default_address_pools_present"] and state["prior_default_address_pools"] is not None:
+    raise SystemExit(1)
 if state["prior_present"]:
     if not isinstance(state["prior_mode"], str) or not re.fullmatch(r"[0-7]{3,4}", state["prior_mode"]):
         raise SystemExit(1)
-    if not os.path.isfile(sys.argv[2]) or os.path.islink(sys.argv[2]):
-        raise SystemExit(1)
-elif state["prior_mode"] is not None or os.path.exists(sys.argv[2]):
+elif state["prior_mode"] is not None:
     raise SystemExit(1)
 print(generation or "")
 PY
-  ) || { rm -rf "$work_dir"; die 'network-policy checkpoint backup is invalid'; }
+  ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
   managed_before=true
 fi
 
@@ -464,7 +525,7 @@ rollback_on_exit() {
   ((status != 0)) || status=1
   if rollback_daemon >/dev/null 2>&1; then
     if [[ "$managed_before" == false ]]; then
-      rm -f "$state_file" "$checkpoint_dir/daemon.json"
+      rm -f "$state_file"
     fi
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
@@ -487,15 +548,15 @@ trap rollback_on_exit EXIT
 # policy keeps this baseline and uses the temp copy above for transaction rollback.
 if [[ "$managed_before" == false ]]; then
   install -d -m 0700 "$checkpoint_dir"
-  if [[ "$had_prior" == true ]]; then
-    install -m 0600 "$backup_dir/$backup_name" "$checkpoint_dir/daemon.json"
-    chgrp "$daemon_gid" "$checkpoint_dir/daemon.json"
-  fi
-  python3 - "$state_file" "$had_prior" "$daemon_mode" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
+  python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
 path = sys.argv[1]
+prior = json.load(open(sys.argv[4], encoding="utf-8")) if sys.argv[2] == "true" else {}
+prior_key_present = "default-address-pools" in prior
 state = {
     "managed": True,
+    "prior_default_address_pools": prior.get("default-address-pools") if prior_key_present else None,
+    "prior_default_address_pools_present": prior_key_present,
     "prior_mode": sys.argv[3] if sys.argv[2] == "true" else None,
     "prior_present": sys.argv[2] == "true",
     "verified_generation": None,

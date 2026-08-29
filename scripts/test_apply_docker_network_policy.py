@@ -508,18 +508,17 @@ class ApplyScriptTests(unittest.TestCase):
                     state,
                     {
                         "managed": True,
+                        "prior_default_address_pools": None,
+                        "prior_default_address_pools_present": False,
                         "prior_mode": "600" if prior_present else None,
                         "prior_present": prior_present,
                         "verified_generation": hashlib.sha256(daemon.read_bytes()).hexdigest(),
                     },
                 )
                 self.assertEqual((checkpoint / "docker-network-policy.json").stat().st_mode & 0o777, 0o600)
-                self.assertEqual((checkpoint / "daemon.json").exists(), prior_present)
-                if prior_present:
-                    self.assertEqual((checkpoint / "daemon.json").read_bytes(), b'{"icc":false}\n')
-                    self.assertEqual((checkpoint / "daemon.json").stat().st_mode & 0o777, 0o600)
+                self.assertFalse((checkpoint / "daemon.json").exists())
 
-    def test_policy_reapply_fails_closed_when_recovery_backup_is_missing(self) -> None:
+    def test_policy_reapply_fails_closed_when_managed_key_provenance_is_missing(self) -> None:
         rendered = self._rendered_with_policy()
         daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
         prior = daemon.read_bytes()
@@ -543,11 +542,11 @@ class ApplyScriptTests(unittest.TestCase):
         result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkpoint backup is invalid", result.stderr)
+        self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
 
-    def test_policy_reapply_fails_closed_when_absent_baseline_has_backup(self) -> None:
+    def test_policy_reapply_rejects_persistent_recovery_backup(self) -> None:
         rendered = self._rendered_with_policy()
         daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
         prior = daemon.read_bytes()
@@ -574,7 +573,7 @@ class ApplyScriptTests(unittest.TestCase):
         result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkpoint backup is invalid", result.stderr)
+        self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
 
@@ -935,6 +934,8 @@ class ApplyScriptTests(unittest.TestCase):
         state_file.write_text(
             json.dumps({
                 "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": hashlib.sha256(prior).hexdigest(),
@@ -1497,28 +1498,94 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("credential", combined)
         self.assertNotIn("restart-secret-error", combined)
 
-    def test_checkpoint_preserves_prior_config(self) -> None:
-        """GREEN: the checkpoint retains the prior daemon.json for restoration."""
-        prior = {"bip": "172.17.0.1/16", "icc": False}
-        self._write_daemon(json.dumps(prior))
-        restart = Path(self.tmp) / "restart.sh"
-        restart.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        restart.chmod(0o755)
-        probe = Path(self.tmp) / "probe.sh"
-        probe.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        probe.chmod(0o755)
-        health = Path(self.tmp) / "health.sh"
-        health.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        health.chmod(0o755)
-        checkpoint_dir = Path(self.tmp) / "checkpoint"
-        env_file = self._write_env_file(self._rendered_with_policy())
-        result = self._run(str(env_file), checkpoint_dir=str(checkpoint_dir))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        backup = checkpoint_dir / "daemon.json"
-        self.assertTrue(backup.exists())
-        self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), prior)
+    def test_removal_restores_prior_pools_and_preserves_current_unrelated_keys(self) -> None:
+        prior_pools = [{"base": "192.0.2.0/24", "size": 28}]
+        daemon = self._write_daemon(json.dumps({"default-address-pools": prior_pools, "icc": False}))
+        checkpoint = Path(self.tmp) / "checkpoint-prior-pools"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
 
-    def test_managed_policy_removal_restores_backup_without_copying_over_daemon(self) -> None:
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertTrue(state["prior_default_address_pools_present"])
+        self.assertEqual(state["prior_default_address_pools"], prior_pools)
+        current = json.loads(daemon.read_text(encoding="utf-8"))
+        current.pop("icc")
+        current["live-restore"] = True
+        daemon.write_text(json.dumps(current), encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(
+            json.loads(daemon.read_text(encoding="utf-8")),
+            {"default-address-pools": prior_pools, "live-restore": True},
+        )
+
+    def test_removal_drops_only_managed_key_when_prior_key_was_absent(self) -> None:
+        for original_file_present, current_unrelated in ((True, {"live-restore": True}), (False, {})):
+            with self.subTest(original_file_present=original_file_present):
+                daemon = self.daemon_dir / "daemon.json"
+                daemon.unlink(missing_ok=True)
+                if original_file_present:
+                    daemon.write_text(json.dumps({"icc": False}), encoding="utf-8")
+                checkpoint = Path(self.tmp) / f"checkpoint-prior-key-absent-{original_file_present}"
+                self._write_success_commands()
+                policy_env = self._write_env_file(self._rendered_with_policy())
+
+                applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+                self.assertFalse(state["prior_default_address_pools_present"])
+                self.assertIsNone(state["prior_default_address_pools"])
+                managed = json.loads(daemon.read_text(encoding="utf-8"))
+                managed.pop("icc", None)
+                managed.update(current_unrelated)
+                daemon.write_text(json.dumps(managed), encoding="utf-8")
+                no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+                removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertEqual(daemon.exists(), bool(current_unrelated) or original_file_present)
+                if daemon.exists():
+                    self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), current_unrelated)
+
+    def test_persistent_provenance_has_no_recovery_backup_and_rejects_inconsistent_state(self) -> None:
+        prior_pools = [{"base": "192.0.2.0/24", "size": 28}]
+        daemon = self._write_daemon(json.dumps({"default-address-pools": prior_pools, "registry-mirrors": ["private-daemon-value"]}))
+        checkpoint = Path(self.tmp) / "checkpoint-provenance-only"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertFalse((checkpoint / "daemon.json").exists())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["prior_default_address_pools_present"] = False
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        managed = daemon.read_bytes()
+        drain_marker = Path(self.tmp) / "inconsistent-provenance-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertFalse(drain_marker.exists())
+        self.assertIn("network-policy checkpoint state is invalid", removed.stderr)
+        self.assertNotIn("private-daemon-value", removed.stdout + removed.stderr)
+        self.assertNotIn("192.0.2.0/24", removed.stdout + removed.stderr)
+
+    def test_managed_policy_removal_replaces_daemon_atomically(self) -> None:
         prior = b'{"icc":false}\n'
         daemon = self.daemon_dir / "daemon.json"
         daemon.write_bytes(prior)
@@ -1556,7 +1623,7 @@ class ApplyScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(removed.returncode, 0, removed.stderr)
-        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), json.loads(prior))
         self.assertEqual(daemon.stat().st_mode & 0o777, 0o640)
 
     def test_successful_removal_restarts_resumes_then_checks_health(self) -> None:
@@ -1623,11 +1690,66 @@ class ApplyScriptTests(unittest.TestCase):
                 self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain.sh", "restart.sh", "health.sh"])
                 self.assertEqual(daemon.exists(), prior_present)
                 if prior_present:
-                    self.assertEqual(daemon.read_bytes(), prior)
+                    self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), json.loads(prior))
                     self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
-                    self.assertTrue((checkpoint / "daemon.json").exists())
+                    self.assertFalse((checkpoint / "daemon.json").exists())
                 self.assertFalse((checkpoint / "docker-network-policy.json").exists())
                 self.assertTrue(retained.exists())
+
+    def test_removal_failure_restores_managed_key_into_current_unrelated_json(self) -> None:
+        daemon = self._write_daemon(json.dumps({"icc": False}))
+        checkpoint = Path(self.tmp) / "checkpoint-remove-merge-rollback"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        current = json.loads(daemon.read_text(encoding="utf-8"))
+        current.pop("icc")
+        current["live-restore"] = True
+        daemon.write_text(json.dumps(current), encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        command_log = Path(self.tmp) / "removal-merge-rollback.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\necho restart >> {command_log}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        mutator = Path(self.tmp) / "mutate-daemon.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "p = sys.argv[1]\n"
+            "d = json.load(open(p))\n"
+            "d['debug'] = True\n"
+            "with open(p, 'w') as handle: json.dump(d, handle)\n",
+            encoding="utf-8",
+        )
+        resume = Path(self.tmp) / "resume.sh"
+        resume.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo resume >> {command_log}\n"
+            'if ! grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2"; then\n'
+            f"  {shutil.which('python3')} {mutator} {daemon}\n"
+            "  exit 2\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        resume.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(f"#!/usr/bin/env bash\necho health >> {command_log}\n", encoding="utf-8")
+        health.chmod(0o755)
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(
+            json.loads(daemon.read_text(encoding="utf-8")),
+            {"default-address-pools": managed_pools, "debug": True, "live-restore": True},
+        )
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "resume", "restart", "resume", "health"],
+        )
 
     def test_removal_failure_restores_managed_config_and_retains_recovery_state(self) -> None:
         prior = b'{"registry-mirrors":["https://mirror.example.invalid?token=credential"]}\n'
@@ -1642,7 +1764,7 @@ class ApplyScriptTests(unittest.TestCase):
         managed = daemon.read_bytes()
         managed_mode = daemon.stat().st_mode & 0o777
         state = (checkpoint / "docker-network-policy.json").read_bytes()
-        baseline = (checkpoint / "daemon.json").read_bytes()
+        self.assertFalse((checkpoint / "daemon.json").exists())
         self.installed_env.write_bytes(policy_env.read_bytes())
 
         restart_log = Path(self.tmp) / "remove-failure-restart.log"
@@ -1669,7 +1791,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.stat().st_mode & 0o777, managed_mode)
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
         self.assertEqual((checkpoint / "docker-network-policy.json").read_bytes(), state)
-        self.assertEqual((checkpoint / "daemon.json").read_bytes(), baseline)
+        self.assertFalse((checkpoint / "daemon.json").exists())
         combined = removed.stdout + removed.stderr
         self.assertIn("managed daemon.json restored", combined)
         for secret in ("198.51.100.0/24", "secret.example.invalid", "mirror.example.invalid", "credential", "removal-health-secret"):
