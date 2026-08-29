@@ -87,7 +87,25 @@ command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 [[ -x "$probe_command" ]] || die "network probe is not executable: $probe_command"
 [[ -x "$health_command" ]] || die "health-check command is not executable: $health_command"
 
+# Serialize with installer mutations using the installer's host-local lock.
+lock_file=${CI_FLEET_INSTALLER_LOCK:-${CI_FLEET_ROOT_PREFIX:-}/run/ci-fleet-installer.lock}
+if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
+  [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
+  [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
+  flock -n 9 || die 'inherited installer lock is unavailable'
+else
+  install -d -m 0755 "$(dirname "$lock_file")"
+  exec 9>"$lock_file"
+  flock -n 9 || die 'another ci-fleet installer or drift check is already running'
+fi
+
+[[ ! -L "$daemon_config" ]] || die "daemon.json must not be a symlink: $daemon_config"
+
 # --- Ownership guard (relaxed in testing) ---
+daemon_mode=644
+if [[ -f "$daemon_config" ]]; then
+  daemon_mode=$(stat -c %a "$daemon_config")
+fi
 if [[ "$testing" != 1 ]]; then
   [[ -w "$(dirname "$daemon_config")" ]] || die "daemon config directory is not writable: $(dirname "$daemon_config")"
   if [[ -f "$daemon_config" ]]; then
@@ -189,26 +207,38 @@ rollback_daemon() {
   return "$failed"
 }
 
-fail_after_apply() {
-  local failure=$1
-  if rollback_daemon; then
+transaction_failure='network-policy apply interrupted'
+rollback_on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  ((status != 0)) || status=1
+  if rollback_daemon >/dev/null 2>&1; then
     rm -rf "$work_dir"
-    die "$failure; prior daemon.json restored"
+    printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
+  else
+    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$work_dir" >&2
   fi
-  rm -rf "$work_dir"
-  die "$failure; rollback verification failed"
+  exit "$status"
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap rollback_on_exit EXIT
+
+fail_after_apply() {
+  transaction_failure=$1
+  exit 2
 }
 
 # --- Transaction: apply → restart → probe → health, with rollback ---
 # Apply daemon.json atomically (rename within same directory)
-python3 - "$staging_daemon" "$daemon_dir" "$daemon_config" <<'PY' || { restore_daemon; rm -rf "$work_dir"; die "failed to apply daemon.json"; }
+python3 - "$staging_daemon" "$daemon_dir" "$daemon_config" "$daemon_mode" <<'PY' || { transaction_failure='failed to apply daemon.json'; exit 2; }
 import os, shutil, sys, tempfile
-_, _, daemon_dir, target = sys.argv
+_, _, daemon_dir, target, daemon_mode = sys.argv
 fd, tmp = tempfile.mkstemp(prefix=".daemon.json.", dir=daemon_dir)
 try:
     with open(sys.argv[1], "rb") as source, os.fdopen(fd, "wb") as staged:
         shutil.copyfileobj(source, staged)
-    os.chmod(tmp, 0o644)
+    os.chmod(tmp, int(daemon_mode, 8))
     os.replace(tmp, target)
 finally:
     if os.path.exists(tmp):
@@ -231,5 +261,6 @@ if ! timeout "$command_timeout" "$health_command" 2>&1; then
 fi
 
 # --- Success ---
+trap - EXIT INT TERM
 rm -rf "$work_dir"
 printf 'NETWORK_POLICY_APPLIED daemon_config=%s\n' "$daemon_config"
