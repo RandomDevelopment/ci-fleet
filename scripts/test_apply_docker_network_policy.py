@@ -210,9 +210,11 @@ class ApplyScriptTests(unittest.TestCase):
         )
         return rendered
 
-    def _run(self, env_file: str, checkpoint_dir: str = "", expected_rc: int = 0) -> subprocess.CompletedProcess:
+    def _run(self, env_file: str, checkpoint_dir: str | None = None, expected_rc: int = 0) -> subprocess.CompletedProcess:
         script = str(SCRIPTS / "apply-docker-network-policy.sh")
         args = [script]
+        if checkpoint_dir is None:
+            checkpoint_dir = str(Path(self.tmp) / "checkpoint-default")
         if checkpoint_dir:
             args += ["--checkpoint", checkpoint_dir]
         args += ["--env", env_file]
@@ -223,6 +225,111 @@ class ApplyScriptTests(unittest.TestCase):
             env=self._env(),
             timeout=30,
         )
+
+    def _write_success_commands(self) -> None:
+        for name in ("restart.sh", "probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+
+    def test_policy_apply_requires_checkpoint_before_drain_or_mutation(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        drain_marker = Path(self.tmp) / "drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir="")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--checkpoint is required", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+
+    def test_successful_apply_records_managed_original_presence_and_mode(self) -> None:
+        for prior_present in (False, True):
+            with self.subTest(prior_present=prior_present):
+                daemon = self.daemon_dir / "daemon.json"
+                daemon.unlink(missing_ok=True)
+                if prior_present:
+                    daemon.write_bytes(b'{"icc":false}\n')
+                    daemon.chmod(0o600)
+                checkpoint = Path(self.tmp) / f"checkpoint-{prior_present}"
+                self._write_success_commands()
+                env_file = self._write_env_file(self._rendered_with_policy())
+
+                result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    state,
+                    {
+                        "managed": True,
+                        "prior_mode": "600" if prior_present else None,
+                        "prior_present": prior_present,
+                    },
+                )
+                self.assertEqual((checkpoint / "docker-network-policy.json").stat().st_mode & 0o777, 0o600)
+                self.assertEqual((checkpoint / "daemon.json").exists(), prior_present)
+                if prior_present:
+                    self.assertEqual((checkpoint / "daemon.json").read_bytes(), b'{"icc":false}\n')
+                    self.assertEqual((checkpoint / "daemon.json").stat().st_mode & 0o777, 0o600)
+
+    def test_policy_reapply_fails_closed_when_recovery_backup_is_missing(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        prior = daemon.read_bytes()
+        checkpoint = Path(self.tmp) / "checkpoint-missing-backup"
+        checkpoint.mkdir()
+        (checkpoint / "docker-network-policy.json").write_text(
+            json.dumps({"managed": True, "prior_mode": "600", "prior_present": True}),
+            encoding="utf-8",
+        )
+        markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
+            marker = Path(self.tmp) / f"missing-backup-{name}.marker"
+            markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(rendered)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint backup is invalid", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_policy_reapply_fails_closed_when_absent_baseline_has_backup(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        prior = daemon.read_bytes()
+        checkpoint = Path(self.tmp) / "checkpoint-unexpected-backup"
+        checkpoint.mkdir()
+        (checkpoint / "docker-network-policy.json").write_text(
+            json.dumps({"managed": True, "prior_mode": None, "prior_present": False}),
+            encoding="utf-8",
+        )
+        (checkpoint / "daemon.json").write_text("{}\n", encoding="utf-8")
+        markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
+            marker = Path(self.tmp) / f"unexpected-backup-{name}.marker"
+            markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(rendered)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint backup is invalid", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertTrue(all(not marker.exists() for marker in markers))
 
     def test_policy_requires_drain_command(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
@@ -241,7 +348,7 @@ class ApplyScriptTests(unittest.TestCase):
         env.pop("CI_FLEET_DOCKER_DRAIN_COMMAND")
 
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             capture_output=True,
             text=True,
             env=env,
@@ -342,7 +449,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
 
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             capture_output=True,
             text=True,
             env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(drain)),
@@ -398,7 +505,7 @@ class ApplyScriptTests(unittest.TestCase):
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(bad_env)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-bad-env"), "--env", str(bad_env)],
             capture_output=True,
             text=True,
             env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(Path(self.tmp) / "drain.sh")),
@@ -432,7 +539,7 @@ class ApplyScriptTests(unittest.TestCase):
             command.chmod(0o755)
         env_file = self._write_env_file(self._rendered_with_policy())
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             capture_output=True,
             text=True,
             env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(drain)),
@@ -541,7 +648,7 @@ class ApplyScriptTests(unittest.TestCase):
         health.chmod(0o755)
         env_file = self._write_env_file(self._rendered_with_policy())
         process = subprocess.Popen(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -669,7 +776,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
         started = time.monotonic()
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             capture_output=True,
             text=True,
             env=self._env(
@@ -690,7 +797,7 @@ class ApplyScriptTests(unittest.TestCase):
             command.chmod(0o755)
         env_file = self._write_env_file(self._rendered_with_policy())
         result = subprocess.run(
-            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-direct"), "--env", str(env_file)],
             capture_output=True,
             text=True,
             env=self._env(CI_FLEET_TEMP_DIR="/dev/shm"),
@@ -815,7 +922,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
         script = str(SCRIPTS / "apply-docker-network-policy.sh")
         result = subprocess.run(
-            [script, "--env", env_file],
+            [script, "--checkpoint", str(Path(self.tmp) / "checkpoint-restart-failure"), "--env", env_file],
             capture_output=True,
             text=True,
             env=env,
@@ -851,15 +958,169 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertTrue(backup.exists())
         self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), prior)
 
-    def test_no_policy_is_noop(self) -> None:
-        """GREEN: when no network policy is rendered, the script does nothing."""
-        self._write_daemon(json.dumps({"bip": "172.17.0.1/16"}))
+    def test_managed_policy_removal_restores_original_state_and_clears_only_marker(self) -> None:
+        for prior_present in (False, True):
+            with self.subTest(prior_present=prior_present):
+                daemon = self.daemon_dir / "daemon.json"
+                daemon.unlink(missing_ok=True)
+                prior = b'{"icc":false}\n'
+                if prior_present:
+                    daemon.write_bytes(prior)
+                    daemon.chmod(0o600)
+                checkpoint = Path(self.tmp) / f"checkpoint-remove-{prior_present}"
+                self._write_success_commands()
+                policy_env = self._write_env_file(self._rendered_with_policy())
+                applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                self.assertTrue((checkpoint / "docker-network-policy.json").exists())
+                retained = checkpoint / "retained"
+                retained.write_text("keep\n", encoding="utf-8")
+
+                command_log = Path(self.tmp) / f"remove-{prior_present}.log"
+                for name in ("drain.sh", "restart.sh", "probe.sh"):
+                    command = Path(self.tmp) / name
+                    command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+                    command.chmod(0o755)
+                no_policy_env = Path(self.tmp) / f"no-policy-{prior_present}.env"
+                no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+                health = Path(self.tmp) / "health.sh"
+                health.write_text(
+                    "#!/usr/bin/env bash\n"
+                    f"[[ $1 == --env && $2 == {no_policy_env} ]] || exit 1\n"
+                    f"echo health.sh >> {command_log}\n",
+                    encoding="utf-8",
+                )
+                health.chmod(0o755)
+
+                removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
+                self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain.sh", "restart.sh", "health.sh"])
+                self.assertEqual(daemon.exists(), prior_present)
+                if prior_present:
+                    self.assertEqual(daemon.read_bytes(), prior)
+                    self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
+                    self.assertTrue((checkpoint / "daemon.json").exists())
+                self.assertFalse((checkpoint / "docker-network-policy.json").exists())
+                self.assertTrue(retained.exists())
+
+    def test_removal_failure_restores_managed_config_and_retains_recovery_state(self) -> None:
+        prior = b'{"registry-mirrors":["https://mirror.example.invalid?token=credential"]}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        daemon.chmod(0o600)
+        checkpoint = Path(self.tmp) / "checkpoint-remove-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        managed_mode = daemon.stat().st_mode & 0o777
+        state = (checkpoint / "docker-network-policy.json").read_bytes()
+        baseline = (checkpoint / "daemon.json").read_bytes()
+
+        restart_log = Path(self.tmp) / "remove-failure-restart.log"
         restart = Path(self.tmp) / "restart.sh"
-        restart.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        restart.write_text(f"#!/usr/bin/env bash\necho restart >> {restart_log}\n", encoding="utf-8")
         restart.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
+            "echo removal-health-secret >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+        no_policy_env = Path(self.tmp) / "no-policy-failure.env"
+        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertEqual(daemon.stat().st_mode & 0o777, managed_mode)
+        self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
+        self.assertEqual((checkpoint / "docker-network-policy.json").read_bytes(), state)
+        self.assertEqual((checkpoint / "daemon.json").read_bytes(), baseline)
+        combined = removed.stdout + removed.stderr
+        self.assertIn("managed daemon.json restored", combined)
+        for secret in ("198.51.100.0/24", "secret.example.invalid", "mirror.example.invalid", "credential", "removal-health-secret"):
+            self.assertNotIn(secret, combined)
+
+    def test_marker_clear_failure_rolls_back_managed_config_and_retains_state(self) -> None:
+        daemon = self._write_daemon('{"icc":false}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-marker-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        state_file = checkpoint / "docker-network-policy.json"
+        state = state_file.read_bytes()
+
+        restart_log = Path(self.tmp) / "marker-failure-restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\necho restart >> {restart_log}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        health.chmod(0o755)
+        no_policy_env = Path(self.tmp) / "no-policy-marker-failure.env"
+        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        fake_bin = Path(self.tmp) / "fake-bin"
+        fake_bin.mkdir()
+        fake_rm = fake_bin / "rm"
+        fake_rm.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ ${{*: -1}} != {state_file} ]] || exit 1\n"
+            f"exec {shutil.which('rm')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_rm.chmod(0o755)
+        env = self._env(PATH=f"{fake_bin}:{os.environ['PATH']}")
+
+        removed = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(no_policy_env),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertEqual(state_file.read_bytes(), state)
+        self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
+
+    def test_unmanaged_no_policy_is_noop_without_mutation_or_commands(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
+            marker = Path(self.tmp) / f"{name}.marker"
+            markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\nexit 1\n", encoding="utf-8")
+            command.chmod(0o755)
+        checkpoint = Path(self.tmp) / "checkpoint"
         env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
-        result = self._run(str(env_file))
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "NETWORK_POLICY_NOOP\n")
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(checkpoint.exists())
+        self.assertTrue(all(not marker.exists() for marker in markers))
 
 
 if __name__ == "__main__":
