@@ -124,6 +124,9 @@ class ApplyScriptTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.daemon_dir = Path(self.tmp) / "etc" / "docker"
         self.daemon_dir.mkdir(parents=True)
+        self.drain_command = Path(self.tmp) / "drain.sh"
+        self.drain_command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        self.drain_command.chmod(0o755)
 
     def _write_daemon(self, content: str) -> Path:
         path = self.daemon_dir / "daemon.json"
@@ -134,6 +137,7 @@ class ApplyScriptTests(unittest.TestCase):
         env = dict(os.environ)
         env["CI_FLEET_TESTING"] = "1"
         env["CI_FLEET_DOCKER_DAEMON_CONFIG"] = str(self.daemon_dir / "daemon.json")
+        env["CI_FLEET_DOCKER_DRAIN_COMMAND"] = str(self.drain_command)
         env["CI_FLEET_DOCKER_RESTART_COMMAND"] = str(Path(self.tmp) / "restart.sh")
         env["CI_FLEET_DOCKER_NETWORK_PROBE"] = str(Path(self.tmp) / "probe.sh")
         env["CI_FLEET_HEALTH_CHECK_COMMAND"] = str(Path(self.tmp) / "health.sh")
@@ -175,6 +179,58 @@ class ApplyScriptTests(unittest.TestCase):
             env=self._env(),
             timeout=30,
         )
+
+    def test_policy_requires_drain_command(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self.daemon_dir / "daemon.json"
+        daemon.write_bytes(prior)
+        restart_marker = Path(self.tmp) / "restart.marker"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\ntouch {restart_marker}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        for name in ("probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        env = self._env()
+        env.pop("CI_FLEET_DOCKER_DRAIN_COMMAND")
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(restart_marker.exists())
+
+    def test_invalid_existing_config_does_not_drain(self) -> None:
+        daemon = self._write_daemon("{not-json\n")
+        drain_marker = Path(self.tmp) / "drain.marker"
+        drain = Path(self.tmp) / "drain-marker.sh"
+        drain.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        drain.chmod(0o755)
+        for name in ("restart.sh", "probe.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_DOCKER_DRAIN_COMMAND=str(drain)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_text(encoding="utf-8"), "{not-json\n")
+        self.assertFalse(drain_marker.exists())
 
     def test_validates_policy_before_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
@@ -282,6 +338,33 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
         self.assertNotIn("198.51.100.0/24", result.stdout + result.stderr)
         self.assertNotIn("super-secret", result.stdout + result.stderr)
+
+    def test_rollback_failure_is_reported(self) -> None:
+        self._write_daemon('{"bip":"172.17.0.1/16"}\n')
+        restart_log = Path(self.tmp) / "restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]] || {{ echo '198.51.100.0/24 super-secret'; exit 1; }}\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("rollback verification failed", combined)
+        self.assertNotIn("prior daemon.json restored", combined)
+        self.assertNotIn("198.51.100.0/24", combined)
+        self.assertNotIn("super-secret", combined)
 
     def test_sleeping_probe_times_out(self) -> None:
         self._write_daemon("{}\n")

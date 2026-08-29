@@ -78,11 +78,12 @@ command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
+[[ -n "$drain_command" ]] || die 'CI_FLEET_DOCKER_DRAIN_COMMAND is required when a network policy is configured'
 [[ -n "$restart_command" ]] || die 'CI_FLEET_DOCKER_RESTART_COMMAND is required when a network policy is configured'
 [[ -n "$probe_command" ]] || die 'CI_FLEET_DOCKER_NETWORK_PROBE is required when a network policy is configured'
 [[ -n "$health_command" ]] || die 'CI_FLEET_HEALTH_CHECK_COMMAND is required when a network policy is configured'
 [[ -x "$restart_command" ]] || die "restart command is not executable: $restart_command"
-[[ -z "$drain_command" || -x "$drain_command" ]] || die "drain command is not executable: $drain_command"
+[[ -x "$drain_command" ]] || die "drain command is not executable: $drain_command"
 [[ -x "$probe_command" ]] || die "network probe is not executable: $probe_command"
 [[ -x "$health_command" ]] || die "health-check command is not executable: $health_command"
 
@@ -118,11 +119,6 @@ PY
 if [[ "$desired_pools_json" == "{}" ]]; then
   printf 'NETWORK_POLICY_NOOP\n'
   exit 0
-fi
-
-# --- Drain before any daemon.json mutation or restart ---
-if [[ -n "$drain_command" ]] && ! timeout "$command_timeout" "$drain_command" 2>&1; then
-  die "drain command failed before network-policy apply"
 fi
 
 # --- Stage merged daemon.json (preserve unrelated keys) ---
@@ -169,6 +165,12 @@ fi
 
 daemon_dir=$(dirname "$daemon_config")
 
+# --- Drain after local validation/checkpointing, before mutation or restart ---
+if ! timeout "$command_timeout" "$drain_command" 2>&1; then
+  rm -rf "$work_dir"
+  die "drain command failed before network-policy apply"
+fi
+
 restore_daemon() {
   if [[ "$had_prior" == true ]]; then
     cp -p "$backup_dir/$backup_name" "$daemon_config"
@@ -185,6 +187,16 @@ rollback_daemon() {
   timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || failed=1
   timeout "$command_timeout" "$health_command" >/dev/null 2>&1 || failed=1
   return "$failed"
+}
+
+fail_after_apply() {
+  local failure=$1
+  if rollback_daemon; then
+    rm -rf "$work_dir"
+    die "$failure; prior daemon.json restored"
+  fi
+  rm -rf "$work_dir"
+  die "$failure; rollback verification failed"
 }
 
 # --- Transaction: apply → restart → probe → health, with rollback ---
@@ -205,23 +217,17 @@ PY
 
 # Restart Docker through the injected command boundary (never host-direct).
 if ! timeout "$command_timeout" "$restart_command" "$daemon_dir" 2>&1; then
-  rollback_daemon || true
-  rm -rf "$work_dir"
-  die "Docker restart command failed; prior daemon.json restored"
+  fail_after_apply "Docker restart command failed"
 fi
 
 # Bounded capacity probe
 if ! timeout "$command_timeout" "$probe_command" 2>&1; then
-  rollback_daemon || true
-  rm -rf "$work_dir"
-  die "capacity probe failed after network-policy restart; prior daemon.json restored"
+  fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
 # Health verification
 if ! timeout "$command_timeout" "$health_command" 2>&1; then
-  rollback_daemon || true
-  rm -rf "$work_dir"
-  die "health check failed after network-policy restart; prior daemon.json restored"
+  fail_after_apply "health check failed after network-policy restart"
 fi
 
 # --- Success ---
