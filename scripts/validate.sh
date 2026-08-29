@@ -14,11 +14,13 @@ python3 -m py_compile \
   scripts/status_receiver.py \
   scripts/scan_committed_secrets.py \
   scripts/test_desired_state.py \
+  scripts/test_apply_docker_network_policy.py \
   scripts/test_health.py \
   scripts/test_status_receiver.py \
   scripts/test_quickstart.py
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_health.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py

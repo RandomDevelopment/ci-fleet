@@ -164,6 +164,17 @@ with open(staging_path, "w", encoding="utf-8") as handle:
 os.chmod(staging_path, 0o644)
 PY
 
+if [[ -f "$daemon_config" ]] && python3 - "$daemon_config" "$staging_daemon" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as current, open(sys.argv[2], encoding="utf-8") as staged:
+    raise SystemExit(json.load(current) != json.load(staged))
+PY
+then
+  rm -rf "$work_dir"
+  printf 'NETWORK_POLICY_NO_CHANGE\n'
+  exit 0
+fi
+
 # --- Back up exact prior daemon.json for rollback ---
 prior_daemon="$work_dir/prior"
 mkdir -p "$prior_daemon"
@@ -184,7 +195,7 @@ fi
 daemon_dir=$(dirname "$daemon_config")
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
-if ! timeout "$command_timeout" "$drain_command" 2>&1; then
+if ! timeout "$command_timeout" "$drain_command" >/dev/null 2>&1; then
   rm -rf "$work_dir"
   die "drain command failed before network-policy apply"
 fi
@@ -203,7 +214,7 @@ rollback_daemon() {
   local failed=0
   restore_daemon || failed=1
   timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1 || failed=1
-  timeout "$command_timeout" "$health_command" >/dev/null 2>&1 || failed=1
+  timeout "$command_timeout" "$health_command" --env "$env_file" >/dev/null 2>&1 || failed=1
   return "$failed"
 }
 
@@ -246,17 +257,17 @@ finally:
 PY
 
 # Restart Docker through the injected command boundary (never host-direct).
-if ! timeout "$command_timeout" "$restart_command" "$daemon_dir" 2>&1; then
+if ! timeout "$command_timeout" "$restart_command" "$daemon_dir" >/dev/null 2>&1; then
   fail_after_apply "Docker restart command failed"
 fi
 
 # Bounded capacity probe
-if ! timeout "$command_timeout" "$probe_command" 2>&1; then
+if ! timeout "$command_timeout" "$probe_command" >/dev/null 2>&1; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
 # Health verification
-if ! timeout "$command_timeout" "$health_command" 2>&1; then
+if ! timeout "$command_timeout" "$health_command" --env "$env_file" >/dev/null 2>&1; then
   fail_after_apply "health check failed after network-policy restart"
 fi
 

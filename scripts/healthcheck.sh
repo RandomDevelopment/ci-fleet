@@ -9,6 +9,11 @@ if [[ ${CI_FLEET_TESTING:-0} == 1 && -n ${CI_FLEET_ROOT_PREFIX:-} ]]; then
   environment="$CI_FLEET_ROOT_PREFIX/etc/ci-fleet/ci-fleet.env"
   args+=(--monitoring-config "$CI_FLEET_ROOT_PREFIX/etc/ci-fleet/monitoring.env" --output "$CI_FLEET_ROOT_PREFIX/var/lib/ci-fleet/health/latest.json")
 fi
+if [[ ${1:-} == --env ]]; then
+  [[ $# -ge 2 && -r $2 ]] || { printf 'ERROR: --env requires a readable file\n' >&2; exit 2; }
+  environment=$2
+  shift 2
+fi
 if [[ -r $environment ]]; then
   set -a
   # shellcheck disable=SC1090

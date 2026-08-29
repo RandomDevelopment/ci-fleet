@@ -115,6 +115,48 @@ class RenderDaemonConfigTests(unittest.TestCase):
         self.assertNotIn("default-address-pools", daemon)
 
 
+class ValidationTests(unittest.TestCase):
+    def test_validate_runs_docker_network_policy_suite(self) -> None:
+        validate = (SCRIPTS / "validate.sh").read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/test_apply_docker_network_policy.py", validate)
+
+
+class HealthcheckScriptTests(unittest.TestCase):
+    def test_env_argument_sources_candidate_rendered_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installed = root / "etc" / "ci-fleet" / "ci-fleet.env"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("ENV_MARKER=stale\n", encoding="utf-8")
+            candidate = root / "candidate.env"
+            candidate.write_text("ENV_MARKER=candidate\n", encoding="utf-8")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ ${ENV_MARKER:-} == candidate ]] || exit 1\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                CI_FLEET_TESTING="1",
+                CI_FLEET_ROOT_PREFIX=tmp,
+                PATH=f"{fake_bin}:{env['PATH']}",
+            )
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class ApplyScriptTests(unittest.TestCase):
     """Integration tests for scripts/apply-docker-network-policy.sh.
 
@@ -311,6 +353,29 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_text(encoding="utf-8"), "{not-json\n")
         self.assertFalse(drain_marker.exists())
 
+    def test_semantically_equal_daemon_config_is_no_change_before_side_effects(self) -> None:
+        rendered = self._rendered_with_policy()
+        desired = render_docker_daemon_config(rendered)
+        daemon = self._write_daemon(json.dumps(desired, separators=(",", ":")))
+        prior = daemon.read_bytes()
+        markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "health.sh"):
+            marker = Path(self.tmp) / f"{name}.marker"
+            markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(rendered)
+        checkpoint = Path(self.tmp) / "checkpoint"
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "NETWORK_POLICY_NO_CHANGE\n")
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(checkpoint.exists())
+        self.assertTrue(all(not marker.exists() for marker in markers))
+
     def test_validates_policy_before_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self.daemon_dir / "daemon.json"
@@ -349,7 +414,13 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = self.daemon_dir / "daemon.json"
         daemon.write_bytes(prior)
         drain = Path(self.tmp) / "drain.sh"
-        drain.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        drain.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
+            "echo 'drain-secret-error' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
         drain.chmod(0o755)
         restart_marker = Path(self.tmp) / "restart.marker"
         restart = Path(self.tmp) / "restart.sh"
@@ -370,6 +441,12 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(restart_marker.exists())
+        combined = result.stdout + result.stderr
+        self.assertEqual(combined, "ERROR: drain command failed before network-policy apply\n")
+        self.assertNotIn("198.51.100.0/24", combined)
+        self.assertNotIn("secret.example.invalid", combined)
+        self.assertNotIn("credential", combined)
+        self.assertNotIn("drain-secret-error", combined)
 
     def test_probe_failure_restores_absent_config_and_restarts(self) -> None:
         restart_log = Path(self.tmp) / "restart.log"
@@ -403,11 +480,22 @@ class ApplyScriptTests(unittest.TestCase):
         )
         restart.chmod(0o755)
         probe = Path(self.tmp) / "probe.sh"
-        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
+            "echo 'probe-secret-error' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
         probe.chmod(0o755)
         health_log = Path(self.tmp) / "health.log"
         health = Path(self.tmp) / "health.sh"
-        health.write_text(f"#!/usr/bin/env bash\necho health >> {health_log}\n", encoding="utf-8")
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ $1 == --env && $2 == {self.tmp}/ci-fleet.env ]] || exit 1\n"
+            f"echo health >> {health_log}\n",
+            encoding="utf-8",
+        )
         health.chmod(0o755)
         env_file = self._write_env_file(self._rendered_with_policy())
         result = self._run(str(env_file), expected_rc=1)
@@ -417,6 +505,9 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
         self.assertNotIn("198.51.100.0/24", result.stdout + result.stderr)
         self.assertNotIn("super-secret", result.stdout + result.stderr)
+        self.assertNotIn("secret.example.invalid", result.stdout + result.stderr)
+        self.assertNotIn("credential", result.stdout + result.stderr)
+        self.assertNotIn("probe-secret-error", result.stdout + result.stderr)
 
     def test_interrupt_after_replace_rolls_back_and_retains_failed_recovery(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
@@ -482,12 +573,13 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual((recovery_dirs[0] / "prior" / "daemon.json.before").read_bytes(), prior)
 
     def test_rollback_failure_is_reported(self) -> None:
-        self._write_daemon('{"bip":"172.17.0.1/16"}\n')
+        prior = b'{"bip":"172.17.0.1/16","registry-mirrors":["https://mirror.example.invalid?token=credential"]}\n'
+        self._write_daemon(prior.decode())
         restart_log = Path(self.tmp) / "restart.log"
         restart = Path(self.tmp) / "restart.sh"
         restart.write_text(
             f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
-            f"[[ $(wc -l < {restart_log}) -eq 1 ]] || {{ echo '198.51.100.0/24 super-secret'; exit 1; }}\n",
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]] || {{ echo '198.51.100.0/24 https://secret.example.invalid token=credential'; echo rollback-secret-error >&2; exit 1; }}\n",
             encoding="utf-8",
         )
         restart.chmod(0o755)
@@ -506,7 +598,64 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("rollback verification failed", combined)
         self.assertNotIn("prior daemon.json restored", combined)
         self.assertNotIn("198.51.100.0/24", combined)
-        self.assertNotIn("super-secret", combined)
+        self.assertNotIn("172.17.0.1/16", combined)
+        self.assertNotIn("secret.example.invalid", combined)
+        self.assertNotIn("mirror.example.invalid", combined)
+        self.assertNotIn("credential", combined)
+        self.assertNotIn("rollback-secret-error", combined)
+        recovery = Path(combined.rstrip().rsplit("recovery data retained at ", 1)[1])
+        self.addCleanup(shutil.rmtree, recovery, ignore_errors=True)
+        self.assertTrue(recovery.name.startswith(".ci-fleet-apply."))
+        self.assertEqual((recovery / "prior" / "daemon.json.before").read_bytes(), prior)
+
+    def test_post_apply_health_uses_candidate_rendered_env(self) -> None:
+        self._write_daemon("{}\n")
+        for name in ("restart.sh", "probe.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        health_log = Path(self.tmp) / "health.log"
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ $1 == --env && $2 == {self.tmp}/ci-fleet.env ]] || exit 1\n"
+            f"printf '%s\\n' \"$2\" >> {health_log}\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), [str(env_file)])
+
+    def test_health_failure_evidence_excludes_command_output(self) -> None:
+        self._write_daemon("{}\n")
+        for name in ("restart.sh", "probe.sh"):
+            command = Path(self.tmp) / name
+            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
+            "echo 'health-secret-error' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("ERROR: health check failed after network-policy restart", combined)
+        self.assertNotIn("198.51.100.0/24", combined)
+        self.assertNotIn("secret.example.invalid", combined)
+        self.assertNotIn("credential", combined)
+        self.assertNotIn("health-secret-error", combined)
 
     def test_sleeping_probe_times_out(self) -> None:
         self._write_daemon("{}\n")
@@ -645,11 +794,16 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.daemon_dir / "restart.log").exists())
 
-    def test_failure_evidence_excludes_secrets(self) -> None:
-        """GREEN: failure evidence must not contain secrets or CIDRs."""
+    def test_restart_failure_evidence_excludes_command_output(self) -> None:
         self._write_daemon(json.dumps({}))
         restart = Path(self.tmp) / "restart.sh"
-        restart.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        restart.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '198.51.100.0/24 https://secret.example.invalid token=credential'\n"
+            "echo 'restart-secret-error' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
         restart.chmod(0o755)
         probe = Path(self.tmp) / "probe.sh"
         probe.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
@@ -669,8 +823,12 @@ class ApplyScriptTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
+        self.assertIn("ERROR: Docker restart command failed", combined)
         self.assertNotIn("198.51.100", combined)
         self.assertNotIn("203.0.113", combined)
+        self.assertNotIn("secret.example.invalid", combined)
+        self.assertNotIn("credential", combined)
+        self.assertNotIn("restart-secret-error", combined)
 
     def test_checkpoint_preserves_prior_config(self) -> None:
         """GREEN: the checkpoint retains the prior daemon.json for restoration."""
