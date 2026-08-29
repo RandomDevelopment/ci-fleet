@@ -9,6 +9,7 @@
 #   CI_FLEET_DOCKER_DAEMON_CONFIG   absolute path to daemon.json
 #   CI_FLEET_DOCKER_DRAIN_COMMAND   path to a host drain script (runs before mutation)
 #   CI_FLEET_DOCKER_RESTART_COMMAND path to a Docker restart script
+#   CI_FLEET_CONTROLLER_RESUME_COMMAND path to a controller resume/start script
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
 #   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
@@ -90,6 +91,7 @@ fi
 daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
 drain_command=${CI_FLEET_DOCKER_DRAIN_COMMAND:-}
 restart_command=${CI_FLEET_DOCKER_RESTART_COMMAND:-}
+resume_command=${CI_FLEET_CONTROLLER_RESUME_COMMAND:-}
 probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
@@ -116,6 +118,7 @@ run_health() {
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
 validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
+validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
 validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
 if [[ "$removing" == false ]]; then
   validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
@@ -132,6 +135,16 @@ else
   exec 9>"$lock_file"
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
+
+# Snapshot the installer's authoritative pre-transaction environment while
+# holding its lock. Rollback must not validate against the rejected candidate.
+installed_env=${CI_FLEET_ROOT_PREFIX:-}/etc/ci-fleet/ci-fleet.env
+[[ -f "$installed_env" && ! -L "$installed_env" && -r "$installed_env" ]] || die "installed rendered env must be a readable regular file: $installed_env"
+[[ $(stat -c %u "$installed_env") == "$expected_env_owner" ]] || die "installed rendered env has an untrusted owner: $installed_env"
+installed_env_mode=$(stat -c %a "$installed_env")
+(( (8#$installed_env_mode & 8#022) == 0 )) || die "installed rendered env must not be group/world writable: $installed_env"
+prior_env=$work_dir/prior-ci-fleet.env
+install -m 0600 -- "$installed_env" "$prior_env"
 
 checkpoint_owner=0
 [[ "$testing" != 1 ]] || checkpoint_owner=$(id -u)
@@ -191,12 +204,49 @@ finally:
 PY
 }
 
+file_generation() {
+  python3 - "$1" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], "rb") as handle:
+    print(hashlib.file_digest(handle, "sha256").hexdigest())
+PY
+}
+
+set_verified_generation() {
+  python3 - "$state_file" "${1:-}" <<'PY'
+import json, os, sys, tempfile
+path, generation = sys.argv[1:]
+state = json.load(open(path, encoding="utf-8"))
+state["verified_generation"] = generation or None
+fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
 if [[ "$removing" == true ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || die 'network-policy checkpoint state is invalid'
   mapfile -t managed_state < <(python3 - "$state_file" <<'PY'
-import json, sys
+import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-if set(state) != {"managed", "prior_mode", "prior_present"} or state["managed"] is not True:
+if set(state) not in ({"managed", "prior_mode", "prior_present"}, {"managed", "prior_mode", "prior_present", "verified_generation"}) or state["managed"] is not True:
+    raise SystemExit(1)
+generation = state.get("verified_generation")
+if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
@@ -208,11 +258,13 @@ elif mode is not None:
     raise SystemExit(1)
 print("true" if state["prior_present"] else "false")
 print(mode or "")
+print(generation or "")
 PY
   ) || die 'network-policy checkpoint state is invalid'
-  [[ ${#managed_state[@]} == 2 ]] || die 'network-policy checkpoint state is invalid'
+  [[ ${#managed_state[@]} == 3 ]] || die 'network-policy checkpoint state is invalid'
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
+  prior_verified_generation=${managed_state[2]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
     [[ -f "$checkpoint_dir/daemon.json" && ! -L "$checkpoint_dir/daemon.json" ]] || die 'network-policy checkpoint backup is invalid'
@@ -237,6 +289,9 @@ PY
     atomic_replace_daemon "$managed_daemon" "$managed_mode" "$managed_gid" || failed=1
     cmp -s "$managed_daemon" "$daemon_config" || failed=1
     run_command "$restart_command" "$daemon_dir" || failed=1
+    run_command "$resume_command" --env "$prior_env" || failed=1
+    run_health "$prior_env" || failed=1
+    set_verified_generation "$prior_verified_generation" || failed=1
     return "$failed"
   }
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
@@ -255,6 +310,7 @@ PY
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap removal_on_exit EXIT
+  set_verified_generation "" || { removal_failure='failed to mark network-policy verification pending'; exit 2; }
 
   if [[ "$prior_present" == true ]]; then
     atomic_replace_daemon "$checkpoint_dir/daemon.json" "$prior_mode" "$prior_gid" || { removal_failure='failed to restore prior daemon.json'; exit 2; }
@@ -264,6 +320,7 @@ PY
     [[ ! -e "$daemon_config" ]] || { removal_failure='failed to verify absent daemon.json'; exit 2; }
   fi
   run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
+  run_command "$resume_command" --env "$env_file" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
   run_health "$env_file" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 
   # Marker deletion commits removal. Ignore catchable signals across the atomic
@@ -328,12 +385,17 @@ PY
 
 state_file=$checkpoint_dir/docker-network-policy.json
 managed_before=false
+prior_verified_generation=
 if [[ -e "$state_file" ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  python3 - "$state_file" "$checkpoint_dir/daemon.json" <<'PY' || { rm -rf "$work_dir"; die 'network-policy checkpoint backup is invalid'; }
+  prior_verified_generation=$(
+    python3 - "$state_file" "$checkpoint_dir/daemon.json" <<'PY'
 import json, os, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-if set(state) != {"managed", "prior_mode", "prior_present"} or state["managed"] is not True:
+if set(state) not in ({"managed", "prior_mode", "prior_present"}, {"managed", "prior_mode", "prior_present", "verified_generation"}) or state["managed"] is not True:
+    raise SystemExit(1)
+generation = state.get("verified_generation")
+if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
@@ -344,19 +406,26 @@ if state["prior_present"]:
         raise SystemExit(1)
 elif state["prior_mode"] is not None or os.path.exists(sys.argv[2]):
     raise SystemExit(1)
+print(generation or "")
 PY
+  ) || { rm -rf "$work_dir"; die 'network-policy checkpoint backup is invalid'; }
   managed_before=true
 fi
 
+daemon_matches=false
 if [[ -f "$daemon_config" ]] && python3 - "$daemon_config" "$staging_daemon" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as current, open(sys.argv[2], encoding="utf-8") as staged:
     raise SystemExit(json.load(current) != json.load(staged))
 PY
 then
-  rm -rf "$work_dir"
-  printf 'NETWORK_POLICY_NO_CHANGE\n'
-  exit 0
+  daemon_matches=true
+  current_generation=$(file_generation "$daemon_config") || { rm -rf "$work_dir"; die 'failed to identify daemon.json generation'; }
+  if [[ -n "$prior_verified_generation" && "$current_generation" == "$prior_verified_generation" ]]; then
+    rm -rf "$work_dir"
+    printf 'NETWORK_POLICY_NO_CHANGE\n'
+    exit 0
+  fi
 fi
 
 # --- Back up exact current daemon.json for transactional rollback ---
@@ -370,11 +439,49 @@ if [[ -f "$daemon_config" ]]; then
   cp -p "$daemon_config" "$backup_dir/$backup_name"
 fi
 
+restore_daemon() {
+  if [[ "$had_prior" == true ]]; then
+    atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
+  else
+    rm -f "$daemon_config"
+  fi
+}
+
+rollback_daemon() {
+  local failed=0
+  restore_daemon || failed=1
+  run_command "$restart_command" "$daemon_dir" || failed=1
+  run_command "$resume_command" --env "$prior_env" || failed=1
+  run_health "$prior_env" || failed=1
+  if [[ "$managed_before" == true ]]; then set_verified_generation "$prior_verified_generation" || failed=1; fi
+  return "$failed"
+}
+
+transaction_failure='network-policy apply interrupted'
+rollback_on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  ((status != 0)) || status=1
+  if rollback_daemon >/dev/null 2>&1; then
+    if [[ "$managed_before" == false ]]; then
+      rm -f "$state_file" "$checkpoint_dir/daemon.json"
+    fi
+    rm -rf "$work_dir"
+    printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
+  else
+    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$work_dir" >&2
+  fi
+  exit "$status"
+}
+
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 if ! run_command "$drain_command"; then
   rm -rf "$work_dir"
   die "drain command failed before network-policy apply"
 fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap rollback_on_exit EXIT
 
 # Record the original host state before the first managed mutation. Re-applying
 # policy keeps this baseline and uses the temp copy above for transaction rollback.
@@ -384,13 +491,14 @@ if [[ "$managed_before" == false ]]; then
     install -m 0600 "$backup_dir/$backup_name" "$checkpoint_dir/daemon.json"
     chgrp "$daemon_gid" "$checkpoint_dir/daemon.json"
   fi
-  python3 - "$state_file" "$had_prior" "$daemon_mode" <<'PY' || { rm -rf "$work_dir"; die 'failed to record network-policy checkpoint state'; }
+  python3 - "$state_file" "$had_prior" "$daemon_mode" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
 path = sys.argv[1]
 state = {
     "managed": True,
     "prior_mode": sys.argv[3] if sys.argv[2] == "true" else None,
     "prior_present": sys.argv[2] == "true",
+    "verified_generation": None,
 }
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -411,44 +519,9 @@ finally:
         os.unlink(tmp)
 PY
 fi
-
-restore_daemon() {
-  if [[ "$had_prior" == true ]]; then
-    atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
-  else
-    rm -f "$daemon_config"
-  fi
-}
-
-# Rollback: restore prior config, restart through the boundary, run health check.
-# Failure evidence is surfaced through exit code only — no CIDRs or secrets leaked.
-rollback_daemon() {
-  local failed=0
-  restore_daemon || failed=1
-  run_command "$restart_command" "$daemon_dir" || failed=1
-  run_health "$env_file" || failed=1
-  return "$failed"
-}
-
-transaction_failure='network-policy apply interrupted'
-rollback_on_exit() {
-  local status=$?
-  trap - EXIT INT TERM
-  ((status != 0)) || status=1
-  if rollback_daemon >/dev/null 2>&1; then
-    if [[ "$managed_before" == false ]]; then
-      rm -f "$state_file" "$checkpoint_dir/daemon.json"
-    fi
-    rm -rf "$work_dir"
-    printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
-  else
-    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$work_dir" >&2
-  fi
-  exit "$status"
-}
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap rollback_on_exit EXIT
+if [[ "$managed_before" == true ]]; then
+  set_verified_generation "" || { transaction_failure='failed to mark network-policy verification pending'; exit 2; }
+fi
 
 fail_after_apply() {
   transaction_failure=$1
@@ -457,7 +530,9 @@ fail_after_apply() {
 
 # --- Transaction: apply → restart → probe → health, with rollback ---
 # Apply daemon.json atomically (rename within same directory).
-atomic_replace_daemon "$staging_daemon" "$daemon_mode" "$daemon_gid" || { transaction_failure='failed to apply daemon.json'; exit 2; }
+if [[ "$daemon_matches" == false ]]; then
+  atomic_replace_daemon "$staging_daemon" "$daemon_mode" "$daemon_gid" || { transaction_failure='failed to apply daemon.json'; exit 2; }
+fi
 
 # Restart Docker through the injected command boundary (never host-direct).
 if ! run_command "$restart_command" "$daemon_dir"; then
@@ -469,10 +544,18 @@ if ! run_command "$probe_command"; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
+# Resume the drained controller before health verification.
+if ! run_command "$resume_command" --env "$env_file"; then
+  fail_after_apply "controller resume command failed after network-policy restart"
+fi
+
 # Health verification
 if ! run_health "$env_file"; then
   fail_after_apply "health check failed after network-policy restart"
 fi
+
+verified_generation=$(file_generation "$daemon_config") || fail_after_apply "failed to identify verified daemon.json generation"
+set_verified_generation "$verified_generation" || fail_after_apply "failed to record verified daemon.json generation"
 
 # --- Success ---
 trap - EXIT INT TERM
