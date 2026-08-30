@@ -224,7 +224,7 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         try:
             network = ipaddress.ip_network(base, strict=True)
         except ValueError as exc:
-            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: malformed CIDR {base!r}") from exc
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: malformed CIDR") from exc
         if network.version != 4:
             raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: must be IPv4")
         try:
@@ -234,7 +234,7 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         if not isinstance(size, int) or size < 0 or size > 29:
             raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: must be between 0 and 29")
         if size < network.prefixlen:
-            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count for {base!r}")
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count")
         pools.append({"base": base, "size": size})
     try:
         policy = {

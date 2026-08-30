@@ -111,6 +111,19 @@ class RenderDaemonConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be an integer"):
             render_docker_daemon_config(env)
 
+    def test_renderer_failure_does_not_disclose_pool_base(self) -> None:
+        base = "10.123.45.0/24"
+        env = {
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": base,
+            "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "16",
+        }
+
+        with self.assertRaises(ValueError) as raised:
+            render_docker_daemon_config(env)
+
+        self.assertNotIn(base, str(raised.exception))
+
     def test_rejects_ipv6_pool(self) -> None:
         env = {
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
