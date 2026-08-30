@@ -45,9 +45,17 @@ restore_transaction_backup() {
     chmod 0600 "$destination" || return
   done <<<"$rollback_transaction_backup"
 }
+rollback_commit_marker_safe() {
+  local marker=$1
+  [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker" 2>/dev/null) == "$expected_uid:600" ]]
+}
+rollback_commit_marker_uncommitted() {
+  local marker=$1
+  [[ ! -e "$marker" && ! -L "$marker" ]] || { [[ ! -L "$marker" && -f "$marker" ]] && ! rollback_commit_marker_safe "$marker"; }
+}
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 && ( ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ) ]]; then
+  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
     if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root"; fi
     if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
       rm -rf -- "$transaction_dir"
@@ -59,7 +67,7 @@ on_exit() {
     transaction_dir=
   elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
-    if [[ -e "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then finalize_committed_rollback; recovery_status=$?; else restore_transaction; recovery_status=$?; fi
+    if rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
     set -e
     if ((recovery_status != 0)); then
       status=$recovery_status
@@ -830,7 +838,7 @@ recover_interrupted_transaction() {
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
   transaction_dir=$candidate
-  if [[ -e "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
+  if ! rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
     finalize_committed_rollback
     recovered_rollback=1
     transaction_committed=0
@@ -845,7 +853,7 @@ recover_interrupted_transaction() {
 finalize_committed_rollback() {
   local marker=$transaction_dir/application-rollback-committed retired
   local final_adapter_path final_adapter_sha final_credential_provider final_credential_ref
-  [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker") == "$expected_uid:600" ]] || block 'application rollback commit marker is unsafe'
+  rollback_commit_marker_safe "$marker" || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
   secure_file "$state_file" 'deployer install state' || return
   final_adapter_path=$(awk '$0 ~ /^ADAPTER_PATH=/ {sub(/^ADAPTER_PATH=/, ""); print}' "$active_policy")
@@ -1293,7 +1301,7 @@ PY
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.
-  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && [[ ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ]]; then
+  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && ! rollback_commit_marker_safe "$transaction_dir/application-rollback-committed"; then
     die 'application adapter rollback failed'
   fi
   # The rollback already replaced the activation pointer and units on possibly

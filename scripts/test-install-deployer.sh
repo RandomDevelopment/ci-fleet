@@ -143,6 +143,10 @@ if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_FAIL_AFTER_MARKER:-} ]]; then exit 42; fi
+if [[ "$1" == rollback && -n ${FAKE_ADAPTER_UNSAFE_ROLLBACK_MARKER:-} ]]; then
+  chmod 0666 "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
+  exit 42
+fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION:-} ]]; then
   rm -rf -- "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")"
   exit 42
@@ -849,6 +853,9 @@ grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" 
 
 FAKE_ADAPTER_CORRUPT_ROLLBACK_TRANSACTION=1 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'adapter-corrupted rollback journal did not restore current core state'
+
+FAKE_ADAPTER_UNSAFE_ROLLBACK_MARKER=1 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'unsafe rollback marker did not restore current core state'
 
 # An adapter that commits the rollback marker but exits nonzero must not be
 # reported as an unchanged failure: recovery finalizes the committed rollback.
@@ -1651,6 +1658,22 @@ FAKE_ADAPTER_CHMOD_DURING=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTE
 expect_success "$runtime" health >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 
+# Adapter metadata drift on the deployed snapshot root must be repaired before
+# the incumbent pointer is restored.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=deployed-root-mode-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:03:50Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'deploy\n' >"$tmp/fail-after-deployed-mode"
+FAKE_ADAPTER_CHMOD_DURING=$root/var/lib/ci-fleet-deployer/deployed FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-deployed-mode \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+[[ $(stat -c '%u:%a' "$root/var/lib/ci-fleet-deployer/deployed") == "$(id -u):700" ]] || fail 'adapter-drifted deployed-root metadata was not repaired'
+expect_success "$runtime" health >/dev/null
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
@@ -1761,6 +1784,22 @@ FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-consumed-mode \
 [[ ! -e "$active" ]] || fail 'consumption-directory drift skipped active marker cleanup'
 [[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/consumed-requests") == 700 ]] || fail 'consumption-directory drift was not repaired'
 grep -Fq 'approval=consumed-mode-attempt' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumption-directory drift skipped terminal audit'
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# A failing adapter cannot leave the audit directory metadata unsafe.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-dir-mode-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:54Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'deploy\n' >"$tmp/fail-after-audit-dir-mode"
+FAKE_ADAPTER_CHMOD_DURING=$root/var/log/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-audit-dir-mode \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+[[ $(stat -c '%u:%a' "$root/var/log/ci-fleet-deployer") == "$(id -u):700" ]] || fail 'adapter-drifted audit-directory metadata was not repaired'
+grep -Fq 'approval=audit-dir-mode-attempt' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit-directory drift skipped terminal audit'
+expect_success "$runtime" health >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 
 # A failing adapter cannot leave recovery state or the audit log with unsafe metadata.

@@ -94,6 +94,11 @@ deploy_exit() {
     fi
   fi
   if [[ ${audit_pending:-0} == 1 ]]; then
+    if [[ -d "$log_root" && ! -L "$log_root" ]]; then
+      chown "$expected_uid" "$log_root" 2>/dev/null || status=1
+      chmod 0700 "$log_root" 2>/dev/null || status=1
+    fi
+    [[ -d "$log_root" && ! -L "$log_root" && $(stat -c '%u:%a' "$log_root" 2>/dev/null) == "$expected_uid:700" ]] || status=1
     # If the adapter replaced the audit log, restore the durable prefix copy
     # (or the opened inode) under its name before appending the terminal
     # failure record, so the record is never written only to an unlinked inode.
@@ -136,7 +141,11 @@ deploy_exit() {
     # adapter deleted its writable state root.
     if [[ -n ${incumbent_policy_backup:-} && -n ${incumbent_state_backup:-} && $state_root_safe == 1 ]]; then
       if [[ ! -e "$deployed_root" && ! -L "$deployed_root" ]]; then install -d -m 0700 "$deployed_root" 2>/dev/null || status=1; fi
-      [[ -d "$deployed_root" && ! -L "$deployed_root" ]] || status=1
+      if [[ -d "$deployed_root" && ! -L "$deployed_root" ]]; then
+        chown "$expected_uid" "$deployed_root" 2>/dev/null || status=1
+        chmod 0700 "$deployed_root" 2>/dev/null || status=1
+      fi
+      [[ -d "$deployed_root" && ! -L "$deployed_root" && $(stat -c '%u:%a' "$deployed_root" 2>/dev/null) == "$expected_uid:700" ]] || status=1
       if [[ -e "$deployed_root/$incumbent_pointer" || -L "$deployed_root/$incumbent_pointer" ]]; then
         [[ -d "$deployed_root/$incumbent_pointer" && ! -L "$deployed_root/$incumbent_pointer" ]] || { rm -rf -- "${deployed_root:?}/$incumbent_pointer"; mkdir -m 0700 "$deployed_root/$incumbent_pointer"; }
         chown "$expected_uid" "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
