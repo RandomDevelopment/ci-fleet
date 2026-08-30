@@ -18,6 +18,7 @@ set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 testing=${CI_FLEET_TESTING:-0}
+original_args=("$@")
 
 env_file=
 checkpoint_dir=
@@ -133,11 +134,6 @@ done
 expected_env_owner=0
 [[ "$testing" != 1 ]] || expected_env_owner=$(id -u)
 validate_trusted_path 'rendered env' "$env_file" regular
-work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
-chmod 0700 "$work_dir"
-trap 'rm -rf "$work_dir"' EXIT
-install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
-env_file=$work_dir/ci-fleet.env
 
 # --- No-op when no network policy is rendered ---
 count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
@@ -229,10 +225,41 @@ if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
   [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
   flock -n 9 || die 'inherited installer lock is unavailable'
 else
-  install -d -m 0755 "$(dirname "$lock_file")"
-  exec 9>"$lock_file"
-  flock -n 9 || die 'another ci-fleet installer or drift check is already running'
+  validate_trusted_path CI_FLEET_INSTALLER_LOCK "$lock_file" regular true
+  exec python3 - "$lock_file" "$testing" "$repo_root/scripts/apply-docker-network-policy.sh" "${original_args[@]}" <<'PY'
+import errno, os, stat, sys
+
+path, testing, script, *args = sys.argv[1:]
+expected_owner = os.getuid() if testing == "1" else 0
+flags = os.O_RDWR | os.O_NOFOLLOW
+try:
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+        fd = os.open(path, flags)
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
+        raise OSError
+    os.dup2(fd, 9)
+    if fd != 9:
+        os.close(fd)
+    os.set_inheritable(9, True)
+    os.environ["CI_FLEET_INSTALLER_LOCK_FD"] = "9"
+    os.execv(script, [script, *args])
+except OSError:
+    print("ERROR: CI_FLEET_INSTALLER_LOCK must remain a trusted root-owned regular file", file=sys.stderr)
+    raise SystemExit(2)
+PY
 fi
+
+work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
+chmod 0700 "$work_dir"
+trap 'rm -rf "$work_dir"' EXIT
+install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
+env_file=$work_dir/ci-fleet.env
 
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true true
 exec 8<"$checkpoint_dir"

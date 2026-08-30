@@ -243,6 +243,7 @@ class ApplyScriptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (Path(self.tmp) / "run").mkdir()
         self.daemon_dir = Path(self.tmp) / "etc" / "docker"
         self.daemon_dir.mkdir(parents=True)
         self.installed_env = Path(self.tmp) / "etc" / "ci-fleet" / "ci-fleet.env"
@@ -1253,7 +1254,7 @@ class ApplyScriptTests(unittest.TestCase):
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
         lock = Path(self.tmp) / "run" / "ci-fleet-installer.lock"
-        lock.parent.mkdir()
+        lock.parent.mkdir(exist_ok=True)
         checkpoint = Path(self.tmp) / "checkpoint"
         env_file = self._write_env_file(self._rendered_with_policy())
 
@@ -1280,6 +1281,73 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
         self.assertFalse(checkpoint.exists())
+
+    def test_symlinked_installer_lock_below_writable_parent_is_rejected_without_side_effects(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock_dir = Path(self.tmp) / "writable-lock-parent"
+        lock_dir.mkdir(mode=0o777)
+        lock_dir.chmod(0o777)
+        victim = Path(self.tmp) / "lock-victim"
+        victim.write_text("do not truncate\n", encoding="utf-8")
+        lock = lock_dir / "installer.lock"
+        lock.symlink_to(victim)
+        drain_marker = Path(self.tmp) / "symlink-lock-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-symlink-lock"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "do not truncate\n")
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+
+    def test_group_writable_installer_lock_parent_fails_before_side_effects(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock_dir = Path(self.tmp) / "group-writable-lock-parent"
+        lock_dir.mkdir(mode=0o770)
+        lock_dir.chmod(0o770)
+        lock = lock_dir / "installer.lock"
+        drain_marker = Path(self.tmp) / "writable-lock-parent-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-writable-lock-parent"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
 
     def test_symlinked_daemon_config_is_rejected_before_drain_or_checkpoint(self) -> None:
         referent = Path(self.tmp) / "referent.json"
@@ -1686,7 +1754,7 @@ class ApplyScriptTests(unittest.TestCase):
             start_new_session=True,
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
-        for _ in range(100):
+        for _ in range(300):
             if ready.exists():
                 break
             time.sleep(0.02)
