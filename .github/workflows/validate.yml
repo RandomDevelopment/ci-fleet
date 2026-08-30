@@ -20,6 +20,7 @@ concurrency:
 jobs:
   commit-convention:
     name: Enforce conventional commits and pull-request title
+    if: ${{ github.event_name != 'push' || github.event.deleted == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -61,15 +62,9 @@ jobs:
           # head commit alone. For workflow_dispatch, validate only HEAD.
           #
           # Like the secret scanner below, the validator itself is extracted
-          # from the trusted base revision when available, so a PR cannot pass
-          # these gates by editing its own copy of the script. Until the script
-          # exists on the base branch (bootstrap PR), the checkout copy runs.
-          validator="$RUNNER_TEMP/trusted-validator.py"
-          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
-            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
-          else
-            cp scripts/validate_commits.py "$validator"
-          fi
+          # from the trusted base revision when available, so a push cannot
+          # pass these gates by editing its own copy of the script. This PR
+          # still needs its checkout copy until the validator lands on main.
           # A newly created tag reports an all-zero `before`, which makes
           # `git rev-list <zero>..<tag>` fail and silently reduce validation
           # to the tagged commit alone. Derive the real range start from the
@@ -78,6 +73,15 @@ jobs:
           # intentional HEAD-only behavior.
           if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
             BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+          fi
+          validator="$RUNNER_TEMP/trusted-validator.py"
+          if git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
+          elif [[ "$EVENT_NAME" != push ]]; then
+            cp scripts/validate_commits.py "$validator"
+          else
+            echo "trusted commit validator unavailable at '$BASE_SHA'" >&2
+            exit 1
           fi
           python3 "$validator" --base "$BASE_SHA" --head "$HEAD_SHA"
 
@@ -90,24 +94,27 @@ jobs:
           # Like the commit gates above, tag policy must run trusted code: a
           # branch-local tagged commit could otherwise weaken its own tag
           # validation by editing scripts/validate_commits.py. Extract the
-          # validator from the merge base with origin/main; fall back to the
-          # checkout copy only while the bootstrap PR has no main copy yet.
+          # validator from the merge base with origin/main and fail closed if
+          # that trusted revision predates the validator.
           validator="$RUNNER_TEMP/trusted-validator.py"
-          TRUSTED_SHA="$(git merge-base "$GITHUB_SHA" origin/main)"
+          TRUSTED_SHA="$(git merge-base "$TAG_COMMIT" origin/main)"
           if git cat-file -e "$TRUSTED_SHA:scripts/validate_commits.py" 2>/dev/null; then
             git show "$TRUSTED_SHA:scripts/validate_commits.py" >"$validator"
           else
-            cp scripts/validate_commits.py "$validator"
+            echo "trusted tag validator unavailable at '$TRUSTED_SHA'" >&2
+            exit 1
           fi
+          RELEASE_BASE="$(python3 "$validator" --release-base-for "$TAG_COMMIT" --exclude-tag "$TAG_NAME")"
           # Stable tags must point into the main line (fetch-depth 0 gives us
           # origin/main); prerelease tags must NOT point into it (they are
           # branch-local per docs/CONTRIBUTING.md).
-          python3 "$validator" --version "$TAG_NAME" --tag-commit "$TAG_COMMIT"
+          python3 "$validator" --version "$TAG_NAME" --tag-commit "$TAG_COMMIT" \
+            --base "$RELEASE_BASE" --head "$TAG_COMMIT"
 
   validate:
     name: Build without registering a runner
     needs: commit-convention
-    if: ${{ always() }}
+    if: ${{ !cancelled() && (github.event_name != 'push' || github.event.deleted == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

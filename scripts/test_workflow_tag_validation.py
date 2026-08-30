@@ -36,12 +36,34 @@ class TrustedTagValidatorTests(unittest.TestCase):
             step,
             "the tag step must not execute the tagged-tree copy of the validator",
         )
+        self.assertNotIn(
+            "cp scripts/validate_commits.py",
+            step,
+            "a tag push must fail when the trusted revision lacks the validator",
+        )
 
     def test_tag_step_uses_trusted_base_extraction(self) -> None:
         step = self._tag_step()
         self.assertIn("trusted-validator.py", step)
         self.assertIn("merge-base", step)
         self.assertIn("git show", step)
+
+    def test_push_commit_validation_uses_the_trusted_base(self) -> None:
+        step = self.text.split("- name: Validate proposed commit messages", 1)[1]
+        step = step.split("- name: Validate release tags", 1)[0]
+        self.assertNotIn('[[ "$EVENT_NAME" == pull_request ]] && git cat-file', step)
+        self.assertIn('git show "$BASE_SHA:scripts/validate_commits.py"', step)
+        self.assertIn('elif [[ "$EVENT_NAME" != push ]]; then', step)
+        self.assertIn("trusted commit validator unavailable", step)
+
+    def test_tag_step_passes_the_release_range(self) -> None:
+        step = self._tag_step()
+        self.assertIn(
+            'RELEASE_BASE="$(python3 "$validator" --release-base-for "$TAG_COMMIT" '
+            '--exclude-tag "$TAG_NAME")"',
+            step,
+        )
+        self.assertIn('--base "$RELEASE_BASE" --head "$TAG_COMMIT"', step)
 
     def test_new_tag_secret_scan_uses_a_finite_range(self) -> None:
         scanner = self.text.split("- name: Scan every proposed commit for secrets", 1)[1]
@@ -52,9 +74,19 @@ class TrustedTagValidatorTests(unittest.TestCase):
         self.assertNotIn('[[ "$EVENT_NAME" == pull_request ]] && git cat-file', scanner)
         self.assertIn('git show "$BASE_SHA:$scanner"', scanner)
 
-    def test_validation_runs_after_convention_failure(self) -> None:
+    def test_validation_runs_after_failure_but_stops_on_cancellation(self) -> None:
         validate_job = self.text.split("\n  validate:\n", 1)[1]
-        self.assertIn("    if: ${{ always() }}", validate_job.split("    steps:", 1)[0])
+        condition = validate_job.split("    steps:", 1)[0]
+        self.assertIn("!cancelled()", condition)
+        self.assertNotIn("always()", condition)
+
+    def test_tag_deletion_skips_both_validation_jobs(self) -> None:
+        guard = "github.event_name != 'push' || github.event.deleted == false"
+        convention_job = self.text.split("\n  commit-convention:\n", 1)[1]
+        convention_job = convention_job.split("    steps:", 1)[0]
+        validate_job = self.text.split("\n  validate:\n", 1)[1].split("    steps:", 1)[0]
+        self.assertIn(guard, convention_job)
+        self.assertIn(guard, validate_job)
 
     def test_repository_validation_runs_this_suite(self) -> None:
         validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")

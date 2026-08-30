@@ -195,8 +195,16 @@ def reverses_commit(revert_sha: str, referenced_sha: str, workspace: str = ".") 
 
     revert_parents = parents(revert_sha)
     referenced_parents = parents(referenced_sha)
-    if len(revert_parents) != 1 or not referenced_parents:
+    if len(revert_parents) != 1:
         return False
+    if not referenced_parents:
+        empty_tree = subprocess.run(
+            ["git", "-C", workspace, "hash-object", "-t", "tree", "--stdin"],
+            input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if empty_tree.returncode != 0:
+            return False
+        referenced_parents = [empty_tree.stdout.decode().strip()]
 
     target = subprocess.run(
         ["git", "-C", workspace, "rev-parse", revert_sha + "^{tree}"],
@@ -394,6 +402,8 @@ def is_ancestor(commit: str, ancestor: str, workspace: str = ".") -> bool:
         ["git", "-C", workspace, "merge-base", "--is-ancestor", commit, ancestor],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"unable to evaluate ancestry: {result.stderr.strip()}")
     return result.returncode == 0
 
 
@@ -412,7 +422,7 @@ def check_required_bump(
     The required bump is computed from the conventional classification of the
     release range base..head (docs/CONTRIBUTING.md release gate: "the SemVer
     bump matches the Conventional Commits classification"). With no prior
-    release tag, any version above 0.0.0 satisfies the pre-1.0 gate.
+    release tag, any valid SemVer satisfies the pre-1.0 gate.
     ponytail: compares only major.minor.patch; prerelease/build metadata of
     the candidate is ignored, upgrade if tag-vs-range metadata ever matters.
     """
@@ -504,8 +514,10 @@ def commit_messages(
     return [(sha, commit_message(workspace, sha)) for sha in commits]
 
 
-def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> tuple[int, int, int] | None:
-    """Return the highest released stable SemVer reachable from main_ref.
+def latest_release(
+    workspace: str = ".", main_ref: str = "origin/main", exclude_tag: str | None = None,
+) -> tuple[tuple[int, int, int], str] | None:
+    """Return the highest stable SemVer and tag reachable from main_ref.
 
     Stable means no prerelease component (prereleases are branch-local and
     never releases per docs/CONTRIBUTING.md). Returns None when no release
@@ -519,6 +531,8 @@ def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> t
         return None
     best: tuple[tuple[int, int, int], str] | None = None
     for tag in result.stdout.split():
+        if tag == exclude_tag:
+            continue
         match = SEMVER_RE.match(tag)
         if match is not None and match.group(4) is None:
             parsed = parse_version(tag)
@@ -526,7 +540,13 @@ def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> t
             key = (parsed, tag)
             if best is None or key[0] > best[0]:
                 best = (parsed, tag)
-    return best[0] if best else None
+    return best
+
+
+def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> tuple[int, int, int] | None:
+    """Return the highest released stable SemVer reachable from main_ref."""
+    release = latest_release(workspace, main_ref)
+    return release[0] if release else None
 
 
 def main() -> int:
@@ -563,12 +583,26 @@ def main() -> int:
         help="ref representing the main line for stable-tag reachability",
     )
     parser.add_argument(
+        "--release-base-for", default=None,
+        help="print the highest stable SemVer tag reachable from this ref",
+    )
+    parser.add_argument(
+        "--exclude-tag", default=None,
+        help="exclude this tag when selecting --release-base-for",
+    )
+    parser.add_argument(
         "--suggest-bump", action="store_true",
         help="print the recommended SemVer bump from the base..head range",
     )
     args = parser.parse_args()
 
     failures: list[str] = []
+
+    if args.release_base_for is not None:
+        release = latest_release(".", args.release_base_for, args.exclude_tag)
+        if release:
+            print(release[1])
+        return 0
 
     if args.version is not None:
         failures.extend(validate_version(args.version))
@@ -595,7 +629,7 @@ def main() -> int:
         if (
             not failures
             and args.tag_commit is not None
-            and args.base
+            and args.base is not None
             and args.head
         ):
             failures.extend(check_required_bump(args.version, args.base, args.head))

@@ -489,6 +489,25 @@ class CliTests(unittest.TestCase):
             result = self._range_result(directory, referenced, revert_sha)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_actual_git_revert_of_root_commit_in_range_is_exempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            root_path = Path(directory) / "root.txt"
+            root_path.write_text("root\n", encoding="utf-8")
+            subprocess.run(["git", "-C", directory, "add", "root.txt"], check=True)
+            root_sha = self._commit(directory, "feat: root change")
+            base_sha = self._commit(directory, "chore: retain history")
+            subprocess.run(
+                ["git", "-C", directory, "revert", "--no-edit", root_sha],
+                check=True, capture_output=True, text=True, env=self._git_env(),
+            )
+            revert_sha = subprocess.run(
+                ["git", "-C", directory, "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            result = self._range_result(directory, base_sha, revert_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_empty_base_validates_head_commit_only(self) -> None:
         # workflow_dispatch path: empty base must not enumerate all history.
         with tempfile.TemporaryDirectory() as directory:
@@ -543,6 +562,17 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("prerelease", result.stderr)
 
+    def test_tag_ancestry_error_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            head_sha = self._commit(directory, "feat: branch release")
+            result = self._run(
+                "--version", "v0.2.0-rc.1", "--tag-commit", head_sha,
+                "--main-ref", "refs/heads/missing", cwd=directory,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unable to evaluate ancestry", result.stderr)
+
     def test_required_bump_enforced_for_tag(self) -> None:
         # Once a prior release exists, a new tag must implement at least the
         # bump its commit range requires (feat! => MAJOR; patch tag fails).
@@ -596,6 +626,32 @@ class CliTests(unittest.TestCase):
                 cwd=directory,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_release_base_ignores_intervening_nonrelease_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            self._commit(directory, "chore: bootstrap")
+            subprocess.run(["git", "-C", directory, "tag", "v0.1.0"], check=True)
+            self._commit(directory, "feat!: break contract")
+            subprocess.run(["git", "-C", directory, "tag", "v0.2.0-rc.1"], check=True)
+            subprocess.run(["git", "-C", directory, "tag", "not-a-release"], check=True)
+            head_sha = self._commit(directory, "fix: follow-up")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main", head_sha], check=True,
+            )
+            subprocess.run(["git", "-C", directory, "tag", "v0.1.1", head_sha], check=True)
+            base = self._run(
+                "--release-base-for", "HEAD", "--exclude-tag", "v0.1.1", cwd=directory,
+            )
+            self.assertEqual(base.returncode, 0, base.stderr)
+            self.assertEqual(base.stdout.strip(), "v0.1.0")
+            result = self._run(
+                "--version", "v0.1.1", "--tag-commit", head_sha,
+                "--base", base.stdout.strip(), "--head", head_sha,
+                cwd=directory,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MAJOR", result.stderr)
 
     def test_required_bump_resets_lower_components(self) -> None:
         for message, version in (
