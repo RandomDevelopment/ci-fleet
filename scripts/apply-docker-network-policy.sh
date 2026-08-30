@@ -136,9 +136,8 @@ expected_env_owner=0
 validate_trusted_path 'rendered env' "$env_file" regular
 
 # --- No-op when no network policy is rendered ---
-count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
 removing=false
-if [[ -z "$count" || "$count" == "0" ]]; then
+if ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$env_file"; then
   if [[ -z "$checkpoint_dir" ]]; then
     printf 'NETWORK_POLICY_NOOP\n'
     exit 0

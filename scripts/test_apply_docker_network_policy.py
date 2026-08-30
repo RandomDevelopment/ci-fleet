@@ -1475,6 +1475,36 @@ class ApplyScriptTests(unittest.TestCase):
         verified = json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"]
         self.assertEqual(verified, hashlib.sha256((self.daemon_dir / "daemon.json").read_bytes()).hexdigest())
 
+    def test_rejects_explicit_zero_on_managed_host_before_checkpoint_lock_or_drain(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-explicit-zero"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        state_file = checkpoint / "docker-network-policy.json"
+        state = state_file.read_bytes()
+        zero_env = self._write_env_file({"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "0"})
+        lock = Path(self.tmp) / "network-policy-zero.lock"
+        drain_marker = Path(self.tmp) / "explicit-zero-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        rejected = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(zero_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.stderr, "ERROR: daemon policy rendering failed\n")
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertEqual(state_file.read_bytes(), state)
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
+
     def test_rejects_overlapping_rendered_pools_before_lock_or_drain(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self._write_daemon(prior.decode())
