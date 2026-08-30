@@ -44,6 +44,7 @@ case ${operation:-} in
       custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
       ipam) network_extra=',"ipam":{"config":[{"subnet":"172.30.0.0/24"}]}' ;;
       replicas) service_extra=',"deploy":{"replicas":2}' ;;
+      scale) service_extra=',"scale":2' ;;
       lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
       gpu) service_extra=',"gpus":"all"' ;;
       deploy-device) service_extra=',"deploy":{"resources":{"reservations":{"devices":[{"capabilities":["gpu"]}]}}}' ;;

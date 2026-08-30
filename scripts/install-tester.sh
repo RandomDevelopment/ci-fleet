@@ -49,8 +49,9 @@ runtime_state=$state_root/environments
 docker_root=$(root_path /var/lib/docker)
 docker_socket=$(root_path /var/run/docker.sock)
 runtime_lock=$(root_path /run/lock/ci-fleet-tester/runtime.lock)
-units=(ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer)
+services=(ci-fleet-tester-health.service ci-fleet-tester-cleanup.service)
 timers=(ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer)
+units=("${services[@]}" "${timers[@]}")
 tmpfiles_conf=ci-fleet-tester-lock.conf
 tmpfiles_dir=$(root_path /usr/lib/tmpfiles.d)
 
@@ -151,7 +152,15 @@ create_tmpfiles() {
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
-start_maintenance() { systemctl start --no-block ci-fleet-tester-health.service ci-fleet-tester-cleanup.service >/dev/null; }
+start_maintenance() {
+  local status=0
+  systemctl start --no-block "${services[@]}" >/dev/null || return 1
+  flock -u 8; unset CI_FLEET_TESTER_LOCK_FD
+  systemctl start "${services[@]}" >/dev/null || status=$?
+  flock -x 8 || return 1
+  export CI_FLEET_TESTER_LOCK_FD=8
+  return "$status"
+}
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {

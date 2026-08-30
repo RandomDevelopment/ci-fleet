@@ -136,7 +136,7 @@ for name,service in services.items():
     if service.get('privileged') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
-    if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
+    if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
