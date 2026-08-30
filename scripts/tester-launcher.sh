@@ -13,8 +13,10 @@ expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 mkdir -m 0755 "$lock_dir" 2>/dev/null || true
 [[ -d $lock_dir && ! -L $lock_dir && $(stat -c %u "$lock_dir") == "$expected_uid" && $(stat -c %a "$lock_dir") == 755 ]] || { printf 'ERROR: tester lock directory is unsafe\n' >&2; exit 1; }
-exec 8>"$lock_file"
-flock -x 8
+if [[ ${CI_FLEET_TESTER_LOCK_FD:-} != 8 || ! -e /proc/$$/fd/8 || $(readlink -f /proc/$$/fd/8) != "$lock_file" ]]; then
+  exec 8>"$lock_file"
+  flock -x 8
+fi
 target=$(readlink -f "$current_link")
 revision=$(basename "$target")
 [[ $target == "$release_dir/$revision" && $revision =~ ^[0-9a-f]{40}$ && -x $target/scripts/tester-runtime.sh ]] || { printf 'ERROR: active tester release is invalid\n' >&2; exit 1; }
