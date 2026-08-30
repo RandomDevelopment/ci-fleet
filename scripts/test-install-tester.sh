@@ -200,6 +200,16 @@ git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.exampl
 bad_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 if "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'failed candidate activation succeeded'; fi
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'failed upgrade did not restore incumbent release'
+
+# Post-switch checks must use the installed launcher rather than bypassing it.
+launcher_repo=$tmp/launcher-repo
+git clone --quiet --shared "$repo_root" "$launcher_repo"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$launcher_repo/scripts/tester-launcher.sh"; chmod 0755 "$launcher_repo/scripts/tester-launcher.sh"
+git -C "$launcher_repo" add scripts/tester-launcher.sh
+git -C "$launcher_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: fail tester launcher'
+launcher_fail_ref=$(git -C "$launcher_repo" rev-parse HEAD)
+if "$launcher_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$launcher_fail_ref" >/dev/null 2>&1; then fail 'candidate with a broken deployed launcher was accepted'; fi
+[[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'launcher failure did not restore incumbent release'
 git -C "$upgrade_repo" checkout --quiet "$ref"
 git -C "$upgrade_repo" replace "$ref" "$bad_ref"
 if "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null 2>&1; then fail 'Git replacement metadata was accepted'; fi
