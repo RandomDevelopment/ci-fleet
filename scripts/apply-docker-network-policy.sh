@@ -774,15 +774,27 @@ PY
 
 managed_before=false
 prior_verified_generation=
+apply_removal_pending=false
 if [[ -e "$state_file" ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  prior_verified_generation=$(
-    python3 - "$state_file" <<'PY'
+  apply_checkpoint_state=$(
+    python3 - "$state_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
+sys.path.insert(0, sys.argv[2])
+from desired_state import validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
-if set(state) not in (required, required | {"verified_generation"}) or state["managed"] is not True:
+pending = {"phase", "removal_managed_default_address_pools"}
+if set(state) not in (required, required | {"verified_generation"}, required | pending, required | pending | {"verified_generation"}) or state["managed"] is not True:
     raise SystemExit(1)
+is_pending = "phase" in state
+if is_pending and state["phase"] != "removal-pending":
+    raise SystemExit(1)
+if is_pending and state["removal_managed_default_address_pools"] is not None:
+    validate_docker_address_pools(
+        state["removal_managed_default_address_pools"],
+        path="checkpoint removal managed default address pools",
+    )
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
@@ -799,9 +811,10 @@ if state["prior_present"]:
         raise SystemExit(1)
 elif state["prior_mode"] is not None:
     raise SystemExit(1)
-print(generation or "")
+print(f"{generation or ''}|{'true' if is_pending else 'false'}")
 PY
   ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
+  IFS='|' read -r prior_verified_generation apply_removal_pending <<<"$apply_checkpoint_state"
   managed_before=true
 fi
 
@@ -883,11 +896,15 @@ PY
 # Record the original host state before the first drain. The marker lets a
 # later no-policy reconciliation resume a controller interrupted by the drain.
 if [[ "$managed_before" == false ]]; then
-  python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
+  python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" "$repo_root/scripts" 2>/dev/null <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
 path = sys.argv[1]
 prior = json.load(open(sys.argv[4], encoding="utf-8")) if sys.argv[2] == "true" else {}
 prior_key_present = "default-address-pools" in prior
+if prior_key_present:
+    sys.path.insert(0, sys.argv[5])
+    from desired_state import validate_docker_address_pools
+    validate_docker_address_pools(prior["default-address-pools"], path="existing daemon default address pools")
 state = {
     "managed": True,
     "prior_default_address_pools": prior.get("default-address-pools") if prior_key_present else None,
@@ -1027,7 +1044,9 @@ if not isinstance(current, dict) or current.get("default-address-pools") != stag
     raise SystemExit(1)
 PY
 verified_generation=$(file_generation "$daemon_config") || fail_after_apply "failed to identify verified daemon.json generation"
-set_verified_generation "$verified_generation" || fail_after_apply "failed to record verified daemon.json generation"
+verified_action=
+[[ "$apply_removal_pending" != true ]] || verified_action=clear-removal
+set_verified_generation "$verified_generation" "$verified_action" || fail_after_apply "failed to record verified daemon.json generation"
 
 # --- Success ---
 trap - EXIT INT TERM

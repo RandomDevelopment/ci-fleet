@@ -822,6 +822,22 @@ class ApplyScriptTests(unittest.TestCase):
                 self.assertEqual((checkpoint / "docker-network-policy.json").stat().st_mode & 0o777, 0o600)
                 self.assertFalse((checkpoint / "daemon.json").exists())
 
+    def test_first_apply_rejects_invalid_baseline_pools_before_checkpoint_or_drain(self) -> None:
+        daemon = self._write_daemon('{"default-address-pools":[],"live-restore":true}\n')
+        prior = daemon.read_bytes()
+        checkpoint = Path(self.tmp) / "checkpoint-invalid-baseline-pools"
+        self._write_success_commands()
+        drain_marker = Path(self.tmp) / "invalid-baseline-pools-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse((checkpoint / "docker-network-policy.json").exists())
+        self.assertFalse(drain_marker.exists())
+
     def test_policy_reapply_fails_closed_when_managed_key_provenance_is_missing(self) -> None:
         rendered = self._rendered_with_policy()
         daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
@@ -2826,6 +2842,53 @@ class ApplyScriptTests(unittest.TestCase):
         rolled_back_state = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertNotIn("phase", rolled_back_state)
         self.assertNotIn("removal_managed_default_address_pools", rolled_back_state)
+
+    def test_configured_apply_resumes_removal_pending_checkpoint(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-removal-pending-apply"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.write_text('{"live-restore":true}\n', encoding="utf-8")
+
+        resumed = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("default-address-pools", json.loads(daemon.read_text(encoding="utf-8")))
+        resumed_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", resumed_state)
+        self.assertNotIn("removal_managed_default_address_pools", resumed_state)
+
+    def test_configured_apply_rejects_invalid_removal_pending_pools_before_drain(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-invalid-removal-pending-apply"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = []
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        managed = daemon.read_bytes()
+        drain_marker = Path(self.tmp) / "invalid-removal-pending-apply-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        rejected = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertFalse(drain_marker.exists())
 
     def test_removal_failure_restores_snapshot_with_absent_managed_key(self) -> None:
         daemon = self._write_daemon('{"live-restore":true}\n')
