@@ -144,20 +144,17 @@ ref=$(git -C "$repo_root" rev-parse HEAD)
 # A release archive containing a symlinked or non-regular member must be rejected
 # before chmod can dereference it and alter a host-side target's permissions.
 symlink_repo=$tmp/symlink-repo
-git init --quiet "$symlink_repo"
-git -C "$symlink_repo" config user.name Example
-git -C "$symlink_repo" config user.email example@invalid.example
-mkdir -p "$symlink_repo/scripts" "$symlink_repo/host/systemd"
-cp "$repo_root/scripts/tester-runtime.sh" "$symlink_repo/scripts/tester-runtime.sh"
-cp "$repo_root/scripts/tester-launcher.sh" "$symlink_repo/scripts/tester-launcher.sh"
-cp "$repo_root"/host/systemd/ci-fleet-tester-*.service "$repo_root"/host/systemd/ci-fleet-tester-*.timer "$symlink_repo/host/systemd/"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$symlink_repo/scripts/host-evil"; chmod 0755 "$symlink_repo/scripts/host-evil"
+git clone --quiet --shared "$repo_root" "$symlink_repo"
+cp "$repo_root/scripts/install-tester.sh" "$symlink_repo/scripts/install-tester.sh"
+host_target=$tmp/host-target
+printf '#!/usr/bin/env bash\nexit 0\n' >"$host_target"; chmod 0640 "$host_target"
 rm -f "$symlink_repo/scripts/tester-runtime.sh"
-ln -s host-evil "$symlink_repo/scripts/tester-runtime.sh"
+ln -s "$host_target" "$symlink_repo/scripts/tester-runtime.sh"
 git -C "$symlink_repo" add -A
-git -C "$symlink_repo" commit --quiet -m 'fixture: symlinked release member'
+git -C "$symlink_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: symlinked release member'
 symlink_ref=$(git -C "$symlink_repo" rev-parse HEAD)
-if "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$symlink_ref" >/dev/null 2>&1; then fail 'install accepted a release archive with a symlinked member'; fi
+if "$symlink_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$symlink_ref" >/dev/null 2>&1; then fail 'install accepted a release archive with a symlinked member'; fi
+[[ $(stat -c %a "$host_target") == 640 ]] || fail 'release validation dereferenced an archive symlink'
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'fresh install failed'
 rm -rf "$root/run/lock/ci-fleet-tester"
