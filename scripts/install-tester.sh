@@ -234,10 +234,13 @@ case $action in
     stage_release "$ref"; activate_release "$ref"
     ;;
   --check)
-    host_preflight; ensure_directories
+    host_preflight
+    for directory in "$opt_dir" "$release_dir" "$systemd_dir"; do secure_dir "$directory" 755; done
+    for directory in "$config_root" "$environment_dir" "$definition_dir" "$secret_root" "$state_root" "$runtime_state"; do secure_dir "$directory" 700; done
     secure_file "$(root_path "$config")" 600
     current=$(installed_revision) || die 'tester is not installed'
     release_complete "$release_dir/$current" "$current" || die 'installed release is incomplete'
+    secure_file "$stable_launcher" 555
     cmp -s "$release_dir/$current/scripts/tester-launcher.sh" "$stable_launcher" || die 'installed launcher differs from active release'
     for unit in "${units[@]}"; do cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"; done
     cmp -s "$release_dir/$current/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf" || die 'installed tmpfiles rule differs from active release'

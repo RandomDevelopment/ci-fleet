@@ -94,6 +94,9 @@ if FAKE_TESTER_ROUTE_PORT=18092 "$runtime" --converge --environment bad-source-l
 write_environment bad-tagged-label 18093
 printf 'services:\n  web:\n    !<tag:yaml.org,2002:str> label_file: /root/credential.env\n' >"$root/etc/ci-fleet-tester/definitions/bad-tagged-label.yaml"
 if FAKE_TESTER_ROUTE_PORT=18093 "$runtime" --converge --environment bad-tagged-label >/dev/null 2>&1; then fail 'verbatim-tagged Compose label_file was accepted before rendering'; fi
+write_environment bad-aliased-label 18094
+printf 'x-key: &external-key label_file\nservices:\n  web:\n    *external-key: /root/credential.env\n' >"$root/etc/ci-fleet-tester/definitions/bad-aliased-label.yaml"
+if FAKE_TESTER_ROUTE_PORT=18094 "$runtime" --converge --environment bad-aliased-label >/dev/null 2>&1; then fail 'aliased Compose label_file was accepted before rendering'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -177,6 +180,10 @@ for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; d
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null
 check_output=$("$installer" --check --config /etc/ci-fleet-tester/tester.env)
 grep -Fq CHECK_OK <<<"$check_output" || fail 'installed check failed'
+stable_launcher=$root/opt/ci-fleet-tester/tester-runtime
+chmod 0777 "$stable_launcher"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'writable privileged launcher passed check'; fi
+chmod 0555 "$stable_launcher"
 for unit in ci-fleet-tester-health.service ci-fleet-tester-health.timer ci-fleet-tester-cleanup.service ci-fleet-tester-cleanup.timer; do [[ -f $root/etc/systemd/system/$unit ]] || fail "unit missing: $unit"; done
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
   grep -Fq 'TimeoutStartSec=300' "$root/etc/systemd/system/$service" || fail "$service does not bound oneshot start time"
@@ -201,6 +208,11 @@ installed_tmpfiles=$root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf
 rm "$installed_tmpfiles"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing installed tmpfiles rule passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-lock.conf" "$installed_tmpfiles"
+runtime_state=$root/var/lib/ci-fleet-tester/environments
+rmdir "$runtime_state"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing runtime state directory passed check'; fi
+[[ ! -e $runtime_state ]] || fail 'check recreated the missing runtime state directory'
+install -d -m 0700 "$runtime_state"
 
 # A syntactically valid candidate that fails its post-switch check restores the incumbent.
 upgrade_repo=$tmp/upgrade-repo

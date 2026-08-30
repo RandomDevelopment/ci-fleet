@@ -116,7 +116,8 @@ text=open(sys.argv[1],encoding='utf-8').read()
 key=r'(?:(?:!!str|!<[^>\n]+>)[ \t]+)?(?:include|label_file|"(?:include|label_file)"|\x27(?:include|label_file)\x27)[ \t]*:'
 explicit_key=r'(?m)^[ \t]*\?'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
-if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text): raise SystemExit('Compose include, label_file, or escaped mapping key is forbidden')
+alias_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\*[A-Za-z0-9_-]+[ \t]*:'
+if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text) or re.search(alias_key,text): raise SystemExit('Compose include, label_file, or indirect mapping key is forbidden')
 PY
   then return 1; fi
   if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
