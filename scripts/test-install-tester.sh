@@ -225,6 +225,8 @@ unit_hash_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.se
 if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >"$tmp/unit-restore.log" 2>&1; then fail 'unit activation failure succeeded'; fi
 grep -Fq 'incumbent unit restore failed' "$tmp/unit-restore.log" || fail 'secondary incumbent restore failure was not surfaced'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" && $(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service") == "$unit_hash_before" ]] || fail 'unit activation failure did not restore incumbent release and units'
+if FAKE_TESTER_SYSTEMCTL_FAIL='start ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'candidate activation did not exercise maintenance services'; fi
+[[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'maintenance service failure did not restore incumbent release'
 
 # A corrupt incumbent is never recorded as the rollback target.
 chmod u+w "$release/scripts/tester-runtime.sh"; printf '# corrupt incumbent\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
