@@ -210,6 +210,7 @@ apply_converge() {
     die 'environment activation failed; tracked state retained for cleanup'
   fi
   rm -f "$prepared_rendered"
+  inspect_environment "$(state_path "$environment")" | grep -q 'STATUS=running' || die 'environment route is unhealthy; tracked state retained for cleanup'
   report "CONVERGED environment=$environment project=$project owner=$owner route=loopback:$route_port expires_at=$expires_at"
 }
 
@@ -230,19 +231,26 @@ remove_environment() {
 }
 
 inspect_environment() {
-  local target=$1 id compose status=running resource value bytes=0 mount expected running_state
+  local target=$1 id compose route_service route_container status=running resource value bytes=0 mount expected running_state
   local -a containers=()
   id=$(basename "$target" .state); secure_file "$target" 600
   while IFS='=' read -r key value; do
     case $key in ENVIRONMENT|PROJECT|OWNER|ROUTE_PORT|EXPIRES_AT|SOURCE_REVISION|IMAGE_DIGESTS|UPDATED_AT) printf '%s=%s ' "$key" "$value" ;; esac
   done <"$target"
   compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
+  route_service=$(awk -F= '$1=="ROUTE_SERVICE"{print $2}' "$target")
   expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
   mapfile -t containers < <(docker compose -p "$(project_name "$id")" -f "$compose" ps -q)
+  route_container=$(docker compose -p "$(project_name "$id")" -f "$compose" ps -q "$route_service") || die 'route container inventory failed'
   [[ ${#containers[@]} == "$expected" ]] || status=unhealthy
+  [[ -n $route_container ]] || status=unhealthy
   for resource in "${containers[@]}"; do
     running_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$resource")
-    [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
+    if [[ $resource == "$route_container" ]]; then
+      [[ $running_state == 'running healthy' ]] || status=unhealthy
+    else
+      [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
+    fi
   done
   inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$(project_name "$id")") || die 'container inventory failed'
   while IFS= read -r resource; do

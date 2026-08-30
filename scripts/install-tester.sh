@@ -166,6 +166,7 @@ remove_units() {
     systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
   fi
   for unit in "${present_units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
+  rm -f -- "$tmpfiles_dir/$tmpfiles_conf" || return 1
   systemctl daemon-reload
 }
 
@@ -230,6 +231,7 @@ case $action in
     release_complete "$release_dir/$current" "$current" || die 'installed release is incomplete'
     cmp -s "$release_dir/$current/scripts/tester-launcher.sh" "$stable_launcher" || die 'installed launcher differs from active release'
     for unit in "${units[@]}"; do cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"; done
+    cmp -s "$release_dir/$current/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf" || die 'installed tmpfiles rule differs from active release'
     for timer in "${timers[@]}"; do
       if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then die "timer is inactive: $timer"; fi
     done

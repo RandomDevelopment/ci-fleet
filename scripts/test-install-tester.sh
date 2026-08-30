@@ -100,6 +100,8 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=changed-model "$runtime" --co
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=mutable "$runtime" --reset --environment preview-a >/dev/null 2>&1; then fail 'reset accepted invalid replacement'; fi
 [[ -f $state ]] || fail 'reset deleted the incumbent before validation'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='exited unhealthy' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a stopped managed service'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a route without health evidence'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
 write_environment secret-preview 18082
 secret_file=$root/etc/ci-fleet-tester/secrets/secret-preview/credential
 printf 'example-test-scope-value\n' >"$secret_file"; chmod 600 "$secret_file"
@@ -190,6 +192,10 @@ installed_unit=$root/etc/systemd/system/ci-fleet-tester-health.service
 printf '# drift\n' >>"$installed_unit"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"
+installed_tmpfiles=$root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf
+rm "$installed_tmpfiles"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing installed tmpfiles rule passed check'; fi
+cp "$release/host/systemd/ci-fleet-tester-lock.conf" "$installed_tmpfiles"
 
 # A syntactically valid candidate that fails its post-switch check restores the incumbent.
 upgrade_repo=$tmp/upgrade-repo
@@ -287,6 +293,7 @@ if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config 
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed'
 [[ -f $root/etc/ci-fleet-tester/tester.env && ! -L $root/opt/ci-fleet-tester/current ]] || fail 'uninstall did not preserve config/remove runtime'
+[[ ! -e $root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf ]] || fail 'uninstall left the tester tmpfiles rule installed'
 FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'repeated uninstall failed on absent units'
 git -C "$upgrade_repo" checkout --quiet "$bad_ref"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'invalid fresh install succeeded'; fi

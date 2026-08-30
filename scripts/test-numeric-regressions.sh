@@ -11,8 +11,12 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 installer=$repo_root/scripts/install-tester.sh
 runtime=$repo_root/scripts/tester-runtime.sh
 test_install=$repo_root/scripts/test-install-tester.sh
+validate=$repo_root/scripts/validate.sh
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+
+[[ -x $0 ]] || fail 'numeric regression test is not executable'
+grep -Fq 'scripts/test-numeric-regressions.sh' "$validate" || fail 'validation does not run numeric regressions'
 
 # Execution-level reproduction: a corrupted comparison makes the whole script
 # unparseable, so `bash -n` must succeed on every affected file.
