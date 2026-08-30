@@ -219,7 +219,10 @@ class HealthcheckScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             candidate = root / "candidate.env"
-            candidate.write_text(f"CI_FLEET_TESTING=1\nCI_FLEET_ROOT_PREFIX={tmp}\n", encoding="utf-8")
+            candidate.write_text(
+                f"CI_FLEET_TESTING=1\nCI_FLEET_ROOT_PREFIX={tmp}\nCI_FLEET_HEALTH_SUPPRESS_DELIVERY=0\n",
+                encoding="utf-8",
+            )
             fake_bin = root / "bin"
             fake_bin.mkdir()
             python = fake_bin / "python3"
@@ -1679,6 +1682,29 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse(drain_marker.exists())
         self.assertFalse(checkpoint.exists())
 
+    def test_installer_lock_cannot_alias_daemon_config(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        drain_marker = Path(self.tmp) / "aliased-lock-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        checkpoint = Path(self.tmp) / "checkpoint-aliased-lock"
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(daemon)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lock and daemon paths must be separate", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+        self.assertFalse(checkpoint.exists())
+
     def test_hook_descendants_do_not_retain_installer_lock(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
@@ -2850,7 +2876,12 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse(daemon.exists())
         self.assertEqual(
             [marker.name for marker in command_markers if marker.exists()],
-            ["interrupted-before-rename-resume.sh.marker", "interrupted-before-rename-health.sh.marker"],
+            [
+                "interrupted-before-rename-restart.sh.marker",
+                "interrupted-before-rename-probe.sh.marker",
+                "interrupted-before-rename-resume.sh.marker",
+                "interrupted-before-rename-health.sh.marker",
+            ],
         )
 
     def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
@@ -3253,6 +3284,11 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
         state_file = checkpoint / "docker-network-policy.json"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"grep -Fq '\"phase\": \"removal-pending\"' {state_file}\n",
+            encoding="utf-8",
+        )
         audit_dir = Path(self.tmp) / "removal-pending-audit"
         audit_dir.mkdir()
         audit_log = Path(self.tmp) / "removal-pending.log"
@@ -3582,7 +3618,7 @@ class ApplyScriptTests(unittest.TestCase):
                 self.assertFalse((checkpoint / "docker-network-policy.json").exists())
                 self.assertTrue(retained.exists())
 
-    def test_removal_failure_restores_managed_key_into_current_unrelated_json(self) -> None:
+    def test_removal_rollback_preserves_concurrent_content_and_metadata(self) -> None:
         daemon = self._write_daemon(json.dumps({"icc": False}))
         checkpoint = Path(self.tmp) / "checkpoint-remove-merge-rollback"
         self._write_success_commands()
@@ -3616,6 +3652,7 @@ class ApplyScriptTests(unittest.TestCase):
             f"echo resume >> {command_log}\n"
             'if ! grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2"; then\n'
             f"  {shutil.which('python3')} {mutator} {daemon}\n"
+            f"  chmod 600 {daemon}\n"
             "  exit 2\n"
             "fi\n",
             encoding="utf-8",
@@ -3632,6 +3669,7 @@ class ApplyScriptTests(unittest.TestCase):
             json.loads(daemon.read_text(encoding="utf-8")),
             {"default-address-pools": managed_pools, "debug": True, "live-restore": True},
         )
+        self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
         self.assertEqual(
             command_log.read_text(encoding="utf-8").splitlines(),
             ["drain", "restart", "resume", "restart", "resume", "health"],
@@ -3771,6 +3809,46 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), managed)
         self.assertEqual(state_file.read_bytes(), state)
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
+
+    def test_marker_directory_fsync_failure_restores_state_before_rollback(self) -> None:
+        daemon = self._write_daemon('{"icc":false}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-marker-fsync-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        state_file = checkpoint / "docker-network-policy.json"
+        state = state_file.read_bytes()
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        audit_dir = Path(self.tmp) / "marker-fsync-failure-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_fsync = os.fsync\n"
+            "_failed = False\n"
+            "def fsync(fd):\n"
+            "    global _failed\n"
+            "    path = os.path.realpath(f'/proc/self/fd/{fd}')\n"
+            "    if not _failed and path == os.environ['CHECKPOINT'] and not os.path.exists(os.environ['STATE_FILE']):\n"
+            "        _failed = True\n"
+            "        raise OSError('injected checkpoint fsync failure')\n"
+            "    return _fsync(fd)\n"
+            "os.fsync = fsync\n",
+            encoding="utf-8",
+        )
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir), CHECKPOINT=str(checkpoint), STATE_FILE=str(state_file)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertEqual(state_file.read_bytes(), state)
 
     def test_unmanaged_no_policy_is_noop_without_mutation_or_commands(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'

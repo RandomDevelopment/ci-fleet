@@ -246,6 +246,7 @@ run_health() {
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
+[[ ! -e "$daemon_config" || ! /proc/self/fd/9 -ef "$daemon_config" ]] || die 'installer lock and daemon paths must be separate'
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true
 checkpoint_state=$checkpoint_dir/docker-network-policy.json
 [[ "$removing" != true || ! -L "$checkpoint_state" ]] || die 'network-policy checkpoint state is invalid'
@@ -287,6 +288,7 @@ drain_failure=
 new_marker=false
 controller_resumed=false
 transaction_recovery=
+removal_checkpoint_started=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
   local status=$? resume_failed=0 health_failed=0
@@ -295,6 +297,9 @@ resume_after_failed_drain() {
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     clear_managed_marker || resume_failed=1
+  fi
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$removal_checkpoint_started" == true ]]; then
+    set_verified_generation "$prior_verified_generation" clear-removal || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)); then
     [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
@@ -353,7 +358,13 @@ fi
 daemon_dir=$(dirname "$daemon_config")
 
 atomic_replace_daemon() {
-  python3 - "$1" "$daemon_dir" "$daemon_config" "$2" "$3" <<'PY'
+  local source=$1 mode=$2 gid=$3
+  if [[ -e "$daemon_config" || -L "$daemon_config" ]]; then
+    validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular
+    mode=$(stat -c %a "$daemon_config")
+    gid=$(stat -c %g "$daemon_config")
+  fi
+  python3 - "$source" "$daemon_dir" "$daemon_config" "$mode" "$gid" <<'PY'
 import os, shutil, sys, tempfile
 _, source, daemon_dir, target, mode, gid = sys.argv
 fd, tmp = tempfile.mkstemp(prefix=".daemon.json.", dir=daemon_dir)
@@ -458,14 +469,31 @@ PY
 clear_managed_marker() {
   checkpoint_path_is_pinned || return 1
   python3 - "$state_file" <<'PY'
-import os, sys
+import os, shutil, sys, tempfile
 path = sys.argv[1]
-os.unlink(path)
-directory_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+parent = os.path.dirname(path)
+fd, backup = tempfile.mkstemp(prefix=".docker-network-policy.clear.", dir=parent)
 try:
-    os.fsync(directory_fd)
+    with open(path, "rb") as source, os.fdopen(fd, "wb") as staged:
+        shutil.copyfileobj(source, staged)
+        os.fchmod(staged.fileno(), 0o600)
+        staged.flush()
+        os.fsync(staged.fileno())
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+        os.unlink(path)
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            os.replace(backup, path)
+            os.fsync(directory_fd)
+            raise
+    finally:
+        os.close(directory_fd)
 finally:
-    os.close(directory_fd)
+    if os.path.exists(backup):
+        os.unlink(backup)
 PY
 }
 
@@ -603,6 +631,8 @@ PY
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
   if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$removal_pending" == false && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
+    run_command "$restart_command" "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
+    run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
     clear_managed_marker || die 'failed to clear interrupted network-policy marker'
@@ -653,6 +683,8 @@ PY
   managed_snapshot=$work_dir/daemon.json.before
   cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
 
+  set_removal_pending "$managed_daemon" || { rm -rf "$work_dir"; die 'failed to persist network-policy removal state'; }
+  removal_checkpoint_started=true
   drain_controller 'drain command failed before network-policy removal'
   if daemon_changed_since_snapshot "$managed_snapshot" true "$managed_metadata"; then
     drain_failure='daemon.json changed during network-policy removal'
@@ -726,7 +758,6 @@ PY
   trap removal_on_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  set_removal_pending "$managed_daemon" || { removal_failure='failed to persist network-policy removal state'; exit 2; }
 
   if [[ "$prior_present" == false ]] && python3 - "$removal_daemon" <<'PY'
 import json, sys

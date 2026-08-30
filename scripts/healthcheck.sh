@@ -21,16 +21,16 @@ health_docker_socket=${CI_FLEET_DOCKER_SOCKET-}
 health_bootstrap=${CI_FLEET_HEALTH_BOOTSTRAP-}
 health_suppress_delivery=${CI_FLEET_HEALTH_SUPPRESS_DELIVERY-}
 while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable CI_FLEET_)
-[[ -z $health_testing ]] || export CI_FLEET_TESTING=$health_testing
-[[ -z $health_root_prefix ]] || export CI_FLEET_ROOT_PREFIX=$health_root_prefix
-[[ -z $health_docker_socket ]] || export CI_FLEET_DOCKER_SOCKET=$health_docker_socket
-[[ -z $health_bootstrap ]] || export CI_FLEET_HEALTH_BOOTSTRAP=$health_bootstrap
-[[ -z $health_suppress_delivery ]] || export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery
 if [[ -r $selected_environment ]]; then
   set -a
   # shellcheck disable=SC1090
   . "$selected_environment"
   set +a
 fi
+[[ -z $health_testing ]] || export CI_FLEET_TESTING=$health_testing
+[[ -z $health_root_prefix ]] || export CI_FLEET_ROOT_PREFIX=$health_root_prefix
+[[ -z $health_docker_socket ]] || export CI_FLEET_DOCKER_SOCKET=$health_docker_socket
+[[ -z $health_bootstrap ]] || export CI_FLEET_HEALTH_BOOTSTRAP=$health_bootstrap
+[[ -z $health_suppress_delivery ]] || export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery
 use_local_docker
 exec python3 "$repo_root/scripts/health.py" "${args[@]}" "$@"
