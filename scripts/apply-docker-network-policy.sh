@@ -251,6 +251,7 @@ run_health() {
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
 [[ ! -e "$daemon_config" || ! /proc/self/fd/9 -ef "$daemon_config" ]] || die 'installer lock and daemon paths must be separate'
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true
+[[ "$daemon_config" != "$checkpoint_dir" && "$daemon_config" != "$checkpoint_dir/"* ]] || die 'daemon config must be outside checkpoint directory'
 checkpoint_state=$checkpoint_dir/docker-network-policy.json
 [[ "$removing" != true || ! -L "$checkpoint_state" ]] || die 'network-policy checkpoint state is invalid'
 if [[ "$removing" == true && ( ! -e "$checkpoint_dir" || ! -e "$checkpoint_state" ) ]]; then

@@ -581,6 +581,51 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("installed rendered env must be a trusted root-owned path", result.stderr)
 
+    def test_rejects_daemon_config_inside_recovery_before_side_effects(self) -> None:
+        checkpoint = Path(self.tmp) / "checkpoint-contained-daemon"
+        checkpoint.mkdir(mode=0o700)
+        recovery = checkpoint / "recovery.review"
+        recovery.mkdir(mode=0o700)
+        daemon = recovery / "daemon.json.before"
+        daemon.write_text('{"live-restore":true}\n', encoding="utf-8")
+        daemon.chmod(0o600)
+        prior = daemon.read_bytes()
+        prior_env = recovery / "prior-ci-fleet.env"
+        prior_env.write_bytes(self.installed_env.read_bytes())
+        prior_env.chmod(0o600)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        command_log = Path(self.tmp) / "contained-daemon-commands.log"
+        for command in (
+            self.drain_command,
+            Path(self.tmp) / "restart.sh",
+            Path(self.tmp) / "probe.sh",
+            Path(self.tmp) / "resume.sh",
+            Path(self.tmp) / "health.sh",
+        ):
+            command.write_text(f"#!/usr/bin/env bash\necho side-effect >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_DOCKER_DAEMON_CONFIG=str(daemon)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "ERROR: daemon config must be outside checkpoint directory\n")
+        self.assertFalse(command_log.exists())
+        self.assertFalse((checkpoint / "docker-network-policy.json").exists())
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertTrue(recovery.is_dir())
+
     def test_successful_apply_restarts_probes_resumes_then_checks_health(self) -> None:
         self._write_daemon("{}\n")
         env_file = self._write_env_file(self._rendered_with_policy())
@@ -1602,7 +1647,7 @@ class ApplyScriptTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("daemon config and checkpoint entry must be separate paths", result.stderr)
+        self.assertIn("daemon config must be outside checkpoint directory", result.stderr)
         self.assertFalse((self.daemon_dir / "daemon.json").exists())
         self.assertTrue(lock.exists())
         self.assertFalse(drain_marker.exists())
@@ -4750,7 +4795,7 @@ class ApplyScriptTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkpoint state paths must be separate", result.stderr)
+        self.assertIn("daemon config must be outside checkpoint directory", result.stderr)
         self.assertFalse(daemon.exists())
 
     def test_no_change_clears_stale_committed_recovery(self) -> None:
