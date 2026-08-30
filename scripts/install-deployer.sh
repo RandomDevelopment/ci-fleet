@@ -168,6 +168,7 @@ unit_names=(
 )
 timer_names=(ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer)
 config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
 
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
@@ -230,6 +231,19 @@ parse_file() {
     # shellcheck disable=SC2004
     output[$key]=$value
   done <"$path"
+}
+
+validate_completed_request() {
+  local path=$1 key
+  local -A completed=()
+  secure_file "$path" 'completed deployment request'
+  parse_file "$path" completed 'completed deployment request' "$request_keys"
+  for key in $request_keys; do [[ -v "completed[$key]" ]] || block "completed deployment request is missing $key"; done
+  [[ ${completed[SCHEMA_VERSION]} == 1 ]] || block 'completed deployment request has an unsupported schema version'
+  [[ ${completed[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${completed[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'completed deployment request has an invalid target identity'
+  [[ ${completed[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ && ${completed[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || block 'completed deployment request is not immutable and qualified'
+  for key in APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID; do [[ ${completed[$key]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || block "completed deployment request has an unsafe $key"; done
+  valid_utc "${completed[APPROVED_AT]}" || block 'completed deployment request has an invalid approval time'
 }
 
 validate_config() {
@@ -1212,7 +1226,8 @@ PY
   # A deployed snapshot published at install time describes a candidate that
   # was never deployed; rollback is meaningful only after a deployment has
   # completed (the runtime records last-request.conf on success).
-  [[ -f "$state_root/last-request.conf" && ! -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
+  [[ -e "$state_root/last-request.conf" || -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
+  validate_completed_request "$state_root/last-request.conf"
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role

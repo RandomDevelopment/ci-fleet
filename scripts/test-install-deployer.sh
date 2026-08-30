@@ -795,7 +795,12 @@ printf 'rollback\n' >"$tmp/fail-rollback"
 # A candidate never deployed must not be a rollback target.
 expect_failure 'no completed deployment is available to roll back to' "$installer" --rollback --config "$config" >/dev/null
 # Rollback requires a completed deployment; simulate one for the rollback battery.
-install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/last-request.conf"
+printf 'malformed\n' >"$root/var/lib/ci-fleet-deployer/last-request.conf"
+chmod 0600 "$root/var/lib/ci-fleet-deployer/last-request.conf"
+rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'malformed completed deployment request line' "$installer" --rollback --config "$config" >/dev/null
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'rollback adapter ran with a malformed completed-deployment marker'
+install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/last-request.conf"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
