@@ -147,7 +147,7 @@ for name,service in services.items():
     for mount in service.get('volumes',[]):
         if isinstance(mount,str) or mount.get('type') not in ('volume','tmpfs'): raise SystemExit(f'{name}: host bind mounts are forbidden')
     for port in service.get('ports',[]):
-        if not isinstance(port,dict) or str(port.get('host_ip','')) != '127.0.0.1': raise SystemExit(f'{name}: published ports must bind loopback')
+        if not isinstance(port,dict) or str(port.get('host_ip','')) != '127.0.0.1' or port.get('protocol','tcp') != 'tcp': raise SystemExit(f'{name}: published ports must use TCP on loopback')
         ports.append((name,int(port.get('published',0)),int(port.get('target',0))))
 if ports != [(route_service,route_port,ports[0][2] if ports else 0)] or not ports or ports[0][2] < 1: raise SystemExit('exactly one declared loopback route is required')
 if value.get('configs'): raise SystemExit('top-level configs are forbidden')
@@ -238,8 +238,9 @@ remove_environment() {
 }
 
 inspect_environment() {
-  local target=$1 id compose route_service route_container status=running resource value bytes=0 mount expected running_state
+  local target=$1 id compose route_service status=running resource value bytes=0 mount expected running_state service configured_image
   local -a containers=()
+  local -A expected_images=() observed_services=()
   id=$(basename "$target" .state); secure_file "$target" 600
   while IFS='=' read -r key value; do
     case $key in ENVIRONMENT|PROJECT|OWNER|ROUTE_PORT|EXPIRES_AT|SOURCE_REVISION|IMAGE_DIGESTS|UPDATED_AT) printf '%s=%s ' "$key" "$value" ;; esac
@@ -247,18 +248,22 @@ inspect_environment() {
   compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
   route_service=$(awk -F= '$1=="ROUTE_SERVICE"{print $2}' "$target")
   expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
+  while read -r service configured_image; do expected_images[$service]=$configured_image; done < <(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\n".join("%s %s" % (name,service["image"]) for name,service in value["services"].items()))' "$compose")
   mapfile -t containers < <(docker compose -p "$(project_name "$id")" -f "$compose" ps -q)
-  route_container=$(docker compose -p "$(project_name "$id")" -f "$compose" ps -q "$route_service") || die 'route container inventory failed'
   [[ ${#containers[@]} == "$expected" ]] || status=unhealthy
-  [[ -n $route_container ]] || status=unhealthy
   for resource in "${containers[@]}"; do
     running_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$resource")
-    if [[ $resource == "$route_container" ]]; then
+    read -r service configured_image < <(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}} {{.Config.Image}}' "$resource")
+    [[ -n $service ]] || { status=unhealthy; continue; }
+    [[ -n ${expected_images[$service]:-} && $configured_image == "${expected_images[$service]}" ]] || status=unhealthy
+    observed_services[$service]=$((${observed_services[$service]:-0} + 1))
+    if [[ $service == "$route_service" ]]; then
       [[ $running_state == 'running healthy' ]] || status=unhealthy
     else
       [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
     fi
   done
+  for service in "${!expected_images[@]}"; do [[ ${observed_services[$service]:-0} == 1 ]] || status=unhealthy; done
   inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$(project_name "$id")") || die 'container inventory failed'
   while IFS= read -r resource; do
     [[ -n $resource ]] || continue

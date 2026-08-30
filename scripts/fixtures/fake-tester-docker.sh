@@ -4,13 +4,42 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
 if [[ $1 == info ]]; then printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; exit 0; fi
-if [[ $1 == ps ]]; then [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9; printf 'fixture-container-id\n'; exit 0; fi
-if [[ $1 == inspect ]]; then
-  if [[ " $* " == *' --size '* ]]; then printf '1024\n'; else printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"; fi
+if [[ $1 == ps ]]; then
+  [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9
+  if [[ " $* " == *' label=com.docker.compose.project '* ]]; then
+    [[ -z ${FAKE_TESTER_ORPHAN_PROJECT:-} ]] || printf 'fixture-orphan-container-id\n'
+  else
+    printf 'fixture-container-id\n'
+  fi
   exit 0
 fi
-if [[ $1 == volume && $2 == ls ]]; then [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9; printf 'fixture-volume\n'; exit 0; fi
-if [[ $1 == volume && $2 == inspect ]]; then printf '%s\n' "${FAKE_TESTER_VOLUME_ROOT:?}"; exit 0; fi
+if [[ $1 == inspect ]]; then
+  if [[ " $* " == *' --size '* ]]; then
+    printf '1024\n'
+  elif [[ " $* " == *'com.docker.compose.project'* ]]; then
+    printf '%s\n' "${FAKE_TESTER_ORPHAN_PROJECT:-}"
+  elif [[ " $* " == *'com.docker.compose.service'* && " $* " == *'.Config.Image'* ]]; then
+    service=web
+    [[ ${*: -1} != fixture-worker-id || ${FAKE_TESTER_DUPLICATE_SERVICE:-0} == 1 ]] || service=worker
+    printf '%s %s\n' "$service" "${FAKE_TESTER_CONTAINER_IMAGE:-registry.example/example/app@sha256:$(printf 'a%.0s' {1..64})}"
+  else
+    printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"
+  fi
+  exit 0
+fi
+if [[ $1 == volume && $2 == ls ]]; then
+  [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9
+  if [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then printf 'fixture-volume\n';
+  elif [[ -n ${FAKE_TESTER_ORPHAN_VOLUME_PROJECT:-} ]]; then printf 'fixture-orphan-volume-id\n'; fi
+  exit 0
+fi
+if [[ $1 == volume && $2 == inspect ]]; then
+  if [[ " $* " == *'com.docker.compose.project'* ]]; then printf '%s\n' "${FAKE_TESTER_ORPHAN_VOLUME_PROJECT:-}";
+  else printf '%s\n' "${FAKE_TESTER_VOLUME_ROOT:?}"; fi
+  exit 0
+fi
+if [[ $1 == network && $2 == ls ]]; then [[ -z ${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-} ]] || printf 'fixture-orphan-network-id\n'; exit 0; fi
+if [[ $1 == network && $2 == inspect ]]; then printf '%s\n' "${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-}"; exit 0; fi
 if [[ $1 == compose && $2 == version ]]; then printf 'Docker Compose version v2.fixture\n'; exit 0; fi
 if [[ $1 == compose && $2 == up && ${3:-} == --help ]]; then [[ ${FAKE_TESTER_NO_WAIT_TIMEOUT:-0} != 1 ]] && printf '%s\n' '  --wait-timeout int'; exit 0; fi
 if [[ $1 != compose ]]; then exit 2; fi
@@ -27,12 +56,13 @@ done
 case ${operation:-} in
   config)
     digest=$(printf 'a%.0s' {1..64})
-    privileged=false; read_only=true; host_ip=127.0.0.1; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128'; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
+    privileged=false; read_only=true; host_ip=127.0.0.1; protocol=tcp; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128'; extra_services=; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
     case ${FAKE_TESTER_POLICY:-valid} in
       mutable) image=registry.example/example/app:latest ;;
       privileged) privileged=true ;;
       bind) volume='{"type":"bind","source":"/","target":"/host"}' ;;
       broad-port) host_ip=0.0.0.0 ;;
+      udp-route) protocol=udp ;;
       external-network) network_name=shared ;;
       environment) service_extra=',"environment":{"TOKEN":"example"}' ;;
       configs) service_extra=',"configs":[{"source":"credential"}]'; top_extra=',"configs":{"credential":{"file":"/tmp/example"}}' ;;
@@ -62,14 +92,20 @@ case ${operation:-} in
       runtime) service_extra=',"runtime":"alternative"' ;;
       unbounded) service_extra=',"cpus":0,"mem_limit":0,"pids_limit":-1' ;;
       oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;
+      two-services) extra_services=$(printf ',"worker":{"image":"%s","privileged":false,"read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"volumes":[],"cpus":0.5,"mem_limit":134217728,"pids_limit":128}' "$image") ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
-    printf '{"services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"tcp"}]%s}},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
-      "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$service_extra" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
+    printf '{"services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"%s"}]%s}%s},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
+      "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$protocol" "$service_extra" "$extra_services" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
     ;;
   up) [[ ${FAKE_TESTER_UP_FAIL:-0} != 1 ]] ;;
   down) [[ ${FAKE_TESTER_DOWN_FAIL:-0} != 1 ]] ;;
-  ps) [[ ${FAKE_TESTER_UNHEALTHY:-0} == 1 ]] || printf 'fixture-container-id\n' ;;
+  ps)
+    [[ ${FAKE_TESTER_UNHEALTHY:-0} == 1 ]] || {
+      printf 'fixture-container-id\n'
+      [[ ${FAKE_TESTER_POLICY:-valid} != two-services || $* != -q ]] || printf 'fixture-worker-id\n'
+    }
+    ;;
   *) exit 2 ;;
 esac

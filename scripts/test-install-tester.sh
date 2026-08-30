@@ -48,6 +48,7 @@ cp "$installer" "$standalone_installer"
 uninstall_bin=$tmp/uninstall-bin
 mkdir "$uninstall_bin"
 for command in bash chmod dirname env find flock grep id install mkdir rm stat; do ln -s "$(command -v "$command")" "$uninstall_bin/$command"; done
+ln -s "$fake_bin/docker" "$uninstall_bin/docker"
 ln -s "$fake_bin/systemctl" "$uninstall_bin/systemctl"
 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
 
@@ -91,7 +92,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
@@ -127,6 +128,11 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=mutable "$runtime" --reset --
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='exited unhealthy' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a stopped managed service'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
+write_environment service-map 18090
+FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --converge --environment service-map >/dev/null
+if FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services FAKE_TESTER_DUPLICATE_SERVICE=1 "$runtime" --inspect --environment service-map | grep -q 'STATUS=running'; then fail 'health accepted duplicate and missing service identities'; fi
+FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --remove --environment service-map >/dev/null
 write_environment secret-preview 18082
 secret_file=$root/etc/ci-fleet-tester/secrets/secret-preview/credential
 printf 'example-test-scope-value\n' >"$secret_file"; chmod 600 "$secret_file"
@@ -357,6 +363,15 @@ launcher_lock_rc=$?
 set -e
 [[ $launcher_lock_rc == 124 ]] || fail 'stable launcher resolved the active release before acquiring the lifecycle lock'
 wait "$lock_pid"
+: >"$tmp/docker.log"
+if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a remote Docker selector'; fi
+[[ -L $root/opt/ci-fleet-tester/current ]] || fail 'remote-selector uninstall removed the active release'
+[[ ! -s $tmp/docker.log ]] || fail 'remote-selector uninstall contacted Docker'
+if DOCKER_CONTEXT=remote "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a remote Docker context'; fi
+if FAKE_TESTER_ORPHAN_PROJECT=ci-fleet-test-missing-state "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored a managed Compose project with missing state'; fi
+[[ -L $root/opt/ci-fleet-tester/current ]] || fail 'orphan-project uninstall removed the active release'
+if FAKE_TESTER_ORPHAN_VOLUME_PROJECT=ci-fleet-test-missing-state "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored a managed Compose volume with missing state'; fi
+if FAKE_TESTER_ORPHAN_NETWORK_PROJECT=ci-fleet-test-missing-state "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored a managed Compose network with missing state'; fi
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored systemd teardown failure'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed'

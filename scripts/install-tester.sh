@@ -36,7 +36,7 @@ case $action in
   --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir readlink sha256sum stat systemctl' ;;
   --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
   --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat systemctl' ;;
-  --uninstall) required_commands='bash chmod dirname env find flock grep install mkdir rm stat systemctl' ;;
+  --uninstall) required_commands='bash chmod dirname docker env find flock grep install mkdir rm stat systemctl' ;;
 esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
@@ -85,6 +85,28 @@ acquire_lifecycle_lock() {
   export CI_FLEET_TESTER_LOCK_FD=8
 }
 
+pin_local_docker() {
+  [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die 'Docker environment selectors are forbidden'
+  unset DOCKER_CONTEXT
+  export DOCKER_HOST="unix://$docker_socket"
+  [[ -S $docker_socket || ( ${CI_FLEET_TESTING:-0} == 1 && -e $docker_socket ) ]] || die 'local Docker socket is unavailable'
+}
+
+reject_managed_compose_resources() {
+  local kind=$1 inventory resource project format
+  local -a inspect_command
+  case $kind in
+    container) inventory=$(docker ps -aq --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker inspect); format='{{index .Config.Labels "com.docker.compose.project"}}' ;;
+    volume) inventory=$(docker volume ls -q --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker volume inspect); format='{{index .Labels "com.docker.compose.project"}}' ;;
+    network) inventory=$(docker network ls -q --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker network inspect); format='{{index .Labels "com.docker.compose.project"}}' ;;
+  esac
+  while IFS= read -r resource; do
+    [[ -n $resource ]] || continue
+    project=$("${inspect_command[@]}" --format "$format" "$resource") || die "Docker Compose $kind identity could not be inspected"
+    [[ $project != ci-fleet-test-* ]] || die 'remove every managed Docker Compose project before uninstalling the tester service'
+  done <<<"$inventory"
+}
+
 host_preflight() {
   local os_release docker_context actual_root used
   os_release=$(root_path /etc/os-release)
@@ -92,11 +114,8 @@ host_preflight() {
   # shellcheck disable=SC1090
   . "$os_release"
   [[ ${ID:-} == debian && ${VERSION_ID:-} =~ ^[0-9]+$ && ${VERSION_ID%%.*} -ge 12 ]] || die 'tester hosts require Debian 12 or newer'
-  [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die 'Docker environment selectors are forbidden'
-  unset DOCKER_CONTEXT
-  export DOCKER_HOST="unix://$docker_socket"
+  pin_local_docker
   docker_context=$(docker context show); [[ $docker_context == default ]] || die 'tester requires the local default Docker context'
-  [[ -S $docker_socket || ( ${CI_FLEET_TESTING:-0} == 1 && -e $docker_socket ) ]] || die 'local Docker socket is unavailable'
   actual_root=$(docker info --format '{{.DockerRootDir}}'); [[ $actual_root == "$docker_root" ]] || die 'Docker root does not match the local managed root'
   docker compose version >/dev/null
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
@@ -280,6 +299,10 @@ case $action in
   --uninstall)
     ensure_directories
     if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
+    pin_local_docker
+    reject_managed_compose_resources container
+    reject_managed_compose_resources volume
+    reject_managed_compose_resources network
     remove_units || die 'could not stop and disable tester maintenance units'
     rm -f -- "$current_link" "$stable_launcher" "$lkg_file"
     [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
