@@ -226,6 +226,31 @@ installed_env_mode=$(stat -c %a "$installed_env")
 prior_env=$work_dir/prior-ci-fleet.env
 install -m 0600 -- "$installed_env" "$prior_env"
 
+drain_failure=
+# shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
+resume_after_failed_drain() {
+  local status=$? resume_failed=0
+  trap - EXIT INT TERM
+  run_command "$resume_command" --env "$prior_env" || resume_failed=1
+  rm -rf "$work_dir"
+  if ((resume_failed)); then
+    printf 'ERROR: %s; controller resume command failed\n' "$drain_failure" >&2
+  else
+    printf 'ERROR: %s\n' "$drain_failure" >&2
+  fi
+  exit "$status"
+}
+
+drain_controller() {
+  local status=0
+  drain_failure=$1
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap resume_after_failed_drain EXIT
+  run_command "$drain_command" || status=$?
+  ((status == 0)) || exit "$status"
+}
+
 checkpoint_owner=0
 [[ "$testing" != 1 ]] || checkpoint_owner=$(id -u)
 if [[ -e "$state_file" || -L "$state_file" ]]; then
@@ -422,10 +447,7 @@ PY
   managed_mode=$(stat -c %a "$daemon_config")
   managed_gid=$(stat -c %g "$daemon_config")
 
-  if ! run_command "$drain_command"; then
-    rm -rf "$work_dir"
-    die 'drain command failed before network-policy removal'
-  fi
+  drain_controller 'drain command failed before network-policy removal'
   checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
 
   removal_failure='network-policy removal interrupted'
@@ -470,9 +492,9 @@ PY
     fi
     exit "$status"
   }
+  trap removal_on_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  trap removal_on_exit EXIT
   set_verified_generation "" || { removal_failure='failed to mark network-policy verification pending'; exit 2; }
 
   if [[ "$prior_present" == false ]] && python3 - "$removal_daemon" <<'PY'
@@ -665,14 +687,11 @@ rollback_on_exit() {
 }
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
-if ! run_command "$drain_command"; then
-  rm -rf "$work_dir"
-  die "drain command failed before network-policy apply"
-fi
+drain_controller 'drain command failed before network-policy apply'
 checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy apply'
+trap rollback_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-trap rollback_on_exit EXIT
 
 # Record the original host state before the first managed mutation. Re-applying
 # policy keeps this baseline and uses the temp copy above for transaction rollback.

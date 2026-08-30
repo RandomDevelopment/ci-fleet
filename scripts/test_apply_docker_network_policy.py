@@ -423,23 +423,48 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "health"])
 
-    def test_drain_failure_never_resumes_controller(self) -> None:
+    def test_drain_timeout_resumes_prior_controller_and_preserves_failure(self) -> None:
         self._write_daemon("{}\n")
         env_file = self._write_env_file(self._rendered_with_policy())
-        self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-        resume_marker = Path(self.tmp) / "resume-after-failed-drain.marker"
+        command_log = Path(self.tmp) / "failed-drain.log"
+        self.drain_command.write_text(
+            f"#!/usr/bin/env bash\necho drain >> {command_log}\nsleep 10\n",
+            encoding="utf-8",
+        )
         resume = Path(self.tmp) / "resume.sh"
-        resume.write_text(f"#!/usr/bin/env bash\ntouch {resume_marker}\n", encoding="utf-8")
+        resume.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo resume >> {command_log}\n"
+            'grep -Fqx "ENV_GENERATION=prior" "$2" || exit 2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
         resume.chmod(0o755)
         for name in ("restart.sh", "probe.sh", "health.sh"):
             command = Path(self.tmp) / name
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
 
-        result = self._run(str(env_file))
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-failed-drain"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_COMMAND_TIMEOUT_SECONDS="1"),
+            timeout=15,
+        )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(resume_marker.exists())
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume"])
+        self.assertEqual(
+            result.stderr,
+            "ERROR: drain command failed before network-policy apply; controller resume command failed\n",
+        )
 
     def test_failed_managed_reapply_restores_prior_verified_generation(self) -> None:
         daemon = self._write_daemon("{}\n")
