@@ -584,7 +584,7 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "ERROR: daemon.json changed during network-policy apply\n")
-        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume"])
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
         self.assertEqual(daemon.read_bytes(), changed)
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
 
@@ -868,7 +868,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
 
-    def test_rejects_absent_daemon_config_in_checkpoint_before_lock_or_drain(self) -> None:
+    def test_rejects_absent_daemon_config_in_checkpoint_after_lock_before_drain(self) -> None:
         self.daemon_dir.chmod(0o700)
         self._write_success_commands()
         env_file = self._write_env_file(self._rendered_with_policy())
@@ -893,10 +893,10 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("daemon config and checkpoint entry must be separate paths", result.stderr)
         self.assertFalse((self.daemon_dir / "daemon.json").exists())
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
         self.assertFalse(drain_marker.exists())
 
-    def test_rejects_relative_daemon_config_before_lock(self) -> None:
+    def test_rejects_relative_daemon_config_before_drain(self) -> None:
         self._write_success_commands()
         env_file = self._write_env_file(self._rendered_with_policy())
         lock = Path(self.tmp) / "network-policy.lock"
@@ -920,9 +920,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
-    def test_rejects_fifo_daemon_config_before_lock(self) -> None:
+    def test_rejects_fifo_daemon_config_before_drain(self) -> None:
         daemon = self.daemon_dir / "daemon.json"
         os.mkfifo(daemon)
         self._write_success_commands()
@@ -950,9 +950,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
-    def test_rejects_group_writable_daemon_file_before_lock(self) -> None:
+    def test_rejects_group_writable_daemon_file_before_drain(self) -> None:
         daemon = self._write_daemon("{}\n")
         daemon.chmod(0o664)
         self._write_success_commands()
@@ -975,9 +975,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
-    def test_rejects_group_writable_daemon_directory_before_lock(self) -> None:
+    def test_rejects_group_writable_daemon_directory_before_drain(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
         self.daemon_dir.chmod(0o775)
@@ -1000,9 +1000,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
-    def test_rejects_hook_below_group_writable_parent_before_lock(self) -> None:
+    def test_rejects_hook_below_group_writable_parent_before_drain(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
         hook_dir = Path(self.tmp) / "writable-hook-parent"
@@ -1033,9 +1033,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
-    def test_rejects_group_writable_injected_hook_before_lock(self) -> None:
+    def test_rejects_group_writable_injected_hook_before_drain(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
         self.drain_command.chmod(0o775)
@@ -1058,7 +1058,7 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted root-owned path", result.stderr)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
 
     def test_injected_hooks_require_absolute_canonical_regular_executables(self) -> None:
         env_file = self._write_env_file(self._rendered_with_policy())
@@ -1247,6 +1247,47 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = json.loads((self.daemon_dir / "daemon.json").read_text(encoding="utf-8"))
         self.assertEqual(len(daemon["default-address-pools"]), 2)
 
+    def test_candidate_is_snapshotted_before_rendering_under_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        rendered = self._rendered_with_policy()
+        env_file = self._write_env_file(rendered)
+        replacement = dict(rendered)
+        replacement["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        replacement_file = Path(self.tmp) / "replacement.env"
+        replacement_file.write_text(
+            "".join(f"{key}={value}\n" for key, value in sorted(replacement.items())),
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp) / "candidate-snapshot-bin"
+        fake_bin.mkdir()
+        install = fake_bin / "install"
+        install.write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ ${{*: -1}} == */ci-fleet.env ]]; then {shutil.which('cp')} {replacement_file} {env_file}; fi\n"
+            f"exec {shutil.which('install')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        install.chmod(0o755)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-candidate-snapshot"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pools = json.loads((self.daemon_dir / "daemon.json").read_text(encoding="utf-8"))["default-address-pools"]
+        self.assertEqual(pools[0]["base"], "192.0.2.0/24")
+
     def test_env_file_below_writable_parent_is_rejected_before_side_effects(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
@@ -1379,6 +1420,32 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
         self.assertFalse(checkpoint.exists())
+
+    def test_removal_noop_requires_installer_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        lock = Path(self.tmp) / "removal-noop.lock"
+        checkpoint = Path(self.tmp) / "checkpoint-removal-noop-lock"
+
+        with lock.open("w") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = subprocess.run(
+                [
+                    str(SCRIPTS / "apply-docker-network-policy.sh"),
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--env",
+                    str(env_file),
+                ],
+                capture_output=True,
+                text=True,
+                env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+                timeout=30,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("NETWORK_POLICY_NOOP", result.stdout)
 
     def test_symlinked_installer_lock_below_writable_parent_is_rejected_without_side_effects(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -1573,7 +1640,7 @@ class ApplyScriptTests(unittest.TestCase):
         verified = json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"]
         self.assertEqual(verified, hashlib.sha256((self.daemon_dir / "daemon.json").read_bytes()).hexdigest())
 
-    def test_rejects_explicit_zero_on_managed_host_before_checkpoint_lock_or_drain(self) -> None:
+    def test_rejects_explicit_zero_on_managed_host_after_lock_before_checkpoint_or_drain(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-explicit-zero"
         self._write_success_commands()
@@ -1600,10 +1667,10 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(rejected.stderr, "ERROR: daemon policy rendering failed\n")
         self.assertEqual(daemon.read_bytes(), managed)
         self.assertEqual(state_file.read_bytes(), state)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
         self.assertFalse(drain_marker.exists())
 
-    def test_rejects_overlapping_rendered_pools_before_lock_or_drain(self) -> None:
+    def test_rejects_overlapping_rendered_pools_after_lock_before_drain(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self._write_daemon(prior.decode())
         self._write_success_commands()
@@ -1625,10 +1692,10 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
         self.assertEqual(daemon.read_bytes(), prior)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
         self.assertFalse(drain_marker.exists())
 
-    def test_rejects_insufficient_rendered_capacity_before_lock_or_drain(self) -> None:
+    def test_rejects_insufficient_rendered_capacity_after_lock_before_drain(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self._write_daemon(prior.decode())
         self._write_success_commands()
@@ -1652,7 +1719,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
         self.assertEqual(daemon.read_bytes(), prior)
-        self.assertFalse(lock.exists())
+        self.assertTrue(lock.exists())
         self.assertFalse(drain_marker.exists())
 
     def test_validates_policy_before_mutation(self) -> None:
@@ -1832,7 +1899,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
-        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
+        self.assertFalse(health_log.exists())
         self.assertNotIn("198.51.100.0/24", result.stdout + result.stderr)
         self.assertNotIn("super-secret", result.stdout + result.stderr)
         self.assertNotIn("secret.example.invalid", result.stdout + result.stderr)
@@ -1934,7 +2001,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
-        self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
+        self.assertFalse(health_log.exists())
         self.assertNotIn("rollback-restart-output", stdout + stderr)
         self.assertNotIn("rollback-health-output", stdout + stderr)
         recovery = Path((stdout + stderr).rstrip().rsplit("recovery data retained at ", 1)[1])
@@ -2524,7 +2591,7 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(removed.returncode, 0)
         self.assertEqual(removed.stderr, "ERROR: daemon.json changed during network-policy removal\n")
-        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume"])
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
         self.assertEqual(daemon.read_bytes(), changed_bytes)
         self.assertEqual(state_file.read_bytes(), prior_state)
 
@@ -2632,6 +2699,36 @@ class ApplyScriptTests(unittest.TestCase):
         command_markers = []
         for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
             marker = Path(self.tmp) / f"malformed-saved-pools-{name}.marker"
+            command_markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("network-policy checkpoint state is invalid", removed.stderr)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertFalse(any(marker.exists() for marker in command_markers))
+
+    def test_removal_rejects_malformed_pending_pools_before_commands_or_mutation(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-malformed-pending-pools"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = []
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        managed = daemon.read_bytes()
+        command_markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
+            marker = Path(self.tmp) / f"malformed-pending-pools-{name}.marker"
             command_markers.append(marker)
             command = Path(self.tmp) / name
             command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
@@ -2824,6 +2921,12 @@ class ApplyScriptTests(unittest.TestCase):
         restart.chmod(0o755)
         (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
         (Path(self.tmp) / "probe.sh").chmod(0o755)
+        resume_marker = Path(self.tmp) / "uncertain-removal-resume.marker"
+        (Path(self.tmp) / "resume.sh").write_text(
+            f"#!/usr/bin/env bash\ntouch {resume_marker}\n",
+            encoding="utf-8",
+        )
+        (Path(self.tmp) / "resume.sh").chmod(0o755)
         no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
 
         removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
@@ -2832,6 +2935,7 @@ class ApplyScriptTests(unittest.TestCase):
         state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "removal-pending")
         self.assertEqual(state["removal_managed_default_address_pools"], managed_pools)
+        self.assertFalse(resume_marker.exists())
 
     def test_failed_removal_from_absent_baseline_persists_durable_recovery(self) -> None:
         daemon = self.daemon_dir / "daemon.json"
@@ -2938,6 +3042,98 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "resume", "health"])
         self.assertFalse(state_file.exists())
+
+    def test_successful_removal_fsyncs_checkpoint_after_marker_unlink(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-marker-fsync"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        audit_log = Path(self.tmp) / "marker-fsync.log"
+        audit_dir = Path(self.tmp) / "marker-fsync-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_unlink = os.unlink\n"
+            "_fsync = os.fsync\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def record(value):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle: handle.write(value + '\\n')\n"
+            "def unlink(path, *args, **kwargs):\n"
+            "    if os.path.realpath(path) == os.environ['STATE_FILE']: record('U ' + os.environ['STATE_FILE'])\n"
+            "    return _unlink(path, *args, **kwargs)\n"
+            "def fsync(fd):\n"
+            "    record('F ' + os.path.realpath(f'/proc/self/fd/{fd}'))\n"
+            "    return _fsync(fd)\n"
+            "os.unlink = unlink\n"
+            "os.fsync = fsync\n",
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp) / "marker-fsync-bin"
+        fake_bin.mkdir()
+        (fake_bin / "rm").write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ ${{*: -1}} == /proc/self/fd/*/docker-network-policy.json ]]; then printf 'U %s\\n' {state_file} >> {audit_log}; fi\n"
+            f"exec {shutil.which('rm')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "rm").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                PYTHONPATH=str(audit_dir),
+                FSYNC_AUDIT_LOG=str(audit_log),
+                STATE_FILE=str(state_file),
+            ),
+            timeout=30,
+        )
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        unlink = events.index(f"U {state_file}")
+        self.assertIn(f"F {checkpoint}", events[unlink + 1 :])
+
+    def test_removal_retains_marker_if_managed_key_reappears_during_verification(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-key-conflict"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        mutator = Path(self.tmp) / "reintroduce-pools.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "path = sys.argv[1]\n"
+            "value = json.load(open(path))\n"
+            "value['default-address-pools'] = [{'base': '192.0.2.0/24', 'size': 29}]\n"
+            "with open(path, 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            'grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2" || '
+            f"{shutil.which('python3')} {mutator} {daemon}\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertTrue(state_file.exists())
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"], managed_pools)
 
     def test_managed_policy_removal_restores_original_state_and_clears_only_marker(self) -> None:
         for prior_present in (False, True):
@@ -3145,17 +3341,18 @@ class ApplyScriptTests(unittest.TestCase):
         health.chmod(0o755)
         no_policy_env = Path(self.tmp) / "no-policy-marker-failure.env"
         no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
-        fake_bin = Path(self.tmp) / "fake-bin"
-        fake_bin.mkdir()
-        fake_rm = fake_bin / "rm"
-        fake_rm.write_text(
-            "#!/usr/bin/env bash\n"
-            "[[ ${*: -1} != /proc/self/fd/*/docker-network-policy.json ]] || exit 1\n"
-            f"exec {shutil.which('rm')} \"$@\"\n",
+        audit_dir = Path(self.tmp) / "marker-failure-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_unlink = os.unlink\n"
+            "def unlink(path, *args, **kwargs):\n"
+            "    if os.path.realpath(path) == os.environ['STATE_FILE']: raise OSError\n"
+            "    return _unlink(path, *args, **kwargs)\n"
+            "os.unlink = unlink\n",
             encoding="utf-8",
         )
-        fake_rm.chmod(0o755)
-        env = self._env(PATH=f"{fake_bin}:{os.environ['PATH']}")
+        env = self._env(PYTHONPATH=str(audit_dir), STATE_FILE=str(state_file))
 
         removed = subprocess.run(
             [
@@ -3197,6 +3394,21 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(checkpoint.exists())
         self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_removal_rejects_broken_checkpoint_state_symlink(self) -> None:
+        daemon = self._write_daemon('{"default-address-pools":[]}\n')
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-broken-state-link"
+        checkpoint.mkdir(mode=0o700)
+        (checkpoint / "docker-network-policy.json").symlink_to(checkpoint / "missing-state")
+        env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint state is invalid", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
 
 
 if __name__ == "__main__":

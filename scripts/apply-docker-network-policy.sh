@@ -143,6 +143,51 @@ done
 [[ -n "$env_file" ]] || die '--env is required'
 validate_trusted_path 'rendered env' "$env_file" regular
 
+# Serialize with installer mutations before reading the rendered candidate.
+lock_file=${CI_FLEET_INSTALLER_LOCK:-${CI_FLEET_ROOT_PREFIX:-}/run/ci-fleet-installer.lock}
+if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
+  [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
+  [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
+  flock -n 9 || die 'inherited installer lock is unavailable'
+else
+  validate_trusted_path CI_FLEET_INSTALLER_LOCK "$lock_file" regular true
+  exec python3 - "$lock_file" "$testing" "$repo_root/scripts/apply-docker-network-policy.sh" "${original_args[@]}" <<'PY'
+import errno, os, stat, sys
+
+path, testing, script, *args = sys.argv[1:]
+expected_owner = os.getuid() if testing == "1" else 0
+flags = os.O_RDWR | os.O_NOFOLLOW
+try:
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+        fd = os.open(path, flags)
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
+        raise OSError
+    os.dup2(fd, 9)
+    if fd != 9:
+        os.close(fd)
+    os.set_inheritable(9, True)
+    os.environ["CI_FLEET_INSTALLER_LOCK_FD"] = "9"
+    os.execv(script, [script, *args])
+except OSError:
+    print("ERROR: CI_FLEET_INSTALLER_LOCK must remain a trusted root-owned regular file", file=sys.stderr)
+    raise SystemExit(2)
+PY
+fi
+
+temp_parent=${CI_FLEET_TEMP_DIR:-/tmp}
+validate_trusted_path 'transaction temp directory' "$temp_parent" tempdir
+work_dir=$(mktemp -d "$temp_parent/.ci-fleet-apply.XXXXXX")
+chmod 0700 "$work_dir"
+trap 'rm -rf "$work_dir"' EXIT
+install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
+env_file=$work_dir/ci-fleet.env
+
 # --- No-op when no network policy is rendered ---
 removing=false
 if ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$env_file"; then
@@ -155,7 +200,7 @@ else
   [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required when a network policy is configured'
 fi
 
-# Validate the rendered policy before acquiring the installer lock.
+# Validate the locked candidate snapshot before mutation.
 if [[ "$removing" == false ]]; then
   desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, sys
@@ -204,6 +249,7 @@ run_health() {
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true
 checkpoint_state=$checkpoint_dir/docker-network-policy.json
+[[ "$removing" != true || ! -L "$checkpoint_state" ]] || die 'network-policy checkpoint state is invalid'
 if [[ "$removing" == true && ( ! -e "$checkpoint_dir" || ! -e "$checkpoint_state" ) ]]; then
   printf 'NETWORK_POLICY_NOOP\n'
   exit 0
@@ -225,51 +271,6 @@ if [[ -d "$checkpoint_dir" ]]; then
   exec 8<&-
 fi
 
-# Serialize with installer mutations using the installer's host-local lock.
-lock_file=${CI_FLEET_INSTALLER_LOCK:-${CI_FLEET_ROOT_PREFIX:-}/run/ci-fleet-installer.lock}
-if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
-  [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
-  [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
-  flock -n 9 || die 'inherited installer lock is unavailable'
-else
-  validate_trusted_path CI_FLEET_INSTALLER_LOCK "$lock_file" regular true
-  exec python3 - "$lock_file" "$testing" "$repo_root/scripts/apply-docker-network-policy.sh" "${original_args[@]}" <<'PY'
-import errno, os, stat, sys
-
-path, testing, script, *args = sys.argv[1:]
-expected_owner = os.getuid() if testing == "1" else 0
-flags = os.O_RDWR | os.O_NOFOLLOW
-try:
-    try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchmod(fd, 0o600)
-    except OSError as exc:
-        if exc.errno != errno.EEXIST:
-            raise
-        fd = os.open(path, flags)
-    metadata = os.fstat(fd)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
-        raise OSError
-    os.dup2(fd, 9)
-    if fd != 9:
-        os.close(fd)
-    os.set_inheritable(9, True)
-    os.environ["CI_FLEET_INSTALLER_LOCK_FD"] = "9"
-    os.execv(script, [script, *args])
-except OSError:
-    print("ERROR: CI_FLEET_INSTALLER_LOCK must remain a trusted root-owned regular file", file=sys.stderr)
-    raise SystemExit(2)
-PY
-fi
-
-temp_parent=${CI_FLEET_TEMP_DIR:-/tmp}
-validate_trusted_path 'transaction temp directory' "$temp_parent" tempdir
-work_dir=$(mktemp -d "$temp_parent/.ci-fleet-apply.XXXXXX")
-chmod 0700 "$work_dir"
-trap 'rm -rf "$work_dir"' EXIT
-install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
-env_file=$work_dir/ci-fleet.env
-
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true true
 exec 8<"$checkpoint_dir"
 checkpoint_path_is_pinned || die 'checkpoint directory must remain a trusted root-owned path'
@@ -289,16 +290,19 @@ controller_resumed=false
 transaction_recovery=
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
-  local status=$? resume_failed=0
+  local status=$? resume_failed=0 health_failed=0
   trap - EXIT INT TERM
   run_command "$resume_command" --env "$prior_env" || resume_failed=1
-  if ((resume_failed == 0)) && [[ "$new_marker" == true ]]; then
+  ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     clear_managed_marker || resume_failed=1
   fi
   [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
   rm -rf "$work_dir"
   if ((resume_failed)); then
     printf 'ERROR: %s; controller resume command failed\n' "$drain_failure" >&2
+  elif ((health_failed)); then
+    printf 'ERROR: %s; prior controller health check failed\n' "$drain_failure" >&2
   else
     printf 'ERROR: %s\n' "$drain_failure" >&2
   fi
@@ -523,6 +527,11 @@ if is_pending and (
     and not isinstance(state["removal_managed_default_address_pools"], list)
 ):
     raise SystemExit(1)
+if is_pending and state["removal_managed_default_address_pools"] is not None:
+    validate_docker_address_pools(
+        state["removal_managed_default_address_pools"],
+        path="checkpoint removal managed default address pools",
+    )
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
     raise SystemExit(1)
@@ -651,7 +660,11 @@ PY
     fi
     if ((failed == 0)); then
       run_command "$restart_command" "$daemon_dir" || failed=1
+    fi
+    if ((failed == 0)); then
       run_command "$resume_command" --env "$prior_env" || failed=1
+    fi
+    if ((failed == 0)); then
       run_health "$prior_env" || failed=1
     fi
     if ((failed == 0)); then
@@ -713,7 +726,19 @@ PY
   # unlink so failure still rolls back and success cannot leave a stale marker.
   trap '' INT TERM
   checkpoint_path_is_pinned || { removal_failure='checkpoint directory changed during network-policy removal'; exit 2; }
-  if ! rm -f "$state_file"; then
+  python3 - "$daemon_config" "$removal_daemon" 2>/dev/null <<'PY' || { removal_failure='daemon.json changed after network-policy removal verification'; exit 2; }
+import json, os, sys
+current = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
+expected = json.load(open(sys.argv[2], encoding="utf-8"))
+missing = object()
+if (
+    not isinstance(current, dict)
+    or not isinstance(expected, dict)
+    or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
+):
+    raise SystemExit(1)
+PY
+  if ! clear_managed_marker; then
     removal_failure='failed to clear network-policy managed marker'
     exit 2
   fi
@@ -902,8 +927,14 @@ rollback_daemon() {
   fi
   if ((failed == 0)); then
     restore_daemon || failed=1
+  fi
+  if ((failed == 0)); then
     run_command "$restart_command" "$daemon_dir" || failed=1
+  fi
+  if ((failed == 0)); then
     run_command "$resume_command" --env "$prior_env" || failed=1
+  fi
+  if ((failed == 0)); then
     run_health "$prior_env" || failed=1
   fi
   if [[ "$managed_before" == true && "$failed" == 0 ]]; then
