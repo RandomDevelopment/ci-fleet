@@ -107,6 +107,7 @@ jobs:
   validate:
     name: Build without registering a runner
     needs: commit-convention
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -123,7 +124,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           scanner=scripts/scan_committed_secrets.py
-          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
+          if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
+            BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+          fi
+          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
             git show "$BASE_SHA:$scanner" >"$RUNNER_TEMP/trusted-secret-scanner.py"
             scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
           fi

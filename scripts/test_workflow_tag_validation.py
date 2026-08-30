@@ -43,6 +43,19 @@ class TrustedTagValidatorTests(unittest.TestCase):
         self.assertIn("merge-base", step)
         self.assertIn("git show", step)
 
+    def test_new_tag_secret_scan_uses_a_finite_range(self) -> None:
+        scanner = self.text.split("- name: Scan every proposed commit for secrets", 1)[1]
+        self.assertIn('BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"', scanner)
+
+    def test_tag_secret_scan_uses_the_trusted_scanner(self) -> None:
+        scanner = self.text.split("- name: Scan every proposed commit for secrets", 1)[1]
+        self.assertNotIn('[[ "$EVENT_NAME" == pull_request ]] && git cat-file', scanner)
+        self.assertIn('git show "$BASE_SHA:$scanner"', scanner)
+
+    def test_validation_runs_after_convention_failure(self) -> None:
+        validate_job = self.text.split("\n  validate:\n", 1)[1]
+        self.assertIn("    if: ${{ always() }}", validate_job.split("    steps:", 1)[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
