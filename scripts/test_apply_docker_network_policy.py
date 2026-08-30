@@ -832,6 +832,41 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"live-restore": True})
 
+    def test_failed_interrupted_reapply_retry_restores_immediate_snapshot(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-reapply"
+        self._write_success_commands()
+        policy_a = self._rendered_with_policy()
+        env_a = self._write_env_file(policy_a)
+        applied = self._run(str(env_a), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        daemon_a = daemon.read_bytes()
+        self.installed_env.write_bytes(env_a.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "daemon.json.before").write_bytes(daemon_a)
+        (recovery / "prior-ci-fleet.env").write_bytes(env_a.read_bytes())
+        for path in recovery.iterdir():
+            path.chmod(0o600)
+        policy_b = dict(policy_a)
+        policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        daemon.write_text(json.dumps(render_docker_daemon_config(policy_b)), encoding="utf-8")
+        policy_c = dict(policy_a)
+        policy_c["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.3.0/24"
+        env_c = self._write_env_file(policy_c)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+
+        result = self._run(str(env_c), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), daemon_a)
+
     def test_failed_unverified_retry_preserves_new_unrelated_keys_after_absent_baseline(self) -> None:
         rendered = self._rendered_with_policy()
         daemon = self._write_daemon(json.dumps({
@@ -923,6 +958,21 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--checkpoint is required", result.stderr)
         self.assertNotIn("NETWORK_POLICY_NOOP", result.stdout)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+
+    def test_partial_no_policy_snapshot_is_rejected_before_removal(self) -> None:
+        daemon = self._write_daemon('{"default-address-pools":[{"base":"192.0.2.0/24","size":28}]}\n')
+        prior = daemon.read_bytes()
+        drain_marker = Path(self.tmp) / "partial-policy-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self._write_success_commands()
+        env_file = self._write_env_file({"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER": "1"})
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("network-policy fields are incomplete", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
 
@@ -2491,6 +2541,52 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(recovery.parent, Path(self.tmp) / "checkpoint-direct")
         self.assertEqual((recovery / "daemon.json.before").read_bytes(), prior)
 
+    def test_signal_during_failed_rollback_waits_for_durable_recovery(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        self._write_daemon(prior.decode())
+        checkpoint = Path(self.tmp) / "checkpoint-signal-during-rollback"
+        rollback_ready = Path(self.tmp) / "rollback.ready"
+        restart_count = Path(self.tmp) / "rollback-restart-count"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo restart >> {restart_count}\n"
+            f"if [[ $(wc -l < {restart_count}) -gt 1 ]]; then\n"
+            f"  touch {rollback_ready}\n"
+            "  sleep 1\n"
+            "  exit 1\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        (Path(self.tmp) / "health.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (Path(self.tmp) / "health.sh").chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        process = subprocess.Popen(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._env(CI_FLEET_COMMAND_TIMEOUT_SECONDS="5"),
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        for _ in range(300):
+            if rollback_ready.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(rollback_ready.exists(), "apply did not reach rollback restart")
+
+        os.kill(process.pid, signal.SIGTERM)
+        _, stderr = process.communicate(timeout=10)
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("recovery data retained at", stderr)
+        recoveries = list(checkpoint.glob("recovery.*"))
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual((recoveries[0] / "daemon.json.before").read_bytes(), prior)
+
     def test_rollback_failure_is_reported(self) -> None:
         prior = b'{"bip":"172.17.0.1/16","registry-mirrors":["https://mirror.example.invalid?token=credential"]}\n'
         self._write_daemon(prior.decode())
@@ -2685,6 +2781,46 @@ class ApplyScriptTests(unittest.TestCase):
             command_log.read_text(encoding="utf-8").splitlines(),
             ["drain", "restart", "probe", "resume", "health", "drain", "restart", "resume", "health"],
         )
+
+    def test_rollback_rejects_restored_pool_change_before_recording_generation(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-rollback-pool-conflict"
+        self._write_success_commands()
+        policy_a = self._rendered_with_policy()
+        env_a = self._write_env_file(policy_a)
+        applied = self._run(str(env_a), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(env_a.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        policy_b = dict(policy_a)
+        policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        env_b = self._write_env_file(policy_b)
+        health_count = Path(self.tmp) / "rollback-pool-health-count"
+        mutator = Path(self.tmp) / "mutate-rollback-pools.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "path = sys.argv[1]\n"
+            "value = json.load(open(path))\n"
+            "value['default-address-pools'] = [{'base': '192.0.3.0/24', 'size': 29}]\n"
+            "with open(path, 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo health >> {health_count}\n"
+            f"if [[ $(wc -l < {health_count}) -eq 1 ]]; then exit 2; fi\n"
+            f"{shutil.which('python3')} {mutator} {daemon}\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+
+        result = self._run(str(env_b), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback verification failed", result.stderr)
+        self.assertIsNone(json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"])
+        self.assertEqual(len(list(checkpoint.glob("recovery.*"))), 1)
 
     def test_health_failure_evidence_excludes_command_output(self) -> None:
         self._write_daemon("{}\n")

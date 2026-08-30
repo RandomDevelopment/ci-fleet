@@ -196,6 +196,9 @@ env_file=$work_dir/ci-fleet.env
 removing=false
 [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
 if ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$env_file"; then
+  if grep -Eq '^CI_FLEET_DOCKER_(DEFAULT_ADDRESS_POOL_|NETWORKS_PER_RUNNER=|NETWORK_RESERVE_SUBNETS=)' "$env_file"; then
+    die 'rendered network-policy fields are incomplete'
+  fi
   removing=true
 fi
 
@@ -293,7 +296,8 @@ apply_checkpoint_started=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
   local status=$? resume_failed=0 health_failed=0
-  trap - EXIT INT TERM
+  trap '' INT TERM
+  trap - EXIT
   run_command "$resume_command" --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
@@ -396,6 +400,21 @@ file_generation() {
 import hashlib, sys
 with open(sys.argv[1], "rb") as handle:
     print(hashlib.file_digest(handle, "sha256").hexdigest())
+PY
+}
+
+daemon_pools_match() {
+  python3 - "$daemon_config" "$1" 2>/dev/null <<'PY'
+import json, os, sys
+current = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
+expected = json.load(open(sys.argv[2], encoding="utf-8")) if os.path.exists(sys.argv[2]) else {}
+missing = object()
+if (
+    not isinstance(current, dict)
+    or not isinstance(expected, dict)
+    or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
+):
+    raise SystemExit(1)
 PY
 }
 
@@ -745,6 +764,9 @@ PY
       run_health "$prior_env" || failed=1
     fi
     if ((failed == 0)); then
+      daemon_pools_match "$managed_daemon" || failed=1
+    fi
+    if ((failed == 0)); then
       set_verified_generation "$prior_verified_generation" clear-removal || failed=1
     fi
     return "$failed"
@@ -752,7 +774,8 @@ PY
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
   removal_on_exit() {
     local status=$?
-    trap - EXIT INT TERM
+    trap '' INT TERM
+    trap - EXIT
     ((status != 0)) || status=1
     if rollback_removal; then
       rm -rf "$work_dir"
@@ -932,9 +955,39 @@ then
 fi
 
 # --- Use the staged source snapshot for transactional rollback ---
+interrupted_recovery=
 if [[ "$managed_before" == true && -z "$prior_verified_generation" ]]; then
-  rollback_source=$work_dir/daemon.json.durable-baseline
-  python3 - "$daemon_config" "$state_file" "$rollback_source" <<'PY' || { rm -rf "$work_dir"; die 'failed to construct durable rollback baseline'; }
+  recovery_info=$(python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY'
+import os, stat, sys
+parent, owner = sys.argv[1], int(sys.argv[2])
+recoveries = [entry for entry in os.scandir(parent) if entry.name.startswith("recovery.")]
+if not recoveries:
+    print("|")
+    raise SystemExit
+if len(recoveries) != 1:
+    raise SystemExit(1)
+recovery = recoveries[0]
+metadata = recovery.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit(1)
+entries = {entry.name: entry for entry in os.scandir(recovery.path)}
+if set(entries) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
+    raise SystemExit(1)
+for entry in entries.values():
+    metadata = entry.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(1)
+print(f"{recovery.path}|{'true' if 'daemon.json.before' in entries else 'false'}")
+PY
+  ) || { rm -rf "$work_dir"; die 'network-policy transaction recovery is invalid'; }
+  IFS='|' read -r interrupted_recovery recovery_present <<<"$recovery_info"
+  if [[ -n "$interrupted_recovery" ]]; then
+    had_prior=$recovery_present
+    prior_env=$interrupted_recovery/prior-ci-fleet.env
+    rollback_source=$interrupted_recovery/daemon.json.before
+  else
+    rollback_source=$work_dir/daemon.json.durable-baseline
+    python3 - "$daemon_config" "$state_file" "$rollback_source" <<'PY' || { rm -rf "$work_dir"; die 'failed to construct durable rollback baseline'; }
 import json, os, sys
 current_path, state_path, output_path = sys.argv[1:]
 current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
@@ -947,8 +1000,9 @@ with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
-  had_prior=$checkpoint_prior_present
-  [[ "$had_prior" != true ]] || daemon_mode=$checkpoint_prior_mode
+    had_prior=$checkpoint_prior_present
+    [[ "$had_prior" != true ]] || daemon_mode=$checkpoint_prior_mode
+  fi
 fi
 
 restore_daemon() {
@@ -1040,9 +1094,13 @@ PY
   new_marker=true
 fi
 if [[ "$managed_before" == true ]]; then
-  recovery_daemon=
-  [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
-  transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+  if [[ -n "$interrupted_recovery" ]]; then
+    transaction_recovery=$interrupted_recovery
+  else
+    recovery_daemon=
+    [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
+    transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+  fi
 fi
 
 rollback_daemon() {
@@ -1062,6 +1120,9 @@ rollback_daemon() {
   if ((failed == 0)); then
     run_health "$prior_env" || failed=1
   fi
+  if ((failed == 0)); then
+    daemon_pools_match "$rollback_source" || failed=1
+  fi
   if [[ "$managed_before" == true && "$failed" == 0 ]]; then
     set_verified_generation "$prior_verified_generation" || failed=1
   fi
@@ -1071,7 +1132,8 @@ rollback_daemon() {
 transaction_failure='network-policy apply interrupted'
 rollback_on_exit() {
   local status=$?
-  trap - EXIT INT TERM
+  trap '' INT TERM
+  trap - EXIT
   ((status != 0)) || status=1
   if rollback_daemon >/dev/null 2>&1 &&
     { [[ "$managed_before" == true ]] || clear_managed_marker; }; then
@@ -1142,13 +1204,7 @@ if ! run_health "$env_file"; then
   fail_after_apply "health check failed after network-policy restart"
 fi
 
-python3 - "$daemon_config" "$staging_daemon" 2>/dev/null <<'PY' || fail_after_apply "daemon.json changed after network-policy verification"
-import json, sys
-current = json.load(open(sys.argv[1], encoding="utf-8"))
-staged = json.load(open(sys.argv[2], encoding="utf-8"))
-if not isinstance(current, dict) or current.get("default-address-pools") != staged.get("default-address-pools"):
-    raise SystemExit(1)
-PY
+daemon_pools_match "$staging_daemon" || fail_after_apply "daemon.json changed after network-policy verification"
 verified_generation=$(file_generation "$daemon_config") || fail_after_apply "failed to identify verified daemon.json generation"
 verified_action=
 [[ "$apply_removal_pending" != true ]] || verified_action=clear-removal
