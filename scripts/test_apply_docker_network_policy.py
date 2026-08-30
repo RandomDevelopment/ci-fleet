@@ -465,6 +465,29 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"], prior_generation)
         self.assertEqual(hashlib.sha256(daemon.read_bytes()).hexdigest(), prior_generation)
 
+    def test_failed_managed_reapply_leaves_generation_unverified_when_rollback_health_fails(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-failed-rollback-generation"
+        self._write_success_commands()
+        prior_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(prior_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(prior_env.read_bytes())
+        candidate = self._rendered_with_policy()
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = Path(self.tmp) / "candidate-failed-rollback.env"
+        candidate_env.write_text("".join(f"{key}={value}\n" for key, value in sorted(candidate.items())), encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        (Path(self.tmp) / "health.sh").write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+        (Path(self.tmp) / "health.sh").chmod(0o755)
+
+        result = self._run(str(candidate_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertIsNone(state["verified_generation"])
+
     def test_policy_apply_requires_checkpoint_before_drain_or_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self.daemon_dir / "daemon.json"
@@ -1455,9 +1478,9 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
         self.assertNotIn("rollback-restart-output", stdout + stderr)
         self.assertNotIn("rollback-health-output", stdout + stderr)
-        recovery_dirs = list(Path(self.tmp).glob(".ci-fleet-apply.*"))
-        self.assertEqual(len(recovery_dirs), 1)
-        self.assertEqual((recovery_dirs[0] / "prior" / "daemon.json.before").read_bytes(), prior)
+        recovery = Path((stdout + stderr).rstrip().rsplit("recovery data retained at ", 1)[1])
+        self.assertEqual(recovery.parent, Path(self.tmp) / "checkpoint-direct")
+        self.assertEqual((recovery / "daemon.json.before").read_bytes(), prior)
 
     def test_rollback_failure_is_reported(self) -> None:
         prior = b'{"bip":"172.17.0.1/16","registry-mirrors":["https://mirror.example.invalid?token=credential"]}\n'
@@ -1491,11 +1514,73 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("credential", combined)
         self.assertNotIn("rollback-secret-error", combined)
         recovery = Path(combined.rstrip().rsplit("recovery data retained at ", 1)[1])
-        self.addCleanup(shutil.rmtree, recovery, ignore_errors=True)
-        self.assertTrue(recovery.name.startswith(".ci-fleet-apply."))
-        self.assertEqual((recovery / "prior" / "daemon.json.before").read_bytes(), prior)
+        self.assertEqual(recovery.parent, Path(self.tmp) / "checkpoint-default")
+        self.assertTrue(recovery.name.startswith("recovery."))
+        self.assertEqual((recovery / "daemon.json.before").read_bytes(), prior)
         recovery_state = json.loads((Path(self.tmp) / "checkpoint-default" / "docker-network-policy.json").read_text(encoding="utf-8"))
         self.assertIsNone(recovery_state["verified_generation"])
+
+    def test_failed_rollback_persists_exact_recovery_under_checkpoint(self) -> None:
+        prior_daemon = b'{"bip":"172.17.0.1/16"}\n'
+        self._write_daemon(prior_daemon.decode())
+        prior_env = self.installed_env.read_bytes()
+        checkpoint = Path(self.tmp) / "checkpoint-durable-recovery"
+        restart_log = Path(self.tmp) / "durable-recovery-restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        (Path(self.tmp) / "health.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (Path(self.tmp) / "health.sh").chmod(0o755)
+        audit_dir = Path(self.tmp) / "recovery-fsync-audit"
+        audit_dir.mkdir()
+        audit_log = Path(self.tmp) / "recovery-fsync.log"
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_fsync = os.fsync\n"
+            "_replace = os.replace\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def fsync(fd):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle:\n"
+            "        handle.write('F ' + os.readlink(f'/proc/self/fd/{fd}') + '\\n')\n"
+            "    return _fsync(fd)\n"
+            "def replace(source, target):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle:\n"
+            "        handle.write(f'R {os.path.realpath(source)} {os.path.realpath(target)}\\n')\n"
+            "    return _replace(source, target)\n"
+            "os.fsync = fsync\n"
+            "os.replace = replace\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_TEMP_DIR=self.tmp, PYTHONPATH=str(audit_dir), FSYNC_AUDIT_LOG=str(audit_log)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        recovery = Path((result.stdout + result.stderr).rstrip().rsplit("recovery data retained at ", 1)[1])
+        self.assertEqual(recovery.parent, checkpoint)
+        self.assertEqual(recovery.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((recovery / "daemon.json.before").read_bytes(), prior_daemon)
+        self.assertEqual((recovery / "prior-ci-fleet.env").read_bytes(), prior_env)
+        self.assertEqual((recovery / "daemon.json.before").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((recovery / "prior-ci-fleet.env").stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(Path(self.tmp).glob(".ci-fleet-apply.*")))
+        audit = audit_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(line.startswith("F ") and line.endswith("/daemon.json.before") for line in audit))
+        self.assertTrue(any(line.startswith("F ") and line.endswith("/prior-ci-fleet.env") for line in audit))
+        self.assertIn(f"F {checkpoint}", audit)
+        self.assertTrue(any(line.startswith("R ") and line.endswith(f" {recovery}") for line in audit))
 
     def test_post_apply_health_uses_candidate_rendered_env(self) -> None:
         self._write_daemon("{}\n")

@@ -315,6 +315,45 @@ finally:
 PY
 }
 
+persist_recovery() {
+  checkpoint_path_is_pinned || return 1
+  python3 - "$state_file" "$had_prior" "$backup_dir/$backup_name" "$prior_env" <<'PY'
+import os, shutil, sys, tempfile
+
+state_path, had_prior, daemon_source, env_source = sys.argv[1:]
+parent = os.path.dirname(state_path)
+staged = tempfile.mkdtemp(prefix=".recovery.", dir=parent)
+try:
+    os.chmod(staged, 0o700)
+    sources = [(env_source, "prior-ci-fleet.env")]
+    if had_prior == "true":
+        sources.insert(0, (daemon_source, "daemon.json.before"))
+    for source, name in sources:
+        target = os.path.join(staged, name)
+        with open(source, "rb") as source_handle, open(target, "xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle)
+            os.fchmod(target_handle.fileno(), 0o600)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+    staged_fd = os.open(staged, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(staged_fd)
+    finally:
+        os.close(staged_fd)
+    final = os.path.join(parent, "recovery." + os.path.basename(staged).removeprefix(".recovery."))
+    os.replace(staged, final)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    print(os.path.realpath(final))
+except BaseException:
+    shutil.rmtree(staged, ignore_errors=True)
+    raise
+PY
+}
+
 if [[ "$removing" == true ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || die 'network-policy checkpoint state is invalid'
   mapfile -t managed_state < <(python3 - "$state_file" <<'PY'
@@ -597,7 +636,9 @@ rollback_daemon() {
   run_command "$restart_command" "$daemon_dir" || failed=1
   run_command "$resume_command" --env "$prior_env" || failed=1
   run_health "$prior_env" || failed=1
-  if [[ "$managed_before" == true ]]; then set_verified_generation "$prior_verified_generation" || failed=1; fi
+  if [[ "$managed_before" == true && "$failed" == 0 ]]; then
+    set_verified_generation "$prior_verified_generation" || failed=1
+  fi
   return "$failed"
 }
 
@@ -613,7 +654,12 @@ rollback_on_exit() {
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
   else
-    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$work_dir" >&2
+    recovery_path=$(persist_recovery) || {
+      printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
+      exit "$status"
+    }
+    rm -rf "$work_dir"
+    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$recovery_path" >&2
   fi
   exit "$status"
 }
