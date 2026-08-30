@@ -31,9 +31,18 @@ root_path() { printf '%s%s' "$root_prefix" "$1"; }
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 if [[ ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run installer as root'; fi
-for command in awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat systemctl tar wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+case $action in
+  --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat systemctl tar wc' ;;
+  --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir readlink sha256sum stat systemctl' ;;
+  --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
+  --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat systemctl' ;;
+  --uninstall) required_commands='bash chmod dirname env find flock grep install mkdir rm stat systemctl' ;;
+esac
+for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
-repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --show-toplevel 2>/dev/null) || die 'installer must run from a Git checkout'
+if [[ $action == --install || $action == --upgrade ]]; then
+  repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --show-toplevel 2>/dev/null) || die 'installer must run from a Git checkout'
+fi
 opt_dir=$(root_path /opt/ci-fleet-tester)
 release_dir=$opt_dir/releases
 current_link=$opt_dir/current

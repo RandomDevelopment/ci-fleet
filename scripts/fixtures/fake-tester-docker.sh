@@ -27,7 +27,7 @@ done
 case ${operation:-} in
   config)
     digest=$(printf 'a%.0s' {1..64})
-    privileged=false; read_only=true; host_ip=127.0.0.1; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
+    privileged=false; read_only=true; host_ip=127.0.0.1; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128'; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
     case ${FAKE_TESTER_POLICY:-valid} in
       mutable) image=registry.example/example/app:latest ;;
       privileged) privileged=true ;;
@@ -60,6 +60,8 @@ case ${operation:-} in
       profiles) service_extra=',"profiles":["extra"]' ;;
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
       runtime) service_extra=',"runtime":"alternative"' ;;
+      unbounded) service_extra=',"cpus":0,"mem_limit":0,"pids_limit":-1' ;;
+      oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}

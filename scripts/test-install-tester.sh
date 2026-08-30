@@ -43,6 +43,14 @@ export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
 export FAKE_TESTER_EVENT_LOG=$tmp/events.log
 
+standalone_installer=$tmp/install-tester.sh
+cp "$installer" "$standalone_installer"
+uninstall_bin=$tmp/uninstall-bin
+mkdir "$uninstall_bin"
+for command in bash chmod dirname env find flock grep id install mkdir rm stat; do ln -s "$(command -v "$command")" "$uninstall_bin/$command"; done
+ln -s "$fake_bin/systemctl" "$uninstall_bin/systemctl"
+PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
+
 write_environment() {
   local id=$1 port=$2
   mkdir -p "$root/etc/ci-fleet-tester/secrets/$id"; chmod 700 "$root/etc/ci-fleet-tester/secrets/$id"
@@ -60,6 +68,10 @@ if "$runtime" --check >/dev/null 2>&1; then fail 'symlinked lifecycle lock direc
 [[ $(stat -c %a "$tmp/lock-target") == 700 ]] || fail 'symlinked lock target permissions changed'
 rm "$root/run/lock/ci-fleet-tester"
 if FAKE_TESTER_DOCKER_ROOT=/remote/docker "$runtime" --check >/dev/null 2>&1; then fail 'remote Docker daemon was accepted'; fi
+write_environment secretless 18079
+rmdir "$root/etc/ci-fleet-tester/secrets/secretless"
+FAKE_TESTER_ROUTE_PORT=18079 "$runtime" --converge --environment secretless >/dev/null || fail 'secretless environment required an empty secret directory'
+FAKE_TESTER_ROUTE_PORT=18079 "$runtime" --remove --environment secretless >/dev/null
 write_environment preview-a 18080
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a | grep -Fq CONVERGED || fail 'converge failed'
 state=$root/var/lib/ci-fleet-tester/environments/preview-a.state
@@ -79,7 +91,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime; do
+for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
@@ -158,6 +170,8 @@ for id in preview-a expired-a expired-b; do
 done
 "$runtime" --cleanup >/dev/null
 [[ ! -e $state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-a.state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-b.state ]] || fail 'expired environment survived cleanup'
+
+[[ ${CI_FLEET_TESTER_RUNTIME_ONLY:-0} != 1 ]] || { printf 'TESTER_RUNTIME_TESTS_OK\n'; exit 0; }
 
 # Commit-backed installer tests run after the implementation commit exists.
 ref=$(git -C "$repo_root" rev-parse HEAD)
@@ -357,6 +371,6 @@ if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tes
 # than failing because a timer unit file is missing.
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'fresh install failed before partial-unit test'
 rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.timer"
-"$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed on a partial unit set'
+PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
 [[ -L $root/opt/ci-fleet-tester/current ]] && fail 'partial uninstall left the active release link'
 printf 'TESTER_INSTALLER_TESTS_OK\n'

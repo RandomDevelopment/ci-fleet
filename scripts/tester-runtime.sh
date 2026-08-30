@@ -104,7 +104,6 @@ load_spec() {
   secure_file "$compose_file" 644
   compose_project=$(project_name "$id")
   secret_dir=$secret_root/$id
-  secure_directory "$secret_dir" 700
 }
 
 validate_compose() {
@@ -126,7 +125,7 @@ PY
   rm -f "$empty_env"
   chmod 600 "$rendered"
   python3 - "$rendered" "$route_service" "$route_port" "$compose_project" "$secret_dir" "$expected_uid" <<'PY' || return 1
-import json,os,re,stat,sys
+import json,math,os,re,stat,sys
 value=json.load(open(sys.argv[1])); route_service=sys.argv[2]; route_port=int(sys.argv[3]); project=sys.argv[4]; secret_dir=sys.argv[5]; expected_uid=int(sys.argv[6])
 services=value.get('services')
 if not isinstance(services,dict) or route_service not in services: raise SystemExit('route service is missing')
@@ -138,6 +137,8 @@ for name,service in services.items():
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
+    if not all(isinstance(service.get(key),(int,float)) and not isinstance(service[key],bool) and math.isfinite(service[key]) and service[key] > 0 for key in ('cpus','mem_limit','pids_limit')): raise SystemExit(f'{name}: positive CPU, memory, and PID limits are required')
+    if service.get('oom_kill_disable') or service.get('oom_score_adj',0) < 0: raise SystemExit(f'{name}: OOM priority overrides are forbidden')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
@@ -157,7 +158,12 @@ for section in ('networks','volumes'):
         if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
         if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
-for name,item in value.get('secrets',{}).items():
+secrets=value.get('secrets',{})
+if secrets:
+    try: metadata=os.lstat(secret_dir)
+    except FileNotFoundError: raise SystemExit('environment secret directory is missing')
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o700: raise SystemExit('environment secret directory must be owner-controlled mode 0700')
+for name,item in secrets.items():
     path=item.get('file')
     if item.get('external') or not isinstance(path,str) or os.path.realpath(path).rsplit('/',1)[0] != secret_dir: raise SystemExit(f'secrets.{name}: secret must be a host-local file in the environment secret directory')
     metadata=os.lstat(path)

@@ -13,7 +13,7 @@ A tester host accepts only:
 - application images addressed by an immutable `sha256` digest;
 - environment secrets stored below that environment's fixed host-local secret directory.
 
-It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, custom volume drivers/options, privileged containers, added capabilities, host or shared namespaces, Docker API access, global container names, and credentials outside the environment secret boundary. Compose environment variables, env files, and configs are forbidden credential channels; use only fixed mode-`0600` Compose secrets. Every service must be read-only, drop all capabilities, and set `no-new-privileges=true`. The validated rendered Compose model is copied into protected runtime state before activation, so partial starts remain tracked and later cleanup does not depend on a mutable or deleted source definition. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something this repository-only change can prove.
+It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, custom volume drivers/options, privileged containers, added capabilities, host or shared namespaces, Docker API access, global container names, and credentials outside the environment secret boundary. Compose environment variables, env files, and configs are forbidden credential channels; use only fixed mode-`0600` Compose secrets. Every service must define positive CPU, memory, and PID limits, remain OOM-killable, be read-only, drop all capabilities, and set `no-new-privileges=true`. The validated rendered Compose model is copied into protected runtime state before activation, so partial starts remain tracked and later cleanup does not depend on a mutable or deleted source definition. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something this repository-only change can prove.
 
 ## Prepare host-local configuration
 
@@ -52,7 +52,7 @@ CI_FLEET_TESTER_ROUTE_SERVICE=web
 CI_FLEET_TESTER_ROUTE_PORT=18080
 ```
 
-The Compose file is root-owned mode `0644` and may contain no credential value. Each image must use `registry/path@sha256:REVIEWED_64_HEX_DIGEST`. Exactly one route is published, on loopback only, at the declared port. Compose-generated network and volume names must remain below `ci-fleet-test-<environment>_...`; explicit external names are rejected.
+The Compose file is root-owned mode `0644` and may contain no credential value. Each image must use `registry/path@sha256:REVIEWED_64_HEX_DIGEST`, and each service must set positive `cpus`, `mem_limit`, and `pids_limit` values. Exactly one route is published, on loopback only, at the declared port. Compose-generated network and volume names must remain below `ci-fleet-test-<environment>_...`; explicit external names are rejected.
 
 If credentials are required, create `/etc/ci-fleet-tester/secrets/example-preview` as root-owned mode `0700`, put only test-scope regular files there as root-owned mode `0600`, and reference them through Compose `secrets.file`. Symlinks, external secrets, production credentials, environment-variable secret transport, and files outside that exact directory are unsupported.
 
