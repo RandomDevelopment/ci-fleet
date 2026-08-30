@@ -68,12 +68,16 @@ deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
   local target state_root_safe=1
-  # The adapter may recursively clear its writable state root. Recreate only
-  # an absent boundary; an unsafe replacement remains a hard failure.
+  # The adapter may recursively clear its writable state root or drift its
+  # metadata. Recreate or repair only a real directory; unsafe types fail.
   if [[ ${audit_pending:-0} == 1 && ! -e "$state_root" && ! -L "$state_root" ]]; then
     install -d -m 0700 "$state_root" 2>/dev/null || { status=1; state_root_safe=0; }
   fi
   if [[ -e "$state_root" || -L "$state_root" ]]; then
+    if [[ -d "$state_root" && ! -L "$state_root" ]]; then
+      chown "$expected_uid" "$state_root" 2>/dev/null || status=1
+      chmod 0700 "$state_root" 2>/dev/null || status=1
+    fi
     [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]] || { status=1; state_root_safe=0; }
   fi
   # An adapter that deletes its own consumption marker must not defeat replay

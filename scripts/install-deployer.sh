@@ -47,9 +47,10 @@ restore_transaction_backup() {
 }
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ! -d $transaction_dir ]]; then
+  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 && ( ! -f "$transaction_dir/application-rollback-committed" || -L "$transaction_dir/application-rollback-committed" ) ]]; then
     if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root"; fi
     if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
+      rm -rf -- "$transaction_dir"
       restore_transaction_backup
     fi
   fi

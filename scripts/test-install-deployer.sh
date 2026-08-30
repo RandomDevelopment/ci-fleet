@@ -146,6 +146,11 @@ if [[ "$1" == rollback && -n ${FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION:-} ]]; t
   rm -rf -- "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")"
   exit 42
 fi
+if [[ "$1" == rollback && -n ${FAKE_ADAPTER_CORRUPT_ROLLBACK_TRANSACTION:-} ]]; then
+  : >"$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")/state/install-state.json"
+  rm -f "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
+  exit 42
+fi
 if [[ -n ${FAKE_ADAPTER_DELETE_CONSUMED_GLOB:-} ]]; then rm -rf $FAKE_ADAPTER_DELETE_CONSUMED_GLOB; fi
 if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
   if [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == truncate ]]; then
@@ -823,6 +828,9 @@ grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" 
 
 FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION=1 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'adapter-deleted rollback journal did not restore current core state'
+
+FAKE_ADAPTER_CORRUPT_ROLLBACK_TRANSACTION=1 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'adapter-corrupted rollback journal did not restore current core state'
 
 # An adapter that commits the rollback marker but exits nonzero must not be
 # reported as an unchanged failure: recovery finalizes the committed rollback.
@@ -1607,6 +1615,22 @@ FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL
   expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
 [[ $(readlink "$deployed_current") == "$incumbent_target" ]] || fail 'recursive state cleanup lost the incumbent pointer'
 [[ $incumbent_policy_before == "$(sha256sum "$deployed_current/policy.conf")" && $incumbent_state_before == "$(sha256sum "$deployed_current/state.json")" ]] || fail 'recursive state cleanup lost the incumbent snapshot'
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# Adapter metadata drift on the real state directory must be repaired so
+# protected-state recovery and later operations remain available.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=state-root-mode-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:03:45Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'deploy\n' >"$tmp/fail-after-state-mode"
+FAKE_ADAPTER_CHMOD_DURING=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-state-mode \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+[[ $(stat -c '%u:%a' "$root/var/lib/ci-fleet-deployer") == "$(id -u):700" ]] || fail 'adapter-drifted state-root metadata was not repaired'
+expect_success "$runtime" health >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 
 write_evidence staging example-staging
