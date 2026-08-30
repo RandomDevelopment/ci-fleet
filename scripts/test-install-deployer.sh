@@ -1825,6 +1825,9 @@ for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--resume' 
 done
 for unit in "$repo_root"/deploy/deployer/*; do
   grep -Fq 'ci-fleet-deployer' "$unit" || fail "unit is not deployer-scoped: $unit"
+  if [[ $unit == *.service ]]; then
+    grep -Eq '^ReadWritePaths=.*(^| )/var/lock/ci-fleet-deployer( |$)' "$unit" && fail "unit lets adapters replace the operation lock: $unit"
+  fi
 done
 
 printf 'DEPLOYER_INSTALL_TESTS_OK\n'

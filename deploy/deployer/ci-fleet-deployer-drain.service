@@ -13,5 +13,5 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer
-ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer /var/lock/ci-fleet-deployer
+ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer
 RestrictSUIDSGID=yes

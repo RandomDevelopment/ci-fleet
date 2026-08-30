@@ -20,6 +20,6 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer
-ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer /var/lock/ci-fleet-deployer /run/docker.sock
+ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer /run/docker.sock
 RestrictSUIDSGID=yes
 LockPersonality=yes
