@@ -78,6 +78,11 @@ load_global() {
   [[ ${ENV_VALUES[CI_FLEET_TESTER_ISOLATION_ACK]:-} == test-only-no-production-authority ]] || die 'explicit test-only isolation acknowledgement is required'
 }
 
+check_disk_threshold() {
+  used=$(df -P "$(root_path /var/lib/docker)" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
+  [[ $used =~ ^[0-9]+$ && $used -lt $disk_warn ]] || die 'Docker storage exceeds configured warning threshold'
+}
+
 project_name() { printf 'ci-fleet-test-%s' "$1"; }
 state_path() { printf '%s/%s.state' "$state_dir" "$1"; }
 deployed_compose_path() { printf '%s/%s.compose.json' "$state_dir" "$1"; }
@@ -113,7 +118,7 @@ validate_compose() {
 import re,sys
 text=open(sys.argv[1],encoding='utf-8').read()
 key=r'(?:(?:!!str|!<[^>\n]+>)[ \t]+)?(?:include|label_file|"(?:include|label_file)"|\x27(?:include|label_file)\x27)[ \t]*:'
-explicit_key=r'(?m)^[ \t]*\?'
+explicit_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\?'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
 alias_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\*[A-Za-z0-9_-]+[ \t]*:'
 if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text) or re.search(alias_key,text): raise SystemExit('Compose include, label_file, or indirect mapping key is forbidden')
@@ -301,8 +306,7 @@ case $action in
     docker compose version >/dev/null
     getent ahosts "$probe_host" >/dev/null || die 'test-host DNS probe failed'
     curl --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
-    used=$(df -P "$(root_path /var/lib/docker)" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
-    [[ $used =~ ^[0-9]+$ && $used -lt $disk_warn ]] || die 'Docker storage exceeds configured warning threshold'
+    check_disk_threshold
     report "CHECK_OK max_environments=$max_environments disk_used_percent=$used"
     ;;
   --converge) converge ;;
@@ -327,6 +331,7 @@ case $action in
     failed=0
     for target in "$state_dir"/*.state; do [[ -e $target ]] || continue; inspect_environment "$target" | grep -q 'STATUS=running' || failed=1; done
     ((failed == 0)) || die 'one or more test environments are unhealthy'
+    check_disk_threshold
     report 'HEALTH_OK'
     ;;
 esac

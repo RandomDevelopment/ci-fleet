@@ -20,7 +20,8 @@ cp "$repo_root/scripts/fixtures/fake-tester-docker.sh" "$fake_bin/docker"
 chmod 0755 "$fake_bin/docker"
 cat >"$fake_bin/df" <<'EOF'
 #!/usr/bin/env bash
-printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 100 20 80 20%% /fixture\n'
+used=${FAKE_TESTER_DISK_USED_PERCENT:-20}
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 100 %s 80 %s%% /fixture\n' "$used" "$used"
 EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -116,6 +117,9 @@ if FAKE_TESTER_ROUTE_PORT=18093 "$runtime" --converge --environment bad-tagged-l
 write_environment bad-aliased-label 18094
 printf 'x-key: &external-key label_file\nservices:\n  web:\n    *external-key: /root/credential.env\n' >"$root/etc/ci-fleet-tester/definitions/bad-aliased-label.yaml"
 if FAKE_TESTER_ROUTE_PORT=18094 "$runtime" --converge --environment bad-aliased-label >/dev/null 2>&1; then fail 'aliased Compose label_file was accepted before rendering'; fi
+write_environment bad-flow-explicit-alias 18095
+printf '{x-key: &external-key include, ? *external-key : [{path: /root/other.yaml, env_file: /root/credential.env}], services: {}}\n' >"$root/etc/ci-fleet-tester/definitions/bad-flow-explicit-alias.yaml"
+if FAKE_TESTER_ROUTE_PORT=18095 "$runtime" --converge --environment bad-flow-explicit-alias >/dev/null 2>&1; then fail 'flow-form explicit aliased Compose include was accepted before rendering'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -129,6 +133,7 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='exited unhealthy' "
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
 write_environment service-map 18090
 FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --converge --environment service-map >/dev/null
 if FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services FAKE_TESTER_DUPLICATE_SERVICE=1 "$runtime" --inspect --environment service-map | grep -q 'STATUS=running'; then fail 'health accepted duplicate and missing service identities'; fi
