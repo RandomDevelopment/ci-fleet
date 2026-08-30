@@ -35,14 +35,19 @@ if [[ -n ${FAKE_TESTER_SYSTEMCTL_WAIT_READY:-} && $1 == start && " $* " != *' --
 fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
-printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/curl"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/getent"
+# shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
+printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_CURL_FAIL:-0} != 1 ]]' >"$fake_bin/curl"
+# shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
+printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_GETENT_FAIL:-0} != 1 ]]' >"$fake_bin/getent"
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
 printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_TMPFILES_FAIL:-0} != 1 ]]' >"$fake_bin/systemd-tmpfiles"
 chmod 0755 "$fake_bin/df" "$fake_bin/systemctl" "$fake_bin/curl" "$fake_bin/getent" "$fake_bin/systemd-tmpfiles"
 export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
 export FAKE_TESTER_EVENT_LOG=$tmp/events.log
+for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
+  if grep -q '^ConditionPathExists=/etc/ci-fleet-tester/tester.env$' "$repo_root/host/systemd/$service"; then fail "$service silently skips missing configuration"; fi
+done
 
 standalone_installer=$tmp/install-tester.sh
 cp "$installer" "$standalone_installer"
@@ -78,6 +83,8 @@ write_environment preview-a 18080
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a | grep -Fq CONVERGED || fail 'converge failed'
 state=$root/var/lib/ci-fleet-tester/environments/preview-a.state
 [[ -f $state && $(stat -c %a "$state") == 600 ]] || fail 'state was not protected'
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_PREEXISTING_VOLUME=ci-fleet-test-preview-a_data "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a pre-existing bind-backed volume'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_PREEXISTING_NETWORK=ci-fleet-test-preview-a_default "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a pre-existing network outside approved IPAM'; fi
 inspect_output=$(FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --inspect --environment preview-a)
 grep -q 'IMAGE_DIGESTS=sha256:[a-f0-9]\{64\}.*STATUS=running DISK_BYTES=[1-9][0-9]*' <<<"$inspect_output" || fail 'inspect did not report health and disk use'
 if FAKE_TESTER_PS_FAIL=1 "$runtime" --inspect --environment preview-a >/dev/null 2>&1; then fail 'container inventory failure was hidden'; fi
@@ -134,6 +141,8 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$run
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_GETENT_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed DNS probe'; fi
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CURL_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed HTTPS probe'; fi
 write_environment service-map 18090
 FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --converge --environment service-map >/dev/null
 if FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services FAKE_TESTER_DUPLICATE_SERVICE=1 "$runtime" --inspect --environment service-map | grep -q 'STATUS=running'; then fail 'health accepted duplicate and missing service identities'; fi
@@ -220,6 +229,12 @@ for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; d
   grep -Fq 'TimeoutStartSec=300' "$root/etc/systemd/system/$service" || fail "$service does not bound oneshot start time"
 done
 release=$root/opt/ci-fleet-tester/releases/$ref
+chmod 0755 "$release/scripts/tester-runtime.sh"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'writable release executable passed check'; fi
+chmod 0555 "$release/scripts/tester-runtime.sh"
+chmod 0644 "$release/.ci-fleet-release.sha256"
+if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'writable release manifest passed check'; fi
+chmod 0444 "$release/.ci-fleet-release.sha256"
 # Reboot-creatable lock path: the tmpfiles.d drop-in ships in the release and
 # recreates the volatile lock directory, so maintenance units survive a reboot.
 [[ -f $release/host/systemd/ci-fleet-tester-lock.conf ]] || fail 'tmpfiles.d lock drop-in is missing from the release'

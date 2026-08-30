@@ -3,7 +3,11 @@ set -Eeuo pipefail
 printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
-if [[ $1 == info ]]; then printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; exit 0; fi
+if [[ $1 == info ]]; then
+  if [[ " $* " == *'DefaultAddressPools'* ]]; then printf '[{"Base":"198.51.100.0/24","Size":28}]\n';
+  else printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; fi
+  exit 0
+fi
 if [[ $1 == ps ]]; then
   [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9
   if [[ " $* " == *' label=com.docker.compose.project '* ]]; then
@@ -29,17 +33,29 @@ if [[ $1 == inspect ]]; then
 fi
 if [[ $1 == volume && $2 == ls ]]; then
   [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9
-  if [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then printf 'fixture-volume\n';
+  if [[ " $* " == *' name=^'* && -n ${FAKE_TESTER_PREEXISTING_VOLUME:-} ]]; then printf '%s\n' "$FAKE_TESTER_PREEXISTING_VOLUME";
+  elif [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then printf 'fixture-volume\n';
   elif [[ -n ${FAKE_TESTER_ORPHAN_VOLUME_PROJECT:-} ]]; then printf 'fixture-orphan-volume-id\n'; fi
   exit 0
 fi
 if [[ $1 == volume && $2 == inspect ]]; then
-  if [[ " $* " == *'com.docker.compose.project'* ]]; then printf '%s\n' "${FAKE_TESTER_ORPHAN_VOLUME_PROJECT:-}";
+  if [[ -n ${FAKE_TESTER_PREEXISTING_VOLUME:-} && ${*: -1} == "$FAKE_TESTER_PREEXISTING_VOLUME" && " $* " != *' --format '* ]]; then
+    printf '[{"Name":"%s","Driver":"local","Options":{"type":"none","device":"/","o":"bind"},"Labels":{"com.docker.compose.project":"ci-fleet-test-preview-a","com.docker.compose.volume":"data"}}]\n' "$FAKE_TESTER_PREEXISTING_VOLUME"
+  elif [[ " $* " == *'com.docker.compose.project'* ]]; then printf '%s\n' "${FAKE_TESTER_ORPHAN_VOLUME_PROJECT:-}";
   else printf '%s\n' "${FAKE_TESTER_VOLUME_ROOT:?}"; fi
   exit 0
 fi
-if [[ $1 == network && $2 == ls ]]; then [[ -z ${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-} ]] || printf 'fixture-orphan-network-id\n'; exit 0; fi
-if [[ $1 == network && $2 == inspect ]]; then printf '%s\n' "${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-}"; exit 0; fi
+if [[ $1 == network && $2 == ls ]]; then
+  if [[ " $* " == *' name=^'* && -n ${FAKE_TESTER_PREEXISTING_NETWORK:-} ]]; then printf '%s\n' "$FAKE_TESTER_PREEXISTING_NETWORK";
+  elif [[ -n ${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-} ]]; then printf 'fixture-orphan-network-id\n'; fi
+  exit 0
+fi
+if [[ $1 == network && $2 == inspect ]]; then
+  if [[ -n ${FAKE_TESTER_PREEXISTING_NETWORK:-} && ${*: -1} == "$FAKE_TESTER_PREEXISTING_NETWORK" && " $* " != *' --format '* ]]; then
+    printf '[{"Name":"%s","Driver":"bridge","Options":{},"Labels":{"com.docker.compose.project":"ci-fleet-test-preview-a","com.docker.compose.network":"default"},"Internal":false,"Attachable":false,"Ingress":false,"EnableIPv6":false,"IPAM":{"Driver":"default","Options":{},"Config":[{"Subnet":"203.0.113.0/24","Gateway":"203.0.113.1"}]}}]\n' "$FAKE_TESTER_PREEXISTING_NETWORK"
+  else printf '%s\n' "${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-}"; fi
+  exit 0
+fi
 if [[ $1 == compose && $2 == version ]]; then printf 'Docker Compose version v2.fixture\n'; exit 0; fi
 if [[ $1 == compose && $2 == up && ${3:-} == --help ]]; then [[ ${FAKE_TESTER_NO_WAIT_TIMEOUT:-0} != 1 ]] && printf '%s\n' '  --wait-timeout int'; exit 0; fi
 if [[ $1 != compose ]]; then exit 2; fi

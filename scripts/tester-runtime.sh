@@ -83,6 +83,11 @@ check_disk_threshold() {
   [[ $used =~ ^[0-9]+$ && $used -lt $disk_warn ]] || die 'Docker storage exceeds configured warning threshold'
 }
 
+check_network_probes() {
+  getent ahosts "$probe_host" >/dev/null || die 'test-host DNS probe failed'
+  curl --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
+}
+
 project_name() { printf 'ci-fleet-test-%s' "$1"; }
 state_path() { printf '%s/%s.state' "$state_dir" "$1"; }
 deployed_compose_path() { printf '%s/%s.compose.json' "$state_dir" "$1"; }
@@ -182,6 +187,47 @@ PY
 )
 }
 
+validate_existing_resources() {
+  python3 - "$1" "$compose_project" "$(state_path "$environment")" <<'PY'
+import ipaddress,json,os,subprocess,sys
+model=json.load(open(sys.argv[1])); project=sys.argv[2]; tracked=os.path.isfile(sys.argv[3])
+def run(*args):
+    result=subprocess.run(args,text=True,capture_output=True)
+    if result.returncode: raise SystemExit(f'Docker resource inventory failed: {" ".join(args[:3])}')
+    return result.stdout
+def inspect(kind,name):
+    value=json.loads(run('docker',kind,'inspect',name))
+    if len(value) != 1 or value[0].get('Name') != name: raise SystemExit(f'{kind} identity is invalid: {name}')
+    return value[0]
+pools=json.loads(run('docker','info','--format','{{json .DefaultAddressPools}}'))
+for kind in ('volume','network'):
+    for logical,item in model.get(kind+'s',{}).items():
+        name=item.get('name',f'{project}_{logical}')
+        existing=[value for value in run('docker',kind,'ls','-q','--filter',f'name=^{name}$').splitlines() if value == name]
+        if not existing: continue
+        if not tracked: raise SystemExit(f'untracked pre-existing Docker {kind} is forbidden: {name}')
+        actual=inspect(kind,name); labels=actual.get('Labels') or {}
+        if labels.get('com.docker.compose.project') != project or labels.get(f'com.docker.compose.{kind}') != logical: raise SystemExit(f'{kind} provenance is invalid: {name}')
+        if kind == 'volume':
+            if actual.get('Driver') != 'local' or actual.get('Options') not in (None,{}): raise SystemExit(f'volume configuration is invalid: {name}')
+            continue
+        if actual.get('Driver') != 'bridge' or actual.get('Options') not in (None,{}) or actual.get('Ingress'): raise SystemExit(f'network configuration is invalid: {name}')
+        if bool(actual.get('Internal')) != bool(item.get('internal')) or bool(actual.get('Attachable')) != bool(item.get('attachable')) or bool(actual.get('EnableIPv6')) != bool(item.get('enable_ipv6')): raise SystemExit(f'network configuration differs from the approved model: {name}')
+        ipam=actual.get('IPAM') or {}
+        if ipam.get('Driver') not in (None,'default') or ipam.get('Options') not in (None,{}): raise SystemExit(f'network IPAM is invalid: {name}')
+        ipv4=[]
+        for config in ipam.get('Config') or []:
+            if not isinstance(config,dict) or config.get('AuxAddress'): raise SystemExit(f'network IPAM is invalid: {name}')
+            try: subnet=ipaddress.ip_network(config.get('Subnet',''))
+            except ValueError: raise SystemExit(f'network IPAM is invalid: {name}')
+            if subnet.version == 4: ipv4.append((subnet,config.get('Gateway')))
+        if len(ipv4) != 1: raise SystemExit(f'network IPv4 allocation is invalid: {name}')
+        subnet,gateway=ipv4[0]
+        approved=any(subnet.prefixlen == pool.get('Size') and subnet.subnet_of(ipaddress.ip_network(pool.get('Base',''))) for pool in pools)
+        if not approved or gateway is not None and ipaddress.ip_address(gateway) not in subnet: raise SystemExit(f'network IPAM is outside approved Docker address pools: {name}')
+PY
+}
+
 check_port_unique() {
   local file key value other_port
   for file in "$state_dir"/*.state; do
@@ -215,6 +261,7 @@ prepare_converge() {
 }
 
 apply_converge() {
+  validate_existing_resources "$prepared_rendered" || die 'pre-existing Docker resource validation failed'
   [[ -f $(state_path "$environment") ]] || install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
   if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait --wait-timeout 60; then
@@ -304,8 +351,7 @@ case $action in
   --check)
     docker info --format '{{.DockerRootDir}}' >/dev/null
     docker compose version >/dev/null
-    getent ahosts "$probe_host" >/dev/null || die 'test-host DNS probe failed'
-    curl --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
+    check_network_probes
     check_disk_threshold
     report "CHECK_OK max_environments=$max_environments disk_used_percent=$used"
     ;;
@@ -332,6 +378,7 @@ case $action in
     for target in "$state_dir"/*.state; do [[ -e $target ]] || continue; inspect_environment "$target" | grep -q 'STATUS=running' || failed=1; done
     ((failed == 0)) || die 'one or more test environments are unhealthy'
     check_disk_threshold
+    check_network_probes
     report 'HEALTH_OK'
     ;;
 esac

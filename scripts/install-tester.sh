@@ -65,8 +65,10 @@ units=("${services[@]}" "${timers[@]}")
 tmpfiles_conf=ci-fleet-tester-lock.conf
 tmpfiles_dir=$(root_path /usr/lib/tmpfiles.d)
 
-secure_file() { [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected file is unsafe: $1"; }
-secure_dir() { [[ -d $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]] || die "protected directory is unsafe: $1"; }
+protected_file() { [[ -f $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]]; }
+protected_dir() { [[ -d $1 && ! -L $1 && $(stat -c %u "$1") == "$expected_uid" && $(stat -c %a "$1") == "$2" ]]; }
+secure_file() { protected_file "$1" "$2" || die "protected file is unsafe: $1"; }
+secure_dir() { protected_dir "$1" "$2" || die "protected directory is unsafe: $1"; }
 remove_release_tree() { [[ ! -e $1 ]] || { [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$1"; rm -rf -- "$1"; }; }
 
 reject_git_replacements() {
@@ -136,10 +138,12 @@ ensure_directories() {
 }
 
 release_complete() {
-  local path=$1 expected=$2 unit
-  [[ -d $path && ! -L $path && $(stat -c %u "$path") == "$expected_uid" && $(stat -c %a "$path") == 555 && -x $path/scripts/tester-runtime.sh && -x $path/scripts/tester-launcher.sh && -f $path/.ci-fleet-source-revision ]] || return 1
+  local path=$1 expected=$2 directory file unit
+  for directory in "$path" "$path/scripts" "$path/host" "$path/host/systemd"; do protected_dir "$directory" 555 || return 1; done
+  for file in "$path/scripts/tester-runtime.sh" "$path/scripts/tester-launcher.sh"; do protected_file "$file" 555 || return 1; done
+  for file in "$path/.ci-fleet-source-revision" "$path/.ci-fleet-release.sha256"; do protected_file "$file" 444 || return 1; done
   [[ $(<"$path/.ci-fleet-source-revision") == "$expected" ]] || return 1
-  for unit in "${units[@]}"; do [[ -f $path/host/systemd/$unit ]] || return 1; done
+  for unit in "${units[@]}" "$tmpfiles_conf"; do protected_file "$path/host/systemd/$unit" 444 || return 1; done
   (cd "$path" && sha256sum --status -c .ci-fleet-release.sha256) || return 1
 }
 
