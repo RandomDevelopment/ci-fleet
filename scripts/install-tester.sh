@@ -121,7 +121,7 @@ stage_release() {
   # (chmod follows symlinks and would change the host target's permissions).
   while IFS= read -r -d '' entry; do
     if [[ -L $entry || ! -f $entry ]]; then remove_release_tree "$staging"; die "release archive contains a non-regular or symlinked member: $entry"; fi
-  done < <(find "$staging" -type f -print0)
+  done < <(find "$staging" ! -type d -print0)
   printf '%s\n' "$commit" >"$staging/.ci-fleet-source-revision"; chmod 0644 "$staging/.ci-fleet-source-revision"
   chmod 0755 "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; shellcheck "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"; bash -n "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"
   (cd "$staging" && sha256sum scripts/tester-runtime.sh scripts/tester-launcher.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
