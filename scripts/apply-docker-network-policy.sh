@@ -738,6 +738,7 @@ PY
     run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
+    clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
     clear_managed_marker "$work_dir/daemon.json.removal" || die 'failed to clear interrupted network-policy marker'
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_REMOVED\n'
@@ -762,9 +763,11 @@ PY
   managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
   managed_snapshot=$work_dir/daemon.json.before
   cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
-  python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" 2>/dev/null <<'PY' || {
+  python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" "$repo_root/scripts" 2>/dev/null <<'PY' || {
 import json, sys
-daemon_path, state_path, managed_path, removal_path = sys.argv[1:]
+daemon_path, state_path, managed_path, removal_path, scripts_path = sys.argv[1:]
+sys.path.insert(0, scripts_path)
+from desired_state import validate_docker_address_pools
 try:
     current = json.load(open(daemon_path, encoding="utf-8"))
     state = json.load(open(state_path, encoding="utf-8"))
@@ -774,6 +777,8 @@ try:
         managed_pools = state["removal_managed_default_address_pools"]
     else:
         managed_pools = current.get("default-address-pools")
+        if "default-address-pools" in current:
+            validate_docker_address_pools(managed_pools, path="managed daemon default address pools")
 except (OSError, json.JSONDecodeError, KeyError, ValueError):
     raise SystemExit(1)
 managed = dict(current)
@@ -925,6 +930,10 @@ if (
 ):
     raise SystemExit(1)
 PY
+  if ! clear_recovery_artifacts; then
+    removal_failure='failed to clear obsolete network-policy recovery data'
+    exit 2
+  fi
   if ! clear_managed_marker "$removal_daemon"; then
     removal_failure='failed to clear network-policy managed marker'
     exit 2

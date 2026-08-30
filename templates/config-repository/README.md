@@ -134,12 +134,18 @@ integrated state when introducing the policy. It also requires matching current
 evidence whenever a controller retains the policy, including across engine
 changes or rollbacks.
 
-The public engine renders these values only for read-only health inspection.
-This phase detects low water, exhaustion, failed inspection, and legacy
-networks; it does not configure or restart Docker, create/delete networks,
-clean resources, drain runners, or change controller scale. Circuit breaking,
-frequent orphan reconciliation, daemon mutation, transactional recovery, and
-consumer-label changes are later issue #81 slices.
+After the three-commit engine activation gate above, the pinned public engine
+can apply or remove a validated policy with at most 64 pools. The executable
+stage holds the installer lock, drains the controller and managed runners,
+changes only Docker's managed `default-address-pools` key, restarts Docker,
+probes capacity, resumes the intended controller state, and checks health. It
+uses prior-key provenance and the prior rendered environment to roll back a
+failed or interrupted transaction, and retains recovery data if rollback cannot
+be verified. A merged or configured policy does not authorize host mutation;
+rollout still requires separate operator approval, exact-head CI, and proof for
+the reviewed engine and desired-state commits. This stage does not create or
+delete networks, prune resources, change controller scale or consumer labels,
+or authorize application deployment.
 
 Application repositories do not encode the number of available workers. They submit all independent tasks and shards. Do not use GitHub Actions `strategy.max-parallel` to model fleet size; controllers and the private configuration decide how many jobs run simultaneously. An application may limit concurrency only for a separately documented external-system constraint, not worker availability.
 

@@ -267,10 +267,18 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
     try:
         configured_max_runners = int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
         effective_max_runners = int(rendered["CI_FLEET_MAX_RUNNERS"])
+        minimum_runners = int(rendered["CI_FLEET_MIN_RUNNERS"])
+        capacity_budget = int(rendered["CI_FLEET_CAPACITY_BUDGET"])
     except (KeyError, ValueError) as exc:
         raise ValueError("rendered controller capacity fields must be present integers") from exc
-    if state != "disabled" and configured_max_runners < 1:
+    if minimum_runners != 0:
+        raise ValueError("CI_FLEET_MIN_RUNNERS: must be zero")
+    if capacity_budget < 1:
+        raise ValueError("CI_FLEET_CAPACITY_BUDGET: must be a positive integer")
+    if configured_max_runners < 1:
         raise ValueError("CI_FLEET_CONFIGURED_MAX_RUNNERS: must be a positive integer")
+    if state != "disabled" and configured_max_runners > capacity_budget:
+        raise ValueError("CI_FLEET_CONFIGURED_MAX_RUNNERS: must not exceed CI_FLEET_CAPACITY_BUDGET")
     expected_effective_max = configured_max_runners if state == "active" else 0
     if effective_max_runners != expected_effective_max:
         raise ValueError("CI_FLEET_MAX_RUNNERS: must match effective controller capacity")

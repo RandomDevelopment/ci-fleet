@@ -347,10 +347,12 @@ class ApplyScriptTests(unittest.TestCase):
 
     def _write_env_file(self, rendered: dict[str, str]) -> Path:
         rendered = {
+            "CI_FLEET_CAPACITY_BUDGET": "1",
             "CI_FLEET_CONFIGURED_MAX_RUNNERS": "1",
             "CI_FLEET_CONTROLLER_STATE": "active",
             "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
             "CI_FLEET_MAX_RUNNERS": "1",
+            "CI_FLEET_MIN_RUNNERS": "0",
             **rendered,
         }
         path = Path(self.tmp) / "ci-fleet.env"
@@ -393,6 +395,122 @@ class ApplyScriptTests(unittest.TestCase):
             command = Path(self.tmp) / name
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
+
+    def _assert_raw_candidate_rejected_before_operational_side_effects(
+        self,
+        rendered: dict[str, str],
+        label: str,
+    ) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        prior = daemon.read_bytes()
+        checkpoint = Path(self.tmp) / f"checkpoint-raw-{label}"
+        command_log = Path(self.tmp) / f"commands-raw-{label}.log"
+        env_file = Path(self.tmp) / f"candidate-raw-{label}.env"
+        env_file.write_text(
+            "".join(f"{key}={value}\n" for key, value in sorted(rendered.items())),
+            encoding="utf-8",
+        )
+        for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
+        self.assertFalse(checkpoint.exists())
+        self.assertFalse(command_log.exists())
+        self.assertEqual(daemon.read_bytes(), prior)
+
+    def test_rejects_raw_minimum_capacity_before_operational_side_effects(self) -> None:
+        for policy_configured in (True, False):
+            for state in ("active", "drained", "disabled"):
+                for label, value in (("missing", None), ("malformed", "none"), ("nonzero", "1")):
+                    with self.subTest(policy_configured=policy_configured, state=state, value=label):
+                        rendered = self._rendered_with_policy()
+                        if not policy_configured:
+                            rendered = {
+                                key: item
+                                for key, item in rendered.items()
+                                if not key.startswith("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_")
+                                and key not in {"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"}
+                            }
+                        rendered["CI_FLEET_CONTROLLER_STATE"] = state
+                        rendered["CI_FLEET_MAX_RUNNERS"] = "1" if state == "active" else "0"
+                        if value is None:
+                            rendered.pop("CI_FLEET_MIN_RUNNERS")
+                        else:
+                            rendered["CI_FLEET_MIN_RUNNERS"] = value
+                        self._assert_raw_candidate_rejected_before_operational_side_effects(
+                            rendered,
+                            f"minimum-{policy_configured}-{state}-{label}",
+                        )
+
+    def test_rejects_raw_capacity_budget_before_operational_side_effects(self) -> None:
+        for policy_configured in (True, False):
+            for state in ("active", "drained", "disabled"):
+                for label, value in (("missing", None), ("malformed", "none"), ("zero", "0"), ("negative", "-1")):
+                    with self.subTest(policy_configured=policy_configured, state=state, value=label):
+                        rendered = self._rendered_with_policy()
+                        if not policy_configured:
+                            rendered = {
+                                key: item
+                                for key, item in rendered.items()
+                                if not key.startswith("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_")
+                                and key not in {"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"}
+                            }
+                        rendered["CI_FLEET_CONTROLLER_STATE"] = state
+                        rendered["CI_FLEET_MAX_RUNNERS"] = "1" if state == "active" else "0"
+                        if value is None:
+                            rendered.pop("CI_FLEET_CAPACITY_BUDGET")
+                        else:
+                            rendered["CI_FLEET_CAPACITY_BUDGET"] = value
+                        self._assert_raw_candidate_rejected_before_operational_side_effects(
+                            rendered,
+                            f"budget-{policy_configured}-{state}-{label}",
+                        )
+            for state in ("active", "drained"):
+                with self.subTest(policy_configured=policy_configured, state=state, value="over-budget"):
+                    rendered = self._rendered_with_policy()
+                    if not policy_configured:
+                        rendered = {
+                            key: item
+                            for key, item in rendered.items()
+                            if not key.startswith("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_")
+                            and key not in {"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"}
+                        }
+                    rendered["CI_FLEET_CONTROLLER_STATE"] = state
+                    rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"] = "3"
+                    rendered["CI_FLEET_MAX_RUNNERS"] = "3" if state == "active" else "0"
+                    rendered["CI_FLEET_CAPACITY_BUDGET"] = "2"
+                    self._assert_raw_candidate_rejected_before_operational_side_effects(
+                        rendered,
+                        f"budget-{policy_configured}-{state}-over-budget",
+                    )
+
+    def test_rejects_raw_disabled_nonpositive_configured_maximum_before_operational_side_effects(self) -> None:
+        for policy_configured in (True, False):
+            for label, value in (("missing", None), ("malformed", "none"), ("zero", "0"), ("negative", "-1")):
+                with self.subTest(policy_configured=policy_configured, value=label):
+                    rendered = self._rendered_with_policy()
+                    if not policy_configured:
+                        rendered = {
+                            key: item
+                            for key, item in rendered.items()
+                            if not key.startswith("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_")
+                            and key not in {"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"}
+                        }
+                    rendered["CI_FLEET_CONTROLLER_STATE"] = "disabled"
+                    if value is None:
+                        rendered.pop("CI_FLEET_CONFIGURED_MAX_RUNNERS")
+                    else:
+                        rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"] = value
+                    rendered["CI_FLEET_MAX_RUNNERS"] = "0"
+                    self._assert_raw_candidate_rejected_before_operational_side_effects(
+                        rendered,
+                        f"disabled-configured-maximum-{policy_configured}-{label}",
+                    )
 
     def test_rejects_untrusted_transaction_temp_parent(self) -> None:
         self._write_daemon("{}\n")
@@ -3277,6 +3395,10 @@ class ApplyScriptTests(unittest.TestCase):
             encoding="utf-8",
         )
         state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
         command_markers = []
         for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
             marker = Path(self.tmp) / f"interrupted-before-rename-{name}.marker"
@@ -3291,6 +3413,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
         self.assertFalse(state_file.exists())
+        self.assertFalse(recovery.exists())
         self.assertFalse(daemon.exists())
         self.assertEqual(
             [marker.name for marker in command_markers if marker.exists()],
@@ -3557,6 +3680,36 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("network-policy checkpoint state is invalid", removed.stderr)
         self.assertEqual(daemon.read_bytes(), managed)
         self.assertFalse(any(marker.exists() for marker in command_markers))
+
+    def test_removal_rejects_malformed_current_managed_pools_before_checkpoint_or_commands(self) -> None:
+        for label, pools in (("malformed-entry", [{"base": "not-a-cidr", "size": 29}]), ("null", None)):
+            with self.subTest(pools=label):
+                daemon = self._write_daemon("{}\n")
+                checkpoint = Path(self.tmp) / f"checkpoint-malformed-current-managed-pools-{label}"
+                self._write_success_commands()
+                policy_env = self._write_env_file(self._rendered_with_policy())
+                applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                state_file = checkpoint / "docker-network-policy.json"
+                managed_state = state_file.read_bytes()
+                malformed = json.dumps({"default-address-pools": pools, "live-restore": True}).encode()
+                daemon.write_bytes(malformed)
+                command_markers = []
+                for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
+                    marker = Path(self.tmp) / f"malformed-current-managed-pools-{label}-{name}.marker"
+                    command_markers.append(marker)
+                    command = Path(self.tmp) / name
+                    command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+                    command.chmod(0o755)
+                no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+                removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+                self.assertNotEqual(removed.returncode, 0)
+                self.assertIn("managed daemon.json is not a valid JSON object", removed.stderr)
+                self.assertEqual(state_file.read_bytes(), managed_state)
+                self.assertEqual(daemon.read_bytes(), malformed)
+                self.assertFalse(any(marker.exists() for marker in command_markers))
 
     def test_removal_rejects_malformed_pending_pools_before_commands_or_mutation(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -4031,6 +4184,92 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "resume", "health"])
         self.assertFalse(state_file.exists())
+
+    def test_successful_removal_clears_recovery_before_marker_and_allows_next_reconciliation(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-recovery-cleanup"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        recovery = checkpoint / "recovery.stale"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
+        audit_log = Path(self.tmp) / "removal-recovery-cleanup.log"
+        audit_dir = Path(self.tmp) / "removal-recovery-cleanup-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, shutil\n"
+            "_unlink = os.unlink\n"
+            "_rmtree = shutil.rmtree\n"
+            "_log = os.environ['CLEANUP_AUDIT_LOG']\n"
+            "def record(value):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle: handle.write(value + '\\n')\n"
+            "def unlink(path, *args, **kwargs):\n"
+            "    if os.path.realpath(path) == os.environ['STATE_FILE']: record('marker')\n"
+            "    return _unlink(path, *args, **kwargs)\n"
+            "def rmtree(path, *args, **kwargs):\n"
+            "    if os.path.realpath(path) == os.environ['RECOVERY_DIR']: record('recovery')\n"
+            "    return _rmtree(path, *args, **kwargs)\n"
+            "os.unlink = unlink\n"
+            "shutil.rmtree = rmtree\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PYTHONPATH=str(audit_dir),
+                CLEANUP_AUDIT_LOG=str(audit_log),
+                STATE_FILE=str(state_file),
+                RECOVERY_DIR=str(recovery),
+            ),
+            timeout=30,
+        )
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(audit_log.read_text(encoding="utf-8").splitlines(), ["recovery", "marker"])
+        self.assertFalse(recovery.exists())
+        reconciled = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(reconciled.stdout, "NETWORK_POLICY_NOOP\n")
+
+    def test_removal_recovery_cleanup_failure_rolls_back_and_keeps_marker_usable(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-recovery-cleanup-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        recovery = checkpoint / "recovery.invalid"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
+        (recovery / "unexpected").write_text("invalid\n", encoding="utf-8")
+        (recovery / "unexpected").chmod(0o600)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("failed to clear obsolete network-policy recovery data", removed.stderr)
+        self.assertEqual(daemon.read_bytes(), managed)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertTrue(state["managed"])
+        self.assertNotIn("phase", state)
+        self.assertTrue(recovery.exists())
+        shutil.rmtree(recovery)
+        retried = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(retried.stdout, "NETWORK_POLICY_REMOVED\n")
 
     def test_successful_removal_fsyncs_checkpoint_after_marker_unlink(self) -> None:
         self._write_daemon("{}\n")
