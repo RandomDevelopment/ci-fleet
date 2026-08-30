@@ -333,10 +333,12 @@ fi
 # --- Ownership guard (relaxed in testing) ---
 daemon_mode=644
 daemon_gid=0
+daemon_metadata=
 [[ "$testing" != 1 ]] || daemon_gid=$(id -g)
 if [[ -f "$daemon_config" ]]; then
   daemon_mode=$(stat -c %a "$daemon_config")
   daemon_gid=$(stat -c %g "$daemon_config")
+  daemon_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
 fi
 if [[ "$testing" != 1 ]]; then
   [[ -w "$(dirname "$daemon_config")" ]] || die "daemon config directory is not writable: $(dirname "$daemon_config")"
@@ -382,12 +384,41 @@ PY
 }
 
 daemon_changed_since_snapshot() {
-  local snapshot=$1 was_present=$2
+  local snapshot=$1 was_present=$2 expected_metadata=${3:-}
   if [[ "$was_present" == true ]]; then
-    if cmp -s "$snapshot" "$daemon_config"; then
-      return 1
-    fi
-    return 0
+    python3 - "$snapshot" "$daemon_config" "$expected_metadata" <<'PY'
+import os, stat, sys
+snapshot_path, daemon_path, expected = sys.argv[1:]
+try:
+    device, inode, uid, mode, gid = expected.split(":")
+    expected_metadata = (int(device), int(inode), int(uid), int(mode, 8), int(gid))
+    fd = os.open(daemon_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with open(snapshot_path, "rb") as snapshot, os.fdopen(fd, "rb") as daemon:
+        before = os.fstat(daemon.fileno())
+        metadata = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            stat.S_IMODE(before.st_mode),
+            before.st_gid,
+        )
+        same = metadata == expected_metadata and snapshot.read() == daemon.read()
+        after = os.fstat(daemon.fileno())
+        stable = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_uid,
+            stat.S_IMODE(value.st_mode),
+            value.st_gid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        same = same and stable(before) == stable(after)
+except (OSError, ValueError):
+    same = False
+raise SystemExit(1 if same else 0)
+PY
   else
     [[ -e "$daemon_config" || -L "$daemon_config" ]]
   fi
@@ -617,11 +648,12 @@ PY
   }
   managed_mode=$(stat -c %a "$daemon_config")
   managed_gid=$(stat -c %g "$daemon_config")
+  managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
   managed_snapshot=$work_dir/daemon.json.before
   cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
 
   drain_controller 'drain command failed before network-policy removal'
-  if daemon_changed_since_snapshot "$managed_snapshot" true; then
+  if daemon_changed_since_snapshot "$managed_snapshot" true "$managed_metadata"; then
     drain_failure='daemon.json changed during network-policy removal'
     exit 2
   fi
@@ -775,6 +807,8 @@ PY
 managed_before=false
 prior_verified_generation=
 apply_removal_pending=false
+checkpoint_prior_present=
+checkpoint_prior_mode=
 if [[ -e "$state_file" ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
   apply_checkpoint_state=$(
@@ -804,6 +838,11 @@ if not isinstance(state["prior_default_address_pools_present"], bool):
     raise SystemExit(1)
 if state["prior_default_address_pools_present"] and not state["prior_present"]:
     raise SystemExit(1)
+if state["prior_default_address_pools_present"]:
+    validate_docker_address_pools(
+        state["prior_default_address_pools"],
+        path="checkpoint prior default address pools",
+    )
 if not state["prior_default_address_pools_present"] and state["prior_default_address_pools"] is not None:
     raise SystemExit(1)
 if state["prior_present"]:
@@ -811,10 +850,13 @@ if state["prior_present"]:
         raise SystemExit(1)
 elif state["prior_mode"] is not None:
     raise SystemExit(1)
-print(f"{generation or ''}|{'true' if is_pending else 'false'}")
+print(
+    f"{generation or ''}|{'true' if is_pending else 'false'}|"
+    f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}"
+)
 PY
   ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  IFS='|' read -r prior_verified_generation apply_removal_pending <<<"$apply_checkpoint_state"
+  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode <<<"$apply_checkpoint_state"
   managed_before=true
 fi
 
@@ -844,10 +886,29 @@ if [[ -f "$daemon_config" ]]; then
   had_prior=true
   cp -p "$daemon_config" "$backup_dir/$backup_name"
 fi
+rollback_source=$backup_dir/$backup_name
+if [[ "$managed_before" == true && -z "$prior_verified_generation" ]]; then
+  rollback_source=$work_dir/daemon.json.durable-baseline
+  python3 - "$daemon_config" "$state_file" "$rollback_source" <<'PY' || { rm -rf "$work_dir"; die 'failed to construct durable rollback baseline'; }
+import json, os, sys
+current_path, state_path, output_path = sys.argv[1:]
+current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
+state = json.load(open(state_path, encoding="utf-8"))
+if state["prior_default_address_pools_present"]:
+    current["default-address-pools"] = state["prior_default_address_pools"]
+else:
+    current.pop("default-address-pools", None)
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(current, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  had_prior=$checkpoint_prior_present
+  [[ "$had_prior" != true ]] || daemon_mode=$checkpoint_prior_mode
+fi
 
 restore_daemon() {
   local rollback_daemon=$work_dir/daemon.json.apply-rollback rollback_action
-  rollback_action=$(python3 - "$daemon_config" "$backup_dir/$backup_name" "$had_prior" "$rollback_daemon" "$staging_daemon" <<'PY'
+  rollback_action=$(python3 - "$daemon_config" "$rollback_source" "$had_prior" "$rollback_daemon" "$staging_daemon" <<'PY'
 import json, os, sys
 current_path, prior_path, had_prior, output_path, staged_path = sys.argv[1:]
 try:
@@ -877,7 +938,7 @@ else:
 PY
   ) || return 1
   if [[ "$rollback_action" == exact ]]; then
-    atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
+    atomic_replace_daemon "$rollback_source" "$daemon_mode" "$daemon_gid"
   elif [[ "$rollback_action" == replace ]]; then
     atomic_replace_daemon "$rollback_daemon" "$daemon_mode" "$daemon_gid"
   else
@@ -935,7 +996,7 @@ PY
 fi
 if [[ "$managed_before" == true ]]; then
   recovery_daemon=
-  [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
+  [[ "$had_prior" != true ]] || recovery_daemon=$rollback_source
   transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
 fi
 
@@ -979,7 +1040,7 @@ rollback_on_exit() {
       recovery_path=$transaction_recovery
     else
       recovery_daemon=
-      [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
+      [[ "$had_prior" != true ]] || recovery_daemon=$rollback_source
       recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
         printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
         exit "$status"
@@ -993,7 +1054,7 @@ rollback_on_exit() {
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 drain_controller 'drain command failed before network-policy apply'
-if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior"; then
+if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior" "$daemon_metadata"; then
   drain_failure='daemon.json changed during network-policy apply'
   exit 2
 fi

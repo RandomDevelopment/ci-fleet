@@ -601,6 +601,29 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), changed)
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
 
+    def test_daemon_metadata_change_during_drain_aborts(self) -> None:
+        for field, command in (("mode", "chmod 600"), ("group", "chgrp 1")):
+            with self.subTest(field=field):
+                daemon = self._write_daemon('{"bip":"172.17.0.1/16"}\n')
+                daemon.chmod(0o644)
+                os.chown(daemon, -1, 0)
+                checkpoint = Path(self.tmp) / f"checkpoint-daemon-{field}-conflict"
+                self.drain_command.write_text(
+                    f"#!/usr/bin/env bash\n{command} {daemon}\n",
+                    encoding="utf-8",
+                )
+                self._write_success_commands()
+                env_file = self._write_env_file(self._rendered_with_policy())
+
+                result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "ERROR: daemon.json changed during network-policy apply\n")
+                if field == "mode":
+                    self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
+                else:
+                    self.assertEqual(daemon.stat().st_gid, 1)
+
     def test_failed_managed_reapply_restores_prior_verified_generation(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-reapply-generation"
@@ -667,6 +690,40 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
         self.assertIsNone(state["verified_generation"])
+
+    def test_failed_unverified_retry_restores_durable_baseline(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps({
+            "default-address-pools": render_docker_daemon_config(rendered)["default-address-pools"],
+            "live-restore": True,
+        }))
+        checkpoint = Path(self.tmp) / "checkpoint-unverified-retry"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": "600",
+                "prior_present": True,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        candidate = dict(rendered)
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        env_file = self._write_env_file(candidate)
+        self._write_success_commands()
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"live-restore": True})
 
     def test_policy_apply_requires_checkpoint_before_drain_or_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
@@ -856,6 +913,35 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
+        self.assertFalse(drain_marker.exists())
+
+    def test_reapply_rejects_invalid_baseline_pools_before_drain(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        checkpoint = Path(self.tmp) / "checkpoint-invalid-reapply-baseline"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": [],
+                "prior_default_address_pools_present": True,
+                "prior_mode": "600",
+                "prior_present": True,
+                "verified_generation": hashlib.sha256(daemon.read_bytes()).hexdigest(),
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        drain_marker = Path(self.tmp) / "invalid-reapply-baseline-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self._write_success_commands()
+        env_file = self._write_env_file(rendered)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertFalse(drain_marker.exists())
 
     def test_policy_reapply_fails_closed_when_managed_key_provenance_is_missing(self) -> None:
