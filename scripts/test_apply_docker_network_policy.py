@@ -3507,6 +3507,34 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("phase", resumed_state)
         self.assertNotIn("removal_managed_default_address_pools", resumed_state)
 
+    def test_failed_configured_apply_from_removal_pending_restores_managed_pools(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-removal-pending-apply-rollback"
+        self._write_success_commands()
+        policy_a = self._rendered_with_policy()
+        env_a = self._write_env_file(policy_a)
+        applied = self._run(str(env_a), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        managed_pools = json.loads(managed)["default-address-pools"]
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = managed_pools
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        policy_b = dict(policy_a)
+        policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        env_b = self._write_env_file(policy_b)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+
+        retried = self._run(str(env_b), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(retried.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+
     def test_configured_apply_rejects_invalid_removal_pending_pools_before_drain(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-invalid-removal-pending-apply"
@@ -3851,6 +3879,46 @@ class ApplyScriptTests(unittest.TestCase):
         no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
 
         removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertTrue(state_file.exists())
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"], managed_pools)
+
+    def test_removal_restores_marker_if_managed_key_reappears_during_marker_clear(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-marker-clear-conflict"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        audit_dir = Path(self.tmp) / "marker-clear-conflict-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import json, os\n"
+            "_unlink = os.unlink\n"
+            "def unlink(path, *args, **kwargs):\n"
+            "    result = _unlink(path, *args, **kwargs)\n"
+            "    if os.path.realpath(path) == os.environ['STATE_FILE']:\n"
+            "        daemon = os.environ['DAEMON']\n"
+            "        value = json.load(open(daemon, encoding='utf-8'))\n"
+            "        value['default-address-pools'] = [{'base': '192.0.2.0/24', 'size': 29}]\n"
+            "        with open(daemon, 'w', encoding='utf-8') as handle: json.dump(value, handle)\n"
+            "    return result\n"
+            "os.unlink = unlink\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir), STATE_FILE=str(state_file), DAEMON=str(daemon)),
+            timeout=30,
+        )
 
         self.assertNotEqual(removed.returncode, 0)
         self.assertTrue(state_file.exists())

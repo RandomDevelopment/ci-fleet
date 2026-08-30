@@ -490,10 +490,11 @@ PY
 }
 
 clear_managed_marker() {
+  local expected_daemon=${1:-}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" <<'PY'
-import os, shutil, sys, tempfile
-path = sys.argv[1]
+  python3 - "$state_file" "$expected_daemon" "$daemon_config" <<'PY'
+import json, os, shutil, sys, tempfile
+path, expected_path, daemon_path = sys.argv[1:]
 parent = os.path.dirname(path)
 fd, backup = tempfile.mkstemp(prefix=".docker-network-policy.clear.", dir=parent)
 try:
@@ -508,9 +509,25 @@ try:
         os.unlink(path)
         try:
             os.fsync(directory_fd)
+            if expected_path:
+                try:
+                    current = json.load(open(daemon_path, encoding="utf-8")) if os.path.exists(daemon_path) else {}
+                    expected = json.load(open(expected_path, encoding="utf-8")) if os.path.exists(expected_path) else {}
+                    missing = object()
+                    if (
+                        not isinstance(current, dict)
+                        or not isinstance(expected, dict)
+                        or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
+                    ):
+                        raise ValueError
+                except (OSError, json.JSONDecodeError, ValueError):
+                    os.replace(backup, path)
+                    os.fsync(directory_fd)
+                    raise
         except OSError:
-            os.replace(backup, path)
-            os.fsync(directory_fd)
+            if os.path.exists(backup):
+                os.replace(backup, path)
+                os.fsync(directory_fd)
             raise
     finally:
         os.close(directory_fd)
@@ -658,7 +675,7 @@ PY
     run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
-    clear_managed_marker || die 'failed to clear interrupted network-policy marker'
+    clear_managed_marker "$work_dir/daemon.json.removal" || die 'failed to clear interrupted network-policy marker'
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_REMOVED\n'
     exit 0
@@ -837,7 +854,7 @@ if (
 ):
     raise SystemExit(1)
 PY
-  if ! clear_managed_marker; then
+  if ! clear_managed_marker "$removal_daemon"; then
     removal_failure='failed to clear network-policy managed marker'
     exit 2
   fi
@@ -992,7 +1009,11 @@ import json, os, sys
 current_path, state_path, output_path = sys.argv[1:]
 current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
 state = json.load(open(state_path, encoding="utf-8"))
-if state["prior_default_address_pools_present"]:
+if state.get("phase") == "removal-pending" and state["removal_managed_default_address_pools"] is not None:
+    current["default-address-pools"] = state["removal_managed_default_address_pools"]
+elif state.get("phase") == "removal-pending":
+    current.pop("default-address-pools", None)
+elif state["prior_default_address_pools_present"]:
     current["default-address-pools"] = state["prior_default_address_pools"]
 else:
     current.pop("default-address-pools", None)
