@@ -85,6 +85,8 @@ printf '? "include":\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-flee
 if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'explicit-key Compose include was accepted'; fi
 printf "? 'include':\n  - path: /etc/passwd\nservices: {}\n" >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
 if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'single-quoted explicit-key Compose include was accepted'; fi
+printf '%s\n' '? "incl\u0075de"' ': [{path: /etc/passwd, env_file: /etc/passwd}]' 'services: {}' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
+if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include >/dev/null 2>&1; then fail 'escaped explicit-key Compose include was accepted'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
