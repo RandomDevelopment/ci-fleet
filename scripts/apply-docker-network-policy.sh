@@ -235,7 +235,7 @@ validate_command() {
 }
 
 run_command() {
-  timeout --kill-after=5 "$command_timeout" "$@" >/dev/null 2>&1
+  timeout --kill-after=5 "$command_timeout" "$@" 9>&- >/dev/null 2>&1
 }
 
 run_health() {
@@ -934,7 +934,9 @@ PY
   new_marker=true
 fi
 if [[ "$managed_before" == true ]]; then
-  transaction_recovery=$(persist_recovery "$backup_dir/$backup_name" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+  recovery_daemon=
+  [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
+  transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
 fi
 
 rollback_daemon() {

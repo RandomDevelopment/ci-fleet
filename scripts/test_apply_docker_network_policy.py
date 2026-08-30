@@ -625,6 +625,26 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"], prior_generation)
         self.assertEqual(hashlib.sha256(daemon.read_bytes()).hexdigest(), prior_generation)
 
+    def test_managed_reapply_recovers_when_daemon_snapshot_is_absent(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-reapply-absent-daemon"
+        self._write_success_commands()
+        prior_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(prior_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(prior_env.read_bytes())
+        daemon.unlink()
+        candidate = self._rendered_with_policy()
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = Path(self.tmp) / "candidate-reapply-absent-daemon.env"
+        candidate_env.write_text("".join(f"{key}={value}\n" for key, value in sorted(candidate.items())), encoding="utf-8")
+
+        result = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(daemon.is_file())
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
     def test_failed_managed_reapply_leaves_generation_unverified_when_rollback_health_fails(self) -> None:
         self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-failed-rollback-generation"
@@ -1449,6 +1469,43 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
         self.assertFalse(checkpoint.exists())
+
+    def test_hook_descendants_do_not_retain_installer_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        lock = Path(self.tmp) / "hook-descendant.lock"
+        child_pid = Path(self.tmp) / "hook-descendant.pid"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            "sleep 30 &\n"
+            f"printf '%s\\n' \"$!\" > {child_pid}\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-hook-descendant"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid = int(child_pid.read_text(encoding="utf-8"))
+        try:
+            with lock.open("w") as lock_handle:
+                try:
+                    fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except BlockingIOError:
+                    acquired = False
+            self.assertTrue(acquired)
+        finally:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def test_removal_noop_requires_installer_lock(self) -> None:
         self._write_daemon("{}\n")
