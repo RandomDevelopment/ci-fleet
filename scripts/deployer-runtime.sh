@@ -79,11 +79,15 @@ deploy_exit() {
   # An adapter that deletes its own consumption marker must not defeat replay
   # protection; restore the durable marker rather than clearing audit_pending.
   if [[ ${audit_pending:-0} == 1 && -n ${consumed_marker:-} && ! -e "$consumed_marker" ]]; then
-    [[ ! -e "$consumed_root" && ! -L "$consumed_root" ]] || secure_directory "$consumed_root" 'consumed request directory'
-    [[ -e "$consumed_root" ]] || install -d -m 0700 "$consumed_root" 2>/dev/null || true
-    install -m 0600 /dev/null "$consumed_marker" 2>/dev/null || true
-    sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || status=1
-    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || status=1
+    if [[ -e "$consumed_root" || -L "$consumed_root" ]] && [[ ! -d "$consumed_root" || -L "$consumed_root" || $(stat -c '%u:%a' "$consumed_root" 2>/dev/null) != "$expected_uid:700" ]]; then
+      rm -rf -- "$consumed_root" 2>/dev/null || status=1
+    fi
+    [[ -e "$consumed_root" ]] || install -d -m 0700 "$consumed_root" 2>/dev/null || status=1
+    if [[ -d "$consumed_root" && ! -L "$consumed_root" ]]; then
+      install -m 0600 /dev/null "$consumed_marker" 2>/dev/null || status=1
+      sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || status=1
+      sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || status=1
+    fi
   fi
   if [[ ${audit_pending:-0} == 1 ]]; then
     # If the adapter replaced the audit log, restore the durable prefix copy

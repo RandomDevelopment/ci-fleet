@@ -1702,6 +1702,25 @@ cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
 
+# Recovery must normalize an adapter-drifted consumption directory without
+# aborting the EXIT handler before audit and active-marker cleanup.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=consumed-mode-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:05:52Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+printf 'deploy\n' >"$tmp/fail-after-consumed-mode"
+FAKE_ADAPTER_CHMOD_DURING=$root/var/lib/ci-fleet-deployer/consumed-requests \
+FAKE_ADAPTER_DELETE_CONSUMED_GLOB="$root/var/lib/ci-fleet-deployer/consumed-requests/*" \
+FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-consumed-mode \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+[[ ! -e "$active" ]] || fail 'consumption-directory drift skipped active marker cleanup'
+[[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/consumed-requests") == 700 ]] || fail 'consumption-directory drift was not repaired'
+grep -Fq 'approval=consumed-mode-attempt' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumption-directory drift skipped terminal audit'
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
 # A failing adapter cannot leave recovery state or the audit log with unsafe metadata.
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
