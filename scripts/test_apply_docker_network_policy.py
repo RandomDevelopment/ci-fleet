@@ -405,7 +405,7 @@ class ApplyScriptTests(unittest.TestCase):
         python = fake_bin / "python3"
         python.write_text(
             "#!/usr/bin/env bash\n"
-            f"[[ ${{2:-}} != {checkpoint}/docker-network-policy.json ]] || exit 1\n"
+            "[[ ${2:-} != /proc/self/fd/*/docker-network-policy.json ]] || exit 1\n"
             f"exec {shutil.which('python3')} \"$@\"\n",
             encoding="utf-8",
         )
@@ -481,6 +481,116 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
 
+    def test_creates_and_validates_checkpoint_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-before-drain"
+        drain_marker = Path(self.tmp) / "checkpoint-before-drain.marker"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"[[ -d {checkpoint} && ! -L {checkpoint} ]] || exit 1\n"
+            f"touch {drain_marker}\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(drain_marker.exists())
+        self.assertEqual(checkpoint.stat().st_mode & 0o777, 0o700)
+
+    def test_checkpoint_swap_between_check_and_state_write_does_not_redirect_state(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-check-use-race"
+        displaced = Path(self.tmp) / "checkpoint-check-use-original"
+        attacker = Path(self.tmp) / "checkpoint-check-use-attacker"
+        attacker.mkdir(mode=0o700)
+        audit_dir = Path(self.tmp) / "checkpoint-race-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, tempfile\n"
+            "_mkstemp = tempfile.mkstemp\n"
+            "_replace = os.replace\n"
+            "def mkstemp(*args, **kwargs):\n"
+            "    if kwargs.get('prefix') == '.docker-network-policy.' and not os.path.exists(os.environ['SWAP_DONE']):\n"
+            "        open(os.environ['SWAP_DONE'], 'w').close()\n"
+            "        os.rename(os.environ['CHECKPOINT'], os.environ['DISPLACED'])\n"
+            "        os.symlink(os.environ['ATTACKER'], os.environ['CHECKPOINT'])\n"
+            "    return _mkstemp(*args, **kwargs)\n"
+            "def replace(source, target):\n"
+            "    if target.endswith('/docker-network-policy.json') and os.path.realpath(os.path.dirname(target)) == os.environ['ATTACKER']:\n"
+            "        open(os.environ['RACE_MARKER'], 'w').close()\n"
+            "    return _replace(source, target)\n"
+            "tempfile.mkstemp = mkstemp\n"
+            "os.replace = replace\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PYTHONPATH=str(audit_dir),
+                CHECKPOINT=str(checkpoint),
+                DISPLACED=str(displaced),
+                ATTACKER=str(attacker),
+                SWAP_DONE=str(Path(self.tmp) / "checkpoint-swap.done"),
+                RACE_MARKER=str(Path(self.tmp) / "checkpoint-race.marker"),
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((Path(self.tmp) / "checkpoint-race.marker").exists())
+        self.assertFalse((attacker / "docker-network-policy.json").exists())
+
+    def test_checkpoint_symlink_swap_does_not_redirect_state(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-symlink-race"
+        attacker = Path(self.tmp) / "attacker-checkpoint"
+        attacker.mkdir(mode=0o700)
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"rm -rf {checkpoint}\n"
+            f"ln -s {attacker} {checkpoint}\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((attacker / "docker-network-policy.json").exists())
+
+    def test_rejects_checkpoint_below_group_writable_parent_before_drain(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        self._write_success_commands()
+        parent = Path(self.tmp) / "writable-checkpoint-parent"
+        parent.mkdir(mode=0o777)
+        parent.chmod(0o777)
+        checkpoint = parent / "checkpoint"
+        drain_marker = Path(self.tmp) / "writable-checkpoint-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertEqual(daemon.read_text(encoding="utf-8"), "{}\n")
+        self.assertFalse(drain_marker.exists())
+
     def test_rejects_unsafe_preexisting_checkpoint_before_drain(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "unsafe-checkpoint"
@@ -493,7 +603,7 @@ class ApplyScriptTests(unittest.TestCase):
         result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkpoint directory must be owned by root with mode 0700", result.stderr)
+        self.assertIn("checkpoint directory must be a trusted root-owned path", result.stderr)
         self.assertEqual(daemon.read_text(encoding="utf-8"), "{}\n")
         self.assertFalse(drain_marker.exists())
 
@@ -585,6 +695,170 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_rejects_relative_daemon_config_before_lock(self) -> None:
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-relative-daemon"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                CI_FLEET_DOCKER_DAEMON_CONFIG="relative/daemon.json",
+                CI_FLEET_INSTALLER_LOCK=str(lock),
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_rejects_fifo_daemon_config_before_lock(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        os.mkfifo(daemon)
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+        writer = subprocess.Popen(["bash", "-c", 'printf "{}\\n" >"$1"', "fifo-writer", str(daemon)])
+        self.addCleanup(writer.kill)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-fifo-daemon"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+        if writer.poll() is None:
+            writer.terminate()
+        writer.wait(timeout=5)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_rejects_group_writable_daemon_file_before_lock(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        daemon.chmod(0o664)
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-writable-daemon"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_rejects_group_writable_daemon_directory_before_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        self.daemon_dir.chmod(0o775)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-writable-directory"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_rejects_hook_below_group_writable_parent_before_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        hook_dir = Path(self.tmp) / "writable-hook-parent"
+        hook_dir.mkdir(mode=0o777)
+        hook_dir.chmod(0o777)
+        hook = hook_dir / "drain.sh"
+        hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-writable-hook-parent"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                CI_FLEET_DOCKER_DRAIN_COMMAND=str(hook),
+                CI_FLEET_INSTALLER_LOCK=str(lock),
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_rejects_group_writable_injected_hook_before_lock(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        self.drain_command.chmod(0o775)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-writable-hook"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(lock.exists())
 
     def test_injected_hooks_require_absolute_canonical_regular_executables(self) -> None:
         env_file = self._write_env_file(self._rendered_with_policy())
@@ -1336,7 +1610,7 @@ class ApplyScriptTests(unittest.TestCase):
             "    return _fsync(fd)\n"
             "def replace(source, target):\n"
             "    with open(_log, 'a', encoding='utf-8') as handle:\n"
-            "        handle.write(f'R {source} {target}\\n')\n"
+            "        handle.write(f'R {os.path.realpath(source)} {os.path.realpath(target)}\\n')\n"
             "    return _replace(source, target)\n"
             "os.fsync = fsync\n"
             "os.replace = replace\n",
@@ -1951,7 +2225,7 @@ class ApplyScriptTests(unittest.TestCase):
         fake_rm = fake_bin / "rm"
         fake_rm.write_text(
             "#!/usr/bin/env bash\n"
-            f"[[ ${{*: -1}} != {state_file} ]] || exit 1\n"
+            "[[ ${*: -1} != /proc/self/fd/*/docker-network-policy.json ]] || exit 1\n"
             f"exec {shutil.which('rm')} \"$@\"\n",
             encoding="utf-8",
         )

@@ -77,8 +77,7 @@ env_file=$work_dir/ci-fleet.env
 count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
 removing=false
 if [[ -z "$count" || "$count" == "0" ]]; then
-  state_file=${checkpoint_dir:+$checkpoint_dir/docker-network-policy.json}
-  if [[ -z "$state_file" || ! -e "$state_file" ]]; then
+  if [[ -z "$checkpoint_dir" ]]; then
     printf 'NETWORK_POLICY_NOOP\n'
     exit 0
   fi
@@ -96,12 +95,80 @@ probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 
+validate_trusted_path() {
+  local name=$1 path=$2 kind=$3 allow_absent=${4:-false} create=${5:-false}
+  python3 - "$path" "$kind" "$allow_absent" "$create" "$testing" "${CI_FLEET_ROOT_PREFIX:-}" <<'PY' ||
+import errno, os, stat, sys
+
+path, kind, allow_absent, create, testing, root_prefix = sys.argv[1:]
+expected_owner = os.getuid() if testing == "1" else 0
+anchor = os.path.realpath(root_prefix) if testing == "1" and root_prefix else "/"
+try:
+    if not path.startswith("/") or os.path.normpath(path) != path or os.path.realpath(path) != path:
+        raise ValueError
+    if os.path.commonpath((anchor, path)) != anchor:
+        raise ValueError
+    metadata = os.lstat(path)
+    exists = True
+except FileNotFoundError:
+    if allow_absent != "true":
+        raise SystemExit(1)
+    exists = False
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+if exists:
+    if kind == "executable" and (not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK)):
+        raise SystemExit(1)
+    if kind == "regular" and not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(1)
+    if kind == "checkpoint" and (not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700):
+        raise SystemExit(1)
+current = os.path.dirname(path)
+
+while True:
+    try:
+        metadata = os.lstat(current)
+    except OSError:
+        raise SystemExit(1)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
+        raise SystemExit(1)
+    if current == anchor:
+        break
+    current = os.path.dirname(current)
+
+if exists:
+    metadata = os.lstat(path)
+    if metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
+        raise SystemExit(1)
+elif create == "true":
+    parent, leaf = os.path.split(path)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+        fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            metadata = os.fstat(fd)
+            if metadata.st_uid != expected_owner or stat.S_IMODE(metadata.st_mode) != 0o700:
+                raise OSError
+        finally:
+            os.close(fd)
+    except OSError:
+        raise SystemExit(1)
+    finally:
+        os.close(parent_fd)
+PY
+    die "$name must be a trusted root-owned path"
+}
+
 validate_command() {
-  local name=$1 path=$2 canonical
+  local name=$1 path=$2
   [[ -n "$path" ]] || die "$name is required when network policy is managed"
-  [[ "$path" == /* && -f "$path" && ! -L "$path" && -x "$path" ]] || die "$name must be an absolute canonical regular executable path"
-  canonical=$(readlink -f -- "$path") || die "$name must be an absolute canonical regular executable path"
-  [[ "$path" == "$canonical" ]] || die "$name must be an absolute canonical regular executable path"
+  validate_trusted_path "$name" "$path" executable
 }
 
 run_command() {
@@ -116,6 +183,13 @@ run_health() {
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
+validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
+validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true
+checkpoint_state=$checkpoint_dir/docker-network-policy.json
+if [[ "$removing" == true && ( ! -e "$checkpoint_dir" || ! -e "$checkpoint_state" ) ]]; then
+  printf 'NETWORK_POLICY_NOOP\n'
+  exit 0
+fi
 validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
 validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
 validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
@@ -134,6 +208,14 @@ else
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
 
+validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true true
+exec 8<"$checkpoint_dir"
+checkpoint_path_is_pinned() {
+  [[ ! -L "$checkpoint_dir" && $(readlink -f /proc/self/fd/8) == "$checkpoint_dir" ]]
+}
+checkpoint_path_is_pinned || die 'checkpoint directory must remain a trusted root-owned path'
+state_file=/proc/self/fd/8/docker-network-policy.json
+
 # Snapshot the installer's authoritative pre-transaction environment while
 # holding its lock. Rollback must not validate against the rejected candidate.
 installed_env=${CI_FLEET_ROOT_PREFIX:-}/etc/ci-fleet/ci-fleet.env
@@ -146,17 +228,12 @@ install -m 0600 -- "$installed_env" "$prior_env"
 
 checkpoint_owner=0
 [[ "$testing" != 1 ]] || checkpoint_owner=$(id -u)
-if [[ -e "$checkpoint_dir" || -L "$checkpoint_dir" ]]; then
-  [[ -d "$checkpoint_dir" && ! -L "$checkpoint_dir" && $(stat -c %u "$checkpoint_dir") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_dir") == 700 ]] ||
-    die "checkpoint directory must be owned by root with mode 0700: $checkpoint_dir"
-  checkpoint_file=$checkpoint_dir/docker-network-policy.json
-  if [[ -e "$checkpoint_file" || -L "$checkpoint_file" ]]; then
-    [[ -f "$checkpoint_file" && ! -L "$checkpoint_file" && $(stat -c %u "$checkpoint_file") == "$checkpoint_owner" && $(stat -c %a "$checkpoint_file") == 600 ]] ||
-      die "checkpoint files must be owned by root with mode 0600: $checkpoint_file"
-  fi
-  [[ ! -e "$checkpoint_dir/daemon.json" && ! -L "$checkpoint_dir/daemon.json" ]] ||
-    die 'network-policy checkpoint state is invalid'
+if [[ -e "$state_file" || -L "$state_file" ]]; then
+  [[ -f "$state_file" && ! -L "$state_file" && $(stat -c %u "$state_file") == "$checkpoint_owner" && $(stat -c %a "$state_file") == 600 ]] ||
+    die "checkpoint files must be owned by root with mode 0600: $checkpoint_dir/docker-network-policy.json"
 fi
+[[ ! -e "/proc/self/fd/8/daemon.json" && ! -L "/proc/self/fd/8/daemon.json" ]] ||
+  die 'network-policy checkpoint state is invalid'
 
 [[ ! -L "$daemon_config" ]] || die "daemon.json must not be a symlink: $daemon_config"
 
@@ -212,6 +289,7 @@ PY
 }
 
 set_verified_generation() {
+  checkpoint_path_is_pinned || return 1
   python3 - "$state_file" "${1:-}" <<'PY'
 import json, os, sys, tempfile
 path, generation = sys.argv[1:]
@@ -309,6 +387,7 @@ PY
     rm -rf "$work_dir"
     die 'drain command failed before network-policy removal'
   fi
+  checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
 
   removal_failure='network-policy removal interrupted'
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
@@ -386,6 +465,7 @@ PY
   # Marker deletion commits removal. Ignore catchable signals across the atomic
   # unlink so failure still rolls back and success cannot leave a stale marker.
   trap '' INT TERM
+  checkpoint_path_is_pinned || { removal_failure='checkpoint directory changed during network-policy removal'; exit 2; }
   if ! rm -f "$state_file"; then
     removal_failure='failed to clear network-policy managed marker'
     exit 2
@@ -443,7 +523,6 @@ with open(staging_path, "w", encoding="utf-8") as handle:
 os.chmod(staging_path, 0o644)
 PY
 
-state_file=$checkpoint_dir/docker-network-policy.json
 managed_before=false
 prior_verified_generation=
 if [[ -e "$state_file" ]]; then
@@ -544,6 +623,7 @@ if ! run_command "$drain_command"; then
   rm -rf "$work_dir"
   die "drain command failed before network-policy apply"
 fi
+checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy apply'
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap rollback_on_exit EXIT
@@ -551,7 +631,6 @@ trap rollback_on_exit EXIT
 # Record the original host state before the first managed mutation. Re-applying
 # policy keeps this baseline and uses the temp copy above for transaction rollback.
 if [[ "$managed_before" == false ]]; then
-  install -d -m 0700 "$checkpoint_dir"
   python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
 path = sys.argv[1]
