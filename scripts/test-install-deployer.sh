@@ -128,6 +128,7 @@ if [[ -n ${FAKE_ADAPTER_REPLACE_PATH:-} && -e $FAKE_ADAPTER_REPLACE_PATH ]]; the
   chmod 0700 "$FAKE_ADAPTER_REPLACE_PATH"
 fi
 if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
+if [[ "$1" == validate && -n ${FAKE_ADAPTER_MUTATE_CONFIG_DURING_VALIDATE:-} ]]; then printf '# adapter mutation\n' >>"$CI_FLEET_DEPLOYER_CONFIG"; fi
 if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
   ((health_calls <= FAKE_ADAPTER_FAIL_HEALTH_AFTER)) || exit 42
@@ -737,6 +738,11 @@ printf 'validate\n' >"$FAKE_ADAPTER_FAIL"
 expect_failure 'candidate adapter validation failed' "$installer" --upgrade --config "$config" >/dev/null
 [[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed candidate replaced healthy state'
 rm "$FAKE_ADAPTER_FAIL"; unset FAKE_ADAPTER_FAIL
+
+export FAKE_ADAPTER_MUTATE_CONFIG_DURING_VALIDATE=1
+expect_failure 'candidate policy changed during adapter validation' "$installer" --upgrade --config "$config" >/dev/null
+unset FAKE_ADAPTER_MUTATE_CONFIG_DURING_VALIDATE
+[[ "$old_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'validation-mutated candidate replaced healthy state'
 
 chmod 0644 "$credential"
 expect_failure 'credential file must be owner-only mode 0600' "$installer" --upgrade --config "$config" >/dev/null

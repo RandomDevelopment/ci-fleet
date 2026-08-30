@@ -1165,7 +1165,10 @@ PY
   fi
   reject_mixed_role
   credential_reference_safe "${cfg[CREDENTIAL_PROVIDER]}" "${cfg[CREDENTIAL_REF]}" 'candidate policy'
+  candidate_policy_sha=$(sha256sum "$config" | cut -d' ' -f1)
   run_verified_adapter "$config" "${cfg[ADAPTER_PATH]}" "${cfg[ADAPTER_SHA256]}" validate >/dev/null || die 'candidate adapter validation failed'
+  secure_file "$config" 'candidate policy snapshot'
+  [[ $(sha256sum "$config" | cut -d' ' -f1) == "$candidate_policy_sha" ]] || die 'candidate policy changed during adapter validation'
   install_release
   secure_directory "$state_root" 700 1
   secure_directory "$log_root" 700 1
