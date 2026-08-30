@@ -73,7 +73,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas lifecycle-hook gpu deploy-device build profiles label-file; do
+for policy in mutable privileged bind broad-port external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas lifecycle-hook gpu deploy-device build profiles label-file runtime; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
 done
@@ -91,6 +91,9 @@ if FAKE_TESTER_ROUTE_PORT=18091 "$runtime" --converge --environment bad-include 
 write_environment bad-source-label 18092
 printf 'services:\n  web:\n    label_file: /root/credential.env\n' >"$root/etc/ci-fleet-tester/definitions/bad-source-label.yaml"
 if FAKE_TESTER_ROUTE_PORT=18092 "$runtime" --converge --environment bad-source-label >/dev/null 2>&1; then fail 'source Compose label_file was accepted before rendering'; fi
+write_environment bad-tagged-label 18093
+printf 'services:\n  web:\n    !<tag:yaml.org,2002:str> label_file: /root/credential.env\n' >"$root/etc/ci-fleet-tester/definitions/bad-tagged-label.yaml"
+if FAKE_TESTER_ROUTE_PORT=18093 "$runtime" --converge --environment bad-tagged-label >/dev/null 2>&1; then fail 'verbatim-tagged Compose label_file was accepted before rendering'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi

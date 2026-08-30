@@ -113,7 +113,7 @@ validate_compose() {
   if ! python3 - "$compose_file" <<'PY'
 import re,sys
 text=open(sys.argv[1],encoding='utf-8').read()
-key=r'(?:!!str[ \t]+)?(?:include|label_file|"(?:include|label_file)"|\x27(?:include|label_file)\x27)[ \t]*:'
+key=r'(?:(?:!!str|!<[^>\n]+>)[ \t]+)?(?:include|label_file|"(?:include|label_file)"|\x27(?:include|label_file)\x27)[ \t]*:'
 explicit_key=r'(?m)^[ \t]*\?'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
 if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text): raise SystemExit('Compose include, label_file, or escaped mapping key is forbidden')
@@ -133,7 +133,7 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')

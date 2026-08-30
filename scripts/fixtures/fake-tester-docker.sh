@@ -58,6 +58,7 @@ case ${operation:-} in
       interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
       profiles) service_extra=',"profiles":["extra"]' ;;
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
+      runtime) service_extra=',"runtime":"alternative"' ;;
       valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
