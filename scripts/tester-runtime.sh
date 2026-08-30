@@ -114,7 +114,7 @@ validate_compose() {
 import re,sys
 text=open(sys.argv[1],encoding='utf-8').read()
 key=r'(?:!!str[ \t]+)?(?:include|"include"|\x27include\x27)[ \t]*:'
-explicit_key=r'(?m)^[ \t]*\?[ \t]*(?:include|"include"|\x27include\x27)[ \t]*:?$'
+explicit_key=r'(?m)^[ \t]*\?'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
 if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text): raise SystemExit('Compose include or escaped mapping key is forbidden')
 PY
