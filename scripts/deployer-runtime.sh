@@ -38,6 +38,26 @@ restore_encoded_file() {
   chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
   mv -Tf "$temporary" "$destination"
 }
+publish_deployed_backup() {
+  local pointer
+  if [[ ! -d "$deployed_root" || -L "$deployed_root" || $(stat -c '%u:%a' "$deployed_root" 2>/dev/null) != "$expected_uid:700" ]]; then
+    rm -rf -- "$deployed_root"
+    install -d -m 0700 "$deployed_root" || return
+  fi
+  rm -rf -- "$snapshot"
+  install -d -m 0700 "$snapshot" || return
+  restore_encoded_file "$snapshot/policy.conf" "$snapshot_policy_backup" || return
+  restore_encoded_file "$snapshot/state.json" "$snapshot_state_backup" || return
+  pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
+  snapshot_pointer=$pointer
+  ln -s "${snapshot##*/}" "$pointer" || return
+  sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || return
+  sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || return
+  mv -Tf "$pointer" "$deployed_current" || return
+  sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || return
+  snapshot_pointer=$deployed_current
+  snapshot=
+}
 if [[ $operation == deploy && -z ${CI_FLEET_DEPLOYER_INHIBITED:-} ]]; then
   export CI_FLEET_DEPLOYER_INHIBITED=1
   [[ $testing != 1 || -z ${CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG:-} ]] || printf '%s\n' deploy >>"$CI_FLEET_DEPLOYER_TEST_INHIBITOR_LOG"
@@ -96,11 +116,14 @@ deploy_exit() {
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
 
   fi
+  if [[ ${application_changed:-0} == 1 && ${snapshot_pointer:-} != "$deployed_current" ]]; then
+    publish_deployed_backup 2>/dev/null || { rm -f -- "$deployed_current"; status=1; }
+  fi
   # On failure, restore the validated incumbent deployed pointer before the
   # active-operation guard is durably cleared — but only when the new pointer
   # was never published. After publication the new pointer is the truth: the
   # application has changed and restoring the incumbent would falsify state.
-  if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
+  if [[ ${audit_pending:-0} == 1 && ${application_changed:-0} != 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     # Restore the incumbent snapshot content from process memory when the
     # adapter deleted its writable state root.
     if [[ -n ${incumbent_policy_backup:-} && -n ${incumbent_state_backup:-} && $state_root_safe == 1 ]]; then
@@ -532,27 +555,12 @@ PY
     if ((adapter_status == 0)); then
       adapter_status=
       audit_phase=post-adapter
+      application_changed=1
       # The application has changed. Rebuild the prepared state from the
       # protected in-memory copy and publish it before any later check can fail.
       trap '' INT TERM
-      if [[ ! -d "$deployed_root" || -L "$deployed_root" || $(stat -c '%u:%a' "$deployed_root" 2>/dev/null) != "$expected_uid:700" ]]; then
-        rm -rf -- "$deployed_root"
-        install -d -m 0700 "$deployed_root"
-      fi
       restore_encoded_file "$request_snapshot" "$request_snapshot_backup" || die 'deployment request snapshot restoration failed'
-      rm -rf -- "$snapshot"
-      install -d -m 0700 "$snapshot"
-      restore_encoded_file "$snapshot/policy.conf" "$snapshot_policy_backup" || die 'prepared deployed policy restoration failed'
-      restore_encoded_file "$snapshot/state.json" "$snapshot_state_backup" || die 'prepared deployed state restoration failed'
-      pointer=$(mktemp -u "$deployed_root/.current.XXXXXX")
-      snapshot_pointer=$pointer
-      ln -s "${snapshot##*/}" "$pointer"
-      sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || die 'prepared deployed snapshot is not durable'
-      sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || die 'prepared deployed snapshot is not durable'
-      mv -Tf "$pointer" "$deployed_current"
-      sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable'
-      snapshot_pointer=$deployed_current
-      snapshot=
+      publish_deployed_backup || die 'prepared deployed snapshot publication failed'
     fi
     # An in-place truncation keeps the same inode; the durable prefix must survive.
     if [[ $(sha256sum "$audit_log" | cut -d' ' -f1) != "$audit_prefix_sha" ]]; then

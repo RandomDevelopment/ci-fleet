@@ -23,13 +23,34 @@ transaction_dir=
 transaction_preparing=0
 transaction_committed=0
 recovered_rollback=0
+backup_transaction() {
+  local path relative
+  rollback_transaction_backup=
+  shopt -s nullglob
+  for path in "$transaction_dir"/* "$transaction_dir"/units/* "$transaction_dir"/state/*; do
+    [[ -f "$path" && ! -L "$path" ]] || continue
+    relative=${path#"$transaction_dir"/}
+    rollback_transaction_backup+="$relative|$(base64 -w0 "$path")"$'\n'
+  done
+  shopt -u nullglob
+}
+restore_transaction_backup() {
+  local relative encoded destination
+  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" || return
+  while IFS='|' read -r relative encoded; do
+    [[ -n "$relative" ]] || continue
+    [[ "$relative" =~ ^(units|state)/[A-Za-z0-9._-]+$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    destination=$transaction_dir/$relative
+    printf '%s' "$encoded" | base64 -d >"$destination" || return
+    chmod 0600 "$destination" || return
+  done <<<"$rollback_transaction_backup"
+}
 on_exit() {
   local status=$? recovery_status=0
   if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ! -d $transaction_dir ]]; then
     if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root"; fi
     if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
-      install -d -m 0700 "$transaction_dir"
-      cp -a "$rollback_transaction_backup/." "$transaction_dir/"
+      restore_transaction_backup
     fi
   fi
   if [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
@@ -48,7 +69,7 @@ on_exit() {
   [[ -z ${checkout_snapshot:-} ]] || rm -rf -- "$checkout_snapshot"
   [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
   [[ -z ${policy_check_snapshot:-} ]] || rm -f -- "$policy_check_snapshot"
-  [[ -z ${rollback_transaction_backup:-} ]] || rm -rf -- "$rollback_transaction_backup"
+
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
   return "$status"
 }
@@ -1266,9 +1287,7 @@ PY
   sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
-  rollback_transaction_backup=$(mktemp -d)
-  chmod 0700 "$rollback_transaction_backup"
-  cp -a "$transaction_dir/." "$rollback_transaction_backup/"
+  backup_transaction
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.
