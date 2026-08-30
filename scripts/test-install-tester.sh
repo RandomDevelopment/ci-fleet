@@ -27,6 +27,7 @@ cat >"$fake_bin/systemctl" <<'EOF'
 printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
+if [[ ${FAKE_TESTER_SYSTEMCTL_REQUIRE_NO_BLOCK:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 6; fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/curl"
@@ -163,7 +164,7 @@ symlink_ref=$(git -C "$symlink_repo" rev-parse HEAD)
 if "$symlink_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$symlink_ref" >/dev/null 2>&1; then fail 'install accepted a release archive with a symlinked member'; fi
 [[ $(stat -c %a "$host_target") == 640 ]] || fail 'release validation dereferenced an archive symlink'
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
-"$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'fresh install failed'
+FAKE_TESTER_SYSTEMCTL_REQUIRE_NO_BLOCK=1 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'activation waited for lock-blocked maintenance services'
 rm -rf "$root/run/lock/ci-fleet-tester"
 "$root/opt/ci-fleet-tester/tester-runtime" --health >/dev/null || fail 'stable launcher did not recreate the volatile lock directory'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'current release link is wrong'
@@ -231,7 +232,7 @@ unit_hash_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.se
 if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >"$tmp/unit-restore.log" 2>&1; then fail 'unit activation failure succeeded'; fi
 grep -Fq 'incumbent unit restore failed' "$tmp/unit-restore.log" || fail 'secondary incumbent restore failure was not surfaced'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" && $(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service") == "$unit_hash_before" ]] || fail 'unit activation failure did not restore incumbent release and units'
-if FAKE_TESTER_SYSTEMCTL_FAIL='start ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'candidate activation did not exercise maintenance services'; fi
+if FAKE_TESTER_SYSTEMCTL_FAIL='start --no-block ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'candidate activation did not exercise maintenance services'; fi
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'maintenance service failure did not restore incumbent release'
 
 # A corrupt incumbent is never recorded as the rollback target.

@@ -151,7 +151,7 @@ create_tmpfiles() {
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
-start_maintenance() { systemctl start ci-fleet-tester-health.service ci-fleet-tester-cleanup.service >/dev/null; }
+start_maintenance() { systemctl start --no-block ci-fleet-tester-health.service ci-fleet-tester-cleanup.service >/dev/null; }
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
