@@ -120,9 +120,7 @@ validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
 validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
 validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
 validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
-if [[ "$removing" == false ]]; then
-  validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
-fi
+validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
 
 # Serialize with installer mutations using the installer's host-local lock.
 lock_file=${CI_FLEET_INSTALLER_LOCK:-${CI_FLEET_ROOT_PREFIX:-}/run/ci-fleet-installer.lock}
@@ -381,6 +379,7 @@ PY
     cmp -s "$removal_daemon" "$daemon_config" || { removal_failure='failed to verify prior network-policy key state'; exit 2; }
   fi
   run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
+  run_command "$probe_command" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   run_command "$resume_command" --env "$env_file" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
   run_health "$env_file" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 

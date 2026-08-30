@@ -1686,6 +1686,38 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), json.loads(prior))
         self.assertEqual(daemon.stat().st_mode & 0o777, 0o640)
 
+    def test_removal_probe_failure_rolls_back_before_resume_health_or_marker_clear(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-probe-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = state_file.read_bytes()
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        command_log = Path(self.tmp) / "removal-probe-failure.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text(f"#!/usr/bin/env bash\necho probe >> {command_log}\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertEqual(state_file.read_bytes(), state)
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "restart", "resume", "health"],
+        )
+
     def test_successful_removal_restarts_resumes_then_checks_health(self) -> None:
         self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-resume"
@@ -1747,7 +1779,7 @@ class ApplyScriptTests(unittest.TestCase):
 
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
-                self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain.sh", "restart.sh", "health.sh"])
+                self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain.sh", "restart.sh", "probe.sh", "health.sh"])
                 self.assertEqual(daemon.exists(), prior_present)
                 if prior_present:
                     self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), json.loads(prior))
