@@ -48,6 +48,8 @@ export FAKE_TESTER_EVENT_LOG=$tmp/events.log
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
   if grep -q '^ConditionPathExists=/etc/ci-fleet-tester/tester.env$' "$repo_root/host/systemd/$service"; then fail "$service silently skips missing configuration"; fi
 done
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "$repo_root/host/systemd/ci-fleet-tester-health.service" || fail 'health service blocks required network probe sockets'
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX' "$repo_root/host/systemd/ci-fleet-tester-cleanup.service" || fail 'cleanup service permits network sockets'
 
 standalone_installer=$tmp/install-tester.sh
 cp "$installer" "$standalone_installer"
