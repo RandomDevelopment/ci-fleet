@@ -25,6 +25,13 @@ transaction_committed=0
 recovered_rollback=0
 on_exit() {
   local status=$? recovery_status=0
+  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ! -d $transaction_dir ]]; then
+    if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root"; fi
+    if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
+      install -d -m 0700 "$transaction_dir"
+      cp -a "$rollback_transaction_backup/." "$transaction_dir/"
+    fi
+  fi
   if [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
     rm -rf -- "$transaction_dir"
     transaction_dir=
@@ -41,6 +48,7 @@ on_exit() {
   [[ -z ${checkout_snapshot:-} ]] || rm -rf -- "$checkout_snapshot"
   [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
   [[ -z ${policy_check_snapshot:-} ]] || rm -f -- "$policy_check_snapshot"
+  [[ -z ${rollback_transaction_backup:-} ]] || rm -rf -- "$rollback_transaction_backup"
   if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
   return "$status"
 }
@@ -425,6 +433,9 @@ require_maintenance_host() {
 
 reject_mixed_role() {
   local unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}" runner_unit
+  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || block 'status receiver state is present'
+  done
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
     [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
@@ -1255,6 +1266,9 @@ PY
   sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
+  rollback_transaction_backup=$(mktemp -d)
+  chmod 0700 "$rollback_transaction_backup"
+  cp -a "$transaction_dir/." "$rollback_transaction_backup/"
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.

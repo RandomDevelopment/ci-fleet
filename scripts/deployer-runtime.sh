@@ -31,7 +31,7 @@ systemd_root=$(root_path /etc/systemd/system)
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 restore_encoded_file() {
   local destination=$1 encoded=$2 temporary
-  temporary=$(mktemp "$state_root/.restore.XXXXXX") || return
+  temporary=$(mktemp "$(dirname "$destination")/.restore.XXXXXX") || return
   printf '%s' "$encoded" | base64 -d >"$temporary" || { rm -f "$temporary"; return 1; }
   chown "$expected_uid" "$temporary" || { rm -f "$temporary"; return 1; }
   chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
@@ -74,8 +74,8 @@ deploy_exit() {
     fi
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
       rm -f -- "$audit_log"
-      if [[ -n ${audit_prefix_copy:-} && -f $audit_prefix_copy ]]; then
-        cat "$audit_prefix_copy" >"$audit_log" 2>/dev/null || status=1
+      if [[ -n ${audit_prefix_backup:-} ]]; then
+        restore_encoded_file "$audit_log" "$audit_prefix_backup" 2>/dev/null || status=1
       else
         cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
       fi
@@ -93,28 +93,26 @@ deploy_exit() {
         "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
     fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
-    [[ -z ${audit_prefix_copy:-} ]] || rm -f "$audit_prefix_copy"
+
   fi
   # On failure, restore the validated incumbent deployed pointer before the
   # active-operation guard is durably cleared — but only when the new pointer
   # was never published. After publication the new pointer is the truth: the
   # application has changed and restoring the incumbent would falsify state.
   if [[ ${audit_pending:-0} == 1 && -n ${incumbent_pointer:-} && ${snapshot_pointer:-} != "$deployed_current" ]]; then
-    # Restore the incumbent snapshot content when the adapter deleted it.
-    if [[ -n ${incumbent_backup:-} ]]; then
+    # Restore the incumbent snapshot content from process memory when the
+    # adapter deleted its writable state root.
+    if [[ -n ${incumbent_policy_backup:-} && -n ${incumbent_state_backup:-} && $state_root_safe == 1 ]]; then
+      if [[ ! -e "$deployed_root" && ! -L "$deployed_root" ]]; then install -d -m 0700 "$deployed_root" 2>/dev/null || status=1; fi
+      [[ -d "$deployed_root" && ! -L "$deployed_root" ]] || status=1
       if [[ -e "$deployed_root/$incumbent_pointer" || -L "$deployed_root/$incumbent_pointer" ]]; then
         [[ -d "$deployed_root/$incumbent_pointer" && ! -L "$deployed_root/$incumbent_pointer" ]] || { rm -rf -- "${deployed_root:?}/$incumbent_pointer"; mkdir -m 0700 "$deployed_root/$incumbent_pointer"; }
         chown "$expected_uid" "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
         chmod 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || status=1
       fi
-      for incumbent_file in policy.conf state.json; do
-        if [[ ! -f "$deployed_root/$incumbent_pointer/$incumbent_file" || -L "$deployed_root/$incumbent_pointer/$incumbent_file" ]] || ! cmp -s "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file"; then
-          mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
-          install -m 0600 "$incumbent_backup/$incumbent_file" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
-        fi
-        chown "$expected_uid" "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
-        chmod 0600 "$deployed_root/$incumbent_pointer/$incumbent_file" 2>/dev/null || status=1
-      done
+      mkdir -m 0700 "$deployed_root/$incumbent_pointer" 2>/dev/null || true
+      restore_encoded_file "$deployed_root/$incumbent_pointer/policy.conf" "$incumbent_policy_backup" 2>/dev/null || status=1
+      restore_encoded_file "$deployed_root/$incumbent_pointer/state.json" "$incumbent_state_backup" 2>/dev/null || status=1
     fi
     if [[ ! -L "$deployed_current" || $(readlink "$deployed_current") != "$incumbent_pointer" ]]; then
       rm -f -- "$deployed_current"
@@ -122,7 +120,7 @@ deploy_exit() {
       sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || status=1
     fi
   fi
-  [[ -z ${incumbent_backup:-} ]] || rm -rf -- "$incumbent_backup"
+
   if [[ ${lkg_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
     restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" 2>/dev/null || status=1
     restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" 2>/dev/null || status=1
@@ -160,6 +158,9 @@ secure_directory() {
 }
 reject_mixed_role() {
   local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || die 'status receiver state is present'
+  done
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
     [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
   done
@@ -313,6 +314,7 @@ case "$operation" in
     request_snapshot=$(mktemp "$state_root/.request.XXXXXX")
     install -m 0600 "$request" "$request_snapshot"
     request_snapshot_sha=$(sha256sum "$request_snapshot" | cut -d' ' -f1)
+    request_snapshot_backup=$(base64 -w0 "$request_snapshot")
     trap 'rm -f "${request_snapshot:-}" "${policy_snapshot:-}"' EXIT
     trap 'exit 2' INT TERM
     request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
@@ -468,8 +470,8 @@ PY
     chmod 0700 "$snapshot"
     install -m 0600 "$config" "$snapshot/policy.conf"
     install -m 0600 "$install_state" "$snapshot/state.json"
-    snapshot_policy_sha=$(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1)
-    snapshot_state_sha=$(sha256sum "$snapshot/state.json" | cut -d' ' -f1)
+    snapshot_policy_backup=$(base64 -w0 "$snapshot/policy.conf")
+    snapshot_state_backup=$(base64 -w0 "$snapshot/state.json")
     reject_mixed_role
     validate_credential
     audit_pending=1
@@ -500,8 +502,7 @@ PY
       >&8 || die 'deployment consumption audit record failed'
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
-    audit_prefix_copy=$(mktemp "$state_root/.audit-prefix.XXXXXX")
-    install -m 0600 "$audit_log" "$audit_prefix_copy"
+    audit_prefix_backup=$(base64 -w0 "$audit_log")
     # Preserve the retained rollback pair in unexported process memory. A
     # filesystem backup under the adapter-writable state root would be lost to
     # the same recursive cleanup as the retained files.
@@ -517,52 +518,57 @@ PY
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
     incumbent_pointer=$(readlink "$deployed_current")
-    incumbent_backup=$(mktemp -d "$state_root/.incumbent.XXXXXX")
-    install -m 0600 "$deployed_current/policy.conf" "$deployed_current/state.json" "$incumbent_backup/"
+    incumbent_policy_backup=$(base64 -w0 "$deployed_current/policy.conf")
+    incumbent_state_backup=$(base64 -w0 "$deployed_current/state.json")
     set +e
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
     adapter_status=$?
     set -e
+    if ((adapter_status == 0)); then
+      adapter_status=
+      audit_phase=post-adapter
+      # The application has changed. Rebuild the prepared state from the
+      # protected in-memory copy and publish it before any later check can fail.
+      trap '' INT TERM
+      if [[ ! -d "$deployed_root" || -L "$deployed_root" || $(stat -c '%u:%a' "$deployed_root" 2>/dev/null) != "$expected_uid:700" ]]; then
+        rm -rf -- "$deployed_root"
+        install -d -m 0700 "$deployed_root"
+      fi
+      restore_encoded_file "$request_snapshot" "$request_snapshot_backup" || die 'deployment request snapshot restoration failed'
+      rm -rf -- "$snapshot"
+      install -d -m 0700 "$snapshot"
+      restore_encoded_file "$snapshot/policy.conf" "$snapshot_policy_backup" || die 'prepared deployed policy restoration failed'
+      restore_encoded_file "$snapshot/state.json" "$snapshot_state_backup" || die 'prepared deployed state restoration failed'
+      pointer=$(mktemp -u "$deployed_root/.current.XXXXXX")
+      snapshot_pointer=$pointer
+      ln -s "${snapshot##*/}" "$pointer"
+      sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || die 'prepared deployed snapshot is not durable'
+      sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || die 'prepared deployed snapshot is not durable'
+      mv -Tf "$pointer" "$deployed_current"
+      sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable'
+      snapshot_pointer=$deployed_current
+      snapshot=
+    fi
     # An in-place truncation keeps the same inode; the durable prefix must survive.
     if [[ $(sha256sum "$audit_log" | cut -d' ' -f1) != "$audit_prefix_sha" ]]; then
-      install -m 0600 "$audit_prefix_copy" "$audit_log" 2>/dev/null || true
+      restore_encoded_file "$audit_log" "$audit_prefix_backup" 2>/dev/null || true
       die 'deployer audit log changed during deployment'
     fi
-    rm -f "$audit_prefix_copy"
     if ((adapter_status != 0)); then
       audit_phase=adapter
       die 'deployment adapter failed after approval consumption'
     fi
-    adapter_status=
-    audit_phase=post-adapter
-    # The adapter change is applied and the approval is consumed; a signal from
-    # here on must not abort before the new snapshot pointer is durable and the
-    # success audit record is written, or later rollback would use stale state.
-    trap '' INT TERM
     secure_directory "$deployed_root" 'deployed snapshot directory'
-    inside "$snapshot" "$deployed_root" || die 'prepared deployed snapshot escaped managed state'
-    secure_directory "$snapshot" 'prepared deployed snapshot'
-    secure_file "$snapshot/policy.conf" 'prepared deployed policy'
-    secure_file "$snapshot/state.json" 'prepared deployed state'
-    [[ $(sha256sum "$snapshot/policy.conf" | cut -d' ' -f1) == "$snapshot_policy_sha" && $(sha256sum "$snapshot/state.json" | cut -d' ' -f1) == "$snapshot_state_sha" ]] || die 'prepared deployed snapshot changed during deployment'
     # The adapter receives the request snapshot path; only verified bytes may
     # become the completed-request record.
     secure_file "$request_snapshot" 'deployment request snapshot'
     [[ $(sha256sum "$request_snapshot" | cut -d' ' -f1) == "$request_snapshot_sha" ]] || die 'deployment request snapshot changed during deployment'
-    pointer=$(mktemp -u "$deployed_root/.current.XXXXXX")
-    snapshot_pointer=$pointer
+
     # Retire the validated pre-adapter incumbent, never an adapter-writable
     # pointer target read after the adapter ran.
     retired_snapshot=$incumbent_pointer
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
-    ln -s "${snapshot##*/}" "$pointer"
     [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$
-    sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || die 'prepared deployed snapshot is not durable'
-    sync -f "$snapshot" 2>/dev/null || sync "$snapshot" 2>/dev/null || die 'prepared deployed snapshot is not durable'
-    mv -Tf "$pointer" "$deployed_current"
-    sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'deployed snapshot pointer is not durable'
-    snapshot_pointer=$deployed_current
-    snapshot=
     if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
     mv -Tf "$request_snapshot" "$last_request"
     request_snapshot=

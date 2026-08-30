@@ -142,9 +142,15 @@ if [[ "$1" == rollback && -n ${CI_FLEET_DEPLOYER_ROLLBACK_COMMIT:-} ]]; then
   install -m 0600 /dev/null "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_FAIL_AFTER_MARKER:-} ]]; then exit 42; fi
+if [[ "$1" == rollback && -n ${FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION:-} ]]; then
+  rm -rf -- "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")"
+  exit 42
+fi
 if [[ -n ${FAKE_ADAPTER_DELETE_CONSUMED_GLOB:-} ]]; then rm -rf $FAKE_ADAPTER_DELETE_CONSUMED_GLOB; fi
 if [[ -n ${FAKE_ADAPTER_MUTATE_AUDIT_PATH:-} ]]; then
-  if [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == unlink ]]; then
+  if [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == truncate ]]; then
+    : >"$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
+  elif [[ ${FAKE_ADAPTER_MUTATE_AUDIT_MODE:-symlink} == unlink ]]; then
     rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"; printf 'adapter-replacement\n' >"$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
   else
     rm -f "$FAKE_ADAPTER_MUTATE_AUDIT_PATH"
@@ -650,6 +656,9 @@ rm "$root/etc/systemd/system/ci-fleet-health.service"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-drift.timer"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-drift.timer"
+printf 'receiver\n' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
+expect_failure 'status receiver state is present' "$installer" --check --config "$config" >/dev/null
+rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
 expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
@@ -811,6 +820,9 @@ export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
 grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'failed application rollback did not restore current core state'
+
+FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION=1 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'adapter-deleted rollback journal did not restore current core state'
 
 # An adapter that commits the rollback marker but exits nonzero must not be
 # reported as an unchanged failure: recovery finalizes the committed rollback.
@@ -1577,6 +1589,26 @@ unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-adapter"
 grep -Fq 'approval=failed-adapter-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=adapter status=42' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'consumed failed deployment was not audited'
 rm -f "$root/var/lib/ci-fleet-deployer/last-request.conf"
 rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
+# A failing adapter can remove the writable state root without destroying the
+# incumbent deployed snapshot, including before an alternate rollback pair exists.
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=incumbent-state-delete-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:03:30Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+incumbent_target=$(readlink "$deployed_current")
+incumbent_policy_before=$(sha256sum "$deployed_current/policy.conf")
+incumbent_state_before=$(sha256sum "$deployed_current/state.json")
+printf 'deploy\n' >"$tmp/fail-after-incumbent-delete"
+FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-incumbent-delete \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+[[ $(readlink "$deployed_current") == "$incumbent_target" ]] || fail 'recursive state cleanup lost the incumbent pointer'
+[[ $incumbent_policy_before == "$(sha256sum "$deployed_current/policy.conf")" && $incumbent_state_before == "$(sha256sum "$deployed_current/state.json")" ]] || fail 'recursive state cleanup lost the incumbent snapshot'
+rm -rf "$root/var/lib/ci-fleet-deployer/consumed-requests"
+
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
@@ -1585,11 +1617,11 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 export FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT=$root/var/lib/ci-fleet-deployer/deployed
-expect_failure 'prepared deployed snapshot changed during deployment' "$runtime" deploy >/dev/null
+deployed_before_snapshot_mutation=$(readlink "$deployed_current")
+expect_success "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT
-grep -Fq 'approval=snapshot-mutation-attempt approver=example-reviewer policy=example-staging-policy-v1 checkpoint=checkpoint-20260808-1 authorized_by=none gate=none result=failed phase=post-adapter status=2' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'post-adapter deployment failure was not audited with its real status'
-[[ $(find "$root/var/lib/ci-fleet-deployer/deployed" -mindepth 1 -maxdepth 1 -name '.snapshot.*' -type d | wc -l) == 1 ]] || fail 'failed publication leaked an unreachable prepared snapshot'
-[[ -e "$deployed_current" ]] || fail 'failed publication dangled the deployed pointer'
+[[ $(readlink "$deployed_current") != "$deployed_before_snapshot_mutation" ]] || fail 'successful adapter snapshot mutation restored stale deployed state'
+cmp -s "$deployed_current/policy.conf" "$config" || fail 'protected prepared policy was not published after adapter mutation'
 
 # A signal while the adapter runs must remove only the unreachable prepared snapshot.
 write_evidence staging example-staging
@@ -1715,10 +1747,12 @@ import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=signal-at-publication-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:06:00Z'))
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
+deployed_before_audit_failure=$(readlink "$deployed_current")
 export FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_TARGET=$tmp/unrelated-audit
 expect_failure 'deployer audit log changed during deployment' "$runtime" deploy >/dev/null
 unset FAKE_ADAPTER_MUTATE_AUDIT_PATH FAKE_ADAPTER_MUTATE_AUDIT_TARGET
 [[ -L "$deployed_current" && -e "$deployed_current" && -f "$deployed_current/policy.conf" && -f "$deployed_current/state.json" ]] || fail 'post-publication failure left deployed/current dangling'
+[[ $(readlink "$deployed_current") != "$deployed_before_audit_failure" ]] || fail 'successful adapter failure restored stale deployed state'
 cmp -s "$deployed_current/policy.conf" "$config" || fail 'published deployed policy does not match the deployed configuration'
 rm "$root/var/log/ci-fleet-deployer/audit.log"
 write_evidence staging example-staging
@@ -1797,6 +1831,26 @@ unset FAKE_ADAPTER_DELETE_STATE_ROOT FAKE_ADAPTER_FAIL_AFTER_MUTATION
 compgen -G "$root/var/lib/ci-fleet-deployer/.lkg.*" >/dev/null && fail 'rollback backup remained inside adapter-writable state'
 rollback=$(expect_success "$installer" --rollback --config "$config")
 grep -Fq 'result=CHANGED' <<<"$rollback" || fail 'rollback after recursive state cleanup did not complete'
+
+# Audit history must survive even when a failing adapter truncates the open log
+# and removes every backup under its writable state root.
+expect_success "$installer" --repair --config "$config" >/dev/null
+write_evidence staging example-staging
+python3 - "$approval" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20260808-1', 'APPROVAL_ID=audit-state-delete-attempt').replace('APPROVED_AT=2026-08-08T20:00:00Z', 'APPROVED_AT=2026-08-08T20:07:30Z'))
+PY
+cp "$approval" "$request"; chmod 0600 "$request"
+audit_prefix_before=$(base64 -w0 "$root/var/log/ci-fleet-deployer/audit.log")
+printf 'deploy\n' >"$tmp/fail-after-audit-state-delete"
+FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_MODE=truncate \
+FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-audit-state-delete \
+  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+python3 - "$root/var/log/ci-fleet-deployer/audit.log" "$audit_prefix_before" <<'PY' || fail 'recursive state cleanup destroyed the protected audit prefix'
+import base64, pathlib, sys
+raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2])) else 1)
+PY
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"

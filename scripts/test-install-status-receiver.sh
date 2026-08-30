@@ -54,6 +54,20 @@ fi
 rm -rf "$root/opt/ci-fleet-status"
 mkdir -p "$root/etc/systemd/system"
 chmod 0750 "$root/etc/systemd/system"
+printf 'deployer\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "deployer role was accepted by the status receiver installer" >&2
+  exit 1
+fi
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+role_lock="$root/run/ci-fleet-role-admission.lock"
+exec 8>"$role_lock"
+flock -n 8
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "status receiver installation ignored the shared role lock" >&2
+  exit 1
+fi
+flock -u 8; exec 8>&-
 export CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE=$tmp/fail-reload-once
 : >"$CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE"
 if run --install --ref "$first" >/dev/null 2>&1; then
