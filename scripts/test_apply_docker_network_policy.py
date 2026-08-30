@@ -744,6 +744,34 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
 
+    def test_rejects_absent_daemon_config_in_checkpoint_before_lock_or_drain(self) -> None:
+        self.daemon_dir.chmod(0o700)
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        lock = Path(self.tmp) / "network-policy.lock"
+        drain_marker = Path(self.tmp) / "drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(self.daemon_dir),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("daemon config and checkpoint entry must be separate paths", result.stderr)
+        self.assertFalse((self.daemon_dir / "daemon.json").exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
+
     def test_rejects_relative_daemon_config_before_lock(self) -> None:
         self._write_success_commands()
         env_file = self._write_env_file(self._rendered_with_policy())

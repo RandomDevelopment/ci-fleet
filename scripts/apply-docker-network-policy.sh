@@ -196,6 +196,17 @@ validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
 validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
 validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
 
+checkpoint_path_is_pinned() {
+  [[ ! -L "$checkpoint_dir" && $(readlink -f /proc/self/fd/8) == "$checkpoint_dir" ]]
+}
+if [[ -d "$checkpoint_dir" ]]; then
+  exec 8<"$checkpoint_dir"
+  checkpoint_path_is_pinned || die 'checkpoint directory must remain a trusted root-owned path'
+  [[ $(readlink -m /proc/self/fd/8/daemon.json) != "$daemon_config" ]] ||
+    die 'daemon config and checkpoint entry must be separate paths'
+  exec 8<&-
+fi
+
 # Serialize with installer mutations using the installer's host-local lock.
 lock_file=${CI_FLEET_INSTALLER_LOCK:-${CI_FLEET_ROOT_PREFIX:-}/run/ci-fleet-installer.lock}
 if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
@@ -210,9 +221,6 @@ fi
 
 validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true true
 exec 8<"$checkpoint_dir"
-checkpoint_path_is_pinned() {
-  [[ ! -L "$checkpoint_dir" && $(readlink -f /proc/self/fd/8) == "$checkpoint_dir" ]]
-}
 checkpoint_path_is_pinned || die 'checkpoint directory must remain a trusted root-owned path'
 state_file=/proc/self/fd/8/docker-network-policy.json
 
