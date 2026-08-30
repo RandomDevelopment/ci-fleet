@@ -183,7 +183,7 @@ activate_release() {
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-  if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! "$target/scripts/tester-runtime.sh" --check || ! "$target/scripts/tester-runtime.sh" --health || ! enable_timers; then
+  if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! "$stable_launcher" --check || ! "$stable_launcher" --health || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
       if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; launcher and incumbent link retained for recovery'; fi
