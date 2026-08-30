@@ -336,6 +336,18 @@ with open(sys.argv[1], "rb") as handle:
 PY
 }
 
+daemon_changed_since_snapshot() {
+  local snapshot=$1 was_present=$2
+  if [[ "$was_present" == true ]]; then
+    if cmp -s "$snapshot" "$daemon_config"; then
+      return 1
+    fi
+    return 0
+  else
+    [[ -e "$daemon_config" || -L "$daemon_config" ]]
+  fi
+}
+
 set_verified_generation() {
   checkpoint_path_is_pinned || return 1
   python3 - "$state_file" "${1:-}" "${2:-}" <<'PY'
@@ -520,6 +532,10 @@ PY
   cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
 
   drain_controller 'drain command failed before network-policy removal'
+  if daemon_changed_since_snapshot "$managed_snapshot" true; then
+    drain_failure='daemon.json changed during network-policy removal'
+    exit 2
+  fi
   checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
 
   removal_failure='network-policy removal interrupted'
@@ -754,9 +770,7 @@ rollback_on_exit() {
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 drain_controller 'drain command failed before network-policy apply'
-if [[ "$had_prior" == true ]]; then
-  cmp -s "$backup_dir/$backup_name" "$daemon_config" || { drain_failure='daemon.json changed during network-policy apply'; exit 2; }
-elif [[ -e "$daemon_config" || -L "$daemon_config" ]]; then
+if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior"; then
   drain_failure='daemon.json changed during network-policy apply'
   exit 2
 fi

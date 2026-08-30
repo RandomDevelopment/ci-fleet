@@ -2141,6 +2141,49 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse(copy_marker.exists())
         self.assertFalse(any(marker.exists() for marker in command_markers))
 
+    def test_removal_daemon_change_during_drain_aborts_and_preserves_update(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-removal-daemon-conflict"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        prior_state = state_file.read_bytes()
+        changed = json.loads(daemon.read_text(encoding="utf-8"))
+        changed["log-level"] = "debug"
+        changed_bytes = json.dumps(changed).encode()
+        command_log = Path(self.tmp) / "removal-daemon-conflict.log"
+        mutator = Path(self.tmp) / "change-daemon-during-removal.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "path = sys.argv[1]\n"
+            "value = json.load(open(path))\n"
+            "value['log-level'] = 'debug'\n"
+            "with open(path, 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo drain >> {command_log}\n"
+            f"{shutil.which('python3')} {mutator} {daemon}\n",
+            encoding="utf-8",
+        )
+        for name in ("restart", "probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(removed.stderr, "ERROR: daemon.json changed during network-policy removal\n")
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume"])
+        self.assertEqual(daemon.read_bytes(), changed_bytes)
+        self.assertEqual(state_file.read_bytes(), prior_state)
+
     def test_removal_restores_prior_pools_and_preserves_current_unrelated_keys(self) -> None:
         prior_pools = [{"base": "192.0.2.0/24", "size": 28}]
         daemon = self._write_daemon(json.dumps({"default-address-pools": prior_pools, "icc": False}))
