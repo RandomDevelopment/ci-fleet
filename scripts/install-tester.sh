@@ -49,6 +49,7 @@ runtime_state=$state_root/environments
 docker_root=$(root_path /var/lib/docker)
 docker_socket=$(root_path /var/run/docker.sock)
 runtime_lock=$(root_path /run/lock/ci-fleet-tester/runtime.lock)
+lifecycle_lock=$(root_path /run/lock/ci-fleet-tester/lifecycle.lock)
 services=(ci-fleet-tester-health.service ci-fleet-tester-cleanup.service)
 timers=(ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer)
 units=("${services[@]}" "${timers[@]}")
@@ -68,6 +69,8 @@ reject_git_replacements() {
 acquire_lifecycle_lock() {
   mkdir -m 0755 "$(dirname "$runtime_lock")" 2>/dev/null || true
   secure_dir "$(dirname "$runtime_lock")" 755
+  exec 9>"$lifecycle_lock"
+  flock -x 9
   exec 8>"$runtime_lock"
   flock -x 8
   export CI_FLEET_TESTER_LOCK_FD=8
@@ -148,7 +151,7 @@ create_tmpfiles() {
   # the installed tmpfiles.d drop-in) so maintenance units work after a reboot.
   mkdir -m 0755 "$(dirname "$runtime_lock")" 2>/dev/null || true
   secure_dir "$(dirname "$runtime_lock")" 755
-  if command -v systemd-tmpfiles >/dev/null 2>&1; then systemd-tmpfiles --create "$tmpfiles_dir/$tmpfiles_conf" 2>/dev/null || true; fi
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then systemd-tmpfiles --create "$tmpfiles_dir/$tmpfiles_conf" 2>/dev/null; fi
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
@@ -242,7 +245,11 @@ case $action in
     release_complete "$release_dir/$current" "$current" || die 'installed release is incomplete'
     secure_file "$stable_launcher" 555
     cmp -s "$release_dir/$current/scripts/tester-launcher.sh" "$stable_launcher" || die 'installed launcher differs from active release'
-    for unit in "${units[@]}"; do cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"; done
+    for unit in "${units[@]}"; do
+      secure_file "$systemd_dir/$unit" 644
+      cmp -s "$release_dir/$current/host/systemd/$unit" "$systemd_dir/$unit" || die "installed unit differs from active release: $unit"
+    done
+    secure_file "$tmpfiles_dir/$tmpfiles_conf" 644
     cmp -s "$release_dir/$current/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf" || die 'installed tmpfiles rule differs from active release'
     for timer in "${timers[@]}"; do
       if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then die "timer is inactive: $timer"; fi
@@ -258,9 +265,7 @@ case $action in
   --rollback)
     ensure_directories; secure_file "$lkg_file" 600
     target=$(<"$lkg_file"); [[ $target =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good revision is invalid'
-    current=$(installed_revision || true)
     activate_release "$target"
-    [[ ! $current =~ ^[0-9a-f]{40}$ || $current == "$target" ]] || write_lkg "$current"
     report "ROLLBACK_OK source_revision=$target"
     ;;
   --uninstall)

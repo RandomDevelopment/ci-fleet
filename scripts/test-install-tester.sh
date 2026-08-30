@@ -28,11 +28,17 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
+if [[ -n ${FAKE_TESTER_SYSTEMCTL_WAIT_READY:-} && $1 == start && " $* " != *' --no-block '* ]]; then
+  touch "$FAKE_TESTER_SYSTEMCTL_WAIT_READY"
+  while [[ ! -e ${FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE:?} ]]; do sleep 0.05; done
+fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/curl"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/getent"
-chmod 0755 "$fake_bin/df" "$fake_bin/systemctl" "$fake_bin/curl" "$fake_bin/getent"
+# shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
+printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_TMPFILES_FAIL:-0} != 1 ]]' >"$fake_bin/systemd-tmpfiles"
+chmod 0755 "$fake_bin/df" "$fake_bin/systemctl" "$fake_bin/curl" "$fake_bin/getent" "$fake_bin/systemd-tmpfiles"
 export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
 export FAKE_TESTER_EVENT_LOG=$tmp/events.log
@@ -208,6 +214,13 @@ installed_tmpfiles=$root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf
 rm "$installed_tmpfiles"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing installed tmpfiles rule passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-lock.conf" "$installed_tmpfiles"
+unsafe_policy_accepted=0
+for policy_file in "$installed_unit" "$installed_tmpfiles"; do
+  chmod 0666 "$policy_file"
+  if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then unsafe_policy_accepted=1; fi
+  chmod 0644 "$policy_file"
+done
+((unsafe_policy_accepted == 0)) || fail 'writable installed systemd policy passed check'
 runtime_state=$root/var/lib/ci-fleet-tester/environments
 rmdir "$runtime_state"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing runtime state directory passed check'; fi
@@ -245,6 +258,8 @@ git -C "$upgrade_repo" show "$ref:scripts/tester-runtime.sh" >"$upgrade_repo/scr
 git -C "$upgrade_repo" add scripts/tester-runtime.sh
 git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: valid tester candidate'
 unit_fail_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
+if FAKE_TESTER_TMPFILES_FAIL=1 "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >/dev/null 2>&1; then fail 'tmpfiles creation failure succeeded'; fi
+[[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'tmpfiles creation failure did not restore incumbent release'
 unit_hash_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-tester-health.service")
 if FAKE_TESTER_SYSTEMCTL_FAIL=daemon-reload "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$unit_fail_ref" >"$tmp/unit-restore.log" 2>&1; then fail 'unit activation failure succeeded'; fi
 grep -Fq 'incumbent unit restore failed' "$tmp/unit-restore.log" || fail 'secondary incumbent restore failure was not surfaced'
@@ -271,6 +286,20 @@ check_line=$(grep -n '^docker info ' "$tmp/events.log" | tail -1 | cut -d: -f1)
 enable_line=$(grep -n '^systemctl enable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
 [[ -n $disable_line && -n $check_line && -n $enable_line && $disable_line -lt $check_line && $check_line -lt $enable_line ]] || fail 'timers were not quiesced until candidate validation completed'
 
+# Maintenance probes release the runtime lock but retain lifecycle serialization.
+probe_ready=$tmp/probe-ready
+probe_release=$tmp/probe-release
+FAKE_TESTER_SYSTEMCTL_WAIT_READY=$probe_ready FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE=$probe_release \
+  "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null & probe_pid=$!
+while [[ ! -e $probe_ready ]]; do kill -0 "$probe_pid" 2>/dev/null || fail 'maintenance probe fixture exited early'; done
+set +e
+timeout 2 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1
+probe_lock_rc=$?
+set -e
+touch "$probe_release"
+wait "$probe_pid"
+[[ $probe_lock_rc == 124 ]] || fail 'maintenance probe allowed another lifecycle action'
+
 # Rollback switches only to a complete recorded release and keeps environments intact.
 old=0000000000000000000000000000000000000000
 cp -a "$root/opt/ci-fleet-tester/releases/$ref" "$root/opt/ci-fleet-tester/releases/$old"
@@ -284,8 +313,13 @@ printf '%s\n' "$old" >"$root/var/lib/ci-fleet-tester/last-known-good"; chmod 600
 write_environment rollback-env 18086
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --converge --environment rollback-env >/dev/null
 rollback_state_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state")
+pre_rollback_release=$(readlink -f "$root/opt/ci-fleet-tester/current")
+chmod u+w "$pre_rollback_release/scripts/tester-runtime.sh"
+printf '# corrupt before rollback\n' >>"$pre_rollback_release/scripts/tester-runtime.sh"
+chmod 0555 "$pre_rollback_release/scripts/tester-runtime.sh"
 "$installer" --rollback --config /etc/ci-fleet-tester/tester.env | grep -Fq ROLLBACK_OK || fail 'rollback failed'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$old" ]] || fail 'rollback selected the wrong release'
+[[ $(<"$root/var/lib/ci-fleet-tester/last-known-good") == "$old" ]] || fail 'rollback recorded a corrupt prior release'
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state") == "$rollback_state_hash" ]] || fail 'rollback changed active environment state'
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --remove --environment rollback-env >/dev/null
 
