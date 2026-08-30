@@ -2070,6 +2070,122 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), json.loads(prior))
         self.assertEqual(daemon.stat().st_mode & 0o777, 0o640)
 
+    def test_interrupted_removal_retry_uses_persisted_managed_pools_for_rollback(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-removal"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = managed_pools
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.write_text('{"live-restore":true}\n', encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(
+            json.loads(daemon.read_text(encoding="utf-8")),
+            {"default-address-pools": managed_pools, "live-restore": True},
+        )
+        rolled_back_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", rolled_back_state)
+        self.assertNotIn("removal_managed_default_address_pools", rolled_back_state)
+
+    def test_removal_pending_state_is_durable_before_daemon_mutation(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-durable-removal-pending"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        state_file = checkpoint / "docker-network-policy.json"
+        audit_dir = Path(self.tmp) / "removal-pending-audit"
+        audit_dir.mkdir()
+        audit_log = Path(self.tmp) / "removal-pending.log"
+        (audit_dir / "sitecustomize.py").write_text(
+            "import json, os\n"
+            "_fsync = os.fsync\n"
+            "_replace = os.replace\n"
+            "_log = os.environ['AUDIT_LOG']\n"
+            "def record(value):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle: handle.write(value + '\\n')\n"
+            "def fsync(fd):\n"
+            "    record('F ' + os.path.realpath(f'/proc/self/fd/{fd}'))\n"
+            "    return _fsync(fd)\n"
+            "def replace(source, target):\n"
+            "    target = os.path.realpath(target)\n"
+            "    if target == os.environ['DAEMON']:\n"
+            "        state = json.load(open(os.environ['STATE'], encoding='utf-8'))\n"
+            "        assert state['phase'] == 'removal-pending'\n"
+            "        assert state['removal_managed_default_address_pools'] == json.loads(os.environ['POOLS'])\n"
+            "    record('R ' + target)\n"
+            "    return _replace(source, target)\n"
+            "os.fsync = fsync\n"
+            "os.replace = replace\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PYTHONPATH=str(audit_dir),
+                AUDIT_LOG=str(audit_log),
+                DAEMON=str(daemon),
+                STATE=str(state_file),
+                POOLS=json.dumps(managed_pools),
+            ),
+            timeout=30,
+        )
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        state_replace = events.index(f"R {state_file}")
+        daemon_replace = events.index(f"R {daemon}")
+        self.assertTrue(any(event.startswith("F ") and ".docker-network-policy." in event for event in events[:state_replace]))
+        self.assertIn(f"F {checkpoint}", events[state_replace + 1 : daemon_replace])
+
+    def test_uncertain_removal_rollback_retains_pending_state(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-uncertain-removal"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        restart_log = Path(self.tmp) / "uncertain-removal-restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "removal-pending")
+        self.assertEqual(state["removal_managed_default_address_pools"], managed_pools)
+
     def test_removal_probe_failure_rolls_back_before_resume_health_or_marker_clear(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-probe-failure"
@@ -2102,7 +2218,7 @@ class ApplyScriptTests(unittest.TestCase):
             ["drain", "restart", "probe", "restart", "resume", "health"],
         )
 
-    def test_successful_removal_restarts_resumes_then_checks_health(self) -> None:
+    def test_successful_removal_runs_runtime_checks_before_deleting_marker(self) -> None:
         self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-resume"
         self._write_success_commands()
@@ -2110,19 +2226,26 @@ class ApplyScriptTests(unittest.TestCase):
         applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
         no_policy_env = Path(self.tmp) / "no-policy-removal-resume.env"
         no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
         command_log = Path(self.tmp) / "removal-resume.log"
         self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
-        for name in ("restart", "resume", "health"):
+        for name in ("restart", "probe", "resume", "health"):
             command = Path(self.tmp) / f"{name}.sh"
-            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.write_text(
+                "#!/usr/bin/env bash\n"
+                f"grep -Fq '\"phase\": \"removal-pending\"' {state_file} || exit 2\n"
+                f"echo {name} >> {command_log}\n",
+                encoding="utf-8",
+            )
             command.chmod(0o755)
 
         removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
 
         self.assertEqual(removed.returncode, 0, removed.stderr)
-        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "health"])
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "resume", "health"])
+        self.assertFalse(state_file.exists())
 
     def test_managed_policy_removal_restores_original_state_and_clears_only_marker(self) -> None:
         for prior_present in (False, True):

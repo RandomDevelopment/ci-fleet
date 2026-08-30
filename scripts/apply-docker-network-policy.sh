@@ -315,11 +315,45 @@ PY
 
 set_verified_generation() {
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "${1:-}" <<'PY'
+  python3 - "$state_file" "${1:-}" "${2:-}" <<'PY'
 import json, os, sys, tempfile
-path, generation = sys.argv[1:]
+path, generation, action = sys.argv[1:]
 state = json.load(open(path, encoding="utf-8"))
+if action == "clear-removal":
+    state.pop("phase", None)
+    state.pop("removal_managed_default_address_pools", None)
 state["verified_generation"] = generation or None
+fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        os.fchmod(handle.fileno(), 0o600)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+set_removal_pending() {
+  checkpoint_path_is_pinned || return 1
+  python3 - "$state_file" "$1" <<'PY'
+import json, os, sys, tempfile
+path, managed_path = sys.argv[1:]
+state = json.load(open(path, encoding="utf-8"))
+if state.get("phase") != "removal-pending":
+    managed = json.load(open(managed_path, encoding="utf-8"))
+    state["phase"] = "removal-pending"
+    state["removal_managed_default_address_pools"] = managed["default-address-pools"]
+state["verified_generation"] = None
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -385,7 +419,12 @@ if [[ "$removing" == true ]]; then
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
-if set(state) not in (required, required | {"verified_generation"}) or state["managed"] is not True:
+pending = {"phase", "removal_managed_default_address_pools"}
+schemas = (required, required | {"verified_generation"}, required | pending, required | pending | {"verified_generation"})
+if set(state) not in schemas or state["managed"] is not True:
+    raise SystemExit(1)
+is_pending = "phase" in state
+if is_pending and (state["phase"] != "removal-pending" or not isinstance(state["removal_managed_default_address_pools"], list)):
     raise SystemExit(1)
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
@@ -407,9 +446,10 @@ elif mode is not None:
 print("true" if state["prior_present"] else "false")
 print(mode or "")
 print(generation or "")
+print("true" if is_pending else "false")
 PY
   ) || die 'network-policy checkpoint state is invalid'
-  [[ ${#managed_state[@]} == 3 ]] || die 'network-policy checkpoint state is invalid'
+  [[ ${#managed_state[@]} == 4 ]] || die 'network-policy checkpoint state is invalid'
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
@@ -428,10 +468,16 @@ try:
     state = json.load(open(state_path, encoding="utf-8"))
     if not isinstance(current, dict):
         raise ValueError
-except (OSError, json.JSONDecodeError, ValueError):
+    if state.get("phase") == "removal-pending":
+        managed_pools = state["removal_managed_default_address_pools"]
+    else:
+        managed_pools = current["default-address-pools"]
+except (OSError, json.JSONDecodeError, KeyError, ValueError):
     raise SystemExit(1)
+managed = dict(current)
+managed["default-address-pools"] = managed_pools
 with open(managed_path, "w", encoding="utf-8") as handle:
-    json.dump(current, handle, indent=2, sort_keys=True)
+    json.dump(managed, handle, indent=2, sort_keys=True)
     handle.write("\n")
 if state["prior_default_address_pools_present"]:
     current["default-address-pools"] = state["prior_default_address_pools"]
@@ -476,7 +522,9 @@ PY
     run_command "$restart_command" "$daemon_dir" || failed=1
     run_command "$resume_command" --env "$prior_env" || failed=1
     run_health "$prior_env" || failed=1
-    set_verified_generation "$prior_verified_generation" || failed=1
+    if ((failed == 0)); then
+      set_verified_generation "$prior_verified_generation" clear-removal || failed=1
+    fi
     return "$failed"
   }
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
@@ -495,7 +543,7 @@ PY
   trap removal_on_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  set_verified_generation "" || { removal_failure='failed to mark network-policy verification pending'; exit 2; }
+  set_removal_pending "$managed_daemon" || { removal_failure='failed to persist network-policy removal state'; exit 2; }
 
   if [[ "$prior_present" == false ]] && python3 - "$removal_daemon" <<'PY'
 import json, sys
