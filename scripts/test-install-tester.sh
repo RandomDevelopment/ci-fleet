@@ -380,7 +380,7 @@ pre_rollback_release=$(readlink -f "$root/opt/ci-fleet-tester/current")
 chmod u+w "$pre_rollback_release/scripts/tester-runtime.sh"
 printf '# corrupt before rollback\n' >>"$pre_rollback_release/scripts/tester-runtime.sh"
 chmod 0555 "$pre_rollback_release/scripts/tester-runtime.sh"
-"$installer" --rollback --config /etc/ci-fleet-tester/tester.env | grep -Fq ROLLBACK_OK || fail 'rollback failed'
+FAKE_TESTER_ROUTE_PORT=18086 "$installer" --rollback --config /etc/ci-fleet-tester/tester.env | grep -Fq ROLLBACK_OK || fail 'rollback failed'
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$old" ]] || fail 'rollback selected the wrong release'
 [[ $(<"$root/var/lib/ci-fleet-tester/last-known-good") == "$old" ]] || fail 'rollback recorded a corrupt prior release'
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state") == "$rollback_state_hash" ]] || fail 'rollback changed active environment state'
