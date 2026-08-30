@@ -602,11 +602,14 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
 
     def test_daemon_metadata_change_during_drain_aborts(self) -> None:
-        for field, command in (("mode", "chmod 600"), ("group", "chgrp 1")):
+        alternate_gid = 1 if os.geteuid() == 0 else next((gid for gid in os.getgroups() if gid != os.getgid()), None)
+        cases = [("mode", "chmod 600")]
+        if alternate_gid is not None:
+            cases.append(("group", f"chgrp {alternate_gid}"))
+        for field, command in cases:
             with self.subTest(field=field):
                 daemon = self._write_daemon('{"bip":"172.17.0.1/16"}\n')
                 daemon.chmod(0o644)
-                os.chown(daemon, -1, 0)
                 checkpoint = Path(self.tmp) / f"checkpoint-daemon-{field}-conflict"
                 self.drain_command.write_text(
                     f"#!/usr/bin/env bash\n{command} {daemon}\n",
@@ -622,7 +625,7 @@ class ApplyScriptTests(unittest.TestCase):
                 if field == "mode":
                     self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
                 else:
-                    self.assertEqual(daemon.stat().st_gid, 1)
+                    self.assertEqual(daemon.stat().st_gid, alternate_gid)
 
     def test_failed_managed_reapply_restores_prior_verified_generation(self) -> None:
         daemon = self._write_daemon("{}\n")
