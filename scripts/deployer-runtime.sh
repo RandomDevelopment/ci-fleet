@@ -331,7 +331,7 @@ case "$operation" in
   health)
     reject_mixed_role
     validate_credential
-    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" "$operation"
+    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" "$operation" 9<&-
     ;;
   cleanup)
     not_drained
@@ -340,7 +340,7 @@ case "$operation" in
     # Scheduled cleanup mutates application-owned resources; production paths
     # remain separately gated like deploy.
     [[ ${cfg[ENVIRONMENT]} != production ]] || die 'production cleanup is not authorized by the current accepted scope'
-    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup
+    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup 9<&-
     ;;
   deploy)
     not_drained
@@ -557,7 +557,7 @@ PY
     incumbent_policy_backup=$(base64 -w0 "$deployed_current/policy.conf")
     incumbent_state_backup=$(base64 -w0 "$deployed_current/state.json")
     set +e
-    env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy
+    env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy 9<&-
     adapter_status=$?
     set -e
     if ((adapter_status == 0)); then

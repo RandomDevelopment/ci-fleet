@@ -90,6 +90,7 @@ report() {
     "$action" "$result" "$environment" "$target" "$core_ref" "${artifact#*@}" "$health" "$changed" "$rollback" "$next"
 }
 rollback_available() {
+  [[ ${validating_rollback_marker:-0} != 1 ]] || { printf no; return; }
   [[ -n ${previous_state:-} && -f ${previous_state:-/nonexistent} && ! -L ${previous_state:-/nonexistent} && -n ${previous_policy:-} && -f ${previous_policy:-/nonexistent} && ! -L ${previous_policy:-/nonexistent} ]] || { printf no; return; }
   [[ $(stat -c '%u:%a' "$previous_state" 2>/dev/null) == "$expected_uid:600" && $(stat -c '%u:%a' "$previous_policy" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
   python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || { printf no; return; }
@@ -144,7 +145,7 @@ PY
   [[ $rollback_release =~ ^[0-9a-f]{40}$ ]] || { printf no; return; }
   release_complete "$releases/$rollback_release" 2>/dev/null || { printf no; return; }
   # Rollback requires a completed deployment; mirror the perform_rollback gate.
-  [[ -f "$state_root/last-request.conf" && ! -L "$state_root/last-request.conf" ]] || { printf no; return; }
+  (validating_rollback_marker=1; validate_completed_request "$state_root/last-request.conf") >/dev/null 2>&1 || { printf no; return; }
   printf yes
 }
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
@@ -1095,13 +1096,13 @@ run_adapter() {
     # deploy runtime, so a normal shutdown cannot strand a partially applied
     # rollback between core mutation and commit-marker publication.
     timeout --signal=TERM --kill-after=10s "${seconds}s" systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name"
+      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 9<&-
     return
   fi
   if [[ -n "$marker" ]]; then
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name"
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 9<&-
   else
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name"
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name" 9<&-
   fi
 }
 
@@ -1185,7 +1186,7 @@ PY
     health=healthy; report NO_CHANGE no none "$(rollback_available)"; return
   fi
   if [[ -L "$current" ]]; then
-    old_release=$(readlink -f "$current")
+    old_release=$(readlink -m "$current")
     if [[ "$mode" == repair ]]; then
       # Repair must not trust or execute a damaged old release; the validated
       # checkout replaces it transactionally below. Upgrade and install still

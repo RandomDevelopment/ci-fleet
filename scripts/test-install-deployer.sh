@@ -119,6 +119,7 @@ cat >"$adapter" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
+[[ ! -e /proc/$$/fd/9 ]] || { printf 'adapter inherited deployer operation lock\n' >&2; exit 46; }
 [[ -z ${FAKE_ADAPTER_RECORD_CONFIG:-} ]] || { printf '%s\n' "${CI_FLEET_DEPLOYER_CONFIG:-unset}" >"$FAKE_ADAPTER_RECORD_CONFIG"; : >"$FAKE_ADAPTER_RECORD_CONFIG.seen"; cp "${CI_FLEET_DEPLOYER_CONFIG:-/dev/null}" "$FAKE_ADAPTER_RECORD_CONFIG.content" 2>/dev/null || true; }
 if [[ -n ${FAKE_ADAPTER_FORBID_CONFIG_PATH:-} && ${CI_FLEET_DEPLOYER_CONFIG:-} == "$FAKE_ADAPTER_FORBID_CONFIG_PATH" ]]; then exit 43; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_FORBID_REQUEST_PATH:-} && ${CI_FLEET_DEPLOYER_REQUEST:-} == "$FAKE_ADAPTER_FORBID_REQUEST_PATH" ]]; then exit 44; fi
@@ -429,6 +430,11 @@ expect_failure 'installed deployer state is absent or drifted' "$installer" --ch
 expect_success "$installer" --repair --config "$config" >/dev/null
 cmp -s "$repo_root/scripts/deployer-runtime.sh" "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh" || fail 'repair did not replace the damaged release with reviewed bytes'
 expect_success "$installer" --check --config "$config" >/dev/null
+
+# Repair must recreate an entirely missing releases boundary behind current.
+mv "$root/opt/ci-fleet-deployer/releases" "$tmp/releases.missing"
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ -f "$root/opt/ci-fleet-deployer/releases/$core_ref/scripts/deployer-runtime.sh" ]] || fail 'repair did not recreate the missing releases boundary'
 
 preparing=$root/var/lib/ci-fleet-deployer/.transaction-preparing.interrupted
 mkdir -m 0700 "$preparing"
@@ -821,6 +827,18 @@ rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'malformed completed deployment request line' "$installer" --rollback --config "$config" >/dev/null
 [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'rollback adapter ran with a malformed completed-deployment marker'
 install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/last-request.conf"
+completed_request=$root/var/lib/ci-fleet-deployer/last-request.conf
+cp "$completed_request" "$tmp/completed-request.saved"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid completed marker was not reported rollback_available=yes'
+chmod 0666 "$completed_request"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'unsafe completed marker still reported rollback_available=yes'
+install -m 0600 "$tmp/completed-request.saved" "$completed_request"
+printf 'malformed\n' >"$completed_request"
+available_check=$(expect_success "$installer" --check --config "$config")
+grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'malformed completed marker still reported rollback_available=yes'
+install -m 0600 "$tmp/completed-request.saved" "$completed_request"
 export FAKE_ADAPTER_FAIL=$tmp/fail-rollback
 expect_failure 'application adapter rollback failed' "$installer" --rollback --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL; rm "$tmp/fail-rollback"
