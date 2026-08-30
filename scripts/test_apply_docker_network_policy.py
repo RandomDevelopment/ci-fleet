@@ -466,6 +466,31 @@ class ApplyScriptTests(unittest.TestCase):
             "ERROR: drain command failed before network-policy apply; controller resume command failed\n",
         )
 
+    def test_daemon_change_during_drain_aborts_and_preserves_update(self) -> None:
+        daemon = self._write_daemon('{"bip":"172.17.0.1/16"}\n')
+        changed = b'{"bip":"172.17.0.1/16","log-level":"debug"}\n'
+        env_file = self._write_env_file(self._rendered_with_policy())
+        checkpoint = Path(self.tmp) / "checkpoint-daemon-conflict"
+        command_log = Path(self.tmp) / "daemon-conflict.log"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo drain >> {command_log}\n"
+            f"printf '%s\\n' '{{\"bip\":\"172.17.0.1/16\",\"log-level\":\"debug\"}}' > {daemon}\n",
+            encoding="utf-8",
+        )
+        for name in ("restart", "probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "ERROR: daemon.json changed during network-policy apply\n")
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume"])
+        self.assertEqual(daemon.read_bytes(), changed)
+        self.assertFalse((checkpoint / "docker-network-policy.json").exists())
+
     def test_failed_managed_reapply_restores_prior_verified_generation(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-reapply-generation"

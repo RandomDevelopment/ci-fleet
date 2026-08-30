@@ -740,6 +740,12 @@ rollback_on_exit() {
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 drain_controller 'drain command failed before network-policy apply'
+if [[ "$had_prior" == true ]]; then
+  cmp -s "$backup_dir/$backup_name" "$daemon_config" || { drain_failure='daemon.json changed during network-policy apply'; exit 2; }
+elif [[ -e "$daemon_config" || -L "$daemon_config" ]]; then
+  drain_failure='daemon.json changed during network-policy apply'
+  exit 2
+fi
 checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy apply'
 trap rollback_on_exit EXIT
 trap 'exit 130' INT
