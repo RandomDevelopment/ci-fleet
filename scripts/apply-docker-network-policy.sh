@@ -284,11 +284,18 @@ prior_env=$work_dir/prior-ci-fleet.env
 install -m 0600 -- "$installed_env" "$prior_env"
 
 drain_failure=
+new_marker=false
+controller_resumed=false
+transaction_recovery=
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
   local status=$? resume_failed=0
   trap - EXIT INT TERM
   run_command "$resume_command" --env "$prior_env" || resume_failed=1
+  if ((resume_failed == 0)) && [[ "$new_marker" == true ]]; then
+    clear_managed_marker || resume_failed=1
+  fi
+  [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
   rm -rf "$work_dir"
   if ((resume_failed)); then
     printf 'ERROR: %s; controller resume command failed\n' "$drain_failure" >&2
@@ -435,7 +442,7 @@ state = json.load(open(path, encoding="utf-8"))
 if state.get("phase") != "removal-pending":
     managed = json.load(open(managed_path, encoding="utf-8"))
     state["phase"] = "removal-pending"
-    state["removal_managed_default_address_pools"] = managed["default-address-pools"]
+    state["removal_managed_default_address_pools"] = managed.get("default-address-pools")
 state["verified_generation"] = None
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -510,7 +517,11 @@ schemas = (required, required | {"verified_generation"}, required | pending, req
 if set(state) not in schemas or state["managed"] is not True:
     raise SystemExit(1)
 is_pending = "phase" in state
-if is_pending and (state["phase"] != "removal-pending" or not isinstance(state["removal_managed_default_address_pools"], list)):
+if is_pending and (
+    state["phase"] != "removal-pending"
+    or state["removal_managed_default_address_pools"] is not None
+    and not isinstance(state["removal_managed_default_address_pools"], list)
+):
     raise SystemExit(1)
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
@@ -551,6 +562,8 @@ PY
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
   if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$removal_pending" == false && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
+    run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
+    run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
     clear_managed_marker || die 'failed to clear interrupted network-policy marker'
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_REMOVED\n'
@@ -571,11 +584,14 @@ try:
     if state.get("phase") == "removal-pending":
         managed_pools = state["removal_managed_default_address_pools"]
     else:
-        managed_pools = current["default-address-pools"]
+        managed_pools = current.get("default-address-pools")
 except (OSError, json.JSONDecodeError, KeyError, ValueError):
     raise SystemExit(1)
 managed = dict(current)
-managed["default-address-pools"] = managed_pools
+if managed_pools is None:
+    managed.pop("default-address-pools", None)
+else:
+    managed["default-address-pools"] = managed_pools
 with open(managed_path, "w", encoding="utf-8") as handle:
     json.dump(managed, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -606,28 +622,38 @@ PY
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
   rollback_removal() {
     local failed=0 rollback_daemon=$work_dir/daemon.json.rollback
-    python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" <<'PY' || failed=1
+    if [[ "$controller_resumed" == true ]]; then
+      run_command "$drain_command" || failed=1
+    fi
+    if ((failed == 0)); then
+      python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" <<'PY' || failed=1
 import json, os, sys
 current_path, managed_path, output_path = sys.argv[1:]
 try:
     current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
     managed = json.load(open(managed_path, encoding="utf-8"))
-    if not isinstance(current, dict) or not isinstance(managed, dict) or "default-address-pools" not in managed:
+    if not isinstance(current, dict) or not isinstance(managed, dict):
         raise ValueError
 except (OSError, json.JSONDecodeError, ValueError):
     raise SystemExit(1)
-current["default-address-pools"] = managed["default-address-pools"]
+if "default-address-pools" in managed:
+    current["default-address-pools"] = managed["default-address-pools"]
+else:
+    current.pop("default-address-pools", None)
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
+    fi
     if ((failed == 0)); then
       atomic_replace_daemon "$rollback_daemon" "$managed_mode" "$managed_gid" || failed=1
       cmp -s "$rollback_daemon" "$daemon_config" || failed=1
     fi
-    run_command "$restart_command" "$daemon_dir" || failed=1
-    run_command "$resume_command" --env "$prior_env" || failed=1
-    run_health "$prior_env" || failed=1
+    if ((failed == 0)); then
+      run_command "$restart_command" "$daemon_dir" || failed=1
+      run_command "$resume_command" --env "$prior_env" || failed=1
+      run_health "$prior_env" || failed=1
+    fi
     if ((failed == 0)); then
       set_verified_generation "$prior_verified_generation" clear-removal || failed=1
     fi
@@ -680,6 +706,7 @@ PY
   run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
   run_command "$probe_command" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   run_command "$resume_command" --env "$env_file" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
+  controller_resumed=true
   run_health "$env_file" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 
   # Marker deletion commits removal. Ignore catchable signals across the atomic
@@ -781,8 +808,40 @@ if [[ -f "$daemon_config" ]]; then
 fi
 
 restore_daemon() {
-  if [[ "$had_prior" == true ]]; then
+  local rollback_daemon=$work_dir/daemon.json.apply-rollback rollback_action
+  rollback_action=$(python3 - "$daemon_config" "$backup_dir/$backup_name" "$had_prior" "$rollback_daemon" "$staging_daemon" <<'PY'
+import json, os, sys
+current_path, prior_path, had_prior, output_path, staged_path = sys.argv[1:]
+try:
+    current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
+    prior = json.load(open(prior_path, encoding="utf-8")) if had_prior == "true" else {}
+    staged = json.load(open(staged_path, encoding="utf-8"))
+    if not isinstance(current, dict) or not isinstance(prior, dict) or not isinstance(staged, dict):
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+current_unrelated = {key: value for key, value in current.items() if key != "default-address-pools"}
+staged_unrelated = {key: value for key, value in staged.items() if key != "default-address-pools"}
+if current_unrelated == staged_unrelated:
+    print("exact" if had_prior == "true" else "remove")
+    raise SystemExit
+if "default-address-pools" in prior:
+    current["default-address-pools"] = prior["default-address-pools"]
+else:
+    current.pop("default-address-pools", None)
+if not current and had_prior != "true":
+    print("remove")
+else:
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(current, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print("replace")
+PY
+  ) || return 1
+  if [[ "$rollback_action" == exact ]]; then
     atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
+  elif [[ "$rollback_action" == replace ]]; then
+    atomic_replace_daemon "$rollback_daemon" "$daemon_mode" "$daemon_gid"
   else
     rm -f "$daemon_config"
     python3 - "$daemon_dir" <<'PY'
@@ -796,55 +855,8 @@ PY
   fi
 }
 
-rollback_daemon() {
-  local failed=0
-  restore_daemon || failed=1
-  run_command "$restart_command" "$daemon_dir" || failed=1
-  run_command "$resume_command" --env "$prior_env" || failed=1
-  run_health "$prior_env" || failed=1
-  if [[ "$managed_before" == true && "$failed" == 0 ]]; then
-    set_verified_generation "$prior_verified_generation" || failed=1
-  fi
-  return "$failed"
-}
-
-transaction_failure='network-policy apply interrupted'
-rollback_on_exit() {
-  local status=$?
-  trap - EXIT INT TERM
-  ((status != 0)) || status=1
-  if rollback_daemon >/dev/null 2>&1; then
-    if [[ "$managed_before" == false ]]; then
-      rm -f "$state_file"
-    fi
-    rm -rf "$work_dir"
-    printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
-  else
-    recovery_daemon=
-    [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
-    recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
-      printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
-      exit "$status"
-    }
-    rm -rf "$work_dir"
-    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$recovery_path" >&2
-  fi
-  exit "$status"
-}
-
-# --- Drain after local validation/checkpointing, before mutation or restart ---
-drain_controller 'drain command failed before network-policy apply'
-if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior"; then
-  drain_failure='daemon.json changed during network-policy apply'
-  exit 2
-fi
-checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy apply'
-trap rollback_on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# Record the original host state before the first managed mutation. Re-applying
-# policy keeps this baseline and uses the temp copy above for transaction rollback.
+# Record the original host state before the first drain. The marker lets a
+# later no-policy reconciliation resume a controller interrupted by the drain.
 if [[ "$managed_before" == false ]]; then
   python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
@@ -877,7 +889,69 @@ finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PY
+  new_marker=true
 fi
+if [[ "$managed_before" == true ]]; then
+  transaction_recovery=$(persist_recovery "$backup_dir/$backup_name" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+fi
+
+rollback_daemon() {
+  local failed=0
+  if [[ "$controller_resumed" == true ]]; then
+    run_command "$drain_command" || failed=1
+  fi
+  if ((failed == 0)); then
+    restore_daemon || failed=1
+    run_command "$restart_command" "$daemon_dir" || failed=1
+    run_command "$resume_command" --env "$prior_env" || failed=1
+    run_health "$prior_env" || failed=1
+  fi
+  if [[ "$managed_before" == true && "$failed" == 0 ]]; then
+    set_verified_generation "$prior_verified_generation" || failed=1
+  fi
+  return "$failed"
+}
+
+transaction_failure='network-policy apply interrupted'
+rollback_on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  ((status != 0)) || status=1
+  if rollback_daemon >/dev/null 2>&1; then
+    if [[ "$managed_before" == false ]]; then
+      rm -f "$state_file"
+    fi
+    [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
+    rm -rf "$work_dir"
+    printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
+  else
+    if [[ -n "$transaction_recovery" ]]; then
+      recovery_path=$transaction_recovery
+    else
+      recovery_daemon=
+      [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
+      recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
+        printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
+        exit "$status"
+      }
+    fi
+    rm -rf "$work_dir"
+    printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$recovery_path" >&2
+  fi
+  exit "$status"
+}
+
+# --- Drain after local validation/checkpointing, before mutation or restart ---
+drain_controller 'drain command failed before network-policy apply'
+if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior"; then
+  drain_failure='daemon.json changed during network-policy apply'
+  exit 2
+fi
+checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy apply'
+trap rollback_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if [[ "$managed_before" == true ]]; then
   set_verified_generation "" || { transaction_failure='failed to mark network-policy verification pending'; exit 2; }
 fi
@@ -907,16 +981,25 @@ fi
 if ! run_command "$resume_command" --env "$env_file"; then
   fail_after_apply "controller resume command failed after network-policy restart"
 fi
+controller_resumed=true
 
 # Health verification
 if ! run_health "$env_file"; then
   fail_after_apply "health check failed after network-policy restart"
 fi
 
+python3 - "$daemon_config" "$staging_daemon" 2>/dev/null <<'PY' || fail_after_apply "daemon.json changed after network-policy verification"
+import json, sys
+current = json.load(open(sys.argv[1], encoding="utf-8"))
+staged = json.load(open(sys.argv[2], encoding="utf-8"))
+if not isinstance(current, dict) or current.get("default-address-pools") != staged.get("default-address-pools"):
+    raise SystemExit(1)
+PY
 verified_generation=$(file_generation "$daemon_config") || fail_after_apply "failed to identify verified daemon.json generation"
 set_verified_generation "$verified_generation" || fail_after_apply "failed to record verified daemon.json generation"
 
 # --- Success ---
 trap - EXIT INT TERM
+[[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
 rm -rf "$work_dir"
 printf 'NETWORK_POLICY_APPLIED daemon_config=%s\n' "$daemon_config"

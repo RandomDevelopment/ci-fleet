@@ -421,6 +421,32 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "restart", "resume", "health"])
 
+    def test_apply_health_failure_redrains_before_rollback_restart(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        command_log = Path(self.tmp) / "apply-health-rollback.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "resume"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo health >> {command_log}\n"
+            'grep -Fqx "ENV_GENERATION=prior" "$2" || exit 2\n',
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "health", "drain", "restart", "resume", "health"],
+        )
+
     def test_failed_apply_uses_pretransaction_installed_env_for_rollback(self) -> None:
         self._write_daemon("{}\n")
         env_file = self._write_env_file(self._rendered_with_policy())
@@ -457,7 +483,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(len(set(rollback_envs)), 1)
         self.assertNotEqual(rollback_envs[0], str(self.installed_env))
 
-    def test_post_drain_state_failure_resumes_prior_controller(self) -> None:
+    def test_checkpoint_state_failure_stops_before_drain(self) -> None:
         daemon = self._write_daemon("{}\n")
         prior = daemon.read_bytes()
         checkpoint = Path(self.tmp) / "checkpoint-post-drain-failure"
@@ -492,7 +518,7 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), prior)
-        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "health"])
+        self.assertFalse(command_log.exists())
 
     def test_drain_timeout_resumes_prior_controller_and_preserves_failure(self) -> None:
         self._write_daemon("{}\n")
@@ -629,10 +655,12 @@ class ApplyScriptTests(unittest.TestCase):
         self._write_daemon("{}\n")
         self._write_success_commands()
         checkpoint = Path(self.tmp) / "checkpoint-before-drain"
+        state_file = checkpoint / "docker-network-policy.json"
         drain_marker = Path(self.tmp) / "checkpoint-before-drain.marker"
         self.drain_command.write_text(
             "#!/usr/bin/env bash\n"
             f"[[ -d {checkpoint} && ! -L {checkpoint} ]] || exit 1\n"
+            f"[[ -s {state_file} ]] || exit 1\n"
             f"touch {drain_marker}\n",
             encoding="utf-8",
         )
@@ -1811,6 +1839,45 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("credential", result.stdout + result.stderr)
         self.assertNotIn("probe-secret-error", result.stdout + result.stderr)
 
+    def test_apply_rollback_preserves_concurrent_unrelated_settings(self) -> None:
+        daemon = self._write_daemon('{"icc":false}\n')
+        env_file = self._write_env_file(self._rendered_with_policy())
+        command_log = Path(self.tmp) / "apply-merge-rollback.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "resume"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        mutator = Path(self.tmp) / "mutate-apply-daemon.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "path = sys.argv[1]\n"
+            "value = json.load(open(path))\n"
+            "value['debug'] = True\n"
+            "with open(path, 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo health >> {command_log}\n"
+            'if grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2"; then\n'
+            f"  {shutil.which('python3')} {mutator} {daemon}\n"
+            "  exit 2\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"debug": True, "icc": False})
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "health", "drain", "restart", "resume", "health"],
+        )
+
     def test_interrupt_after_replace_rolls_back_and_retains_failed_recovery(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self.daemon_dir / "daemon.json"
@@ -1974,6 +2041,38 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn(f"F {checkpoint}", audit)
         self.assertTrue(any(line.startswith("R ") and line.endswith(f" {recovery}") for line in audit))
 
+    def test_managed_reapply_persists_recovery_before_daemon_restart(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-reapply-recovery"
+        self._write_success_commands()
+        restart_count = Path(self.tmp) / "reapply-restart-count"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo restart >> {restart_count}\n"
+            f"if [[ $(wc -l < {restart_count}) -gt 1 ]]; then\n"
+            f"  recovery=({checkpoint}/recovery.*)\n"
+            '  [[ -f ${recovery[0]}/daemon.json.before && -f ${recovery[0]}/prior-ci-fleet.env ]] || exit 2\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        prior_daemon = daemon.read_bytes()
+        prior_env = policy_env.read_bytes()
+        self.installed_env.write_bytes(prior_env)
+        candidate = self._rendered_with_policy()
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = self._write_env_file(candidate)
+
+        reapplied = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(reapplied.returncode, 0, reapplied.stderr)
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+        self.assertNotEqual(daemon.read_bytes(), prior_daemon)
+
     def test_post_apply_health_uses_candidate_rendered_env(self) -> None:
         self._write_daemon("{}\n")
         for name in ("restart.sh", "probe.sh"):
@@ -1997,6 +2096,45 @@ class ApplyScriptTests(unittest.TestCase):
         health_paths = health_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(health_paths), 1)
         self.assertNotEqual(health_paths[0], str(env_file))
+
+    def test_apply_rejects_managed_pool_change_before_recording_generation(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        command_log = Path(self.tmp) / "final-pool-conflict.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "resume"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        mutator = Path(self.tmp) / "mutate-final-pools.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "path = sys.argv[1]\n"
+            "value = json.load(open(path))\n"
+            "value['default-address-pools'] = [{'base': '192.0.2.0/24', 'size': 29}]\n"
+            "with open(path, 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo health >> {command_log}\n"
+            'if grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2"; then\n'
+            f"  {shutil.which('python3')} {mutator} {daemon}\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        health.chmod(0o755)
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("daemon.json changed after network-policy verification", result.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {})
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "health", "drain", "restart", "resume", "health"],
+        )
 
     def test_health_failure_evidence_excludes_command_output(self) -> None:
         self._write_daemon("{}\n")
@@ -2258,7 +2396,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("credential", combined)
         self.assertNotIn("restart-secret-error", combined)
 
-    def test_removal_clears_interrupted_first_apply_before_rename_without_commands(self) -> None:
+    def test_removal_resumes_interrupted_first_apply_before_clearing_marker(self) -> None:
         daemon = self.daemon_dir / "daemon.json"
         self.assertFalse(daemon.exists())
         checkpoint = Path(self.tmp) / "checkpoint-interrupted-before-rename"
@@ -2291,7 +2429,10 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
         self.assertFalse(state_file.exists())
         self.assertFalse(daemon.exists())
-        self.assertFalse(any(marker.exists() for marker in command_markers))
+        self.assertEqual(
+            [marker.name for marker in command_markers if marker.exists()],
+            ["interrupted-before-rename-resume.sh.marker", "interrupted-before-rename-health.sh.marker"],
+        )
 
     def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -2575,6 +2716,37 @@ class ApplyScriptTests(unittest.TestCase):
         rolled_back_state = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertNotIn("phase", rolled_back_state)
         self.assertNotIn("removal_managed_default_address_pools", rolled_back_state)
+
+    def test_removal_failure_restores_snapshot_with_absent_managed_key(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-absent-managed-key"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        daemon.write_text('{"debug":true,"live-restore":true}\n', encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        command_log = Path(self.tmp) / "absent-managed-key.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(f"#!/usr/bin/env bash\necho restart >> {command_log}\n", encoding="utf-8")
+        restart.chmod(0o755)
+        resume = Path(self.tmp) / "resume.sh"
+        resume.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo resume >> {command_log}\n"
+            'grep -q "^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=" "$2"\n',
+            encoding="utf-8",
+        )
+        resume.chmod(0o755)
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("managed daemon.json restored", removed.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"debug": True, "live-restore": True})
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "restart", "resume"])
 
     def test_removal_pending_state_is_durable_before_daemon_mutation(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -2950,7 +3122,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), managed)
         self.assertEqual(
             command_log.read_text(encoding="utf-8").splitlines(),
-            ["drain", "restart", "resume-candidate", "health-candidate", "restart", "resume-managed", "health-managed"],
+            ["drain", "restart", "resume-candidate", "health-candidate", "drain", "restart", "resume-managed", "health-managed"],
         )
 
     def test_marker_clear_failure_rolls_back_managed_config_and_retains_state(self) -> None:
