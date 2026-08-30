@@ -215,6 +215,15 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         return {}
     if count < 0:
         raise ValueError("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be non-negative")
+    pool_prefix = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
+    actual_pool_fields = {name for name in rendered if name.startswith(pool_prefix) and name != f"{pool_prefix}COUNT"}
+    expected_pool_fields = {
+        f"{pool_prefix}{index}_{field}"
+        for index in range(count)
+        for field in ("BASE", "SIZE")
+    }
+    if actual_pool_fields != expected_pool_fields:
+        raise ValueError("rendered Docker address-pool indexed fields must match the declared count")
     pools: list[dict[str, Any]] = []
     for index in range(count):
         base = rendered.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE")
@@ -236,13 +245,15 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         if size < network.prefixlen:
             raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count")
         pools.append({"base": base, "size": size})
+    state = rendered.get("CI_FLEET_CONTROLLER_STATE")
+    if state not in {"active", "drained", "disabled"}:
+        raise ValueError("CI_FLEET_CONTROLLER_STATE: must be active, drained, or disabled")
     try:
         policy = {
             "default_address_pools": pools,
             "networks_per_runner": int(rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"]),
             "reserve_subnets": int(rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"]),
         }
-        state = rendered["CI_FLEET_CONTROLLER_STATE"]
         max_runners = 0 if state == "disabled" else int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
     except (KeyError, ValueError) as exc:
         raise ValueError("rendered Docker network policy fields must be present integers") from exc

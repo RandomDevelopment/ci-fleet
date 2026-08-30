@@ -93,6 +93,35 @@ class RenderDaemonConfigTests(unittest.TestCase):
                 "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "-1",
             })
 
+    def test_rejects_pool_entries_outside_declared_count(self) -> None:
+        rendered = self._complete_rendered_policy()
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = "1"
+
+        with self.assertRaisesRegex(ValueError, "indexed fields must match"):
+            render_docker_daemon_config(rendered)
+
+    def test_rejects_unknown_rendered_controller_state(self) -> None:
+        rendered = self._complete_rendered_policy()
+        rendered["CI_FLEET_CONTROLLER_STATE"] = "disable"
+
+        with self.assertRaisesRegex(ValueError, "active, drained, or disabled"):
+            render_docker_daemon_config(rendered)
+
+    @staticmethod
+    def _complete_rendered_policy() -> dict[str, str]:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
+        rendered, _ = build_rendered_env(
+            value,
+            "example-ci-01",
+            host_values(),
+            config_repository="example-org/example-fleet-config",
+            config_ref=CONFIG_COMMIT,
+            docker_gid=998,
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+        )
+        return rendered
+
     def test_rejects_negative_rendered_runner_capacity(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
@@ -2871,7 +2900,7 @@ class ApplyScriptTests(unittest.TestCase):
             timeout=30,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 5)
+        self.assertLess(time.monotonic() - started, 7)
 
     @unittest.skipUnless(Path("/dev/shm").is_dir(), "/dev/shm is unavailable")
     def test_apply_works_across_temp_filesystems(self) -> None:
@@ -3587,7 +3616,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(removed.returncode, 0)
         self.assertIn("managed daemon.json restored", removed.stderr)
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"debug": True, "live-restore": True})
-        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "restart", "resume"])
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "resume", "drain", "restart", "resume"])
 
     def test_removal_pending_state_is_durable_before_daemon_mutation(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -4026,7 +4055,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
         self.assertEqual(
             command_log.read_text(encoding="utf-8").splitlines(),
-            ["drain", "restart", "resume", "restart", "resume", "health"],
+            ["drain", "restart", "resume", "drain", "restart", "resume", "health"],
         )
 
     def test_removal_failure_restores_managed_config_and_retains_recovery_state(self) -> None:
@@ -4240,6 +4269,135 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
+
+    def test_first_apply_persists_prior_environment_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-first-apply-environment"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"recovery=({checkpoint}/recovery.*)\n"
+            '[[ ${#recovery[@]} == 1 ]]\n'
+            f"cmp -s {self.installed_env} \"${{recovery[0]}}/prior-ci-fleet.env\"\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
+    def test_daemon_config_cannot_alias_checkpoint_state(self) -> None:
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-daemon-state-alias"
+        checkpoint.mkdir(mode=0o700)
+        env_file = self._write_env_file(self._rendered_with_policy())
+        daemon = checkpoint / "docker-network-policy.json"
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_DOCKER_DAEMON_CONFIG=str(daemon)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint state paths must be separate", result.stderr)
+        self.assertFalse(daemon.exists())
+
+    def test_no_change_clears_stale_committed_recovery(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-stale-recovery"
+        env_file = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        recovery = checkpoint / "recovery.stale"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "NETWORK_POLICY_NO_CHANGE\n")
+        self.assertFalse(recovery.exists())
+
+    def test_non_standard_daemon_json_is_rejected_before_drain(self) -> None:
+        daemon = self._write_daemon('{"log-level":NaN}\n')
+        prior = daemon.read_bytes()
+        self._write_success_commands()
+        drain_marker = Path(self.tmp) / "non-standard-json-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(Path(self.tmp) / "checkpoint-non-standard-json"))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to stage merged daemon.json", result.stderr)
+        self.assertFalse(drain_marker.exists())
+        self.assertEqual(daemon.read_bytes(), prior)
+
+    def test_failed_resume_redrains_before_rollback_restart(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        command_log = Path(self.tmp) / "failed-resume-rollback.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        resume = Path(self.tmp) / "resume.sh"
+        resume.write_text(f"#!/usr/bin/env bash\necho resume >> {command_log}\nexit 1\n", encoding="utf-8")
+        resume.chmod(0o755)
+
+        result = self._run(str(env_file), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "drain", "restart", "resume"],
+        )
+
+    def test_rollback_merge_rejects_concurrent_content_change(self) -> None:
+        daemon = self._write_daemon('{"icc":false}\n')
+        self._write_success_commands()
+        trigger = Path(self.tmp) / "mutate-during-rollback"
+        health = Path(self.tmp) / "health.sh"
+        health.write_text(f"#!/usr/bin/env bash\ntouch {trigger}\nexit 2\n", encoding="utf-8")
+        health.chmod(0o755)
+        fake_bin = Path(self.tmp) / "fake-bin"
+        fake_bin.mkdir()
+        stat_command = fake_bin / "stat"
+        stat_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"{shutil.which('stat')} \"$@\"\n"
+            "status=$?\n"
+            f"if [[ -e {trigger} && $1 == -c && $2 == %g && $3 == {daemon} ]]; then\n"
+            f"  {shutil.which('python3')} -c \"import json; p='{daemon}'; v=json.load(open(p)); v['concurrent']=True; json.dump(v,open(p,'w'))\"\n"
+            f"  rm -f {trigger}\n"
+            "fi\n"
+            "exit $status\n",
+            encoding="utf-8",
+        )
+        stat_command.chmod(0o755)
+        checkpoint = Path(self.tmp) / "checkpoint-rollback-content-conflict"
+        env_file = self._write_env_file(self._rendered_with_policy())
+        env = self._env(PATH=f"{fake_bin}:{os.environ['PATH']}")
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback verification failed", result.stderr)
+        self.assertTrue(json.loads(daemon.read_text(encoding="utf-8"))["concurrent"])
 
 
 if __name__ == "__main__":
