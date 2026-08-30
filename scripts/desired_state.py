@@ -32,6 +32,7 @@ HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
 DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
+MAX_DOCKER_ADDRESS_POOLS = 64
 
 
 class DesiredStateError(ValueError):
@@ -215,8 +216,12 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         return {}
     if count < 0:
         raise ValueError("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be non-negative")
+    if count > MAX_DOCKER_ADDRESS_POOLS:
+        raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must not exceed {MAX_DOCKER_ADDRESS_POOLS}")
     pool_prefix = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
     actual_pool_fields = {name for name in rendered if name.startswith(pool_prefix) and name != f"{pool_prefix}COUNT"}
+    if len(actual_pool_fields) != count * 2:
+        raise ValueError("rendered Docker address-pool indexed fields must match the declared count")
     expected_pool_fields = {
         f"{pool_prefix}{index}_{field}"
         for index in range(count)

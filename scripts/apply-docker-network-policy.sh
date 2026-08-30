@@ -278,6 +278,10 @@ validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true t
 exec 8<"$checkpoint_dir"
 checkpoint_path_is_pinned || die 'checkpoint directory must remain a trusted root-owned path'
 state_file=/proc/self/fd/8/docker-network-policy.json
+if [[ $(readlink -m "$checkpoint_state") == $(readlink -f /proc/self/fd/9) ||
+      ( -e "$state_file" && "$state_file" -ef /proc/self/fd/9 ) ]]; then
+  die 'installer lock and checkpoint state paths must be separate'
+fi
 if [[ $(readlink -m "$state_file") == "$daemon_config" || ( -e "$state_file" && "$state_file" -ef "$daemon_config" ) ]]; then
   die 'daemon config and checkpoint state paths must be separate'
 fi

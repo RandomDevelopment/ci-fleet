@@ -93,6 +93,12 @@ class RenderDaemonConfigTests(unittest.TestCase):
                 "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "-1",
             })
 
+    def test_rejects_pool_count_above_repository_limit_before_expansion(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not exceed 64"):
+            render_docker_daemon_config({
+                "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "65",
+            })
+
     def test_rejects_pool_entries_outside_declared_count(self) -> None:
         rendered = self._complete_rendered_policy()
         rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = "1"
@@ -1312,6 +1318,68 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("checkpoint state is invalid", result.stderr)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_rejects_installer_lock_at_checkpoint_marker_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-lock-marker-alias"
+        checkpoint.mkdir(mode=0o700)
+        marker = checkpoint / "docker-network-policy.json"
+        marker.write_text("{}\n", encoding="utf-8")
+        marker.chmod(0o600)
+        drain_marker = Path(self.tmp) / "lock-marker-alias-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(marker)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installer lock and checkpoint state paths must be separate", result.stderr)
+        self.assertFalse(drain_marker.exists())
+
+    def test_rejects_installer_lock_hardlink_to_checkpoint_marker_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-lock-marker-hardlink"
+        checkpoint.mkdir(mode=0o700)
+        marker = checkpoint / "docker-network-policy.json"
+        marker.write_text("{}\n", encoding="utf-8")
+        marker.chmod(0o600)
+        lock = Path(self.tmp) / "network-policy-marker-hardlink.lock"
+        os.link(marker, lock)
+        drain_marker = Path(self.tmp) / "lock-marker-hardlink-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installer lock and checkpoint state paths must be separate", result.stderr)
+        self.assertFalse(drain_marker.exists())
 
     def test_rejects_absent_daemon_config_in_checkpoint_after_lock_before_drain(self) -> None:
         self.daemon_dir.chmod(0o700)
