@@ -451,6 +451,44 @@ class CliTests(unittest.TestCase):
                 "a revert referencing a nonexistent commit must be rejected",
             )
 
+    def test_revert_of_unrelated_existing_commit_in_range_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            self._commit(directory, "chore: bootstrap")
+            referenced = self._commit(directory, "feat: referenced change")
+            forged = self._commit(
+                directory,
+                'Revert "feat: referenced change"\n\nThis reverts commit '
+                + referenced + ".",
+            )
+            result = self._range_result(directory, referenced, forged)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "a generated-looking message must actually reverse the reference",
+            )
+
+    def test_actual_git_revert_in_range_is_exempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            path = Path(directory) / "value.txt"
+            path.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "-C", directory, "add", "value.txt"], check=True)
+            self._commit(directory, "chore: bootstrap")
+            path.write_text("after\n", encoding="utf-8")
+            subprocess.run(["git", "-C", directory, "add", "value.txt"], check=True)
+            referenced = self._commit(directory, "feat: change value")
+            reverted = subprocess.run(
+                ["git", "-C", directory, "revert", "--no-edit", referenced],
+                check=True, capture_output=True, text=True, env=self._git_env(),
+            )
+            self.assertEqual(reverted.returncode, 0)
+            revert_sha = subprocess.run(
+                ["git", "-C", directory, "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            result = self._range_result(directory, referenced, revert_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_empty_base_validates_head_commit_only(self) -> None:
         # workflow_dispatch path: empty base must not enumerate all history.
         with tempfile.TemporaryDirectory() as directory:

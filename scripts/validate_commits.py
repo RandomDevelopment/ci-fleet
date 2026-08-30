@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Iterable
 
 # ---------------------------------------------------------------------------
@@ -183,8 +184,53 @@ def referenced_commit_exists(sha: str, workspace: str = ".") -> bool:
     return result.returncode == 0
 
 
+def reverses_commit(revert_sha: str, referenced_sha: str, workspace: str = ".") -> bool:
+    """Return True when `revert_sha` applies the inverse of `referenced_sha`."""
+    def parents(sha: str) -> list[str]:
+        result = subprocess.run(
+            ["git", "-C", workspace, "rev-list", "--parents", "-n", "1", sha],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        return result.stdout.strip().split()[1:] if result.returncode == 0 else []
+
+    revert_parents = parents(revert_sha)
+    referenced_parents = parents(referenced_sha)
+    if len(revert_parents) != 1 or not referenced_parents:
+        return False
+
+    target = subprocess.run(
+        ["git", "-C", workspace, "rev-parse", revert_sha + "^{tree}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ).stdout.strip()
+    for referenced_parent in referenced_parents:
+        patch = subprocess.run(
+            ["git", "-C", workspace, "diff", "--binary", referenced_parent, referenced_sha],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        with tempfile.NamedTemporaryFile() as index:
+            env = {**os.environ, "GIT_INDEX_FILE": index.name}
+            read_tree = subprocess.run(
+                ["git", "-C", workspace, "read-tree", revert_parents[0]],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            applied = subprocess.run(
+                ["git", "-C", workspace, "apply", "--cached", "--reverse"],
+                input=patch.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            if read_tree.returncode != 0 or applied.returncode != 0:
+                continue
+            tree = subprocess.run(
+                ["git", "-C", workspace, "write-tree"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            if tree.returncode == 0 and tree.stdout.strip() == target:
+                return True
+    return False
+
+
 def is_git_generated_revert(
-    message: str, *, workspace: str = ".", verify_reference: bool = False,
+    message: str, *, sha: str | None = None, workspace: str = ".",
+    verify_reference: bool = False,
 ) -> bool:
     """Return True only for git's own generated revert form.
 
@@ -208,6 +254,8 @@ def is_git_generated_revert(
             referenced is None
             or set(referenced) == {"0"}
             or not referenced_commit_exists(referenced, workspace)
+            or sha is None
+            or not reverses_commit(sha, referenced, workspace)
         ):
             return False
     return True
@@ -297,7 +345,7 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
 
     if skip_merge:
         if is_git_generated_revert(
-            message, workspace=workspace, verify_reference=bool(sha),
+            message, sha=sha, workspace=workspace, verify_reference=bool(sha),
         ):
             # Only git's own generated revert form (subject + body proof line)
             # is exempt; anything else must be conventional. When a sha is
