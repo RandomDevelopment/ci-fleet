@@ -44,7 +44,7 @@ import errno, os, stat, sys
 
 path, kind, allow_absent, create, testing, root_prefix = sys.argv[1:]
 expected_owner = os.getuid() if testing == "1" else 0
-anchor = os.path.realpath(root_prefix) if testing == "1" and root_prefix else "/"
+anchor = os.path.realpath(root_prefix) if testing == "1" and root_prefix and kind != "tempdir" else "/"
 try:
     if not path.startswith("/") or os.path.normpath(path) != path or os.path.realpath(path) != path:
         raise ValueError
@@ -66,20 +66,30 @@ if exists:
         raise SystemExit(1)
     if kind == "checkpoint" and (not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700):
         raise SystemExit(1)
-current = os.path.dirname(path)
+    if kind == "tempdir" and not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(1)
+current = path if kind == "tempdir" else os.path.dirname(path)
 
 while True:
     try:
         metadata = os.lstat(current)
     except OSError:
         raise SystemExit(1)
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
+    sticky_temp = (
+        kind == "tempdir"
+        and metadata.st_uid in (0, expected_owner)
+        and metadata.st_mode & stat.S_ISVTX
+    )
+    trusted_owner = metadata.st_uid == expected_owner or (kind == "tempdir" and metadata.st_uid == 0)
+    if not stat.S_ISDIR(metadata.st_mode) or (
+        (not trusted_owner or metadata.st_mode & 0o022) and not sticky_temp
+    ):
         raise SystemExit(1)
     if current == anchor:
         break
     current = os.path.dirname(current)
 
-if exists:
+if exists and kind != "tempdir":
     metadata = os.lstat(path)
     if metadata.st_uid != expected_owner or metadata.st_mode & 0o022:
         raise SystemExit(1)
@@ -131,8 +141,6 @@ while (($#)); do
 done
 
 [[ -n "$env_file" ]] || die '--env is required'
-expected_env_owner=0
-[[ "$testing" != 1 ]] || expected_env_owner=$(id -u)
 validate_trusted_path 'rendered env' "$env_file" regular
 
 # --- No-op when no network policy is rendered ---
@@ -254,7 +262,9 @@ except OSError:
 PY
 fi
 
-work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
+temp_parent=${CI_FLEET_TEMP_DIR:-/tmp}
+validate_trusted_path 'transaction temp directory' "$temp_parent" tempdir
+work_dir=$(mktemp -d "$temp_parent/.ci-fleet-apply.XXXXXX")
 chmod 0700 "$work_dir"
 trap 'rm -rf "$work_dir"' EXIT
 install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
@@ -268,10 +278,8 @@ state_file=/proc/self/fd/8/docker-network-policy.json
 # Snapshot the installer's authoritative pre-transaction environment while
 # holding its lock. Rollback must not validate against the rejected candidate.
 installed_env=${CI_FLEET_ROOT_PREFIX:-}/etc/ci-fleet/ci-fleet.env
-[[ -f "$installed_env" && ! -L "$installed_env" && -r "$installed_env" ]] || die "installed rendered env must be a readable regular file: $installed_env"
-[[ $(stat -c %u "$installed_env") == "$expected_env_owner" ]] || die "installed rendered env has an untrusted owner: $installed_env"
-installed_env_mode=$(stat -c %a "$installed_env")
-(( (8#$installed_env_mode & 8#022) == 0 )) || die "installed rendered env must not be group/world writable: $installed_env"
+validate_trusted_path 'installed rendered env' "$installed_env" regular
+[[ -r "$installed_env" ]] || die "installed rendered env must be readable: $installed_env"
 prior_env=$work_dir/prior-ci-fleet.env
 install -m 0600 -- "$installed_env" "$prior_env"
 

@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -317,6 +318,75 @@ class ApplyScriptTests(unittest.TestCase):
             command = Path(self.tmp) / name
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
+
+    def test_rejects_untrusted_transaction_temp_parent(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        self._write_success_commands()
+        temp_parent = Path(self.tmp) / "untrusted-temp"
+        temp_parent.mkdir(mode=0o777)
+        temp_parent.chmod(0o777)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-untrusted-temp"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_TEMP_DIR=str(temp_parent)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("transaction temp directory must be a trusted root-owned path", result.stderr)
+
+    @unittest.skipUnless(os.geteuid() == 0 and shutil.which("runuser"), "requires root and runuser")
+    def test_testing_mode_accepts_default_tmp_as_non_root(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        self._write_success_commands()
+        test_scripts = Path(self.tmp) / "repo" / "scripts"
+        test_scripts.mkdir(parents=True)
+        for name in ("apply-docker-network-policy.sh", "desired_state.py"):
+            shutil.copy2(SCRIPTS / name, test_scripts / name)
+        nobody = pwd.getpwnam("nobody")
+        for path in [Path(self.tmp), *Path(self.tmp).rglob("*")]:
+            os.chown(path, nobody.pw_uid, nobody.pw_gid)
+
+        result = subprocess.run(
+            [
+                "runuser",
+                "-u",
+                "nobody",
+                "--",
+                str(test_scripts / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-non-root"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_installed_env_under_untrusted_directory(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        self._write_success_commands()
+        self.installed_env.parent.chmod(0o777)
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed rendered env must be a trusted root-owned path", result.stderr)
 
     def test_successful_apply_restarts_probes_resumes_then_checks_health(self) -> None:
         self._write_daemon("{}\n")
