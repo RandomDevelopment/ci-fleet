@@ -1846,7 +1846,7 @@ audit_prefix_before=$(base64 -w0 "$root/var/log/ci-fleet-deployer/audit.log")
 printf 'deploy\n' >"$tmp/fail-after-audit-state-delete"
 FAKE_ADAPTER_MUTATE_AUDIT_PATH=$root/var/log/ci-fleet-deployer/audit.log FAKE_ADAPTER_MUTATE_AUDIT_MODE=truncate \
 FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/fail-after-audit-state-delete \
-  expect_failure 'deployment adapter failed after approval consumption' "$runtime" deploy >/dev/null
+  expect_failure 'deployer audit log changed during deployment' "$runtime" deploy >/dev/null
 python3 - "$root/var/log/ci-fleet-deployer/audit.log" "$audit_prefix_before" <<'PY' || fail 'recursive state cleanup destroyed the protected audit prefix'
 import base64, pathlib, sys
 raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2])) else 1)
