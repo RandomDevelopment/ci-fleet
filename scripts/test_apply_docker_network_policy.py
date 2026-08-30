@@ -93,6 +93,23 @@ class RenderDaemonConfigTests(unittest.TestCase):
                 "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "-1",
             })
 
+    def test_rejects_negative_rendered_runner_capacity(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
+        rendered, _ = build_rendered_env(
+            value,
+            "example-ci-01",
+            host_values(),
+            config_repository="example-org/example-fleet-config",
+            config_ref=CONFIG_COMMIT,
+            docker_gid=998,
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+        )
+        rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"] = "-1"
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            render_docker_daemon_config(rendered)
+
     def test_rejects_malformed_pool_index(self) -> None:
         env = {
             "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT": "1",
@@ -604,6 +621,38 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), changed)
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
 
+    def test_apply_stages_from_the_conflict_detection_snapshot(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        env_file = self._write_env_file(self._rendered_with_policy())
+        self._write_success_commands()
+        fake_bin = Path(self.tmp) / "snapshot-cp-bin"
+        fake_bin.mkdir()
+        cp = fake_bin / "cp"
+        cp.write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ $2 == {daemon} ]]; then printf '%s\\n' '{{\"live-restore\":true,\"log-level\":\"debug\"}}' > {daemon}; fi\n"
+            f"exec {shutil.which('cp')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        cp.chmod(0o755)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-snapshot-stage"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["log-level"], "debug")
+
     def test_post_drain_conflict_retains_recovery_when_prior_resume_fails(self) -> None:
         daemon = self._write_daemon('{"live-restore":true}\n')
         checkpoint = Path(self.tmp) / "checkpoint-post-drain-recovery"
@@ -684,6 +733,28 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"], prior_generation)
         self.assertEqual(hashlib.sha256(daemon.read_bytes()).hexdigest(), prior_generation)
 
+    def test_managed_reapply_marks_generation_pending_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-reapply-pending-before-drain"
+        self._write_success_commands()
+        prior_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(prior_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(prior_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        self.drain_command.write_text(
+            "#!/usr/bin/env bash\n"
+            f"grep -q '\"verified_generation\": null' {state_file}\n",
+            encoding="utf-8",
+        )
+        candidate = self._rendered_with_policy()
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = self._write_env_file(candidate)
+
+        result = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_managed_reapply_recovers_when_daemon_snapshot_is_absent(self) -> None:
         daemon = self.daemon_dir / "daemon.json"
         checkpoint = Path(self.tmp) / "checkpoint-reapply-absent-daemon"
@@ -743,6 +814,40 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_default_address_pools_present": False,
                 "prior_mode": "600",
                 "prior_present": True,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        candidate = dict(rendered)
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        env_file = self._write_env_file(candidate)
+        self._write_success_commands()
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        probe.chmod(0o755)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"live-restore": True})
+
+    def test_failed_unverified_retry_preserves_new_unrelated_keys_after_absent_baseline(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps({
+            **render_docker_daemon_config(rendered),
+            "live-restore": True,
+        }))
+        checkpoint = Path(self.tmp) / "checkpoint-unverified-absent-baseline"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": None,
+                "prior_present": False,
                 "verified_generation": None,
             }),
             encoding="utf-8",
@@ -2977,6 +3082,51 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
         self.assertEqual(daemon.read_bytes(), changed_bytes)
         self.assertEqual(state_file.read_bytes(), prior_state)
+
+    def test_removal_stages_from_the_conflict_detection_snapshot(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-removal-snapshot-stage"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        mutator = Path(self.tmp) / "mutate-before-removal-snapshot.py"
+        mutator.write_text(
+            "import json, sys\n"
+            "value = json.load(open(sys.argv[1]))\n"
+            "value['log-level'] = 'debug'\n"
+            "with open(sys.argv[1], 'w') as handle: json.dump(value, handle)\n",
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp) / "removal-snapshot-cp-bin"
+        fake_bin.mkdir()
+        cp = fake_bin / "cp"
+        cp.write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ $2 == {daemon} ]]; then {shutil.which('python3')} {mutator} {daemon}; fi\n"
+            f"exec {shutil.which('cp')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        cp.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(no_policy_env),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["log-level"], "debug")
 
     def test_removal_restores_prior_pools_and_preserves_current_unrelated_keys(self) -> None:
         prior_pools = [{"base": "192.0.2.0/24", "size": 28}]

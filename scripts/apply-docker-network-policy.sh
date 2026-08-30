@@ -289,6 +289,7 @@ new_marker=false
 controller_resumed=false
 transaction_recovery=
 removal_checkpoint_started=false
+apply_checkpoint_started=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
   local status=$? resume_failed=0 health_failed=0
@@ -300,6 +301,9 @@ resume_after_failed_drain() {
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$removal_checkpoint_started" == true ]]; then
     set_verified_generation "$prior_verified_generation" clear-removal || resume_failed=1
+  fi
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$apply_checkpoint_started" == true ]]; then
+    set_verified_generation "$prior_verified_generation" || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)); then
     [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
@@ -644,7 +648,20 @@ PY
 
   managed_daemon=$work_dir/daemon.json.managed
   removal_daemon=$work_dir/daemon.json.removal
-  python3 - "$daemon_config" "$state_file" "$managed_daemon" "$removal_daemon" 2>/dev/null <<'PY' || {
+  python3 - "$daemon_config" <<'PY' || { rm -rf "$work_dir"; die 'managed daemon.json is not a valid JSON object'; }
+import json, sys
+try:
+    if not isinstance(json.load(open(sys.argv[1], encoding="utf-8")), dict):
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+PY
+  managed_mode=$(stat -c %a "$daemon_config")
+  managed_gid=$(stat -c %g "$daemon_config")
+  managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
+  managed_snapshot=$work_dir/daemon.json.before
+  cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
+  python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" 2>/dev/null <<'PY' || {
 import json, sys
 daemon_path, state_path, managed_path, removal_path = sys.argv[1:]
 try:
@@ -677,11 +694,6 @@ PY
     rm -rf "$work_dir"
     die 'managed daemon.json is not a valid JSON object'
   }
-  managed_mode=$(stat -c %a "$daemon_config")
-  managed_gid=$(stat -c %g "$daemon_config")
-  managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
-  managed_snapshot=$work_dir/daemon.json.before
-  cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
 
   set_removal_pending "$managed_daemon" || { rm -rf "$work_dir"; die 'failed to persist network-policy removal state'; }
   removal_checkpoint_started=true
@@ -814,8 +826,19 @@ fi
 
 # --- Stage merged daemon.json (preserve unrelated keys) ---
 staging_daemon="$work_dir/daemon.json"
+prior_daemon="$work_dir/prior"
+mkdir -p "$prior_daemon"
+backup_dir=$prior_daemon
+backup_name=daemon.json.before
+had_prior=false
+if [[ -f "$daemon_config" ]]; then
+  had_prior=true
+  cp -p "$daemon_config" "$backup_dir/$backup_name"
+fi
+snapshot_present=$had_prior
+rollback_source=$backup_dir/$backup_name
 
-python3 - "$env_file" "$daemon_config" "$staging_daemon" "$desired_pools_json" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
+python3 - "$env_file" "$rollback_source" "$staging_daemon" "$desired_pools_json" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
 import json, os, sys
 _, _, daemon_path, staging_path, desired_pools_json = sys.argv
 prior = {}
@@ -908,18 +931,7 @@ then
   fi
 fi
 
-# --- Back up exact current daemon.json for transactional rollback ---
-prior_daemon="$work_dir/prior"
-mkdir -p "$prior_daemon"
-backup_dir=$prior_daemon
-backup_name=daemon.json.before
-had_prior=false
-if [[ -f "$daemon_config" ]]; then
-  had_prior=true
-  cp -p "$daemon_config" "$backup_dir/$backup_name"
-fi
-snapshot_present=$had_prior
-rollback_source=$backup_dir/$backup_name
+# --- Use the staged source snapshot for transactional rollback ---
 if [[ "$managed_before" == true && -z "$prior_verified_generation" ]]; then
   rollback_source=$work_dir/daemon.json.durable-baseline
   python3 - "$daemon_config" "$state_file" "$rollback_source" <<'PY' || { rm -rf "$work_dir"; die 'failed to construct durable rollback baseline'; }
@@ -946,7 +958,7 @@ import json, os, sys
 current_path, prior_path, had_prior, output_path, staged_path = sys.argv[1:]
 try:
     current = json.load(open(current_path, encoding="utf-8")) if os.path.exists(current_path) else {}
-    prior = json.load(open(prior_path, encoding="utf-8")) if had_prior == "true" else {}
+    prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
     staged = json.load(open(staged_path, encoding="utf-8"))
     if not isinstance(current, dict) or not isinstance(prior, dict) or not isinstance(staged, dict):
         raise ValueError
@@ -955,7 +967,7 @@ except (OSError, json.JSONDecodeError, ValueError):
 current_unrelated = {key: value for key, value in current.items() if key != "default-address-pools"}
 staged_unrelated = {key: value for key, value in staged.items() if key != "default-address-pools"}
 if current_unrelated == staged_unrelated:
-    print("exact" if had_prior == "true" else "remove")
+    print("exact" if had_prior == "true" or prior else "remove")
     raise SystemExit
 if "default-address-pools" in prior:
     current["default-address-pools"] = prior["default-address-pools"]
@@ -1084,6 +1096,10 @@ rollback_on_exit() {
 }
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
+if [[ "$managed_before" == true ]]; then
+  set_verified_generation "" || die 'failed to mark network-policy verification pending'
+  apply_checkpoint_started=true
+fi
 drain_controller 'drain command failed before network-policy apply'
 if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$snapshot_present" "$daemon_metadata"; then
   drain_failure='daemon.json changed during network-policy apply'
@@ -1093,10 +1109,6 @@ checkpoint_path_is_pinned || die 'checkpoint directory changed during network-po
 trap rollback_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-if [[ "$managed_before" == true ]]; then
-  set_verified_generation "" || { transaction_failure='failed to mark network-policy verification pending'; exit 2; }
-fi
 
 fail_after_apply() {
   transaction_failure=$1

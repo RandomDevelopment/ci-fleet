@@ -242,9 +242,12 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
             "networks_per_runner": int(rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"]),
             "reserve_subnets": int(rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"]),
         }
-        max_runners = 0 if rendered["CI_FLEET_CONTROLLER_STATE"] == "disabled" else int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
+        state = rendered["CI_FLEET_CONTROLLER_STATE"]
+        max_runners = 0 if state == "disabled" else int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
     except (KeyError, ValueError) as exc:
         raise ValueError("rendered Docker network policy fields must be present integers") from exc
+    if state != "disabled" and max_runners < 1:
+        raise ValueError("CI_FLEET_CONFIGURED_MAX_RUNNERS: must be a positive integer")
     validate_docker_network_policy(policy, path="rendered Docker network policy", max_runners=max_runners)
     return {"default-address-pools": pools}
 
