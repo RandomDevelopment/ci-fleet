@@ -601,6 +601,36 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), changed)
         self.assertFalse((checkpoint / "docker-network-policy.json").exists())
 
+    def test_post_drain_conflict_retains_recovery_when_prior_resume_fails(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-post-drain-recovery"
+        self._write_success_commands()
+        prior_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(prior_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        prior_env_bytes = prior_env.read_bytes()
+        self.installed_env.write_bytes(prior_env_bytes)
+        prior_daemon = daemon.read_bytes()
+        candidate = self._rendered_with_policy()
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = self._write_env_file(candidate)
+        self.drain_command.write_text(
+            f"#!/usr/bin/env bash\nprintf '%s\\n' '{{\"debug\":true}}' > {daemon}\n",
+            encoding="utf-8",
+        )
+        resume = Path(self.tmp) / "resume.sh"
+        resume.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        resume.chmod(0o755)
+
+        result = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("controller resume command failed", result.stderr)
+        recoveries = list(checkpoint.glob("recovery.*"))
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual((recoveries[0] / "daemon.json.before").read_bytes(), prior_daemon)
+        self.assertEqual((recoveries[0] / "prior-ci-fleet.env").read_bytes(), prior_env_bytes)
+
     def test_daemon_metadata_change_during_drain_aborts(self) -> None:
         alternate_gid = 1 if os.geteuid() == 0 else next((gid for gid in os.getgroups() if gid != os.getgid()), None)
         cases = [("mode", "chmod 600")]
@@ -728,6 +758,34 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"live-restore": True})
 
+    def test_unverified_retry_preserves_current_snapshot_presence(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        checkpoint = Path(self.tmp) / "checkpoint-unverified-current-present"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": None,
+                "prior_present": False,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        self._write_success_commands()
+        env_file = self._write_env_file(rendered)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"NETWORK_POLICY_APPLIED daemon_config={daemon}\n")
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(state["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
+
     def test_policy_apply_requires_checkpoint_before_drain_or_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self.daemon_dir / "daemon.json"
@@ -741,6 +799,22 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--checkpoint is required", result.stderr)
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(drain_marker.exists())
+
+    def test_policy_removal_requires_checkpoint_before_noop(self) -> None:
+        prior = b'{"default-address-pools":[{"base":"192.0.2.0/24","size":28}]}\n'
+        daemon = self._write_daemon(prior.decode())
+        drain_marker = Path(self.tmp) / "removal-without-checkpoint-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self._write_success_commands()
+        env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        result = self._run(str(env_file), checkpoint_dir="")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--checkpoint is required", result.stderr)
+        self.assertNotIn("NETWORK_POLICY_NOOP", result.stdout)
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
 
@@ -764,6 +838,52 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(drain_marker.exists())
         self.assertEqual(checkpoint.stat().st_mode & 0o777, 0o700)
+
+    def test_checkpoint_creation_fsyncs_parent_directory(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        checkpoint = Path(self.tmp) / "checkpoint-parent-fsync"
+        audit_log = Path(self.tmp) / "checkpoint-parent-fsync.log"
+        audit_dir = Path(self.tmp) / "checkpoint-parent-fsync-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_mkdir = os.mkdir\n"
+            "_fsync = os.fsync\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def record(value):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle: handle.write(value + '\\n')\n"
+            "def mkdir(path, mode=0o777, *, dir_fd=None):\n"
+            "    result = _mkdir(path, mode, dir_fd=dir_fd)\n"
+            "    parent = os.path.realpath(f'/proc/self/fd/{dir_fd}') if dir_fd is not None else os.getcwd()\n"
+            "    created = os.path.realpath(os.path.join(parent, path))\n"
+            "    if created == os.environ['CHECKPOINT']: record('M ' + created)\n"
+            "    return result\n"
+            "def fsync(fd):\n"
+            "    record('F ' + os.path.realpath(f'/proc/self/fd/{fd}'))\n"
+            "    return _fsync(fd)\n"
+            "os.mkdir = mkdir\n"
+            "os.fsync = fsync\n",
+            encoding="utf-8",
+        )
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PYTHONPATH=str(audit_dir),
+                FSYNC_AUDIT_LOG=str(audit_log),
+                CHECKPOINT=str(checkpoint),
+            ),
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        mkdir = events.index(f"M {checkpoint}")
+        self.assertIn(f"F {checkpoint.parent}", events[mkdir + 1 :])
 
     def test_checkpoint_swap_between_check_and_state_write_does_not_redirect_state(self) -> None:
         self._write_daemon("{}\n")
@@ -2038,6 +2158,63 @@ class ApplyScriptTests(unittest.TestCase):
         events = audit_log.read_text(encoding="utf-8").splitlines()
         unlink = events.index(f"U {self.daemon_dir / 'daemon.json'}")
         self.assertIn(f"F {self.daemon_dir}", events[unlink + 1 :])
+
+    def test_first_apply_rollback_fsyncs_checkpoint_after_marker_unlink(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        checkpoint = Path(self.tmp) / "checkpoint-first-rollback-fsync"
+        state_file = checkpoint / "docker-network-policy.json"
+        audit_log = Path(self.tmp) / "first-rollback-fsync.log"
+        audit_dir = Path(self.tmp) / "first-rollback-fsync-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_unlink = os.unlink\n"
+            "_fsync = os.fsync\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def record(value):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle: handle.write(value + '\\n')\n"
+            "def unlink(path, *args, **kwargs):\n"
+            "    if os.path.realpath(path) == os.environ['STATE_FILE']: record('U ' + os.environ['STATE_FILE'])\n"
+            "    return _unlink(path, *args, **kwargs)\n"
+            "def fsync(fd):\n"
+            "    record('F ' + os.path.realpath(f'/proc/self/fd/{fd}'))\n"
+            "    return _fsync(fd)\n"
+            "os.unlink = unlink\n"
+            "os.fsync = fsync\n",
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp) / "first-rollback-fsync-bin"
+        fake_bin.mkdir()
+        (fake_bin / "rm").write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ ${{*: -1}} == /proc/self/fd/*/docker-network-policy.json ]]; then printf 'U %s\\n' {state_file} >> {audit_log}; fi\n"
+            f"exec {shutil.which('rm')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "rm").chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                PYTHONPATH=str(audit_dir),
+                FSYNC_AUDIT_LOG=str(audit_log),
+                STATE_FILE=str(state_file),
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("prior daemon.json restored", result.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        unlink = events.index(f"U {state_file}")
+        self.assertIn(f"F {checkpoint}", events[unlink + 1 :])
 
     def test_probe_failure_rolls_back_restarts_and_health_checks(self) -> None:
         prior = b'{"bip":"172.17.0.1/16","icc":false}\n'

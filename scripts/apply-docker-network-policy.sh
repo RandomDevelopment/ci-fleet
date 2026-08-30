@@ -25,10 +25,10 @@ checkpoint_dir=
 
 usage() {
   cat >&2 <<'EOF'
-usage: apply-docker-network-policy.sh --env PATH [--checkpoint PATH]
+usage: apply-docker-network-policy.sh --env PATH --checkpoint PATH
 
 --env PATH          path to the rendered ci-fleet env file (required)
---checkpoint PATH   directory to back up the prior daemon.json into
+--checkpoint PATH   directory for durable network-policy state (required)
 EOF
 }
 
@@ -97,8 +97,10 @@ elif create == "true":
     parent, leaf = os.path.split(path)
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        created = False
         try:
             os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+            created = True
         except OSError as exc:
             if exc.errno != errno.EEXIST:
                 raise
@@ -109,6 +111,8 @@ elif create == "true":
                 raise OSError
         finally:
             os.close(fd)
+        if created:
+            os.fsync(parent_fd)
     except OSError:
         raise SystemExit(1)
     finally:
@@ -190,14 +194,9 @@ env_file=$work_dir/ci-fleet.env
 
 # --- No-op when no network policy is rendered ---
 removing=false
+[[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
 if ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$env_file"; then
-  if [[ -z "$checkpoint_dir" ]]; then
-    printf 'NETWORK_POLICY_NOOP\n'
-    exit 0
-  fi
   removing=true
-else
-  [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required when a network policy is configured'
 fi
 
 # Validate the locked candidate snapshot before mutation.
@@ -297,7 +296,9 @@ resume_after_failed_drain() {
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     clear_managed_marker || resume_failed=1
   fi
-  [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
+  if ((resume_failed == 0 && health_failed == 0)); then
+    [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
+  fi
   rm -rf "$work_dir"
   if ((resume_failed)); then
     printf 'ERROR: %s; controller resume command failed\n' "$drain_failure" >&2
@@ -886,6 +887,7 @@ if [[ -f "$daemon_config" ]]; then
   had_prior=true
   cp -p "$daemon_config" "$backup_dir/$backup_name"
 fi
+snapshot_present=$had_prior
 rollback_source=$backup_dir/$backup_name
 if [[ "$managed_before" == true && -z "$prior_verified_generation" ]]; then
   rollback_source=$work_dir/daemon.json.durable-baseline
@@ -996,7 +998,7 @@ PY
 fi
 if [[ "$managed_before" == true ]]; then
   recovery_daemon=
-  [[ "$had_prior" != true ]] || recovery_daemon=$rollback_source
+  [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
   transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
 fi
 
@@ -1028,10 +1030,8 @@ rollback_on_exit() {
   local status=$?
   trap - EXIT INT TERM
   ((status != 0)) || status=1
-  if rollback_daemon >/dev/null 2>&1; then
-    if [[ "$managed_before" == false ]]; then
-      rm -f "$state_file"
-    fi
+  if rollback_daemon >/dev/null 2>&1 &&
+    { [[ "$managed_before" == true ]] || clear_managed_marker; }; then
     [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
@@ -1040,7 +1040,7 @@ rollback_on_exit() {
       recovery_path=$transaction_recovery
     else
       recovery_daemon=
-      [[ "$had_prior" != true ]] || recovery_daemon=$rollback_source
+      [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
       recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
         printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
         exit "$status"
@@ -1054,7 +1054,7 @@ rollback_on_exit() {
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 drain_controller 'drain command failed before network-policy apply'
-if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$had_prior" "$daemon_metadata"; then
+if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$snapshot_present" "$daemon_metadata"; then
   drain_failure='daemon.json changed during network-policy apply'
   exit 2
 fi
