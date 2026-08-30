@@ -36,84 +36,6 @@ die() {
   exit 2
 }
 
-while (($#)); do
-  case "$1" in
-    --env)
-      [[ $# -ge 2 ]] || die '--env requires a value'
-      env_file=$2
-      shift 2
-      ;;
-    --checkpoint)
-      [[ $# -ge 2 ]] || die '--checkpoint requires a value'
-      checkpoint_dir=$2
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      usage
-      die "unknown argument: $1"
-      ;;
-  esac
-done
-
-[[ -n "$env_file" ]] || die '--env is required'
-[[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] || die "rendered env must be a readable regular file: $env_file"
-env_owner=$(stat -c %u "$env_file")
-expected_env_owner=0
-[[ "$testing" != 1 ]] || expected_env_owner=$(id -u)
-[[ "$env_owner" == "$expected_env_owner" ]] || die "rendered env has an untrusted owner: $env_file"
-env_mode=$(stat -c %a "$env_file")
-(( (8#$env_mode & 8#022) == 0 )) || die "rendered env must not be group/world writable: $env_file"
-work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
-chmod 0700 "$work_dir"
-trap 'rm -rf "$work_dir"' EXIT
-install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
-env_file=$work_dir/ci-fleet.env
-
-# --- No-op when no network policy is rendered ---
-count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
-removing=false
-if [[ -z "$count" || "$count" == "0" ]]; then
-  if [[ -z "$checkpoint_dir" ]]; then
-    printf 'NETWORK_POLICY_NOOP\n'
-    exit 0
-  fi
-  removing=true
-else
-  [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required when a network policy is configured'
-fi
-
-# Validate the rendered policy before acquiring the installer lock.
-if [[ "$removing" == false ]]; then
-  desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
-import json, sys
-env_path, scripts_dir = sys.argv[1], sys.argv[2]
-sys.path.insert(0, scripts_dir)
-values = {}
-with open(env_path, encoding="utf-8") as handle:
-    for line in handle:
-        line = line.rstrip("\n")
-        if "=" in line and line:
-            key, _, value = line.partition("=")
-            values[key] = value
-from desired_state import render_docker_daemon_config
-print(json.dumps(render_docker_daemon_config(values)))
-PY
-  ) || die "daemon policy rendering failed"
-fi
-
-# --- Resolve required injected commands ---
-daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
-drain_command=${CI_FLEET_DOCKER_DRAIN_COMMAND:-}
-restart_command=${CI_FLEET_DOCKER_RESTART_COMMAND:-}
-resume_command=${CI_FLEET_CONTROLLER_RESUME_COMMAND:-}
-probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
-health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
-command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
-
 validate_trusted_path() {
   local name=$1 path=$2 kind=$3 allow_absent=${4:-false} create=${5:-false}
   python3 - "$path" "$kind" "$allow_absent" "$create" "$testing" "${CI_FLEET_ROOT_PREFIX:-}" <<'PY' ||
@@ -183,6 +105,80 @@ elif create == "true":
 PY
     die "$name must be a trusted root-owned path"
 }
+
+while (($#)); do
+  case "$1" in
+    --env)
+      [[ $# -ge 2 ]] || die '--env requires a value'
+      env_file=$2
+      shift 2
+      ;;
+    --checkpoint)
+      [[ $# -ge 2 ]] || die '--checkpoint requires a value'
+      checkpoint_dir=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$env_file" ]] || die '--env is required'
+expected_env_owner=0
+[[ "$testing" != 1 ]] || expected_env_owner=$(id -u)
+validate_trusted_path 'rendered env' "$env_file" regular
+work_dir=$(mktemp -d "${CI_FLEET_TEMP_DIR:-/tmp}/.ci-fleet-apply.XXXXXX")
+chmod 0700 "$work_dir"
+trap 'rm -rf "$work_dir"' EXIT
+install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
+env_file=$work_dir/ci-fleet.env
+
+# --- No-op when no network policy is rendered ---
+count=$(awk -F= '$1 == "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" {print substr($0, index($0, "=") + 1)}' "$env_file")
+removing=false
+if [[ -z "$count" || "$count" == "0" ]]; then
+  if [[ -z "$checkpoint_dir" ]]; then
+    printf 'NETWORK_POLICY_NOOP\n'
+    exit 0
+  fi
+  removing=true
+else
+  [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required when a network policy is configured'
+fi
+
+# Validate the rendered policy before acquiring the installer lock.
+if [[ "$removing" == false ]]; then
+  desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
+import json, sys
+env_path, scripts_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, scripts_dir)
+values = {}
+with open(env_path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.rstrip("\n")
+        if "=" in line and line:
+            key, _, value = line.partition("=")
+            values[key] = value
+from desired_state import render_docker_daemon_config
+print(json.dumps(render_docker_daemon_config(values)))
+PY
+  ) || die "daemon policy rendering failed"
+fi
+
+# --- Resolve required injected commands ---
+daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
+drain_command=${CI_FLEET_DOCKER_DRAIN_COMMAND:-}
+restart_command=${CI_FLEET_DOCKER_RESTART_COMMAND:-}
+resume_command=${CI_FLEET_CONTROLLER_RESUME_COMMAND:-}
+probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
+health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
+command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 
 validate_command() {
   local name=$1 path=$2

@@ -1148,6 +1148,49 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = json.loads((self.daemon_dir / "daemon.json").read_text(encoding="utf-8"))
         self.assertEqual(len(daemon["default-address-pools"]), 2)
 
+    def test_env_file_below_writable_parent_is_rejected_before_side_effects(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        untrusted_parent = Path(self.tmp) / "writable-parent"
+        untrusted_parent.mkdir()
+        untrusted_parent.chmod(0o777)
+        env_file = untrusted_parent / "ci-fleet.env"
+        env_file.write_text(
+            "".join(f"{key}={value}\n" for key, value in sorted(self._rendered_with_policy().items())),
+            encoding="utf-8",
+        )
+        env_file.chmod(0o600)
+        checkpoint = Path(self.tmp) / "checkpoint-untrusted-env-parent"
+        lock = Path(self.tmp) / "untrusted-env-parent.lock"
+        drain_marker = Path(self.tmp) / "untrusted-env-parent-drain.marker"
+        snapshot_marker = Path(self.tmp) / "untrusted-env-parent-snapshot.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        fake_bin = Path(self.tmp) / "untrusted-env-parent-bin"
+        fake_bin.mkdir()
+        install = fake_bin / "install"
+        install.write_text(
+            "#!/usr/bin/env bash\n"
+            f"touch {snapshot_marker}\n"
+            f"exec {shutil.which('install')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        install.chmod(0o755)
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock), PATH=f"{fake_bin}:{os.environ['PATH']}"),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted root-owned path", result.stderr)
+        self.assertFalse(snapshot_marker.exists())
+        self.assertFalse(checkpoint.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
+
     def test_renderer_failure_suppresses_private_stderr(self) -> None:
         daemon = self._write_daemon("{}\n")
         prior = daemon.read_bytes()
