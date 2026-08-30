@@ -56,6 +56,10 @@ class TrustedTagValidatorTests(unittest.TestCase):
         validate_job = self.text.split("\n  validate:\n", 1)[1]
         self.assertIn("    if: ${{ always() }}", validate_job.split("    steps:", 1)[0])
 
+    def test_repository_validation_runs_this_suite(self) -> None:
+        validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/test_workflow_tag_validation.py", validation)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

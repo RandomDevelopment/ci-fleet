@@ -79,7 +79,7 @@ CONVENTIONAL_HEADER = re.compile(
 # beginning with them is still recognized as footers by has_breaking_change().
 TRAILER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]")
 TRAILER_RE = re.compile(
-    r"^(?:" + TRAILER_TOKEN_RE.pattern + r": " + FOOTER_VALUE + r"|"
+    r"^(?:" + TRAILER_TOKEN_RE.pattern + r"(?:: | #)" + FOOTER_VALUE + r"|"
     + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|"
     + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
 )
@@ -419,7 +419,7 @@ def check_required_bump(
     parsed = parse_version(version)
     if parsed is None:
         return []
-    prior = latest_release_tag(workspace)
+    prior = latest_release_tag(workspace, base)
     if prior is None:
         return []
     required = suggest_bump(msg for _, msg in commit_messages(base, head, workspace=workspace))
@@ -431,10 +431,10 @@ def check_required_bump(
     def _bumped(level: str) -> bool:
         """True when the candidate implements exactly `level` over prior."""
         if level == "MAJOR":
-            return new_major > old_major
+            return new_major > old_major and (new_minor, new_patch) == (0, 0)
         if level == "MINOR":
             # MINOR keeps major and increases minor (0.y.z included).
-            return new_major == old_major and new_minor > old_minor
+            return new_major == old_major and new_minor > old_minor and new_patch == 0
         # PATCH: same major.minor, higher patch.
         return (new_major, new_minor) == (old_major, old_minor) and new_patch > old_patch
 

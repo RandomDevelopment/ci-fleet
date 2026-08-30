@@ -198,9 +198,9 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
             message = (
                 "feat: add guard rails\n"
                 "\n"
-                "\n" + opener +
-                "\nBREAKING CHANGE: the old flag is gone.\n"
-            ).replace("\n\n\n", "\n\n")
+                + opener
+                + "BREAKING CHANGE: the old flag is gone.\n"
+            )
             self.assertEqual(vc.validate_message(message), [], message)
             self.assertEqual(vc.bump_kind(message), "MAJOR", message)
 
@@ -572,6 +572,45 @@ class CliTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("MAJOR", result.stderr)
+
+    def test_required_bump_uses_release_base_for_prior_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            base_sha = self._commit(directory, "chore: bootstrap")
+            subprocess.run(
+                ["git", "-C", directory, "tag", "v0.1.0"], check=True,
+            )
+            head_sha = self._commit(directory, "fix: patch release")
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main", head_sha],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", directory, "tag", "v0.1.1", head_sha], check=True,
+            )
+            result = self._run(
+                "--version", "v0.1.1",
+                "--tag-commit", head_sha,
+                "--base", base_sha,
+                "--head", head_sha,
+                cwd=directory,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_required_bump_resets_lower_components(self) -> None:
+        for message, version in (
+            ("feat: add capability", "v1.3.9"),
+            ("feat!: replace contract", "v2.7.9"),
+        ):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                self._init_repo(directory)
+                base_sha = self._commit(directory, "chore: bootstrap")
+                subprocess.run(
+                    ["git", "-C", directory, "tag", "v1.2.7"], check=True,
+                )
+                head_sha = self._commit(directory, message)
+                result = vc.check_required_bump(version, base_sha, head_sha, directory)
+                self.assertTrue(result, f"{version} must reset lower components")
 
 
 class LowercaseDescriptionTests(unittest.TestCase):
