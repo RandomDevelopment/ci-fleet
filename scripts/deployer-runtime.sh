@@ -23,6 +23,7 @@ drained=$state_root/drained
 last_request=$state_root/last-request.conf
 consumed_root=$state_root/consumed-requests
 install_state=$state_root/install-state.json
+installed_policy=$state_root/active-policy.conf
 deployed_root=$state_root/deployed
 deployed_current=$deployed_root/current
 audit_log=$log_root/audit.log
@@ -127,6 +128,10 @@ deploy_exit() {
   fi
   if [[ ${audit_pending:-0} == 1 && ${last_request_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
     restore_encoded_file "$last_request" "$last_request_backup" 2>/dev/null || status=1
+  fi
+  if [[ ${audit_pending:-0} == 1 && -n ${snapshot_policy_backup:-} && -n ${snapshot_state_backup:-} && $state_root_safe == 1 ]]; then
+    restore_encoded_file "$installed_policy" "$snapshot_policy_backup" 2>/dev/null || status=1
+    restore_encoded_file "$install_state" "$snapshot_state_backup" 2>/dev/null || status=1
   fi
   rm -f "$active" "${active_temporary:-}" "${request_snapshot:-}" "${policy_snapshot:-}" || true
   sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || status=1
