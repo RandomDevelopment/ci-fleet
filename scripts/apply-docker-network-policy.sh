@@ -405,6 +405,20 @@ finally:
 PY
 }
 
+clear_managed_marker() {
+  checkpoint_path_is_pinned || return 1
+  python3 - "$state_file" <<'PY'
+import os, sys
+path = sys.argv[1]
+os.unlink(path)
+directory_fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+
 set_removal_pending() {
   checkpoint_path_is_pinned || return 1
   python3 - "$state_file" "$1" <<'PY'
@@ -478,9 +492,11 @@ PY
 
 if [[ "$removing" == true ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || die 'network-policy checkpoint state is invalid'
-  mapfile -t managed_state < <(python3 - "$state_file" <<'PY'
+  mapfile -t managed_state < <(python3 - "$state_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
+sys.path.insert(0, sys.argv[2])
+from desired_state import validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
 pending = {"phase", "removal_managed_default_address_pools"}
 schemas = (required, required | {"verified_generation"}, required | pending, required | pending | {"verified_generation"})
@@ -496,9 +512,14 @@ if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
 if not isinstance(state["prior_default_address_pools_present"], bool):
     raise SystemExit(1)
-if state["prior_default_address_pools_present"] and not state["prior_present"]:
-    raise SystemExit(1)
-if not state["prior_default_address_pools_present"] and state["prior_default_address_pools"] is not None:
+if state["prior_default_address_pools_present"]:
+    if not state["prior_present"]:
+        raise SystemExit(1)
+    validate_docker_address_pools(
+        state["prior_default_address_pools"],
+        path="checkpoint prior default address pools",
+    )
+elif state["prior_default_address_pools"] is not None:
     raise SystemExit(1)
 mode = state["prior_mode"]
 if state["prior_present"]:
@@ -510,14 +531,23 @@ print("true" if state["prior_present"] else "false")
 print(mode or "")
 print(generation or "")
 print("true" if is_pending else "false")
+print("true" if "verified_generation" in state else "false")
 PY
   ) || die 'network-policy checkpoint state is invalid'
-  [[ ${#managed_state[@]} == 4 ]] || die 'network-policy checkpoint state is invalid'
+  [[ ${#managed_state[@]} == 5 ]] || die 'network-policy checkpoint state is invalid'
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
+  removal_pending=${managed_state[3]}
+  has_verified_generation=${managed_state[4]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
+  fi
+  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$removal_pending" == false && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
+    clear_managed_marker || die 'failed to clear interrupted network-policy marker'
+    rm -rf "$work_dir"
+    printf 'NETWORK_POLICY_REMOVED\n'
+    exit 0
   fi
   [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
 

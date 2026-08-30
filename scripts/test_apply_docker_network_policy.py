@@ -2158,6 +2158,41 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("credential", combined)
         self.assertNotIn("restart-secret-error", combined)
 
+    def test_removal_clears_interrupted_first_apply_before_rename_without_commands(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        self.assertFalse(daemon.exists())
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-before-rename"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": None,
+                "prior_present": False,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        command_markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
+            marker = Path(self.tmp) / f"interrupted-before-rename-{name}.marker"
+            command_markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
+        self.assertFalse(state_file.exists())
+        self.assertFalse(daemon.exists())
+        self.assertFalse(any(marker.exists() for marker in command_markers))
+
     def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-non-object-removal"
@@ -2338,6 +2373,36 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertIn("network-policy checkpoint state is invalid", removed.stderr)
         self.assertNotIn("private-daemon-value", removed.stdout + removed.stderr)
         self.assertNotIn("192.0.2.0/24", removed.stdout + removed.stderr)
+
+    def test_removal_rejects_malformed_saved_pools_before_commands_or_mutation(self) -> None:
+        prior_pools = [{"base": "192.0.2.0/24", "size": 28}]
+        daemon = self._write_daemon(json.dumps({"default-address-pools": prior_pools}))
+        checkpoint = Path(self.tmp) / "checkpoint-malformed-saved-pools"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["prior_default_address_pools"] = [{"base": "not-a-cidr", "size": 29}]
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        managed = daemon.read_bytes()
+        command_markers = []
+        for name in ("drain.sh", "restart.sh", "probe.sh", "resume.sh", "health.sh"):
+            marker = Path(self.tmp) / f"malformed-saved-pools-{name}.marker"
+            command_markers.append(marker)
+            command = Path(self.tmp) / name
+            command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("network-policy checkpoint state is invalid", removed.stderr)
+        self.assertEqual(daemon.read_bytes(), managed)
+        self.assertFalse(any(marker.exists() for marker in command_markers))
 
     def test_managed_policy_removal_replaces_daemon_atomically(self) -> None:
         prior = b'{"icc":false}\n'

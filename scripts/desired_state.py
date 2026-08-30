@@ -139,31 +139,12 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     }
 
 
-def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, int, list[dict[str, Any]]]:
-    if not isinstance(policy, dict):
-        raise DesiredStateError(f"{path}: must be an object")
-    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
-    if set(policy) != required:
-        unknown = sorted(set(policy) - required)
-        missing = sorted(required - set(policy))
-        messages: list[str] = []
-        if missing:
-            messages.append(f"missing keys: {', '.join(missing)}")
-        if unknown:
-            messages.append(f"unknown keys: {', '.join(unknown)}")
-        raise DesiredStateError(f"{path}: " + "; ".join(messages))
-    reserve = policy.get("reserve_subnets")
-    if type(reserve) is not int or reserve < 1:
-        raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
-    networks_per_runner = policy.get("networks_per_runner")
-    if type(networks_per_runner) is not int or networks_per_runner < 1:
-        raise DesiredStateError(f"{path}.networks_per_runner: must be a positive integer")
-    pools = policy.get("default_address_pools")
+def validate_docker_address_pools(pools: Any, *, path: str) -> list[dict[str, Any]]:
     if type(pools) is not list or not pools:
-        raise DesiredStateError(f"{path}.default_address_pools: must be a non-empty list")
+        raise DesiredStateError(f"{path}: must be a non-empty list")
     parsed: list[dict[str, Any]] = []
     for index, pool in enumerate(pools):
-        pool_path = f"{path}.default_address_pools[{index}]"
+        pool_path = f"{path}[{index}]"
         if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
             raise DesiredStateError(f"{pool_path}: must contain only base and size")
         base = pool.get("base")
@@ -185,9 +166,30 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
         for right in range(left + 1, len(parsed)):
             other = parsed[right]
             if item["network"].overlaps(other["network"]):
-                raise DesiredStateError(
-                    f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}"
-                )
+                raise DesiredStateError(f"{path}[{left}].base: overlaps configured pool {right}")
+    return parsed
+
+
+def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        raise DesiredStateError(f"{path}: must be an object")
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
+    if set(policy) != required:
+        unknown = sorted(set(policy) - required)
+        missing = sorted(required - set(policy))
+        messages: list[str] = []
+        if missing:
+            messages.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            messages.append(f"unknown keys: {', '.join(unknown)}")
+        raise DesiredStateError(f"{path}: " + "; ".join(messages))
+    reserve = policy.get("reserve_subnets")
+    if type(reserve) is not int or reserve < 1:
+        raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
+    networks_per_runner = policy.get("networks_per_runner")
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        raise DesiredStateError(f"{path}.networks_per_runner: must be a positive integer")
+    parsed = validate_docker_address_pools(policy.get("default_address_pools"), path=f"{path}.default_address_pools")
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
     if configured < max_runners * networks_per_runner + reserve + 1:
         raise DesiredStateError(
