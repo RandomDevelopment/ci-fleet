@@ -56,7 +56,18 @@ mkdir "$uninstall_bin"
 for command in bash chmod dirname env find flock grep id install mkdir rm stat; do ln -s "$(command -v "$command")" "$uninstall_bin/$command"; done
 ln -s "$fake_bin/docker" "$uninstall_bin/docker"
 ln -s "$fake_bin/systemctl" "$uninstall_bin/systemctl"
+ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.service"
+ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.timer"
 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
+[[ ! -L $root/etc/systemd/system/ci-fleet-tester-health.service && ! -L $root/etc/systemd/system/ci-fleet-tester-health.timer ]] || fail 'uninstall left dangling tester unit symlinks'
+mv "$root/var/run/docker.sock" "$root/var/run/docker.real"
+ln -s docker.real "$root/var/run/docker.sock"
+if PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a symlinked Docker endpoint'; fi
+rm "$root/var/run/docker.sock"; mv "$root/var/run/docker.real" "$root/var/run/docker.sock"
+if FAKE_TESTER_DOCKER_ROOT=/remote/docker PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a Docker endpoint with the wrong managed root'; fi
+chmod 0666 "$root/var/run/docker.sock"
+if PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a world-writable Docker control socket'; fi
+chmod 0600 "$root/var/run/docker.sock"
 
 write_environment() {
   local id=$1 port=$2
@@ -69,6 +80,9 @@ write_environment() {
 }
 
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
+chmod 0666 "$root/var/run/docker.sock"
+if "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted a world-writable Docker control socket'; fi
+chmod 0600 "$root/var/run/docker.sock"
 [[ $(stat -c %a "$root/run/lock") == 1777 && $(stat -c %a "$root/run/lock/ci-fleet-tester") == 755 ]] || fail 'runtime changed shared lock-directory permissions'
 rm -rf "$root/run/lock/ci-fleet-tester"; mkdir "$tmp/lock-target"; chmod 700 "$tmp/lock-target"; ln -s "$tmp/lock-target" "$root/run/lock/ci-fleet-tester"
 if "$runtime" --check >/dev/null 2>&1; then fail 'symlinked lifecycle lock directory was accepted'; fi
@@ -127,6 +141,9 @@ if FAKE_TESTER_ROUTE_PORT=18094 "$runtime" --converge --environment bad-aliased-
 write_environment bad-flow-explicit-alias 18095
 printf '{x-key: &external-key include, ? *external-key : [{path: /root/other.yaml, env_file: /root/credential.env}], services: {}}\n' >"$root/etc/ci-fleet-tester/definitions/bad-flow-explicit-alias.yaml"
 if FAKE_TESTER_ROUTE_PORT=18095 "$runtime" --converge --environment bad-flow-explicit-alias >/dev/null 2>&1; then fail 'flow-form explicit aliased Compose include was accepted before rendering'; fi
+write_environment bad-anchored-key 18096
+printf '&external include: [{path: /root/other.yaml, env_file: /root/credential.env}]\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-anchored-key.yaml"
+if FAKE_TESTER_ROUTE_PORT=18096 "$runtime" --converge --environment bad-anchored-key >/dev/null 2>&1; then fail 'anchored Compose include key was accepted before rendering'; fi
 write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
@@ -140,6 +157,9 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='exited unhealthy' "
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
+for live_policy in privileged bind broad-port unbounded; do
+  if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
+done
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_GETENT_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed DNS probe'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CURL_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed HTTPS probe'; fi
@@ -190,6 +210,9 @@ for id in preview-a expired-a expired-b; do
 done
 "$runtime" --cleanup >/dev/null
 [[ ! -e $state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-a.state && ! -e $root/var/lib/ci-fleet-tester/environments/expired-b.state ]] || fail 'expired environment survived cleanup'
+if FAKE_TESTER_ORPHAN_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose container project'; fi
+if FAKE_TESTER_ORPHAN_VOLUME_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose volume project'; fi
+if FAKE_TESTER_ORPHAN_NETWORK_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose network project'; fi
 
 [[ ${CI_FLEET_TESTER_RUNTIME_ONLY:-0} != 1 ]] || { printf 'TESTER_RUNTIME_TESTS_OK\n'; exit 0; }
 

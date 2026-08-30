@@ -26,6 +26,16 @@ if [[ $1 == inspect ]]; then
     service=web
     [[ ${*: -1} != fixture-worker-id || ${FAKE_TESTER_DUPLICATE_SERVICE:-0} == 1 ]] || service=worker
     printf '%s %s\n' "$service" "${FAKE_TESTER_CONTAINER_IMAGE:-registry.example/example/app@sha256:$(printf 'a%.0s' {1..64})}"
+  elif [[ " $* " != *' --format '* ]]; then
+    privileged=false; nano_cpus=500000000; memory=134217728; pids_limit=128; mounts='[{"Type":"volume","Destination":"/data","RW":true}]'; ports=$(printf '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}")
+    case ${FAKE_TESTER_LIVE_POLICY:-valid} in
+      privileged) privileged=true ;;
+      bind) mounts='[{"Type":"bind","Source":"/","Destination":"/host"}]' ;;
+      broad-port) ports=$(printf '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}") ;;
+      unbounded) nano_cpus=0; memory=0; pids_limit=0 ;;
+    esac
+    if [[ ${*: -1} == fixture-worker-id ]]; then mounts='[]'; ports='{}'; fi
+    printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"PidsLimit":%s,"PortBindings":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$pids_limit" "$ports" "$mounts"
   else
     printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"
   fi

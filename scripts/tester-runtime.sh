@@ -126,7 +126,8 @@ key=r'(?:(?:!!str|!<[^>\n]+>)[ \t]+)?(?:include|label_file|"(?:include|label_fil
 explicit_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\?'
 escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
 alias_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\*[A-Za-z0-9_-]+[ \t]*:'
-if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text) or re.search(alias_key,text): raise SystemExit('Compose include, label_file, or indirect mapping key is forbidden')
+anchor_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)&[A-Za-z0-9_-]+[ \t]+'
+if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text) or re.search(alias_key,text) or re.search(anchor_key,text): raise SystemExit('Compose include, label_file, or indirect mapping key is forbidden')
 PY
   then return 1; fi
   if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
@@ -289,6 +290,53 @@ remove_environment() {
   report "REMOVED environment=$id"
 }
 
+reject_orphaned_projects() {
+  local kind inventory resource project format
+  local -a inspect_command
+  for kind in container volume network; do
+    case $kind in
+      container) inventory=$(docker ps -aq --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker inspect); format='{{index .Config.Labels "com.docker.compose.project"}}' ;;
+      volume) inventory=$(docker volume ls -q --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker volume inspect); format='{{index .Labels "com.docker.compose.project"}}' ;;
+      network) inventory=$(docker network ls -q --filter label=com.docker.compose.project) || die "Docker Compose $kind inventory could not be inspected"; inspect_command=(docker network inspect); format='{{index .Labels "com.docker.compose.project"}}' ;;
+    esac
+    while IFS= read -r resource; do
+      [[ -n $resource ]] || continue
+      project=$("${inspect_command[@]}" --format "$format" "$resource") || die "Docker Compose $kind identity could not be inspected"
+      [[ $project != ci-fleet-test-* ]] && continue
+      [[ $project =~ ^ci-fleet-test-([a-z0-9][a-z0-9-]{0,62})$ && -f $(state_path "${BASH_REMATCH[1]}") ]] || die "orphaned tester Compose project exists: $project"
+    done <<<"$inventory"
+  done
+}
+
+live_container_matches() {
+  local compose=$1 service=$2 resource=$3 inspection rc=0
+  inspection=$(mktemp)
+  if ! docker inspect "$resource" >"$inspection"; then rm -f "$inspection"; return 1; fi
+  python3 - "$compose" "$service" "$inspection" <<'PY' || rc=$?
+import json,sys
+model=json.load(open(sys.argv[1])); service=model['services'][sys.argv[2]]
+value=json.load(open(sys.argv[3])); actual=value[0] if len(value)==1 else {}; host=actual.get('HostConfig') or {}
+security=lambda values: sorted(str(value).replace('=true',':true') for value in values or [])
+expected_ports={}
+for port in service.get('ports',[]):
+    key=f"{int(port['target'])}/{port.get('protocol','tcp')}"
+    expected_ports.setdefault(key,[]).append({'HostIp':str(port.get('host_ip','')),'HostPort':str(port['published'])})
+expected_mounts=[(mount['type'],'',mount['target'],not mount.get('read_only',False)) for mount in service.get('volumes',[])]
+for secret in service.get('secrets',[]):
+    item={'source':secret,'target':secret} if isinstance(secret,str) else secret
+    expected_mounts.append(('bind',model['secrets'][item['source']]['file'],f"/run/secrets/{item.get('target',item['source'])}",False))
+expected_mounts=sorted(expected_mounts)
+actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
+valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
+       not host.get('CapAdd') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
+       host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
+       host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts)
+raise SystemExit(0 if valid else 1)
+PY
+  rm -f "$inspection"
+  return "$rc"
+}
+
 inspect_environment() {
   local target=$1 id compose route_service status=running resource value bytes=0 mount expected running_state service configured_image
   local -a containers=()
@@ -308,6 +356,7 @@ inspect_environment() {
     read -r service configured_image < <(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}} {{.Config.Image}}' "$resource")
     [[ -n $service ]] || { status=unhealthy; continue; }
     [[ -n ${expected_images[$service]:-} && $configured_image == "${expected_images[$service]}" ]] || status=unhealthy
+    live_container_matches "$compose" "$service" "$resource" || status=unhealthy
     observed_services[$service]=$((${observed_services[$service]:-0} + 1))
     if [[ $service == "$route_service" ]]; then
       [[ $running_state == 'running healthy' ]] || status=unhealthy
@@ -332,10 +381,13 @@ inspect_environment() {
 load_global
 docker_socket=$(root_path /var/run/docker.sock)
 if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
-  [[ -f $docker_socket && ! -L $docker_socket ]] || die 'local Docker socket is unavailable'
+  [[ -f $docker_socket ]] || die 'local Docker socket is unavailable'
 else
-  [[ -S $docker_socket && ! -L $docker_socket && $(stat -c %u "$docker_socket") == 0 ]] || die 'local root-owned Docker socket is unavailable'
+  [[ -S $docker_socket ]] || die 'local Docker socket is unavailable'
 fi
+socket_mode=$(stat -c %a "$docker_socket")
+[[ ! -L $docker_socket && $(stat -c %u "$docker_socket") == "$expected_uid" ]] || die 'local root-owned Docker socket is unavailable'
+(( (8#$socket_mode & 0002) == 0 )) || die 'local Docker socket is writable outside its administration group'
 unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$docker_socket"
 [[ $(docker info --format '{{.DockerRootDir}}') == "$(root_path /var/lib/docker)" ]] || die 'Docker daemon root is not the expected local path'
@@ -370,6 +422,7 @@ case $action in
         ((expires > now)) || remove_environment "$(basename "$target" .state)"
       ); then failed=1; fi
     done
+    reject_orphaned_projects
     ((failed == 0)) || die 'one or more expired environments could not be removed'
     report 'CLEANUP_OK'
     ;;

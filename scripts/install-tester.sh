@@ -88,10 +88,16 @@ acquire_lifecycle_lock() {
 }
 
 pin_local_docker() {
+  local socket_mode docker_context actual_root
   [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die 'Docker environment selectors are forbidden'
   unset DOCKER_CONTEXT
   export DOCKER_HOST="unix://$docker_socket"
   [[ -S $docker_socket || ( ${CI_FLEET_TESTING:-0} == 1 && -e $docker_socket ) ]] || die 'local Docker socket is unavailable'
+  socket_mode=$(stat -c %a "$docker_socket")
+  [[ ! -L $docker_socket && $(stat -c %u "$docker_socket") == "$expected_uid" ]] || die 'local root-owned Docker socket is unavailable'
+  (( (8#$socket_mode & 0002) == 0 )) || die 'local Docker socket is writable outside its administration group'
+  docker_context=$(docker context show); [[ $docker_context == default ]] || die 'tester requires the local default Docker context'
+  actual_root=$(docker info --format '{{.DockerRootDir}}'); [[ $actual_root == "$docker_root" ]] || die 'Docker root does not match the local managed root'
 }
 
 reject_managed_compose_resources() {
@@ -110,15 +116,13 @@ reject_managed_compose_resources() {
 }
 
 host_preflight() {
-  local os_release docker_context actual_root used
+  local os_release used
   os_release=$(root_path /etc/os-release)
   [[ -f $os_release ]] || die 'supported Debian os-release is missing'
   # shellcheck disable=SC1090
   . "$os_release"
   [[ ${ID:-} == debian && ${VERSION_ID:-} =~ ^[0-9]+$ && ${VERSION_ID%%.*} -ge 12 ]] || die 'tester hosts require Debian 12 or newer'
   pin_local_docker
-  docker_context=$(docker context show); [[ $docker_context == default ]] || die 'tester requires the local default Docker context'
-  actual_root=$(docker info --format '{{.DockerRootDir}}'); [[ $actual_root == "$docker_root" ]] || die 'Docker root does not match the local managed root'
   docker compose version >/dev/null
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
   docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
@@ -201,10 +205,10 @@ install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_la
 remove_units() {
   local unit present_units=() present_timers=()
   for unit in "${units[@]}"; do
-    [[ ! -e $systemd_dir/$unit ]] || present_units+=("$unit")
+    [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
   for unit in "${timers[@]}"; do
-    [[ ! -e $systemd_dir/$unit ]] || present_timers+=("$unit")
+    [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_timers+=("$unit")
   done
   if (( ${#present_timers[@]} )); then
     systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
