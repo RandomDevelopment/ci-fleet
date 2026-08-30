@@ -1339,6 +1339,58 @@ class ApplyScriptTests(unittest.TestCase):
         verified = json.loads(state_file.read_text(encoding="utf-8"))["verified_generation"]
         self.assertEqual(verified, hashlib.sha256((self.daemon_dir / "daemon.json").read_bytes()).hexdigest())
 
+    def test_rejects_overlapping_rendered_pools_before_lock_or_drain(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self._write_daemon(prior.decode())
+        self._write_success_commands()
+        rendered = self._rendered_with_policy()
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_1_BASE"] = "198.51.100.128/25"
+        env_file = self._write_env_file(rendered)
+        lock = Path(self.tmp) / "network-policy.lock"
+        drain_marker = Path(self.tmp) / "drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-overlap"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
+
+    def test_rejects_insufficient_rendered_capacity_before_lock_or_drain(self) -> None:
+        prior = b'{"bip":"172.17.0.1/16"}\n'
+        daemon = self._write_daemon(prior.decode())
+        self._write_success_commands()
+        rendered = self._rendered_with_policy()
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = "1"
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "198.51.100.0/28"
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE"] = "29"
+        env_file = self._write_env_file(rendered)
+        lock = Path(self.tmp) / "network-policy.lock"
+        drain_marker = Path(self.tmp) / "drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-capacity"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_INSTALLER_LOCK=str(lock)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
+        self.assertEqual(daemon.read_bytes(), prior)
+        self.assertFalse(lock.exists())
+        self.assertFalse(drain_marker.exists())
+
     def test_validates_policy_before_mutation(self) -> None:
         prior = b'{"bip":"172.17.0.1/16"}\n'
         daemon = self.daemon_dir / "daemon.json"

@@ -234,7 +234,17 @@ def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
         if size < network.prefixlen:
             raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count for {base!r}")
         pools.append({"base": base, "size": size})
-    return {"default-address-pools": [{"base": p["base"], "size": p["size"]} for p in pools]}
+    try:
+        policy = {
+            "default_address_pools": pools,
+            "networks_per_runner": int(rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"]),
+            "reserve_subnets": int(rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"]),
+        }
+        max_runners = 0 if rendered["CI_FLEET_CONTROLLER_STATE"] == "disabled" else int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("rendered Docker network policy fields must be present integers") from exc
+    validate_docker_network_policy(policy, path="rendered Docker network policy", max_runners=max_runners)
+    return {"default-address-pools": pools}
 
 
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -86,6 +86,25 @@ else
   [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required when a network policy is configured'
 fi
 
+# Validate the rendered policy before acquiring the installer lock.
+if [[ "$removing" == false ]]; then
+  desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
+import json, sys
+env_path, scripts_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, scripts_dir)
+values = {}
+with open(env_path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.rstrip("\n")
+        if "=" in line and line:
+            key, _, value = line.partition("=")
+            values[key] = value
+from desired_state import render_docker_daemon_config
+print(json.dumps(render_docker_daemon_config(values)))
+PY
+  ) || die "daemon policy rendering failed"
+fi
+
 # --- Resolve required injected commands ---
 daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
 drain_command=${CI_FLEET_DOCKER_DRAIN_COMMAND:-}
@@ -590,29 +609,6 @@ PY
   trap - EXIT INT TERM
   rm -rf "$work_dir"
   printf 'NETWORK_POLICY_REMOVED\n'
-  exit 0
-fi
-
-# --- Render desired daemon config block via shared validator ---
-desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
-import json, os, sys
-env_path, scripts_dir = sys.argv[1], sys.argv[2]
-sys.path.insert(0, scripts_dir)
-values = {}
-with open(env_path, encoding="utf-8") as handle:
-    for line in handle:
-        line = line.rstrip("\n")
-        if "=" in line and line:
-            key, _, value = line.partition("=")
-            values[key] = value
-from desired_state import render_docker_daemon_config
-print(json.dumps(render_docker_daemon_config(values)))
-PY
-) || die "daemon policy rendering failed"
-
-# Re-check: if rendering returned empty, treat as no-op.
-if [[ "$desired_pools_json" == "{}" ]]; then
-  printf 'NETWORK_POLICY_NOOP\n'
   exit 0
 fi
 
