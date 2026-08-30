@@ -398,17 +398,18 @@ PY
 }
 
 persist_recovery() {
+  local daemon_source=${1:-} env_source=${2:-$prior_env}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "$had_prior" "$backup_dir/$backup_name" "$prior_env" <<'PY'
+  python3 - "$state_file" "$daemon_source" "$env_source" <<'PY'
 import os, shutil, sys, tempfile
 
-state_path, had_prior, daemon_source, env_source = sys.argv[1:]
+state_path, daemon_source, env_source = sys.argv[1:]
 parent = os.path.dirname(state_path)
 staged = tempfile.mkdtemp(prefix=".recovery.", dir=parent)
 try:
     os.chmod(staged, 0o700)
     sources = [(env_source, "prior-ci-fleet.env")]
-    if had_prior == "true":
+    if daemon_source:
         sources.insert(0, (daemon_source, "daemon.json.before"))
     for source, name in sources:
         target = os.path.join(staged, name)
@@ -515,6 +516,8 @@ PY
   }
   managed_mode=$(stat -c %a "$daemon_config")
   managed_gid=$(stat -c %g "$daemon_config")
+  managed_snapshot=$work_dir/daemon.json.before
+  cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
 
   drain_controller 'drain command failed before network-policy removal'
   checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
@@ -559,7 +562,12 @@ PY
       rm -rf "$work_dir"
       printf 'ERROR: %s; managed daemon.json restored\n' "$removal_failure" >&2
     else
-      printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$removal_failure" "$work_dir" >&2
+      recovery_path=$(persist_recovery "$managed_snapshot" "$prior_env") || {
+        printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$removal_failure" >&2
+        exit "$status"
+      }
+      rm -rf "$work_dir"
+      printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$removal_failure" "$recovery_path" >&2
     fi
     exit "$status"
   }
@@ -697,6 +705,14 @@ restore_daemon() {
     atomic_replace_daemon "$backup_dir/$backup_name" "$daemon_mode" "$daemon_gid"
   else
     rm -f "$daemon_config"
+    python3 - "$daemon_dir" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
   fi
 }
 
@@ -724,7 +740,9 @@ rollback_on_exit() {
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
   else
-    recovery_path=$(persist_recovery) || {
+    recovery_daemon=
+    [[ "$had_prior" != true ]] || recovery_daemon=$backup_dir/$backup_name
+    recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
       printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
       exit "$status"
     }

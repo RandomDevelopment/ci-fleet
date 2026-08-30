@@ -1550,6 +1550,57 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
         self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
 
+    def test_absent_apply_rollback_fsyncs_daemon_dir_after_unlink(self) -> None:
+        self._write_success_commands()
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        audit_log = Path(self.tmp) / "absent-rollback-fsync.log"
+        audit_dir = Path(self.tmp) / "absent-rollback-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os\n"
+            "_fsync = os.fsync\n"
+            "_log = os.environ['FSYNC_AUDIT_LOG']\n"
+            "def fsync(fd):\n"
+            "    with open(_log, 'a', encoding='utf-8') as handle:\n"
+            "        handle.write('F ' + os.path.realpath(f'/proc/self/fd/{fd}') + '\\n')\n"
+            "    return _fsync(fd)\n"
+            "os.fsync = fsync\n",
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp) / "absent-rollback-bin"
+        fake_bin.mkdir()
+        (fake_bin / "rm").write_text(
+            "#!/usr/bin/env bash\n"
+            f"if [[ ${{*: -1}} == {self.daemon_dir / 'daemon.json'} ]]; then\n"
+            f"  {shutil.which('rm')} \"$@\"\n"
+            f"  printf 'U %s\\n' {self.daemon_dir / 'daemon.json'} >> {audit_log}\n"
+            "  exit\n"
+            "fi\n"
+            f"exec {shutil.which('rm')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "rm").chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(Path(self.tmp) / "checkpoint-absent-fsync"), "--env", str(env_file)],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                PYTHONPATH=str(audit_dir),
+                FSYNC_AUDIT_LOG=str(audit_log),
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("prior daemon.json restored", result.stderr)
+        events = audit_log.read_text(encoding="utf-8").splitlines()
+        unlink = events.index(f"U {self.daemon_dir / 'daemon.json'}")
+        self.assertIn(f"F {self.daemon_dir}", events[unlink + 1 :])
+
     def test_probe_failure_rolls_back_restarts_and_health_checks(self) -> None:
         prior = b'{"bip":"172.17.0.1/16","icc":false}\n'
         daemon = self.daemon_dir / "daemon.json"
@@ -2333,6 +2384,51 @@ class ApplyScriptTests(unittest.TestCase):
         state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "removal-pending")
         self.assertEqual(state["removal_managed_default_address_pools"], managed_pools)
+
+    def test_failed_removal_from_absent_baseline_persists_durable_recovery(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        self.assertFalse(daemon.exists())
+        checkpoint = Path(self.tmp) / "checkpoint-durable-removal-recovery"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        managed_pools = json.loads(managed)["default-address-pools"]
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        prior_env = self.installed_env.read_bytes()
+        restart_log = Path(self.tmp) / "durable-removal-restart.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(CI_FLEET_TEMP_DIR=self.tmp),
+            timeout=30,
+        )
+
+        self.assertNotEqual(removed.returncode, 0)
+        combined = removed.stdout + removed.stderr
+        recovery = Path(combined.rstrip().rsplit("recovery data retained at ", 1)[1])
+        for volatile in Path(self.tmp).glob(".ci-fleet-apply.*"):
+            shutil.rmtree(volatile)
+        self.assertEqual(recovery.parent, checkpoint)
+        self.assertEqual((recovery / "daemon.json.before").read_bytes(), managed)
+        self.assertEqual((recovery / "prior-ci-fleet.env").read_bytes(), prior_env)
+        state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "removal-pending")
+        self.assertEqual(state["removal_managed_default_address_pools"], managed_pools)
+        self.assertIsNone(state["verified_generation"])
 
     def test_removal_probe_failure_rolls_back_before_resume_health_or_marker_clear(self) -> None:
         daemon = self._write_daemon("{}\n")
