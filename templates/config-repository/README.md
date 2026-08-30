@@ -112,8 +112,9 @@ The validator totals the maximum capacity of every active or drained controller 
 
 For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
 subnet prefix `size`. The size must be no longer than `/29` and cannot be
-broader than its base. Pools must not overlap, and active or drained controllers
-must provide at least `max_runners * networks_per_runner + reserve_subnets + 1`
+broader than its base. A policy may declare at most 64 pools. Pools must not
+overlap, and active or drained controllers must provide at least
+`max_runners * networks_per_runner + reserve_subnets + 1`
 subnets. The final
 subnet is reserved for the persistent controller Compose network. Real pool
 values belong in the private configuration; this template uses RFC 5737

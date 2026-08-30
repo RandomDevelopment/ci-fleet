@@ -346,7 +346,13 @@ class ApplyScriptTests(unittest.TestCase):
         return env
 
     def _write_env_file(self, rendered: dict[str, str]) -> Path:
-        rendered = {"CI_FLEET_DESIRED_STATE_SCHEMA": "3", **rendered}
+        rendered = {
+            "CI_FLEET_CONFIGURED_MAX_RUNNERS": "1",
+            "CI_FLEET_CONTROLLER_STATE": "active",
+            "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
+            "CI_FLEET_MAX_RUNNERS": "1",
+            **rendered,
+        }
         path = Path(self.tmp) / "ci-fleet.env"
         path.write_text("".join(f"{k}={v}\n" for k, v in sorted(rendered.items())), encoding="utf-8")
         return path
@@ -471,6 +477,48 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "resume", "health"])
+
+    def test_leading_whitespace_policy_assignments_are_applied(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        rendered = self._rendered_with_policy()
+        env_file = Path(self.tmp) / "leading-whitespace-policy.env"
+        env_file.write_text(
+            "".join(
+                f"{'  ' if key.startswith('CI_FLEET_DOCKER_') else ''}{key}={value}\n"
+                for key, value in sorted(rendered.items())
+            ),
+            encoding="utf-8",
+        )
+        self._write_success_commands()
+
+        result = self._run(str(env_file))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("default-address-pools", json.loads(daemon.read_text(encoding="utf-8")))
+
+    def test_effective_capacity_mismatch_is_rejected_before_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        for configured in (True, False):
+            with self.subTest(configured=configured):
+                rendered = self._rendered_with_policy()
+                if not configured:
+                    rendered = {
+                        key: value
+                        for key, value in rendered.items()
+                        if not key.startswith("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_")
+                        and key not in {"CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"}
+                    }
+                rendered["CI_FLEET_MAX_RUNNERS"] = "1000"
+                env_file = self._write_env_file(rendered)
+                drain_marker = Path(self.tmp) / f"capacity-mismatch-{configured}.marker"
+                self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+
+                result = self._run(str(env_file), checkpoint_dir=str(Path(self.tmp) / f"checkpoint-capacity-{configured}"))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
+                self.assertFalse(drain_marker.exists())
 
     def test_rejects_missing_malformed_or_non_v3_schema_before_checkpoint_or_drain(self) -> None:
         self._write_daemon("{}\n")
@@ -1039,7 +1087,7 @@ class ApplyScriptTests(unittest.TestCase):
         result = self._run(str(env_file))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("network-policy fields are incomplete", result.stderr)
+        self.assertEqual(result.stderr, "ERROR: daemon policy rendering failed\n")
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertFalse(drain_marker.exists())
 
@@ -3551,8 +3599,7 @@ class ApplyScriptTests(unittest.TestCase):
         applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
         self.assertEqual(applied.returncode, 0, applied.stderr)
 
-        no_policy_env = Path(self.tmp) / "no-policy-atomic-removal.env"
-        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
         fake_bin = Path(self.tmp) / "fake-cp-bin"
         fake_bin.mkdir()
         fake_cp = fake_bin / "cp"
@@ -3966,8 +4013,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.installed_env.write_bytes(policy_env.read_bytes())
         state_file = checkpoint / "docker-network-policy.json"
-        no_policy_env = Path(self.tmp) / "no-policy-removal-resume.env"
-        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
         command_log = Path(self.tmp) / "removal-resume.log"
         self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
         for name in ("restart", "probe", "resume", "health"):
@@ -4141,8 +4187,7 @@ class ApplyScriptTests(unittest.TestCase):
                     command = Path(self.tmp) / name
                     command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
                     command.chmod(0o755)
-                no_policy_env = Path(self.tmp) / f"no-policy-{prior_present}.env"
-                no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+                no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
                 health = Path(self.tmp) / "health.sh"
                 health.write_text(
                     "#!/usr/bin/env bash\n"
@@ -4253,8 +4298,7 @@ class ApplyScriptTests(unittest.TestCase):
             encoding="utf-8",
         )
         health.chmod(0o755)
-        no_policy_env = Path(self.tmp) / "no-policy-failure.env"
-        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
 
         removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
 
@@ -4278,8 +4322,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         managed = daemon.read_bytes()
         self.installed_env.write_bytes(policy_env.read_bytes())
-        no_policy_env = Path(self.tmp) / "no-policy-removal-rollback.env"
-        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
         command_log = Path(self.tmp) / "removal-rollback-env.log"
         self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
         restart = Path(self.tmp) / "restart.sh"
@@ -4324,8 +4367,7 @@ class ApplyScriptTests(unittest.TestCase):
         health = Path(self.tmp) / "health.sh"
         health.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         health.chmod(0o755)
-        no_policy_env = Path(self.tmp) / "no-policy-marker-failure.env"
-        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
         audit_dir = Path(self.tmp) / "marker-failure-audit"
         audit_dir.mkdir()
         (audit_dir / "sitecustomize.py").write_text(

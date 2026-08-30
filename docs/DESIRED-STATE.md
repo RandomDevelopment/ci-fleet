@@ -47,8 +47,9 @@ Active and drained controllers reserve their configured maximum against the pool
 
 The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
 prefix `size` no longer than `/29`, which leaves enough addresses for an
-ordinary Compose network. Validation rejects malformed or overlapping pools,
-allocation prefixes broader than their base, and active or drained policies with fewer subnets than
+ordinary Compose network. A policy may declare at most 64 pools. Validation
+rejects malformed or overlapping pools, allocation prefixes broader than their
+base, and active or drained policies with fewer subnets than
 `max_runners * networks_per_runner + reserve_subnets + 1`. The final subnet is reserved for the
 persistent controller Compose network. Disabled controllers do not reserve
 runner subnet capacity, but their retained policy must still cover the reserve

@@ -204,34 +204,22 @@ if parse_env(Path(sys.argv[1]), allow_unknown=True).get("CI_FLEET_DESIRED_STATE_
 PY
   die 'rendered env must declare desired-state schema 3'
 
-# --- No-op when no network policy is rendered ---
-removing=false
-[[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
-if ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$env_file"; then
-  if grep -Eq '^CI_FLEET_DOCKER_(DEFAULT_ADDRESS_POOL_|NETWORKS_PER_RUNNER=|NETWORK_RESERVE_SUBNETS=)' "$env_file"; then
-    die 'rendered network-policy fields are incomplete'
-  fi
-  removing=true
-fi
-
 # Validate the locked candidate snapshot before mutation.
-if [[ "$removing" == false ]]; then
-  desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
+desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, sys
 env_path, scripts_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, scripts_dir)
-values = {}
-with open(env_path, encoding="utf-8") as handle:
-    for line in handle:
-        line = line.rstrip("\n")
-        if "=" in line and line:
-            key, _, value = line.partition("=")
-            values[key] = value
-from desired_state import render_docker_daemon_config
+from pathlib import Path
+from desired_state import parse_env, render_docker_daemon_config
+values = parse_env(Path(env_path), allow_unknown=True)
 print(json.dumps(render_docker_daemon_config(values)))
 PY
-  ) || die "daemon policy rendering failed"
-fi
+) || die "daemon policy rendering failed"
+
+# --- No-op when no network policy is rendered ---
+removing=false
+[[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
+[[ "$desired_pools_json" != '{}' ]] || removing=true
 
 # --- Resolve required injected commands ---
 daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
