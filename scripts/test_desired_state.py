@@ -232,6 +232,20 @@ class DesiredStateTests(unittest.TestCase):
         )
         self.assertEqual((configured, reserve, networks_per_runner), (6, 1, 2))
 
+    def test_docker_network_policy_rejects_more_than_64_pools_before_overlap_checks(self) -> None:
+        policy = {
+            "networks_per_runner": 1,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/24", "size": 29}] * 65,
+        }
+
+        with self.assertRaisesRegex(DesiredStateError, "must not exceed 64"):
+            validate_docker_network_policy(
+                policy,
+                path="$.controllers.example-ci-01.docker_network_policy",
+                max_runners=1,
+            )
+
     def test_disabled_docker_network_policy_keeps_reserve_and_controller_capacity(self) -> None:
         configured, _, _, _ = validate_docker_network_policy(
             {

@@ -59,6 +59,7 @@ FORBIDDEN_DIRECTORIES = {"credentials", "private", "secrets"}
 RFC_5737_NETWORKS = tuple(
     ipaddress.ip_network(value) for value in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
 )
+MAX_DOCKER_ADDRESS_POOLS = 64
 
 
 class Validation:
@@ -178,6 +179,11 @@ def validate_docker_network_policy(
     pools = policy["default_address_pools"]
     if type(pools) is not list or not pools:
         validation.errors.append(f"{path}.default_address_pools: must be a non-empty list")
+        return 0, 0, []
+    if len(pools) > MAX_DOCKER_ADDRESS_POOLS:
+        validation.errors.append(
+            f"{path}.default_address_pools: must not exceed {MAX_DOCKER_ADDRESS_POOLS} pools"
+        )
         return 0, 0, []
     parsed: list[dict[str, Any]] = []
     for index, pool in enumerate(pools):

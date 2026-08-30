@@ -192,6 +192,18 @@ trap 'rm -rf "$work_dir"' EXIT
 install -m 0600 -- "$env_file" "$work_dir/ci-fleet.env"
 env_file=$work_dir/ci-fleet.env
 
+python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY' ||
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+from desired_state import parse_env
+
+if parse_env(Path(sys.argv[1]), allow_unknown=True).get("CI_FLEET_DESIRED_STATE_SCHEMA") != "3":
+    raise SystemExit(1)
+PY
+  die 'rendered env must declare desired-state schema 3'
+
 # --- No-op when no network policy is rendered ---
 removing=false
 [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
@@ -729,12 +741,11 @@ PY
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
-  removal_pending=${managed_state[3]}
   has_verified_generation=${managed_state[4]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
-  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$removal_pending" == false && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
+  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
     run_command "$restart_command" "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
     run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
@@ -1200,7 +1211,11 @@ if [[ "$managed_before" == true ]]; then
     transaction_recovery=$interrupted_recovery
   else
     recovery_daemon=
-    [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
+    if [[ "$apply_removal_pending" == true ]]; then
+      recovery_daemon=$rollback_source
+    elif [[ "$snapshot_present" == true ]]; then
+      recovery_daemon=$backup_dir/$backup_name
+    fi
     transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
   fi
 else

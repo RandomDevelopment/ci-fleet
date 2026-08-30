@@ -346,6 +346,7 @@ class ApplyScriptTests(unittest.TestCase):
         return env
 
     def _write_env_file(self, rendered: dict[str, str]) -> Path:
+        rendered = {"CI_FLEET_DESIRED_STATE_SCHEMA": "3", **rendered}
         path = Path(self.tmp) / "ci-fleet.env"
         path.write_text("".join(f"{k}={v}\n" for k, v in sorted(rendered.items())), encoding="utf-8")
         return path
@@ -470,6 +471,37 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "restart", "probe", "resume", "health"])
+
+    def test_rejects_missing_malformed_or_non_v3_schema_before_checkpoint_or_drain(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        for configured in (True, False):
+            for label, schema in (("missing", None), ("malformed", "three"), ("non-v3", "2")):
+                with self.subTest(configured=configured, schema=label):
+                    checkpoint = Path(self.tmp) / f"checkpoint-schema-{configured}-{label}"
+                    drain_marker = Path(self.tmp) / f"drain-schema-{configured}-{label}.marker"
+                    self.drain_command.write_text(
+                        f"#!/usr/bin/env bash\ntouch {drain_marker}\n",
+                        encoding="utf-8",
+                    )
+                    rendered = self._rendered_with_policy() if configured else {"CI_FLEET_INSTANCE": "example-ci-01"}
+                    if schema is None:
+                        rendered.pop("CI_FLEET_DESIRED_STATE_SCHEMA", None)
+                        env_file = Path(self.tmp) / f"schema-{configured}-{label}.env"
+                        env_file.write_text(
+                            "".join(f"{key}={value}\n" for key, value in sorted(rendered.items())),
+                            encoding="utf-8",
+                        )
+                    else:
+                        rendered["CI_FLEET_DESIRED_STATE_SCHEMA"] = schema
+                        env_file = self._write_env_file(rendered)
+
+                    result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("schema 3", result.stderr)
+                    self.assertFalse(checkpoint.exists())
+                    self.assertFalse(drain_marker.exists())
 
     def test_failed_apply_restarts_resumes_then_checks_rollback_health(self) -> None:
         self._write_daemon("{}\n")
@@ -3520,7 +3552,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
 
         no_policy_env = Path(self.tmp) / "no-policy-atomic-removal.env"
-        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
         fake_bin = Path(self.tmp) / "fake-cp-bin"
         fake_bin.mkdir()
         fake_cp = fake_bin / "cp"
@@ -3579,6 +3611,71 @@ class ApplyScriptTests(unittest.TestCase):
         rolled_back_state = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertNotIn("phase", rolled_back_state)
         self.assertNotIn("removal_managed_default_address_pools", rolled_back_state)
+
+    def test_pending_removal_with_absent_daemon_completes_runtime_verification(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-pending-removal-absent-daemon"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = json.loads(
+            daemon.read_text(encoding="utf-8")
+        )["default-address-pools"]
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.unlink()
+        command_log = Path(self.tmp) / "pending-removal-absent-daemon.log"
+        for name in ("restart", "probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(removed.stdout, "NETWORK_POLICY_REMOVED\n")
+        self.assertFalse(state_file.exists())
+        self.assertFalse(daemon.exists())
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["restart", "probe", "resume", "health"],
+        )
+
+    def test_apply_from_pending_removal_persists_synthesized_rollback_daemon(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-pending-removal-apply-recovery"
+        self._write_success_commands()
+        policy = self._rendered_with_policy()
+        policy_env = self._write_env_file(policy)
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed_pools = json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"]
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = managed_pools
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.unlink()
+        changed_policy = dict(policy)
+        changed_policy["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        changed_env = self._write_env_file(changed_policy)
+        (Path(self.tmp) / "restart.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "restart.sh").chmod(0o755)
+
+        retried = self._run(str(changed_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(retried.returncode, 0)
+        recovery = next(checkpoint.glob("recovery.*"))
+        recovered_daemon = json.loads((recovery / "daemon.json.before").read_text(encoding="utf-8"))
+        self.assertEqual(recovered_daemon["default-address-pools"], managed_pools)
 
     def test_configured_apply_resumes_removal_pending_checkpoint(self) -> None:
         daemon = self._write_daemon('{"live-restore":true}\n')
@@ -3870,7 +3967,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.installed_env.write_bytes(policy_env.read_bytes())
         state_file = checkpoint / "docker-network-policy.json"
         no_policy_env = Path(self.tmp) / "no-policy-removal-resume.env"
-        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
         command_log = Path(self.tmp) / "removal-resume.log"
         self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
         for name in ("restart", "probe", "resume", "health"):
@@ -4045,7 +4142,7 @@ class ApplyScriptTests(unittest.TestCase):
                     command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
                     command.chmod(0o755)
                 no_policy_env = Path(self.tmp) / f"no-policy-{prior_present}.env"
-                no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+                no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
                 health = Path(self.tmp) / "health.sh"
                 health.write_text(
                     "#!/usr/bin/env bash\n"
@@ -4157,7 +4254,7 @@ class ApplyScriptTests(unittest.TestCase):
         )
         health.chmod(0o755)
         no_policy_env = Path(self.tmp) / "no-policy-failure.env"
-        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
 
         removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
 
@@ -4182,7 +4279,7 @@ class ApplyScriptTests(unittest.TestCase):
         managed = daemon.read_bytes()
         self.installed_env.write_bytes(policy_env.read_bytes())
         no_policy_env = Path(self.tmp) / "no-policy-removal-rollback.env"
-        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
         command_log = Path(self.tmp) / "removal-rollback-env.log"
         self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
         restart = Path(self.tmp) / "restart.sh"
@@ -4228,7 +4325,7 @@ class ApplyScriptTests(unittest.TestCase):
         health.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         health.chmod(0o755)
         no_policy_env = Path(self.tmp) / "no-policy-marker-failure.env"
-        no_policy_env.write_text("CI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
+        no_policy_env.write_text("CI_FLEET_DESIRED_STATE_SCHEMA=3\nCI_FLEET_INSTANCE=example-ci-01\n", encoding="utf-8")
         audit_dir = Path(self.tmp) / "marker-failure-audit"
         audit_dir.mkdir()
         (audit_dir / "sitecustomize.py").write_text(

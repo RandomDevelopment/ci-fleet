@@ -143,6 +143,8 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
 def validate_docker_address_pools(pools: Any, *, path: str) -> list[dict[str, Any]]:
     if type(pools) is not list or not pools:
         raise DesiredStateError(f"{path}: must be a non-empty list")
+    if len(pools) > MAX_DOCKER_ADDRESS_POOLS:
+        raise DesiredStateError(f"{path}: must not exceed {MAX_DOCKER_ADDRESS_POOLS} pools")
     parsed: list[dict[str, Any]] = []
     for index, pool in enumerate(pools):
         pool_path = f"{path}[{index}]"
