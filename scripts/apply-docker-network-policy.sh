@@ -313,7 +313,7 @@ resume_after_failed_drain() {
   fi
   ((resume_failed != 0)) || run_command "$resume_command" --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
-  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true || "$apply_phase" == first-apply-pending ]]; then
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     complete_first_apply_rollback || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$removal_checkpoint_started" == true ]]; then
@@ -323,7 +323,7 @@ resume_after_failed_drain() {
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$apply_checkpoint_started" == true ]]; then
     set_verified_generation "$prior_verified_generation" || resume_failed=1
   fi
-  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" != true && "$apply_phase" != first-apply-pending && "$cancelling_first_apply" != true ]]; then
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" != true && -z "$apply_phase" && "$cancelling_first_apply" != true ]]; then
     clear_recovery_artifacts || resume_failed=1
   fi
   rm -rf "$work_dir"
@@ -849,8 +849,7 @@ PY
     controller_resumed=true
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
-    clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
-    clear_managed_marker "$work_dir/daemon.json.removal" || die 'failed to clear interrupted network-policy marker'
+    complete_first_apply_rollback || die 'failed to complete interrupted network-policy rollback'
     trap - EXIT INT TERM
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_REMOVED\n'
@@ -1018,10 +1017,14 @@ PY
       rm -rf "$work_dir"
       printf 'ERROR: %s; managed daemon.json restored\n' "$removal_failure" >&2
     else
-      recovery_path=$(persist_recovery "$managed_snapshot" "$prior_env") || {
-        printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$removal_failure" >&2
-        exit "$status"
-      }
+      if [[ -n "$transaction_recovery" ]]; then
+        recovery_path=$transaction_recovery
+      else
+        recovery_path=$(persist_recovery "$managed_snapshot" "$prior_env") || {
+          printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$removal_failure" >&2
+          exit "$status"
+        }
+      fi
       rm -rf "$work_dir"
       printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$removal_failure" "$recovery_path" >&2
     fi

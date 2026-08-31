@@ -6,7 +6,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/python3" <<'EOF'
 #!/usr/bin/env bash
-printf 'controller=%s\n' "${CI_FLEET_CONTROLLER-}"
+printf 'instance=%s\n' "${CI_FLEET_INSTANCE-}"
 printf 'stale=%s\n' "${CI_FLEET_STALE-unset}"
 printf 'testing=%s\n' "${CI_FLEET_TESTING-}"
 printf 'testing_present=%s\n' "${CI_FLEET_TESTING+set}"
@@ -23,7 +23,7 @@ printf 'args=%s\n' "$*"
 EOF
 chmod +x "$tmp/bin/python3"
 cat >"$tmp/candidate.env" <<EOF
-CI_FLEET_CONTROLLER=candidate
+CI_FLEET_INSTANCE=candidate
 CI_FLEET_TESTING=candidate
 CI_FLEET_ROOT_PREFIX=$tmp/candidate-root
 CI_FLEET_DOCKER_SOCKET=$tmp/candidate-docker.sock
@@ -33,7 +33,7 @@ EOF
 
 output=$(env -i \
   "PATH=$tmp/bin:$PATH" \
-  CI_FLEET_CONTROLLER=stale \
+  CI_FLEET_INSTANCE=stale \
   CI_FLEET_STALE=stale \
   CI_FLEET_TESTING=1 \
   "CI_FLEET_ROOT_PREFIX=$tmp/root" \
@@ -42,7 +42,7 @@ output=$(env -i \
   CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1 \
   "$repo_root/scripts/healthcheck.sh" --env "$tmp/candidate.env")
 
-grep -Fqx 'controller=candidate' <<<"$output"
+grep -Fqx 'instance=candidate' <<<"$output"
 grep -Fqx 'stale=unset' <<<"$output"
 grep -Fqx 'testing=1' <<<"$output"
 grep -Fqx 'testing_present=set' <<<"$output"
@@ -59,10 +59,10 @@ grep -Fqx "args=$repo_root/scripts/health.py local --monitoring-config $tmp/root
 
 output=$(env -i \
   "PATH=$tmp/bin:$PATH" \
-  CI_FLEET_CONTROLLER=stale \
+  CI_FLEET_INSTANCE=stale \
   "$repo_root/scripts/healthcheck.sh" --env "$tmp/candidate.env")
 
-grep -Fqx 'controller=candidate' <<<"$output"
+grep -Fqx 'instance=candidate' <<<"$output"
 grep -Fqx 'testing=' <<<"$output"
 grep -Fqx 'testing_present=' <<<"$output"
 grep -Fqx 'root_prefix=' <<<"$output"

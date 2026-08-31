@@ -29,6 +29,33 @@ HOST_REQUIRED = {
     "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE",
 }
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
+RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
+    "CI_FLEET_CAPACITY_BUDGET",
+    "CI_FLEET_COMMIT",
+    "CI_FLEET_CONFIGURED_MAX_RUNNERS",
+    "CI_FLEET_CONFIG_REF",
+    "CI_FLEET_CONFIG_REPOSITORY",
+    "CI_FLEET_CONTROLLER_IMAGE",
+    "CI_FLEET_CONTROLLER_STATE",
+    "CI_FLEET_DESIRED_STATE_SCHEMA",
+    "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT",
+    "CI_FLEET_DOCKER_GID",
+    "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
+    "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
+    "CI_FLEET_ENGINE_REF",
+    "CI_FLEET_GITHUB_URL",
+    "CI_FLEET_INSTANCE",
+    "CI_FLEET_LABELS",
+    "CI_FLEET_MAX_RUNNERS",
+    "CI_FLEET_MIN_RUNNERS",
+    "CI_FLEET_RUNNER_CPUS",
+    "CI_FLEET_RUNNER_GROUP",
+    "CI_FLEET_RUNNER_IMAGE",
+    "CI_FLEET_RUNNER_MEMORY_MIB",
+    "CI_FLEET_SCALE_SET_NAME",
+    "CI_FLEET_STATUS_REPORTING_REQUIRED",
+    "CI_FLEET_VERSION",
+}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
 DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
@@ -111,6 +138,21 @@ def parse_env(path: Path, *, allow_unknown: bool) -> dict[str, str]:
             raise DesiredStateError(f"{path}:{number}: unsupported host-local variable {name}")
         values[name] = value
     return values
+
+
+def rendered_env_names(values: dict[str, str]) -> set[str]:
+    names = set(RENDERED_ENV_NAMES)
+    try:
+        count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
+    except ValueError:
+        count = 0
+    if 0 < count <= MAX_DOCKER_ADDRESS_POOLS:
+        names.update(
+            f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_{field}"
+            for index in range(count)
+            for field in ("BASE", "SIZE")
+        )
+    return names
 
 
 def validate_host_values(values: dict[str, str]) -> dict[str, str]:
@@ -380,6 +422,8 @@ def build_rendered_env(
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if reporting_required:
         rendered["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+    if set(rendered) - rendered_env_names(rendered):
+        raise DesiredStateError("renderer produced unsupported environment fields")
     for name, value in rendered.items():
         if not SAFE_ENV_VALUE.fullmatch(value):
             raise DesiredStateError(f"rendered value for {name} contains unsafe characters")

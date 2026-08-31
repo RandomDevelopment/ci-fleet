@@ -34,14 +34,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[2])
-from desired_state import parse_env
+from desired_state import parse_env, rendered_env_names
 
 values = parse_env(Path(sys.argv[1]), allow_unknown=True)
 invalid = next((name for name in values if not name.startswith("CI_FLEET_")), None)
 if invalid is not None:
     raise SystemExit(f"ERROR: rendered environment variable must start with CI_FLEET_: {invalid}")
+allowed = rendered_env_names(values)
 for name, value in values.items():
-    if name.startswith("CI_FLEET_HEALTH_"):
+    if name not in allowed:
         continue
     sys.stdout.buffer.write(name.encode() + b"\0" + value.encode() + b"\0")
 PY

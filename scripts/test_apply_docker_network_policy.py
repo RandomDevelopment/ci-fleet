@@ -203,15 +203,15 @@ class HealthcheckScriptTests(unittest.TestCase):
             root = Path(tmp)
             installed = root / "etc" / "ci-fleet" / "ci-fleet.env"
             installed.parent.mkdir(parents=True)
-            installed.write_text("CI_FLEET_ENV_MARKER=stale\n", encoding="utf-8")
+            installed.write_text("CI_FLEET_INSTANCE=stale\n", encoding="utf-8")
             candidate = root / "candidate.env"
-            candidate.write_text("CI_FLEET_ENV_MARKER=candidate\n", encoding="utf-8")
+            candidate.write_text("CI_FLEET_INSTANCE=candidate\n", encoding="utf-8")
             fake_bin = root / "bin"
             fake_bin.mkdir()
             python = fake_bin / "python3"
             python.write_text(
                 "#!/usr/bin/env bash\n"
-                "[[ ${CI_FLEET_ENV_MARKER:-} == candidate ]] || exit 1\n",
+                "[[ ${CI_FLEET_INSTANCE:-} == candidate ]] || exit 1\n",
                 encoding="utf-8",
             )
             python.chmod(0o755)
@@ -286,6 +286,41 @@ class HealthcheckScriptTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "[[ ${CI_FLEET_INSTANCE:-} == candidate ]]\n"
                 "[[ -z ${CI_FLEET_HEALTH_DISK_WARN_PERCENT+x} ]]\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                CI_FLEET_TESTING="1",
+                CI_FLEET_ROOT_PREFIX=tmp,
+                PATH=f"{fake_bin}:{env['PATH']}",
+            )
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_selected_env_does_not_export_non_rendered_runtime_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate.env"
+            candidate.write_text(
+                "CI_FLEET_INSTANCE=candidate\nCI_FLEET_CONTROLLER_CONTAINER=wrong-controller\n",
+                encoding="utf-8",
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ ${CI_FLEET_INSTANCE:-} == candidate ]]\n"
+                "[[ -z ${CI_FLEET_CONTROLLER_CONTAINER+x} ]]\n",
                 encoding="utf-8",
             )
             python.chmod(0o755)
@@ -3940,6 +3975,46 @@ class ApplyScriptTests(unittest.TestCase):
             ],
         )
 
+    def test_absent_first_apply_cleanup_commits_before_recovery_deletion(self) -> None:
+        checkpoint = Path(self.tmp) / "checkpoint-absent-first-apply-cleanup-crash"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending", recovery=True)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(prior_mode=None, prior_present=False)
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        (checkpoint / "recovery.interrupted" / "daemon.json.before").unlink()
+        self._write_success_commands()
+        audit_dir = Path(self.tmp) / "absent-first-apply-cleanup-crash-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, shutil, signal\n"
+            "_rmtree = shutil.rmtree\n"
+            "def rmtree(path, *args, **kwargs):\n"
+            "    result = _rmtree(path, *args, **kwargs)\n"
+            "    if os.path.basename(path).startswith('recovery.'):\n"
+            "        os.kill(os.getppid(), signal.SIGKILL)\n"
+            "    return result\n"
+            "shutil.rmtree = rmtree\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        interrupted = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(checkpoint),
+                "--env",
+                str(no_policy_env),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["phase"], "rollback-complete")
+
     def test_interrupted_first_apply_failed_candidate_resume_redrains_before_prior_resume(self) -> None:
         checkpoint = Path(self.tmp) / "checkpoint-interrupted-resume-failure"
         checkpoint.mkdir(mode=0o700)
@@ -4028,6 +4103,51 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertTrue(state_file.exists())
         self.assertTrue(recovery.exists())
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
+
+    def test_configured_first_apply_retry_failed_drain_preserves_recovery(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        checkpoint = Path(self.tmp) / "checkpoint-configured-first-apply-drain-failure"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending", recovery=True)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(prior_mode=None, prior_present=False)
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        recovery = checkpoint / "recovery.interrupted"
+        (recovery / "daemon.json.before").unlink()
+        self._write_success_commands()
+        self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        env_file = self._write_env_file(rendered)
+
+        retried = self._run(str(env_file), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(retried.returncode, 0)
+        self.assertTrue(state_file.exists())
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["phase"], "first-apply-pending")
+        self.assertTrue(recovery.exists())
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), render_docker_daemon_config(rendered))
+
+    def test_configured_pending_retry_failed_drain_preserves_recovery(self) -> None:
+        rendered = self._rendered_with_policy()
+        managed = render_docker_daemon_config(rendered)
+        env_file = self._write_env_file(rendered)
+        for phase in ("reapply-pending", "removal-pending"):
+            with self.subTest(phase=phase):
+                self._write_daemon(json.dumps(managed))
+                checkpoint = Path(self.tmp) / f"checkpoint-configured-{phase}-drain-failure"
+                state_file = self._seed_checkpoint(checkpoint, phase, recovery=True)
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                if phase == "removal-pending":
+                    state["removal_managed_default_address_pools"] = managed["default-address-pools"]
+                    state_file.write_text(json.dumps(state), encoding="utf-8")
+                recovery = checkpoint / "recovery.interrupted"
+                self._write_success_commands()
+                self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+
+                retried = self._run(str(env_file), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+                self.assertNotEqual(retried.returncode, 0)
+                self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["phase"], phase)
+                self.assertTrue(recovery.exists())
 
     def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -4544,7 +4664,9 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertNotEqual(removed.returncode, 0)
         self.assertIn("rollback verification failed; recovery data retained at", removed.stderr)
-        recovery = next(checkpoint.glob("recovery.*"))
+        recoveries = list(checkpoint.glob("recovery.*"))
+        self.assertEqual(len(recoveries), 1)
+        recovery = recoveries[0]
         self.assertEqual((recovery / "daemon.json.before").read_bytes(), managed)
         self.assertEqual((recovery / "prior-ci-fleet.env").read_bytes(), prior_env)
         retained_state = json.loads(state_file.read_text(encoding="utf-8"))
