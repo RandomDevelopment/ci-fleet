@@ -254,7 +254,7 @@ validate_trusted_path 'checkpoint directory' "$checkpoint_dir" checkpoint true
 [[ "$daemon_config" != "$checkpoint_dir" && "$daemon_config" != "$checkpoint_dir/"* ]] || die 'daemon config must be outside checkpoint directory'
 checkpoint_state=$checkpoint_dir/docker-network-policy.json
 [[ "$removing" != true || ! -L "$checkpoint_state" ]] || die 'network-policy checkpoint state is invalid'
-if [[ "$removing" == true && ( ! -e "$checkpoint_dir" || ! -e "$checkpoint_state" ) ]]; then
+if [[ "$removing" == true && ! -e "$checkpoint_dir" ]]; then
   printf 'NETWORK_POLICY_NOOP\n'
   exit 0
 fi
@@ -301,6 +301,8 @@ controller_resumed=false
 transaction_recovery=
 removal_checkpoint_started=false
 apply_checkpoint_started=false
+apply_phase=
+cancelling_first_apply=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
   local status=$? resume_failed=0 health_failed=0
@@ -311,17 +313,18 @@ resume_after_failed_drain() {
   fi
   ((resume_failed != 0)) || run_command "$resume_command" --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
-  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
-    clear_managed_marker || resume_failed=1
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true || "$apply_phase" == first-apply-pending ]]; then
+    complete_first_apply_rollback || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$removal_checkpoint_started" == true ]]; then
-    set_verified_generation "$prior_verified_generation" clear-removal || resume_failed=1
+    restored_generation=$(file_generation "$daemon_config") || resume_failed=1
+    ((resume_failed != 0)) || set_verified_generation "$restored_generation" clear-removal || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$apply_checkpoint_started" == true ]]; then
     set_verified_generation "$prior_verified_generation" || resume_failed=1
   fi
-  if ((resume_failed == 0 && health_failed == 0)); then
-    [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" != true && "$apply_phase" != first-apply-pending && "$cancelling_first_apply" != true ]]; then
+    clear_recovery_artifacts || resume_failed=1
   fi
   rm -rf "$work_dir"
   if ((resume_failed)); then
@@ -508,6 +511,12 @@ state = json.load(open(path, encoding="utf-8"))
 if action == "clear-removal":
     state.pop("phase", None)
     state.pop("removal_managed_default_address_pools", None)
+elif action in ("reapply-pending", "rollback-complete"):
+    state["phase"] = action
+    state.pop("removal_managed_default_address_pools", None)
+if generation:
+    state.pop("phase", None)
+    state.pop("removal_managed_default_address_pools", None)
 state["verified_generation"] = generation or None
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -654,20 +663,23 @@ clear_recovery_artifacts() {
 import os, shutil, stat, sys
 
 parent, owner = sys.argv[1], int(sys.argv[2])
+recoveries = []
 for entry in os.scandir(parent):
-    if not entry.name.startswith("recovery."):
+    if not entry.name.startswith(("recovery.", ".recovery.")):
         continue
+    recoveries.append(entry.path)
     metadata = entry.stat(follow_symlinks=False)
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise SystemExit(1)
     files = {child.name: child for child in os.scandir(entry.path)}
-    if set(files) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
+    if not set(files) <= {"daemon.json.before", "prior-ci-fleet.env"}:
         raise SystemExit(1)
     for child in files.values():
         metadata = child.stat(follow_symlinks=False)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o600:
             raise SystemExit(1)
-    shutil.rmtree(entry.path)
+for recovery in recoveries:
+    shutil.rmtree(recovery)
 parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
 try:
     os.fsync(parent_fd)
@@ -675,6 +687,80 @@ finally:
     os.close(parent_fd)
 PY
 }
+
+complete_first_apply_rollback() {
+  set_verified_generation "" rollback-complete || return 1
+  clear_recovery_artifacts || return 1
+  clear_managed_marker || return 1
+  transaction_recovery=
+}
+
+authoritative_recovery() {
+  python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY'
+import os, stat, sys
+parent, owner = sys.argv[1], int(sys.argv[2])
+recoveries = [entry for entry in os.scandir(parent) if entry.name.startswith("recovery.")]
+if len(recoveries) != 1:
+    raise SystemExit(1)
+recovery = recoveries[0]
+metadata = recovery.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit(1)
+entries = {entry.name: entry for entry in os.scandir(recovery.path)}
+if set(entries) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
+    raise SystemExit(1)
+for entry in entries.values():
+    metadata = entry.stat(follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(1)
+print(f"{recovery.path}|{'true' if 'daemon.json.before' in entries else 'false'}")
+PY
+}
+
+# Retire states whose recovery can no longer be consumed before any fast path.
+checkpoint_phase=absent
+if [[ -e "$state_file" ]]; then
+  checkpoint_phase=$(
+    python3 - "$state_file" "$repo_root/scripts" <<'PY'
+import json, re, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+phase = state.get("phase")
+generation = state.get("verified_generation")
+if phase is not None and generation is not None:
+    raise SystemExit(1)
+required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
+if phase == "rollback-complete":
+    if set(state) != required | {"phase", "verified_generation"} or state["managed"] is not True:
+        raise SystemExit(1)
+    if not isinstance(state["prior_present"], bool) or not isinstance(state["prior_default_address_pools_present"], bool):
+        raise SystemExit(1)
+    if state["prior_default_address_pools_present"]:
+        sys.path.insert(0, sys.argv[2])
+        from desired_state import validate_docker_address_pools
+        validate_docker_address_pools(state["prior_default_address_pools"], path="checkpoint prior default address pools")
+    elif state["prior_default_address_pools"] is not None:
+        raise SystemExit(1)
+    if state["prior_present"] != (state["prior_mode"] is not None):
+        raise SystemExit(1)
+if phase in ("first-apply-pending", "reapply-pending", "removal-pending", "rollback-complete") and generation is None:
+    print(phase)
+elif phase is None and isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation):
+    print("verified")
+else:
+    print("active")
+PY
+  ) || die 'network-policy checkpoint state is invalid'
+fi
+if [[ "$checkpoint_phase" == absent || "$checkpoint_phase" == rollback-complete ]]; then
+  clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
+fi
+if [[ "$checkpoint_phase" == rollback-complete ]]; then
+  clear_managed_marker || die 'failed to clear completed network-policy marker'
+fi
+if [[ "$removing" == true && ! -e "$state_file" ]]; then
+  printf 'NETWORK_POLICY_NOOP\n'
+  exit 0
+fi
 
 if [[ "$removing" == true ]]; then
   [[ -f "$state_file" && ! -L "$state_file" ]] || die 'network-policy checkpoint state is invalid'
@@ -685,23 +771,29 @@ sys.path.insert(0, sys.argv[2])
 from desired_state import validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
 pending = {"phase", "removal_managed_default_address_pools"}
-schemas = (required, required | {"verified_generation"}, required | pending, required | pending | {"verified_generation"})
-if set(state) not in schemas or state["managed"] is not True:
+phase = state.get("phase")
+if state["managed"] is not True:
     raise SystemExit(1)
-is_pending = "phase" in state
-if is_pending and (
-    state["phase"] != "removal-pending"
-    or state["removal_managed_default_address_pools"] is not None
+if phase == "removal-pending":
+    if set(state) != required | pending | {"verified_generation"} or (
+        state["removal_managed_default_address_pools"] is not None
     and not isinstance(state["removal_managed_default_address_pools"], list)
-):
+    ):
+        raise SystemExit(1)
+elif phase == "first-apply-pending":
+    if set(state) != required | {"phase", "verified_generation"}:
+        raise SystemExit(1)
+elif phase is not None or set(state) not in (required, required | {"verified_generation"}):
     raise SystemExit(1)
-if is_pending and state["removal_managed_default_address_pools"] is not None:
+if phase == "removal-pending" and state["removal_managed_default_address_pools"] is not None:
     validate_docker_address_pools(
         state["removal_managed_default_address_pools"],
         path="checkpoint removal managed default address pools",
     )
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
+    raise SystemExit(1)
+if "verified_generation" in state and generation is None and phase is None:
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
@@ -725,7 +817,7 @@ elif mode is not None:
 print("true" if state["prior_present"] else "false")
 print(mode or "")
 print(generation or "")
-print("true" if is_pending else "false")
+print(phase or "")
 print("true" if "verified_generation" in state else "false")
 PY
   ) || die 'network-policy checkpoint state is invalid'
@@ -733,10 +825,21 @@ PY
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
-  removal_pending=${managed_state[3]}
+  removal_phase=${managed_state[3]}
+  removal_pending=false
+  [[ "$removal_phase" != removal-pending ]] || removal_pending=true
   has_verified_generation=${managed_state[4]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
+  fi
+  [[ "$checkpoint_phase" != verified ]] || clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
+  if [[ "$removal_phase" == first-apply-pending || "$removal_pending" == true ]]; then
+    recovery_info=$(authoritative_recovery) || die 'network-policy transaction recovery is invalid'
+    IFS='|' read -r transaction_recovery _ <<<"$recovery_info"
+    prior_env=$transaction_recovery/prior-ci-fleet.env
+  fi
+  if [[ "$removal_phase" == first-apply-pending ]]; then
+    cancelling_first_apply=true
   fi
   absent_removal_recovery=false
   if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" && "$removal_pending" != true ]]; then
@@ -837,8 +940,11 @@ PY
     }
   fi
 
-  set_removal_pending "$managed_daemon" || { rm -rf "$work_dir"; die 'failed to persist network-policy removal state'; }
-  removal_checkpoint_started=true
+  if [[ "$cancelling_first_apply" != true ]]; then
+    [[ -n "$transaction_recovery" ]] || transaction_recovery=$(persist_recovery "$managed_snapshot" "$prior_env") || { rm -rf "$work_dir"; die 'failed to persist network-policy transaction recovery'; }
+    set_removal_pending "$managed_daemon" || { rm -rf "$work_dir"; die 'failed to persist network-policy removal state'; }
+    removal_checkpoint_started=true
+  fi
   if [[ "$absent_removal_recovery" != true ]]; then
     drain_controller 'drain command failed before network-policy removal'
     if daemon_changed_since_snapshot "$managed_snapshot" true "$managed_metadata"; then
@@ -897,7 +1003,7 @@ PY
     if ((failed == 0)); then
       daemon_pools_match "$managed_daemon" || failed=1
     fi
-    if ((failed == 0)); then
+    if ((failed == 0)) && [[ "$cancelling_first_apply" != true ]]; then
       set_verified_generation "$prior_verified_generation" clear-removal || failed=1
     fi
     return "$failed"
@@ -949,8 +1055,10 @@ PY
   run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
   run_command "$probe_command" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   controller_resumed=true
-  run_command "$resume_command" --env "$env_file" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
-  run_health "$env_file" || { removal_failure='health check failed after network-policy removal'; exit 2; }
+  activation_env=$env_file
+  [[ "$cancelling_first_apply" != true ]] || activation_env=$prior_env
+  run_command "$resume_command" --env "$activation_env" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
+  run_health "$activation_env" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 
   # Marker deletion commits removal. Ignore catchable signals across the atomic
   # unlink so failure still rolls back and success cannot leave a stale marker.
@@ -968,13 +1076,12 @@ if (
 ):
     raise SystemExit(1)
 PY
-  if ! clear_recovery_artifacts; then
-    removal_failure='failed to clear obsolete network-policy recovery data'
-    exit 2
-  fi
-  if ! clear_managed_marker "$removal_daemon"; then
-    removal_failure='failed to clear network-policy managed marker'
-    exit 2
+  if [[ "$cancelling_first_apply" == true ]]; then
+    trap - EXIT
+    complete_first_apply_rollback || { removal_failure='failed to complete interrupted first-apply rollback'; exit 2; }
+  else
+    clear_recovery_artifacts || { removal_failure='failed to clear obsolete network-policy recovery data'; exit 2; }
+    clear_managed_marker "$removal_daemon" || { removal_failure='failed to clear network-policy managed marker'; exit 2; }
   fi
   trap - EXIT INT TERM
   rm -rf "$work_dir"
@@ -1033,19 +1140,27 @@ state = json.load(open(sys.argv[1], encoding="utf-8"))
 sys.path.insert(0, sys.argv[2])
 from desired_state import validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
-pending = {"phase", "removal_managed_default_address_pools"}
-if set(state) not in (required, required | {"verified_generation"}, required | pending, required | pending | {"verified_generation"}) or state["managed"] is not True:
+phase = state.get("phase")
+extra = set(state) - required - {"verified_generation", "phase", "removal_managed_default_address_pools"}
+if extra or not required <= set(state) or state["managed"] is not True:
     raise SystemExit(1)
-is_pending = "phase" in state
-if is_pending and state["phase"] != "removal-pending":
+if phase == "removal-pending":
+    if "removal_managed_default_address_pools" not in state:
+        raise SystemExit(1)
+elif phase in ("first-apply-pending", "reapply-pending"):
+    if "removal_managed_default_address_pools" in state:
+        raise SystemExit(1)
+elif phase is not None or "removal_managed_default_address_pools" in state:
     raise SystemExit(1)
-if is_pending and state["removal_managed_default_address_pools"] is not None:
+if phase == "removal-pending" and state["removal_managed_default_address_pools"] is not None:
     validate_docker_address_pools(
         state["removal_managed_default_address_pools"],
         path="checkpoint removal managed default address pools",
     )
 generation = state.get("verified_generation")
 if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
+    raise SystemExit(1)
+if "verified_generation" in state and generation is None and phase is None:
     raise SystemExit(1)
 if not isinstance(state["prior_present"], bool):
     raise SystemExit(1)
@@ -1066,13 +1181,14 @@ if state["prior_present"]:
 elif state["prior_mode"] is not None:
     raise SystemExit(1)
 print(
-    f"{generation or ''}|{'true' if is_pending else 'false'}|"
-    f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}"
+    f"{generation or ''}|{'true' if phase == 'removal-pending' else 'false'}|"
+    f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}|{phase or ''}"
 )
 PY
   ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode <<<"$apply_checkpoint_state"
+  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode apply_phase <<<"$apply_checkpoint_state"
   managed_before=true
+  [[ "$checkpoint_phase" != verified ]] || clear_recovery_artifacts || { rm -rf "$work_dir"; die 'failed to clear obsolete network-policy recovery data'; }
 fi
 
 daemon_matches=false
@@ -1094,34 +1210,14 @@ fi
 
 # --- Use the staged source snapshot for transactional rollback ---
 interrupted_recovery=
-if [[ "$managed_before" == true && -z "$prior_verified_generation" ]]; then
-  recovery_info=$(python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY'
-import os, stat, sys
-parent, owner = sys.argv[1], int(sys.argv[2])
-recoveries = [entry for entry in os.scandir(parent) if entry.name.startswith("recovery.")]
-if not recoveries:
-    print("|")
-    raise SystemExit
-if len(recoveries) != 1:
-    raise SystemExit(1)
-recovery = recoveries[0]
-metadata = recovery.stat(follow_symlinks=False)
-if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
-    raise SystemExit(1)
-entries = {entry.name: entry for entry in os.scandir(recovery.path)}
-if set(entries) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
-    raise SystemExit(1)
-for entry in entries.values():
-    metadata = entry.stat(follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise SystemExit(1)
-print(f"{recovery.path}|{'true' if 'daemon.json.before' in entries else 'false'}")
-PY
-  ) || { rm -rf "$work_dir"; die 'network-policy transaction recovery is invalid'; }
+if [[ "$managed_before" == true && -n "$apply_phase" && -z "$prior_verified_generation" ]]; then
+  recovery_info=$(authoritative_recovery) || { rm -rf "$work_dir"; die 'network-policy transaction recovery is invalid'; }
   IFS='|' read -r interrupted_recovery recovery_present <<<"$recovery_info"
   if [[ -n "$interrupted_recovery" ]]; then
-    had_prior=$recovery_present
     prior_env=$interrupted_recovery/prior-ci-fleet.env
+  fi
+  if [[ "$recovery_present" == true ]]; then
+    had_prior=true
     rollback_source=$interrupted_recovery/daemon.json.before
   else
     rollback_source=$work_dir/daemon.json.durable-baseline
@@ -1201,8 +1297,25 @@ PY
   fi
 }
 
-# Record the original host state before the first drain. The marker lets a
-# later no-policy reconciliation resume a controller interrupted by the drain.
+if [[ "$managed_before" == true ]]; then
+  if [[ -n "$interrupted_recovery" ]]; then
+    transaction_recovery=$interrupted_recovery
+  else
+    recovery_daemon=
+    if [[ "$apply_removal_pending" == true ]]; then
+      recovery_daemon=$rollback_source
+    elif [[ "$snapshot_present" == true ]]; then
+      recovery_daemon=$backup_dir/$backup_name
+    fi
+    transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+  fi
+else
+  recovery_daemon=
+  [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
+  transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
+fi
+
+# Recovery is authoritative before the pending marker becomes visible.
 if [[ "$managed_before" == false ]]; then
   python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" "$repo_root/scripts" 2>/dev/null <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
@@ -1215,6 +1328,7 @@ if prior_key_present:
     validate_docker_address_pools(prior["default-address-pools"], path="existing daemon default address pools")
 state = {
     "managed": True,
+    "phase": "first-apply-pending",
     "prior_default_address_pools": prior.get("default-address-pools") if prior_key_present else None,
     "prior_default_address_pools_present": prior_key_present,
     "prior_mode": sys.argv[3] if sys.argv[2] == "true" else None,
@@ -1241,23 +1355,6 @@ finally:
 PY
   new_marker=true
 fi
-if [[ "$managed_before" == true ]]; then
-  if [[ -n "$interrupted_recovery" ]]; then
-    transaction_recovery=$interrupted_recovery
-  else
-    recovery_daemon=
-    if [[ "$apply_removal_pending" == true ]]; then
-      recovery_daemon=$rollback_source
-    elif [[ "$snapshot_present" == true ]]; then
-      recovery_daemon=$backup_dir/$backup_name
-    fi
-    transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
-  fi
-else
-  recovery_daemon=
-  [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
-  transaction_recovery=$(persist_recovery "$recovery_daemon" "$prior_env") || die 'failed to persist network-policy transaction recovery'
-fi
 
 rollback_daemon() {
   local failed=0
@@ -1279,8 +1376,9 @@ rollback_daemon() {
   if ((failed == 0)); then
     daemon_pools_match "$rollback_source" || failed=1
   fi
-  if [[ "$managed_before" == true && "$failed" == 0 ]]; then
-    set_verified_generation "$prior_verified_generation" || failed=1
+  if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
+    restored_generation=$(file_generation "$daemon_config") || failed=1
+    ((failed != 0)) || set_verified_generation "$restored_generation" || failed=1
   fi
   return "$failed"
 }
@@ -1291,9 +1389,13 @@ rollback_on_exit() {
   trap '' INT TERM
   trap - EXIT
   ((status != 0)) || status=1
-  if rollback_daemon >/dev/null 2>&1 &&
-    { [[ "$managed_before" == true ]] || clear_managed_marker; }; then
-    [[ -z "$transaction_recovery" ]] || rm -rf "$transaction_recovery"
+  if rollback_daemon >/dev/null 2>&1 && {
+    if [[ "$new_marker" == true || "$apply_phase" == first-apply-pending ]]; then
+      complete_first_apply_rollback
+    else
+      clear_recovery_artifacts
+    fi
+  }; then
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
   else
@@ -1314,8 +1416,8 @@ rollback_on_exit() {
 }
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
-if [[ "$managed_before" == true ]]; then
-  set_verified_generation "" || die 'failed to mark network-policy verification pending'
+if [[ "$managed_before" == true && -z "$apply_phase" ]]; then
+  set_verified_generation "" reapply-pending || die 'failed to mark network-policy verification pending'
   apply_checkpoint_started=true
 fi
 drain_controller 'drain command failed before network-policy apply'

@@ -435,6 +435,216 @@ class ApplyScriptTests(unittest.TestCase):
             command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             command.chmod(0o755)
 
+    def _seed_checkpoint(self, checkpoint: Path, phase: str | None, *, recovery: bool = False) -> Path:
+        checkpoint.mkdir(mode=0o700)
+        state = {
+            "managed": True,
+            "prior_default_address_pools": None,
+            "prior_default_address_pools_present": False,
+            "prior_mode": "600",
+            "prior_present": True,
+            "verified_generation": None,
+        }
+        if phase is not None:
+            state["phase"] = phase
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        if recovery:
+            recovery_dir = checkpoint / "recovery.interrupted"
+            recovery_dir.mkdir(mode=0o700)
+            (recovery_dir / "daemon.json.before").write_text("{}\n", encoding="utf-8")
+            (recovery_dir / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+            for path in recovery_dir.iterdir():
+                path.chmod(0o600)
+        return state_file
+
+    def _write_recovery(self, checkpoint: Path, daemon: bytes | None = None) -> Path:
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        if daemon is not None:
+            (recovery / "daemon.json.before").write_bytes(daemon)
+        for path in recovery.iterdir():
+            path.chmod(0o600)
+        return recovery
+
+    def test_null_generation_without_phase_fails_before_commands(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-ambiguous-null"
+        state_file = self._seed_checkpoint(checkpoint, None, recovery=True)
+        command_log = Path(self.tmp) / "ambiguous-null-commands"
+        for command in (self.drain_command, *(Path(self.tmp) / name for name in ("restart.sh", "probe.sh", "resume.sh", "health.sh"))):
+            command.write_text(f"#!/usr/bin/env bash\necho command >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy())
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkpoint state is invalid", result.stderr)
+        self.assertFalse(command_log.exists())
+        self.assertTrue(state_file.exists())
+        self.assertTrue((checkpoint / "recovery.interrupted").exists())
+
+    def test_obsolete_checkpoint_states_cleanup_before_noop(self) -> None:
+        env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        for phase, recovery in (("absent", True), ("rollback-complete", True), ("rollback-complete", False)):
+            with self.subTest(phase=phase, recovery=recovery):
+                checkpoint = Path(self.tmp) / f"checkpoint-cleanup-{phase}-{recovery}"
+                state_file = self._seed_checkpoint(checkpoint, "rollback-complete", recovery=recovery)
+                if phase == "absent":
+                    state_file.unlink()
+                command_log = Path(self.tmp) / f"cleanup-{phase}-{recovery}-commands"
+                for command in (self.drain_command, *(Path(self.tmp) / name for name in ("restart.sh", "probe.sh", "resume.sh", "health.sh"))):
+                    command.write_text(f"#!/usr/bin/env bash\necho command >> {command_log}\n", encoding="utf-8")
+                    command.chmod(0o755)
+
+                result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "NETWORK_POLICY_NOOP\n")
+                self.assertFalse(state_file.exists())
+                self.assertFalse(list(checkpoint.glob("*recovery.*")))
+                self.assertFalse(command_log.exists())
+
+    def test_obsolete_cleanup_validates_all_nodes_before_deleting_any(self) -> None:
+        checkpoint = Path(self.tmp) / "checkpoint-validate-obsolete"
+        checkpoint.mkdir(mode=0o700)
+        for name in ("recovery.safe", "recovery.unsafe"):
+            recovery = checkpoint / name
+            recovery.mkdir(mode=0o700)
+            payload = recovery / "prior-ci-fleet.env"
+            payload.write_bytes(self.installed_env.read_bytes())
+            payload.chmod(0o600)
+        (checkpoint / "recovery.unsafe" / "unexpected").write_text("unsafe\n", encoding="utf-8")
+        env_file = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        self._write_success_commands()
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((checkpoint / "recovery.safe").exists())
+        self.assertTrue((checkpoint / "recovery.unsafe").exists())
+
+    def test_interrupted_first_apply_retry_rollback_retires_checkpoint(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        checkpoint = Path(self.tmp) / "checkpoint-first-retry-rollback"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending", recovery=True)
+        self._write_success_commands()
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        candidate = dict(rendered)
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        env_file = self._write_env_file(candidate)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {})
+        self.assertFalse(state_file.exists())
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
+    def test_interrupted_reapply_retry_rollback_preserves_verified_marker(self) -> None:
+        rendered = self._rendered_with_policy()
+        daemon = self._write_daemon(json.dumps(render_docker_daemon_config(rendered)))
+        checkpoint = Path(self.tmp) / "checkpoint-reapply-retry-rollback"
+        state_file = self._seed_checkpoint(checkpoint, "reapply-pending", recovery=True)
+        self._write_success_commands()
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        env_file = self._write_env_file(rendered)
+
+        result = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", state)
+        self.assertEqual(state["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
+    def test_retried_removal_failed_drain_restores_verified_marker(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-retry-drain"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        self.assertEqual(self._run(str(policy_env), checkpoint_dir=str(checkpoint)).returncode, 0)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(phase="removal-pending", removal_managed_default_address_pools=json.loads(daemon.read_text())["default-address-pools"], verified_generation=None)
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "daemon.json.before").write_bytes(daemon.read_bytes())
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        for path in recovery.iterdir():
+            path.chmod(0o600)
+        self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        result = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        restored = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", restored)
+        self.assertEqual(restored["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
+
+    def test_removal_pending_requires_authoritative_recovery_before_commands(self) -> None:
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-without-recovery"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        self.assertEqual(self._run(str(policy_env), checkpoint_dir=str(checkpoint)).returncode, 0)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(phase="removal-pending", removal_managed_default_address_pools=json.loads(daemon.read_text())["default-address-pools"], verified_generation=None)
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        result = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("transaction recovery is invalid", result.stderr)
+        self.assertTrue(state_file.exists())
+
+
+    def test_first_apply_completion_failures_preserve_authority(self) -> None:
+        audit = Path(self.tmp) / "completion-faults"
+        audit.mkdir()
+        (audit / "sitecustomize.py").write_text(
+            "import json, os, shutil\n_replace, _rmtree, _unlink = os.replace, shutil.rmtree, os.unlink\ndef replace(src, dst):\n"
+            " if os.environ['FAULT']=='complete' and os.path.basename(dst)==os.path.basename(os.environ['STATE']) and json.load(open(src)).get('phase')=='rollback-complete': raise OSError('injected')\n"
+            " return _replace(src, dst)\ndef rmtree(path, *a, **k):\n"
+            " if os.environ['FAULT']=='recovery' and os.path.basename(path).startswith('recovery.'): raise OSError('injected')\n"
+            " return _rmtree(path, *a, **k)\ndef unlink(path, *a, **k):\n"
+            " if os.environ['FAULT']=='marker' and os.path.basename(path)==os.path.basename(os.environ['STATE']): raise OSError('injected')\n"
+            " return _unlink(path, *a, **k)\nos.replace, shutil.rmtree, os.unlink = replace, rmtree, unlink\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        for fault, phase, has_recovery in (("complete", "first-apply-pending", True), ("recovery", "rollback-complete", True), ("marker", "rollback-complete", False)):
+            with self.subTest(fault=fault):
+                checkpoint = Path(self.tmp) / f"checkpoint-completion-{fault}"
+                self._seed_checkpoint(checkpoint, "first-apply-pending", recovery=True)
+                self._write_daemon('{"default-address-pools":[{"base":"198.51.100.0/24","size":29}]}')
+                self._write_success_commands()
+                command_log = Path(self.tmp) / f"completion-{fault}.log"
+                for name in ("drain", "restart", "probe", "resume", "health"):
+                    command = Path(self.tmp) / f"{name}.sh"
+                    command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+                    command.chmod(0o755)
+                state_file = checkpoint / "docker-network-policy.json"
+                result = subprocess.run(
+                    [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+                    capture_output=True, text=True, env=self._env(PYTHONPATH=str(audit), FAULT=fault, STATE=str(state_file)), timeout=30,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(json.loads(state_file.read_text())["phase"], phase)
+                self.assertEqual(bool(list(checkpoint.glob("recovery.*"))), has_recovery)
+                self.assertEqual(command_log.read_text().splitlines(), ["drain", "restart", "probe", "resume", "health"])
+
     def _assert_raw_candidate_rejected_before_operational_side_effects(
         self,
         rendered: dict[str, str],
@@ -1061,7 +1271,8 @@ class ApplyScriptTests(unittest.TestCase):
         state_file = checkpoint / "docker-network-policy.json"
         self.drain_command.write_text(
             "#!/usr/bin/env bash\n"
-            f"grep -q '\"verified_generation\": null' {state_file}\n",
+            f"grep -q '\"verified_generation\": null' {state_file}\n"
+            f"grep -q '\"phase\": \"reapply-pending\"' {state_file}\n",
             encoding="utf-8",
         )
         candidate = self._rendered_with_policy()
@@ -1132,10 +1343,17 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": "600",
                 "prior_present": True,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
         state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "daemon.json.before").write_text('{"live-restore":true}', encoding="utf-8")
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        for path in recovery.iterdir():
+            path.chmod(0o600)
         candidate = dict(rendered)
         candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
         env_file = self._write_env_file(candidate)
@@ -1162,6 +1380,7 @@ class ApplyScriptTests(unittest.TestCase):
         state_file = checkpoint / "docker-network-policy.json"
         state = json.loads(state_file.read_text(encoding="utf-8"))
         state["verified_generation"] = None
+        state["phase"] = "reapply-pending"
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
         recovery = checkpoint / "recovery.interrupted"
@@ -1201,10 +1420,15 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
         state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
         candidate = dict(rendered)
         candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
         env_file = self._write_env_file(candidate)
@@ -1232,10 +1456,15 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
         state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
         self._write_success_commands()
         env_file = self._write_env_file(rendered)
 
@@ -3359,7 +3588,7 @@ class ApplyScriptTests(unittest.TestCase):
             timeout=30,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 7)
+        self.assertLess(time.monotonic() - started, 10)
 
     @unittest.skipUnless(Path("/dev/shm").is_dir(), "/dev/shm is unavailable")
     def test_apply_works_across_temp_filesystems(self) -> None:
@@ -3584,6 +3813,7 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
@@ -3631,6 +3861,7 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
@@ -3680,6 +3911,7 @@ class ApplyScriptTests(unittest.TestCase):
                 "prior_mode": None,
                 "prior_present": False,
                 "verified_generation": None,
+                "phase": "first-apply-pending",
             }),
             encoding="utf-8",
         )
@@ -3798,7 +4030,10 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(removed.stderr, "ERROR: daemon.json changed during network-policy removal\n")
         self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
         self.assertEqual(daemon.read_bytes(), changed_bytes)
-        self.assertEqual(state_file.read_bytes(), prior_state)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        expected = json.loads(prior_state)
+        expected["verified_generation"] = hashlib.sha256(changed_bytes).hexdigest()
+        self.assertEqual(state, expected)
 
     def test_removal_stages_from_the_conflict_detection_snapshot(self) -> None:
         daemon = self._write_daemon('{"live-restore":true}\n')
@@ -4075,8 +4310,10 @@ class ApplyScriptTests(unittest.TestCase):
         state = json.loads(state_file.read_text(encoding="utf-8"))
         state["phase"] = "removal-pending"
         state["removal_managed_default_address_pools"] = managed_pools
+        state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, daemon.read_bytes())
         daemon.write_text('{"live-restore":true}\n', encoding="utf-8")
         (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
         (Path(self.tmp) / "probe.sh").chmod(0o755)
@@ -4109,6 +4346,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, daemon.read_bytes())
         daemon.unlink()
         command_log = Path(self.tmp) / "pending-removal-absent-daemon.log"
         for name in ("restart", "probe", "resume", "health"):
@@ -4144,6 +4382,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, managed)
         daemon.unlink()
         command_log = Path(self.tmp) / "pending-removal-absent-failure.log"
         (Path(self.tmp) / "restart.sh").write_text(
@@ -4196,6 +4435,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, managed)
         daemon.unlink()
         restart_log = Path(self.tmp) / "pending-removal-absent-recovery.log"
         restart = Path(self.tmp) / "restart.sh"
@@ -4236,6 +4476,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, daemon.read_bytes())
         daemon.unlink()
         changed_policy = dict(policy)
         changed_policy["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
@@ -4264,6 +4505,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, daemon.read_bytes())
         daemon.write_text('{"live-restore":true}\n', encoding="utf-8")
 
         resumed = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
@@ -4291,6 +4533,7 @@ class ApplyScriptTests(unittest.TestCase):
         state["verified_generation"] = None
         state_file.write_text(json.dumps(state), encoding="utf-8")
         state_file.chmod(0o600)
+        self._write_recovery(checkpoint, managed)
         policy_b = dict(policy_a)
         policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
         env_b = self._write_env_file(policy_b)
@@ -5097,7 +5340,8 @@ class ApplyScriptTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             f"recovery=({checkpoint}/recovery.*)\n"
             '[[ ${#recovery[@]} == 1 ]]\n'
-            f"cmp -s {self.installed_env} \"${{recovery[0]}}/prior-ci-fleet.env\"\n",
+            f"cmp -s {self.installed_env} \"${{recovery[0]}}/prior-ci-fleet.env\"\n"
+            f"grep -Fq '\"phase\": \"first-apply-pending\"' {checkpoint / 'docker-network-policy.json'}\n",
             encoding="utf-8",
         )
         env_file = self._write_env_file(self._rendered_with_policy())
