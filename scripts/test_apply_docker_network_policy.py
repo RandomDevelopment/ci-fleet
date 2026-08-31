@@ -3580,6 +3580,54 @@ class ApplyScriptTests(unittest.TestCase):
             ],
         )
 
+    def test_interrupted_first_apply_failed_candidate_resume_redrains_before_prior_resume(self) -> None:
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-resume-failure"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": None,
+                "prior_present": False,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
+        command_log = Path(self.tmp) / "interrupted-resume-failure.log"
+        candidate_side_effect = Path(self.tmp) / "candidate-resume-side-effect"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        resume = Path(self.tmp) / "resume.sh"
+        resume.write_text(
+            "#!/usr/bin/env bash\n"
+            f"if grep -Fqx 'ENV_GENERATION=prior' \"$2\"; then echo resume-prior >> {command_log}; exit 0; fi\n"
+            f"echo resume-candidate >> {command_log}\n"
+            f"touch {candidate_side_effect}\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        resume.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertTrue(candidate_side_effect.exists())
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume-candidate", "drain", "resume-prior", "health"],
+        )
+
     def test_interrupted_first_apply_drain_failure_stops_before_restart_or_mutation(self) -> None:
         daemon = self.daemon_dir / "daemon.json"
         checkpoint = Path(self.tmp) / "checkpoint-interrupted-drain-failure"

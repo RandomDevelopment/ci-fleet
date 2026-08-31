@@ -306,7 +306,10 @@ resume_after_failed_drain() {
   local status=$? resume_failed=0 health_failed=0
   trap '' INT TERM
   trap - EXIT
-  run_command "$resume_command" --env "$prior_env" || resume_failed=1
+  if [[ "$controller_resumed" == true ]]; then
+    run_command "$drain_command" || resume_failed=1
+  fi
+  ((resume_failed != 0)) || run_command "$resume_command" --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     clear_managed_marker || resume_failed=1
@@ -740,6 +743,7 @@ PY
     drain_controller 'drain command failed before interrupted network-policy recovery'
     run_command "$restart_command" "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
     run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
+    controller_resumed=true
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
     clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
