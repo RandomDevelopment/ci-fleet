@@ -1080,6 +1080,7 @@ PY
     trap - EXIT
     complete_first_apply_rollback || { removal_failure='failed to complete interrupted first-apply rollback'; exit 2; }
   else
+    set_verified_generation "" rollback-complete || { removal_failure='failed to commit network-policy removal'; exit 2; }
     clear_recovery_artifacts || { removal_failure='failed to clear obsolete network-policy recovery data'; exit 2; }
     clear_managed_marker "$removal_daemon" || { removal_failure='failed to clear network-policy managed marker'; exit 2; }
   fi
@@ -1200,7 +1201,25 @@ PY
 then
   daemon_matches=true
   current_generation=$(file_generation "$daemon_config") || { rm -rf "$work_dir"; die 'failed to identify daemon.json generation'; }
-  if [[ -n "$prior_verified_generation" && "$current_generation" == "$prior_verified_generation" ]]; then
+  if [[ -n "$prior_verified_generation" && "$current_generation" == "$prior_verified_generation" ]] &&
+    python3 - "$env_file" "$prior_env" "$repo_root/scripts" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from desired_state import parse_env
+
+candidate = parse_env(Path(sys.argv[1]), allow_unknown=True)
+installed = parse_env(Path(sys.argv[2]), allow_unknown=True)
+fields = {
+    "CI_FLEET_CONFIGURED_MAX_RUNNERS",
+    "CI_FLEET_CONTROLLER_STATE",
+    "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
+    "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
+}
+raise SystemExit(any(candidate.get(name) != installed.get(name) for name in fields))
+PY
+  then
     clear_recovery_artifacts || { rm -rf "$work_dir"; die 'failed to clear obsolete network-policy recovery data'; }
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_NO_CHANGE\n'

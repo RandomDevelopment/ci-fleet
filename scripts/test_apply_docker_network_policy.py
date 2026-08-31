@@ -271,6 +271,41 @@ class HealthcheckScriptTests(unittest.TestCase):
             self.assertFalse(candidate_shim_ran.exists())
             self.assertFalse(health_substitute_ran.exists())
 
+    def test_selected_env_does_not_export_health_only_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate.env"
+            candidate.write_text(
+                "CI_FLEET_INSTANCE=candidate\nCI_FLEET_HEALTH_DISK_WARN_PERCENT=99\n",
+                encoding="utf-8",
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ ${CI_FLEET_INSTANCE:-} == candidate ]]\n"
+                "[[ -z ${CI_FLEET_HEALTH_DISK_WARN_PERCENT+x} ]]\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                CI_FLEET_TESTING="1",
+                CI_FLEET_ROOT_PREFIX=tmp,
+                PATH=f"{fake_bin}:{env['PATH']}",
+            )
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_selected_env_does_not_inherit_removed_pool_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2215,6 +2250,34 @@ class ApplyScriptTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
+    def test_health_wrapper_preflight_failure_is_not_warning(self) -> None:
+        self._write_daemon("{}\n")
+        self._write_success_commands()
+        env_file = self._write_env_file(self._rendered_with_policy())
+        release_scripts = Path(self.tmp) / "release" / "scripts"
+        release_scripts.mkdir(parents=True)
+        for name in ("healthcheck.sh", "docker-local-env.sh", "desired_state.py"):
+            shutil.copy2(SCRIPTS / name, release_scripts / name)
+
+        result = subprocess.run(
+            [
+                str(SCRIPTS / "apply-docker-network-policy.sh"),
+                "--checkpoint",
+                str(Path(self.tmp) / "checkpoint-health-preflight"),
+                "--env",
+                str(env_file),
+            ],
+            capture_output=True,
+            text=True,
+            env=self._env(
+                CI_FLEET_HEALTH_CHECK_COMMAND=str(release_scripts / "healthcheck.sh"),
+                DOCKER_HOST="tcp://example.invalid:2375",
+            ),
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+
     def test_transactional_health_suppresses_delivery(self) -> None:
         self._write_daemon("{}\n")
         self._write_success_commands()
@@ -2672,6 +2735,7 @@ class ApplyScriptTests(unittest.TestCase):
             command.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
             command.chmod(0o755)
         env_file = self._write_env_file(rendered)
+        self.installed_env.write_bytes(env_file.read_bytes())
         checkpoint = Path(self.tmp) / "checkpoint"
         checkpoint.mkdir(mode=0o700)
         state_file = checkpoint / "docker-network-policy.json"
@@ -2695,6 +2759,33 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(daemon.read_bytes(), prior)
         self.assertTrue(checkpoint.exists())
         self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_capacity_change_with_matching_daemon_runs_verification_gates(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-capacity-change"
+        self._write_success_commands()
+        rendered = self._rendered_with_policy()
+        env_file = self._write_env_file(rendered)
+        applied = self._run(str(env_file), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(env_file.read_bytes())
+        rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"] = "2"
+        candidate_env = self._write_env_file(rendered)
+        command_log = Path(self.tmp) / "capacity-change.log"
+        command_log.touch()
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("restart", "probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+
+        reconciled = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "health"],
+        )
 
     def test_matching_file_without_verified_generation_runs_activation_and_marks_verified(self) -> None:
         self._write_daemon("{}\n")
@@ -4855,6 +4946,44 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
         self.assertEqual(reconciled.stdout, "NETWORK_POLICY_NOOP\n")
 
+    def test_removal_completion_survives_crash_after_recovery_cleanup(self) -> None:
+        self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-removal-completion-crash"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        audit_dir = Path(self.tmp) / "removal-completion-crash-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, shutil, signal\n"
+            "_rmtree = shutil.rmtree\n"
+            "def rmtree(path, *args, **kwargs):\n"
+            "    result = _rmtree(path, *args, **kwargs)\n"
+            "    if os.path.basename(path).startswith('recovery.'):\n"
+            "        os.kill(os.getppid(), signal.SIGKILL)\n"
+            "    return result\n"
+            "shutil.rmtree = rmtree\n",
+            encoding="utf-8",
+        )
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        interrupted = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["phase"], "rollback-complete")
+        reconciled = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(reconciled.stdout, "NETWORK_POLICY_NOOP\n")
+
     def test_removal_recovery_cleanup_failure_rolls_back_and_keeps_marker_usable(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-recovery-cleanup-failure"
@@ -5377,6 +5506,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
         applied = self._run(str(env_file), checkpoint_dir=str(checkpoint))
         self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(env_file.read_bytes())
         recovery = checkpoint / "recovery.stale"
         recovery.mkdir(mode=0o700)
         (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())

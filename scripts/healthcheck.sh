@@ -41,6 +41,8 @@ invalid = next((name for name in values if not name.startswith("CI_FLEET_")), No
 if invalid is not None:
     raise SystemExit(f"ERROR: rendered environment variable must start with CI_FLEET_: {invalid}")
 for name, value in values.items():
+    if name.startswith("CI_FLEET_HEALTH_"):
+        continue
     sys.stdout.buffer.write(name.encode() + b"\0" + value.encode() + b"\0")
 PY
   then
@@ -57,5 +59,5 @@ if [[ $health_root_prefix_present == x ]]; then export CI_FLEET_ROOT_PREFIX=$hea
 if [[ $health_docker_socket_present == x ]]; then export CI_FLEET_DOCKER_SOCKET=$health_docker_socket; else unset CI_FLEET_DOCKER_SOCKET; fi
 if [[ $health_bootstrap_present == x ]]; then export CI_FLEET_HEALTH_BOOTSTRAP=$health_bootstrap; else unset CI_FLEET_HEALTH_BOOTSTRAP; fi
 if [[ $health_suppress_delivery_present == x ]]; then export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery; else unset CI_FLEET_HEALTH_SUPPRESS_DELIVERY; fi
-use_local_docker
+use_local_docker || exit 2
 exec python3 "$repo_root/scripts/health.py" "${args[@]}" "$@"
