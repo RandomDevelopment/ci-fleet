@@ -203,15 +203,15 @@ class HealthcheckScriptTests(unittest.TestCase):
             root = Path(tmp)
             installed = root / "etc" / "ci-fleet" / "ci-fleet.env"
             installed.parent.mkdir(parents=True)
-            installed.write_text("ENV_MARKER=stale\n", encoding="utf-8")
+            installed.write_text("CI_FLEET_ENV_MARKER=stale\n", encoding="utf-8")
             candidate = root / "candidate.env"
-            candidate.write_text("ENV_MARKER=candidate\n", encoding="utf-8")
+            candidate.write_text("CI_FLEET_ENV_MARKER=candidate\n", encoding="utf-8")
             fake_bin = root / "bin"
             fake_bin.mkdir()
             python = fake_bin / "python3"
             python.write_text(
                 "#!/usr/bin/env bash\n"
-                "[[ ${ENV_MARKER:-} == candidate ]] || exit 1\n",
+                "[[ ${CI_FLEET_ENV_MARKER:-} == candidate ]] || exit 1\n",
                 encoding="utf-8",
             )
             python.chmod(0o755)
@@ -231,6 +231,45 @@ class HealthcheckScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_env_argument_rejects_path_before_command_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_bin = root / "candidate-bin"
+            candidate_bin.mkdir()
+            candidate_shim_ran = root / "candidate-shim-ran"
+            (candidate_bin / "python3").write_text(
+                f"#!/bin/bash\n: > {candidate_shim_ran}\n",
+                encoding="utf-8",
+            )
+            (candidate_bin / "python3").chmod(0o755)
+            candidate = root / "candidate.env"
+            candidate.write_text(f"PATH={candidate_bin}\n", encoding="utf-8")
+
+            trusted_bin = root / "trusted-bin"
+            trusted_bin.mkdir()
+            health_substitute_ran = root / "health-substitute-ran"
+            (trusted_bin / "python3").write_text(
+                "#!/bin/bash\n"
+                "if [[ ${1:-} == - ]]; then exec /usr/bin/python3 \"$@\"; fi\n"
+                f": > {health_substitute_ran}\n",
+                encoding="utf-8",
+            )
+            (trusted_bin / "python3").chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{trusted_bin}:{env['PATH']}"
+
+            result = subprocess.run(
+                [str(SCRIPTS / "healthcheck.sh"), "--env", str(candidate)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertFalse(candidate_shim_ran.exists())
+            self.assertFalse(health_substitute_ran.exists())
 
     def test_selected_env_does_not_inherit_removed_pool_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
