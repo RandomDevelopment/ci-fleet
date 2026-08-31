@@ -1,0 +1,20 @@
+[Unit]
+Description=Validate ci-fleet test environments
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ci-fleet-tester/tester-runtime --health
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ci-fleet-tester -/run/lock/ci-fleet-tester
+TimeoutStartSec=300
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
