@@ -33,7 +33,9 @@ while (($#)); do
 done
 [[ -n $action ]] || { usage; exit 2; }
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
-for command in awk basename chmod cmp curl date df dirname docker du env find flock getent grep install mktemp mv python3 readlink rm stat wc; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
+required_commands='awk basename chmod cmp date df dirname docker du env find flock grep install mkdir mktemp mv python3 readlink rm stat wc'
+case $action in --check|--health) required_commands+=' curl getent' ;; esac
+for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 secure_directory() {
   local path=$1 mode=$2

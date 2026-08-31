@@ -215,6 +215,10 @@ done
 if FAKE_TESTER_ORPHAN_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose container project'; fi
 if FAKE_TESTER_ORPHAN_VOLUME_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose volume project'; fi
 if FAKE_TESTER_ORPHAN_NETWORK_PROJECT=ci-fleet-test-orphan "$runtime" --cleanup >/dev/null 2>&1; then fail 'scheduled cleanup ignored an orphaned Compose network project'; fi
+cleanup_bin=$tmp/cleanup-bin
+mkdir "$cleanup_bin"
+for command in awk basename bash chmod cmp date df dirname docker du env find flock grep id install mkdir mktemp mv python3 readlink rm stat wc; do ln -s "$(command -v "$command")" "$cleanup_bin/$command"; done
+PATH=$cleanup_bin "$runtime" --cleanup >/dev/null || fail 'cleanup required unrelated network-probe tools'
 
 [[ ${CI_FLEET_TESTER_RUNTIME_ONLY:-0} != 1 ]] || { printf 'TESTER_RUNTIME_TESTS_OK\n'; exit 0; }
 
