@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate import Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_rollout_evidence, validate_transition
+from validate import MAX_DOCKER_ADDRESS_POOLS, Validation, load_json, scan_secret_material, scan_tree_path_list, validate_config, validate_rollout_evidence, validate_transition
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,7 +89,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(set(controller), {"type", "additionalProperties", "required", "properties"})
         self.assertEqual(controller["required"], ["default_address_pools", "networks_per_runner", "reserve_subnets"])
         self.assertEqual(controller["properties"]["networks_per_runner"], {"type": "integer", "minimum": 1})
-        pool = controller["properties"]["default_address_pools"]["items"]
+        pools = controller["properties"]["default_address_pools"]
+        self.assertEqual(pools["maxItems"], MAX_DOCKER_ADDRESS_POOLS)
+        pool = pools["items"]
         self.assertEqual(set(pool["properties"]), {"base", "size"})
         self.assertEqual(pool["properties"]["size"]["maximum"], 29)
 
@@ -146,6 +148,14 @@ class PolicyTests(unittest.TestCase):
             {"base": "203.0.113.0/28", "size": 29}
         )
         self.assertEqual(errors_for(config), [])
+
+    def test_docker_network_policy_rejects_more_than_64_pools_before_overlap_checks(self) -> None:
+        config = copy.deepcopy(reference_config())
+        first_controller(config)["docker_network_policy"]["default_address_pools"] = [
+            {"base": "198.51.100.0/24", "size": 29}
+        ] * 65
+
+        self.assert_rejected(config, "must not exceed 64")
 
     def test_disabled_docker_network_policy_keeps_reserve_and_controller_capacity(self) -> None:
         config = copy.deepcopy(reference_config())

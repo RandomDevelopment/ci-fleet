@@ -47,8 +47,9 @@ Active and drained controllers reserve their configured maximum against the pool
 
 The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
 prefix `size` no longer than `/29`, which leaves enough addresses for an
-ordinary Compose network. Validation rejects malformed or overlapping pools,
-allocation prefixes broader than their base, and active or drained policies with fewer subnets than
+ordinary Compose network. A policy may declare at most 64 pools. Validation
+rejects malformed or overlapping pools, allocation prefixes broader than their
+base, and active or drained policies with fewer subnets than
 `max_runners * networks_per_runner + reserve_subnets + 1`. The final subnet is reserved for the
 persistent controller Compose network. Disabled controllers do not reserve
 runner subnet capacity, but their retained policy must still cover the reserve
@@ -70,12 +71,23 @@ reconciliation. Once present, the policy requires current evidence naming the
 selected engine and declaring `docker_network_policy_config: true`; remove the
 policy before selecting an engine without that evidence.
 
-This phase renders the policy solely for read-only health inspection. It does
-not write `daemon.json`, restart Docker, create or remove networks, prune
-resources, drain runners, or alter controller scale. Circuit breaking,
-frequent orphan reconciliation, daemon configuration rollout, transactional
-exhausted-pool recovery, and downstream-consumer label changes remain later
-issue #81 slices.
+This accepted phase permits the executable policy stage to apply or remove the
+managed `default-address-pools` key on an isolated ordinary-CI controller only
+from validated desired state. Before mutation, the stage must persist a
+root-only checkpoint with prior-key provenance, acquire the shared installer
+lock for serialized mutation, and drain the controller and managed runners. It
+must atomically and durably write or remove only the managed key, restart
+Docker, run the bounded capacity probe, resume the controller to its intended
+state, and verify health against the exact candidate rendered environment.
+
+On interruption or failure, rollback must restore the managed key and prior
+rendered environment from the checkpoint, restart Docker, resume the prior
+controller state, and verify prior health. A failed rollback must retain its
+recovery checkpoint. Rollout requires exact-head CI and proof for the reviewed
+engine and desired-state commits before any host mutation. No deployment occurs
+in this PR. This scope does not create or remove networks, prune resources,
+alter controller scale, change downstream-consumer labels, or authorize
+application production deployment.
 
 Managed prewarmed runners are not currently supported: `min_runners` is fixed at zero in schema, semantic validation, rendering, and preflight. This keeps idle privileged workers absent and prevents reviewed configuration from passing validation only to fail host adoption.
 

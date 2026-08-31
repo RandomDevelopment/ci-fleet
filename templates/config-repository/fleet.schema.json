@@ -91,6 +91,7 @@
             "default_address_pools": {
               "type": "array",
               "minItems": 1,
+              "maxItems": 64,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
