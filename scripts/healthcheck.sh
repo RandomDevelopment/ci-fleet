@@ -15,10 +15,15 @@ if [[ ${1:-} == --env ]]; then
   shift 2
 fi
 selected_environment=$environment
+health_testing_present=${CI_FLEET_TESTING+x}
 health_testing=${CI_FLEET_TESTING-}
+health_root_prefix_present=${CI_FLEET_ROOT_PREFIX+x}
 health_root_prefix=${CI_FLEET_ROOT_PREFIX-}
+health_docker_socket_present=${CI_FLEET_DOCKER_SOCKET+x}
 health_docker_socket=${CI_FLEET_DOCKER_SOCKET-}
+health_bootstrap_present=${CI_FLEET_HEALTH_BOOTSTRAP+x}
 health_bootstrap=${CI_FLEET_HEALTH_BOOTSTRAP-}
+health_suppress_delivery_present=${CI_FLEET_HEALTH_SUPPRESS_DELIVERY+x}
 health_suppress_delivery=${CI_FLEET_HEALTH_SUPPRESS_DELIVERY-}
 while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable CI_FLEET_)
 if [[ -r $selected_environment ]]; then
@@ -27,10 +32,10 @@ if [[ -r $selected_environment ]]; then
   . "$selected_environment"
   set +a
 fi
-[[ -z $health_testing ]] || export CI_FLEET_TESTING=$health_testing
-[[ -z $health_root_prefix ]] || export CI_FLEET_ROOT_PREFIX=$health_root_prefix
-[[ -z $health_docker_socket ]] || export CI_FLEET_DOCKER_SOCKET=$health_docker_socket
-[[ -z $health_bootstrap ]] || export CI_FLEET_HEALTH_BOOTSTRAP=$health_bootstrap
-[[ -z $health_suppress_delivery ]] || export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery
+if [[ $health_testing_present == x ]]; then export CI_FLEET_TESTING=$health_testing; else unset CI_FLEET_TESTING; fi
+if [[ $health_root_prefix_present == x ]]; then export CI_FLEET_ROOT_PREFIX=$health_root_prefix; else unset CI_FLEET_ROOT_PREFIX; fi
+if [[ $health_docker_socket_present == x ]]; then export CI_FLEET_DOCKER_SOCKET=$health_docker_socket; else unset CI_FLEET_DOCKER_SOCKET; fi
+if [[ $health_bootstrap_present == x ]]; then export CI_FLEET_HEALTH_BOOTSTRAP=$health_bootstrap; else unset CI_FLEET_HEALTH_BOOTSTRAP; fi
+if [[ $health_suppress_delivery_present == x ]]; then export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=$health_suppress_delivery; else unset CI_FLEET_HEALTH_SUPPRESS_DELIVERY; fi
 use_local_docker
 exec python3 "$repo_root/scripts/health.py" "${args[@]}" "$@"

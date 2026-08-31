@@ -3059,6 +3059,115 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse(list(checkpoint.glob("recovery.*")))
         self.assertNotEqual(daemon.read_bytes(), prior_daemon)
 
+    def test_signal_after_recovery_cleanup_cannot_run_rollback(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-commit-cleanup-signal"
+        self._write_success_commands()
+        policy = self._rendered_with_policy()
+        policy_env = self._write_env_file(policy)
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        candidate = dict(policy)
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = self._write_env_file(candidate)
+        command_log = Path(self.tmp) / "commit-cleanup-signal.log"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\necho drain >> {command_log}\n", encoding="utf-8")
+        for name in ("probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {command_log}\n"
+            f"[[ $(wc -l < {command_log}) -lt 7 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        signal_marker = Path(self.tmp) / "cleanup-signal.sent"
+        audit_dir = Path(self.tmp) / "cleanup-signal-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, shutil, signal\n"
+            "_rmtree = shutil.rmtree\n"
+            "def rmtree(path, *args, **kwargs):\n"
+            "    result = _rmtree(path, *args, **kwargs)\n"
+            "    if os.path.basename(path).startswith('recovery.') and not os.path.exists(os.environ['SIGNAL_MARKER']):\n"
+            "        open(os.environ['SIGNAL_MARKER'], 'w').close()\n"
+            "        os.kill(os.getppid(), signal.SIGTERM)\n"
+            "    return result\n"
+            "shutil.rmtree = rmtree\n",
+            encoding="utf-8",
+        )
+
+        reapplied = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(candidate_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir), SIGNAL_MARKER=str(signal_marker)),
+            timeout=30,
+        )
+
+        self.assertEqual(reapplied.returncode, 0, reapplied.stderr)
+        self.assertTrue(signal_marker.exists())
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["drain", "restart", "probe", "resume", "health"],
+        )
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"][0]["base"], "192.0.2.0/24")
+
+    def test_recovery_cleanup_failure_does_not_report_deleted_evidence(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-commit-cleanup-failure"
+        self._write_success_commands()
+        policy = self._rendered_with_policy()
+        policy_env = self._write_env_file(policy)
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        candidate = dict(policy)
+        candidate["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        candidate_env = self._write_env_file(candidate)
+        restart_count = Path(self.tmp) / "commit-cleanup-failure-restarts"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_count}\n"
+            f"[[ $(wc -l < {restart_count}) -eq 1 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        audit_dir = Path(self.tmp) / "cleanup-failure-audit"
+        audit_dir.mkdir()
+        (audit_dir / "sitecustomize.py").write_text(
+            "import os, shutil\n"
+            "_rmtree = shutil.rmtree\n"
+            "def rmtree(path, *args, **kwargs):\n"
+            "    result = _rmtree(path, *args, **kwargs)\n"
+            "    if os.path.basename(path).startswith('recovery.'):\n"
+            "        raise OSError('injected recovery cleanup failure')\n"
+            "    return result\n"
+            "shutil.rmtree = rmtree\n",
+            encoding="utf-8",
+        )
+
+        reapplied = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(candidate_env)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit_dir), CI_FLEET_TEMP_DIR=self.tmp),
+            timeout=30,
+        )
+
+        self.assertNotEqual(reapplied.returncode, 0)
+        self.assertIn("failed to clear obsolete network-policy recovery data", reapplied.stderr)
+        self.assertNotIn("recovery data retained at", reapplied.stderr)
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+        self.assertFalse(list(Path(self.tmp).glob(".ci-fleet-apply.*")))
+        state = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertIsNotNone(state["verified_generation"])
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["default-address-pools"][0]["base"], "192.0.2.0/24")
+
     def test_post_apply_health_uses_candidate_rendered_env(self) -> None:
         self._write_daemon("{}\n")
         for name in ("restart.sh", "probe.sh"):
@@ -3463,12 +3572,52 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(
             [marker.name for marker in command_markers if marker.exists()],
             [
+                "interrupted-before-rename-drain.sh.marker",
                 "interrupted-before-rename-restart.sh.marker",
                 "interrupted-before-rename-probe.sh.marker",
                 "interrupted-before-rename-resume.sh.marker",
                 "interrupted-before-rename-health.sh.marker",
             ],
         )
+
+    def test_interrupted_first_apply_drain_failure_stops_before_restart_or_mutation(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-drain-failure"
+        checkpoint.mkdir(mode=0o700)
+        state_file = checkpoint / "docker-network-policy.json"
+        state_file.write_text(
+            json.dumps({
+                "managed": True,
+                "prior_default_address_pools": None,
+                "prior_default_address_pools_present": False,
+                "prior_mode": None,
+                "prior_present": False,
+                "verified_generation": None,
+            }),
+            encoding="utf-8",
+        )
+        state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        (recovery / "prior-ci-fleet.env").chmod(0o600)
+        command_log = Path(self.tmp) / "interrupted-drain-failure.log"
+        for name in ("drain", "restart", "probe", "resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(
+                f"#!/usr/bin/env bash\necho {name} >> {command_log}\n" + ("exit 1\n" if name == "drain" else ""),
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertFalse(daemon.exists())
+        self.assertTrue(state_file.exists())
+        self.assertTrue(recovery.exists())
+        self.assertEqual(command_log.read_text(encoding="utf-8").splitlines(), ["drain", "resume", "health"])
 
     def test_removal_rejects_non_object_daemon_before_copy_or_commands(self) -> None:
         daemon = self._write_daemon("{}\n")
@@ -3891,6 +4040,98 @@ class ApplyScriptTests(unittest.TestCase):
             command_log.read_text(encoding="utf-8").splitlines(),
             ["restart", "probe", "resume", "health"],
         )
+
+    def test_pending_removal_with_absent_daemon_failure_restores_managed_state(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-pending-removal-absent-failure"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = json.loads(managed)["default-address-pools"]
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.unlink()
+        command_log = Path(self.tmp) / "pending-removal-absent-failure.log"
+        (Path(self.tmp) / "restart.sh").write_text(
+            f"#!/usr/bin/env bash\necho restart >> {command_log}\n",
+            encoding="utf-8",
+        )
+        (Path(self.tmp) / "probe.sh").write_text(
+            f"#!/usr/bin/env bash\necho probe >> {command_log}\nexit 1\n",
+            encoding="utf-8",
+        )
+        for name in ("resume", "health"):
+            command = Path(self.tmp) / f"{name}.sh"
+            command.write_text(
+                "#!/usr/bin/env bash\n"
+                f"echo {name} >> {command_log}\n"
+                f"grep -Fqx 'CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=2' \"$2\"\n",
+                encoding="utf-8",
+            )
+        for name in ("restart", "probe", "resume", "health"):
+            (Path(self.tmp) / f"{name}.sh").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), managed)
+        restored_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertTrue(restored_state["managed"])
+        self.assertNotIn("phase", restored_state)
+        self.assertIsNotNone(restored_state["verified_generation"])
+        self.assertEqual(
+            command_log.read_text(encoding="utf-8").splitlines(),
+            ["restart", "probe", "restart", "resume", "health"],
+        )
+
+    def test_pending_removal_with_absent_daemon_failed_rollback_retains_recovery(self) -> None:
+        daemon = self.daemon_dir / "daemon.json"
+        checkpoint = Path(self.tmp) / "checkpoint-pending-removal-absent-recovery"
+        self._write_success_commands()
+        policy_env = self._write_env_file(self._rendered_with_policy())
+        applied = self._run(str(policy_env), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        managed = daemon.read_bytes()
+        self.installed_env.write_bytes(policy_env.read_bytes())
+        prior_env = self.installed_env.read_bytes()
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["phase"] = "removal-pending"
+        state["removal_managed_default_address_pools"] = json.loads(managed)["default-address-pools"]
+        state["verified_generation"] = None
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        daemon.unlink()
+        restart_log = Path(self.tmp) / "pending-removal-absent-recovery.log"
+        restart = Path(self.tmp) / "restart.sh"
+        restart.write_text(
+            f"#!/usr/bin/env bash\necho restart >> {restart_log}\n"
+            f"[[ $(wc -l < {restart_log}) -eq 1 ]]\n",
+            encoding="utf-8",
+        )
+        restart.chmod(0o755)
+        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        removed = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(removed.returncode, 0)
+        self.assertIn("rollback verification failed; recovery data retained at", removed.stderr)
+        recovery = next(checkpoint.glob("recovery.*"))
+        self.assertEqual((recovery / "daemon.json.before").read_bytes(), managed)
+        self.assertEqual((recovery / "prior-ci-fleet.env").read_bytes(), prior_env)
+        retained_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(retained_state["phase"], "removal-pending")
+        self.assertIsNone(retained_state["verified_generation"])
 
     def test_apply_from_pending_removal_persists_synthesized_rollback_daemon(self) -> None:
         daemon = self.daemon_dir / "daemon.json"

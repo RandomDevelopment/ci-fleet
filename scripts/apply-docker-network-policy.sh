@@ -730,26 +730,57 @@ PY
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
+  removal_pending=${managed_state[3]}
   has_verified_generation=${managed_state[4]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
-  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" ]]; then
+  absent_removal_recovery=false
+  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" && "$removal_pending" != true ]]; then
+    drain_controller 'drain command failed before interrupted network-policy recovery'
     run_command "$restart_command" "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
     run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
     run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
     clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
     clear_managed_marker "$work_dir/daemon.json.removal" || die 'failed to clear interrupted network-policy marker'
+    trap - EXIT INT TERM
     rm -rf "$work_dir"
     printf 'NETWORK_POLICY_REMOVED\n'
     exit 0
   fi
-  [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
+  if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" && "$removal_pending" == true ]]; then
+    absent_removal_recovery=true
+  else
+    [[ -f "$daemon_config" ]] || die 'managed daemon.json is missing before policy removal'
+  fi
 
   managed_daemon=$work_dir/daemon.json.managed
   removal_daemon=$work_dir/daemon.json.removal
-  python3 - "$daemon_config" <<'PY' || { rm -rf "$work_dir"; die 'managed daemon.json is not a valid JSON object'; }
+  managed_snapshot=$work_dir/daemon.json.before
+  if [[ "$absent_removal_recovery" == true ]]; then
+    python3 - "$state_file" "$managed_daemon" "$removal_daemon" "$managed_snapshot" <<'PY' || {
+import json, shutil, sys
+state_path, managed_path, removal_path, snapshot_path = sys.argv[1:]
+state = json.load(open(state_path, encoding="utf-8"))
+managed = {}
+if state["removal_managed_default_address_pools"] is not None:
+    managed["default-address-pools"] = state["removal_managed_default_address_pools"]
+for path, value in ((managed_path, managed), (removal_path, {})):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+shutil.copyfile(managed_path, snapshot_path)
+PY
+      rm -rf "$work_dir"
+      die 'failed to reconstruct interrupted network-policy removal state'
+    }
+    managed_mode=$daemon_mode
+    managed_gid=$daemon_gid
+    managed_metadata=
+    prior_verified_generation=$(file_generation "$managed_daemon") || { rm -rf "$work_dir"; die 'failed to identify managed daemon.json generation'; }
+  else
+    python3 - "$daemon_config" <<'PY' || { rm -rf "$work_dir"; die 'managed daemon.json is not a valid JSON object'; }
 import json, sys
 def reject_constant(_value):
     raise ValueError
@@ -759,12 +790,11 @@ try:
 except (OSError, json.JSONDecodeError, ValueError):
     raise SystemExit(1)
 PY
-  managed_mode=$(stat -c %a "$daemon_config")
-  managed_gid=$(stat -c %g "$daemon_config")
-  managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
-  managed_snapshot=$work_dir/daemon.json.before
-  cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
-  python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" "$repo_root/scripts" 2>/dev/null <<'PY' || {
+    managed_mode=$(stat -c %a "$daemon_config")
+    managed_gid=$(stat -c %g "$daemon_config")
+    managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
+    cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
+    python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" "$repo_root/scripts" 2>/dev/null <<'PY' || {
 import json, sys
 daemon_path, state_path, managed_path, removal_path, scripts_path = sys.argv[1:]
 sys.path.insert(0, scripts_path)
@@ -798,16 +828,19 @@ with open(removal_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
-    rm -rf "$work_dir"
-    die 'managed daemon.json is not a valid JSON object'
-  }
+      rm -rf "$work_dir"
+      die 'managed daemon.json is not a valid JSON object'
+    }
+  fi
 
   set_removal_pending "$managed_daemon" || { rm -rf "$work_dir"; die 'failed to persist network-policy removal state'; }
   removal_checkpoint_started=true
-  drain_controller 'drain command failed before network-policy removal'
-  if daemon_changed_since_snapshot "$managed_snapshot" true "$managed_metadata"; then
-    drain_failure='daemon.json changed during network-policy removal'
-    exit 2
+  if [[ "$absent_removal_recovery" != true ]]; then
+    drain_controller 'drain command failed before network-policy removal'
+    if daemon_changed_since_snapshot "$managed_snapshot" true "$managed_metadata"; then
+      drain_failure='daemon.json changed during network-policy removal'
+      exit 2
+    fi
   fi
   checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
 
@@ -1328,9 +1361,16 @@ verified_generation=$(file_generation "$daemon_config") || fail_after_apply "fai
 verified_action=
 [[ "$apply_removal_pending" != true ]] || verified_action=clear-removal
 set_verified_generation "$verified_generation" "$verified_action" || fail_after_apply "failed to record verified daemon.json generation"
-clear_recovery_artifacts || fail_after_apply "failed to clear obsolete network-policy recovery data"
+
+# The verified generation commits the apply. Disarm rollback before deleting
+# the snapshot it consumes; cleanup failure leaves the committed marker usable.
+trap '' INT TERM
+trap - EXIT
+if ! clear_recovery_artifacts; then
+  rm -rf "$work_dir"
+  die "failed to clear obsolete network-policy recovery data"
+fi
 
 # --- Success ---
-trap - EXIT INT TERM
 rm -rf "$work_dir"
 printf 'NETWORK_POLICY_APPLIED daemon_config=%s\n' "$daemon_config"
