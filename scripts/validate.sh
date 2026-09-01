@@ -9,6 +9,8 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/bootstrap-github-callback.py \
+  scripts/fixtures/fake-bootstrap-curl.py \
   scripts/health.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
@@ -24,6 +26,7 @@ python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_health.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
+scripts/test-bootstrap-github.sh
 python3 -m json.tool schemas/status-report-v1.json >/dev/null
 python3 scripts/desired_state.py validate-engine-capabilities --manifest engine-capabilities.json --require-docker-network-policy-config --require-status-reporting-config --require-status-reporting >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
