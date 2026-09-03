@@ -139,6 +139,7 @@ case "${1:-}" in
         [[ -z "$paused_state" ]] || rm -f "$paused_state"
         ;;
       build)
+        [[ -z "${FAKE_FAIL_BUILD:-}" ]] || exit 46
         [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
         ;;
@@ -618,6 +619,17 @@ ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
 ref_two=$(write_config active 2 2)
+build_failure_output=$tmp/build-failure.out
+build_failure_root=$tmp/build-failure-root
+cp -a "$root" "$build_failure_root"
+export FAKE_FAIL_BUILD=1
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$build_failure_output" 2>&1; then
+  fail 'candidate build failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_BUILD
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
+diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
 export FAKE_FAIL_KILL_ONCE=$tmp/fail-kill-once
 : >"$FAKE_FAIL_KILL_ONCE"
 expect_failure 'failed to signal the paused controller' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
@@ -628,7 +640,7 @@ export FAKE_RUNNER_STATE=$tmp/managed-runner-active
 export FAKE_FAIL_UP_ONCE=$tmp/fail-up-once
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"
-[[ ! -f "$FAKE_RUNNER_STATE" ]] || fail 'upgrade preflight ran before the active runner was drained'
+[[ ! -f "$FAKE_RUNNER_STATE" ]] || fail 'upgrade did not drain the active runner before activation'
 unset FAKE_RUNNER_STATE
 unset FAKE_FAIL_UP_ONCE
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'failed activation did not restore capacity one'

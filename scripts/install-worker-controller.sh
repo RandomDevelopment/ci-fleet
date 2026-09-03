@@ -1065,6 +1065,7 @@ perform_converge() {
     return
   fi
   install_release
+  build_candidate
   make_checkpoint
   transaction_active=true
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
@@ -1075,7 +1076,6 @@ perform_converge() {
   drain_current
   controller_id=$desired_controller_id
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
-  build_candidate
   activate_candidate
   transaction_active=false
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"

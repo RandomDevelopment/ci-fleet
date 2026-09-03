@@ -283,6 +283,13 @@ class TestSystemdUnits(unittest.TestCase):
         self.assertIn("ExecStart", content)
         self.assertIn("remote-reconcile.sh", content)
 
+    def test_service_timeout_covers_lock_build_and_rollback(self):
+        svc = REPO_ROOT / "host" / "systemd" / "ci-fleet-reconcile.service"
+        content = svc.read_text()
+        self.assertIn("lock_wait_seconds=3600", RECONCILE_SCRIPT.read_text())
+        self.assertIn("TimeoutStartSec=2h", content)
+        self.assertIn("One hour for the installer lock, plus one hour for a cold build and rollback.", content)
+
     def test_timer_file_exists(self):
         timer = REPO_ROOT / "host" / "systemd" / "ci-fleet-reconcile.timer"
         self.assertTrue(timer.exists())
