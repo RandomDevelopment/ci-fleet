@@ -769,8 +769,14 @@ try_drain_current() {
     old_release=$(current_runtime_release)
     [[ -n "$old_release" ]] || old_release=$fallback_release
     if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-    if ! compose "$old_release" "$drain_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
-    paused=true
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+      paused=true
+    elif compose "$old_release" "$drain_env" pause controller >/dev/null; then
+      paused=true
+    else
+      drain_error='could not pause the controller for drain'
+      return 1
+    fi
   fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
   while :; do
@@ -1099,7 +1105,7 @@ perform_converge() {
   fi
   drain_current
   if [[ "$testing" == 1 && -n ${CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE:-} ]]; then
-    printf '%s\n' "$BASHPID" >"$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE"
+    : >"$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE"
     while [[ ! -f "$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE.continue" ]]; do sleep 0.05; done
   fi
   controller_id=$desired_controller_id

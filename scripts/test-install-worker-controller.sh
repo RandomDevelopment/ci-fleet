@@ -136,8 +136,12 @@ case "${1:-}" in
         ;;
       down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
+        if [[ -n "$paused_state" && -f "$paused_state" ]]; then
+          printf 'Error response from daemon: container is already paused\n' >&2
+          exit 42
+        fi
         [[ -z "$paused_state" ]] || : >"$paused_state"
-        [[ -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
+        [[ -n "${FAKE_KEEP_RUNNER_ON_PAUSE:-}" || -z "${FAKE_RUNNER_STATE:-}" ]] || rm -f "$FAKE_RUNNER_STATE"
         ;;
       unpause) [[ -z "$paused_state" ]] || rm -f "$paused_state" ;;
       kill)
@@ -672,7 +676,7 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'live runner tag build
 unset FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_LIVE_TAG_BUILD:-0} != 1 ]] || { printf 'LIVE_TAG_BUILD_REGRESSION_OK\n'; exit 0; }
 terminate_upgrade() {
-  local output=$1 marker=$2 second_term_marker=${3:-} pid installer_pid status=0 attempt
+  local output=$1 marker=$2 second_term_marker=${3:-} pid status=0 attempt
   export CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE=$marker
   if [[ -n "$second_term_marker" ]]; then
     : >"$second_term_marker"
@@ -689,20 +693,46 @@ terminate_upgrade() {
     wait "$pid" 2>/dev/null || true
     fail 'TERM regression did not reach the drained transaction'
   fi
-  installer_pid=$(<"$marker")
-  kill -TERM "$installer_pid"
+  kill -TERM "$pid"
   if [[ -n "$second_term_marker" ]]; then
     for ((attempt = 0; attempt < 200; attempt++)); do
       [[ ! -f "${second_term_marker}.entered" ]] || break
       sleep 0.05
     done
     [[ -f "${second_term_marker}.entered" ]] || fail 'TERM regression did not enter checkpoint restoration'
-    kill -TERM "$installer_pid"
+    kill -TERM "$pid"
   fi
   if wait "$pid"; then status=0; else status=$?; fi
   unset CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE FAKE_DELAY_UP_ONCE
   [[ "$status" == 143 ]] || fail "TERM regression changed the signal exit status: $status"
 }
+paused_term_output=$tmp/paused-term-rollback.out
+export FAKE_RUNNER_STATE=$tmp/paused-term-managed-runner
+export FAKE_KEEP_RUNNER_ON_PAUSE=1
+: >"$FAKE_RUNNER_STATE"
+rm -f "$FAKE_PAUSED_STATE"
+"$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$paused_term_output" 2>&1 &
+paused_term_pid=$!
+for ((attempt = 0; attempt < 200; attempt++)); do
+  [[ ! -f "$FAKE_PAUSED_STATE" ]] || break
+  sleep 0.05
+done
+if [[ ! -f "$FAKE_PAUSED_STATE" ]]; then
+  kill -TERM "$paused_term_pid" 2>/dev/null || true
+  wait "$paused_term_pid" 2>/dev/null || true
+  fail 'TERM regression did not reach the paused drain phase'
+fi
+if grep -Fq 'DRAIN_OK managed_runners=0' "$paused_term_output"; then fail 'TERM regression passed the drain phase before signaling'; fi
+kill -TERM "$paused_term_pid"
+rm -f "$FAKE_RUNNER_STATE"
+if wait "$paused_term_pid"; then paused_term_status=0; else paused_term_status=$?; fi
+unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE
+[[ "$paused_term_status" == 143 ]] || fail "paused TERM regression changed the signal exit status: $paused_term_status"
+grep -Fq 'ROLLBACK_RESTORED' "$paused_term_output" || fail "paused TERM did not report checkpoint restoration: $(<"$paused_term_output")"
+[[ ! -f "$FAKE_PAUSED_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'TERM before DRAIN_OK did not restore the active controller'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'TERM before DRAIN_OK did not restore installed state'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'TERM before DRAIN_OK did not restore the prior manager release'
+[[ ${CI_FLEET_TEST_STOP_AFTER_PAUSED_TERM:-0} != 1 ]] || { printf 'PAUSED_TERM_REGRESSION_OK\n'; exit 0; }
 term_output=$tmp/term-rollback.out
 terminate_upgrade "$term_output" "$tmp/term-pause" "$tmp/term-rollback-up"
 grep -Fq 'ROLLBACK_RESTORED' "$term_output" || fail "TERM did not report checkpoint restoration: $(<"$term_output")"
