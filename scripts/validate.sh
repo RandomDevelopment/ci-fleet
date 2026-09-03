@@ -31,6 +31,8 @@ python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.jso
 scripts/test-capacity-preflight.sh
 scripts/test-healthcheck.sh
 scripts/test-install-worker-controller.sh
+scripts/test-install-deployer.sh
+scripts/test-deployer-units.sh
 scripts/test-install-status-receiver.sh
 
 tmp=$(mktemp)

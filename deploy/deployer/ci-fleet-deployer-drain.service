@@ -1,0 +1,17 @@
+[Unit]
+Description=Drain the ci-fleet deployer before maintenance
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh drain
+Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
+TimeoutStartSec=2min
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer
+ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer
+RestrictSUIDSGID=yes

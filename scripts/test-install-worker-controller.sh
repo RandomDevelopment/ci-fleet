@@ -392,6 +392,13 @@ expect_failure 'host configuration must be owned by root' "$installer" --install
 unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
+# A controller must never install onto a deployer host.
+mkdir -p "$root/etc/systemd/system" "$root/var/lib/ci-fleet-deployer"
+printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+rmdir "$root/var/lib/ci-fleet-deployer"
+
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 expect_success env DOCKER_CONTEXT=default "$installer" --check "${base_args[@]}" --ref "$ref_one"
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'

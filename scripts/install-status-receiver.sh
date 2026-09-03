@@ -49,6 +49,17 @@ if ! mkdir -m 0700 "$lock_directory" 2>/dev/null; then
 fi
 exec 9<"$lock_directory"
 flock 9
+role_lock="$root/run/ci-fleet-role-admission.lock"
+exec 8>"$role_lock"
+flock -n 8 || { echo "another ci-fleet role installation is already running" >&2; exit 1; }
+
+reject_deployer_role() {
+  local path
+  for path in "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || { echo "deployer host state is present" >&2; exit 1; }
+  done
+}
+reject_deployer_role
 
 current_ref() {
   local link release releases target
