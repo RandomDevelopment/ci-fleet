@@ -647,14 +647,21 @@ done
 build_failure_output=$tmp/build-failure.out
 build_failure_root=$tmp/build-failure-root
 cp -a "$root" "$build_failure_root"
+export FAKE_COMPOSE_LOG=$tmp/stopped-distinct-tag-build-compose.log
+: >"$FAKE_COMPOSE_LOG"
+printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$build_failure_output" 2>&1; then
   fail 'candidate build failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_BUILD
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
+grep -q '^build|' "$FAKE_COMPOSE_LOG" || fail 'stopped controller with distinct trusted tags did not prebuild'
+if grep -q '^stop|' "$FAKE_COMPOSE_LOG"; then fail 'stopped controller with distinct trusted tags was stopped before prebuild'; fi
 diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
+rm -f "$FAKE_CONTROLLER_STATUS_FILE"
+unset FAKE_COMPOSE_LOG
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], "CI_FLEET_RUNNER_IMAGE="))' "$FAKE_CONTROLLER_ENV_FILE" "CI_FLEET_RUNNER_IMAGE=$prior_runner_image"
 empty_live_image_output=$tmp/empty-live-image-build.out
 export FAKE_COMPOSE_LOG=$tmp/empty-live-image-build-compose.log
@@ -716,22 +723,27 @@ fi
 unset FAKE_FAIL_CONFIG
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail 'candidate Compose validation failure entered the transaction'; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate Compose validation failure stopped the installed controller'
-live_tag_build_output=$tmp/live-tag-build.out
-export FAKE_COMPOSE_LOG=$tmp/live-tag-build-compose.log
+restartable_tag_build_output=$tmp/restartable-tag-build.out
+export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
+printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_FAIL_BUILD=1
-if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$live_tag_build_output" 2>&1; then
-  fail 'live-tag candidate build failure unexpectedly succeeded'
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$restartable_tag_build_output" 2>&1; then
+  fail 'restartable-tag candidate build failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_BUILD
 stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'live runner tag was built before drain'
-grep -Fq 'DRAIN_OK managed_runners=0' "$live_tag_build_output" || fail 'live runner tag build did not wait for drain'
-grep -Fq 'ROLLBACK_RESTORED' "$live_tag_build_output" || fail 'live runner tag build failure did not restore the checkpoint'
-grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'live runner tag build failure changed installed state'
+[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'restartable controller runner tag was built before stop'
+grep -Fq 'DRAIN_OK managed_runners=0' "$restartable_tag_build_output" || fail 'restartable controller runner tag build did not wait for drain'
+grep -Fq 'ROLLBACK_RESTORED' "$restartable_tag_build_output" || fail 'restartable controller runner tag build failure did not restore the checkpoint'
+[[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'restartable controller runner tag build failure did not restore the installed controller'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'restartable controller runner tag build failure changed installed environment'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$FAKE_CONTROLLER_ENV_FILE" || fail 'restartable controller runner tag build failure did not restore the installed controller environment'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'restartable controller runner tag build failure changed installed state'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'restartable controller runner tag build failure changed the installed manager'
 unset FAKE_COMPOSE_LOG
-[[ ${CI_FLEET_TEST_STOP_AFTER_LIVE_TAG_BUILD:-0} != 1 ]] || { printf 'LIVE_TAG_BUILD_REGRESSION_OK\n'; exit 0; }
+[[ ${CI_FLEET_TEST_STOP_AFTER_RESTARTABLE_TAG_BUILD:-0} != 1 ]] || { printf 'RESTARTABLE_TAG_BUILD_REGRESSION_OK\n'; exit 0; }
 terminate_upgrade() {
   local output=$1 marker=$2 second_term_marker=${3:-} pid status=0 attempt
   export CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE=$marker
@@ -854,10 +866,7 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rol
 
 ref_three=$(write_config drained 2 2)
 printf 'dead\n' >"$FAKE_CONTROLLER_STATUS_FILE"
-export FAKE_STOP_FAIL=$tmp/stop-dead-fails
-: >"$FAKE_STOP_FAIL"
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_three" >/dev/null
-unset FAKE_STOP_FAIL
 [[ ! -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'non-active convergence retained a dead controller'
 grep -Fq 'CI_FLEET_CONTROLLER_STATE=drained' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained state was not rendered'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=0' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained controller retained effective capacity'

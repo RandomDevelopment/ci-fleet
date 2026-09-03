@@ -750,7 +750,15 @@ try_drain_current() {
   drain_error=
   status=$(controller_status)
   case "$status" in
-    running|''|exited|created|dead) ;;
+    running|'') ;;
+    exited|created|dead)
+      [[ -f "$drain_env" ]] || { drain_error="cannot stop restartable controller state without its rendered environment: $status"; return 1; }
+      old_release=$(current_runtime_release)
+      [[ -n "$old_release" ]] || old_release=$fallback_release
+      [[ -n "$old_release" ]] || { drain_error="cannot stop restartable controller state without its runtime release: $status"; return 1; }
+      compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop restartable controller state: $status"; return 1; }
+      status=
+      ;;
     *)
       if [[ "$force_nonterminal" != true ]]; then
         drain_error="cannot safely drain controller in non-terminal state: $status"
@@ -1087,8 +1095,10 @@ perform_converge() {
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   case "$existing_status" in
-    ''|exited|created|dead) build_before_drain=true ;;
-    running)
+    '')
+      [[ "$mode" == install && ! -f "$rendered_env" && ! -f "$state_file" ]] && build_before_drain=true
+      ;;
+    running|exited|created|dead)
       if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
         && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
         && live_runner_image=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null | awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}') \
