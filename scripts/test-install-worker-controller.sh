@@ -155,6 +155,7 @@ case "${1:-}" in
         [[ -z "${FAKE_FAIL_BUILD:-}" ]] || exit 46
         [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
+        [[ -z "${FAKE_DISK_USED_PERCENT_AFTER_BUILD:-}" || -z "${FAKE_DISK_USED_PERCENT_FILE:-}" ]] || printf '%s\n' "$FAKE_DISK_USED_PERCENT_AFTER_BUILD" >"$FAKE_DISK_USED_PERCENT_FILE"
         ;;
       config) [[ -z "${FAKE_FAIL_CONFIG:-}" ]] || exit 47 ;;
       logs) ;;
@@ -214,12 +215,18 @@ chmod 700 "$fake_bin/git"
 
 cat >"$fake_bin/df" <<'EOF'
 #!/usr/bin/env bash
-if [[ -n ${FAKE_DISK_USED_PERCENT:-} ]]; then
+if [[ -n ${FAKE_DISK_USED_PERCENT_FILE:-} && -f $FAKE_DISK_USED_PERCENT_FILE ]]; then
+  used=$(<"$FAKE_DISK_USED_PERCENT_FILE")
+elif [[ -n ${FAKE_DISK_USED_PERCENT:-} ]]; then
+  used=$FAKE_DISK_USED_PERCENT
+else
+  exec "$REAL_DF" "$@"
+fi
+if [[ -n ${used:-} ]]; then
   printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-  printf 'fixture 100 90 10 %s%% /fixture\n' "$FAKE_DISK_USED_PERCENT"
+  printf 'fixture 100 90 10 %s%% /fixture\n' "$used"
   exit 0
 fi
-exec "$REAL_DF" "$@"
 EOF
 chmod 700 "$fake_bin/df"
 
@@ -648,6 +655,35 @@ unset FAKE_FAIL_BUILD
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
 diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
+python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$FAKE_CONTROLLER_ENV_FILE" "$prior_runner_image" "$FAKE_RUNNER_IMAGE"
+live_drift_build_output=$tmp/live-drift-build.out
+export FAKE_COMPOSE_LOG=$tmp/live-drift-build-compose.log
+: >"$FAKE_COMPOSE_LOG"
+export FAKE_FAIL_BUILD=1
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$live_drift_build_output" 2>&1; then
+  fail 'live-drift candidate build failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_BUILD
+stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'live drift runner tag was built before drain'
+grep -Fq 'DRAIN_OK managed_runners=0' "$live_drift_build_output" || fail 'live drift runner tag build did not wait for drain'
+grep -Fq 'ROLLBACK_RESTORED' "$live_drift_build_output" || fail 'live drift runner tag build failure did not restore the checkpoint'
+unset FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_LIVE_DRIFT_BUILD:-0} != 1 ]] || { printf 'LIVE_DRIFT_BUILD_REGRESSION_OK\n'; exit 0; }
+postbuild_capacity_output=$tmp/postbuild-capacity.out
+export FAKE_DISK_USED_PERCENT_FILE=$tmp/docker-disk-used-percent
+export FAKE_DISK_USED_PERCENT_AFTER_BUILD=80
+printf '79\n' >"$FAKE_DISK_USED_PERCENT_FILE"
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$postbuild_capacity_output" 2>&1; then
+  fail 'post-build Docker capacity failure unexpectedly succeeded'
+fi
+unset FAKE_DISK_USED_PERCENT_AFTER_BUILD FAKE_DISK_USED_PERCENT_FILE
+grep -Fq 'Docker filesystem' "$postbuild_capacity_output" || fail 'post-build Docker capacity failure was not reported'
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$postbuild_capacity_output"; then fail 'post-build Docker capacity failure entered the transaction'; fi
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'post-build Docker capacity failure stopped the installed controller'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'post-build Docker capacity failure changed installed state'
+[[ ${CI_FLEET_TEST_STOP_AFTER_POSTBUILD_CAPACITY:-0} != 1 ]] || { printf 'POSTBUILD_CAPACITY_REGRESSION_OK\n'; exit 0; }
 for environment in "$rendered_env" "$FAKE_CONTROLLER_ENV_FILE"; do
   python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$environment" "$prior_runner_image" "$FAKE_RUNNER_IMAGE"
 done

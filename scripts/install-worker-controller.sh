@@ -1064,7 +1064,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image installed_runner_image expected_owner=0
+  local count existing_status candidate_runner_image installed_runner_image live_runner_image expected_owner=0
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1090,12 +1090,13 @@ perform_converge() {
     ''|exited|created|dead) build_before_drain=true ;;
     running)
       if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
-        && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env"); then
-        [[ "$candidate_runner_image" == "$installed_runner_image" ]] || build_before_drain=true
+        && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
+        && live_runner_image=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null | awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}'); then
+        [[ "$candidate_runner_image" == "$installed_runner_image" || "$candidate_runner_image" == "$live_runner_image" ]] || build_before_drain=true
       fi
       ;;
   esac
-  if $build_before_drain; then build_candidate; fi
+  if $build_before_drain; then build_candidate; require_commands; fi
   make_checkpoint
   transaction_active=true
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
