@@ -64,6 +64,8 @@ case "${1:-}" in
       printf 'managed-runner\n'
     elif [[ -n "${FAKE_RUNNER_STATE:-}" && -f "$FAKE_RUNNER_STATE" ]]; then
       printf 'managed-runner\n'
+    elif [[ "$*" != *'io.randomdevelopment.ci-fleet.kind=runner'* && -n "${FAKE_ACTIVE_MANAGED_STATE:-}" && -f "$FAKE_ACTIVE_MANAGED_STATE" ]]; then
+      printf 'active-managed-container\n'
     fi
     exit 0
     ;;
@@ -124,6 +126,7 @@ case "${1:-}" in
       stop)
         if [[ -n "${FAKE_STOP_FAIL:-}" && -f "$FAKE_STOP_FAIL" ]]; then exit 42; fi
         rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE"
+        [[ -z "${FAKE_ACTIVE_MANAGED_AFTER_STOP:-}" ]] || : >"$FAKE_ACTIVE_MANAGED_AFTER_STOP"
         ;;
       down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
@@ -630,6 +633,18 @@ unset FAKE_FAIL_BUILD
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
 diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
+managed_preflight_output=$tmp/managed-preflight.out
+export FAKE_ACTIVE_MANAGED_STATE=$tmp/active-managed-after-drain
+export FAKE_ACTIVE_MANAGED_AFTER_STOP=$FAKE_ACTIVE_MANAGED_STATE
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$managed_preflight_output" 2>&1; then
+  fail 'managed candidate preflight skipped an active managed container after drain'
+fi
+unset FAKE_ACTIVE_MANAGED_AFTER_STOP FAKE_ACTIVE_MANAGED_STATE
+grep -Fq 'DRAIN_OK managed_runners=0' "$managed_preflight_output" || fail 'managed candidate preflight ran before drain completed'
+grep -Fq 'managed containers already active for this instance' "$managed_preflight_output" || fail 'managed candidate preflight did not check active managed containers'
+grep -Fq 'ROLLBACK_RESTORED' "$managed_preflight_output" || fail 'managed candidate preflight failure did not restore the checkpoint'
+rm -f "$tmp/active-managed-after-drain"
+[[ ${CI_FLEET_TEST_STOP_AFTER_MANAGED_PREFLIGHT:-0} != 1 ]] || { printf 'MANAGED_PREFLIGHT_REGRESSION_OK\n'; exit 0; }
 export FAKE_FAIL_KILL_ONCE=$tmp/fail-kill-once
 : >"$FAKE_FAIL_KILL_ONCE"
 expect_failure 'failed to signal the paused controller' "$installer" --upgrade "${base_args[@]}" --ref "$ref_two"

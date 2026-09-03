@@ -85,7 +85,7 @@ disk_used=$(df -P "$docker_root" 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); pr
 if [[ -z "$disk_used" ]]; then disk_used=$(df -P / | awk 'NR==2 {gsub(/%/, "", $5); print $5}'); fi
 if ((disk_used >= 80)); then fail "Docker filesystem is ${disk_used}% full"; else ok "Docker filesystem is ${disk_used}% full"; fi
 
-if command -v docker >/dev/null && [[ "$managed" == false ]]; then
+if command -v docker >/dev/null; then
   active=$(docker ps -q \
     --filter label=io.randomdevelopment.ci-fleet.managed=true \
     --filter "label=io.randomdevelopment.ci-fleet.instance=${CI_FLEET_INSTANCE:-}" | wc -l | tr -d ' ')

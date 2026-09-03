@@ -693,7 +693,6 @@ run_candidate_preflight() {
 }
 
 build_candidate() {
-  run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
   compose "$release_dir" "$candidate_env" build runner-image controller
 }
@@ -1075,6 +1074,7 @@ perform_converge() {
   fi
   drain_current
   controller_id=$desired_controller_id
+  run_candidate_preflight
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
   activate_candidate
   transaction_active=false
