@@ -36,10 +36,13 @@ EOF
 note() { printf '%s\n' "$*"; }
 die() {
   printf 'ERROR: %s\n' "$*" >&2
+  trap - ERR
+  trap '' TERM
   if [[ ${transaction_active:-false} == true ]] && declare -F restore_checkpoint >/dev/null; then
     restore_checkpoint || true
     transaction_active=false
   fi
+  trap - ERR
   exit 2
 }
 
@@ -693,7 +696,6 @@ run_candidate_preflight() {
 }
 
 build_candidate() {
-  compose "$release_dir" "$candidate_env" config --quiet
   compose "$release_dir" "$candidate_env" build runner-image controller
 }
 
@@ -1024,14 +1026,24 @@ restore_checkpoint() {
   note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
 }
 
-on_error() {
-  local status=$?
+rollback_and_exit() {
+  local status=$1
+  trap - ERR
+  trap '' TERM
   if $transaction_active; then
     restore_checkpoint || true
+    transaction_active=false
   fi
+  trap - ERR
   exit "$status"
 }
+on_error() {
+  local status=$?
+  rollback_and_exit "$status"
+}
+on_term() { rollback_and_exit 143; }
 trap on_error ERR
+trap on_term TERM
 
 perform_check() {
   local count
@@ -1046,7 +1058,8 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status desired_controller_id=$controller_id
+  local count existing_status candidate_runner_image installed_runner_image expected_owner=0
+  local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -1064,7 +1077,19 @@ perform_converge() {
     return
   fi
   install_release
-  build_candidate
+  compose "$release_dir" "$candidate_env" config --quiet
+  candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  case "$existing_status" in
+    ''|exited|created|dead) build_before_drain=true ;;
+    running)
+      if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
+        && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env"); then
+        [[ "$candidate_runner_image" == "$installed_runner_image" ]] || build_before_drain=true
+      fi
+      ;;
+  esac
+  if $build_before_drain; then build_candidate; fi
   make_checkpoint
   transaction_active=true
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
@@ -1073,8 +1098,13 @@ perform_converge() {
     die '--adopt requires a trusted installed controller identity'
   fi
   drain_current
+  if [[ "$testing" == 1 && -n ${CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE:-} ]]; then
+    printf '%s\n' "$BASHPID" >"$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE"
+    while [[ ! -f "$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE.continue" ]]; do sleep 0.05; done
+  fi
   controller_id=$desired_controller_id
   run_candidate_preflight
+  if ! $build_before_drain; then build_candidate; fi
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
   activate_candidate
   transaction_active=false

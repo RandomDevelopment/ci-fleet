@@ -9,8 +9,10 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/ci-fleet/manager/current
 ExecStart=/opt/ci-fleet/manager/current/scripts/remote-reconcile.sh
-# One hour for the installer lock, plus one hour for a cold build and rollback.
+# One hour for the installer lock, plus one hour for a cold build and transaction.
 TimeoutStartSec=2h
+# Allow checkpoint restoration after TimeoutStartSec sends SIGTERM.
+TimeoutStopSec=15min
 Restart=no
 # 0=noop, 3=drift/invalid — timer retries
 SuccessExitStatus=0 3

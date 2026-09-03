@@ -136,12 +136,13 @@ The installer:
 3. selects exactly one logical controller;
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
-6. creates a root-only controller checkpoint;
-7. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
-8. runs managed preflight and builds the pinned runner and controller images;
-9. installs health, cleanup, and pinned-state drift unit definitions;
-10. starts the controller only when its desired state is active and verifies runtime health;
-11. atomically records redacted installation state, then enables the maintenance timers.
+6. validates the candidate Compose configuration and builds images before the transaction when no active installed controller uses the candidate runner tag;
+7. creates a root-only controller checkpoint;
+8. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
+9. runs managed preflight and, when the candidate would retag the active controller's runner image, builds the images after drain;
+10. installs health, cleanup, and pinned-state drift unit definitions;
+11. starts the controller only when its desired state is active and verifies runtime health;
+12. atomically records redacted installation state, then enables the maintenance timers.
 
 A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. A successful engine upgrade advances both the runtime release and the maintenance installer-manager to the same pinned commit; rollback restores both.
 
@@ -240,7 +241,7 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Build and validation happen before the active release changes. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Compose validation happens before the checkpoint. A build using a distinct inert runner tag may also happen before the checkpoint; failure may leave candidate image or layer artifacts, but installed state and the active controller remain unchanged. A build that would retag the active controller's runner image happens only after checkpoint and drain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
 
 Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy.
 

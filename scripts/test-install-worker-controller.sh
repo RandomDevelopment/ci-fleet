@@ -108,6 +108,12 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        if [[ -n "${FAKE_DELAY_UP_ONCE:-}" && -f "$FAKE_DELAY_UP_ONCE" ]]; then
+          delay_marker=$FAKE_DELAY_UP_ONCE
+          rm -f "$delay_marker"
+          : >"${delay_marker}.entered"
+          sleep 2
+        fi
         if [[ -n "${FAKE_FAIL_UP_ONCE:-}" && -f "$FAKE_FAIL_UP_ONCE" ]]; then
           rm -f "$FAKE_FAIL_UP_ONCE"
           exit 42
@@ -146,7 +152,8 @@ case "${1:-}" in
         [[ -z "${FAKE_RUNNER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_RUNNER_IMAGE_STATE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_STATE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_IMAGE_STATE"
         ;;
-      config|logs) ;;
+      config) [[ -z "${FAKE_FAIL_CONFIG:-}" ]] || exit 47 ;;
+      logs) ;;
       *) exit 1 ;;
     esac
     ;;
@@ -622,6 +629,10 @@ ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
 ref_two=$(write_config active 2 2)
+prior_runner_image=ci-fleet-runner:prior
+for environment in "$rendered_env" "$FAKE_CONTROLLER_ENV_FILE"; do
+  python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$environment" "$FAKE_RUNNER_IMAGE" "$prior_runner_image"
+done
 build_failure_output=$tmp/build-failure.out
 build_failure_root=$tmp/build-failure-root
 cp -a "$root" "$build_failure_root"
@@ -633,6 +644,79 @@ unset FAKE_FAIL_BUILD
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
 diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
+for environment in "$rendered_env" "$FAKE_CONTROLLER_ENV_FILE"; do
+  python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$environment" "$prior_runner_image" "$FAKE_RUNNER_IMAGE"
+done
+config_failure_output=$tmp/config-failure.out
+export FAKE_FAIL_CONFIG=1
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$config_failure_output" 2>&1; then
+  fail 'candidate Compose validation failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_CONFIG
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail 'candidate Compose validation failure entered the transaction'; fi
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate Compose validation failure stopped the installed controller'
+live_tag_build_output=$tmp/live-tag-build.out
+export FAKE_COMPOSE_LOG=$tmp/live-tag-build-compose.log
+: >"$FAKE_COMPOSE_LOG"
+export FAKE_FAIL_BUILD=1
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$live_tag_build_output" 2>&1; then
+  fail 'live-tag candidate build failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_BUILD
+stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'live runner tag was built before drain'
+grep -Fq 'DRAIN_OK managed_runners=0' "$live_tag_build_output" || fail 'live runner tag build did not wait for drain'
+grep -Fq 'ROLLBACK_RESTORED' "$live_tag_build_output" || fail 'live runner tag build failure did not restore the checkpoint'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'live runner tag build failure changed installed state'
+unset FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_LIVE_TAG_BUILD:-0} != 1 ]] || { printf 'LIVE_TAG_BUILD_REGRESSION_OK\n'; exit 0; }
+terminate_upgrade() {
+  local output=$1 marker=$2 second_term_marker=${3:-} pid installer_pid status=0 attempt
+  export CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE=$marker
+  if [[ -n "$second_term_marker" ]]; then
+    : >"$second_term_marker"
+    export FAKE_DELAY_UP_ONCE=$second_term_marker
+  fi
+  "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$output" 2>&1 &
+  pid=$!
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    [[ ! -f "$marker" ]] || break
+    sleep 0.05
+  done
+  if [[ ! -f "$marker" ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail 'TERM regression did not reach the drained transaction'
+  fi
+  installer_pid=$(<"$marker")
+  kill -TERM "$installer_pid"
+  if [[ -n "$second_term_marker" ]]; then
+    for ((attempt = 0; attempt < 200; attempt++)); do
+      [[ ! -f "${second_term_marker}.entered" ]] || break
+      sleep 0.05
+    done
+    [[ -f "${second_term_marker}.entered" ]] || fail 'TERM regression did not enter checkpoint restoration'
+    kill -TERM "$installer_pid"
+  fi
+  if wait "$pid"; then status=0; else status=$?; fi
+  unset CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE FAKE_DELAY_UP_ONCE
+  [[ "$status" == 143 ]] || fail "TERM regression changed the signal exit status: $status"
+}
+term_output=$tmp/term-rollback.out
+terminate_upgrade "$term_output" "$tmp/term-pause" "$tmp/term-rollback-up"
+grep -Fq 'ROLLBACK_RESTORED' "$term_output" || fail "TERM did not report checkpoint restoration: $(<"$term_output")"
+[[ ! -f "$FAKE_PAUSED_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'TERM did not restore the active controller'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'TERM did not restore installed state'
+term_failure_output=$tmp/term-rollback-failure.out
+export FAKE_FAIL_UP_ONCE=$tmp/term-rollback-fail-up
+: >"$FAKE_FAIL_UP_ONCE"
+terminate_upgrade "$term_failure_output" "$tmp/term-failure-pause"
+unset FAKE_FAIL_UP_ONCE
+grep -Fq 'ROLLBACK_FAILED' "$term_failure_output" || fail 'TERM rollback failure was not reported'
+expect_success "$installer" --rollback >/dev/null
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'explicit rollback did not recover after TERM rollback failure'
+[[ ${CI_FLEET_TEST_STOP_AFTER_TERM_ROLLBACK:-0} != 1 ]] || { printf 'TERM_ROLLBACK_REGRESSION_OK\n'; exit 0; }
 managed_preflight_output=$tmp/managed-preflight.out
 export FAKE_ACTIVE_MANAGED_STATE=$tmp/active-managed-after-drain
 export FAKE_ACTIVE_MANAGED_AFTER_STOP=$FAKE_ACTIVE_MANAGED_STATE
