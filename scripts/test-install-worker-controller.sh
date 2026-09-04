@@ -157,6 +157,11 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$env_file")
+        "$0" image inspect --format '{{.Id}}' "$controller_image" >/dev/null 2>&1 || {
+          printf 'configured controller image is unavailable: %s\n' "$controller_image" >&2
+          exit 49
+        }
         if [[ -n "${FAKE_DELAY_UP_ONCE:-}" && -f "$FAKE_DELAY_UP_ONCE" ]]; then
           delay_marker=$FAKE_DELAY_UP_ONCE
           rm -f "$delay_marker"
@@ -881,24 +886,34 @@ absent_controller_output=$tmp/absent-controller-timer-rollback.out
 export FAKE_COMPOSE_LOG=$tmp/absent-controller-timer-rollback-compose.log
 export FAKE_STOPPED_CONTROLLER_STATE=$tmp/stopped-controller
 : >"$FAKE_COMPOSE_LOG"
-prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
+prior_controller_image_id=sha256:4444444444444444444444444444444444444444444444444444444444444444
+printf '%s\n' "$prior_controller_image_id" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 rm -f "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_CONTROLLER_IMAGE_ID_STATE"
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$prior_controller_image_id" ]] || fail 'untagged running controller lost its exact image ID'
 export FAKE_FAIL_TIMER_ENABLE=1
 if "$installer" --upgrade --config-repo "$config_repo" --config-identity fixture-org/fleet-config --controller example-ci-01 --ref "$ref_two" >"$absent_controller_output" 2>&1; then
   fail 'absent-controller timer activation failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_TIMER_ENABLE
-grep -Fq 'ROLLBACK_RESTORED' "$absent_controller_output" || fail "absent-controller timer failure did not restore the checkpoint: $(<"$absent_controller_output")"
+grep -Fq 'ROLLBACK_RESTORED' "$absent_controller_output" || fail "absent-controller timer failure did not restore the checkpoint: $(<"$absent_controller_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$absent_controller_output")
+grep -Fxq 'CI_FLEET_CONTROLLER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'checkpoint did not preserve the absent controller tag'
+grep -Fxq "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=$prior_controller_image_id" "$checkpoint_path/image-ids.env" || fail 'checkpoint omitted the untagged live controller image ID'
 [[ ! -e "$FAKE_CONTROLLER_IMAGE_STATE" && ! -e "$FAKE_CONTROLLER_IMAGE_ID_STATE" ]] || fail 'timer-failure rollback retained a controller tag that was previously absent'
 [[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_STOPPED_CONTROLLER_STATE" ]] || fail 'timer-failure rollback did not restart the prior controller'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$prior_controller_image_id" ]] || fail 'timer-failure rollback did not recreate the exact prior controller image'
 candidate_up_line=$(grep -n -m1 '^up|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_stop_line=$(grep -n '^stop|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 candidate_rm_line=$(grep -n -m1 '^rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-controller_rm_line=$(grep -n -m1 "^image-rm|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
-[[ -n "$candidate_up_line" && -n "$rollback_stop_line" && -n "$candidate_rm_line" && -n "$controller_rm_line" && -n "$rollback_up_line" \
-  && "$candidate_up_line" -lt "$rollback_stop_line" && "$rollback_stop_line" -lt "$candidate_rm_line" && "$candidate_rm_line" -lt "$controller_rm_line" && "$controller_rm_line" -lt "$rollback_up_line" ]] \
-  || fail 'timer-failure rollback did not remove the stopped candidate before restoring image state and restarting'
+controller_rm_line=$(grep -n "^image-rm|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+[[ -n "$candidate_up_line" && -n "$rollback_stop_line" && -n "$candidate_rm_line" && -n "$controller_tag_line" && -n "$rollback_up_line" && -n "$controller_rm_line" \
+  && "$candidate_up_line" -lt "$rollback_stop_line" && "$rollback_stop_line" -lt "$candidate_rm_line" && "$candidate_rm_line" -lt "$controller_tag_line" \
+  && "$controller_tag_line" -lt "$rollback_up_line" && "$rollback_up_line" -lt "$controller_rm_line" ]] \
+  || fail 'timer-failure rollback did not remove the candidate, recreate the prior controller, and remove its temporary tag'
 printf '%s\n' "$engine_ref" >"$FAKE_CONTROLLER_IMAGE_STATE"
 printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
 printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"

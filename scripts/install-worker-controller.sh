@@ -700,7 +700,7 @@ build_candidate() {
 }
 
 load_checkpoint_images() {
-  local environment=$1 image_ids=${2:-} output expected=2
+  local environment=$1 image_ids=${2:-} output
   output=$(python3 - "$environment" "$image_ids" "$repo_root/scripts" <<'PY'
 import re
 import sys
@@ -719,19 +719,23 @@ for key in image_keys:
 if sys.argv[2]:
     id_keys = tuple(f"{key}_ID" for key in image_keys)
     values = parse_env(Path(sys.argv[2]), allow_unknown=True)
-    if set(values) != set(id_keys) or any(values[key] != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
+    live_key = "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID"
+    if not set(id_keys).issubset(values) or not set(values) <= {*id_keys, live_key} or any(values[key] != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
+        raise SystemExit(1)
+    if live_key in values and (values[id_keys[1]] != "absent" or not re.fullmatch(r"sha256:[0-9a-f]{64}", values[live_key])):
         raise SystemExit(1)
     for key in id_keys:
         print(values[key])
+    if live_key in values:
+        print(values[live_key])
 PY
   ) || return 1
-  [[ -z "$image_ids" ]] || expected=4
   mapfile -t checkpoint_images <<<"$output"
-  [[ ${#checkpoint_images[@]} == "$expected" ]]
+  [[ ${#checkpoint_images[@]} == 2 || -n "$image_ids" && ( ${#checkpoint_images[@]} == 4 || ${#checkpoint_images[@]} == 5 ) ]]
 }
 
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id=
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
   install -d -m 0700 "$checkpoints_dir"
@@ -753,10 +757,16 @@ make_checkpoint() {
     if ! controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null); then
       docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
       controller_id=absent
+      if ! controller_live_id=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null); then
+        docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+        controller_live_id=
+      fi
     fi
     [[ "$runner_id" == absent || "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed runner image ID is invalid'
     [[ "$controller_id" == absent || "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed controller image ID is invalid'
+    [[ -z "$controller_live_id" || "$controller_live_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'live controller image ID is invalid'
     printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/image-ids.env"
+    [[ -z "$controller_live_id" ]] || printf 'CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=%s\n' "$controller_live_id" >>"$checkpoint_dir/image-ids.env"
     chmod 0600 "$checkpoint_dir/image-ids.env"
   fi
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
@@ -1024,6 +1034,7 @@ restore_systemd_snapshot() {
 
 restore_checkpoint() {
   local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false
+  local remove_restored_controller_tag=false
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -1104,15 +1115,22 @@ restore_checkpoint() {
   if $restore_images; then
     for index in 0 1; do
       if [[ ${checkpoint_images[index + 2]} == absent ]]; then
-        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
-          docker image rm "${checkpoint_images[index]}" >/dev/null || failed=1
+        if [[ "$index" == 1 && ${#checkpoint_images[@]} == 5 ]]; then
+          docker image tag "${checkpoint_images[4]}" "${checkpoint_images[index]}" || failed=1
+          actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
+          [[ "$actual" == "${checkpoint_images[4]}" ]] || failed=1
+          remove_restored_controller_tag=true
         else
-          docker info >/dev/null 2>&1 || failed=1
-        fi
-        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
-          failed=1
-        else
-          docker info >/dev/null 2>&1 || failed=1
+          if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+            docker image rm "${checkpoint_images[index]}" >/dev/null || failed=1
+          else
+            docker info >/dev/null 2>&1 || failed=1
+          fi
+          if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+            failed=1
+          else
+            docker info >/dev/null 2>&1 || failed=1
+          fi
         fi
       else
         docker image tag "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || failed=1
@@ -1132,6 +1150,14 @@ restore_checkpoint() {
         compose "$release_dir" "$rendered_env" up -d --no-deps controller || failed=1
         if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" true || failed=1; fi
       fi
+    fi
+  fi
+  if $remove_restored_controller_tag && ((failed == 0)); then
+    docker image rm "${checkpoint_images[1]}" >/dev/null || failed=1
+    if docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" >/dev/null 2>&1; then
+      failed=1
+    else
+      docker info >/dev/null 2>&1 || failed=1
     fi
   fi
   set -e
