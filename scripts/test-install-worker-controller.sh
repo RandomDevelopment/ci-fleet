@@ -34,6 +34,7 @@ if [[ -n ${FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT:-} ]]; then
 fi
 case "${1:-}" in
   info)
+    if [[ -n ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} && -f $FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT ]]; then exit 1; fi
     [[ "$*" != *DockerRootDir* ]] || printf '%s\n' "${CI_FLEET_DOCKER_ROOT:?}"
     exit 0
     ;;
@@ -83,7 +84,15 @@ case "${1:-}" in
         else
           exit 1
         fi
-        if [[ "$*" == *'{{.Id}}'* ]]; then [[ -f "$image_id_state" ]] && cat "$image_id_state"; else [[ -f "$image_state" ]] && cat "$image_state"; fi
+        if [[ "$*" == *'{{.Id}}'* ]]; then
+          if [[ ! -f "$image_id_state" ]]; then
+            [[ -z ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} ]] || : >"$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
+            exit 1
+          fi
+          cat "$image_id_state"
+        else
+          [[ -f "$image_state" ]] && cat "$image_state"
+        fi
         ;;
       tag)
         image_id=${3:-}
@@ -99,6 +108,20 @@ case "${1:-}" in
         fi
         printf '%s\n' "$image_id" >"$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-tag|%s|%s\n' "$image_id" "$image" >>"$FAKE_COMPOSE_LOG"
+        ;;
+      rm)
+        image=${3:-}
+        if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
+          image_state=${FAKE_RUNNER_IMAGE_STATE:-}
+          image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
+        elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
+          image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
+          image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
+        else
+          exit 1
+        fi
+        rm -f "$image_state" "$image_id_state"
+        [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
         ;;
       *) exit 1 ;;
     esac
@@ -455,6 +478,10 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+fresh_checkpoint=$(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d ! -name '.checkpoint.staging.*' -print -quit)
+fresh_format_marker=$fresh_checkpoint/format-version
+[[ -f "$fresh_format_marker" && ! -L "$fresh_format_marker" && $(stat -c '%u:%a:%s' "$fresh_format_marker") == "$(id -u):600:2" && $(<"$fresh_format_marker") == 2 ]] || fail 'fresh checkpoint lacks the exact root-owned mode-0600 format marker'
+[[ ! -e "$fresh_checkpoint/ci-fleet.env" && ! -e "$fresh_checkpoint/image-ids.env" ]] || fail 'fresh checkpoint stored prior managed image state'
 if find "$root/var/lib/ci-fleet/checkpoints" -name image-ids.env -print -quit | grep -q .; then fail 'fresh install checkpoint stored a prior image map'; fi
 install_state=$root/var/lib/ci-fleet/install-state.json
 chmod 644 "$install_state"
@@ -797,6 +824,47 @@ if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$invalid_image_output" |
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'invalid installed image ID stopped the installed controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'invalid installed image ID changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'invalid installed image ID changed the installed manager'
+missing_tag_output=$tmp/missing-tag-build.out
+export FAKE_COMPOSE_LOG=$tmp/missing-tag-build-compose.log
+: >"$FAKE_COMPOSE_LOG"
+prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
+prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
+rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE"
+export FAKE_PARTIAL_BUILD_FAIL=1
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$missing_tag_output" 2>&1; then
+  fail 'missing-tag candidate build failure unexpectedly succeeded'
+fi
+unset FAKE_PARTIAL_BUILD_FAIL
+grep -Fq 'DRAIN_OK managed_runners=0' "$missing_tag_output" || fail "missing managed tag did not reach the deferred build failure: $(<"$missing_tag_output")"
+grep -Fq 'ROLLBACK_RESTORED' "$missing_tag_output" || fail 'missing-tag build failure did not restore the checkpoint'
+checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$missing_tag_output")
+grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'checkpoint did not record the missing runner tag'
+[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" ]] || fail 'rollback retained a runner tag that was absent before repair'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'missing-tag rollback did not restore the prior controller image ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'missing-tag rollback changed the installed environment'
+grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'missing-tag rollback changed the installed manager'
+runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+[[ -n "$runner_rm_line" && -n "$controller_tag_line" && -n "$rollback_up_line" && "$runner_rm_line" -lt "$rollback_up_line" && "$controller_tag_line" -lt "$rollback_up_line" ]] || fail 'missing-tag rollback restarted the controller before restoring both image states'
+daemon_failure_output=$tmp/missing-tag-daemon-failure.out
+export FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT=$tmp/docker-info-fail-after-image-inspect
+: >"$FAKE_COMPOSE_LOG"
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$daemon_failure_output" 2>&1; then
+  fail 'missing-tag daemon failure unexpectedly succeeded'
+fi
+rm -f "$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
+unset FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT
+grep -Fq 'Docker daemon is unavailable' "$daemon_failure_output" || fail 'image absence was accepted without confirming Docker availability'
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$daemon_failure_output" || grep -Eq '^(stop|build)\|' "$FAKE_COMPOSE_LOG"; then fail 'Docker daemon failure entered the transaction'; fi
+uninstall_output=$(expect_success "$installer" --uninstall)
+grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
+expect_success "$installer" --rollback >/dev/null
+[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the missing-tag installation'
+printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
+printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
+unset FAKE_COMPOSE_LOG
 restartable_tag_build_output=$tmp/restartable-tag-build.out
 export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
@@ -822,7 +890,9 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'restartable controlle
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'rollback did not restore the prior controller tag image ID'
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$restartable_tag_build_output")
 image_ids_file=$checkpoint_path/image-ids.env
+format_marker=$checkpoint_path/format-version
 [[ -d "$checkpoint_path" && $(stat -c %a "$checkpoint_path") == 700 ]] || fail 'image rollback checkpoint is not a mode-0700 directory'
+[[ -f "$format_marker" && ! -L "$format_marker" && $(stat -c '%u:%a:%s' "$format_marker") == "$(id -u):600:2" && $(<"$format_marker") == 2 ]] || fail 'managed checkpoint lacks the exact root-owned mode-0600 format marker'
 [[ -f "$image_ids_file" && $(stat -c %a "$image_ids_file") == 600 && $(wc -l <"$image_ids_file") == 2 ]] || fail 'checkpoint image map is not exactly one mode-0600 two-ID file'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE_ID=$prior_runner_image_id" "$image_ids_file" || fail 'checkpoint omitted the prior runner image ID'
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_ID=$prior_controller_image_id" "$image_ids_file" || fail 'checkpoint omitted the prior controller image ID'
@@ -840,7 +910,29 @@ if grep -q '^up|' "$FAKE_COMPOSE_LOG"; then fail 'malformed checkpoint image ID 
 printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$prior_runner_image_id" "$prior_controller_image_id" >"$image_ids_file"
 expect_success "$installer" --rollback >/dev/null
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'repaired checkpoint did not restore the prior controller'
+legacy_checkpoint=$root/var/lib/ci-fleet/checkpoints/legacy-checkpoint
+cp -a "$checkpoint_path" "$legacy_checkpoint"
+rm -f "$legacy_checkpoint/format-version" "$legacy_checkpoint/image-ids.env"
+touch "$legacy_checkpoint/.complete"
+: >"$FAKE_COMPOSE_LOG"
+legacy_output=$tmp/legacy-checkpoint.out
+if ! "$installer" --rollback >"$legacy_output" 2>&1; then
+  fail "legacy checkpoint was rejected: $(<"$legacy_output")"
+fi
+grep -Fq 'ROLLBACK_LEGACY_IMAGE_STATE_UNVERIFIED' "$legacy_output" || fail 'legacy rollback omitted its image-state warning'
+if grep -Eq '^image-(tag|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'legacy rollback claimed or changed image identity'; fi
+printf '3\n' >"$legacy_checkpoint/format-version"
+chmod 0600 "$legacy_checkpoint/format-version"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'checkpoint format marker is invalid' "$installer" --rollback
+if [[ ! -f "$FAKE_DOCKER_STATE" ]] || grep -Eq '^(stop|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unknown checkpoint version caused rollback side effects'; fi
+printf '2\n' >"$legacy_checkpoint/format-version"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'checkpoint image mappings are invalid' "$installer" --rollback
+if [[ ! -f "$FAKE_DOCKER_STATE" ]] || grep -Eq '^(stop|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'version-2 checkpoint without image state caused rollback side effects'; fi
+rm -rf "$legacy_checkpoint"
 unset FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_CHECKPOINT_COMPAT:-0} != 1 ]] || { printf 'CHECKPOINT_COMPAT_REGRESSIONS_OK\n'; exit 0; }
 [[ ${CI_FLEET_TEST_STOP_AFTER_IMAGE_ROLLBACK:-0} != 1 ]] || { printf 'IMAGE_ROLLBACK_REGRESSION_OK\n'; exit 0; }
 terminate_upgrade() {
   local output=$1 marker=$2 second_term_marker=${3:-} pid status=0 attempt

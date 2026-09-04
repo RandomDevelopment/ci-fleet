@@ -719,7 +719,7 @@ for key in image_keys:
 if sys.argv[2]:
     id_keys = tuple(f"{key}_ID" for key in image_keys)
     values = parse_env(Path(sys.argv[2]), allow_unknown=True)
-    if set(values) != set(id_keys) or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
+    if set(values) != set(id_keys) or any(values[key] != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
         raise SystemExit(1)
     for key in id_keys:
         print(values[key])
@@ -739,15 +739,23 @@ make_checkpoint() {
   staging_paths+=("$staged_checkpoint")
   checkpoint_dir=$staged_checkpoint
   install -d -m 0700 "$checkpoint_dir/systemd"
+  printf '2\n' >"$checkpoint_dir/format-version"
+  chmod 0600 "$checkpoint_dir/format-version"
   if [[ -f "$rendered_env" ]]; then
     [[ "$testing" != 1 ]] || expected_owner=$(id -u)
     [[ $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $rendered_env"
     install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
     load_checkpoint_images "$checkpoint_dir/ci-fleet.env" || die 'installed image tags are invalid'
-    runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null) || die 'installed runner image mapping is unavailable'
-    controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null) || die 'installed controller image mapping is unavailable'
-    [[ "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed runner image ID is invalid'
-    [[ "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed controller image ID is invalid'
+    if ! runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      runner_id=absent
+    fi
+    if ! controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      controller_id=absent
+    fi
+    [[ "$runner_id" == absent || "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed runner image ID is invalid'
+    [[ "$controller_id" == absent || "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed controller image ID is invalid'
     printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/image-ids.env"
     chmod 0600 "$checkpoint_dir/image-ids.env"
   fi
@@ -1011,17 +1019,32 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state actual failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false
+  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false
+  local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ -e "$format_marker" || -L "$format_marker" ]]; then
+    if [[ -L "$format_marker" || ! -f "$format_marker" || $(stat -c %u "$format_marker") != "$expected_owner" \
+      || $(stat -c %a "$format_marker") != 600 || $(stat -c %s "$format_marker") != 2 || $(<"$format_marker") != 2 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint format marker is invalid'
+      return 1
+    fi
+    new_format=true
+  elif [[ -e "$image_ids" || -L "$image_ids" ]]; then
+    note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+    return 1
+  elif [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    note 'ROLLBACK_LEGACY_IMAGE_STATE_UNVERIFIED'
+  fi
   [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
-  if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
-    if [[ ! -f "$checkpoint_dir/image-ids.env" || -L "$checkpoint_dir/image-ids.env" || $(stat -c %a "$checkpoint_dir/image-ids.env") != 600 ]] \
-      || ! load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$checkpoint_dir/image-ids.env"; then
+  if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    if [[ ! -f "$image_ids" || -L "$image_ids" || $(stat -c %u "$image_ids") != "$expected_owner" || $(stat -c %a "$image_ids") != 600 ]] \
+      || ! load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$image_ids"; then
       note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
       return 1
     fi
     restore_images=true
-  elif [[ -e "$checkpoint_dir/image-ids.env" || -L "$checkpoint_dir/image-ids.env" ]]; then
+  elif $new_format && [[ -e "$image_ids" || -L "$image_ids" ]]; then
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
     return 1
   fi
@@ -1075,12 +1098,24 @@ restore_checkpoint() {
     rm -f "$manager_current" || failed=1
   fi
   if $restore_images; then
-    docker image tag "${checkpoint_images[2]}" "${checkpoint_images[0]}" || failed=1
-    docker image tag "${checkpoint_images[3]}" "${checkpoint_images[1]}" || failed=1
-    actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null) || failed=1
-    [[ "$actual" == "${checkpoint_images[2]}" ]] || failed=1
-    actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null) || failed=1
-    [[ "$actual" == "${checkpoint_images[3]}" ]] || failed=1
+    for index in 0 1; do
+      if [[ ${checkpoint_images[index + 2]} == absent ]]; then
+        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+          docker image rm "${checkpoint_images[index]}" >/dev/null || failed=1
+        else
+          docker info >/dev/null 2>&1 || failed=1
+        fi
+        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+          failed=1
+        else
+          docker info >/dev/null 2>&1 || failed=1
+        fi
+      else
+        docker image tag "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || failed=1
+        actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
+        [[ "$actual" == "${checkpoint_images[index + 2]}" ]] || failed=1
+      fi
+    done
   fi
   restore_systemd_snapshot || failed=1
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
