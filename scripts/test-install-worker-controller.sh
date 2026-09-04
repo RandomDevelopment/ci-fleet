@@ -48,7 +48,7 @@ case "${1:-}" in
       [[ -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" ]] || exit 1
       cat "$FAKE_CONTROLLER_IMAGE_ID_FILE"
     elif [[ "$*" == *'.State.Status'* ]]; then
-      if [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
+      if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'paused\n'; elif [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
     elif [[ "$*" == *'.State.Paused'* ]]; then
       if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'true\n'; else printf 'false\n'; fi
     else
@@ -130,6 +130,7 @@ case "${1:-}" in
         fi
         ;;
       stop)
+        if [[ -n "$paused_state" && -f "$paused_state" ]]; then exit 42; fi
         if [[ -n "${FAKE_STOP_FAIL:-}" && -f "$FAKE_STOP_FAIL" ]]; then exit 42; fi
         rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE"
         [[ -z "${FAKE_ACTIVE_MANAGED_AFTER_STOP:-}" ]] || : >"$FAKE_ACTIVE_MANAGED_AFTER_STOP"

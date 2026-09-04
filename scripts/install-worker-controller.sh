@@ -768,6 +768,9 @@ try_drain_current() {
       old_release=$(current_runtime_release)
       [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
+      if [[ "$status" == paused ]]; then
+        compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || { drain_error="failed to unpause non-terminal candidate state: $status"; return 1; }
+      fi
       compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
       status=
       ;;
