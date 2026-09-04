@@ -113,13 +113,19 @@ case "${1:-}" in
       rm)
         image=${3:-}
         if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
+          image_kind=runner
           image_state=${FAKE_RUNNER_IMAGE_STATE:-}
           image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
         elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
+          image_kind=controller
           image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
           image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
         else
           exit 1
+        fi
+        if [[ "$image_kind" == runner && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
+          [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
+          exit 48
         fi
         if [[ -n "$stopped_state" && -f "$stopped_state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
           && cmp -s "$FAKE_CONTROLLER_IMAGE_ID_FILE" "$image_id_state"; then
@@ -134,6 +140,7 @@ case "${1:-}" in
     ;;
   rm)
     (($# >= 2)) || exit 1
+    [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'container-rm|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"
     [[ -z "${FAKE_ALL_RUNNER_STATE:-}" ]] || rm -f "$FAKE_ALL_RUNNER_STATE"
     ;;
   volume|network)
@@ -241,6 +248,7 @@ if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}
   exit 98
 fi
 if [[ -n "${FAKE_FAIL_TIMER_ENABLE:-}" && "${1:-}" == enable && "${2:-}" == --now && "$*" == *ci-fleet-reconcile.timer* ]]; then
+  [[ -z "${FAKE_CREATE_STOPPED_RUNNER_ON_TIMER_FAILURE:-}" || -z "${FAKE_ALL_RUNNER_STATE:-}" ]] || : >"$FAKE_ALL_RUNNER_STATE"
   exit 97
 fi
 if [[ -n "${FAKE_DISABLED_TIMER:-}" && ( "${1:-}" == is-enabled || "${1:-}" == is-active ) && $# == 3 && "${3:-}" == "$FAKE_DISABLED_TIMER" ]]; then
@@ -583,7 +591,7 @@ printf '%040d\n' 0 >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] || fail 'controller convergence did not restore running image provenance'
-printf 'sha256:%040d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+printf 'sha256:%064d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$FAKE_CANDIDATE_CONTROLLER_IMAGE_ID" ]] || fail 'controller convergence did not restore live image identity'
@@ -920,6 +928,57 @@ printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 printf '%s\n' "$engine_ref" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
 unset FAKE_STOPPED_CONTROLLER_STATE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_ABSENT_CONTROLLER_ROLLBACK:-0} != 1 ]] || { printf 'ABSENT_CONTROLLER_ROLLBACK_REGRESSION_OK\n'; exit 0; }
+drifted_controller_output=$tmp/drifted-controller-timer-rollback.out
+export FAKE_COMPOSE_LOG=$tmp/drifted-controller-timer-rollback-compose.log
+: >"$FAKE_COMPOSE_LOG"
+drifted_live_controller_image_id=sha256:5555555555555555555555555555555555555555555555555555555555555555
+drifted_tag_controller_image_id=sha256:6666666666666666666666666666666666666666666666666666666666666666
+printf '%s\n%s\n' "$drifted_live_controller_image_id" "$drifted_tag_controller_image_id" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+printf '%s\n' "$engine_ref" >"$FAKE_CONTROLLER_IMAGE_STATE"
+printf '%s\n' "$drifted_tag_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+printf '%s\n' "$drifted_live_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+export FAKE_FAIL_TIMER_ENABLE=1
+if "$installer" --upgrade --config-repo "$config_repo" --config-identity fixture-org/fleet-config --controller example-ci-01 --ref "$ref_two" >"$drifted_controller_output" 2>&1; then
+  fail 'drifted-controller timer activation failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_TIMER_ENABLE
+grep -Fq 'CHECKPOINT_CREATED' "$drifted_controller_output" || fail 'drifted-controller timer failure changed state before checkpointing'
+grep -Fq 'DRAIN_OK managed_runners=0' "$drifted_controller_output" || fail 'drifted-controller timer failure did not drain before activation'
+grep -Fq 'ROLLBACK_RESTORED' "$drifted_controller_output" || fail "drifted-controller timer failure did not restore the checkpoint: $(<"$drifted_controller_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$drifted_tag_controller_image_id" ]] || fail 'drifted-controller rollback did not preserve the prior tag mapping'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$drifted_live_controller_image_id" ]] || fail 'drifted-controller rollback did not recreate the exact prior controller image'
+checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$drifted_controller_output")
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_ID=$drifted_tag_controller_image_id" "$checkpoint_path/image-ids.env" || fail 'checkpoint omitted the drifted controller tag image ID'
+grep -Fxq "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=$drifted_live_controller_image_id" "$checkpoint_path/image-ids.env" || fail 'checkpoint omitted the drifted live controller image ID'
+unset FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_DRIFTED_CONTROLLER_ROLLBACK:-0} != 1 ]] || { printf 'DRIFTED_CONTROLLER_ROLLBACK_REGRESSION_OK\n'; exit 0; }
+printf '%s\n' "$drifted_tag_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+stopped_runner_output=$tmp/stopped-runner-timer-rollback.out
+export FAKE_COMPOSE_LOG=$tmp/stopped-runner-timer-rollback-compose.log
+export FAKE_ALL_RUNNER_STATE=$tmp/stopped-candidate-runner
+: >"$FAKE_COMPOSE_LOG"
+rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE" "$FAKE_ALL_RUNNER_STATE"
+export FAKE_CREATE_STOPPED_RUNNER_ON_TIMER_FAILURE=1
+export FAKE_FAIL_TIMER_ENABLE=1
+if "$installer" --upgrade --config-repo "$config_repo" --config-identity fixture-org/fleet-config --controller example-ci-01 --ref "$ref_two" >"$stopped_runner_output" 2>&1; then
+  fail 'stopped-runner timer activation failure unexpectedly succeeded'
+fi
+unset FAKE_CREATE_STOPPED_RUNNER_ON_TIMER_FAILURE FAKE_FAIL_TIMER_ENABLE
+grep -Fq 'CHECKPOINT_CREATED' "$stopped_runner_output" || fail 'stopped-runner timer failure changed state before checkpointing'
+grep -Fq 'DRAIN_OK managed_runners=0' "$stopped_runner_output" || fail 'stopped-runner timer failure did not drain before activation'
+grep -Fq 'ROLLBACK_RESTORED' "$stopped_runner_output" || fail "stopped candidate runner blocked absent-tag rollback: $(<"$stopped_runner_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$stopped_runner_output")
+grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'stopped-runner checkpoint did not preserve the absent runner tag'
+[[ ! -e "$FAKE_ALL_RUNNER_STATE" ]] || fail 'rollback retained the stopped candidate runner'
+[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" ]] || fail 'stopped-runner rollback retained a runner tag that was previously absent'
+container_rm_line=$(grep -n -m1 '^container-rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+[[ -n "$container_rm_line" && -n "$runner_rm_line" && -n "$rollback_up_line" && "$container_rm_line" -lt "$runner_rm_line" && "$runner_rm_line" -lt "$rollback_up_line" ]] || fail 'rollback did not remove the stopped candidate runner before restoring images and restarting the controller'
+printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
+printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
+unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_STOPPED_RUNNER_ROLLBACK:-0} != 1 ]] || { printf 'STOPPED_RUNNER_ROLLBACK_REGRESSION_OK\n'; exit 0; }
 restartable_tag_build_output=$tmp/restartable-tag-build.out
 export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
