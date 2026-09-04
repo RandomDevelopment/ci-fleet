@@ -25,6 +25,7 @@ set -u
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
+stopped_state=${FAKE_STOPPED_CONTROLLER_STATE:-}
 if [[ -n ${FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT:-} ]]; then
   expected_socket=${CI_FLEET_ROOT_PREFIX:-}/var/run/docker.sock
   [[ ${DOCKER_HOST:-} == "unix://$expected_socket" ]] || {
@@ -39,7 +40,7 @@ case "${1:-}" in
     exit 0
     ;;
   inspect)
-    [[ -f "$state" ]] || exit 1
+    [[ -f "$state" || -n "$stopped_state" && -f "$stopped_state" ]] || exit 1
     if [[ "$*" == *'.Config.Env'* ]]; then
       [[ -n "${FAKE_CONTROLLER_ENV_FILE:-}" && -f "$FAKE_CONTROLLER_ENV_FILE" ]] || exit 1
       cat "$FAKE_CONTROLLER_ENV_FILE"
@@ -49,7 +50,7 @@ case "${1:-}" in
       [[ -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" ]] || exit 1
       cat "$FAKE_CONTROLLER_IMAGE_ID_FILE"
     elif [[ "$*" == *'.State.Status'* ]]; then
-      if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'paused\n'; elif [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
+      if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'paused\n'; elif [[ -n "$status_file" && -f "$status_file" ]]; then cat "$status_file"; elif [[ -n "$stopped_state" && -f "$stopped_state" ]]; then printf 'exited\n'; else printf '%s\n' "${FAKE_CONTROLLER_STATUS:-running}"; fi
     elif [[ "$*" == *'.State.Paused'* ]]; then
       if [[ -n "$paused_state" && -f "$paused_state" ]]; then printf 'true\n'; else printf 'false\n'; fi
     else
@@ -120,6 +121,11 @@ case "${1:-}" in
         else
           exit 1
         fi
+        if [[ -n "$stopped_state" && -f "$stopped_state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
+          && cmp -s "$FAKE_CONTROLLER_IMAGE_ID_FILE" "$image_id_state"; then
+          [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
+          exit 48
+        fi
         rm -f "$image_state" "$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
         ;;
@@ -162,6 +168,7 @@ case "${1:-}" in
           exit 42
         fi
         : >"$state"
+        [[ -z "$stopped_state" ]] || rm -f "$stopped_state"
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
@@ -175,10 +182,15 @@ case "${1:-}" in
       stop)
         if [[ -n "$paused_state" && -f "$paused_state" ]]; then exit 42; fi
         if [[ -n "${FAKE_STOP_FAIL:-}" && -f "$FAKE_STOP_FAIL" ]]; then exit 42; fi
-        rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE"
+        rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"
+        if [[ -n "$stopped_state" ]]; then
+          : >"$stopped_state"
+        else
+          [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE"
+        fi
         [[ -z "${FAKE_ACTIVE_MANAGED_AFTER_STOP:-}" ]] || : >"$FAKE_ACTIVE_MANAGED_AFTER_STOP"
         ;;
-      down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
+      down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "$stopped_state" ]] || rm -f "$stopped_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
         if [[ -n "$paused_state" && -f "$paused_state" ]]; then
           printf 'Error response from daemon: container is already paused\n' >&2
@@ -865,6 +877,34 @@ expect_success "$installer" --rollback >/dev/null
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 unset FAKE_COMPOSE_LOG
+absent_controller_output=$tmp/absent-controller-timer-rollback.out
+export FAKE_COMPOSE_LOG=$tmp/absent-controller-timer-rollback-compose.log
+export FAKE_STOPPED_CONTROLLER_STATE=$tmp/stopped-controller
+: >"$FAKE_COMPOSE_LOG"
+prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
+rm -f "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_CONTROLLER_IMAGE_ID_STATE"
+export FAKE_FAIL_TIMER_ENABLE=1
+if "$installer" --upgrade --config-repo "$config_repo" --config-identity fixture-org/fleet-config --controller example-ci-01 --ref "$ref_two" >"$absent_controller_output" 2>&1; then
+  fail 'absent-controller timer activation failure unexpectedly succeeded'
+fi
+unset FAKE_FAIL_TIMER_ENABLE
+grep -Fq 'ROLLBACK_RESTORED' "$absent_controller_output" || fail "absent-controller timer failure did not restore the checkpoint: $(<"$absent_controller_output")"
+[[ ! -e "$FAKE_CONTROLLER_IMAGE_STATE" && ! -e "$FAKE_CONTROLLER_IMAGE_ID_STATE" ]] || fail 'timer-failure rollback retained a controller tag that was previously absent'
+[[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_STOPPED_CONTROLLER_STATE" ]] || fail 'timer-failure rollback did not restart the prior controller'
+candidate_up_line=$(grep -n -m1 '^up|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+rollback_stop_line=$(grep -n '^stop|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+candidate_rm_line=$(grep -n -m1 '^rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+controller_rm_line=$(grep -n -m1 "^image-rm|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+[[ -n "$candidate_up_line" && -n "$rollback_stop_line" && -n "$candidate_rm_line" && -n "$controller_rm_line" && -n "$rollback_up_line" \
+  && "$candidate_up_line" -lt "$rollback_stop_line" && "$rollback_stop_line" -lt "$candidate_rm_line" && "$candidate_rm_line" -lt "$controller_rm_line" && "$controller_rm_line" -lt "$rollback_up_line" ]] \
+  || fail 'timer-failure rollback did not remove the stopped candidate before restoring image state and restarting'
+printf '%s\n' "$engine_ref" >"$FAKE_CONTROLLER_IMAGE_STATE"
+printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
+printf '%s\n' "$engine_ref" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+unset FAKE_STOPPED_CONTROLLER_STATE FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_ABSENT_CONTROLLER_ROLLBACK:-0} != 1 ]] || { printf 'ABSENT_CONTROLLER_ROLLBACK_REGRESSION_OK\n'; exit 0; }
 restartable_tag_build_output=$tmp/restartable-tag-build.out
 export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"

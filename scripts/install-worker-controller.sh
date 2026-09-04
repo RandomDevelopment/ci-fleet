@@ -795,7 +795,7 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release status paused=false force_nonterminal=${1:-false}
+  local deadline count old_release='' status paused=false force_nonterminal=${1:-false}
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
@@ -851,25 +851,29 @@ try_drain_current() {
     sleep 2
   done
   note 'DRAIN_READY managed_runners=0'
-  if [[ "$status" != running ]]; then
-    note 'DRAIN_OK managed_runners=0'
-    return 0
-  fi
-  compose "$old_release" "$drain_env" kill --signal SIGTERM controller >/dev/null || {
-    compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || true
-    drain_error='failed to signal the paused controller for graceful scale-set cleanup'
-    return 1
-  }
-  if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
-    compose "$old_release" "$drain_env" unpause controller >/dev/null || {
-      drain_error='failed to unpause the signaled controller for graceful shutdown'
+  if [[ "$status" == running ]]; then
+    compose "$old_release" "$drain_env" kill --signal SIGTERM controller >/dev/null || {
+      compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || true
+      drain_error='failed to signal the paused controller for graceful scale-set cleanup'
+      return 1
+    }
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+      compose "$old_release" "$drain_env" unpause controller >/dev/null || {
+        drain_error='failed to unpause the signaled controller for graceful shutdown'
+        return 1
+      }
+    fi
+    compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null || {
+      drain_error='could not stop the drained controller'
       return 1
     }
   fi
-  compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null || {
-    drain_error='could not stop the drained controller'
-    return 1
-  }
+  if [[ "$force_nonterminal" == true && -n "$old_release" ]]; then
+    compose "$old_release" "$drain_env" rm -f controller >/dev/null || {
+      drain_error='could not remove the stopped candidate controller'
+      return 1
+    }
+  fi
   note 'DRAIN_OK managed_runners=0'
 }
 
