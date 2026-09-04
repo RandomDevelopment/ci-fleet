@@ -699,8 +699,39 @@ build_candidate() {
   compose "$release_dir" "$candidate_env" build runner-image controller
 }
 
+load_checkpoint_images() {
+  local environment=$1 image_ids=${2:-} output expected=2
+  output=$(python3 - "$environment" "$image_ids" "$repo_root/scripts" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from desired_state import parse_env
+
+image_keys = ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE")
+values = parse_env(Path(sys.argv[1]), allow_unknown=True)
+if any(not values.get(key) for key in image_keys):
+    raise SystemExit(1)
+for key in image_keys:
+    print(values[key])
+
+if sys.argv[2]:
+    id_keys = tuple(f"{key}_ID" for key in image_keys)
+    values = parse_env(Path(sys.argv[2]), allow_unknown=True)
+    if set(values) != set(id_keys) or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
+        raise SystemExit(1)
+    for key in id_keys:
+        print(values[key])
+PY
+  ) || return 1
+  [[ -z "$image_ids" ]] || expected=4
+  mapfile -t checkpoint_images <<<"$output"
+  [[ ${#checkpoint_images[@]} == "$expected" ]]
+}
+
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
   install -d -m 0700 "$checkpoints_dir"
@@ -708,7 +739,18 @@ make_checkpoint() {
   staging_paths+=("$staged_checkpoint")
   checkpoint_dir=$staged_checkpoint
   install -d -m 0700 "$checkpoint_dir/systemd"
-  [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+  if [[ -f "$rendered_env" ]]; then
+    [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+    [[ $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $rendered_env"
+    install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+    load_checkpoint_images "$checkpoint_dir/ci-fleet.env" || die 'installed image tags are invalid'
+    runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null) || die 'installed runner image mapping is unavailable'
+    controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null) || die 'installed controller image mapping is unavailable'
+    [[ "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed runner image ID is invalid'
+    [[ "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed controller image ID is invalid'
+    printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/image-ids.env"
+    chmod 0600 "$checkpoint_dir/image-ids.env"
+  fi
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   target=$(current_runtime_release)
   if [[ -n "$target" ]]; then
@@ -969,9 +1011,20 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state failed=0 checkpoint_release='' drain_env=$rendered_env drain_release=''
+  local target restored_state actual failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
+  if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    if [[ ! -f "$checkpoint_dir/image-ids.env" || -L "$checkpoint_dir/image-ids.env" || $(stat -c %a "$checkpoint_dir/image-ids.env") != 600 ]] \
+      || ! load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$checkpoint_dir/image-ids.env"; then
+      note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+      return 1
+    fi
+    restore_images=true
+  elif [[ -e "$checkpoint_dir/image-ids.env" || -L "$checkpoint_dir/image-ids.env" ]]; then
+    note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+    return 1
+  fi
   drain_release=$(current_runtime_release)
   if [[ -f "$rendered_env" ]]; then
     load_installed_controller_identity "$temporary/no-install-state" "$rendered_env"
@@ -1020,6 +1073,14 @@ restore_checkpoint() {
     fi
   else
     rm -f "$manager_current" || failed=1
+  fi
+  if $restore_images; then
+    docker image tag "${checkpoint_images[2]}" "${checkpoint_images[0]}" || failed=1
+    docker image tag "${checkpoint_images[3]}" "${checkpoint_images[1]}" || failed=1
+    actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null) || failed=1
+    [[ "$actual" == "${checkpoint_images[2]}" ]] || failed=1
+    actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null) || failed=1
+    [[ "$actual" == "${checkpoint_images[3]}" ]] || failed=1
   fi
   restore_systemd_snapshot || failed=1
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
@@ -1075,7 +1136,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image installed_runner_image live_runner_image expected_owner=0
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1096,6 +1157,7 @@ perform_converge() {
   install_release
   compose "$release_dir" "$candidate_env" config --quiet
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
+  candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   case "$existing_status" in
     '')
@@ -1104,9 +1166,11 @@ perform_converge() {
     running|exited|created|dead)
       if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
         && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
+        && installed_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
         && live_runner_image=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null | awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}') \
-        && [[ -n "$installed_runner_image" && -n "$live_runner_image" ]]; then
-        [[ "$candidate_runner_image" == "$installed_runner_image" || "$candidate_runner_image" == "$live_runner_image" ]] || build_before_drain=true
+        && [[ -n "$installed_runner_image" && -n "$installed_controller_image" && -n "$live_runner_image" ]]; then
+        if [[ "$candidate_runner_image" != "$installed_runner_image" && "$candidate_runner_image" != "$live_runner_image" \
+          && "$candidate_controller_image" != "$installed_controller_image" ]]; then build_before_drain=true; fi
       fi
       ;;
   esac
