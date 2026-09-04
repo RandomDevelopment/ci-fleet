@@ -1110,9 +1110,19 @@ expect_success "$installer" --rollback >/dev/null
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
 
 ref_three=$(write_config drained 2 2)
+missing_current_output=$tmp/missing-current-restartable.out
+export FAKE_COMPOSE_LOG=$tmp/missing-current-restartable-compose.log
+: >"$FAKE_COMPOSE_LOG"
+rm -f "$root/opt/ci-fleet/current"
 printf 'dead\n' >"$FAKE_CONTROLLER_STATUS_FILE"
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_three" >/dev/null
+if ! "$installer" --upgrade "${base_args[@]}" --ref "$ref_three" >"$missing_current_output" 2>&1; then
+  grep -Fq 'cannot stop restartable controller state without its runtime release: dead' "$missing_current_output" || fail "missing-current convergence failed unexpectedly: $(<"$missing_current_output")"
+  if grep -Eq '^(stop|build|up|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'missing-current convergence mutated the controller before validating a drain release'; fi
+  fail "missing-current convergence did not use the validated candidate release: $(<"$missing_current_output")"
+fi
+unset FAKE_COMPOSE_LOG
 [[ ! -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'non-active convergence retained a dead controller'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'missing-current convergence did not repair the current release link'
 grep -Fq 'CI_FLEET_CONTROLLER_STATE=drained' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained state was not rendered'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=0' "$root/etc/ci-fleet/ci-fleet.env" || fail 'drained controller retained effective capacity'
 [[ ! -f "$FAKE_DOCKER_STATE" ]] || fail 'drained controller remained running'
@@ -1147,16 +1157,30 @@ export FAKE_ALL_RUNNER_STATE=$tmp/uninstall-stopped-managed-runner
 mkdir -p "$root/var/lib/ci-fleet/health"
 printf '{"status":"healthy"}\n' >"$root/var/lib/ci-fleet/health/latest.json"
 : >"$FAKE_DOCKER_PS_LOG"
-expect_success "$installer" --uninstall >/dev/null
+uninstall_output=$tmp/dangling-current-uninstall.out
+export FAKE_COMPOSE_LOG=$tmp/dangling-current-uninstall-compose.log
+: >"$FAKE_COMPOSE_LOG"
+export FAKE_STOPPED_CONTROLLER_STATE=$tmp/uninstall-created-controller
+: >"$FAKE_STOPPED_CONTROLLER_STATE"
+printf 'created\n' >"$FAKE_CONTROLLER_STATUS_FILE"
+ln -sfn "$root/opt/ci-fleet/releases/missing/release" "$root/opt/ci-fleet/current"
+if ! "$installer" --uninstall >"$uninstall_output" 2>&1; then
+  grep -Fq 'cannot stop restartable controller state without its runtime release: created' "$uninstall_output" || fail "dangling-current uninstall failed unexpectedly: $(<"$uninstall_output")"
+  if grep -Eq '^(stop|build|up|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'dangling-current uninstall mutated the controller before validating a drain release'; fi
+  fail "dangling-current uninstall did not use a validated installed release: $(<"$uninstall_output")"
+fi
+unset FAKE_STOPPED_CONTROLLER_STATE FAKE_COMPOSE_LOG
+grep -Fq 'UNINSTALL_OK' "$uninstall_output" || fail 'dangling-current uninstall did not complete'
 [[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'uninstall did not wait for an orphaned managed runner'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'uninstall retained stopped managed runners'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'uninstall runner cleanup was not scoped to the installed instance'
 if grep -Eq 'label=io.randomdevelopment.ci-fleet.instance=$' "$FAKE_DOCKER_PS_LOG"; then fail 'uninstall runner cleanup used an empty instance filter'; fi
 unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
-[[ ! -e "$root/opt/ci-fleet/current" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'uninstall left active installation state'
+[[ ! -e "$root/opt/ci-fleet/current" && ! -L "$root/opt/ci-fleet/current" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'uninstall left active installation state'
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
 [[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
 [[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
+[[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_LINK_FALLBACK:-0} != 1 ]] || { printf 'CURRENT_LINK_FALLBACK_REGRESSIONS_OK\n'; exit 0; }
 
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root

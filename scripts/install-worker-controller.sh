@@ -888,7 +888,7 @@ try_drain_current() {
 }
 
 drain_current() {
-  try_drain_current || die "$drain_error"
+  try_drain_current "$@" || die "$drain_error"
 }
 
 install_systemd_units() {
@@ -1247,7 +1247,7 @@ perform_converge() {
   elif [[ "$mode" == adopt ]]; then
     die '--adopt requires a trusted installed controller identity'
   fi
-  drain_current
+  drain_current false "$rendered_env" "$release_dir"
   if [[ "$testing" == 1 && -n ${CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE:-} ]]; then
     : >"$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE"
     while [[ ! -f "$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE.continue" ]]; do sleep 0.05; done
@@ -1275,12 +1275,17 @@ perform_rollback() {
 }
 
 perform_uninstall() {
-  local old_release=
+  local candidate old_release='' old_ref=''
   load_installed_controller_identity
-  old_release=$(current_runtime_release)
+  for candidate in "$(current_runtime_release)" "$(readlink -f "$manager_current" 2>/dev/null || true)" "$repo_root"; do
+    [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
+    old_ref=$(<"$candidate/.ci-fleet-engine-ref")
+    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref"; then old_release=$candidate; break; fi
+  done
+  [[ -n "$old_release" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint
   transaction_active=true
-  drain_current
+  drain_current false "$rendered_env" "$old_release"
   remove_inactive_managed_runners
   if [[ -n "$old_release" && -f "$rendered_env" ]]; then
     compose "$old_release" "$rendered_env" down --remove-orphans || true
