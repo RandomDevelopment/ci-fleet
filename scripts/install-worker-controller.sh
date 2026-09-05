@@ -16,6 +16,7 @@ testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
 checkpoint_dir=
 staging_paths=()
+captured_current_state=
 
 usage() {
   cat >&2 <<'EOF'
@@ -36,10 +37,13 @@ EOF
 note() { printf '%s\n' "$*"; }
 die() {
   printf 'ERROR: %s\n' "$*" >&2
+  trap - ERR
+  trap '' TERM
   if [[ ${transaction_active:-false} == true ]] && declare -F restore_checkpoint >/dev/null; then
     restore_checkpoint || true
     transaction_active=false
   fi
+  trap - ERR
   exit 2
 }
 
@@ -372,13 +376,16 @@ controller_status() {
 }
 
 current_runtime_release() {
-  local target
+  local target='' marker
   if [[ -L "$current_link" ]]; then
     target=$(readlink -f "$current_link" 2>/dev/null || true)
-    [[ -z "$target" ]] || printf '%s' "$target"
   elif [[ -f "$install_root/deploy/compose.yaml" ]]; then
-    printf '%s' "$install_root"
+    target=$install_root
   fi
+  [[ -n "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 0
+  marker=$(<"$target/.ci-fleet-engine-ref")
+  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" || return 0
+  printf '%s' "$target"
 }
 
 managed_runner_count() {
@@ -544,6 +551,18 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
+manager_release_from_raw_pointer() {
+  local target relative ref
+  target=$(readlink -n "$manager_current" 2>/dev/null && printf x) || return 1
+  target=${target%x}
+  [[ "$target" == "$manager_releases/"* ]] || return 1
+  relative=${target#"$manager_releases/"}
+  [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
+  ref=$(<"$target/.ci-fleet-engine-ref")
+  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] && manager_release_complete "$target" "$ref" || return 1
+  printf '%s' "$target"
+}
+
 release_matches() {
   runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$current_link" ]] || return 1
@@ -693,13 +712,101 @@ run_candidate_preflight() {
 }
 
 build_candidate() {
-  run_candidate_preflight
-  compose "$release_dir" "$candidate_env" config --quiet
   compose "$release_dir" "$candidate_env" build runner-image controller
 }
 
+load_checkpoint_images() {
+  local environment=$1 image_ids=${2:-} output
+  output=$(python3 - "$environment" "$image_ids" "$repo_root/scripts" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from desired_state import parse_env
+
+image_keys = ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE")
+values = parse_env(Path(sys.argv[1]), allow_unknown=True)
+if any(not values.get(key) for key in image_keys):
+    raise SystemExit(1)
+for key in image_keys:
+    print(values[key])
+
+if sys.argv[2]:
+    id_keys = tuple(f"{key}_ID" for key in image_keys)
+    values = parse_env(Path(sys.argv[2]), allow_unknown=True)
+    live_key = "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID"
+    if not set(id_keys).issubset(values) or not set(values) <= {*id_keys, live_key} or any(values[key] != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", values[key]) for key in id_keys):
+        raise SystemExit(1)
+    if live_key in values and (not re.fullmatch(r"sha256:[0-9a-f]{64}", values[live_key]) or values[live_key] == values[id_keys[1]]):
+        raise SystemExit(1)
+    for key in id_keys:
+        print(values[key])
+    if live_key in values:
+        print(values[live_key])
+PY
+  ) || return 1
+  mapfile -t checkpoint_images <<<"$output"
+  [[ ${#checkpoint_images[@]} == 2 || -n "$image_ids" && ( ${#checkpoint_images[@]} == 4 || ${#checkpoint_images[@]} == 5 ) ]]
+}
+
+capture_current_pointer() {
+  local expected_owner=0
+  [[ -z "$captured_current_state" ]] || return 0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ -L "$current_link" ]]; then
+    if ! python3 - "$current_link" "$temporary/current-link" "$expected_owner" <<'PY'
+import os
+import stat
+import sys
+
+source, destination = map(os.fsencode, sys.argv[1:3])
+metadata = os.lstat(source)
+if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != int(sys.argv[3]) or stat.S_IMODE(metadata.st_mode) != 0o777:
+    raise SystemExit(1)
+target = os.readlink(source)
+if not target or len(target) > 4095:
+    raise SystemExit(1)
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "wb") as output:
+    output.write(target)
+PY
+    then
+      die 'current pointer is invalid'
+    fi
+    captured_current_state='link'
+  elif [[ -e "$current_link" ]]; then
+    die 'current pointer must be a symlink or absent'
+  else
+    captured_current_state=absent
+  fi
+}
+
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
+  capture_current_pointer
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  status=$(controller_status)
+  if [[ -L "$manager_current" ]]; then
+    if [[ "$mode" == uninstall && -z "$status" ]]; then
+      manager_target=$(manager_release_from_raw_pointer || true)
+    else
+      manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
+      [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
+      manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
+      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+        die 'manager current pointer is invalid'
+      fi
+    fi
+  elif [[ -e "$manager_current" ]]; then
+    die 'manager current pointer is invalid'
+  fi
+  target=$(current_runtime_release)
+  if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
+    fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
+    if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref"; then target=$fallback_release; fi
+  fi
+  [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
   install -d -m 0700 "$checkpoints_dir"
@@ -707,16 +814,47 @@ make_checkpoint() {
   staging_paths+=("$staged_checkpoint")
   checkpoint_dir=$staged_checkpoint
   install -d -m 0700 "$checkpoint_dir/systemd"
-  [[ ! -f "$rendered_env" ]] || install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+  printf '3\n' >"$checkpoint_dir/format-version"
+  chmod 0600 "$checkpoint_dir/format-version"
+  if [[ "$captured_current_state" == link ]]; then
+    install -m 0600 "$temporary/current-link" "$checkpoint_dir/current-link"
+  else
+    : >"$checkpoint_dir/current-absent"
+    chmod 0600 "$checkpoint_dir/current-absent"
+  fi
+  if [[ -f "$rendered_env" ]]; then
+    [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+    [[ $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $rendered_env"
+    install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
+    load_checkpoint_images "$checkpoint_dir/ci-fleet.env" || die 'installed image tags are invalid'
+    if ! runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      runner_id=absent
+    fi
+    if ! controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      controller_id=absent
+    fi
+    if controller_live_id=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null); then
+      [[ "$controller_live_id" != "$controller_id" ]] || controller_live_id=
+    else
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      controller_live_id=
+    fi
+    [[ "$runner_id" == absent || "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed runner image ID is invalid'
+    [[ "$controller_id" == absent || "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'installed controller image ID is invalid'
+    [[ -z "$controller_live_id" || "$controller_live_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'live controller image ID is invalid'
+    printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/image-ids.env"
+    [[ -z "$controller_live_id" ]] || printf 'CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=%s\n' "$controller_live_id" >>"$checkpoint_dir/image-ids.env"
+    chmod 0600 "$checkpoint_dir/image-ids.env"
+  fi
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
-  target=$(current_runtime_release)
   if [[ -n "$target" ]]; then
     printf '%s\n' "$target" >"$checkpoint_dir/release-target"
     chmod 0600 "$checkpoint_dir/release-target"
   fi
-  if [[ -L "$manager_current" ]]; then
-    target=$(readlink -f "$manager_current")
-    printf '%s\n' "$target" >"$checkpoint_dir/manager-target"
+  if [[ -n "$manager_target" ]]; then
+    printf '%s\n' "$manager_target" >"$checkpoint_dir/manager-target"
     chmod 0600 "$checkpoint_dir/manager-target"
   fi
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
@@ -744,12 +882,20 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release status paused=false force_nonterminal=${1:-false}
+  local deadline count old_release='' status paused=false force_nonterminal=${1:-false}
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
   case "$status" in
-    running|''|exited|created|dead) ;;
+    running|'') ;;
+    exited|created|dead)
+      [[ -f "$drain_env" ]] || { drain_error="cannot stop restartable controller state without its rendered environment: $status"; return 1; }
+      old_release=$(current_runtime_release)
+      [[ -n "$old_release" ]] || old_release=$fallback_release
+      [[ -n "$old_release" ]] || { drain_error="cannot stop restartable controller state without its runtime release: $status"; return 1; }
+      compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop restartable controller state: $status"; return 1; }
+      status=
+      ;;
     *)
       if [[ "$force_nonterminal" != true ]]; then
         drain_error="cannot safely drain controller in non-terminal state: $status"
@@ -759,6 +905,9 @@ try_drain_current() {
       old_release=$(current_runtime_release)
       [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
+      if [[ "$status" == paused ]]; then
+        compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || { drain_error="failed to unpause non-terminal candidate state: $status"; return 1; }
+      fi
       compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
       status=
       ;;
@@ -768,8 +917,14 @@ try_drain_current() {
     old_release=$(current_runtime_release)
     [[ -n "$old_release" ]] || old_release=$fallback_release
     if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-    if ! compose "$old_release" "$drain_env" pause controller >/dev/null; then drain_error='could not pause the controller for drain'; return 1; fi
-    paused=true
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+      paused=true
+    elif compose "$old_release" "$drain_env" pause controller >/dev/null; then
+      paused=true
+    else
+      drain_error='could not pause the controller for drain'
+      return 1
+    fi
   fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
   while :; do
@@ -783,30 +938,34 @@ try_drain_current() {
     sleep 2
   done
   note 'DRAIN_READY managed_runners=0'
-  if [[ "$status" != running ]]; then
-    note 'DRAIN_OK managed_runners=0'
-    return 0
-  fi
-  compose "$old_release" "$drain_env" kill --signal SIGTERM controller >/dev/null || {
-    compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || true
-    drain_error='failed to signal the paused controller for graceful scale-set cleanup'
-    return 1
-  }
-  if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
-    compose "$old_release" "$drain_env" unpause controller >/dev/null || {
-      drain_error='failed to unpause the signaled controller for graceful shutdown'
+  if [[ "$status" == running ]]; then
+    compose "$old_release" "$drain_env" kill --signal SIGTERM controller >/dev/null || {
+      compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || true
+      drain_error='failed to signal the paused controller for graceful scale-set cleanup'
+      return 1
+    }
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+      compose "$old_release" "$drain_env" unpause controller >/dev/null || {
+        drain_error='failed to unpause the signaled controller for graceful shutdown'
+        return 1
+      }
+    fi
+    compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null || {
+      drain_error='could not stop the drained controller'
       return 1
     }
   fi
-  compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null || {
-    drain_error='could not stop the drained controller'
-    return 1
-  }
+  if [[ "$force_nonterminal" == true && -n "$old_release" ]]; then
+    compose "$old_release" "$drain_env" rm -f controller >/dev/null || {
+      drain_error='could not remove the stopped candidate controller'
+      return 1
+    }
+  fi
   note 'DRAIN_OK managed_runners=0'
 }
 
 drain_current() {
-  try_drain_current || die "$drain_error"
+  try_drain_current "$@" || die "$drain_error"
 }
 
 install_systemd_units() {
@@ -951,10 +1110,118 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state failed=0 checkpoint_release='' drain_env=$rendered_env drain_release=''
+  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target=''
+  local restore_controller_tag_after_start=false
+  local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
-  [[ ! -f "$checkpoint_dir/release-target" ]] || checkpoint_release=$(<"$checkpoint_dir/release-target")
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ -e "$format_marker" || -L "$format_marker" ]]; then
+    if [[ -L "$format_marker" || ! -f "$format_marker" || $(stat -c %u "$format_marker") != "$expected_owner" \
+      || $(stat -c %a "$format_marker") != 600 || $(stat -c %s "$format_marker") != 2 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint format marker is invalid'
+      return 1
+    fi
+    checkpoint_format=$(<"$format_marker")
+    if [[ "$checkpoint_format" != 2 && "$checkpoint_format" != 3 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint format marker is invalid'
+      return 1
+    fi
+    new_format=true
+  elif [[ -e "$image_ids" || -L "$image_ids" ]]; then
+    note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+    return 1
+  elif [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    note 'ROLLBACK_LEGACY_IMAGE_STATE_UNVERIFIED'
+  fi
+  if [[ -e "$checkpoint_dir/fallback-release" || -L "$checkpoint_dir/fallback-release" ]]; then
+    note 'ROLLBACK_FAILED reason=checkpoint fallback release is unsupported'
+    return 1
+  fi
+  if [[ "$checkpoint_format" == 3 ]]; then
+    if [[ -f "$checkpoint_dir/current-link" && ! -L "$checkpoint_dir/current-link" && ! -e "$checkpoint_dir/current-absent" && ! -L "$checkpoint_dir/current-absent" ]]; then
+      validated_current_target=$temporary/validated-current-link
+      if ! python3 - "$checkpoint_dir/current-link" "$validated_current_target" "$expected_owner" <<'PY'
+import os
+import stat
+import sys
+
+source, destination = map(os.fsencode, sys.argv[1:3])
+metadata = os.lstat(source)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != int(sys.argv[3]) or stat.S_IMODE(metadata.st_mode) != 0o600:
+    raise SystemExit(1)
+with open(source, "rb") as checkpoint:
+    target = checkpoint.read(4096)
+if not target or len(target) > 4095 or b"\0" in target:
+    raise SystemExit(1)
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "wb") as output:
+    output.write(target)
+PY
+      then
+        note 'ROLLBACK_FAILED reason=checkpoint current state is invalid'
+        return 1
+      fi
+    elif [[ ! -e "$checkpoint_dir/current-link" && ! -L "$checkpoint_dir/current-link" \
+      && -f "$checkpoint_dir/current-absent" && ! -L "$checkpoint_dir/current-absent" \
+      && $(stat -c %u "$checkpoint_dir/current-absent") == "$expected_owner" \
+      && $(stat -c %a "$checkpoint_dir/current-absent") == 600 && $(stat -c %s "$checkpoint_dir/current-absent") == 0 ]]; then
+      :
+    else
+      note 'ROLLBACK_FAILED reason=checkpoint current state is invalid'
+      return 1
+    fi
+  fi
+  if [[ -e "$checkpoint_dir/release-target" || -L "$checkpoint_dir/release-target" ]]; then
+    if [[ -L "$checkpoint_dir/release-target" || ! -f "$checkpoint_dir/release-target" \
+      || $(stat -c %u "$checkpoint_dir/release-target") != "$expected_owner" || $(stat -c %a "$checkpoint_dir/release-target") != 600 \
+      || $(stat -c %s "$checkpoint_dir/release-target") -lt 2 || $(stat -c %s "$checkpoint_dir/release-target") -gt 4096 \
+      || $(wc -l <"$checkpoint_dir/release-target") != 1 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
+      return 1
+    fi
+    checkpoint_release=$(<"$checkpoint_dir/release-target")
+    if [[ ! -f "$checkpoint_release/.ci-fleet-engine-ref" ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
+      return 1
+    fi
+    target=$(<"$checkpoint_release/.ci-fleet-engine-ref")
+    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target"; then
+      note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
+      return 1
+    fi
+  fi
+
+  if [[ -e "$checkpoint_dir/manager-target" || -L "$checkpoint_dir/manager-target" ]]; then
+    if [[ -L "$checkpoint_dir/manager-target" || ! -f "$checkpoint_dir/manager-target" \
+      || $(stat -c %u "$checkpoint_dir/manager-target") != "$expected_owner" || $(stat -c %a "$checkpoint_dir/manager-target") != 600 \
+      || $(stat -c %s "$checkpoint_dir/manager-target") -gt 4096 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
+      return 1
+    fi
+    target=$(<"$checkpoint_dir/manager-target")
+    if [[ "$target" != "$manager_releases/"* || ! -f "$target/.ci-fleet-engine-ref" ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
+      return 1
+    fi
+    restored_state=$(<"$target/.ci-fleet-engine-ref")
+    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state"; then
+      note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
+      return 1
+    fi
+  fi
+  if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    if [[ ! -f "$image_ids" || -L "$image_ids" || $(stat -c %u "$image_ids") != "$expected_owner" || $(stat -c %a "$image_ids") != 600 ]] \
+      || ! load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$image_ids"; then
+      note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+      return 1
+    fi
+    restore_images=true
+  elif $new_format && [[ -e "$image_ids" || -L "$image_ids" ]]; then
+    note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
+    return 1
+  fi
   drain_release=$(current_runtime_release)
+  [[ -n "$drain_release" ]] || drain_release=$checkpoint_release
   if [[ -f "$rendered_env" ]]; then
     load_installed_controller_identity "$temporary/no-install-state" "$rendered_env"
   elif [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -964,6 +1231,10 @@ restore_checkpoint() {
   fi
   if ! try_drain_current true "$drain_env" "$drain_release"; then
     note "ROLLBACK_FAILED reason=$drain_error"
+    return 1
+  fi
+  if ! remove_inactive_managed_runners; then
+    note 'ROLLBACK_FAILED reason=could not remove inactive managed runners'
     return 1
   fi
   if [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -981,17 +1252,27 @@ restore_checkpoint() {
   else
     rm -f "$state_file" || failed=1
   fi
-  if [[ -f "$checkpoint_dir/release-target" ]]; then
-    target=$(<"$checkpoint_dir/release-target")
-    if [[ -d "$target" && -f "$target/deploy/compose.yaml" ]]; then
-      ln -sfn "$target" "$temporary/rollback-current" && mv -Tf "$temporary/rollback-current" "$current_link" || failed=1
-      release_dir=$target
-    else
-      failed=1
-    fi
-  else
+  release_dir=$checkpoint_release
+  if [[ "$checkpoint_format" == 3 && -n "$validated_current_target" ]]; then
+    current_temporary=$install_root/.current.rollback.$$
+    staging_paths+=("$current_temporary")
+    python3 - "$validated_current_target" "$current_temporary" <<'PY' && mv -Tf "$current_temporary" "$current_link" || failed=1
+import os
+import sys
+
+source, destination = map(os.fsencode, sys.argv[1:])
+with open(source, "rb") as checkpoint:
+    target = checkpoint.read()
+os.symlink(target, destination)
+PY
+  elif [[ "$checkpoint_format" == 3 ]]; then
     rm -f "$current_link" || failed=1
-    release_dir=
+  elif [[ -n "$checkpoint_release" ]]; then
+    ln -sfn "$checkpoint_release" "$temporary/rollback-current" && mv -Tf "$temporary/rollback-current" "$current_link" || failed=1
+  elif [[ "$checkpoint_format" == 2 ]]; then
+    rm -f "$current_link" || failed=1
+  else
+    if [[ ! -L "$current_link" || -e "$current_link" ]]; then rm -f "$current_link" || failed=1; fi
   fi
   if [[ -f "$checkpoint_dir/manager-target" ]]; then
     target=$(<"$checkpoint_dir/manager-target")
@@ -1002,6 +1283,31 @@ restore_checkpoint() {
     fi
   else
     rm -f "$manager_current" || failed=1
+  fi
+  if $restore_images; then
+    for index in 0 1; do
+      if [[ "$index" == 1 && ${#checkpoint_images[@]} == 5 ]]; then
+        docker image tag "${checkpoint_images[4]}" "${checkpoint_images[index]}" || failed=1
+        actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
+        [[ "$actual" == "${checkpoint_images[4]}" ]] || failed=1
+        restore_controller_tag_after_start=true
+      elif [[ ${checkpoint_images[index + 2]} == absent ]]; then
+        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+          docker image rm "${checkpoint_images[index]}" >/dev/null || failed=1
+        else
+          docker info >/dev/null 2>&1 || failed=1
+        fi
+        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
+          failed=1
+        else
+          docker info >/dev/null 2>&1 || failed=1
+        fi
+      else
+        docker image tag "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || failed=1
+        actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
+        [[ "$actual" == "${checkpoint_images[index + 2]}" ]] || failed=1
+      fi
+    done
   fi
   restore_systemd_snapshot || failed=1
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
@@ -1016,6 +1322,20 @@ restore_checkpoint() {
       fi
     fi
   fi
+  if $restore_controller_tag_after_start && ((failed == 0)); then
+    if [[ ${checkpoint_images[3]} == absent ]]; then
+      docker image rm --force "${checkpoint_images[1]}" >/dev/null || failed=1
+      if docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" >/dev/null 2>&1; then
+        failed=1
+      else
+        docker info >/dev/null 2>&1 || failed=1
+      fi
+    else
+      docker image tag "${checkpoint_images[3]}" "${checkpoint_images[1]}" || failed=1
+      actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null) || failed=1
+      [[ "$actual" == "${checkpoint_images[3]}" ]] || failed=1
+    fi
+  fi
   set -e
   trap on_error ERR
   if ((failed != 0)); then
@@ -1025,14 +1345,24 @@ restore_checkpoint() {
   note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
 }
 
-on_error() {
-  local status=$?
+rollback_and_exit() {
+  local status=$1
+  trap - ERR
+  trap '' TERM
   if $transaction_active; then
     restore_checkpoint || true
+    transaction_active=false
   fi
+  trap - ERR
   exit "$status"
 }
+on_error() {
+  local status=$?
+  rollback_and_exit "$status"
+}
+on_term() { rollback_and_exit 143; }
 trap on_error ERR
+trap on_term TERM
 
 perform_check() {
   local count
@@ -1047,7 +1377,8 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status desired_controller_id=$controller_id
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref
+  local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -1058,24 +1389,60 @@ perform_converge() {
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
   fi
+  if [[ -L "$manager_current" ]]; then
+    manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
+    [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
+    manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
+    if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+      die 'manager current pointer is invalid'
+    fi
+  elif [[ -e "$manager_current" ]]; then
+    die 'manager current pointer is invalid'
+  fi
   drift_count
   count=$DRIFT_COUNT
   if ((count == 0)); then
     note "NO_CHANGE controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
     return
   fi
+  capture_current_pointer
   install_release
-  make_checkpoint
+  compose "$release_dir" "$candidate_env" config --quiet
+  candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
+  candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  case "$existing_status" in
+    '')
+      [[ "$mode" == install && ! -f "$rendered_env" && ! -f "$state_file" ]] && build_before_drain=true
+      ;;
+    running|exited|created|dead)
+      if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
+        && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
+        && installed_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
+        && live_runner_image=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null | awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}') \
+        && [[ -n "$installed_runner_image" && -n "$installed_controller_image" && -n "$live_runner_image" ]]; then
+        if [[ "$candidate_runner_image" != "$installed_runner_image" && "$candidate_runner_image" != "$live_runner_image" \
+          && "$candidate_controller_image" != "$installed_controller_image" ]]; then build_before_drain=true; fi
+      fi
+      ;;
+  esac
+  if $build_before_drain; then build_candidate; require_commands; fi
+  make_checkpoint "$release_dir"
   transaction_active=true
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
     load_installed_controller_identity
   elif [[ "$mode" == adopt ]]; then
     die '--adopt requires a trusted installed controller identity'
   fi
-  drain_current
+  drain_current false "$rendered_env" "$release_dir"
+  if [[ "$testing" == 1 && -n ${CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE:-} ]]; then
+    : >"$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE"
+    while [[ ! -f "$CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE.continue" ]]; do sleep 0.05; done
+  fi
   controller_id=$desired_controller_id
+  run_candidate_preflight
+  if ! $build_before_drain; then build_candidate; fi
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
-  build_candidate
   activate_candidate
   transaction_active=false
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
@@ -1095,12 +1462,23 @@ perform_rollback() {
 }
 
 perform_uninstall() {
-  local old_release=
+  local candidate manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
-  old_release=$(current_runtime_release)
-  make_checkpoint
+  status=$(controller_status)
+  if [[ -z "$status" ]]; then
+    manager_candidate=$(manager_release_from_raw_pointer || true)
+  else
+    manager_candidate=$(readlink -f "$manager_current" 2>/dev/null || true)
+  fi
+  for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
+    [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
+    old_ref=$(<"$candidate/.ci-fleet-engine-ref")
+    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref"; then old_release=$candidate; break; fi
+  done
+  [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
+  make_checkpoint "$old_release"
   transaction_active=true
-  drain_current
+  drain_current false "$rendered_env" "$old_release"
   remove_inactive_managed_runners
   if [[ -n "$old_release" && -f "$rendered_env" ]]; then
     compose "$old_release" "$rendered_env" down --remove-orphans || true

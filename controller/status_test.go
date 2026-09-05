@@ -113,26 +113,19 @@ func TestStatusPublisherRefreshesIdleSnapshot(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		scaler.publishStatus(ctx, time.Millisecond)
-		close(done)
-	}()
-	deadline := time.After(time.Second)
-	for {
-		if _, err := os.Stat(path); err == nil {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("idle status publisher did not stop")
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("idle status publisher did not refresh snapshot")
-		case <-time.After(time.Millisecond):
-		}
+	original := encodeControllerStatus
+	encodeControllerStatus = func(file *os.File, value controllerStatus) error {
+		err := original(file, value)
+		cancel()
+		return err
 	}
+	defer func() { encodeControllerStatus = original }()
+	ticks := make(chan time.Time, 1)
+	ticks <- time.Now()
+	scaler.publishStatus(ctx, ticks)
+	body, err := os.ReadFile(path)
+	if err != nil { t.Fatal("idle status publisher did not refresh snapshot") }
+	var got controllerStatus
+	if err := json.Unmarshal(body, &got); err != nil { t.Fatal(err) }
+	if got.Current != 0 || got.Busy != 0 { t.Fatalf("published non-idle status: %+v", got) }
 }
