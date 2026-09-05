@@ -539,6 +539,79 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+initial_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
+assert_uninstall_manager_rejected_without_mutation() {
+  local label=$1 snapshot=$tmp/uninstall-manager-$1-snapshot output=$tmp/uninstall-manager-$1.out
+  export FAKE_COMPOSE_LOG=$tmp/uninstall-manager-$1-compose.log
+  export FAKE_SYSTEMCTL_LOG=$tmp/uninstall-manager-$1-systemctl.log
+  export FAKE_MV_LOG=$tmp/uninstall-manager-$1-mv.log
+  : >"$FAKE_COMPOSE_LOG"
+  : >"$FAKE_SYSTEMCTL_LOG"
+  : >"$FAKE_MV_LOG"
+  cp -a "$root" "$snapshot"
+  if "$installer" --uninstall >"$output" 2>&1; then fail "invalid uninstall manager pointer was accepted: $label"; fi
+  grep -Fq 'manager current pointer is invalid' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
+  diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid uninstall manager pointer mutated host files: $label"
+  if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid uninstall manager pointer caused a Compose or Docker mutation: $label"; fi
+  if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid uninstall manager pointer caused a systemd mutation: $label"; fi
+  [[ ! -s "$FAKE_MV_LOG" ]] || fail "invalid uninstall manager pointer replaced a link: $label"
+  rm -rf "$snapshot"
+  unset FAKE_COMPOSE_LOG FAKE_SYSTEMCTL_LOG FAKE_MV_LOG
+}
+ln -sfn "$root/opt/ci-fleet/manager/releases/missing" "$root/opt/ci-fleet/manager/current"
+assert_uninstall_manager_rejected_without_mutation present-dangling
+rm -f "$FAKE_DOCKER_STATE"
+rm -f "$root/opt/ci-fleet/manager/current"
+printf 'not a link\n' >"$root/opt/ci-fleet/manager/current"
+assert_uninstall_manager_rejected_without_mutation absent-file
+rm -f "$root/opt/ci-fleet/manager/current"
+mkdir "$root/opt/ci-fleet/manager/current"
+assert_uninstall_manager_rejected_without_mutation absent-directory
+rmdir "$root/opt/ci-fleet/manager/current"
+ln -sfn "$root/opt/ci-fleet/manager/releases/missing" "$root/opt/ci-fleet/manager/current"
+export FAKE_ALL_RUNNER_STATE=$tmp/dangling-manager-uninstall-runner
+: >"$FAKE_ALL_RUNNER_STATE"
+dangling_manager_uninstall_output=$tmp/dangling-manager-uninstall.out
+if ! "$installer" --uninstall >"$dangling_manager_uninstall_output" 2>&1; then
+  fail "dangling-manager no-controller uninstall failed: $(<"$dangling_manager_uninstall_output")"
+fi
+grep -Fq 'UNINSTALL_OK' "$dangling_manager_uninstall_output" || fail 'dangling-manager no-controller uninstall did not complete'
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'dangling-manager no-controller uninstall did not remove inactive runners'
+expect_success "$installer" --rollback >/dev/null
+ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
+rm -f "$FAKE_DOCKER_STATE"
+incomplete_uninstall_manager=$root/opt/ci-fleet/manager/releases/incomplete-uninstall-manager
+mkdir "$incomplete_uninstall_manager"
+printf '%s\n' "$engine_ref" >"$incomplete_uninstall_manager/.ci-fleet-engine-ref"
+ln -sfn "$incomplete_uninstall_manager" "$root/opt/ci-fleet/manager/current"
+: >"$FAKE_ALL_RUNNER_STATE"
+incomplete_manager_uninstall_output=$(expect_success "$installer" --uninstall)
+grep -Fq 'UNINSTALL_OK' <<<"$incomplete_manager_uninstall_output" || fail 'incomplete-manager no-controller uninstall did not complete'
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'incomplete-manager no-controller uninstall did not remove inactive runners'
+expect_success "$installer" --rollback >/dev/null
+ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$incomplete_uninstall_manager"
+rm -f "$FAKE_DOCKER_STATE"
+raw_manager_release=${initial_manager}$'\n'
+cp -a "$initial_manager" "$raw_manager_release"
+python3 - "$root/opt/ci-fleet/manager/current" "$initial_manager" <<'PY'
+import os
+import sys
+
+link, target = map(os.fsencode, sys.argv[1:])
+os.unlink(link)
+os.symlink(target + b"\n", link)
+PY
+: >"$FAKE_ALL_RUNNER_STATE"
+raw_manager_uninstall_output=$(expect_success "$installer" --uninstall)
+raw_manager_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' <<<"$raw_manager_uninstall_output")
+[[ ! -e "$raw_manager_checkpoint/manager-target" ]] || fail "raw invalid manager pointer was normalized into checkpoint authority: $(<"$raw_manager_checkpoint/manager-target")"
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'raw-manager no-controller uninstall did not remove inactive runners'
+expect_success "$installer" --rollback >/dev/null
+ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$raw_manager_release"
+unset FAKE_ALL_RUNNER_STATE
+[[ ${CI_FLEET_TEST_STOP_AFTER_DANGLING_MANAGER_UNINSTALL:-0} != 1 ]] || { printf 'DANGLING_MANAGER_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
 authority_ref=$(write_config drained 1 1)
 incomplete_current_output=$tmp/incomplete-current-authority.out
@@ -804,8 +877,11 @@ no_release_failure_output=$tmp/no-release-uninstall-failure.out
 if "$installer" --uninstall >"$no_release_failure_output" 2>&1; then
   fail 'no-release uninstall ignored inactive runner removal failure'
 fi
+grep -Fq 'CHECKPOINT_CREATED' "$no_release_failure_output" || fail 'no-release runner removal failure omitted checkpoint evidence'
 grep -Fq 'ROLLBACK_RESTORED' "$no_release_failure_output" || fail "no-release runner removal failure did not roll back: $(<"$no_release_failure_output")"
 if grep -Fq 'UNINSTALL_OK' "$no_release_failure_output"; then fail 'no-release runner removal failure reported successful uninstall'; fi
+no_release_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$no_release_failure_output")
+[[ -f "$no_release_failure_checkpoint/.complete" ]] || fail 'no-release runner removal failure did not preserve its complete checkpoint'
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'no-release runner removal failure deleted managed state before rollback'
 : >"$FAKE_ALL_RUNNER_STATE"
 no_release_output=$(expect_success "$installer" --uninstall)
@@ -1660,7 +1736,6 @@ expect_failure 'a trusted complete release is required to uninstall the controll
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'untrusted present-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'untrusted present-controller uninstall invoked Compose'; fi
 rm -f "$FAKE_DOCKER_STATE"
-rm -f "$root/opt/ci-fleet/manager/current"
 export FAKE_ALL_RUNNER_STATE=$tmp/damaged-no-controller-inactive-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 if ! "$installer" --uninstall >"$damaged_uninstall_output" 2>&1; then

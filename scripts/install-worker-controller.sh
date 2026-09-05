@@ -551,6 +551,18 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
+manager_release_from_raw_pointer() {
+  local target relative ref
+  target=$(readlink -n "$manager_current" 2>/dev/null && printf x) || return 1
+  target=${target%x}
+  [[ "$target" == "$manager_releases/"* ]] || return 1
+  relative=${target#"$manager_releases/"}
+  [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
+  ref=$(<"$target/.ci-fleet-engine-ref")
+  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] && manager_release_complete "$target" "$ref" || return 1
+  printf '%s' "$target"
+}
+
 release_matches() {
   runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   [[ -L "$current_link" ]] || return 1
@@ -774,12 +786,17 @@ make_checkpoint() {
   local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
   capture_current_pointer
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  status=$(controller_status)
   if [[ -L "$manager_current" ]]; then
-    manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
-    [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
-    manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-    if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
-      die 'manager current pointer is invalid'
+    if [[ "$mode" == uninstall && -z "$status" ]]; then
+      manager_target=$(manager_release_from_raw_pointer || true)
+    else
+      manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
+      [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
+      manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
+      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+        die 'manager current pointer is invalid'
+      fi
     fi
   elif [[ -e "$manager_current" ]]; then
     die 'manager current pointer is invalid'
@@ -789,7 +806,6 @@ make_checkpoint() {
     fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
     if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref"; then target=$fallback_release; fi
   fi
-  status=$(controller_status)
   [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
@@ -1446,14 +1462,19 @@ perform_rollback() {
 }
 
 perform_uninstall() {
-  local candidate old_release='' old_ref='' status
+  local candidate manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
-  for candidate in "$(current_runtime_release)" "$(readlink -f "$manager_current" 2>/dev/null || true)" "$repo_root"; do
+  status=$(controller_status)
+  if [[ -z "$status" ]]; then
+    manager_candidate=$(manager_release_from_raw_pointer || true)
+  else
+    manager_candidate=$(readlink -f "$manager_current" 2>/dev/null || true)
+  fi
+  for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
     old_ref=$(<"$candidate/.ci-fleet-engine-ref")
     if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref"; then old_release=$candidate; break; fi
   done
-  status=$(controller_status)
   [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint "$old_release"
   transaction_active=true
