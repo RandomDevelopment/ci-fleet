@@ -63,6 +63,8 @@ case "${1:-}" in
     [[ -z "${FAKE_DOCKER_PS_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_DOCKER_PS_LOG"
     if [[ "$*" == *'--all'* && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
       printf 'managed-runner-all-state\n'
+    elif [[ "$*" == *'--all'* && -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
+      printf 'managed-runner\n'
     elif [[ -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
       rm -f "$FAKE_RUNNER_STATE_ONCE"
       printf 'managed-runner\n'
@@ -154,6 +156,11 @@ case "${1:-}" in
   rm)
     (($# >= 2)) || exit 1
     [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'container-rm|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"
+    if [[ "$*" == *managed-runner* && -n "${FAKE_RUNNER_STATE_ONCE:-}" && -f "$FAKE_RUNNER_STATE_ONCE" ]]; then
+      [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'container-rm-blocked-running|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"
+      printf 'Error response from daemon: cannot remove running container managed-runner\n' >&2
+      exit 48
+    fi
     if [[ -n "${FAKE_FAIL_CONTAINER_RM_ONCE:-}" && -f "$FAKE_FAIL_CONTAINER_RM_ONCE" ]]; then
       rm -f "$FAKE_FAIL_CONTAINER_RM_ONCE"
       exit 48
@@ -294,6 +301,12 @@ cat >"$fake_bin/journalctl" <<'EOF'
 exit 1
 EOF
 chmod 700 "$fake_bin/journalctl"
+
+cat >"$fake_bin/dpkg" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == --audit ]] || exit 1
+EOF
+chmod 700 "$fake_bin/dpkg"
 
 cat >"$fake_bin/tar" <<'EOF'
 #!/usr/bin/env bash
@@ -869,6 +882,22 @@ ln -sfn "$root/opt/ci-fleet/manager/releases/$engine_ref" "$root/opt/ci-fleet/ma
 rm -rf "$manager_incomplete"
 [[ ${CI_FLEET_TEST_STOP_AFTER_MANAGER_POINTER:-0} != 1 ]] || { printf 'MANAGER_POINTER_REGRESSION_OK\n'; exit 0; }
 rm -f "$root/opt/ci-fleet/current" "$root/opt/ci-fleet/manager/current" "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
+export FAKE_RUNNER_STATE_ONCE=$tmp/no-release-active-orphan
+export FAKE_COMPOSE_LOG=$tmp/no-release-active-orphan-compose.log
+: >"$FAKE_RUNNER_STATE_ONCE"
+: >"$FAKE_COMPOSE_LOG"
+no_release_active_orphan_output=$tmp/no-release-active-orphan.out
+if ! "$installer" --uninstall >"$no_release_active_orphan_output" 2>&1; then
+  grep -Fq 'container-rm-blocked-running|rm managed-runner' "$FAKE_COMPOSE_LOG" || fail "no-release active-orphan uninstall failed without refusing to remove the running runner: $(<"$no_release_active_orphan_output")"
+  fail "no-release uninstall tried to remove an active orphan instead of waiting: $(<"$no_release_active_orphan_output")"
+fi
+grep -Fq 'DRAIN_OK managed_runners=0' "$no_release_active_orphan_output" || fail 'no-release active-orphan uninstall omitted drain evidence'
+grep -Fq 'UNINSTALL_OK' "$no_release_active_orphan_output" || fail 'no-release active-orphan uninstall did not complete'
+[[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'no-release uninstall did not wait for the active orphan'
+if grep -Fq 'container-rm-blocked-running|' "$FAKE_COMPOSE_LOG"; then fail 'no-release uninstall tried to remove the active orphan'; fi
+expect_success "$installer" --rollback >/dev/null
+unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN:-0} != 1 ]] || { printf 'NO_RELEASE_ACTIVE_ORPHAN_REGRESSION_OK\n'; exit 0; }
 export FAKE_ALL_RUNNER_STATE=$tmp/no-release-inactive-runner
 export FAKE_FAIL_CONTAINER_RM_ONCE=$tmp/no-release-fail-container-rm
 : >"$FAKE_ALL_RUNNER_STATE"

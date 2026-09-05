@@ -1478,9 +1478,7 @@ perform_uninstall() {
   [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint "$old_release"
   transaction_active=true
-  if [[ -n "$old_release" ]]; then
-    drain_current false "$rendered_env" "$old_release"
-  fi
+  drain_current false "$rendered_env" "$old_release"
   remove_inactive_managed_runners
   if [[ -n "$old_release" && -f "$rendered_env" ]]; then
     compose "$old_release" "$rendered_env" down --remove-orphans || true
