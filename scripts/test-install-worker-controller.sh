@@ -693,37 +693,26 @@ fi
 flock -u 9
 exec 9>&-
 if ((inside_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
-rm -rf "$lock_manager"
 
-# Test standalone mode: nonexistent lock path inside manager release
-# must be rejected BEFORE creating parent or lock file
-standalone_lock_manager=$tmp/standalone-lock-manager
-standalone_lock_release=$standalone_lock_manager/releases/prior-manager
-mkdir -p "$standalone_lock_manager/releases"
-cp -a "$original_manager" "$standalone_lock_release"
-ln -s "$standalone_lock_release" "$standalone_lock_manager/current"
-# nonexistent lock path inside the release (parent and file do not exist)
-standalone_inside_lock=$standalone_lock_release/scripts/__pycache__/nested/nonexistent.lock
-standalone_lock_output=$tmp/standalone-lock.out
-standalone_lock_result=0
-if "$repair_helper" --lock-file "$standalone_inside_lock" "$standalone_lock_manager/current" >"$standalone_lock_output" 2>&1; then
-  printf 'FAIL standalone lock inside manager release was accepted: %s\n' "$(<"$standalone_lock_output")" >&2
-  standalone_lock_result=1
-elif ! grep -Fq 'installer lock must be outside the manager release' "$standalone_lock_output"; then
-  printf 'FAIL standalone lock inside manager release returned the wrong error: %s\n' "$(<"$standalone_lock_output")" >&2
-  standalone_lock_result=1
-fi
-# Verify neither parent nor lock file was created
-if [[ -e "$(dirname "$standalone_inside_lock")" ]]; then
-  printf 'FAIL standalone lock parent directory was created before rejection\n' >&2
-  standalone_lock_result=1
-fi
-if [[ -e "$standalone_inside_lock" ]]; then
-  printf 'FAIL standalone lock file was created before rejection\n' >&2
-  standalone_lock_result=1
-fi
-if ((standalone_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
-rm -rf "$standalone_lock_manager"
+standalone_lock_parent=$lock_release/nonexistent-lock-parent
+standalone_lock=$standalone_lock_parent/nested/installer.lock
+[[ ! -e "$standalone_lock_parent" && ! -L "$standalone_lock_parent" ]] || fail 'standalone lock parent fixture already exists'
+expect_failure 'installer lock must be outside the manager release' \
+  env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$standalone_lock" "$lock_manager/current"
+[[ ! -e "$standalone_lock_parent" && ! -L "$standalone_lock_parent" ]] || fail 'rejected standalone lock created its parent inside the manager release'
+[[ ! -e "$standalone_lock" && ! -L "$standalone_lock" ]] || fail 'rejected standalone lock created a file inside the manager release'
+
+standalone_lock_alias=$tmp/standalone-lock-alias
+aliased_lock_parent=$lock_release/nonexistent-aliased-lock-parent
+aliased_lock=$standalone_lock_alias/nonexistent-aliased-lock-parent/nested/installer.lock
+ln -s "$lock_release" "$standalone_lock_alias"
+[[ ! -e "$aliased_lock_parent" && ! -L "$aliased_lock_parent" ]] || fail 'aliased standalone lock parent fixture already exists'
+expect_failure 'installer lock must be outside the manager release' \
+  env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$aliased_lock" "$lock_manager/current"
+[[ ! -e "$aliased_lock_parent" && ! -L "$aliased_lock_parent" ]] || fail 'rejected aliased standalone lock created its parent inside the manager release'
+[[ ! -e "$aliased_lock" && ! -L "$aliased_lock" ]] || fail 'rejected aliased standalone lock created a file inside the manager release'
+rm -f "$standalone_lock_alias"
+rm -rf "$lock_manager"
 
 ((bytecode_contract_failures == 0)) || fail "$bytecode_contract_failures bytecode repair contract regression(s) failed"
 
