@@ -554,6 +554,14 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+git -C "$config_repo" commit -q --allow-empty -m 'missing manager upgrade fixture'
+missing_manager_ref=$(git -C "$config_repo" rev-parse HEAD)
+rm -f "$root/opt/ci-fleet/manager/current"
+missing_manager_output=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$missing_manager_ref")
+grep -Fq 'CONVERGED mode=upgrade' <<<"$missing_manager_output" || fail 'missing manager pointer did not trigger convergence'
+[[ -L "$root/opt/ci-fleet/manager/current" && $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'upgrade did not recreate the manager current pointer'
+ref_one=$missing_manager_ref
+[[ ${CI_FLEET_TEST_STOP_AFTER_MISSING_MANAGER_POINTER:-0} != 1 ]] || { printf 'MISSING_MANAGER_POINTER_REGRESSION_OK\n'; exit 0; }
 git -C "$config_repo" commit -q --allow-empty -m 'bytecode repair upgrade fixture'
 repair_ref=$(git -C "$config_repo" rev-parse HEAD)
 manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
