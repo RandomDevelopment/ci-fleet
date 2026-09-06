@@ -96,7 +96,13 @@ def remove_inventory(root: Path, inventory: tuple[tuple[str, tuple[tuple[str, in
 def resolve_release(current: Path) -> tuple[Path, str, str]:
     if not current.is_symlink():
         fail("manager current pointer is not a symlink")
-    releases = (current.parent / "releases").resolve(strict=True)
+    releases = current.parent / "releases"
+    try:
+        if not stat.S_ISDIR(releases.lstat().st_mode):
+            fail("manager releases directory is invalid")
+        releases = releases.resolve(strict=True)
+    except OSError:
+        fail("manager releases directory is invalid")
     target = current.resolve(strict=True)
     if target.parent != releases:
         fail("manager current pointer target is invalid")
@@ -104,12 +110,14 @@ def resolve_release(current: Path) -> tuple[Path, str, str]:
     stored = target / ".ci-fleet-tree-sha256"
     if marker.is_symlink() or stored.is_symlink() or not marker.is_file() or not stored.is_file():
         fail("manager release markers are invalid")
-    manager_ref = marker.read_text(encoding="ascii").strip()
-    if not re.fullmatch(r"[0-9a-f]{40}", manager_ref):
+    manager_ref_bytes = marker.read_bytes()
+    if not re.fullmatch(rb"[0-9a-f]{40}\n*", manager_ref_bytes):
         fail("manager release marker is invalid")
-    expected = stored.read_text(encoding="ascii").strip()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+    expected_bytes = stored.read_bytes()
+    if not re.fullmatch(rb"[0-9a-f]{64}\n*", expected_bytes):
         fail("manager release digest marker is invalid")
+    manager_ref = manager_ref_bytes.rstrip(b"\n").decode("ascii")
+    expected = expected_bytes.rstrip(b"\n").decode("ascii")
     return target, manager_ref, expected
 
 
@@ -120,12 +128,14 @@ def main() -> None:
     args = parser.parse_args()
 
     lock_path = Path(args.lock_file)
+    resolved_lock = None
     inherited_lock_fd = os.environ.get("CI_FLEET_INSTALLER_LOCK_FD")
     if inherited_lock_fd:
         if inherited_lock_fd != "9":
             fail("inherited installer lock must use file descriptor 9")
         try:
-            if Path("/proc/self/fd/9").resolve(strict=True) != lock_path.resolve(strict=True):
+            resolved_lock = lock_path.resolve(strict=True)
+            if Path("/proc/self/fd/9").resolve(strict=True) != resolved_lock:
                 fail("inherited installer lock does not match the configured lock file")
         except OSError:
             fail("inherited installer lock does not match the configured lock file")
@@ -137,9 +147,13 @@ def main() -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         fail("inherited installer lock is unavailable" if inherited_lock_fd else "installer lock is held")
+    if resolved_lock is None:
+        resolved_lock = lock_path.resolve(strict=True)
 
     current = Path(args.manager_current)
     target, manager_ref, expected = resolve_release(current)
+    if resolved_lock == target or target in resolved_lock.parents:
+        fail("installer lock must be outside the manager release")
     if release_digest(target) == expected:
         print(f"BYTECODE_REPAIR NO_CHANGE manager_ref={manager_ref}")
         return
