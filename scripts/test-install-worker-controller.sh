@@ -554,6 +554,48 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+git -C "$config_repo" commit -q --allow-empty -m 'bytecode repair upgrade fixture'
+repair_ref=$(git -C "$config_repo" rev-parse HEAD)
+manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+repair_output=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$repair_ref")
+grep -Fq 'BYTECODE_REPAIR REPAIRED' <<<"$repair_output" || fail 'bytecode repair did not report recovery'
+[[ ! -e "$manager_cache" ]] || fail 'bytecode repair retained the generated cache'
+grep -Fq "CI_FLEET_CONFIG_REF=$repair_ref" "$root/etc/ci-fleet/ci-fleet.env" || fail 'bytecode repair upgrade did not advance to the requested configuration ref'
+ref_one=$repair_ref
+original_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
+alias_manager=$root/opt/ci-fleet/manager/releases/prior-manager
+cp -a "$original_manager" "$alias_manager"
+ln -sfn "$alias_manager" "$root/opt/ci-fleet/manager/current"
+alias_ref=$(<"$alias_manager/.ci-fleet-engine-ref")
+alias_output=$(expect_success "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current")
+[[ "$alias_output" == "BYTECODE_REPAIR NO_CHANGE manager_ref=$alias_ref" ]] || fail "healthy manager alias returned the wrong result: $alias_output"
+ln -sfn "$original_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$alias_manager"
+[[ ${CI_FLEET_TEST_STOP_AFTER_MANAGER_ALIAS:-0} != 1 ]] || { printf 'MANAGER_ALIAS_REGRESSION_OK\n'; exit 0; }
+manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+printf 'not bytecode\n' >"$manager_cache/unexpected.txt"
+expect_failure 'unsafe cache entry' "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current"
+[[ -f "$manager_cache/desired_state.cpython-312.pyc" && -f "$manager_cache/unexpected.txt" ]] || fail 'rejected bytecode repair mutated the manager release'
+rm -rf "$manager_cache"
+manager_health="$root/opt/ci-fleet/manager/current/scripts/healthcheck.sh"
+cp -a "$manager_health" "$tmp/manager-healthcheck.sh"
+printf '# non-cache drift\n' >>"$manager_health"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+expect_failure 'manager release has drift beyond Python bytecode caches' \
+  "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current"
+[[ -f "$manager_cache/desired_state.cpython-312.pyc" ]] || fail 'mixed-drift repair removed bytecode before rejecting other drift'
+grep -Fq '# non-cache drift' "$manager_health" || fail 'mixed-drift repair changed the non-cache drift'
+cp -a "$tmp/manager-healthcheck.sh" "$manager_health"
+rm -rf "$manager_cache"
+[[ ${CI_FLEET_TEST_STOP_AFTER_BYTECODE_REPAIR:-0} != 1 ]] || { printf 'BYTECODE_REPAIR_REGRESSION_OK\n'; exit 0; }
 initial_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
 assert_uninstall_manager_rejected_without_mutation() {
   local label=$1 snapshot=$tmp/uninstall-manager-$1-snapshot output=$tmp/uninstall-manager-$1.out
