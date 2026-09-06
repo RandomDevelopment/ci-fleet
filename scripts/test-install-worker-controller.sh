@@ -423,7 +423,9 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
   grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
-grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
+for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh; do
+  grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/$entrypoint" || fail "$entrypoint may write Python bytecode into the immutable manager release"
+done
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo

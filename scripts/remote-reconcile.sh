@@ -8,6 +8,7 @@
 # Usage:
 #   remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
