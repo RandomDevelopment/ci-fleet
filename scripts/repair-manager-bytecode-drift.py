@@ -11,7 +11,6 @@ import shutil
 import stat
 import tempfile
 
-
 EXCLUDED = {".ci-fleet-engine-ref", ".ci-fleet-tree-sha256"}
 
 
@@ -130,6 +129,20 @@ def main() -> None:
     lock_path = Path(args.lock_file)
     resolved_lock = None
     inherited_lock_fd = os.environ.get("CI_FLEET_INSTALLER_LOCK_FD")
+    current = Path(args.manager_current)
+    target, manager_ref, expected = resolve_release(current)
+
+    # Check lock containment BEFORE creating parent or lock file
+    if resolved_lock is None:
+        # Use normpath for containment check when lock hasn't been resolved yet
+        resolved_lock = Path(os.path.normpath(str(lock_path)))
+    if resolved_lock is not None:
+        lock_norm = os.path.normpath(str(resolved_lock)) + "/"
+        target_norm = os.path.normpath(str(target)) + "/"
+        if lock_norm.startswith(target_norm) or target_norm.startswith(lock_norm):
+            # Lock is inside or overlaps target - it's invalid
+            fail("installer lock must be outside the manager release")
+
     if inherited_lock_fd:
         if inherited_lock_fd != "9":
             fail("inherited installer lock must use file descriptor 9")
@@ -150,10 +163,6 @@ def main() -> None:
     if resolved_lock is None:
         resolved_lock = lock_path.resolve(strict=True)
 
-    current = Path(args.manager_current)
-    target, manager_ref, expected = resolve_release(current)
-    if resolved_lock == target or target in resolved_lock.parents:
-        fail("installer lock must be outside the manager release")
     if release_digest(target) == expected:
         print(f"BYTECODE_REPAIR NO_CHANGE manager_ref={manager_ref}")
         return

@@ -694,6 +694,37 @@ flock -u 9
 exec 9>&-
 if ((inside_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
 rm -rf "$lock_manager"
+
+# Test standalone mode: nonexistent lock path inside manager release
+# must be rejected BEFORE creating parent or lock file
+standalone_lock_manager=$tmp/standalone-lock-manager
+standalone_lock_release=$standalone_lock_manager/releases/prior-manager
+mkdir -p "$standalone_lock_manager/releases"
+cp -a "$original_manager" "$standalone_lock_release"
+ln -s "$standalone_lock_release" "$standalone_lock_manager/current"
+# nonexistent lock path inside the release (parent and file do not exist)
+standalone_inside_lock=$standalone_lock_release/scripts/__pycache__/nested/nonexistent.lock
+standalone_lock_output=$tmp/standalone-lock.out
+standalone_lock_result=0
+if "$repair_helper" --lock-file "$standalone_inside_lock" "$standalone_lock_manager/current" >"$standalone_lock_output" 2>&1; then
+  printf 'FAIL standalone lock inside manager release was accepted: %s\n' "$(<"$standalone_lock_output")" >&2
+  standalone_lock_result=1
+elif ! grep -Fq 'installer lock must be outside the manager release' "$standalone_lock_output"; then
+  printf 'FAIL standalone lock inside manager release returned the wrong error: %s\n' "$(<"$standalone_lock_output")" >&2
+  standalone_lock_result=1
+fi
+# Verify neither parent nor lock file was created
+if [[ -e "$(dirname "$standalone_inside_lock")" ]]; then
+  printf 'FAIL standalone lock parent directory was created before rejection\n' >&2
+  standalone_lock_result=1
+fi
+if [[ -e "$standalone_inside_lock" ]]; then
+  printf 'FAIL standalone lock file was created before rejection\n' >&2
+  standalone_lock_result=1
+fi
+if ((standalone_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
+rm -rf "$standalone_lock_manager"
+
 ((bytecode_contract_failures == 0)) || fail "$bytecode_contract_failures bytecode repair contract regression(s) failed"
 
 manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
