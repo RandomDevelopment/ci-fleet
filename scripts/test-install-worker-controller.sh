@@ -694,6 +694,12 @@ flock -u 9
 exec 9>&-
 if ((inside_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
 
+dotdot_lock_parent=$lock_release/nonexistent-dotdot-parent
+dotdot_lock=$dotdot_lock_parent/../../installer.lock
+[[ ! -e "$dotdot_lock_parent" && ! -L "$dotdot_lock_parent" ]] || fail 'dotdot lock parent fixture already exists'
+expect_success env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$dotdot_lock" "$lock_manager/current" >/dev/null
+[[ ! -e "$dotdot_lock_parent" && ! -L "$dotdot_lock_parent" ]] || fail 'normalized external lock created an intermediate directory inside the manager release'
+
 standalone_lock_parent=$lock_release/nonexistent-lock-parent
 standalone_lock=$standalone_lock_parent/nested/installer.lock
 [[ ! -e "$standalone_lock_parent" && ! -L "$standalone_lock_parent" ]] || fail 'standalone lock parent fixture already exists'

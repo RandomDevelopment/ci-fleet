@@ -142,8 +142,8 @@ def main() -> None:
         lock_fd = 9
     else:
         target, _, _ = resolve_release(Path(args.manager_current))
-        prospective_lock = lock_path.resolve(strict=False)
-        if prospective_lock == target or target in prospective_lock.parents:
+        lock_path = lock_path.resolve(strict=False)
+        if lock_path == target or target in lock_path.parents:
             fail("installer lock must be outside the manager release")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
