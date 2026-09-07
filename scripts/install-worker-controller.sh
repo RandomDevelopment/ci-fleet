@@ -1382,6 +1382,10 @@ perform_converge() {
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
+  if [[ "$mode" == upgrade && ( -e "$manager_current" || -L "$manager_current" ) ]]; then
+    CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
+      || die 'manager current pointer is invalid'
+  fi
   existing_status=$(controller_status)
   if [[ "$mode" == adopt && ! -f "$rendered_env" && ! -f "$state_file" && -z "$existing_status" ]]; then
     die '--adopt requires an existing controller or configuration; use --install for a fresh host'

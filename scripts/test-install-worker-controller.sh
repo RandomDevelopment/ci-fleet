@@ -423,7 +423,9 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
   grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
-grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-controller.sh" || fail 'managed validation may write Python bytecode into the immutable manager release'
+for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh; do
+  grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/$entrypoint" || fail "$entrypoint may write Python bytecode into the immutable manager release"
+done
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'
 grep -Fq "CI_FLEET_COMMIT: \${CI_FLEET_COMMIT:-unknown}" "$repo_root/deploy/compose.yaml" || fail 'runner build lacks engine provenance argument'
 config_repo=$tmp/config-repo
@@ -552,6 +554,195 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+git -C "$config_repo" commit -q --allow-empty -m 'missing manager upgrade fixture'
+missing_manager_ref=$(git -C "$config_repo" rev-parse HEAD)
+rm -f "$root/opt/ci-fleet/manager/current"
+missing_manager_output=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$missing_manager_ref")
+grep -Fq 'CONVERGED mode=upgrade' <<<"$missing_manager_output" || fail 'missing manager pointer did not trigger convergence'
+[[ -L "$root/opt/ci-fleet/manager/current" && $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'upgrade did not recreate the manager current pointer'
+ref_one=$missing_manager_ref
+[[ ${CI_FLEET_TEST_STOP_AFTER_MISSING_MANAGER_POINTER:-0} != 1 ]] || { printf 'MISSING_MANAGER_POINTER_REGRESSION_OK\n'; exit 0; }
+git -C "$config_repo" commit -q --allow-empty -m 'bytecode repair upgrade fixture'
+repair_ref=$(git -C "$config_repo" rev-parse HEAD)
+manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+repair_output=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$repair_ref")
+grep -Fq 'BYTECODE_REPAIR REPAIRED' <<<"$repair_output" || fail 'bytecode repair did not report recovery'
+[[ ! -e "$manager_cache" ]] || fail 'bytecode repair retained the generated cache'
+grep -Fq "CI_FLEET_CONFIG_REF=$repair_ref" "$root/etc/ci-fleet/ci-fleet.env" || fail 'bytecode repair upgrade did not advance to the requested configuration ref'
+ref_one=$repair_ref
+original_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
+alias_manager=$root/opt/ci-fleet/manager/releases/prior-manager
+cp -a "$original_manager" "$alias_manager"
+ln -sfn "$alias_manager" "$root/opt/ci-fleet/manager/current"
+alias_ref=$(<"$alias_manager/.ci-fleet-engine-ref")
+alias_output=$(expect_success "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current")
+[[ "$alias_output" == "BYTECODE_REPAIR NO_CHANGE manager_ref=$alias_ref" ]] || fail "healthy manager alias returned the wrong result: $alias_output"
+ln -sfn "$original_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$alias_manager"
+[[ ${CI_FLEET_TEST_STOP_AFTER_MANAGER_ALIAS:-0} != 1 ]] || { printf 'MANAGER_ALIAS_REGRESSION_OK\n'; exit 0; }
+repair_helper=$repo_root/scripts/repair-manager-bytecode-drift.py
+bytecode_contract_failures=0
+marker_manager=$tmp/bytecode-marker-manager
+marker_release=$marker_manager/releases/prior-manager
+mkdir -p "$marker_manager/releases"
+cp -a "$original_manager" "$marker_release"
+ln -s "$marker_release" "$marker_manager/current"
+assert_malformed_repair_marker_rejected() {
+  local marker_name=$1 position=$2 expected=$3 marker_file value cache_file cache_inode output result=0
+  marker_file=$marker_release/$marker_name
+  value=$(<"$marker_file")
+  if [[ "$position" == leading ]]; then
+    printf ' %s\n' "$value" >"$marker_file"
+  else
+    printf '%s \n' "$value" >"$marker_file"
+  fi
+  cache_file=$marker_release/scripts/__pycache__/desired_state.cpython-312.pyc
+  mkdir -p "$(dirname "$cache_file")"
+  printf 'fixture\n' >"$cache_file"
+  cache_inode=$(stat -c %i "$cache_file")
+  output=$tmp/bytecode-marker-${marker_name#*.}-$position.out
+  if "$repair_helper" --lock-file "$root/run/ci-fleet-installer.lock" "$marker_manager/current" >"$output" 2>&1; then
+    printf 'FAIL malformed %s %s whitespace was accepted: %s\n' "$marker_name" "$position" "$(<"$output")" >&2
+    result=1
+  elif ! grep -Fq "$expected" "$output"; then
+    printf 'FAIL malformed %s %s whitespace returned the wrong error: %s\n' "$marker_name" "$position" "$(<"$output")" >&2
+    result=1
+  fi
+  if [[ ! -f "$cache_file" || $(stat -c %i "$cache_file") != "$cache_inode" || $(<"$cache_file") != fixture ]]; then
+    printf 'FAIL malformed %s %s whitespace mutated bytecode before rejection\n' "$marker_name" "$position" >&2
+    result=1
+  fi
+  rm -rf "$marker_release/scripts/__pycache__"
+  printf '%s\n' "$value" >"$marker_file"
+  return "$result"
+}
+for marker_case in \
+  '.ci-fleet-engine-ref|manager release marker is invalid' \
+  '.ci-fleet-tree-sha256|manager release digest marker is invalid'; do
+  IFS='|' read -r marker_name expected <<<"$marker_case"
+  for position in leading trailing; do
+    if ! assert_malformed_repair_marker_rejected "$marker_name" "$position" "$expected"; then
+      bytecode_contract_failures=$((bytecode_contract_failures + 1))
+    fi
+  done
+done
+rm -rf "$marker_manager"
+
+external_manager=$tmp/external-bytecode-manager
+external_release=$external_manager/releases/prior-manager
+aliased_manager=$tmp/aliased-bytecode-manager
+mkdir -p "$external_manager/releases" "$aliased_manager"
+cp -a "$original_manager" "$external_release"
+ln -s "$external_manager/releases" "$aliased_manager/releases"
+ln -s "$aliased_manager/releases/prior-manager" "$aliased_manager/current"
+external_cache=$external_release/scripts/__pycache__/desired_state.cpython-312.pyc
+mkdir -p "$(dirname "$external_cache")"
+printf 'fixture\n' >"$external_cache"
+external_cache_inode=$(stat -c %i "$external_cache")
+external_output=$tmp/symlinked-releases-bytecode.out
+external_result=0
+if "$repair_helper" --lock-file "$root/run/ci-fleet-installer.lock" "$aliased_manager/current" >"$external_output" 2>&1; then
+  printf 'FAIL symlinked manager releases directory was accepted: %s\n' "$(<"$external_output")" >&2
+  external_result=1
+elif ! grep -Fq 'manager releases directory is invalid' "$external_output"; then
+  printf 'FAIL symlinked manager releases directory returned the wrong error: %s\n' "$(<"$external_output")" >&2
+  external_result=1
+fi
+if [[ ! -f "$external_cache" || $(stat -c %i "$external_cache") != "$external_cache_inode" || $(<"$external_cache") != fixture ]]; then
+  printf 'FAIL symlinked manager releases directory mutated external bytecode before rejection\n' >&2
+  external_result=1
+fi
+if ((external_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
+rm -rf "$aliased_manager" "$external_manager"
+
+lock_manager=$tmp/inside-lock-manager
+lock_release=$lock_manager/releases/prior-manager
+mkdir -p "$lock_manager/releases"
+cp -a "$original_manager" "$lock_release"
+ln -s "$lock_release" "$lock_manager/current"
+inside_lock=$lock_release/scripts/__pycache__/repair.cpython-312.pyc
+mkdir -p "$(dirname "$inside_lock")"
+printf 'fixture\n' >"$inside_lock"
+inside_lock_inode=$(stat -c %i "$inside_lock")
+exec 9<>"$inside_lock"
+flock -n 9 || fail 'fixture could not acquire the inside-manager installer lock'
+inside_lock_output=$tmp/inside-manager-lock.out
+inside_lock_result=0
+if CI_FLEET_INSTALLER_LOCK_FD=9 "$repair_helper" --lock-file "$inside_lock" "$lock_manager/current" >"$inside_lock_output" 2>&1; then
+  printf 'FAIL lock inside manager release was accepted: %s\n' "$(<"$inside_lock_output")" >&2
+  inside_lock_result=1
+elif ! grep -Fq 'installer lock must be outside the manager release' "$inside_lock_output"; then
+  printf 'FAIL lock inside manager release returned the wrong error: %s\n' "$(<"$inside_lock_output")" >&2
+  inside_lock_result=1
+fi
+if [[ ! -f "$inside_lock" || $(stat -c %i "$inside_lock") != "$inside_lock_inode" || $(<"$inside_lock") != fixture ]]; then
+  printf 'FAIL lock inside manager release changed before rejection\n' >&2
+  inside_lock_result=1
+fi
+if [[ ! -e "$inside_lock" ]]; then
+  mkdir -p "$(dirname "$inside_lock")"
+  : >"$inside_lock"
+fi
+if (exec 8<>"$inside_lock"; flock -n 8); then
+  printf 'FAIL a second process acquired the authoritative lock pathname while fd 9 remained held\n' >&2
+  inside_lock_result=1
+fi
+flock -u 9
+exec 9>&-
+if ((inside_lock_result != 0)); then bytecode_contract_failures=$((bytecode_contract_failures + 1)); fi
+
+dotdot_lock_parent=$lock_release/nonexistent-dotdot-parent
+dotdot_lock=$dotdot_lock_parent/../../installer.lock
+[[ ! -e "$dotdot_lock_parent" && ! -L "$dotdot_lock_parent" ]] || fail 'dotdot lock parent fixture already exists'
+expect_success env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$dotdot_lock" "$lock_manager/current" >/dev/null
+[[ ! -e "$dotdot_lock_parent" && ! -L "$dotdot_lock_parent" ]] || fail 'normalized external lock created an intermediate directory inside the manager release'
+
+standalone_lock_parent=$lock_release/nonexistent-lock-parent
+standalone_lock=$standalone_lock_parent/nested/installer.lock
+[[ ! -e "$standalone_lock_parent" && ! -L "$standalone_lock_parent" ]] || fail 'standalone lock parent fixture already exists'
+expect_failure 'installer lock must be outside the manager release' \
+  env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$standalone_lock" "$lock_manager/current"
+[[ ! -e "$standalone_lock_parent" && ! -L "$standalone_lock_parent" ]] || fail 'rejected standalone lock created its parent inside the manager release'
+[[ ! -e "$standalone_lock" && ! -L "$standalone_lock" ]] || fail 'rejected standalone lock created a file inside the manager release'
+
+standalone_lock_alias=$tmp/standalone-lock-alias
+aliased_lock_parent=$lock_release/nonexistent-aliased-lock-parent
+aliased_lock=$standalone_lock_alias/nonexistent-aliased-lock-parent/nested/installer.lock
+ln -s "$lock_release" "$standalone_lock_alias"
+[[ ! -e "$aliased_lock_parent" && ! -L "$aliased_lock_parent" ]] || fail 'aliased standalone lock parent fixture already exists'
+expect_failure 'installer lock must be outside the manager release' \
+  env -u CI_FLEET_INSTALLER_LOCK_FD "$repair_helper" --lock-file "$aliased_lock" "$lock_manager/current"
+[[ ! -e "$aliased_lock_parent" && ! -L "$aliased_lock_parent" ]] || fail 'rejected aliased standalone lock created its parent inside the manager release'
+[[ ! -e "$aliased_lock" && ! -L "$aliased_lock" ]] || fail 'rejected aliased standalone lock created a file inside the manager release'
+rm -f "$standalone_lock_alias"
+rm -rf "$lock_manager"
+
+((bytecode_contract_failures == 0)) || fail "$bytecode_contract_failures bytecode repair contract regression(s) failed"
+
+manager_cache="$root/opt/ci-fleet/manager/current/scripts/__pycache__"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+printf 'not bytecode\n' >"$manager_cache/unexpected.txt"
+expect_failure 'unsafe cache entry' "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current"
+[[ -f "$manager_cache/desired_state.cpython-312.pyc" && -f "$manager_cache/unexpected.txt" ]] || fail 'rejected bytecode repair mutated the manager release'
+rm -rf "$manager_cache"
+manager_health="$root/opt/ci-fleet/manager/current/scripts/healthcheck.sh"
+cp -a "$manager_health" "$tmp/manager-healthcheck.sh"
+printf '# non-cache drift\n' >>"$manager_health"
+mkdir "$manager_cache"
+printf 'fixture\n' >"$manager_cache/desired_state.cpython-312.pyc"
+expect_failure 'manager release has drift beyond Python bytecode caches' \
+  "$repo_root/scripts/repair-manager-bytecode-drift.py" \
+  --lock-file "$root/run/ci-fleet-installer.lock" "$root/opt/ci-fleet/manager/current"
+[[ -f "$manager_cache/desired_state.cpython-312.pyc" ]] || fail 'mixed-drift repair removed bytecode before rejecting other drift'
+grep -Fq '# non-cache drift' "$manager_health" || fail 'mixed-drift repair changed the non-cache drift'
+cp -a "$tmp/manager-healthcheck.sh" "$manager_health"
+rm -rf "$manager_cache"
+[[ ${CI_FLEET_TEST_STOP_AFTER_BYTECODE_REPAIR:-0} != 1 ]] || { printf 'BYTECODE_REPAIR_REGRESSION_OK\n'; exit 0; }
 initial_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
 assert_uninstall_manager_rejected_without_mutation() {
   local label=$1 snapshot=$tmp/uninstall-manager-$1-snapshot output=$tmp/uninstall-manager-$1.out
