@@ -2018,14 +2018,36 @@ unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
 : >"$FAKE_COMPOSE_LOG"
+export FAKE_SYSTEMCTL_LOG=$tmp/reconcile-timer-state-systemctl.log
+: >"$FAKE_SYSTEMCTL_LOG"
+export FAKE_DISABLED_TIMER=ci-fleet-reconcile.timer
 export FAKE_RUNNER_STATE_ONCE=$tmp/adopt-managed-runner
 : >"$FAKE_RUNNER_STATE_ONCE"
 : >"$FAKE_DOCKER_PS_LOG"
-adopt=$(expect_success "$installer" --adopt "${base_args[@]}" --ref "$ref_one")
+adopt=$(expect_success "$installer" --adopt "${base_args[@]}" --config-identity RandomDevelopment/rd-delivery-config --ref "$ref_one")
 grep -Fq 'CONVERGED mode=adopt' <<<"$adopt" || fail 'adoption did not converge'
 [[ -f "$adopt_root/etc/ci-fleet/host.env" ]] || fail 'adoption did not separate host-local values'
 grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=legacy-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'adoption did not drain the installed controller instance'
+if grep -Fxq 'enable --now ci-fleet-reconcile.timer' "$FAKE_SYSTEMCTL_LOG"; then fail 'adoption enabled a previously disabled reconcile timer'; fi
+grep -Fxq 'disable --now ci-fleet-reconcile.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'adoption did not preserve the disabled reconcile timer'
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
+
+git -C "$config_repo" commit -q --allow-empty -m 'disabled reconciliation timer upgrade fixture'
+disabled_timer_ref=$(git -C "$config_repo" rev-parse HEAD)
+: >"$FAKE_SYSTEMCTL_LOG"
+expect_success "$installer" --upgrade "${base_args[@]}" --config-identity RandomDevelopment/rd-delivery-config --ref "$disabled_timer_ref" >/dev/null
+if grep -Fxq 'enable --now ci-fleet-reconcile.timer' "$FAKE_SYSTEMCTL_LOG"; then fail 'upgrade enabled a previously disabled reconcile timer'; fi
+grep -Fxq 'disable --now ci-fleet-reconcile.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'upgrade did not preserve the disabled reconcile timer'
+unset FAKE_DISABLED_TIMER
+
+git -C "$config_repo" commit -q --allow-empty -m 'enabled reconciliation timer upgrade fixture'
+enabled_timer_ref=$(git -C "$config_repo" rev-parse HEAD)
+: >"$FAKE_SYSTEMCTL_LOG"
+expect_success "$installer" --upgrade "${base_args[@]}" --config-identity RandomDevelopment/rd-delivery-config --ref "$enabled_timer_ref" >/dev/null
+grep -Fxq 'enable --now ci-fleet-reconcile.timer' "$FAKE_SYSTEMCTL_LOG" || fail 'upgrade did not preserve the enabled reconcile timer'
+unset FAKE_SYSTEMCTL_LOG
+ref_one=$enabled_timer_ref
+[[ ${CI_FLEET_TEST_STOP_AFTER_RECONCILE_TIMER_STATE:-0} != 1 ]] || { printf 'RECONCILE_TIMER_STATE_REGRESSION_OK\n'; exit 0; }
 
 # Public pre-health engine fixture; do not depend on a local remote-tracking ref.
 legacy_engine_ref=af9c0c13cd12866ce75dd6c43a4cda01915507e1
