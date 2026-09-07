@@ -418,8 +418,14 @@ controller_environment_matches() {
     CI_FLEET_GITHUB_URL CI_FLEET_SCALE_SET_NAME CI_FLEET_LABELS CI_FLEET_RUNNER_GROUP \
     CI_FLEET_RUNNER_IMAGE CI_FLEET_INSTANCE CI_FLEET_GITHUB_APP_CLIENT_ID \
     CI_FLEET_GITHUB_APP_INSTALLATION_ID CI_FLEET_MIN_RUNNERS CI_FLEET_MAX_RUNNERS \
-    CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID; do
+    CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID \
+    CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
     expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    if [[ -z "$expected" && ( "$key" == CI_FLEET_DOCKER_NETWORKS_PER_RUNNER || "$key" == CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS ) ]]; then
+      actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
+      [[ -z "$actual" || "$actual" == 0 ]] || return 1
+      continue
+    fi
     [[ -n "$expected" ]] || return 1
     actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' <<<"$live") || return 1
     [[ "$actual" == "$expected" ]] || return 1

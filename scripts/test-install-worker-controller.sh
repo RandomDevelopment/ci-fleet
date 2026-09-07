@@ -1218,6 +1218,16 @@ grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-env
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=1' "$FAKE_CONTROLLER_ENV_FILE" || fail 'controller convergence did not restore live environment'
+for key in CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
+  expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$FAKE_CONTROLLER_ENV_FILE")
+  [[ $expected =~ ^[0-9]+$ ]] || fail "live environment lacks numeric $key"
+  replacement=$((expected + 1))
+  python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); key, old, new = sys.argv[2:]; path.write_text(path.read_text().replace(f"{key}={old}\n", f"{key}={new}\n"))' "$FAKE_CONTROLLER_ENV_FILE" "$key" "$expected" "$replacement"
+  grep -Fxq "$key=$replacement" "$FAKE_CONTROLLER_ENV_FILE" || fail "$key live-environment fixture did not mutate"
+  expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+  grep -Fxq "$key=$expected" "$FAKE_CONTROLLER_ENV_FILE" || fail "controller convergence did not restore $key"
+done
 
 rm -f "$FAKE_RUNNER_IMAGE_STATE"
 expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --ref "$ref_one"
