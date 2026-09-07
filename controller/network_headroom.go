@@ -80,8 +80,10 @@ func (s *Scaler) availableNetworkRunnerSlots(ctx context.Context) (int, error) {
 			if !subnet.Addr().Is4() {
 				continue
 			}
+			if subnet != subnet.Masked() {
+				return 0, fmt.Errorf("Docker network %q reported a non-canonical IPv4 subnet", item.Name)
+			}
 			hasIPv4Subnet = true
-			subnet = subnet.Masked()
 			subnetStart, subnetEnd := prefixRange(subnet)
 			for index, pool := range pools {
 				poolStart, poolEnd := prefixRange(pool.prefix)

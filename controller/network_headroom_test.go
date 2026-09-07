@@ -101,10 +101,11 @@ func TestOverlappingDockerAddressPoolsAreRejected(t *testing.T) {
 
 func TestMalformedDockerNetworkInventoryStopsRunnerCreation(t *testing.T) {
 	cases := map[string]string{
-		"null inventory":      `null`,
-		"null entry":          `[null]`,
-		"empty entry":         `[{}]`,
-		"missing IPv4 subnet": `[{"Name":"fixture","Id":"fixture-id","Driver":"bridge","EnableIPv4":true,"IPAM":{"Config":[{}]}}]`,
+		"null inventory":       `null`,
+		"null entry":           `[null]`,
+		"empty entry":          `[{}]`,
+		"missing IPv4 subnet":  `[{"Name":"fixture","Id":"fixture-id","Driver":"bridge","EnableIPv4":true,"IPAM":{"Config":[{}]}}]`,
+		"non-canonical subnet": `[{"Name":"fixture","Id":"fixture-id","Driver":"bridge","EnableIPv4":true,"IPAM":{"Config":[{"Subnet":"10.64.0.1/28"}]}}]`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
