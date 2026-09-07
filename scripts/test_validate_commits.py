@@ -772,6 +772,7 @@ class ExistingHistoryComplianceTests(unittest.TestCase):
         "Fix controller access to root-owned app key",
         "Prevent manager validation bytecode drift",
         "Add fleet-wide host health monitoring (#42)",
+        "feat: Docker daemon network policy apply engine stage (#83)",
     }
 
     def test_head_commits_on_branch_conform(self) -> None:
