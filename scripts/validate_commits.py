@@ -475,8 +475,10 @@ def git_revision_list(base: str | None, head: str, *, workspace: str = ".") -> l
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     commits = [line for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode == 0:
+        return commits
     if not commits:
-        # Shallow clone or range resolved to nothing: resolve the head alone.
+        # Shallow clone or unavailable range: resolve the head alone.
         resolved = subprocess.run(
             ["git", "-C", workspace, "rev-parse", head],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -507,7 +509,7 @@ def commit_messages(
 
     Returns a list of (sha, message) tuples.
 
-    Falls back to resolving the head SHA alone when the range is empty
+    Falls back to resolving the head SHA alone when the range is unavailable
     (shallow clones, single-commit histories).
     """
     commits = git_revision_list(base, head, workspace=workspace)

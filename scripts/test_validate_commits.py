@@ -384,6 +384,23 @@ class CliTests(unittest.TestCase):
             result = self._range_result(directory, base_sha, head_sha)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_git_revision_list_distinguishes_empty_and_unavailable_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            base_sha = self._commit(directory, "chore: base")
+            middle_sha = self._commit(directory, "feat: middle")
+            head_sha = self._commit(directory, "fix: head")
+            self.assertEqual(vc.git_revision_list(base_sha, base_sha, workspace=directory), [])
+            self.assertEqual(
+                vc.git_revision_list(base_sha, head_sha, workspace=directory),
+                [middle_sha, head_sha],
+            )
+            self.assertEqual(vc.git_revision_list(None, head_sha, workspace=directory), [head_sha])
+            self.assertEqual(
+                vc.git_revision_list("missing", head_sha, workspace=directory),
+                [head_sha],
+            )
+
     def test_range_fails_on_bad_new_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
