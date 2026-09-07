@@ -401,6 +401,14 @@ class CliTests(unittest.TestCase):
                 [head_sha],
             )
 
+    def test_equal_base_and_head_accepts_an_empty_range(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            head_sha = self._commit(directory, "chore: base")
+            result = self._range_result(directory, head_sha, "HEAD")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("no commits to validate", result.stdout)
+
     def test_range_fails_on_bad_new_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
@@ -455,14 +463,14 @@ class CliTests(unittest.TestCase):
         # commit must exist; a fabricated or all-zero reference is not proof.
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
-            self._commit(directory, "feat: base commit")
+            base_sha = self._commit(directory, "feat: base commit")
             fabricated = (
                 'Revert "feat: never happened"\n'
                 "\n"
                 "This reverts commit ffffffffffffffffffffffffffffffffffffffff.\n"
             )
             sha = self._commit(directory, fabricated)
-            result = self._range_result(directory, "HEAD", sha)
+            result = self._range_result(directory, base_sha, sha)
             self.assertNotEqual(
                 result.returncode, 0,
                 "a revert referencing a nonexistent commit must be rejected",

@@ -669,6 +669,17 @@ def main() -> int:
     # Default: validate every commit in base..head.
     commits = commit_messages(args.base, args.head)
     if not commits:
+        try:
+            empty_range = (
+                bool(args.base)
+                and is_ancestor(args.base, args.head)
+                and is_ancestor(args.head, args.base)
+            )
+        except RuntimeError:
+            empty_range = False
+        if empty_range:
+            print("OK: no commits to validate")
+            return 0
         print("no commits found to validate; pass --base/--head or --message", file=sys.stderr)
         return 1
 
