@@ -34,6 +34,16 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	defer s.writeStatus()
 	current := s.runners.count()
 	target := min(s.config.MaxRunners, s.config.MinRunners+count)
+	if target > current && s.config.DockerNetworksPerRunner > 0 {
+		available, err := s.availableNetworkRunnerSlots(ctx)
+		if err != nil {
+			s.logger.Error("runner creation blocked by Docker network headroom inspection", "error", err)
+			return current, nil
+		}
+		// ponytail: double-count current job networks until ownership labels make attribution safe.
+		target = min(target, available)
+		if target <= current { s.logger.Warn("runner creation blocked by Docker network low water") }
+	}
 	for i := current; i < target; i++ {
 		if _, err := s.startRunner(ctx); err != nil {
 			return s.runners.count(), fmt.Errorf("start runner: %w", err)
