@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/network"
 )
+
+var dockerNetworkInspectionTimeout = 10 * time.Second
 
 type slotInterval struct {
 	start uint64
@@ -20,7 +24,10 @@ type addressPool struct {
 }
 
 func (s *Scaler) availableNetworkRunnerSlots(ctx context.Context) (int, error) {
-	info, err := s.dockerClient.Info(ctx)
+	inspectionCtx, cancel := context.WithTimeout(ctx, dockerNetworkInspectionTimeout)
+	defer cancel()
+
+	info, err := s.dockerClient.Info(inspectionCtx)
 	if err != nil {
 		return 0, fmt.Errorf("inspect Docker address pools: %w", err)
 	}
@@ -43,15 +50,28 @@ func (s *Scaler) availableNetworkRunnerSlots(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("Docker reported no default address pools")
 	}
 
-	networks, err := s.dockerClient.NetworkList(ctx, network.ListOptions{})
+	networks, err := s.dockerClient.NetworkList(inspectionCtx, network.ListOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("list Docker networks: %w", err)
 	}
+	if len(networks) == 0 {
+		return 0, fmt.Errorf("Docker reported no networks")
+	}
 	occupied := make([][]slotInterval, len(pools))
 	for _, item := range networks {
+		if strings.TrimSpace(item.ID) == "" || strings.TrimSpace(item.Name) == "" {
+			return 0, fmt.Errorf("Docker reported an incomplete network entry")
+		}
+		if item.Driver == "host" || item.Driver == "null" {
+			continue
+		}
+		if len(item.IPAM.Config) == 0 {
+			return 0, fmt.Errorf("Docker network %q reported no allocation information", item.Name)
+		}
+		hasIPv4Subnet := false
 		for _, value := range item.IPAM.Config {
-			if value.Subnet == "" {
-				continue
+			if strings.TrimSpace(value.Subnet) == "" {
+				return 0, fmt.Errorf("Docker network %q reported incomplete allocation information", item.Name)
 			}
 			subnet, err := netip.ParsePrefix(value.Subnet)
 			if err != nil {
@@ -60,6 +80,7 @@ func (s *Scaler) availableNetworkRunnerSlots(ctx context.Context) (int, error) {
 			if !subnet.Addr().Is4() {
 				continue
 			}
+			hasIPv4Subnet = true
 			subnet = subnet.Masked()
 			subnetStart, subnetEnd := prefixRange(subnet)
 			for index, pool := range pools {
@@ -74,6 +95,9 @@ func (s *Scaler) availableNetworkRunnerSlots(ctx context.Context) (int, error) {
 					end:   (last - poolStart) / blockSize,
 				})
 			}
+		}
+		if item.EnableIPv4 && !hasIPv4Subnet {
+			return 0, fmt.Errorf("Docker network %q reported no IPv4 allocation", item.Name)
 		}
 	}
 
