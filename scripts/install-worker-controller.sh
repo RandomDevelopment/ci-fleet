@@ -1076,7 +1076,9 @@ PY
       # Only enable remote reconciliation timers when config is
       # identified as an OWNER/REPO (not a local checkout path)
       if [[ "$config_identity" == *"/"* && "$config_identity" != "/"* ]]; then
-        systemctl enable --now "$opt_timer" >/dev/null
+        if [[ "$mode" == install && ! -f "$checkpoint_dir/install-state.json" && ! -f "$checkpoint_dir/ci-fleet.env" ]] || grep -Fxq "$opt_timer" "$checkpoint_dir/enabled-timers"; then
+          systemctl enable --now "$opt_timer" >/dev/null
+        elif [[ -f "$systemd_dir/$opt_timer" ]]; then systemctl disable --now "$opt_timer" >/dev/null; fi
       elif [[ -f "$systemd_dir/$opt_timer" ]]; then
         # Local checkout path — disable and stop any previously enabled timer
         systemctl disable --now "$opt_timer" >/dev/null
