@@ -24,6 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Reject updates to published tags
+        if: ${{ startsWith(github.ref, 'refs/tags/') && github.event.created == false }}
+        run: |
+          echo "published tags must not be moved" >&2
+          exit 1
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -53,6 +59,7 @@ jobs:
       - name: Validate proposed commit messages
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -79,6 +86,10 @@ jobs:
             git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
           elif [[ "$EVENT_NAME" != push ]]; then
             cp scripts/validate_commits.py "$validator"
+          elif [[ "$REF_NAME" == refs/heads/main ]] && \
+               [[ -z "$(git rev-list -1 "$BASE_SHA" -- scripts/validate_commits.py)" ]] && \
+               git cat-file -e "$HEAD_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            git show "$HEAD_SHA:scripts/validate_commits.py" >"$validator"
           else
             echo "trusted commit validator unavailable at '$BASE_SHA'" >&2
             exit 1
@@ -109,7 +120,7 @@ jobs:
           # origin/main); prerelease tags must NOT point into it (they are
           # branch-local per docs/CONTRIBUTING.md).
           python3 "$validator" --version "$TAG_NAME" --tag-commit "$TAG_COMMIT" \
-            --base "$RELEASE_BASE" --head "$TAG_COMMIT"
+            --base "$RELEASE_BASE" --head "$TAG_COMMIT" --exclude-tag "$TAG_NAME"
 
   validate:
     name: Build without registering a runner

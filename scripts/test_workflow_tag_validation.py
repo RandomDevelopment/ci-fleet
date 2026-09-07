@@ -88,6 +88,21 @@ class TrustedTagValidatorTests(unittest.TestCase):
         self.assertIn(guard, convention_job)
         self.assertIn(guard, validate_job)
 
+    def test_updated_tags_are_rejected_before_validation(self) -> None:
+        convention = self.text.split("\n  commit-convention:\n", 1)[1]
+        reject = convention.split("- name: Check out repository", 1)[0]
+        self.assertIn("Reject updates to published tags", reject)
+        self.assertIn("github.event.created == false", reject)
+        self.assertIn("startsWith(github.ref, 'refs/tags/')", reject)
+
+    def test_first_main_push_may_bootstrap_the_validator(self) -> None:
+        step = self.text.split("- name: Validate proposed commit messages", 1)[1]
+        step = step.split("- name: Validate release tags", 1)[0]
+        self.assertIn("REF_NAME: ${{ github.ref }}", step)
+        self.assertIn('"$REF_NAME" == refs/heads/main', step)
+        self.assertIn('git rev-list -1 "$BASE_SHA" -- scripts/validate_commits.py', step)
+        self.assertIn('git cat-file -e "$HEAD_SHA:scripts/validate_commits.py"', step)
+
     def test_repository_validation_runs_this_suite(self) -> None:
         validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/test_workflow_tag_validation.py", validation)

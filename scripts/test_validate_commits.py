@@ -186,6 +186,16 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         )
         self.assertEqual(vc.bump_kind(message), "MAJOR")
 
+    def test_breaking_footer_value_may_contain_blank_lines(self) -> None:
+        message = (
+            "fix: replace legacy api\n"
+            "\n"
+            "BREAKING CHANGE: the old endpoint is removed.\n"
+            "\n"
+            "Clients must use the new endpoint.\n"
+        )
+        self.assertEqual(vc.bump_kind(message), "MAJOR")
+
     def test_git_trailer_first_then_breaking_change_counts(self) -> None:
         # A footer block may begin with a conventional git trailer
         # (lowercase-with-hyphen token); a later BREAKING CHANGE trailer in
@@ -692,6 +702,25 @@ class CliTests(unittest.TestCase):
                 head_sha = self._commit(directory, message)
                 result = vc.check_required_bump(version, base_sha, head_sha, directory)
                 self.assertTrue(result, f"{version} must reset lower components")
+
+    def test_release_version_cannot_regress_from_later_main_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            base_sha = self._commit(directory, "chore: bootstrap")
+            subprocess.run(["git", "-C", directory, "tag", "v1.0.0"], check=True)
+            historical_sha = self._commit(directory, "fix: historical patch")
+            latest_sha = self._commit(directory, "feat: later release")
+            subprocess.run(
+                ["git", "-C", directory, "tag", "v1.1.0", latest_sha], check=True,
+            )
+            subprocess.run(
+                ["git", "-C", directory, "branch", "origin/main", latest_sha], check=True,
+            )
+            result = vc.check_required_bump(
+                "v1.0.1", base_sha, historical_sha, directory,
+                main_ref="origin/main",
+            )
+            self.assertTrue(result, "a new stable version must exceed every release on main")
 
 
 class LowercaseDescriptionTests(unittest.TestCase):

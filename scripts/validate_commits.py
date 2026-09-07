@@ -324,18 +324,15 @@ def has_breaking_change(message: str) -> bool:
     # continuation lines until the next trailer. A "BREAKING CHANGE:"-shaped
     # line glued to body text without that separator is body prose, not a
     # footer.
-    try:
-        last_blank = len(lines) - 1 - lines[::-1].index("")
-    except ValueError:
-        return False
-    footer = lines[last_blank + 1:]
-    if not footer or not TRAILER_RE.match(footer[0]):
-        return False
-    return any(
-        line.startswith(BREAKING_HEADER) or line.startswith(BREAKING_HEADER_ALT)
-        for line in footer
-        if TRAILER_RE.match(line)
-    )
+    for index, line in enumerate(lines[1:], 1):
+        if line == "" and index + 1 < len(lines) and TRAILER_RE.match(lines[index + 1]):
+            return any(
+                candidate.startswith(BREAKING_HEADER)
+                or candidate.startswith(BREAKING_HEADER_ALT)
+                for candidate in lines[index + 1:]
+                if TRAILER_RE.match(candidate)
+            )
+    return False
 
 
 def validate_message(message: str, *, skip_merge: bool = True, sha: str | None = None, workspace: str = ".") -> list[str]:
@@ -416,6 +413,7 @@ def validate_version(value: str) -> list[str]:
 
 def check_required_bump(
     version: str, base: str, head: str, workspace: str = ".",
+    *, main_ref: str = "origin/main", exclude_tag: str | None = None,
 ) -> list[str]:
     """Reject `version` when it does not implement the required SemVer bump.
 
@@ -429,6 +427,12 @@ def check_required_bump(
     parsed = parse_version(version)
     if parsed is None:
         return []
+    latest = latest_release_tag(workspace, main_ref, exclude_tag or version)
+    if latest is not None and parsed <= latest:
+        return [
+            f"version '{version}' does not exceed the latest released "
+            f"'{latest[0]}.{latest[1]}.{latest[2]}' on '{main_ref}'"
+        ]
     prior = latest_release_tag(workspace, base)
     if prior is None:
         return []
@@ -545,9 +549,11 @@ def latest_release(
     return best
 
 
-def latest_release_tag(workspace: str = ".", main_ref: str = "origin/main") -> tuple[int, int, int] | None:
+def latest_release_tag(
+    workspace: str = ".", main_ref: str = "origin/main", exclude_tag: str | None = None,
+) -> tuple[int, int, int] | None:
     """Return the highest released stable SemVer reachable from main_ref."""
-    release = latest_release(workspace, main_ref)
+    release = latest_release(workspace, main_ref, exclude_tag)
     return release[0] if release else None
 
 
@@ -634,7 +640,10 @@ def main() -> int:
             and args.base is not None
             and args.head
         ):
-            failures.extend(check_required_bump(args.version, args.base, args.head))
+            failures.extend(check_required_bump(
+                args.version, args.base, args.head,
+                main_ref=args.main_ref, exclude_tag=args.exclude_tag,
+            ))
         if failures:
             for failure in failures:
                 print(f"version: {failure}", file=sys.stderr)
