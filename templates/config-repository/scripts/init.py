@@ -123,7 +123,7 @@ def main() -> int:
                     "networks_per_runner": args.networks_per_runner,
                     "reserve_subnets": 1,
                     "default_address_pools": [
-                        {"base": "198.51.100.0/24", "size": 24 + (runner_networks + 1).bit_length()},
+                        {"base": "10.64.0.0/24", "size": 24 + (runner_networks + 1).bit_length()},
                     ],
                 },
             }
