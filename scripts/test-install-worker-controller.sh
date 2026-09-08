@@ -486,7 +486,7 @@ PY
 root=$tmp/host
 export CI_FLEET_ROOT_PREFIX=$root
 export CI_FLEET_DOCKER_ROOT=$root/var/lib/docker
-mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
+mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/etc/docker" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 printf 'fixture CA bundle\n' >"$root/etc/ssl/certs/ca-certificates.crt"
 : >"$root/var/run/docker.sock"
