@@ -393,7 +393,7 @@ if [[ -n "${FAKE_FAIL_RECOVERY_CLEANUP_ONCE:-}" && -f "$FAKE_FAIL_RECOVERY_CLEAN
     rm -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE"
     script=${script/'    shutil.rmtree(recovery)'/'    raise OSError("injected recovery deletion failure")'}
   fi
-  printf '%s\n' "$script" | exec "$REAL_PYTHON3" "$@"
+  exec "$REAL_PYTHON3" "$@" <<<"$script"
 fi
 exec "$REAL_PYTHON3" "$@"
 EOF
