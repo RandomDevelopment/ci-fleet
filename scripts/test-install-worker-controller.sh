@@ -991,6 +991,121 @@ if ! "$installer" --uninstall >"$dangling_manager_uninstall_output" 2>&1; then
 fi
 grep -Fq 'UNINSTALL_OK' "$dangling_manager_uninstall_output" || fail 'dangling-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'dangling-manager no-controller uninstall did not remove inactive runners'
+dangling_manager_uninstall_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$dangling_manager_uninstall_output")
+[[ -n "$dangling_manager_uninstall_checkpoint" ]] || fail 'dangling-manager no-controller uninstall did not report its checkpoint'
+latest_completed_checkpoint=$(
+  { find "$root/var/lib/ci-fleet/checkpoints" -mindepth 2 -maxdepth 2 -type f -name .complete ! -path "$root/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*" -printf '%T@ %h\n' 2>/dev/null || true; } \
+    | sort -nr \
+    | awk 'NR == 1 {print $2}'
+)
+[[ "$latest_completed_checkpoint" == "$dangling_manager_uninstall_checkpoint" ]] || fail "latest completed checkpoint $latest_completed_checkpoint does not match dangling-manager uninstall checkpoint $dangling_manager_uninstall_checkpoint"
+python3 - "$dangling_manager_uninstall_checkpoint/ci-fleet.env" "$daemon_config" "$policy_marker" "$(id -u)" <<'PY'
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+environment_path, daemon_path, marker_path, expected_uid = sys.argv[1:]
+expected_uid = int(expected_uid)
+pool_prefix = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
+pool_values = {}
+try:
+    environment_lines = Path(environment_path).read_text(encoding="utf-8").splitlines()
+except (OSError, UnicodeError) as error:
+    raise AssertionError(f"rollback diagnostic: checkpoint environment is unreadable: {error}") from error
+for number, raw in enumerate(environment_lines, start=1):
+    line = raw.strip()
+    if not line.startswith(pool_prefix):
+        continue
+    assert "=" in line, f"rollback diagnostic: malformed checkpoint environment pool entry on line {number}"
+    name, value = line.split("=", 1)
+    assert name not in pool_values, f"rollback diagnostic: duplicate checkpoint environment pool entry {name}"
+    pool_values[name] = value
+assert pool_values.get(f"{pool_prefix}COUNT") == "1", f"rollback diagnostic: checkpoint environment pool count is {pool_values.get(f'{pool_prefix}COUNT')!r}, not '1'"
+assert set(pool_values) == {f"{pool_prefix}COUNT", f"{pool_prefix}0_BASE", f"{pool_prefix}0_SIZE"}, f"rollback diagnostic: checkpoint environment pool fields are {sorted(pool_values)!r}"
+assert pool_values[f"{pool_prefix}0_BASE"] == "10.64.0.0/24", f"rollback diagnostic: checkpoint environment pool base is {pool_values[f'{pool_prefix}0_BASE']!r}"
+assert pool_values[f"{pool_prefix}0_SIZE"] == "28", f"rollback diagnostic: checkpoint environment pool size is {pool_values[f'{pool_prefix}0_SIZE']!r}"
+environment_pools = [{"base": "10.64.0.0/24", "size": 28}]
+
+try:
+    daemon_meta = os.lstat(daemon_path)
+except OSError as error:
+    raise AssertionError(f"rollback diagnostic: daemon.json metadata unavailable: {error}") from error
+assert stat.S_ISREG(daemon_meta.st_mode), "rollback diagnostic: daemon.json is not a regular file"
+assert not stat.S_ISLNK(daemon_meta.st_mode), "rollback diagnostic: daemon.json is a symlink"
+assert daemon_meta.st_uid == expected_uid, f"rollback diagnostic: daemon.json UID is {daemon_meta.st_uid}, not {expected_uid}"
+assert not stat.S_IMODE(daemon_meta.st_mode) & 0o022, f"rollback diagnostic: daemon.json mode {stat.S_IMODE(daemon_meta.st_mode):04o} is group/world writable"
+
+try:
+    marker_meta = os.lstat(marker_path)
+except OSError as error:
+    raise AssertionError(f"rollback diagnostic: policy marker metadata unavailable: {error}") from error
+assert stat.S_ISREG(marker_meta.st_mode), "rollback diagnostic: policy marker is not a regular file"
+assert not stat.S_ISLNK(marker_meta.st_mode), "rollback diagnostic: policy marker is a symlink"
+assert marker_meta.st_uid == expected_uid, f"rollback diagnostic: policy marker UID is {marker_meta.st_uid}, not {expected_uid}"
+assert stat.S_IMODE(marker_meta.st_mode) == 0o600, f"rollback diagnostic: policy marker mode is {stat.S_IMODE(marker_meta.st_mode):04o}, not 0600"
+
+try:
+    marker = json.loads(Path(marker_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise AssertionError(f"rollback diagnostic: policy marker is not valid JSON: {error}") from error
+required_marker_keys = {
+    "managed",
+    "prior_default_address_pools",
+    "prior_default_address_pools_present",
+    "prior_mode",
+    "prior_present",
+    "verified_generation",
+}
+assert isinstance(marker, dict), "rollback diagnostic: policy marker is not an object"
+assert set(marker) == required_marker_keys, f"rollback diagnostic: policy marker keys are {sorted(marker)!r}"
+assert marker["managed"] is True, f"rollback diagnostic: policy marker managed value is {marker['managed']!r}, not true"
+assert "phase" not in marker, f"rollback diagnostic: policy marker retains phase {marker['phase']!r}"
+assert isinstance(marker["prior_present"], bool), f"rollback diagnostic: policy marker prior_present is not boolean: {marker['prior_present']!r}"
+assert isinstance(marker["prior_default_address_pools_present"], bool), f"rollback diagnostic: policy marker prior_default_address_pools_present is not boolean: {marker['prior_default_address_pools_present']!r}"
+prior_pools_present = marker["prior_default_address_pools_present"]
+prior_pools = marker["prior_default_address_pools"]
+assert not prior_pools_present or marker["prior_present"], "rollback diagnostic: policy marker records prior pools without a prior daemon.json"
+if prior_pools_present:
+    assert type(prior_pools) is list and prior_pools, f"rollback diagnostic: policy marker prior pools are invalid: {prior_pools!r}"
+    assert len(prior_pools) <= 64, f"rollback diagnostic: policy marker has {len(prior_pools)} prior pools, more than 64"
+    networks = []
+    for index, pool in enumerate(prior_pools):
+        assert isinstance(pool, dict) and set(pool) == {"base", "size"}, f"rollback diagnostic: policy marker prior pool {index} has invalid fields: {pool!r}"
+        assert isinstance(pool["base"], str) and type(pool["size"]) is int and 0 <= pool["size"] <= 29, f"rollback diagnostic: policy marker prior pool {index} has invalid values: {pool!r}"
+        try:
+            network = ipaddress.ip_network(pool["base"], strict=True)
+        except ValueError as error:
+            raise AssertionError(f"rollback diagnostic: policy marker prior pool {index} has malformed CIDR {pool['base']!r}") from error
+        assert network.version == 4 and pool["size"] >= network.prefixlen, f"rollback diagnostic: policy marker prior pool {index} has impossible IPv4 provenance: {pool!r}"
+        networks.append(network)
+    for left, network in enumerate(networks):
+        for right in range(left + 1, len(networks)):
+            assert not network.overlaps(networks[right]), f"rollback diagnostic: policy marker prior pool {left} overlaps pool {right}"
+else:
+    assert prior_pools is None, f"rollback diagnostic: policy marker absent prior pools have non-null provenance: {prior_pools!r}"
+prior_mode = marker["prior_mode"]
+if marker["prior_present"]:
+    assert isinstance(prior_mode, str) and re.fullmatch(r"[0-7]{3,4}", prior_mode), f"rollback diagnostic: policy marker prior mode is invalid: {prior_mode!r}"
+else:
+    assert prior_mode is None, f"rollback diagnostic: policy marker absent prior daemon has mode {prior_mode!r}"
+generation = marker["verified_generation"]
+assert isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation), f"rollback diagnostic: policy marker verified generation is invalid: {generation!r}"
+
+try:
+    daemon_bytes = Path(daemon_path).read_bytes()
+    daemon = json.loads(daemon_bytes)
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise AssertionError(f"rollback diagnostic: daemon.json is not valid JSON: {error}") from error
+assert isinstance(daemon, dict), "rollback diagnostic: daemon.json is not an object"
+assert daemon.get("default-address-pools") == environment_pools, f"rollback diagnostic: daemon pools {daemon.get('default-address-pools')!r} do not equal checkpoint environment pools {environment_pools!r}"
+actual_generation = hashlib.sha256(daemon_bytes).hexdigest()
+assert actual_generation == generation, f"rollback diagnostic: daemon.json SHA-256 {actual_generation} does not equal verified generation {generation}"
+PY
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -f "$FAKE_DOCKER_STATE"
