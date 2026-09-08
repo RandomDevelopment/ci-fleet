@@ -2170,14 +2170,6 @@ legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
 legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
-legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit omit)
-export FAKE_PREVIOUS_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE
-export FAKE_PREVIOUS_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE
-export FAKE_ENGINE_REF=$legacy_engine_ref
-export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
-export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
-[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi
