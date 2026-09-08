@@ -11,6 +11,7 @@ config_ref=
 controller_id=
 host_config_arg=
 config_source_checkout=
+policy_action=
 root_prefix=${CI_FLEET_ROOT_PREFIX:-}
 testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
@@ -35,16 +36,34 @@ EOF
 }
 
 note() { printf '%s\n' "$*"; }
+transaction_result_enabled() {
+  [[ ${CI_FLEET_TRANSACTION_RESULT_FD:-} == 7 && -e /proc/self/fd/7 ]]
+}
+write_transaction_result() {
+  local outcome=$1
+  transaction_result_enabled || return 0
+  printf '{"schema_version":1,"outcome":"%s"}\n' "$outcome" >&7
+}
 die() {
+  local result=2 restored=false
   printf 'ERROR: %s\n' "$*" >&2
   trap - ERR
   trap '' TERM
   if [[ ${transaction_active:-false} == true ]] && declare -F restore_checkpoint >/dev/null; then
-    restore_checkpoint || true
+    if restore_checkpoint; then restored=true; fi
     transaction_active=false
+    if transaction_result_enabled; then
+      if [[ "$restored" == true ]]; then
+        write_transaction_result rollback_verified
+        result=20
+      else
+        write_transaction_result rollback_unverified
+        result=21
+      fi
+    fi
   fi
   trap - ERR
-  exit 2
+  exit "$result"
 }
 
 while (($#)); do
@@ -53,6 +72,12 @@ while (($#)); do
       [[ -z "$mode" ]] || die 'select exactly one operating mode'
       mode=${1#--}
       shift
+      ;;
+    --policy-action)
+      [[ -z "$mode" && $# -ge 2 ]] || die '--policy-action requires one exclusive action'
+      mode=policy-action
+      policy_action=$2
+      shift 2
       ;;
     --config-repo)
       (($# >= 2)) || die '--config-repo requires a value'
@@ -115,6 +140,8 @@ state_root=$(root_path /var/lib/ci-fleet)
 state_file=$state_root/install-state.json
 health_report=$state_root/health/latest.json
 checkpoints_dir=$state_root/checkpoints
+network_policy_checkpoint=$state_root/docker-network-policy
+docker_daemon_config=$(root_path /etc/docker/daemon.json)
 systemd_dir=$(root_path /etc/systemd/system)
 lock_file=${CI_FLEET_INSTALLER_LOCK:-$(root_path /run/ci-fleet-installer.lock)}
 controller_container=ci-fleet-controller-1
@@ -516,7 +543,7 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script
   local -a capability_args=()
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
@@ -526,6 +553,16 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
+    if python3 - "$path/engine-capabilities.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(value.get("capabilities", {}).get("docker_network_policy_config") is not True)
+PY
+    then
+      for policy_script in apply-docker-network-policy.sh docker-network-policy-adapter.sh; do
+        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" && -x "$path/scripts/$policy_script" ]] || return 1
+      done
+    fi
   fi
   if grep -Fq 'scripts/health.py' "$path/scripts/healthcheck.sh"; then
     [[ -f "$path/scripts/health.py" ]] || return 1
@@ -602,6 +639,61 @@ systemd_matches() {
   done
 }
 
+docker_network_policy_matches() {
+  local expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  python3 - "$candidate_env" "$docker_daemon_config" "$network_policy_checkpoint/docker-network-policy.json" "$repo_root/scripts" "$expected_owner" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+environment, daemon_path, marker_path, scripts_path, expected_owner = sys.argv[1:]
+sys.path.insert(0, scripts_path)
+from desired_state import parse_env, render_docker_daemon_config
+
+values = parse_env(Path(environment), allow_unknown=True)
+managed = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" in values
+marker_exists = os.path.lexists(marker_path)
+if not managed:
+    raise SystemExit(1 if marker_exists else 0)
+if not marker_exists or not os.path.exists(daemon_path):
+    raise SystemExit(1)
+try:
+    marker_meta = os.lstat(marker_path)
+    daemon_meta = os.lstat(daemon_path)
+    if (
+        not stat.S_ISREG(marker_meta.st_mode)
+        or stat.S_ISLNK(marker_meta.st_mode)
+        or marker_meta.st_uid != int(expected_owner)
+        or stat.S_IMODE(marker_meta.st_mode) != 0o600
+        or not stat.S_ISREG(daemon_meta.st_mode)
+        or stat.S_ISLNK(daemon_meta.st_mode)
+    ):
+        raise ValueError
+    marker = json.load(open(marker_path, encoding="utf-8"))
+    daemon_bytes = Path(daemon_path).read_bytes()
+    daemon = json.loads(daemon_bytes)
+    desired = render_docker_daemon_config(values)
+    generation = marker.get("verified_generation")
+    if (
+        marker.get("managed") is not True
+        or marker.get("phase") is not None
+        or not isinstance(generation, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", generation)
+        or not isinstance(daemon, dict)
+        or daemon.get("default-address-pools") != desired.get("default-address-pools")
+        or hashlib.sha256(daemon_bytes).hexdigest() != generation
+    ):
+        raise ValueError
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
 drift_count() {
   local count=0 expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -621,6 +713,8 @@ drift_count() {
   fi
   managed_images_match || { note 'DRIFT managed_images'; count=$((count + 1)); }
   systemd_matches || { note 'DRIFT maintenance_timers'; count=$((count + 1)); }
+  DOCKER_NETWORK_POLICY_DRIFT=false
+  docker_network_policy_matches || { note 'DRIFT docker_network_policy'; count=$((count + 1)); DOCKER_NETWORK_POLICY_DRIFT=true; }
   DRIFT_COUNT=$count
 }
 
@@ -1041,7 +1135,7 @@ PY
 }
 
 activate_candidate() {
-  local staged_state
+  local check_health=${1:-true} staged_state
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
   install -m 0600 "$candidate_env" "$rendered_env"
   ln -sfn "$release_dir" "$temporary/current"
@@ -1059,7 +1153,7 @@ activate_candidate() {
       runtime_matches "$target_state" || die 'controller did not reach the requested non-active state'
     fi
   fi
-  if ! run_health_check "$release_dir" "$rendered_env" true; then
+  if [[ "$check_health" == true ]] && ! run_health_check "$release_dir" "$rendered_env" true; then
     die 'post-activation health check failed'
   fi
   staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
@@ -1353,13 +1447,72 @@ PY
   note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
 }
 
+load_policy_action_context() {
+  local path expected_owner=0
+  [[ ${CI_FLEET_INSTALLER_LOCK_FD:-} == 9 ]] || die 'policy actions require the inherited installer lock'
+  [[ "$policy_action" =~ ^(drain|resume|restore|health)$ ]] || die 'unknown policy adapter action'
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  release_dir=${CI_FLEET_POLICY_RELEASE:-}
+  candidate_metadata=${CI_FLEET_POLICY_METADATA:-}
+  checkpoint_dir=${CI_FLEET_POLICY_CHECKPOINT:-}
+  candidate_env=${CI_FLEET_POLICY_ENV:-}
+  config_identity=${CI_FLEET_POLICY_CONFIG_IDENTITY:-}
+  engine_ref=${CI_FLEET_POLICY_ENGINE_REF:-}
+  status_reporting_required=${CI_FLEET_POLICY_STATUS_REQUIRED:-0}
+  status_reporting_configured=${CI_FLEET_POLICY_STATUS_CONFIGURED:-0}
+  build_before_drain=${CI_FLEET_POLICY_PREBUILT:-false}
+  for path in "$candidate_env" "$candidate_metadata"; do
+    [[ "$path" == /* && -f "$path" && ! -L "$path" && $(stat -c %u "$path") == "$expected_owner" ]] || die 'policy action context is invalid'
+  done
+  [[ "$checkpoint_dir" == /* && -d "$checkpoint_dir" && ! -L "$checkpoint_dir" && $(stat -c %u "$checkpoint_dir") == "$expected_owner" && $(stat -c %a "$checkpoint_dir") == 700 ]] || die 'policy action checkpoint is invalid'
+  [[ "$engine_ref" =~ ^[0-9a-f]{40}$ ]] || die 'policy action engine ref is invalid'
+  runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || die 'policy action release is invalid'
+  controller_id=$(awk -F= '$1 == "CI_FLEET_INSTANCE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'policy action controller identity is invalid'
+  target_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'policy action controller state is invalid'
+  [[ "$controller_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ && "$target_state" =~ ^(active|drained|disabled)$ ]] || die 'policy action candidate is invalid'
+}
+
+perform_policy_action() {
+  local health_release
+  load_policy_action_context
+  case "$policy_action" in
+    drain)
+      if [[ -f "$state_file" || -f "$rendered_env" ]]; then load_installed_controller_identity; fi
+      drain_current false "$rendered_env" "$release_dir"
+      ;;
+    resume)
+      run_candidate_preflight
+      if [[ "$build_before_drain" != true ]]; then build_candidate; fi
+      mode=${CI_FLEET_POLICY_MODE:-upgrade}
+      activate_candidate false
+      ;;
+    restore)
+      restore_checkpoint || die 'checkpoint restoration failed'
+      ;;
+    health)
+      health_release=$(current_runtime_release)
+      [[ -n "$health_release" ]] || health_release=$release_dir
+      run_health_check "$health_release" "$candidate_env" true || die 'policy action health check failed'
+      ;;
+  esac
+}
+
 rollback_and_exit() {
-  local status=$1
+  local status=$1 restored=false
   trap - ERR
   trap '' TERM
   if $transaction_active; then
-    restore_checkpoint || true
+    if restore_checkpoint; then restored=true; fi
     transaction_active=false
+    if transaction_result_enabled; then
+      if [[ "$restored" == true ]]; then
+        write_transaction_result rollback_verified
+        status=20
+      else
+        write_transaction_result rollback_unverified
+        status=21
+      fi
+    fi
   fi
   trap - ERR
   exit "$status"
@@ -1385,7 +1538,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1441,6 +1594,35 @@ perform_converge() {
   if $build_before_drain; then build_candidate; require_commands; fi
   make_checkpoint "$release_dir"
   transaction_active=true
+  if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
+    policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")
+    policy_metadata=$(mktemp "$state_root/.policy-candidate-metadata.XXXXXX")
+    staging_paths+=("$policy_env" "$policy_metadata")
+    install -m 0600 "$candidate_env" "$policy_env"
+    install -m 0600 "$candidate_metadata" "$policy_metadata"
+    export CI_FLEET_DOCKER_DAEMON_CONFIG=$docker_daemon_config
+    export CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER=$release_dir/scripts/docker-network-policy-adapter.sh
+    export CI_FLEET_INSTALLER_LOCK=$lock_file
+    export CI_FLEET_POLICY_INSTALLER=$repo_root/scripts/install-worker-controller.sh
+    export CI_FLEET_POLICY_RELEASE=$release_dir
+    export CI_FLEET_POLICY_METADATA=$policy_metadata
+    export CI_FLEET_POLICY_CHECKPOINT=$checkpoint_dir
+    export CI_FLEET_POLICY_CONFIG_IDENTITY=$config_identity
+    export CI_FLEET_POLICY_ENGINE_REF=$engine_ref
+    export CI_FLEET_POLICY_STATUS_REQUIRED=$status_reporting_required
+    export CI_FLEET_POLICY_STATUS_CONFIGURED=$status_reporting_configured
+    export CI_FLEET_POLICY_PREBUILT=$build_before_drain
+    export CI_FLEET_POLICY_MODE=$mode
+    policy_status=0
+    "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" || policy_status=$?
+    transaction_active=false
+    if ((policy_status == 0)); then
+      note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
+      return
+    fi
+    ((policy_status == 20)) && return 20
+    return 21
+  fi
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
     load_installed_controller_identity
   elif [[ "$mode" == adopt ]]; then
@@ -1510,7 +1692,11 @@ perform_uninstall() {
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"
 }
 
-require_commands
+if [[ "$mode" == policy-action ]]; then
+  [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]] || die 'policy actions require the inherited installer lock'
+else
+  require_commands
+fi
 if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
   [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
   [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
@@ -1519,6 +1705,10 @@ else
   install -d -m 0755 "$(dirname "$lock_file")"
   exec 9>"$lock_file"
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
+fi
+if [[ "$mode" == policy-action ]]; then
+  perform_policy_action
+  exit 0
 fi
 case "$mode" in
   check|install|adopt|upgrade)
@@ -1530,7 +1720,12 @@ case "$mode" in
     select_engine
     prepare_engine_capabilities
     render_candidate
-    if [[ "$mode" == check ]]; then perform_check; else perform_converge; fi
+    if [[ "$mode" == check ]]; then
+      perform_check
+    else
+      perform_converge
+      write_transaction_result applied
+    fi
     ;;
   rollback)
     perform_rollback

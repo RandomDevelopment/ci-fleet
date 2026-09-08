@@ -21,6 +21,10 @@ reconcile_state_dir=${CI_FLEET_RECONCILE_STATE_DIR:-/var/lib/ci-fleet/reconcile}
 reconcile_state_file=$reconcile_state_dir/state.json
 lkg_dir=${CI_FLEET_LKG_DIR:-/var/lib/ci-fleet/last-known-good}
 temp_dir=$(mktemp -d) || exit 2
+transaction_result=$temp_dir/transaction-result.json
+: >"$transaction_result"
+chmod 0600 "$transaction_result"
+exec 7>"$transaction_result"
 # shellcheck disable=SC2317 # cleanup_temp is invoked indirectly via trap
 cleanup_temp() { rm -rf "$temp_dir"; }
 trap cleanup_temp EXIT
@@ -222,7 +226,7 @@ apply_lkg() {
     return
   fi
 
-  local lkg_ref lkg_repo lkg_controller
+  local lkg_ref lkg_repo lkg_controller lkg_status=0 outcome
   mapfile -t lkg_vals <<<"$(python3 - "$lkg_dir/metadata.json" <<'PY' 2>/dev/null || true
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -257,14 +261,17 @@ PY
   fi
   git -C "$lkg_pinned" checkout -q FETCH_HEAD
 
-  CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
+  exec 7>"$transaction_result"
+  CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
     --config-repo "$lkg_pinned" \
     --config-identity "$lkg_repo" \
     --ref "$lkg_ref" \
-    --controller "$lkg_controller" 2>"$temp_dir/rollback_err" && {
+    --controller "$lkg_controller" 2>"$temp_dir/rollback_err" || lkg_status=$?
+  outcome=$(transaction_outcome)
+  if ((lkg_status == 0)) && [[ "$outcome" == applied ]]; then
     log_json "WARN" "rollback" "restored last-known-good"
     return 0
-  }
+  fi
   local err
   err=$(<"$temp_dir/rollback_err")
   log_json "ERROR" "rollback" "rollback failed: ${err}"
@@ -275,7 +282,7 @@ save_lkg() {
   local commit=$1
   install -d -m 0700 "$lkg_dir"
   python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" <<'PY' 2>/dev/null || true
-import json, os, sys, tempfile
+import json, os, stat, sys, tempfile
 
 path = sys.argv[1]
 meta = {
@@ -284,6 +291,25 @@ meta = {
     "controller": sys.argv[4],
     "saved_at": int(__import__("time").time()),
 }
+try:
+    metadata = os.lstat(path)
+    current = json.load(open(path, encoding="utf-8"))
+except (OSError, TypeError, ValueError):
+    metadata = None
+    current = None
+if (
+    metadata is not None
+    and stat.S_ISREG(metadata.st_mode)
+    and not stat.S_ISLNK(metadata.st_mode)
+    and metadata.st_uid == os.getuid()
+    and stat.S_IMODE(metadata.st_mode) == 0o600
+    and isinstance(current, dict)
+    and set(current) == set(meta)
+    and all(current[key] == meta[key] for key in ("config_repository", "config_ref", "controller"))
+    and type(current["saved_at"]) is int
+    and current["saved_at"] >= 0
+):
+    raise SystemExit(0)
 fd, tmp = tempfile.mkstemp(prefix=".lkg-meta.", dir=os.path.dirname(path), text=True)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -294,6 +320,21 @@ try:
 except:
     os.unlink(tmp, missing_ok=True)
     raise
+PY
+}
+
+transaction_outcome() {
+  python3 - "$transaction_result" <<'PY' 2>/dev/null || printf 'unknown\n'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+if len(lines) != 1:
+    raise SystemExit(1)
+value = json.loads(lines[0])
+if set(value) != {"schema_version", "outcome"} or value["schema_version"] != 1:
+    raise SystemExit(1)
+if value["outcome"] not in {"applied", "rollback_verified", "rollback_unverified"}:
+    raise SystemExit(1)
+print(value["outcome"])
 PY
 }
 
@@ -452,32 +493,40 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
 save_reconcile_state 'reconciling' "$desired_commit" "$installed_config_ref" 'unknown' "reconciling to ${desired_commit}"
-if CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
+upgrade_status=0
+if CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   --config-repo "$pinned_dir" \
   --config-identity "$installed_config_repo" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
 
-  # Save new LKG
-  save_lkg "$desired_commit"
-
   # Run health check
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
   health_status=$(run_health_check "$temp_dir/health.json")
 
+  if [[ "$health_status" != healthy && "$health_status" != warning ]]; then
+    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
+    apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
+    exit 3
+  fi
+
+  save_lkg "$desired_commit"
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
+  upgrade_status=$?
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
-
-  # Rollback to LKG — reinstalls a checkpoint of this attempt was already created,
-  # or safely restores LKG config directly via the installer
-  apply_lkg || die "rollback to last-known-good also failed"
-  health_status=$(run_health_check "$temp_dir/health.json")
-  save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconciled failed, rolled back to ${installed_config_ref}"
-  note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
+  outcome=$(transaction_outcome)
+  if [[ "$upgrade_status" == 20 && "$outcome" == rollback_verified ]]; then
+    health_status=$(run_health_check "$temp_dir/health.json")
+    save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconcile failed; installer verified rollback to ${installed_config_ref}"
+    note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
+    exit 3
+  fi
+  save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" 'unknown' "reconcile failed; installer rollback ${outcome}"
+  note "ROLLBACK_UNVERIFIED outcome=${outcome}"
   exit 3
 fi
