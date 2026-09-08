@@ -727,7 +727,7 @@ PY
 
 clear_recovery_artifacts() {
   checkpoint_path_is_pinned || return 1
-  python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY'
+  python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY' || return $?
 import os, shutil, stat, sys
 
 parent, owner = sys.argv[1], int(sys.argv[2])
