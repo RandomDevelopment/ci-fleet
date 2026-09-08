@@ -316,6 +316,20 @@ if [[ -n "${FAKE_FAIL_TAR_ONCE:-}" && -f "$FAKE_FAIL_TAR_ONCE" ]]; then
   rm -f "$FAKE_FAIL_TAR_ONCE"
   exit 45
 fi
+if [[ -n "${FAKE_GROUP_WRITABLE_ARCHIVE:-}" && " $* " == *' -xf '* ]]; then
+  destination= previous=
+  for argument in "$@"; do
+    [[ "$previous" != -C ]] || destination=$argument
+    previous=$argument
+  done
+  "$REAL_TAR" "$@" || exit $?
+  mask=$((8#$(umask)))
+  # Model mode 0775 archive entries: both extraction policy and umask must be safe.
+  if [[ " $* " != *' --no-same-permissions '* ]] || (( (mask & 8#22) != 8#22 )); then
+    chmod g+w "$destination" "$destination/scripts/docker-network-policy-adapter.sh" || exit $?
+  fi
+  exit 0
+fi
 exec "$REAL_TAR" "$@"
 EOF
 chmod 700 "$fake_bin/tar"
@@ -597,12 +611,14 @@ cp "$daemon_config" "$malformed_daemon_snapshot"
 export FAKE_COMPOSE_LOG=$tmp/malformed-daemon-compose.log
 : >"$FAKE_COMPOSE_LOG"
 : >"$FAKE_TRANSACTION_LOG"
+malformed_checkpoint_count=$(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d | wc -l)
 malformed_daemon_output=$tmp/malformed-daemon.out
 set +e
 "$installer" --install "${base_args[@]}" --ref "$ref_one" >"$malformed_daemon_output" 2>&1
 malformed_daemon_status=$?
 set -e
 ((malformed_daemon_status != 0)) || fail 'malformed managed daemon.json was reconciled'
+[[ $(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d | wc -l) == "$malformed_checkpoint_count" ]] || fail 'malformed managed daemon.json created a checkpoint before rejection'
 cmp -s "$malformed_daemon_snapshot" "$daemon_config" || fail 'malformed managed daemon.json changed before rejection'
 cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'malformed managed daemon.json changed its policy marker before rejection'
 malformed_policy_transaction_log=$tmp/malformed-policy-transaction.log
@@ -612,6 +628,18 @@ if grep -Eq '^(pause|stop|up|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'ma
 cp "$managed_daemon_snapshot" "$daemon_config"
 cp "$managed_marker_snapshot" "$policy_marker"
 unset FAKE_COMPOSE_LOG
+
+chmod 0660 "$daemon_config"
+untrusted_daemon_output=$tmp/untrusted-daemon-metadata.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$untrusted_daemon_output" 2>&1
+untrusted_daemon_status=$?
+set -e
+[[ "$untrusted_daemon_status" == 3 ]] || fail "group-writable daemon.json drift returned $untrusted_daemon_status instead of 3: $(<"$untrusted_daemon_output")"
+grep -Fq 'DRIFT docker_network_policy' "$untrusted_daemon_output" || fail "group-writable daemon.json drift was not reported: $(<"$untrusted_daemon_output")"
+cmp -s "$managed_daemon_snapshot" "$daemon_config" || fail 'daemon metadata fixture changed daemon.json bytes'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'daemon metadata fixture changed the verified policy generation'
+chmod 0600 "$daemon_config"
 
 rm -f "$daemon_config"
 expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -1492,6 +1520,16 @@ unset FAKE_FAIL_TAR_ONCE
 if compgen -G "$root/opt/ci-fleet/releases/.${engine_ref}.staging.*" >/dev/null; then fail 'interrupted release staging was not cleaned'; fi
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+rm -f "$root/opt/ci-fleet/manager/current" "$active_release/scripts/docker-network-policy-adapter.sh"
+rm -rf "$manager_release"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
+archive_permissions=$(umask 0002; expect_success env FAKE_GROUP_WRITABLE_ARCHIVE=1 "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'CONVERGED mode=install' <<<"$archive_permissions" || fail 'safe archive extraction did not converge the policy repair'
+manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+for archive_path in "$active_release" "$active_release/scripts/docker-network-policy-adapter.sh" "$manager_release" "$manager_release/scripts/docker-network-policy-adapter.sh"; do
+  archive_mode=$(stat -c %a "$archive_path")
+  (( (8#$archive_mode & 8#22) == 0 )) || fail "archive extraction installed an untrusted group/world-writable path: $archive_path"
+done
 manager_release_backup=$tmp/manager-release-backup
 cp -a "$manager_release" "$manager_release_backup"
 printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"
