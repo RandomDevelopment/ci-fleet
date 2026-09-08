@@ -901,13 +901,29 @@ if grep -Eq '^systemctl restart docker(\.service)?$|^docker (network (create|rm)
 fi
 rm -rf "$pre_adapter_snapshot"
 
+FAKE_ENGINE_REF=$engine_ref
+FAKE_RUNNER_IMAGE=$head_runner_image
+FAKE_CONTROLLER_IMAGE=$head_controller_image
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+pre_adapter_current_without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
+: >"$FAKE_TRANSACTION_LOG"
+pre_adapter_policy_removal=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_current_without_policy_ref")
+grep -Fq 'NETWORK_POLICY_REMOVED' <<<"$pre_adapter_policy_removal" || fail 'current engine did not remove managed policy before selecting the adapterless engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+pre_adapter_policy_marker=$pre_adapter_root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+[[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'current engine retained the managed policy marker before selecting the adapterless engine'
+
+FAKE_ENGINE_REF=$pre_adapter_ref
+FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
+export FAKE_PRIOR_RUNNER_IMAGE=$head_runner_image
+export FAKE_PRIOR_CONTROLLER_IMAGE=$head_controller_image
 pre_adapter_without_policy_ref=$(write_config active 1 1 "$pre_adapter_ref" false omit)
 : >"$FAKE_COMPOSE_LOG"
 pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_without_policy_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'adapterless engine with omitted policy did not converge'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'adapterless no-policy upgrade did not activate its runtime'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'adapterless no-policy upgrade did not activate its manager'
-pre_adapter_policy_marker=$pre_adapter_root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
 [[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'adapterless no-policy upgrade retained the managed policy marker'
 [[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'installed pre-adapter release gained an adapter'
 
