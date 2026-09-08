@@ -1444,21 +1444,26 @@ fi
 rollback_daemon() {
   local failed=0
   if [[ "$controller_resumed" == true ]]; then
+    rollback_stage=candidate_drain
     run_primitive rollback-drain || failed=1
   fi
   if ((failed == 0)); then
+    rollback_stage=daemon_restore
     restore_daemon || failed=1
   fi
   if ((failed == 0)); then
+    rollback_stage=docker_restart
     run_primitive restart "$daemon_dir" || failed=1
   fi
   if ((failed == 0)); then
+    rollback_stage=controller_resume
     run_primitive restore --env "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
     run_health "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
+    rollback_stage=daemon_pool_verify
     daemon_pools_match "$rollback_source" || failed=1
   fi
   if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
@@ -1487,6 +1492,7 @@ rollback_on_exit() {
     write_transaction_result rollback_verified
     if transaction_result_enabled; then result=20; fi
   else
+    printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s\n' "$rollback_stage" >&2
     if [[ -n "$transaction_recovery" ]]; then
       recovery_path=$transaction_recovery
     else
