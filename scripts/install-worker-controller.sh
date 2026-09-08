@@ -1450,7 +1450,7 @@ PY
 load_policy_action_context() {
   local path expected_owner=0
   [[ ${CI_FLEET_INSTALLER_LOCK_FD:-} == 9 ]] || die 'policy actions require the inherited installer lock'
-  [[ "$policy_action" =~ ^(drain|resume|restore|health)$ ]] || die 'unknown policy adapter action'
+  [[ "$policy_action" =~ ^(drain|rollback-drain|resume|restore|health)$ ]] || die 'unknown policy adapter action'
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   release_dir=${CI_FLEET_POLICY_RELEASE:-}
   candidate_metadata=${CI_FLEET_POLICY_METADATA:-}
@@ -1479,6 +1479,10 @@ perform_policy_action() {
     drain)
       if [[ -f "$state_file" || -f "$rendered_env" ]]; then load_installed_controller_identity; fi
       drain_current false "$rendered_env" "$release_dir"
+      ;;
+    rollback-drain)
+      if [[ -f "$state_file" || -f "$rendered_env" ]]; then load_installed_controller_identity; fi
+      drain_current true "$rendered_env" "$release_dir"
       ;;
     resume)
       run_candidate_preflight

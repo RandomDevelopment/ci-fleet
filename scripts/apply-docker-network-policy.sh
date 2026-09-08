@@ -250,7 +250,7 @@ run_primitive() {
     return
   fi
   case "$action" in
-    drain) run_command "$drain_command" "$@" ;;
+    drain|rollback-drain) run_command "$drain_command" "$@" ;;
     restart) run_command "$restart_command" "$@" ;;
     probe) run_command "$probe_command" "$@" ;;
     resume|restore) run_command "$resume_command" "$@" ;;
@@ -345,7 +345,7 @@ resume_after_failed_drain() {
   trap '' INT TERM
   trap - EXIT
   if [[ "$controller_resumed" == true ]]; then
-    run_primitive drain || resume_failed=1
+    run_primitive rollback-drain || resume_failed=1
   fi
   ((resume_failed != 0)) || run_primitive restore --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
@@ -1002,7 +1002,7 @@ PY
   rollback_removal() {
     local failed=0 rollback_daemon=$work_dir/daemon.json.rollback rollback_expected=$work_dir/daemon.json.rollback-expected
     if [[ "$controller_resumed" == true ]]; then
-      run_primitive drain || failed=1
+      run_primitive rollback-drain || failed=1
     fi
     if ((failed == 0)); then
       python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" <<'PY' || failed=1
@@ -1444,7 +1444,7 @@ fi
 rollback_daemon() {
   local failed=0
   if [[ "$controller_resumed" == true ]]; then
-    run_primitive drain || failed=1
+    run_primitive rollback-drain || failed=1
   fi
   if ((failed == 0)); then
     restore_daemon || failed=1

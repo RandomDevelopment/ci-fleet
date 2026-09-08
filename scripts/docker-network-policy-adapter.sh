@@ -22,9 +22,9 @@ invoke_installer() {
 }
 
 case "$action" in
-  drain)
-    [[ $# -eq 0 ]] || die 'invalid drain arguments'
-    invoke_installer drain
+  drain|rollback-drain)
+    [[ $# -eq 0 ]] || die "invalid $action arguments"
+    invoke_installer "$action"
     ;;
   restore)
     [[ $# -eq 2 ]] || die 'invalid restore arguments'
