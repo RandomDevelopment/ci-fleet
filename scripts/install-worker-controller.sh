@@ -1619,13 +1619,22 @@ perform_converge() {
     export CI_FLEET_POLICY_PREBUILT=$build_before_drain
     export CI_FLEET_POLICY_MODE=$mode
     policy_status=0
-    "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" || policy_status=$?
+    if transaction_result_enabled; then
+      "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" || policy_status=$?
+    else
+      CI_FLEET_TRANSACTION_RESULT_FD=7 \
+        "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" \
+        7>/dev/null || policy_status=$?
+    fi
     transaction_active=false
     if ((policy_status == 0)); then
       note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
       return
     fi
-    ((policy_status == 20)) && return 20
+    if ((policy_status == 20)); then
+      note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
+      return 20
+    fi
     return 21
   fi
   if [[ -f "$state_file" || -f "$rendered_env" ]]; then
