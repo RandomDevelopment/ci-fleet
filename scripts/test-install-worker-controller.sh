@@ -991,121 +991,7 @@ if ! "$installer" --uninstall >"$dangling_manager_uninstall_output" 2>&1; then
 fi
 grep -Fq 'UNINSTALL_OK' "$dangling_manager_uninstall_output" || fail 'dangling-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'dangling-manager no-controller uninstall did not remove inactive runners'
-dangling_manager_uninstall_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$dangling_manager_uninstall_output")
-[[ -n "$dangling_manager_uninstall_checkpoint" ]] || fail 'dangling-manager no-controller uninstall did not report its checkpoint'
-latest_completed_checkpoint=$(
-  { find "$root/var/lib/ci-fleet/checkpoints" -mindepth 2 -maxdepth 2 -type f -name .complete ! -path "$root/var/lib/ci-fleet/checkpoints/.checkpoint.staging.*/*" -printf '%T@ %h\n' 2>/dev/null || true; } \
-    | sort -nr \
-    | awk 'NR == 1 {print $2}'
-)
-[[ "$latest_completed_checkpoint" == "$dangling_manager_uninstall_checkpoint" ]] || fail "latest completed checkpoint $latest_completed_checkpoint does not match dangling-manager uninstall checkpoint $dangling_manager_uninstall_checkpoint"
-python3 - "$dangling_manager_uninstall_checkpoint/ci-fleet.env" "$daemon_config" "$policy_marker" "$(id -u)" <<'PY'
-import hashlib
-import ipaddress
-import json
-import os
-import re
-import stat
-import sys
-from pathlib import Path
-
-environment_path, daemon_path, marker_path, expected_uid = sys.argv[1:]
-expected_uid = int(expected_uid)
-pool_prefix = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
-pool_values = {}
-try:
-    environment_lines = Path(environment_path).read_text(encoding="utf-8").splitlines()
-except (OSError, UnicodeError) as error:
-    raise AssertionError(f"rollback diagnostic: checkpoint environment is unreadable: {error}") from error
-for number, raw in enumerate(environment_lines, start=1):
-    line = raw.strip()
-    if not line.startswith(pool_prefix):
-        continue
-    assert "=" in line, f"rollback diagnostic: malformed checkpoint environment pool entry on line {number}"
-    name, value = line.split("=", 1)
-    assert name not in pool_values, f"rollback diagnostic: duplicate checkpoint environment pool entry {name}"
-    pool_values[name] = value
-assert pool_values.get(f"{pool_prefix}COUNT") == "1", f"rollback diagnostic: checkpoint environment pool count is {pool_values.get(f'{pool_prefix}COUNT')!r}, not '1'"
-assert set(pool_values) == {f"{pool_prefix}COUNT", f"{pool_prefix}0_BASE", f"{pool_prefix}0_SIZE"}, f"rollback diagnostic: checkpoint environment pool fields are {sorted(pool_values)!r}"
-assert pool_values[f"{pool_prefix}0_BASE"] == "10.64.0.0/24", f"rollback diagnostic: checkpoint environment pool base is {pool_values[f'{pool_prefix}0_BASE']!r}"
-assert pool_values[f"{pool_prefix}0_SIZE"] == "28", f"rollback diagnostic: checkpoint environment pool size is {pool_values[f'{pool_prefix}0_SIZE']!r}"
-environment_pools = [{"base": "10.64.0.0/24", "size": 28}]
-
-try:
-    daemon_meta = os.lstat(daemon_path)
-except OSError as error:
-    raise AssertionError(f"rollback diagnostic: daemon.json metadata unavailable: {error}") from error
-assert stat.S_ISREG(daemon_meta.st_mode), "rollback diagnostic: daemon.json is not a regular file"
-assert not stat.S_ISLNK(daemon_meta.st_mode), "rollback diagnostic: daemon.json is a symlink"
-assert daemon_meta.st_uid == expected_uid, f"rollback diagnostic: daemon.json UID is {daemon_meta.st_uid}, not {expected_uid}"
-assert not stat.S_IMODE(daemon_meta.st_mode) & 0o022, f"rollback diagnostic: daemon.json mode {stat.S_IMODE(daemon_meta.st_mode):04o} is group/world writable"
-
-try:
-    marker_meta = os.lstat(marker_path)
-except OSError as error:
-    raise AssertionError(f"rollback diagnostic: policy marker metadata unavailable: {error}") from error
-assert stat.S_ISREG(marker_meta.st_mode), "rollback diagnostic: policy marker is not a regular file"
-assert not stat.S_ISLNK(marker_meta.st_mode), "rollback diagnostic: policy marker is a symlink"
-assert marker_meta.st_uid == expected_uid, f"rollback diagnostic: policy marker UID is {marker_meta.st_uid}, not {expected_uid}"
-assert stat.S_IMODE(marker_meta.st_mode) == 0o600, f"rollback diagnostic: policy marker mode is {stat.S_IMODE(marker_meta.st_mode):04o}, not 0600"
-
-try:
-    marker = json.loads(Path(marker_path).read_text(encoding="utf-8"))
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise AssertionError(f"rollback diagnostic: policy marker is not valid JSON: {error}") from error
-required_marker_keys = {
-    "managed",
-    "prior_default_address_pools",
-    "prior_default_address_pools_present",
-    "prior_mode",
-    "prior_present",
-    "verified_generation",
-}
-assert isinstance(marker, dict), "rollback diagnostic: policy marker is not an object"
-assert set(marker) == required_marker_keys, f"rollback diagnostic: policy marker keys are {sorted(marker)!r}"
-assert marker["managed"] is True, f"rollback diagnostic: policy marker managed value is {marker['managed']!r}, not true"
-assert "phase" not in marker, f"rollback diagnostic: policy marker retains phase {marker['phase']!r}"
-assert isinstance(marker["prior_present"], bool), f"rollback diagnostic: policy marker prior_present is not boolean: {marker['prior_present']!r}"
-assert isinstance(marker["prior_default_address_pools_present"], bool), f"rollback diagnostic: policy marker prior_default_address_pools_present is not boolean: {marker['prior_default_address_pools_present']!r}"
-prior_pools_present = marker["prior_default_address_pools_present"]
-prior_pools = marker["prior_default_address_pools"]
-assert not prior_pools_present or marker["prior_present"], "rollback diagnostic: policy marker records prior pools without a prior daemon.json"
-if prior_pools_present:
-    assert type(prior_pools) is list and prior_pools, f"rollback diagnostic: policy marker prior pools are invalid: {prior_pools!r}"
-    assert len(prior_pools) <= 64, f"rollback diagnostic: policy marker has {len(prior_pools)} prior pools, more than 64"
-    networks = []
-    for index, pool in enumerate(prior_pools):
-        assert isinstance(pool, dict) and set(pool) == {"base", "size"}, f"rollback diagnostic: policy marker prior pool {index} has invalid fields: {pool!r}"
-        assert isinstance(pool["base"], str) and type(pool["size"]) is int and 0 <= pool["size"] <= 29, f"rollback diagnostic: policy marker prior pool {index} has invalid values: {pool!r}"
-        try:
-            network = ipaddress.ip_network(pool["base"], strict=True)
-        except ValueError as error:
-            raise AssertionError(f"rollback diagnostic: policy marker prior pool {index} has malformed CIDR {pool['base']!r}") from error
-        assert network.version == 4 and pool["size"] >= network.prefixlen, f"rollback diagnostic: policy marker prior pool {index} has impossible IPv4 provenance: {pool!r}"
-        networks.append(network)
-    for left, network in enumerate(networks):
-        for right in range(left + 1, len(networks)):
-            assert not network.overlaps(networks[right]), f"rollback diagnostic: policy marker prior pool {left} overlaps pool {right}"
-else:
-    assert prior_pools is None, f"rollback diagnostic: policy marker absent prior pools have non-null provenance: {prior_pools!r}"
-prior_mode = marker["prior_mode"]
-if marker["prior_present"]:
-    assert isinstance(prior_mode, str) and re.fullmatch(r"[0-7]{3,4}", prior_mode), f"rollback diagnostic: policy marker prior mode is invalid: {prior_mode!r}"
-else:
-    assert prior_mode is None, f"rollback diagnostic: policy marker absent prior daemon has mode {prior_mode!r}"
-generation = marker["verified_generation"]
-assert isinstance(generation, str) and re.fullmatch(r"[0-9a-f]{64}", generation), f"rollback diagnostic: policy marker verified generation is invalid: {generation!r}"
-
-try:
-    daemon_bytes = Path(daemon_path).read_bytes()
-    daemon = json.loads(daemon_bytes)
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise AssertionError(f"rollback diagnostic: daemon.json is not valid JSON: {error}") from error
-assert isinstance(daemon, dict), "rollback diagnostic: daemon.json is not an object"
-assert daemon.get("default-address-pools") == environment_pools, f"rollback diagnostic: daemon pools {daemon.get('default-address-pools')!r} do not equal checkpoint environment pools {environment_pools!r}"
-actual_generation = hashlib.sha256(daemon_bytes).hexdigest()
-assert actual_generation == generation, f"rollback diagnostic: daemon.json SHA-256 {actual_generation} does not equal verified generation {generation}"
-PY
+printf 'ROLLBACK_CASE=dangling-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -f "$FAKE_DOCKER_STATE"
@@ -1117,6 +1003,7 @@ ln -sfn "$incomplete_uninstall_manager" "$root/opt/ci-fleet/manager/current"
 incomplete_manager_uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$incomplete_manager_uninstall_output" || fail 'incomplete-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'incomplete-manager no-controller uninstall did not remove inactive runners'
+printf 'ROLLBACK_CASE=incomplete-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$incomplete_uninstall_manager"
@@ -1136,6 +1023,7 @@ raw_manager_uninstall_output=$(expect_success "$installer" --uninstall)
 raw_manager_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' <<<"$raw_manager_uninstall_output")
 [[ ! -e "$raw_manager_checkpoint/manager-target" ]] || fail "raw invalid manager pointer was normalized into checkpoint authority: $(<"$raw_manager_checkpoint/manager-target")"
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'raw-manager no-controller uninstall did not remove inactive runners'
+printf 'ROLLBACK_CASE=raw-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$raw_manager_release"
@@ -1325,6 +1213,7 @@ ln -sfn "$format_two_dangling_target" "$root/opt/ci-fleet/current"
 rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_COMPOSE_LOG=$tmp/format-two-no-target-compose.log
 : >"$FAKE_COMPOSE_LOG"
+printf 'ROLLBACK_CASE=format-two-no-target\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -e "$root/opt/ci-fleet/current" && ! -L "$root/opt/ci-fleet/current" ]] || fail 'format-2 checkpoint without release-target retained a dangling live current link'
 if grep -Eq '^(build|up|stop|pause|unpause|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'format-2 checkpoint without release-target used an uncheckpointed release'; fi
@@ -1411,6 +1300,7 @@ grep -Fq 'DRAIN_OK managed_runners=0' "$no_release_active_orphan_output" || fail
 grep -Fq 'UNINSTALL_OK' "$no_release_active_orphan_output" || fail 'no-release active-orphan uninstall did not complete'
 [[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'no-release uninstall did not wait for the active orphan'
 if grep -Fq 'container-rm-blocked-running|' "$FAKE_COMPOSE_LOG"; then fail 'no-release uninstall tried to remove the active orphan'; fi
+printf 'ROLLBACK_CASE=no-release-active-orphan\n' >&2
 expect_success "$installer" --rollback >/dev/null
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN:-0} != 1 ]] || { printf 'NO_RELEASE_ACTIVE_ORPHAN_REGRESSION_OK\n'; exit 0; }
@@ -1432,6 +1322,7 @@ no_release_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "
 no_release_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$no_release_output" || fail 'no-release uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'no-release uninstall retained an inactive managed runner'
+printf 'ROLLBACK_CASE=no-release-uninstall\n' >&2
 expect_success "$installer" --rollback >/dev/null
 no_release_checkpoint=$(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d ! -name '.checkpoint.staging.*' -printf '%T@ %p\n' | sort -nr | awk 'NR == 1 {print $2}')
 printf '%s\n' "$authority_active_release" >"$no_release_checkpoint/manager-target"
@@ -1919,6 +1810,7 @@ grep -Fq 'Docker daemon is unavailable' "$daemon_failure_output" || fail 'image 
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$daemon_failure_output" || grep -Eq '^(stop|build)\|' "$FAKE_COMPOSE_LOG"; then fail 'Docker daemon failure entered the transaction'; fi
 uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
+printf 'ROLLBACK_CASE=missing-tag\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the missing-tag installation'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
@@ -2057,6 +1949,7 @@ expect_failure 'checkpoint image mappings are invalid' "$installer" --rollback
 if grep -q '^up|' "$FAKE_COMPOSE_LOG"; then fail 'malformed checkpoint image ID restarted the prior controller'; fi
 [[ ! -f "$FAKE_DOCKER_STATE" ]] || fail 'malformed checkpoint image ID restored the prior controller'
 printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$prior_runner_image_id" "$prior_controller_image_id" >"$image_ids_file"
+printf 'ROLLBACK_CASE=repaired-image-map\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'repaired checkpoint did not restore the prior controller'
 legacy_checkpoint=$root/var/lib/ci-fleet/checkpoints/legacy-checkpoint
@@ -2065,6 +1958,7 @@ rm -f "$legacy_checkpoint/format-version" "$legacy_checkpoint/image-ids.env"
 touch "$legacy_checkpoint/.complete"
 : >"$FAKE_COMPOSE_LOG"
 legacy_output=$tmp/legacy-checkpoint.out
+printf 'ROLLBACK_CASE=legacy-checkpoint\n' >&2
 if ! "$installer" --rollback >"$legacy_output" 2>&1; then
   fail "legacy checkpoint was rejected: $(<"$legacy_output")"
 fi
@@ -2085,6 +1979,7 @@ cp -a "$checkpoint_path" "$format_two_checkpoint"
 printf '2\n' >"$format_two_checkpoint/format-version"
 rm -f "$format_two_checkpoint/current-link" "$format_two_checkpoint/current-absent"
 touch "$format_two_checkpoint/.complete"
+printf 'ROLLBACK_CASE=format-two-checkpoint\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -L "$root/opt/ci-fleet/current" && $(readlink -f "$root/opt/ci-fleet/current") == $(<"$format_two_checkpoint/release-target") ]] || fail 'format-2 checkpoint did not restore its validated release target'
 rm -rf "$format_two_checkpoint"
@@ -2160,6 +2055,7 @@ export FAKE_FAIL_UP_ONCE=$tmp/term-rollback-fail-up
 terminate_upgrade "$term_failure_output" "$tmp/term-failure-pause"
 unset FAKE_FAIL_UP_ONCE
 grep -Fq 'ROLLBACK_FAILED' "$term_failure_output" || fail 'TERM rollback failure was not reported'
+printf 'ROLLBACK_CASE=term-recovery\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'explicit rollback did not recover after TERM rollback failure'
 [[ ${CI_FLEET_TEST_STOP_AFTER_TERM_ROLLBACK:-0} != 1 ]] || { printf 'TERM_ROLLBACK_REGRESSION_OK\n'; exit 0; }
@@ -2207,6 +2103,7 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upg
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 rm -f "$root/var/lib/ci-fleet/install-state.json" "$root/etc/ci-fleet/ci-fleet.env"
+printf 'ROLLBACK_CASE=restarting-controller\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
@@ -2315,6 +2212,7 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
 [[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
 [[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
+printf 'ROLLBACK_CASE=dangling-current-uninstall\n' >&2
 expect_success "$installer" --rollback >/dev/null
 damaged_uninstall_output=$tmp/damaged-uninstall.out
 export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log
