@@ -991,7 +991,6 @@ if ! "$installer" --uninstall >"$dangling_manager_uninstall_output" 2>&1; then
 fi
 grep -Fq 'UNINSTALL_OK' "$dangling_manager_uninstall_output" || fail 'dangling-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'dangling-manager no-controller uninstall did not remove inactive runners'
-printf 'ROLLBACK_CASE=dangling-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -f "$FAKE_DOCKER_STATE"
@@ -1003,7 +1002,6 @@ ln -sfn "$incomplete_uninstall_manager" "$root/opt/ci-fleet/manager/current"
 incomplete_manager_uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$incomplete_manager_uninstall_output" || fail 'incomplete-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'incomplete-manager no-controller uninstall did not remove inactive runners'
-printf 'ROLLBACK_CASE=incomplete-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$incomplete_uninstall_manager"
@@ -1023,7 +1021,6 @@ raw_manager_uninstall_output=$(expect_success "$installer" --uninstall)
 raw_manager_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' <<<"$raw_manager_uninstall_output")
 [[ ! -e "$raw_manager_checkpoint/manager-target" ]] || fail "raw invalid manager pointer was normalized into checkpoint authority: $(<"$raw_manager_checkpoint/manager-target")"
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'raw-manager no-controller uninstall did not remove inactive runners'
-printf 'ROLLBACK_CASE=raw-manager\n' >&2
 expect_success "$installer" --rollback >/dev/null
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$raw_manager_release"
@@ -1214,7 +1211,6 @@ ln -sfn "$format_two_dangling_target" "$root/opt/ci-fleet/current"
 rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_COMPOSE_LOG=$tmp/format-two-no-target-compose.log
 : >"$FAKE_COMPOSE_LOG"
-printf 'ROLLBACK_CASE=format-two-no-target\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -e "$root/opt/ci-fleet/current" && ! -L "$root/opt/ci-fleet/current" ]] || fail 'format-2 checkpoint without release-target retained a dangling live current link'
 if grep -Eq '^(build|up|stop|pause|unpause|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'format-2 checkpoint without release-target used an uncheckpointed release'; fi
@@ -1301,7 +1297,6 @@ grep -Fq 'DRAIN_OK managed_runners=0' "$no_release_active_orphan_output" || fail
 grep -Fq 'UNINSTALL_OK' "$no_release_active_orphan_output" || fail 'no-release active-orphan uninstall did not complete'
 [[ ! -f "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'no-release uninstall did not wait for the active orphan'
 if grep -Fq 'container-rm-blocked-running|' "$FAKE_COMPOSE_LOG"; then fail 'no-release uninstall tried to remove the active orphan'; fi
-printf 'ROLLBACK_CASE=no-release-active-orphan\n' >&2
 expect_success "$installer" --rollback >/dev/null
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN:-0} != 1 ]] || { printf 'NO_RELEASE_ACTIVE_ORPHAN_REGRESSION_OK\n'; exit 0; }
@@ -1323,7 +1318,6 @@ no_release_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "
 no_release_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$no_release_output" || fail 'no-release uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'no-release uninstall retained an inactive managed runner'
-printf 'ROLLBACK_CASE=no-release-uninstall\n' >&2
 expect_success "$installer" --rollback >/dev/null
 no_release_checkpoint=$(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d ! -name '.checkpoint.staging.*' -printf '%T@ %p\n' | sort -nr | awk 'NR == 1 {print $2}')
 printf '%s\n' "$authority_active_release" >"$no_release_checkpoint/manager-target"
@@ -1811,7 +1805,6 @@ grep -Fq 'Docker daemon is unavailable' "$daemon_failure_output" || fail 'image 
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$daemon_failure_output" || grep -Eq '^(stop|build)\|' "$FAKE_COMPOSE_LOG"; then fail 'Docker daemon failure entered the transaction'; fi
 uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
-printf 'ROLLBACK_CASE=missing-tag\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the missing-tag installation'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
@@ -1950,7 +1943,6 @@ expect_failure 'checkpoint image mappings are invalid' "$installer" --rollback
 if grep -q '^up|' "$FAKE_COMPOSE_LOG"; then fail 'malformed checkpoint image ID restarted the prior controller'; fi
 [[ ! -f "$FAKE_DOCKER_STATE" ]] || fail 'malformed checkpoint image ID restored the prior controller'
 printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$prior_runner_image_id" "$prior_controller_image_id" >"$image_ids_file"
-printf 'ROLLBACK_CASE=repaired-image-map\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'repaired checkpoint did not restore the prior controller'
 legacy_checkpoint=$root/var/lib/ci-fleet/checkpoints/legacy-checkpoint
@@ -1959,7 +1951,6 @@ rm -f "$legacy_checkpoint/format-version" "$legacy_checkpoint/image-ids.env"
 touch "$legacy_checkpoint/.complete"
 : >"$FAKE_COMPOSE_LOG"
 legacy_output=$tmp/legacy-checkpoint.out
-printf 'ROLLBACK_CASE=legacy-checkpoint\n' >&2
 if ! "$installer" --rollback >"$legacy_output" 2>&1; then
   fail "legacy checkpoint was rejected: $(<"$legacy_output")"
 fi
@@ -1980,7 +1971,6 @@ cp -a "$checkpoint_path" "$format_two_checkpoint"
 printf '2\n' >"$format_two_checkpoint/format-version"
 rm -f "$format_two_checkpoint/current-link" "$format_two_checkpoint/current-absent"
 touch "$format_two_checkpoint/.complete"
-printf 'ROLLBACK_CASE=format-two-checkpoint\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -L "$root/opt/ci-fleet/current" && $(readlink -f "$root/opt/ci-fleet/current") == $(<"$format_two_checkpoint/release-target") ]] || fail 'format-2 checkpoint did not restore its validated release target'
 rm -rf "$format_two_checkpoint"
@@ -2056,7 +2046,6 @@ export FAKE_FAIL_UP_ONCE=$tmp/term-rollback-fail-up
 terminate_upgrade "$term_failure_output" "$tmp/term-failure-pause"
 unset FAKE_FAIL_UP_ONCE
 grep -Fq 'ROLLBACK_FAILED' "$term_failure_output" || fail 'TERM rollback failure was not reported'
-printf 'ROLLBACK_CASE=term-recovery\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'explicit rollback did not recover after TERM rollback failure'
 [[ ${CI_FLEET_TEST_STOP_AFTER_TERM_ROLLBACK:-0} != 1 ]] || { printf 'TERM_ROLLBACK_REGRESSION_OK\n'; exit 0; }
@@ -2104,7 +2093,6 @@ grep -Fq 'CI_FLEET_MAX_RUNNERS=2' "$root/etc/ci-fleet/ci-fleet.env" || fail 'upg
 mkdir -p "$root/var/lib/ci-fleet/checkpoints/99999999-incomplete"
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 rm -f "$root/var/lib/ci-fleet/install-state.json" "$root/etc/ci-fleet/ci-fleet.env"
-printf 'ROLLBACK_CASE=restarting-controller\n' >&2
 expect_success "$installer" --rollback >/dev/null
 [[ ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'explicit rollback did not recover a restarting controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$root/etc/ci-fleet/ci-fleet.env" || fail 'rollback did not restore capacity one'
@@ -2213,7 +2201,6 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 [[ -f "$host_config" && -f "$pem" ]] || fail 'uninstall removed preserved host credentials'
 [[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
 [[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
-printf 'ROLLBACK_CASE=dangling-current-uninstall\n' >&2
 expect_success "$installer" --rollback >/dev/null
 damaged_uninstall_output=$tmp/damaged-uninstall.out
 export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log

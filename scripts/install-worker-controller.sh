@@ -845,7 +845,7 @@ install_manager() {
     staged_manager=$(mktemp -d "$manager_releases/.${manager_commit}.staging.XXXXXX")
     staging_paths+=("$staged_manager")
     chmod 0755 "$staged_manager"
-    tar -xf "$archive" -C "$staged_manager"
+    (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager")
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
     manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'staged installer manager release is incomplete'
