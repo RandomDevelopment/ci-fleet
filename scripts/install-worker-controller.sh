@@ -1706,6 +1706,7 @@ else
   exec 9>"$lock_file"
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
+export CI_FLEET_INSTALLER_LOCK_FD=9
 if [[ "$mode" == policy-action ]]; then
   perform_policy_action
   exit 0
