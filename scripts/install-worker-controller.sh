@@ -1605,6 +1605,7 @@ perform_converge() {
     export CI_FLEET_INSTALLER_LOCK=$lock_file
     export CI_FLEET_POLICY_INSTALLER=$repo_root/scripts/install-worker-controller.sh
     export CI_FLEET_POLICY_RELEASE=$release_dir
+    export CI_FLEET_POLICY_ENV=$policy_env
     export CI_FLEET_POLICY_METADATA=$policy_metadata
     export CI_FLEET_POLICY_CHECKPOINT=$checkpoint_dir
     export CI_FLEET_POLICY_CONFIG_IDENTITY=$config_identity
