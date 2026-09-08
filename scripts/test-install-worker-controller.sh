@@ -206,7 +206,7 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "$stopped_state" ]] || rm -f "$stopped_state"
-        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$env_file" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
@@ -565,6 +565,16 @@ import sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["default-address-pools"] == [{"base": "10.64.0.0/24", "size": 28}]
 PY
+policy_marker=$root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["prior_present"] = "false"; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$policy_marker"
+strict_marker_output=$tmp/strict-policy-marker.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$strict_marker_output" 2>&1
+strict_marker_status=$?
+set -e
+[[ "$strict_marker_status" == 3 ]] || fail "string prior_present marker drift returned $strict_marker_status instead of 3: $(<"$strict_marker_output")"
+grep -Fq 'DRIFT docker_network_policy' "$strict_marker_output" || fail "string prior_present marker drift was not reported: $(<"$strict_marker_output")"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["prior_present"] = False; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$policy_marker"
 
 assert_single_policy_transaction() {
   local log=$1
@@ -577,6 +587,32 @@ assert_single_policy_transaction() {
 }
 
 export FAKE_TRANSACTION_LOG=$tmp/docker-policy-transaction.log
+managed_daemon_snapshot=$tmp/managed-daemon.json
+managed_marker_snapshot=$tmp/managed-policy-marker.json
+malformed_daemon_snapshot=$tmp/malformed-daemon.json
+cp "$daemon_config" "$managed_daemon_snapshot"
+cp "$policy_marker" "$managed_marker_snapshot"
+printf '{"unrelated-setting": "preserve"\n' >"$daemon_config"
+cp "$daemon_config" "$malformed_daemon_snapshot"
+export FAKE_COMPOSE_LOG=$tmp/malformed-daemon-compose.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_TRANSACTION_LOG"
+malformed_daemon_output=$tmp/malformed-daemon.out
+set +e
+"$installer" --install "${base_args[@]}" --ref "$ref_one" >"$malformed_daemon_output" 2>&1
+malformed_daemon_status=$?
+set -e
+((malformed_daemon_status != 0)) || fail 'malformed managed daemon.json was reconciled'
+cmp -s "$malformed_daemon_snapshot" "$daemon_config" || fail 'malformed managed daemon.json changed before rejection'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'malformed managed daemon.json changed its policy marker before rejection'
+malformed_policy_transaction_log=$tmp/malformed-policy-transaction.log
+grep -E '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up) .*controller|network (create|rm) )' "$FAKE_TRANSACTION_LOG" >"$malformed_policy_transaction_log" || true
+[[ ! -s "$malformed_policy_transaction_log" ]] || fail "malformed managed daemon.json entered a policy transaction: $(<"$malformed_policy_transaction_log")"
+if grep -Eq '^(pause|stop|up|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'malformed managed daemon.json mutated the controller'; fi
+cp "$managed_daemon_snapshot" "$daemon_config"
+cp "$managed_marker_snapshot" "$policy_marker"
+unset FAKE_COMPOSE_LOG
+
 rm -f "$daemon_config"
 expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 : >"$FAKE_TRANSACTION_LOG"
@@ -606,6 +642,34 @@ except FileNotFoundError:
     value = {}
 assert "default-address-pools" not in value
 PY
+no_policy_rendered=$tmp/no-policy-rendered.env
+cp "$root/etc/ci-fleet/ci-fleet.env" "$no_policy_rendered"
+export FAKE_COMPOSE_LOG=$tmp/policy-mismatch-rollback-compose.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_TRANSACTION_LOG"
+policy_mismatch_rollback_output=$tmp/policy-mismatch-rollback.out
+set +e
+"$installer" --rollback >"$policy_mismatch_rollback_output" 2>&1
+policy_mismatch_rollback_status=$?
+set -e
+((policy_mismatch_rollback_status != 0)) || fail 'manual rollback accepted a Docker network-policy mismatch'
+if grep -Fq 'ROLLBACK_OK' "$policy_mismatch_rollback_output"; then fail 'policy-mismatched rollback reported success'; fi
+grep -Fq 'rollback requires Docker network-policy reconciliation' "$policy_mismatch_rollback_output" || fail "policy-mismatched rollback returned the wrong error: $(<"$policy_mismatch_rollback_output")"
+cmp -s "$no_policy_rendered" "$root/etc/ci-fleet/ci-fleet.env" || fail 'policy-mismatched rollback changed the installed no-policy configuration'
+[[ ! -e "$policy_marker" && ! -L "$policy_marker" ]] || fail 'policy-mismatched rollback recreated the managed policy marker'
+python3 - "$daemon_config" <<'PY' || fail 'policy-mismatched rollback restored managed daemon pools'
+import json
+import os
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
+assert "default-address-pools" not in value
+PY
+if grep -Eq '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up|kill|down|rm) .*controller|network (create|rm) |rm )' "$FAKE_TRANSACTION_LOG"; then
+  fail 'policy-mismatched rollback caused a Compose, Docker, or controller mutation'
+fi
+if grep -Eq '^(pause|stop|up|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'policy-mismatched rollback invoked Compose'; fi
+unset FAKE_COMPOSE_LOG
 : >"$FAKE_TRANSACTION_LOG"
 no_policy=$(expect_success "$installer" --install "${base_args[@]}" --ref "$without_policy_ref")
 grep -Fq 'NO_CHANGE' <<<"$no_policy" || fail 'no-policy host without a managed marker was not a no-op'
@@ -614,6 +678,60 @@ if grep -Eq '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|s
 fi
 ref_one=$(write_config active 1 1)
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+
+pre_adapter_ref=003de44f7e27d7bfe5bb753098efb6eb5f9712f1
+pre_adapter_manifest=$tmp/pre-adapter-engine-capabilities.json
+git -C "$repo_root" show "$pre_adapter_ref:engine-capabilities.json" >"$pre_adapter_manifest"
+python3 - "$pre_adapter_manifest" <<'PY' || fail 'pre-adapter release does not advertise Docker network-policy configuration'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["capabilities"]["docker_network_policy_config"] is True
+PY
+if git -C "$repo_root" cat-file -e "$pre_adapter_ref:scripts/docker-network-policy-adapter.sh" 2>/dev/null; then
+  fail 'pre-adapter release unexpectedly contains the Docker network-policy adapter'
+fi
+pre_adapter_checkout=$tmp/pre-adapter-checkout
+git clone -q --no-checkout "$repo_root" "$pre_adapter_checkout"
+git -C "$pre_adapter_checkout" checkout -q --detach "$pre_adapter_ref"
+pre_adapter_config_ref=$(write_config active 1 1 "$pre_adapter_ref")
+head_runner_image=$FAKE_RUNNER_IMAGE
+head_controller_image=$FAKE_CONTROLLER_IMAGE
+pre_adapter_runner_image=ci-fleet-runner:${pre_adapter_ref:0:12}
+pre_adapter_controller_image=ci-fleet-controller:${pre_adapter_ref:0:12}
+FAKE_ENGINE_REF=$pre_adapter_ref
+FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
+pre_adapter_install=$(expect_success "$pre_adapter_checkout/scripts/install-worker-controller.sh" --upgrade "${base_args[@]}" --ref "$pre_adapter_config_ref")
+grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
+pre_adapter_runtime=$root/opt/ci-fleet/releases/$pre_adapter_ref
+pre_adapter_manager=$root/opt/ci-fleet/manager/releases/$pre_adapter_ref
+[[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'historical installer did not activate the pre-adapter runtime'
+[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'historical installer did not activate the pre-adapter manager'
+[[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'installed pre-adapter release gained an adapter'
+pre_adapter_rendered=$tmp/pre-adapter-rendered.env
+cp "$root/etc/ci-fleet/ci-fleet.env" "$pre_adapter_rendered"
+FAKE_ENGINE_REF=$engine_ref
+FAKE_RUNNER_IMAGE=$head_runner_image
+FAKE_CONTROLLER_IMAGE=$head_controller_image
+export FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
+export FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
+export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
+: >"$FAKE_RESTART_AFTER_UP"
+pre_adapter_upgrade_output=$tmp/pre-adapter-upgrade.out
+set +e
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
+pre_adapter_upgrade_status=$?
+set -e
+unset FAKE_RESTART_AFTER_UP
+[[ "$pre_adapter_upgrade_status" == 20 ]] || fail "pre-adapter upgrade rollback returned $pre_adapter_upgrade_status instead of 20: $(<"$pre_adapter_upgrade_output")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$pre_adapter_upgrade_output" || true) == 1 ]] || fail "pre-adapter upgrade did not emit exactly one restored marker: $(<"$pre_adapter_upgrade_output")"
+[[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
+[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
+cmp -s "$pre_adapter_rendered" "$root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 unset FAKE_TRANSACTION_LOG
 
 git -C "$config_repo" commit -q --allow-empty -m 'missing manager upgrade fixture'
@@ -1991,10 +2109,15 @@ unset FAKE_RUNNER_STATE
 export FAKE_ALL_RUNNER_STATE=$tmp/drained-exited-managed-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 : >"$FAKE_DOCKER_PS_LOG"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
 expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_three" >/dev/null
-[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'non-active convergence did not remove stopped managed runners'
-grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'managed runner cleanup was not scoped to the selected instance'
+policy_runner_cleanup=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_three")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$policy_runner_cleanup" || fail 'drained policy drift did not use the policy apply path'
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'policy apply did not remove the stopped managed runner'
+grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'policy-path runner cleanup was not scoped to the selected instance'
+policy_runner_check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_three")
+grep -Fq 'CHECK_OK' <<<"$policy_runner_check" || fail "post-policy runner cleanup did not pass check: $policy_runner_check"
+if grep -Fq 'DRIFT managed_runners' <<<"$policy_runner_check"; then fail 'post-policy check retained managed-runner drift'; fi
 unset FAKE_ALL_RUNNER_STATE
 
 ref_four=$(write_config disabled 2 2)
