@@ -13,6 +13,7 @@
 #   CI_FLEET_CONTROLLER_RESUME_COMMAND path to a controller resume/start script
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
+#   CI_FLEET_POLICY_CHECKPOINT      original installer checkpoint for recovery
 #   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
 #   CI_FLEET_DRAIN_TIMEOUT_SECONDS  controller drain timeout in seconds (default 300)
 #   CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS adapter resume timeout in seconds (default 3600)
@@ -232,6 +233,7 @@ resume_command=${CI_FLEET_CONTROLLER_RESUME_COMMAND:-}
 probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 adapter_command=${CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER:-}
+controller_checkpoint=${CI_FLEET_POLICY_CHECKPOINT:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
 drain_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
 resume_timeout=${CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS:-3600}
@@ -302,6 +304,7 @@ if [[ "$removing" == true && ! -e "$checkpoint_dir" ]]; then
 fi
 if [[ -n "$adapter_command" ]]; then
   validate_command CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER "$adapter_command"
+  [[ -z "$controller_checkpoint" ]] || validate_trusted_path CI_FLEET_POLICY_CHECKPOINT "$controller_checkpoint" checkpoint
 else
   validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
   validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
@@ -678,10 +681,10 @@ PY
 persist_recovery() {
   local daemon_source=${1:-} env_source=${2:-$prior_env}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "$daemon_source" "$env_source" <<'PY'
+  python3 - "$state_file" "$daemon_source" "$env_source" "$controller_checkpoint" <<'PY'
 import os, shutil, sys, tempfile
 
-state_path, daemon_source, env_source = sys.argv[1:]
+state_path, daemon_source, env_source, controller_checkpoint = sys.argv[1:]
 parent = os.path.dirname(state_path)
 staged = tempfile.mkdtemp(prefix=".recovery.", dir=parent)
 try:
@@ -693,6 +696,13 @@ try:
         target = os.path.join(staged, name)
         with open(source, "rb") as source_handle, open(target, "xb") as target_handle:
             shutil.copyfileobj(source_handle, target_handle)
+            os.fchmod(target_handle.fileno(), 0o600)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+    if controller_checkpoint:
+        target = os.path.join(staged, "controller-checkpoint")
+        with open(target, "x", encoding="utf-8") as target_handle:
+            target_handle.write(controller_checkpoint + "\n")
             os.fchmod(target_handle.fileno(), 0o600)
             target_handle.flush()
             os.fsync(target_handle.fileno())
@@ -730,7 +740,7 @@ for entry in os.scandir(parent):
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise SystemExit(1)
     files = {child.name: child for child in os.scandir(entry.path)}
-    if not set(files) <= {"daemon.json.before", "prior-ci-fleet.env"}:
+    if not set(files) <= {"controller-checkpoint", "daemon.json.before", "prior-ci-fleet.env"}:
         raise SystemExit(1)
     for child in files.values():
         metadata = child.stat(follow_symlinks=False)
@@ -765,7 +775,7 @@ metadata = recovery.stat(follow_symlinks=False)
 if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
     raise SystemExit(1)
 entries = {entry.name: entry for entry in os.scandir(recovery.path)}
-if set(entries) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
+if not {"prior-ci-fleet.env"} <= set(entries) <= {"controller-checkpoint", "daemon.json.before", "prior-ci-fleet.env"}:
     raise SystemExit(1)
 for entry in entries.values():
     metadata = entry.stat(follow_symlinks=False)

@@ -964,6 +964,86 @@ PY
   fi
 }
 
+pending_policy_checkpoint() {
+  local expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  python3 - "$network_policy_checkpoint" "$checkpoints_dir" "$expected_owner" <<'PY'
+import json
+import os
+import stat
+import sys
+
+policy_dir, checkpoints_dir, expected_owner = sys.argv[1], sys.argv[2], int(sys.argv[3])
+marker_path = os.path.join(policy_dir, "docker-network-policy.json")
+if not os.path.lexists(marker_path):
+    raise SystemExit(1)
+try:
+    marker_meta = os.lstat(marker_path)
+    marker = json.load(open(marker_path, encoding="utf-8"))
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(2)
+if (
+    not stat.S_ISREG(marker_meta.st_mode)
+    or stat.S_ISLNK(marker_meta.st_mode)
+    or marker_meta.st_uid != expected_owner
+    or stat.S_IMODE(marker_meta.st_mode) != 0o600
+):
+    raise SystemExit(2)
+if marker.get("phase") not in {"first-apply-pending", "reapply-pending", "removal-pending"}:
+    raise SystemExit(1)
+try:
+    recoveries = [entry for entry in os.scandir(policy_dir) if entry.name.startswith("recovery.")]
+    if len(recoveries) != 1:
+        raise ValueError
+    recovery = recoveries[0]
+    recovery_meta = recovery.stat(follow_symlinks=False)
+    metadata_path = os.path.join(recovery.path, "controller-checkpoint")
+    metadata = os.lstat(metadata_path)
+    if (
+        not stat.S_ISDIR(recovery_meta.st_mode)
+        or recovery_meta.st_uid != expected_owner
+        or stat.S_IMODE(recovery_meta.st_mode) != 0o700
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != expected_owner
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size < 2
+        or metadata.st_size > 4096
+    ):
+        raise ValueError
+    raw_target = open(metadata_path, "rb").read()
+    if raw_target.count(b"\n") != 1 or not raw_target.endswith(b"\n") or b"\0" in raw_target:
+        raise ValueError
+    target = os.fsdecode(raw_target[:-1])
+    if (
+        not target.startswith("/")
+        or os.path.normpath(target) != target
+        or os.path.realpath(target) != target
+        or os.path.dirname(target) != checkpoints_dir
+    ):
+        raise ValueError
+    checkpoints_meta = os.lstat(checkpoints_dir)
+    target_meta = os.lstat(target)
+    complete_meta = os.lstat(os.path.join(target, ".complete"))
+    if (
+        not stat.S_ISDIR(checkpoints_meta.st_mode)
+        or checkpoints_meta.st_uid != expected_owner
+        or stat.S_IMODE(checkpoints_meta.st_mode) != 0o700
+        or not stat.S_ISDIR(target_meta.st_mode)
+        or target_meta.st_uid != expected_owner
+        or stat.S_IMODE(target_meta.st_mode) != 0o700
+        or not stat.S_ISREG(complete_meta.st_mode)
+        or complete_meta.st_uid != expected_owner
+        or stat.S_IMODE(complete_meta.st_mode) != 0o600
+        or complete_meta.st_size != 0
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(2)
+print(target)
+PY
+}
+
 make_checkpoint() {
   local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
   capture_current_pointer
@@ -1625,7 +1705,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1682,7 +1762,13 @@ perform_converge() {
       ;;
   esac
   if $build_before_drain; then build_candidate; require_commands; fi
-  make_checkpoint "$release_dir"
+  pending_checkpoint_status=0
+  pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
+  case "$pending_checkpoint_status" in
+    0) checkpoint_dir=$pending_checkpoint ;;
+    1) make_checkpoint "$release_dir" ;;
+    *) die 'pending network-policy controller checkpoint is invalid' ;;
+  esac
   transaction_active=true
   if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
     policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")
