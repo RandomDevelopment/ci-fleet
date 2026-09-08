@@ -1666,7 +1666,7 @@ perform_converge() {
     export CI_FLEET_DOCKER_DAEMON_CONFIG=$docker_daemon_config
     export CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER=$release_dir/scripts/docker-network-policy-adapter.sh
     export CI_FLEET_INSTALLER_LOCK=$lock_file
-    export CI_FLEET_POLICY_INSTALLER=$repo_root/scripts/install-worker-controller.sh
+    export CI_FLEET_POLICY_INSTALLER=$release_dir/scripts/install-worker-controller.sh
     export CI_FLEET_POLICY_RELEASE=$release_dir
     export CI_FLEET_POLICY_ENV=$policy_env
     export CI_FLEET_POLICY_METADATA=$policy_metadata
