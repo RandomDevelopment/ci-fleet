@@ -324,6 +324,9 @@ if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == unverified ]];
   printf 'ERROR: network-policy rollback verification failed\\n' >&2
   exit 2
 fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == success ]]; then
+  printf '{"schema_version":1,"outcome":"applied"}\\n' >&7
+fi
 exit 0
 """,
         )
@@ -341,8 +344,15 @@ except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
     observed = ""
 with open(os.environ["FAKE_HEALTH_OBSERVED_LKG"], "w", encoding="utf-8") as handle:
     handle.write(observed + "\\n")
+installer_calls = open(os.environ["FAKE_INSTALLER_LOG"], encoding="utf-8").read().splitlines()
+rollback = len(installer_calls) > 1
+status = os.environ["FAKE_ROLLBACK_HEALTH_STATUS"] if rollback else os.environ["FAKE_HEALTH_STATUS"]
+desired_state = os.environ["FAKE_ROLLBACK_HEALTH_DESIRED_STATE"] if rollback else os.environ["FAKE_HEALTH_DESIRED_STATE"]
 with open(output, "w", encoding="utf-8") as handle:
-    json.dump({"status": os.environ["FAKE_HEALTH_STATUS"]}, handle)
+    if status == "malformed":
+        handle.write("{")
+    else:
+        json.dump({"status": status, "desired_state": desired_state}, handle)
 """,
             encoding="utf-8",
         )
@@ -399,19 +409,20 @@ exec {shlex.quote(real_git or 'git')} "$@"
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
 
-    def _write_installed_ref(self, config_ref: str) -> None:
+    def _write_installed_ref(self, config_ref: str, desired_state: str = "active") -> None:
         self.state_file.write_text(json.dumps({
             "config_repository": "example-org/private-config",
             "config_ref": config_ref,
             "controller": "example-ci-01",
+            "controller_state": desired_state,
         }), encoding="utf-8")
         self.state_file.chmod(0o600)
 
-    def _reset(self, lkg_ref: str) -> None:
+    def _reset(self, lkg_ref: str, desired_state: str = "active") -> None:
         self.installer_log.unlink(missing_ok=True)
         self.health_observed_lkg.unlink(missing_ok=True)
         self.policy_marker.unlink(missing_ok=True)
-        self._write_installed_ref(self.prior_ref)
+        self._write_installed_ref(self.prior_ref, desired_state)
         self.lkg_dir.mkdir(mode=0o700, exist_ok=True)
         (self.lkg_dir / "metadata.json").write_text(json.dumps({
             "config_repository": "example-org/private-config",
@@ -419,10 +430,22 @@ exec {shlex.quote(real_git or 'git')} "$@"
             "controller": "example-ci-01",
         }), encoding="utf-8")
 
-    def _run(self, health: str, *, installer_result: str = "success", policy_state: str = "healthy"):
+    def _run(
+        self,
+        health: str,
+        *,
+        desired_state: str = "active",
+        rollback_health: str = "healthy",
+        rollback_desired_state: str | None = None,
+        installer_result: str = "success",
+        policy_state: str = "healthy",
+    ):
         env = dict(self.env)
         env.update(
             FAKE_HEALTH_STATUS=health,
+            FAKE_HEALTH_DESIRED_STATE=desired_state,
+            FAKE_ROLLBACK_HEALTH_STATUS=rollback_health,
+            FAKE_ROLLBACK_HEALTH_DESIRED_STATE=rollback_desired_state or desired_state,
             FAKE_INSTALLER_RESULT=installer_result,
             FAKE_POLICY_STATE=policy_state,
         )
@@ -440,6 +463,21 @@ exec {shlex.quote(real_git or 'git')} "$@"
     def _lkg_ref(self) -> str:
         return json.loads((self.lkg_dir / "metadata.json").read_text(encoding="utf-8"))["config_ref"]
 
+    def _reconcile_state(self) -> dict:
+        path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _assert_rolled_back(self, result: subprocess.CompletedProcess, health: str) -> None:
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--upgrade", "--upgrade"])
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "rolled_back")
+        self.assertEqual(state["desired_commit"], self.desired_ref)
+        self.assertEqual(state["applied_commit"], self.prior_ref)
+        self.assertEqual(state["health"], health)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertEqual((result.stdout + result.stderr).count("ROLLBACK_OK"), 1)
+
     def test_normal_reconcile_delegates_one_locked_transaction_to_installer(self):
         result = self._run("healthy")
 
@@ -451,24 +489,54 @@ exec {shlex.quote(real_git or 'git')} "$@"
         self.assertEqual(calls[0]["fd9"], str(self.lock_file))
         self.assertFalse(self.policy_marker.exists())
 
-    def test_candidate_lkg_is_saved_only_after_accepted_final_health(self):
-        for health in ("healthy", "warning"):
-            with self.subTest(health=health):
-                self._reset(self.prior_ref)
-                result = self._run(health)
+    def test_state_aware_final_health_acceptance_advances_candidate_lkg(self):
+        for desired_state, health in (
+            ("active", "healthy"),
+            ("active", "warning"),
+            ("drained", "maintenance"),
+            ("drained", "warning"),
+            ("disabled", "maintenance"),
+            ("disabled", "warning"),
+        ):
+            with self.subTest(desired_state=desired_state, health=health):
+                self._reset(self.prior_ref, desired_state)
+                result = self._run(health, desired_state=desired_state)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--upgrade"])
                 self.assertEqual(self.health_observed_lkg.read_text(encoding="utf-8").strip(), self.prior_ref)
                 self.assertEqual(self._lkg_ref(), self.desired_ref)
+                state = self._reconcile_state()
+                self.assertEqual(state["status"], "converged")
+                self.assertEqual(state["desired_commit"], self.desired_ref)
+                self.assertEqual(state["applied_commit"], self.desired_ref)
+                self.assertEqual(state["health"], health)
 
-    def test_unaccepted_or_unknown_health_preserves_prior_lkg_and_fails(self):
-        for health in ("unhealthy", "unknown"):
-            with self.subTest(health=health):
+    def test_final_health_rejection_persists_truthful_rollback_state(self):
+        for health, rollback_health in (("unhealthy", "warning"), ("unknown", "healthy")):
+            with self.subTest(health=health, rollback_health=rollback_health):
                 self._reset(self.prior_ref)
-                result = self._run(health)
+                result = self._run(health, rollback_health=rollback_health)
 
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self._lkg_ref(), self.prior_ref)
+                self._assert_rolled_back(result, rollback_health)
+
+    def test_state_aware_final_health_rejection_rolls_back(self):
+        for applied_state, health, reported_state in (
+            ("active", "maintenance", "active"),
+            ("drained", "healthy", "drained"),
+            ("disabled", "healthy", "disabled"),
+            ("active", "warning", "drained"),
+            ("active", "malformed", "active"),
+        ):
+            with self.subTest(applied_state=applied_state, health=health, reported_state=reported_state):
+                self._reset(self.prior_ref, applied_state)
+                result = self._run(
+                    health,
+                    desired_state=reported_state,
+                    rollback_desired_state=applied_state,
+                )
+
+                self._assert_rolled_back(result, "healthy")
 
     def test_unverified_installer_rollback_does_not_trigger_outer_lkg_apply(self):
         result = self._run("healthy", installer_result="unverified")
