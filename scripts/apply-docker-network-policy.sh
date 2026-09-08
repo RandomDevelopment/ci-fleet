@@ -14,6 +14,7 @@
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
 #   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
+#   CI_FLEET_DRAIN_TIMEOUT_SECONDS  controller drain timeout in seconds (default 300)
 #   CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS adapter resume timeout in seconds (default 3600)
 #   CI_FLEET_TESTING                when 1, relaxes root/strict checks
 set -Eeuo pipefail
@@ -232,6 +233,7 @@ probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 adapter_command=${CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
+drain_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
 resume_timeout=${CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS:-3600}
 
 validate_command() {
@@ -249,7 +251,13 @@ run_primitive() {
   shift
   if [[ -n "$adapter_command" ]]; then
     local status=0 timeout_seconds=$command_timeout
-    [[ "$action" != resume ]] || timeout_seconds=$resume_timeout
+    case "$action" in
+      drain|rollback-drain|restore)
+        timeout_seconds=$((2 * drain_timeout + 30))
+        ((timeout_seconds >= command_timeout)) || timeout_seconds=$command_timeout
+        ;;
+      resume) timeout_seconds=$resume_timeout ;;
+    esac
     timeout --kill-after=5 "$timeout_seconds" "$adapter_command" "$action" "$@" >/dev/null || status=$?
     return "$status"
   fi
@@ -279,6 +287,7 @@ run_health() {
 }
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
+[[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_DRAIN_TIMEOUT_SECONDS must be a positive integer'
 [[ "$resume_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
