@@ -324,8 +324,12 @@ if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == unverified ]];
   printf 'ERROR: network-policy rollback verification failed\\n' >&2
   exit 2
 fi
-if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == success ]]; then
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} =~ ^(success|cleanup_failure)$ ]]; then
   printf '{"schema_version":1,"outcome":"applied"}\\n' >&7
+fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == cleanup_failure ]]; then
+  printf 'ERROR: post-commit cleanup failed\\n' >&2
+  exit 1
 fi
 exit 0
 """,
@@ -544,6 +548,20 @@ exec {shlex.quote(real_git or 'git')} "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self._installer_calls()), 1)
         self.assertEqual(self._lkg_ref(), self.prior_ref)
+
+    def test_applied_cleanup_failure_records_failed_applied_state(self):
+        result = self._run("healthy", installer_result="cleanup_failure")
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(len(self._installer_calls()), 1)
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["desired_commit"], self.desired_ref)
+        self.assertEqual(state["applied_commit"], self.desired_ref)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertIn("post-commit cleanup failed", state["message"])
+        self.assertNotIn("ROLLBACK_UNVERIFIED", result.stdout + result.stderr)
+        self.assertNotIn("ROLLBACK_UNVERIFIED", json.dumps(state))
 
     def test_same_commit_policy_loss_or_corruption_is_drift_and_repaired(self):
         for policy_state in ("missing", "corrupt"):
