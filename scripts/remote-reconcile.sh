@@ -534,6 +534,10 @@ else
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
   outcome=$(transaction_outcome)
+  if [[ "$outcome" == applied ]]; then
+    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" 'unknown' "reconcile failed after apply: ${upg_err:-unknown}"
+    exit 3
+  fi
   if [[ "$upgrade_status" == 20 && "$outcome" == rollback_verified ]]; then
     health_status=$(run_health_check "$temp_dir/health.json")
     save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconcile failed; installer verified rollback to ${installed_config_ref}"
