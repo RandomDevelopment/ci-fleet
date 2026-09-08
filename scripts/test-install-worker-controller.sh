@@ -262,6 +262,11 @@ case "${1:-}" in
       logs) ;;
       *) exit 1 ;;
     esac
+    status=$?
+    if [[ "$env_file" == */.policy-candidate-env.* && -n "${FAKE_COMPOSE_LOG:-}" ]]; then
+      printf 'status|%s|%d\n' "$command" "$status" >>"$FAKE_COMPOSE_LOG"
+    fi
+    exit "$status"
     ;;
   *) exit 1 ;;
 esac
