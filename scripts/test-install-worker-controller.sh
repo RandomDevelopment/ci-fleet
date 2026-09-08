@@ -2105,7 +2105,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 expect_failure 'NETWORK_POLICY_ROLLBACK_FAILED stage=candidate_drain' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
-fail "diagnostic candidate rollback compose trace: $(<"$FAKE_COMPOSE_LOG")"
+[[ ! -e "$FAKE_COMPOSE_LOG" ]] || fail "diagnostic candidate rollback compose trace: $(<"$FAKE_COMPOSE_LOG")"
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
