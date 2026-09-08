@@ -553,16 +553,17 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
-    if python3 - "$path/engine-capabilities.json" <<'PY'
+    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh; do
+      policy_script=${required#*:}
+      if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(value.get("capabilities", {}).get("docker_network_policy_config") is not True)
+raise SystemExit(value.get("capabilities", {}).get(sys.argv[2]) is not True)
 PY
-    then
-      for policy_script in apply-docker-network-policy.sh docker-network-policy-adapter.sh; do
+      then
         [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" && -x "$path/scripts/$policy_script" ]] || return 1
-      done
-    fi
+      fi
+    done
   fi
   if grep -Fq 'scripts/health.py' "$path/scripts/healthcheck.sh"; then
     [[ -f "$path/scripts/health.py" ]] || return 1
@@ -653,7 +654,7 @@ from pathlib import Path
 
 environment, daemon_path, marker_path, scripts_path, expected_owner = sys.argv[1:]
 sys.path.insert(0, scripts_path)
-from desired_state import parse_env, render_docker_daemon_config
+from desired_state import parse_env, render_docker_daemon_config, validate_docker_address_pools
 
 values = parse_env(Path(environment), allow_unknown=True)
 managed = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" in values
@@ -678,11 +679,33 @@ try:
     daemon_bytes = Path(daemon_path).read_bytes()
     daemon = json.loads(daemon_bytes)
     desired = render_docker_daemon_config(values)
-    generation = marker.get("verified_generation")
+    required = {
+        "managed",
+        "prior_default_address_pools",
+        "prior_default_address_pools_present",
+        "prior_mode",
+        "prior_present",
+        "verified_generation",
+    }
+    if not isinstance(marker, dict) or set(marker) != required or marker["managed"] is not True:
+        raise ValueError
+    if not isinstance(marker["prior_present"], bool) or not isinstance(marker["prior_default_address_pools_present"], bool):
+        raise ValueError
+    if marker["prior_default_address_pools_present"]:
+        if not marker["prior_present"]:
+            raise ValueError
+        validate_docker_address_pools(marker["prior_default_address_pools"], path="checkpoint prior default address pools")
+    elif marker["prior_default_address_pools"] is not None:
+        raise ValueError
+    mode = marker["prior_mode"]
+    if marker["prior_present"]:
+        if not isinstance(mode, str) or not re.fullmatch(r"[0-7]{3,4}", mode):
+            raise ValueError
+    elif mode is not None:
+        raise ValueError
+    generation = marker["verified_generation"]
     if (
-        marker.get("managed") is not True
-        or marker.get("phase") is not None
-        or not isinstance(generation, str)
+        not isinstance(generation, str)
         or not re.fullmatch(r"[0-9a-f]{64}", generation)
         or not isinstance(daemon, dict)
         or daemon.get("default-address-pools") != desired.get("default-address-pools")
@@ -1136,6 +1159,7 @@ PY
 
 activate_candidate() {
   local check_health=${1:-true} staged_state
+  [[ "$target_state" == active ]] || remove_inactive_managed_runners
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
   install -m 0600 "$candidate_env" "$rendered_env"
   ln -sfn "$release_dir" "$temporary/current"
@@ -1650,7 +1674,6 @@ perform_converge() {
   controller_id=$desired_controller_id
   run_candidate_preflight
   if ! $build_before_drain; then build_candidate; fi
-  [[ "$target_state" == active ]] || remove_inactive_managed_runners
   activate_candidate
   transaction_active=false
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
@@ -1662,9 +1685,17 @@ latest_checkpoint() {
 }
 
 perform_rollback() {
+  local checkpoint_env
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
-  load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
+  if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    checkpoint_env=$checkpoint_dir/ci-fleet.env
+  else
+    checkpoint_env=$temporary/rollback-empty.env
+    install -m 0600 /dev/null "$checkpoint_env"
+  fi
+  candidate_env=$checkpoint_env
+  docker_network_policy_matches || die 'rollback requires Docker network-policy reconciliation through --upgrade'
   restore_checkpoint || die 'checkpoint restoration failed'
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
 }

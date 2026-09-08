@@ -2,6 +2,7 @@
   "schema_version": 1,
   "capabilities": {
     "docker_network_policy_config": true,
+    "docker_network_policy_adapter": true,
     "status_reporting_config": true,
     "required_status_reporting": true
   }
