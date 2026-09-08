@@ -2070,7 +2070,7 @@ unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
 export FAKE_DOCKER_STATE=$tmp/adopt-controller-running
-mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
+mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/etc/docker" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$adopt_root/etc/os-release"
 printf 'fixture CA bundle\n' >"$adopt_root/etc/ssl/certs/ca-certificates.crt"
 : >"$adopt_root/var/run/docker.sock"
