@@ -14,7 +14,7 @@
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
 #   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
-#   CI_FLEET_RESUME_TIMEOUT_SECONDS adapter resume timeout in seconds (default 3600)
+#   CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS adapter resume timeout in seconds (default 3600)
 #   CI_FLEET_TESTING                when 1, relaxes root/strict checks
 set -Eeuo pipefail
 
@@ -232,7 +232,7 @@ probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
 adapter_command=${CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
-resume_timeout=${CI_FLEET_RESUME_TIMEOUT_SECONDS:-3600}
+resume_timeout=${CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS:-3600}
 
 validate_command() {
   local name=$1 path=$2
@@ -279,7 +279,7 @@ run_health() {
 }
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
-[[ "$resume_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_RESUME_TIMEOUT_SECONDS must be a positive integer'
+[[ "$resume_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
 [[ ! -e "$daemon_config" || ! /proc/self/fd/9 -ef "$daemon_config" ]] || die 'installer lock and daemon paths must be separate'
