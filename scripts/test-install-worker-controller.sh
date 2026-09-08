@@ -1035,6 +1035,7 @@ for child in "${interrupted_descendants[@]}"; do
     fi
     [[ "$child_state" == Z ]] && break
     ((SECONDS < deadline)) || fail "interrupted hard stop left child $child running (state $child_state)"
+    sleep 0.05
   done
 done
 : >"$interrupted_pause.continue"
