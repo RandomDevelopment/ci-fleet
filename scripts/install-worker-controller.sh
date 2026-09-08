@@ -1691,7 +1691,8 @@ on_error() {
 on_term() { rollback_and_exit 143; }
 on_policy_term() {
   policy_wait_interrupted=true
-  kill -TERM "$policy_pid" 2>/dev/null || true
+  policy_term_pending=true
+  [[ -z ${policy_pid:-} ]] || kill -TERM "$policy_pid" 2>/dev/null || true
 }
 trap on_error ERR
 trap on_term TERM
@@ -1709,7 +1710,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid policy_wait_interrupted
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1795,6 +1796,7 @@ perform_converge() {
     export CI_FLEET_POLICY_PREBUILT=$build_before_drain
     export CI_FLEET_POLICY_MODE=$mode
     policy_status=0
+    trap on_policy_term TERM
     if transaction_result_enabled; then
       "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" &
     else
@@ -1803,7 +1805,7 @@ perform_converge() {
         7>/dev/null &
     fi
     policy_pid=$!
-    trap on_policy_term TERM
+    if $policy_term_pending; then kill -TERM "$policy_pid" 2>/dev/null || true; fi
     while :; do
       policy_wait_interrupted=false
       if wait "$policy_pid"; then policy_status=0; else policy_status=$?; fi
