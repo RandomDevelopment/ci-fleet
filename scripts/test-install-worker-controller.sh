@@ -1025,8 +1025,17 @@ kill -KILL -- "-$interrupted_pid" "${interrupted_descendants[@]}" 2>/dev/null ||
 set +e
 wait "$interrupted_pid"
 set -e
+deadline=$((SECONDS + 5))
 for child in "${interrupted_descendants[@]}"; do
-  [[ ! -e "/proc/$child" ]] || fail "interrupted hard stop left child $child running"
+  while [[ -e "/proc/$child" ]]; do
+    child_state=unknown
+    if IFS= read -r child_stat <"/proc/$child/stat" 2>/dev/null; then
+      child_state=${child_stat##*) }
+      child_state=${child_state%% *}
+    fi
+    [[ "$child_state" == Z ]] && break
+    ((SECONDS < deadline)) || fail "interrupted hard stop left child $child running (state $child_state)"
+  done
 done
 : >"$interrupted_pause.continue"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'hard stop did not occur after B controller state was written'
