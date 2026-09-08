@@ -1807,7 +1807,7 @@ perform_converge() {
     while :; do
       policy_wait_interrupted=false
       if wait "$policy_pid"; then policy_status=0; else policy_status=$?; fi
-      [[ "$policy_wait_interrupted" == true ]] || break
+      [[ "$policy_wait_interrupted" == true ]] && kill -0 "$policy_pid" 2>/dev/null || break
     done
     transaction_active=false
     trap on_term TERM
