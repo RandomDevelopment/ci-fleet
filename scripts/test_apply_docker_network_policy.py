@@ -70,7 +70,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
         value = config()
         policy = docker_network_policy()
         value["controllers"]["example-ci-01"]["docker_network_policy"] = policy
-        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"}
+        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"}
         rendered, _ = build_rendered_env(
             value,
             "example-ci-01",
@@ -124,7 +124,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"},
         )
         return rendered
 
@@ -138,7 +138,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"},
         )
         rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"] = "-1"
 
@@ -471,7 +471,7 @@ class ApplyScriptTests(unittest.TestCase):
     def _rendered_with_policy(self) -> dict[str, str]:
         value = config()
         value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
-        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"}
+        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"}
         rendered, _ = build_rendered_env(
             value,
             "example-ci-01",
