@@ -1200,6 +1200,7 @@ rm -rf "$fallback_checkpoint"
 [[ ${CI_FLEET_TEST_STOP_AFTER_FALLBACK_AUTHORITY:-0} != 1 ]] || { printf 'FALLBACK_AUTHORITY_REGRESSIONS_OK\n'; exit 0; }
 format_two_baseline=$tmp/format-two-no-target-baseline
 cp -a "$root" "$format_two_baseline"
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$without_policy_ref" >/dev/null
 format_two_no_target=$root/var/lib/ci-fleet/checkpoints/format-two-no-target
 cp -a "$pointer_checkpoint" "$format_two_no_target"
 printf '2\n' >"$format_two_no_target/format-version"
