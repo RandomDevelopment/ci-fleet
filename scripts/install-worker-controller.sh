@@ -1820,6 +1820,10 @@ perform_converge() {
       note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
       return
     fi
+    if ((policy_status == 20)); then
+      note "ROLLBACK_RESTORED checkpoint=$checkpoint_dir"
+      return 20
+    fi
     if docker_network_policy_matches; then
       write_transaction_result applied
       return "$policy_status"
