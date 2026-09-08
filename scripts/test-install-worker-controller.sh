@@ -734,6 +734,7 @@ FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
 pre_adapter_install=$(expect_success "$pre_adapter_checkout/scripts/install-worker-controller.sh" --upgrade "${base_args[@]}" --ref "$pre_adapter_config_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
+pre_adapter_upgrade_ref=$(write_config active 1 1 "$engine_ref")
 pre_adapter_runtime=$root/opt/ci-fleet/releases/$pre_adapter_ref
 pre_adapter_manager=$root/opt/ci-fleet/manager/releases/$pre_adapter_ref
 [[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'historical installer did not activate the pre-adapter runtime'
@@ -750,7 +751,7 @@ export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 pre_adapter_upgrade_output=$tmp/pre-adapter-upgrade.out
 set +e
-CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_upgrade_ref" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
 pre_adapter_upgrade_status=$?
 set -e
 unset FAKE_RESTART_AFTER_UP
@@ -759,7 +760,7 @@ unset FAKE_RESTART_AFTER_UP
 [[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
 [[ $(readlink "$root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
 cmp -s "$pre_adapter_rendered" "$root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_upgrade_ref" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 unset FAKE_TRANSACTION_LOG
 
