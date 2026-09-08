@@ -675,7 +675,7 @@ docker_network_policy_matches() {
     return 0
   fi
   docker_daemon_config_trusted || return 1
-  python3 - "$candidate_env" "$docker_daemon_config" "$network_policy_checkpoint/docker-network-policy.json" "$repo_root/scripts" "$expected_owner" <<'PY'
+  python3 - "$candidate_env" "$docker_daemon_config" "$network_policy_checkpoint/docker-network-policy.json" "$repo_root/scripts" "$expected_owner" "$network_policy_checkpoint" "$root_prefix" <<'PY'
 import hashlib
 import json
 import os
@@ -684,7 +684,7 @@ import stat
 import sys
 from pathlib import Path
 
-environment, daemon_path, marker_path, scripts_path, expected_owner = sys.argv[1:]
+environment, daemon_path, marker_path, scripts_path, expected_owner, checkpoint_dir, root_prefix = sys.argv[1:]
 sys.path.insert(0, scripts_path)
 from desired_state import parse_env, render_docker_daemon_config, validate_docker_address_pools
 
@@ -696,6 +696,33 @@ if not managed:
 if not marker_exists or not os.path.exists(daemon_path):
     raise SystemExit(1)
 try:
+    anchor = os.path.realpath(root_prefix) if root_prefix else "/"
+    if (
+        not checkpoint_dir.startswith("/")
+        or os.path.normpath(checkpoint_dir) != checkpoint_dir
+        or os.path.realpath(checkpoint_dir) != checkpoint_dir
+        or os.path.commonpath((anchor, checkpoint_dir)) != anchor
+    ):
+        raise ValueError
+    checkpoint_meta = os.lstat(checkpoint_dir)
+    if (
+        not stat.S_ISDIR(checkpoint_meta.st_mode)
+        or checkpoint_meta.st_uid != int(expected_owner)
+        or stat.S_IMODE(checkpoint_meta.st_mode) != 0o700
+    ):
+        raise ValueError
+    current = os.path.dirname(checkpoint_dir)
+    while True:
+        ancestor_meta = os.lstat(current)
+        if (
+            not stat.S_ISDIR(ancestor_meta.st_mode)
+            or ancestor_meta.st_uid != int(expected_owner)
+            or ancestor_meta.st_mode & 0o022
+        ):
+            raise ValueError
+        if current == anchor:
+            break
+        current = os.path.dirname(current)
     marker_meta = os.lstat(marker_path)
     daemon_meta = os.lstat(daemon_path)
     if (
