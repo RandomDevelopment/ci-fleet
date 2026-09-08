@@ -2249,6 +2249,80 @@ class ApplyScriptTests(unittest.TestCase):
             self.assertTrue(any(line.startswith(f"--kill-after=5 300 {path}") for line in lines), path)
         self.assertEqual(sorted(hook_log.read_text(encoding="utf-8").splitlines()), sorted(path.name for path in hooks.values()))
 
+    def test_adapter_resume_uses_reconciliation_timeout_budget(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        timeout_log = Path(self.tmp) / "adapter-timeouts.log"
+        adapter_log = Path(self.tmp) / "adapter-actions.log"
+        failed_health = Path(self.tmp) / "failed-health"
+        fake_bin = Path(self.tmp) / "adapter-bin"
+        fake_bin.mkdir()
+        fake_timeout = fake_bin / "timeout"
+        fake_timeout.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s %s\\n' \"$2\" \"$4\" >> {timeout_log}\n"
+            f"exec {shutil.which('timeout')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_timeout.chmod(0o755)
+        adapter = Path(self.tmp) / "policy-adapter.sh"
+        adapter.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$1\" >> {adapter_log}\n"
+            'if [[ $1 == resume && ${SLOW_RESUME:-0} == 1 ]]; then sleep 2; fi\n'
+            f"if [[ $1 == health && ${{FAIL_HEALTH_ONCE:-0}} == 1 && ! -e {failed_health} ]]; then touch {failed_health}; exit 2; fi\n",
+            encoding="utf-8",
+        )
+        adapter.chmod(0o755)
+        command = [
+            str(SCRIPTS / "apply-docker-network-policy.sh"),
+            "--checkpoint",
+            str(Path(self.tmp) / "checkpoint-adapter-timeout"),
+            "--env",
+            str(env_file),
+        ]
+        run_env = self._env(
+            CI_FLEET_COMMAND_TIMEOUT_SECONDS="1",
+            CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS="3",
+            CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER=str(adapter),
+            PATH=f"{fake_bin}:{os.environ['PATH']}",
+        )
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env={**run_env, "SLOW_RESUME": "1", "FAIL_HEALTH_ONCE": "0"},
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self._write_daemon("{}\n")
+        command[2] = str(Path(self.tmp) / "checkpoint-adapter-rollback-timeout")
+        rollback = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env={**run_env, "SLOW_RESUME": "0", "FAIL_HEALTH_ONCE": "1"},
+            timeout=15,
+        )
+
+        self.assertNotEqual(rollback.returncode, 0)
+        actions = adapter_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            actions,
+            [
+                "drain", "restart", "probe", "resume", "health",
+                "drain", "restart", "probe", "resume", "health",
+                "rollback-drain", "restart", "restore", "health",
+            ],
+        )
+        self.assertEqual(
+            timeout_log.read_text(encoding="utf-8").splitlines(),
+            [f"{'3' if action == 'resume' else '1'} {action}" for action in actions],
+        )
+
     def test_health_accepts_only_success_and_warning_results(self) -> None:
         env_file = self._write_env_file(self._rendered_with_policy())
         cases = {
