@@ -640,9 +640,41 @@ systemd_matches() {
   done
 }
 
+docker_daemon_config_trusted() {
+  local expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  python3 - "$docker_daemon_config" "$expected_owner" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, expected_owner = sys.argv[1:]
+if not os.path.lexists(path):
+    raise SystemExit(0)
+try:
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != int(expected_owner)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not isinstance(json.load(open(path, encoding="utf-8")), dict)
+    ):
+        raise ValueError
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
 docker_network_policy_matches() {
   local expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if [[ ! -e "$network_policy_checkpoint/docker-network-policy.json" && ! -L "$network_policy_checkpoint/docker-network-policy.json" ]] \
+    && ! grep -q '^CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=' "$candidate_env"; then
+    return 0
+  fi
+  docker_daemon_config_trusted || return 1
   python3 - "$candidate_env" "$docker_daemon_config" "$network_policy_checkpoint/docker-network-policy.json" "$repo_root/scripts" "$expected_owner" <<'PY'
 import hashlib
 import json
@@ -791,7 +823,7 @@ install_release() {
   staged_release=$(mktemp -d "$releases_dir/.${engine_ref}.staging.XXXXXX")
   staging_paths+=("$staged_release")
   chmod 0755 "$staged_release"
-  tar -xf "$archive" -C "$staged_release"
+  (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_release")
   printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
@@ -1570,6 +1602,9 @@ perform_converge() {
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
+  fi
+  if ! docker_network_policy_matches && ! docker_daemon_config_trusted; then
+    die 'failed to stage Docker network policy'
   fi
   if [[ "$mode" == upgrade && ( -e "$manager_current" || -L "$manager_current" ) ]]; then
     CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
