@@ -417,6 +417,9 @@ expect_failure() {
   local expected=$1 output
   shift
   if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+  if [[ ${CI_FLEET_TEST_PRINT_EXPECTED_FAILURE:-0} == 1 ]]; then
+    printf '%s\n' 'CI_FLEET_EXPECTED_FAILURE_OUTPUT_BEGIN' "$output" 'CI_FLEET_EXPECTED_FAILURE_OUTPUT_END' >&2
+  fi
   grep -Fq -- "$expected" <<<"$output" || fail "missing failure [$expected]: $output"
 }
 expect_command_failure() {
@@ -2122,7 +2125,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
-expect_failure 'NETWORK_POLICY_ROLLBACK_FAILED stage=candidate_drain' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+CI_FLEET_TEST_PRINT_EXPECTED_FAILURE=1 expect_failure 'NETWORK_POLICY_ROLLBACK_FAILED stage=candidate_drain' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
 [[ ! -e "$FAKE_COMPOSE_LOG" ]] || fail "diagnostic candidate rollback compose trace: $(<"$FAKE_COMPOSE_LOG")"
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 unset FAKE_RESTART_AFTER_UP
