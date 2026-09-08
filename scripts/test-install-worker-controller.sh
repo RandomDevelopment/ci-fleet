@@ -1020,10 +1020,14 @@ wait_for_file "$interrupted_pause.entered" 'interrupted recovery regression did 
 interrupted_recovery=$(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*')
 [[ -n "$interrupted_recovery" && $(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*' | wc -l) == 1 ]] || fail 'interrupted policy apply did not retain one authoritative recovery'
 interrupted_recovery_inode=$(stat -c %i "$interrupted_recovery")
-kill -KILL -- "-$interrupted_pid"
+mapfile -t interrupted_descendants < <(descendant_pids "$interrupted_pid")
+kill -KILL -- "-$interrupted_pid" "${interrupted_descendants[@]}" 2>/dev/null || true
 set +e
 wait "$interrupted_pid"
 set -e
+for child in "${interrupted_descendants[@]}"; do
+  [[ ! -e "/proc/$child" ]] || fail "interrupted hard stop left child $child running"
+done
 : >"$interrupted_pause.continue"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'hard stop did not occur after B controller state was written'
 
