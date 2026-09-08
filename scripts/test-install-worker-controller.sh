@@ -20,6 +20,8 @@ export REAL_DF
 REAL_DF=$(command -v df)
 export REAL_MV
 REAL_MV=$(command -v mv)
+export REAL_TIMEOUT
+REAL_TIMEOUT=$(command -v timeout)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -361,6 +363,17 @@ if [[ -n ${used:-} ]]; then
 fi
 EOF
 chmod 700 "$fake_bin/df"
+
+cat >"$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+"$REAL_TIMEOUT" "$@"
+status=$?
+if [[ -n "${FAKE_COMPOSE_LOG:-}" && "$*" == *docker-network-policy-adapter.sh* && "$*" == *rollback-drain* ]]; then
+  printf 'timeout-status|%d\n' "$status" >>"$FAKE_COMPOSE_LOG"
+fi
+exit "$status"
+EOF
+chmod 700 "$fake_bin/timeout"
 
 export PATH="$fake_bin:$PATH"
 
