@@ -1441,11 +1441,17 @@ PY
   new_marker=true
 fi
 
+rollback_drain_status=not_run
 rollback_daemon() {
   local failed=0
   rollback_stage=
   if [[ "$controller_resumed" == true ]]; then
-    if ! run_primitive rollback-drain; then
+    if run_primitive rollback-drain; then
+      rollback_drain_status=$?
+    else
+      rollback_drain_status=$?
+    fi
+    if ((rollback_drain_status != 0)); then
       rollback_stage=candidate_drain
       failed=1
     fi
@@ -1506,7 +1512,7 @@ rollback_on_exit() {
     write_transaction_result rollback_verified
     if transaction_result_enabled; then result=20; fi
   else
-    [[ -z "$rollback_stage" ]] || printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s\n' "$rollback_stage" >&2
+    [[ -z "$rollback_stage" ]] || printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s rollback_drain_status=%s\n' "$rollback_stage" "$rollback_drain_status" >&2
     if [[ -n "$transaction_recovery" ]]; then
       recovery_path=$transaction_recovery
     else
