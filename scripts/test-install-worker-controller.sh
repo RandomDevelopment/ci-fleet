@@ -620,12 +620,13 @@ missing_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" 
 grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$missing_policy_repair" || fail 'same-commit missing Docker policy was not repaired by the apply engine'
 assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
 
-printf '{corrupt\n' >"$daemon_config"
+printf '{"unrelated-setting":"preserve","default-address-pools":[{"base":"10.64.0.0/24","size":27}]}\n' >"$daemon_config"
 expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 : >"$FAKE_TRANSACTION_LOG"
 corrupt_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$corrupt_policy_repair" || fail 'same-commit corrupt Docker policy was not repaired by the apply engine'
 assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+python3 -c 'import json, sys; assert json.load(open(sys.argv[1], encoding="utf-8"))["unrelated-setting"] == "preserve"' "$daemon_config" || fail 'Docker policy repair did not preserve unrelated daemon config'
 
 without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
 : >"$FAKE_TRANSACTION_LOG"
