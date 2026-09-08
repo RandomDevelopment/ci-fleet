@@ -1445,29 +1445,41 @@ rollback_daemon() {
   local failed=0
   rollback_stage=
   if [[ "$controller_resumed" == true ]]; then
-    rollback_stage=candidate_drain
-    run_primitive rollback-drain || failed=1
+    if ! run_primitive rollback-drain; then
+      rollback_stage=candidate_drain
+      failed=1
+    fi
   fi
   if ((failed == 0)); then
-    rollback_stage=daemon_restore
-    restore_daemon || failed=1
+    if ! restore_daemon; then
+      rollback_stage=daemon_restore
+      failed=1
+    fi
   fi
   if ((failed == 0)); then
-    rollback_stage=docker_restart
-    run_primitive restart "$daemon_dir" || failed=1
+    if ! run_primitive restart "$daemon_dir"; then
+      rollback_stage=docker_restart
+      failed=1
+    fi
   fi
   if ((failed == 0)); then
-    rollback_stage=controller_resume
-    run_primitive restore --env "$prior_env" || failed=1
+    if ! run_primitive restore --env "$prior_env"; then
+      rollback_stage=controller_resume
+      failed=1
+    fi
   fi
   if ((failed == 0)); then
-    run_health "$prior_env" || failed=1
+    if ! run_health "$prior_env"; then
+      rollback_stage=controller_resume
+      failed=1
+    fi
   fi
   if ((failed == 0)); then
-    rollback_stage=daemon_pool_verify
-    daemon_pools_match "$rollback_source" || failed=1
+    if ! daemon_pools_match "$rollback_source"; then
+      rollback_stage=daemon_pool_verify
+      failed=1
+    fi
   fi
-  ((failed != 0)) || rollback_stage=
   if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
     restored_generation=$(file_generation "$daemon_config") || failed=1
     ((failed != 0)) || set_verified_generation "$restored_generation" || failed=1
