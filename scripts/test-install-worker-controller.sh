@@ -801,26 +801,57 @@ pre_adapter_checkout=$tmp/pre-adapter-checkout
 git clone -q --no-checkout "$repo_root" "$pre_adapter_checkout"
 git -C "$pre_adapter_checkout" checkout -q --detach "$pre_adapter_ref"
 [[ $(git -C "$pre_adapter_checkout" rev-parse HEAD) == "$pre_adapter_ref" ]] || fail 'pre-adapter checkout did not resolve to the exact historical engine'
+pre_adapter_root=$tmp/pre-adapter-host
+pre_adapter_pem=$pre_adapter_root/etc/ci-fleet/secrets/github-app.pem
+pre_adapter_host_config=$pre_adapter_root/etc/ci-fleet/host.env
+pre_adapter_args=(--config-repo "$config_repo" --controller example-ci-01 --host-config "$pre_adapter_host_config")
+pre_adapter_env=(
+  env
+  CI_FLEET_ROOT_PREFIX="$pre_adapter_root"
+  CI_FLEET_DOCKER_ROOT="$pre_adapter_root/var/lib/docker"
+  FAKE_DOCKER_STATE="$tmp/pre-adapter-controller-running"
+  FAKE_CONTROLLER_STATUS_FILE="$tmp/pre-adapter-controller-status"
+  FAKE_PAUSED_STATE="$tmp/pre-adapter-controller-paused"
+  FAKE_CONTROLLER_PROVENANCE_FILE="$tmp/pre-adapter-controller-provenance"
+  FAKE_CONTROLLER_IMAGE_ID_FILE="$tmp/pre-adapter-controller-image-id"
+  FAKE_CONTROLLER_ENV_FILE="$tmp/pre-adapter-controller-env"
+  FAKE_RUNNER_IMAGE_STATE="$tmp/pre-adapter-runner-image-present"
+  FAKE_CONTROLLER_IMAGE_STATE="$tmp/pre-adapter-controller-image-present"
+  FAKE_RUNNER_IMAGE_ID_STATE="$tmp/pre-adapter-runner-image-id"
+  FAKE_CONTROLLER_IMAGE_ID_STATE="$tmp/pre-adapter-controller-image-id-state"
+  FAKE_AVAILABLE_IMAGE_IDS="$tmp/pre-adapter-available-image-ids"
+)
+mkdir -p "$pre_adapter_root/etc/ci-fleet/secrets" "$pre_adapter_root/etc/ssl/certs" "$pre_adapter_root/etc/docker" "$pre_adapter_root/var/run" "$pre_adapter_root/var/lib/docker"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$pre_adapter_root/etc/os-release"
+printf 'fixture CA bundle\n' >"$pre_adapter_root/etc/ssl/certs/ca-certificates.crt"
+: >"$pre_adapter_root/var/run/docker.sock"
+printf 'fixture only\n' >"$pre_adapter_pem"
+chmod 600 "$pre_adapter_pem"
+printf '%s\n' \
+  'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
+  'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
+  "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$pre_adapter_pem" \
+  'CI_FLEET_RUNNER_TTL=6h' >"$pre_adapter_host_config"
+chmod 600 "$pre_adapter_host_config"
 head_runner_image=$FAKE_RUNNER_IMAGE
 head_controller_image=$FAKE_CONTROLLER_IMAGE
 pre_adapter_runner_image=ci-fleet-runner:${pre_adapter_ref:0:12}
 pre_adapter_controller_image=ci-fleet-controller:${pre_adapter_ref:0:12}
 pre_adapter_config_ref=$(write_config active 1 1 "$pre_adapter_ref" omit omit)
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$without_policy_ref" >/dev/null
 FAKE_ENGINE_REF=$pre_adapter_ref
 FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
-pre_adapter_install=$(expect_success "$pre_adapter_checkout/scripts/install-worker-controller.sh" --upgrade "${base_args[@]}" --ref "$pre_adapter_config_ref")
-grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
-pre_adapter_runtime=$root/opt/ci-fleet/releases/$pre_adapter_ref
-pre_adapter_manager=$root/opt/ci-fleet/manager/releases/$pre_adapter_ref
-pre_adapter_current=$(readlink "$root/opt/ci-fleet/current")
-pre_adapter_manager_current=$(readlink "$root/opt/ci-fleet/manager/current")
+pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$pre_adapter_checkout/scripts/install-worker-controller.sh" --install "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref")
+grep -Fq 'CONVERGED mode=install' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
+pre_adapter_runtime=$pre_adapter_root/opt/ci-fleet/releases/$pre_adapter_ref
+pre_adapter_manager=$pre_adapter_root/opt/ci-fleet/manager/releases/$pre_adapter_ref
+pre_adapter_current=$(readlink "$pre_adapter_root/opt/ci-fleet/current")
+pre_adapter_manager_current=$(readlink "$pre_adapter_root/opt/ci-fleet/manager/current")
 [[ "$pre_adapter_current" == "$pre_adapter_runtime" ]] || fail 'historical installer did not activate the pre-adapter runtime'
 [[ "$pre_adapter_manager_current" == "$pre_adapter_manager" ]] || fail 'historical installer did not activate the pre-adapter manager'
 [[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'historical installer added the adapter to a pre-adapter tree'
 pre_adapter_rendered=$tmp/pre-adapter-rendered.env
-cp "$root/etc/ci-fleet/ci-fleet.env" "$pre_adapter_rendered"
+cp "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" "$pre_adapter_rendered"
 FAKE_ENGINE_REF=$engine_ref
 FAKE_RUNNER_IMAGE=$head_runner_image
 FAKE_CONTROLLER_IMAGE=$head_controller_image
@@ -831,19 +862,19 @@ export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 pre_adapter_upgrade_output=$tmp/pre-adapter-upgrade.out
 set +e
-CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_upgrade_ref" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
+CI_FLEET_TRANSACTION_RESULT_FD=7 "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
 pre_adapter_upgrade_status=$?
 set -e
 unset FAKE_RESTART_AFTER_UP
 [[ "$pre_adapter_upgrade_status" == 20 ]] || fail "pre-adapter upgrade rollback returned $pre_adapter_upgrade_status instead of 20: $(<"$pre_adapter_upgrade_output")"
 [[ $(grep -Fc 'ROLLBACK_RESTORED' "$pre_adapter_upgrade_output" || true) == 1 ]] || fail "pre-adapter upgrade did not emit exactly one restored marker: $(<"$pre_adapter_upgrade_output")"
-[[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
-[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$pre_adapter_manager_current" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
-cmp -s "$pre_adapter_rendered" "$root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
-pre_adapter_converged=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_upgrade_ref")
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager_current" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
+cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
+pre_adapter_converged=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_converged" || fail 'post-rollback upgrade did not converge to the current engine'
-[[ $(readlink "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
-[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current manager'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current manager'
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 
 FAKE_ENGINE_REF=$pre_adapter_ref
@@ -857,11 +888,11 @@ pre_adapter_output=$tmp/pre-adapter-policy.out
 export FAKE_COMPOSE_LOG=$tmp/pre-adapter-policy-compose.log
 : >"$FAKE_COMPOSE_LOG"
 : >"$FAKE_TRANSACTION_LOG"
-cp -a "$root" "$pre_adapter_snapshot"
-if "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_policy_ref" >"$pre_adapter_output" 2>&1; then
+cp -a "$pre_adapter_root" "$pre_adapter_snapshot"
+if "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_policy_ref" >"$pre_adapter_output" 2>&1; then
   fail 'adapterless engine accepted a retained managed Docker policy'
 fi
-diff --no-dereference -r "$pre_adapter_snapshot" "$root" >/dev/null || fail 'adapterless retained-policy rejection changed installed state'
+diff --no-dereference -r "$pre_adapter_snapshot" "$pre_adapter_root" >/dev/null || fail 'adapterless retained-policy rejection changed installed state'
 if grep -Eq '^(build|up|stop|pause|unpause|kill|down|rm|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then
   fail 'adapterless retained-policy rejection invoked Compose or mutated Docker state'
 fi
@@ -872,11 +903,12 @@ rm -rf "$pre_adapter_snapshot"
 
 pre_adapter_without_policy_ref=$(write_config active 1 1 "$pre_adapter_ref" false omit)
 : >"$FAKE_COMPOSE_LOG"
-pre_adapter_install=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$pre_adapter_without_policy_ref")
+pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_without_policy_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'adapterless engine with omitted policy did not converge'
-[[ $(readlink "$root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'adapterless no-policy upgrade did not activate its runtime'
-[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'adapterless no-policy upgrade did not activate its manager'
-[[ ! -e "$policy_marker" && ! -L "$policy_marker" ]] || fail 'adapterless no-policy upgrade retained the managed policy marker'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'adapterless no-policy upgrade did not activate its runtime'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'adapterless no-policy upgrade did not activate its manager'
+pre_adapter_policy_marker=$pre_adapter_root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+[[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'adapterless no-policy upgrade retained the managed policy marker'
 [[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'installed pre-adapter release gained an adapter'
 
 FAKE_ENGINE_REF=$engine_ref
@@ -885,7 +917,7 @@ FAKE_CONTROLLER_IMAGE=$head_controller_image
 FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
 ref_one=$(write_config active 1 1)
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 
 drift_policy() {
