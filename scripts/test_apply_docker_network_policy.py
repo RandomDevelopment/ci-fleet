@@ -2283,6 +2283,7 @@ class ApplyScriptTests(unittest.TestCase):
         ]
         run_env = self._env(
             CI_FLEET_COMMAND_TIMEOUT_SECONDS="1",
+            CI_FLEET_DRAIN_TIMEOUT_SECONDS="1",
             CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS="3",
             CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER=str(adapter),
             PATH=f"{fake_bin}:{os.environ['PATH']}",
@@ -2320,7 +2321,10 @@ class ApplyScriptTests(unittest.TestCase):
         )
         self.assertEqual(
             timeout_log.read_text(encoding="utf-8").splitlines(),
-            [f"{'3' if action == 'resume' else '1'} {action}" for action in actions],
+            [
+                f"{32 if action in {'drain', 'rollback-drain', 'restore'} else 3 if action == 'resume' else 1} {action}"
+                for action in actions
+            ],
         )
 
     def test_health_accepts_only_success_and_warning_results(self) -> None:
