@@ -1481,7 +1481,8 @@ perform_policy_action() {
       drain_current false "$rendered_env" "$release_dir"
       ;;
     rollback-drain)
-      drain_current true "$candidate_env" "$release_dir"
+      if [[ -f "$state_file" || -f "$rendered_env" ]]; then load_installed_controller_identity; fi
+      drain_current true "$rendered_env" "$release_dir"
       ;;
     resume)
       run_candidate_preflight

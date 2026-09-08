@@ -246,8 +246,9 @@ run_primitive() {
   local action=$1
   shift
   if [[ -n "$adapter_command" ]]; then
-    timeout --kill-after=5 "$command_timeout" "$adapter_command" "$action" "$@" >/dev/null
-    return
+    local status=0
+    timeout --kill-after=5 "$command_timeout" "$adapter_command" "$action" "$@" >/dev/null || status=$?
+    return "$status"
   fi
   case "$action" in
     drain|rollback-drain) run_command "$drain_command" "$@" ;;
@@ -1441,50 +1442,25 @@ PY
   new_marker=true
 fi
 
-rollback_drain_status=not_run
 rollback_daemon() {
   local failed=0
-  rollback_stage=
   if [[ "$controller_resumed" == true ]]; then
-    if run_primitive rollback-drain; then
-      rollback_drain_status=$?
-    else
-      rollback_drain_status=$?
-    fi
-    if ((rollback_drain_status != 0)); then
-      rollback_stage=candidate_drain
-      failed=1
-    fi
+    run_primitive rollback-drain || failed=1
   fi
   if ((failed == 0)); then
-    if ! restore_daemon; then
-      rollback_stage=daemon_restore
-      failed=1
-    fi
+    restore_daemon || failed=1
   fi
   if ((failed == 0)); then
-    if ! run_primitive restart "$daemon_dir"; then
-      rollback_stage=docker_restart
-      failed=1
-    fi
+    run_primitive restart "$daemon_dir" || failed=1
   fi
   if ((failed == 0)); then
-    if ! run_primitive restore --env "$prior_env"; then
-      rollback_stage=controller_resume
-      failed=1
-    fi
+    run_primitive restore --env "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
-    if ! run_health "$prior_env"; then
-      rollback_stage=controller_resume
-      failed=1
-    fi
+    run_health "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
-    if ! daemon_pools_match "$rollback_source"; then
-      rollback_stage=daemon_pool_verify
-      failed=1
-    fi
+    daemon_pools_match "$rollback_source" || failed=1
   fi
   if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
     restored_generation=$(file_generation "$daemon_config") || failed=1
@@ -1512,7 +1488,6 @@ rollback_on_exit() {
     write_transaction_result rollback_verified
     if transaction_result_enabled; then result=20; fi
   else
-    [[ -z "$rollback_stage" ]] || printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s rollback_drain_status=%s\n' "$rollback_stage" "$rollback_drain_status" >&2
     if [[ -n "$transaction_recovery" ]]; then
       recovery_path=$transaction_recovery
     else
