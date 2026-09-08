@@ -24,6 +24,7 @@ REAL_MV=$(command -v mv)
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
+[[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'docker %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
@@ -268,6 +269,7 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+[[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
@@ -554,6 +556,66 @@ grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not con
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+
+daemon_config=$root/etc/docker/daemon.json
+python3 - "$daemon_config" <<'PY' || fail 'fresh install did not apply the advertised Docker network policy'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["default-address-pools"] == [{"base": "10.64.0.0/24", "size": 28}]
+PY
+
+assert_single_policy_transaction() {
+  local log=$1
+  [[ $(grep -Ec '^systemctl restart docker(\.service)?$' "$log") == 1 ]] || fail 'installer did not own exactly one Docker policy restart'
+  [[ $(grep -Ec '^docker compose .* pause controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller drain'
+  [[ $(grep -Ec '^docker compose .* stop .* controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller stop'
+  [[ $(grep -Ec '^docker compose .* up .* controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller resume'
+  [[ $(grep -Ec '^docker network create ' "$log") == 1 ]] || fail 'installer did not run exactly one bounded network probe'
+  [[ $(grep -Ec '^docker network rm ' "$log") == 1 ]] || fail 'installer did not clean up exactly one bounded network probe'
+}
+
+export FAKE_TRANSACTION_LOG=$tmp/docker-policy-transaction.log
+rm -f "$daemon_config"
+expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+: >"$FAKE_TRANSACTION_LOG"
+missing_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$missing_policy_repair" || fail 'same-commit missing Docker policy was not repaired by the apply engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+
+printf '{corrupt\n' >"$daemon_config"
+expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+: >"$FAKE_TRANSACTION_LOG"
+corrupt_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$corrupt_policy_repair" || fail 'same-commit corrupt Docker policy was not repaired by the apply engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+
+without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
+: >"$FAKE_TRANSACTION_LOG"
+policy_removal=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$without_policy_ref")
+grep -Fq 'NETWORK_POLICY_REMOVED' <<<"$policy_removal" || fail 'omitted managed Docker policy did not enter transactional removal'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+python3 - "$daemon_config" <<'PY' || fail 'transactional policy removal retained the managed key'
+import json
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+except FileNotFoundError:
+    value = {}
+assert "default-address-pools" not in value
+PY
+: >"$FAKE_TRANSACTION_LOG"
+no_policy=$(expect_success "$installer" --install "${base_args[@]}" --ref "$without_policy_ref")
+grep -Fq 'NO_CHANGE' <<<"$no_policy" || fail 'no-policy host without a managed marker was not a no-op'
+if grep -Eq '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up) .*controller|network (create|rm) )' "$FAKE_TRANSACTION_LOG"; then
+  fail 'no-policy host without a managed marker entered a policy transaction'
+fi
+ref_one=$(write_config active 1 1)
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_TRANSACTION_LOG
+
 git -C "$config_repo" commit -q --allow-empty -m 'missing manager upgrade fixture'
 missing_manager_ref=$(git -C "$config_repo" rev-parse HEAD)
 rm -f "$root/opt/ci-fleet/manager/current"
@@ -1282,6 +1344,26 @@ printf '{"schema_version":1,"capabilities":null}\n' >"$active_release/engine-cap
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" >/dev/null || fail 'engine capability declaration was not repaired'
+python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" --require-docker-network-policy-config >/dev/null || fail 'active release does not advertise Docker network policy support'
+for required_policy_script in apply-docker-network-policy.sh docker-network-policy-adapter.sh; do
+  required_policy_path=$active_release/scripts/$required_policy_script
+  rm -f "$required_policy_path"
+  expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+  [[ -f "$required_policy_path" && ! -L "$required_policy_path" && -x "$required_policy_path" ]] || fail "advertised policy capability did not restore trusted executable $required_policy_script"
+done
+chmod 0644 "$active_release/scripts/docker-network-policy-adapter.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$active_release/scripts/docker-network-policy-adapter.sh" && ! -L "$active_release/scripts/docker-network-policy-adapter.sh" && -x "$active_release/scripts/docker-network-policy-adapter.sh" ]] || fail 'non-executable production policy adapter was not repaired as a trusted path'
+external_policy_adapter=$tmp/external-policy-adapter.sh
+printf '#!/usr/bin/env bash\nexit 0\n' >"$external_policy_adapter"
+chmod 0755 "$external_policy_adapter"
+rm -f "$active_release/scripts/docker-network-policy-adapter.sh"
+ln -s "$external_policy_adapter" "$active_release/scripts/docker-network-policy-adapter.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$active_release/scripts/docker-network-policy-adapter.sh" && ! -L "$active_release/scripts/docker-network-policy-adapter.sh" && -x "$active_release/scripts/docker-network-policy-adapter.sh" ]] || fail 'symlinked production policy adapter was not repaired as a trusted path'
 rm -f "$active_release/deploy/compose.yaml"
 export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
 : >"$FAKE_FAIL_TAR_ONCE"
