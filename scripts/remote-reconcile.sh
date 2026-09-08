@@ -120,9 +120,6 @@ PY
 }
 
 load_installed_state() {
-  installed_config_repo=
-  installed_config_ref=
-  installed_controller=
   if [[ ! -f "$state_file" ]]; then
     return 1
   fi
@@ -130,17 +127,18 @@ load_installed_state() {
   if ! values=$(python3 - "$state_file" <<'PY'
 import json, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
-for key in ("config_repository", "config_ref", "controller"):
+for key in ("config_repository", "config_ref", "controller", "controller_state"):
     print(state[key])
 PY
   ); then
     return 1
   fi
   mapfile -t vals <<<"$values"
-  [[ ${#vals[@]} == 3 ]] || return 1
+  [[ ${#vals[@]} == 4 ]] || return 1
   installed_config_repo=${vals[0]}
   installed_config_ref=${vals[1]}
   installed_controller=${vals[2]}
+  installed_controller_state=${vals[3]}
 }
 
 # --- GitHub App token ---
@@ -482,6 +480,7 @@ if [[ "$no_op" == true ]]; then
 fi
 
 # Save LKG before reconciling
+restored_config_ref=$installed_config_ref
 save_lkg "$installed_config_ref"
 
 # Create a pinned local checkout for the installer.
@@ -503,13 +502,28 @@ if CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --
 
   # Run health check
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
+  load_installed_state || installed_controller_state=unknown
   health_status=$(run_health_check "$temp_dir/health.json")
+  health_desired_state=$(python3 - "$temp_dir/health.json" <<'PY' 2>/dev/null || echo unknown
+import json, sys
+desired_state = json.load(open(sys.argv[1], encoding="utf-8"))["desired_state"]
+if desired_state not in {"active", "drained", "disabled"}:
+    raise ValueError("unknown desired state")
+print(desired_state)
+PY
+  )
 
-  if [[ "$health_status" != healthy && "$health_status" != warning ]]; then
-    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
-    apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
-    exit 3
-  fi
+  case "$installed_controller_state:$health_desired_state:$health_status" in
+    active:active:healthy|active:active:warning|drained:drained:maintenance|drained:drained:warning|disabled:disabled:maintenance|disabled:disabled:warning) ;;
+    *)
+      save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
+      apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
+      rollback_health_status=$(run_health_check "$temp_dir/health.json")
+      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
+      note "ROLLBACK_OK controller=${installed_controller} restored=${restored_config_ref}"
+      exit 3
+      ;;
+  esac
 
   save_lkg "$desired_commit"
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
