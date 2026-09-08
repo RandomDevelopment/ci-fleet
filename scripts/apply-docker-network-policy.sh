@@ -246,7 +246,7 @@ run_primitive() {
   local action=$1
   shift
   if [[ -n "$adapter_command" ]]; then
-    timeout --kill-after=5 "$command_timeout" "$adapter_command" "$action" "$@" >/dev/null 2>&1
+    timeout --kill-after=5 "$command_timeout" "$adapter_command" "$action" "$@" >/dev/null
     return
   fi
   case "$action" in
