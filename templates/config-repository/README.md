@@ -90,8 +90,11 @@ Git.
 The same per-controller evidence record may declare
 `docker_network_policy_config`. A controller may omit this boolean only while it
 omits `docker_network_policy`. A retained policy requires current evidence for
-the selected engine with this boolean set to `true`. A complete record has this
-shape after an operator has verified the named engine is active:
+the selected engine with this boolean set to `true`, and the selected engine
+manifest must advertise both `docker_network_policy_config` and
+`docker_network_policy_adapter`. Remove the policy before selecting an engine
+without either capability, including an adapterless engine. A complete record
+has this shape after an operator has verified the named engine is active:
 
 ```json
 {
