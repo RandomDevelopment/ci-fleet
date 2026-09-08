@@ -2104,11 +2104,34 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
-expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+adopt_failure_output=$tmp/adopt-restart-loop.out
+set +e
+"$installer" --adopt "${base_args[@]}" --ref "$ref_one" >"$adopt_failure_output" 2>&1
+adopt_failure_status=$?
+set -e
+[[ "$adopt_failure_status" == 20 ]] || fail "adoption restart-loop rollback returned $adopt_failure_status instead of 20: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$adopt_failure_output" || true) == 1 ]] || fail "adoption restart-loop rollback did not emit exactly one restored marker: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ ! -e "$adopt_root/etc/docker/daemon.json" && ! -L "$adopt_root/etc/docker/daemon.json" ]] || fail 'adoption restart-loop rollback did not restore absent daemon.json'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
-unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
+
+adopt_result_file=$adopt_root/transaction-result.json
+adopt_fd7_output=$tmp/adopt-restart-loop-fd7.out
+: >"$adopt_result_file"
+chmod 0600 "$adopt_result_file"
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_RESTART_AFTER_UP"
+set +e
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --adopt "${base_args[@]}" --ref "$ref_one" 7>"$adopt_result_file" >"$adopt_fd7_output" 2>&1
+adopt_fd7_status=$?
+set -e
+[[ "$adopt_fd7_status" == 20 ]] || fail "FD7 adoption restart-loop rollback returned $adopt_fd7_status instead of 20: $(<"$adopt_fd7_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$adopt_fd7_output" || true) == 1 ]] || fail "FD7 adoption restart-loop rollback did not emit exactly one restored marker: $(<"$adopt_fd7_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(wc -l <"$adopt_result_file") == 1 ]] || fail 'FD7 adoption restart-loop rollback did not write exactly one result line'
+[[ $(<"$adopt_result_file") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] || fail 'FD7 adoption restart-loop rollback wrote an unexpected result'
+[[ ! -e "$adopt_root/etc/docker/daemon.json" && ! -L "$adopt_root/etc/docker/daemon.json" ]] || fail 'FD7 adoption restart-loop rollback did not restore absent daemon.json'
+unset FAKE_RESTART_AFTER_UP
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_SYSTEMCTL_LOG=$tmp/reconcile-timer-state-systemctl.log
 : >"$FAKE_SYSTEMCTL_LOG"
