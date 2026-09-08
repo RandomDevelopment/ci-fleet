@@ -1158,12 +1158,10 @@ if [[ -f "$daemon_config" ]]; then
 fi
 snapshot_present=$had_prior
 rollback_source=$backup_dir/$backup_name
-managed_marker_present=false
-[[ ! -e "$state_file" ]] || managed_marker_present=true
 
-python3 - "$env_file" "$rollback_source" "$staging_daemon" "$desired_pools_json" "$managed_marker_present" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
+python3 - "$env_file" "$rollback_source" "$staging_daemon" "$desired_pools_json" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
 import json, os, sys
-_, _, daemon_path, staging_path, desired_pools_json, managed_marker_present = sys.argv
+_, _, daemon_path, staging_path, desired_pools_json = sys.argv
 def reject_constant(_value):
     raise ValueError
 prior = {}
@@ -1174,9 +1172,7 @@ if os.path.exists(daemon_path):
         if not isinstance(prior, dict):
             raise ValueError("daemon.json root must be an object")
     except (json.JSONDecodeError, ValueError) as exc:
-        if managed_marker_present != "true":
-            raise SystemExit(f"ERROR: existing daemon.json is not a valid JSON object: {exc}")
-        prior = {}
+        raise SystemExit(f"ERROR: existing daemon.json is not a valid JSON object: {exc}")
 desired_pools = json.loads(desired_pools_json)
 merged = dict(prior)
 merged["default-address-pools"] = desired_pools.get("default-address-pools", [])
