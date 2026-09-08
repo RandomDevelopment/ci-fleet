@@ -1689,6 +1689,10 @@ on_error() {
   rollback_and_exit "$status"
 }
 on_term() { rollback_and_exit 143; }
+on_policy_term() {
+  policy_wait_interrupted=true
+  kill -TERM "$policy_pid" 2>/dev/null || true
+}
 trap on_error ERR
 trap on_term TERM
 
@@ -1705,7 +1709,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid policy_wait_interrupted
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -1792,13 +1796,21 @@ perform_converge() {
     export CI_FLEET_POLICY_MODE=$mode
     policy_status=0
     if transaction_result_enabled; then
-      "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" || policy_status=$?
+      "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" &
     else
       CI_FLEET_TRANSACTION_RESULT_FD=7 \
         "$release_dir/scripts/apply-docker-network-policy.sh" --env "$policy_env" --checkpoint "$network_policy_checkpoint" \
-        7>/dev/null || policy_status=$?
+        7>/dev/null &
     fi
+    policy_pid=$!
+    trap on_policy_term TERM
+    while :; do
+      policy_wait_interrupted=false
+      if wait "$policy_pid"; then policy_status=0; else policy_status=$?; fi
+      [[ "$policy_wait_interrupted" == true ]] || break
+    done
     transaction_active=false
+    trap on_term TERM
     if ((policy_status == 0)); then
       note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
       return
