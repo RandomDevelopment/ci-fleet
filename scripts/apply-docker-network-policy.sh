@@ -1467,11 +1467,11 @@ rollback_daemon() {
     rollback_stage=daemon_pool_verify
     daemon_pools_match "$rollback_source" || failed=1
   fi
+  ((failed != 0)) || rollback_stage=
   if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
     restored_generation=$(file_generation "$daemon_config") || failed=1
     ((failed != 0)) || set_verified_generation "$restored_generation" || failed=1
   fi
-  ((failed != 0)) || rollback_stage=
   return "$failed"
 }
 
