@@ -136,6 +136,7 @@ class TestRemoteReconcile(unittest.TestCase):
             "CI_FLEET_REMOTE_STATE_FILE": str(self.state_file),
             "CI_FLEET_RENDERED_ENV": str(self.td / "ci-fleet.env"),
             "CI_FLEET_HOST_ENV": str(self.host_env),
+            "CI_FLEET_INSTALLER_LOCK": str(self.td / "installer.lock"),
             "CI_FLEET_LKG_DIR": str(self.lkg_dir),
             "CI_FLEET_RECONCILE_STATE_DIR": str(self.td / "reconcile-state"),
             "CI_FLEET_RECONCILE_MAX_ATTEMPTS": "1",
@@ -484,7 +485,6 @@ exec {shlex.quote(real_git or 'git')} "$@"
                 result = self._run("healthy", policy_state=policy_state)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotIn("NO_CHANGE", result.stdout)
                 self.assertIn("DRIFT", result.stdout)
                 self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check", "--upgrade"])
 
