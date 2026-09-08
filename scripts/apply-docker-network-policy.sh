@@ -1443,6 +1443,7 @@ fi
 
 rollback_daemon() {
   local failed=0
+  rollback_stage=
   if [[ "$controller_resumed" == true ]]; then
     rollback_stage=candidate_drain
     run_primitive rollback-drain || failed=1
@@ -1470,6 +1471,7 @@ rollback_daemon() {
     restored_generation=$(file_generation "$daemon_config") || failed=1
     ((failed != 0)) || set_verified_generation "$restored_generation" || failed=1
   fi
+  ((failed != 0)) || rollback_stage=
   return "$failed"
 }
 
@@ -1492,7 +1494,7 @@ rollback_on_exit() {
     write_transaction_result rollback_verified
     if transaction_result_enabled; then result=20; fi
   else
-    printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s\n' "$rollback_stage" >&2
+    [[ -z "$rollback_stage" ]] || printf 'NETWORK_POLICY_ROLLBACK_FAILED stage=%s\n' "$rollback_stage" >&2
     if [[ -n "$transaction_recovery" ]]; then
       recovery_path=$transaction_recovery
     else
