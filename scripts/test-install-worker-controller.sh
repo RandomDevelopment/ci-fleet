@@ -1799,12 +1799,7 @@ printf 'sha256:%064d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$FAKE_CANDIDATE_CONTROLLER_IMAGE_ID" ]] || fail 'controller convergence did not restore live image identity'
-python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_MAX_RUNNERS=1", "CI_FLEET_MAX_RUNNERS=9"))' "$FAKE_CONTROLLER_ENV_FILE"
-grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-environment fixture did not mutate'
-expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-grep -Fxq 'CI_FLEET_MAX_RUNNERS=1' "$FAKE_CONTROLLER_ENV_FILE" || fail 'controller convergence did not restore live environment'
-for key in CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
+for key in CI_FLEET_MAX_RUNNERS CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
   expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$FAKE_CONTROLLER_ENV_FILE")
   [[ $expected =~ ^[0-9]+$ ]] || fail "live environment lacks numeric $key"
   replacement=$((expected + 1))
