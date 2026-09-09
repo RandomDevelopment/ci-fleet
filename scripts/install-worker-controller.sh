@@ -561,7 +561,7 @@ def trusted(path):
     if metadata.st_uid != expected_owner:
         return False
     if stat.S_ISLNK(metadata.st_mode):
-        return True
+        return False
     return (
         (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))
         and stat.S_IMODE(metadata.st_mode) & 0o022 == 0

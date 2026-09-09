@@ -1035,6 +1035,7 @@ ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+git -C "$config_repo" reset -q --hard "$ref_one"
 [[ ${CI_FLEET_TEST_STOP_AFTER_CROSS_REF_RESTAGE:-0} != 1 ]] || { printf 'CROSS_REF_RESTAGE_REGRESSION_OK\n'; exit 0; }
 
 drift_policy() {
@@ -1537,6 +1538,20 @@ for checkpoint_kind in release manager; do
   chmod g-w "$unsafe_target/scripts" "$unsafe_target/scripts/docker-network-policy-adapter.sh"
   refresh_release_digest "$unsafe_target"
 done
+escaped_cleanup=$tmp/escaped-cleanup.sh
+saved_cleanup=$tmp/saved-cleanup.sh
+cp -p "$authority_active_release/scripts/cleanup.sh" "$escaped_cleanup"
+cp -p "$authority_active_release/scripts/cleanup.sh" "$saved_cleanup"
+rm "$authority_active_release/scripts/cleanup.sh"
+ln -s "$escaped_cleanup" "$authority_active_release/scripts/cleanup.sh"
+refresh_release_digest "$authority_active_release"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'checkpoint release target is invalid' "$installer" --rollback
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'external release symlink stopped the controller'
+if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'external release symlink caused an operational mutation'; fi
+rm "$authority_active_release/scripts/cleanup.sh"
+mv "$saved_cleanup" "$authority_active_release/scripts/cleanup.sh"
+refresh_release_digest "$authority_active_release"
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"
 printf '2\n' >"$authority_checkpoint/format-version"
 rm -f "$authority_checkpoint/current-link" "$authority_checkpoint/current-absent"
