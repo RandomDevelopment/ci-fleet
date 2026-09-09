@@ -992,6 +992,50 @@ ref_one=$(write_config active 1 1)
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 
+authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
+authority_active_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
+cross_ref_tree=$(git -C "$repo_root" rev-parse 'HEAD^{tree}')
+cross_ref_old=$(printf 'cross-ref rollback fixture\n' | env \
+  GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid \
+  git -C "$repo_root" commit-tree "$cross_ref_tree" -p "$engine_ref")
+cross_ref_runtime=$root/opt/ci-fleet/releases/$cross_ref_old
+cross_ref_manager=$root/opt/ci-fleet/manager/releases/$cross_ref_old
+cp -a "$authority_active_release" "$cross_ref_runtime"
+printf '%s\n' "$cross_ref_old" >"$cross_ref_runtime/.ci-fleet-engine-ref"
+chmod g+w "$cross_ref_runtime/scripts" "$cross_ref_runtime/scripts/docker-network-policy-adapter.sh"
+refresh_release_digest "$cross_ref_runtime"
+cp -a "$authority_active_manager" "$cross_ref_manager"
+printf '%s\n' "$cross_ref_old" >"$cross_ref_manager/.ci-fleet-engine-ref"
+chmod g+w "$cross_ref_manager/scripts" "$cross_ref_manager/scripts/docker-network-policy-adapter.sh"
+printf 'outside\n' >"$tmp/outside-manager-cache.pyc"
+ln -s "$tmp" "$cross_ref_manager/scripts/__pycache__"
+refresh_release_digest "$cross_ref_manager"
+ln -sfn "$cross_ref_runtime" "$root/opt/ci-fleet/current"
+ln -sfn "$cross_ref_manager" "$root/opt/ci-fleet/manager/current"
+cross_ref=$(write_config active 2 2)
+export FAKE_FAIL_UP_ONCE=$tmp/cross-ref-fail-up
+: >"$FAKE_FAIL_UP_ONCE"
+cross_ref_output=$tmp/cross-ref.out
+if "$installer" --upgrade "${base_args[@]}" --ref "$cross_ref" >"$cross_ref_output" 2>&1; then
+  fail 'cross-ref unsafe authority fixture unexpectedly succeeded'
+fi
+unset FAKE_FAIL_UP_ONCE
+grep -Fq 'ROLLBACK_RESTORED' "$cross_ref_output" || fail "cross-ref unsafe rollback was not restored: $(<"$cross_ref_output")"
+cross_ref_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$cross_ref_output")
+grep -Fxq "$cross_ref_runtime" "$cross_ref_checkpoint/release-target" || fail 'cross-ref checkpoint did not retain the securely restaged old runtime'
+grep -Fxq "$cross_ref_manager" "$cross_ref_checkpoint/manager-target" || fail 'cross-ref checkpoint did not retain the securely restaged old manager'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$cross_ref_runtime" ]] || fail 'cross-ref rollback did not restore the old runtime ref'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$cross_ref_manager" ]] || fail 'cross-ref rollback did not restore the old manager ref'
+[[ -f "$tmp/outside-manager-cache.pyc" ]] || fail 'unsafe manager bytecode repair touched an external file before restaging'
+if find "$cross_ref_runtime" "$cross_ref_manager" \( -type d -o -type f \) -perm /022 -print -quit | grep -q .; then
+  fail 'cross-ref repair retained group/world-writable release content'
+fi
+[[ ! -e "$cross_ref_manager/scripts/__pycache__" && ! -L "$cross_ref_manager/scripts/__pycache__" ]] || fail 'cross-ref manager was not securely restaged before bytecode handling'
+ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
+ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$cross_ref_runtime" "$cross_ref_manager"
+[[ ${CI_FLEET_TEST_STOP_AFTER_CROSS_REF_RESTAGE:-0} != 1 ]] || { printf 'CROSS_REF_RESTAGE_REGRESSION_OK\n'; exit 0; }
+
 drift_policy() {
   python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
 }
@@ -1458,25 +1502,6 @@ rm -rf "$raw_manager_release"
 unset FAKE_ALL_RUNNER_STATE
 [[ ${CI_FLEET_TEST_STOP_AFTER_DANGLING_MANAGER_UNINSTALL:-0} != 1 ]] || { printf 'DANGLING_MANAGER_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
-permission_unsafe_ref=$(write_config active 1 1)
-permission_unsafe_current=$root/opt/ci-fleet/releases/permission-unsafe-current
-cp -a "$authority_active_release" "$permission_unsafe_current"
-chmod g+w "$permission_unsafe_current/scripts" "$permission_unsafe_current/scripts/docker-network-policy-adapter.sh"
-refresh_release_digest "$permission_unsafe_current"
-ln -sfn "$permission_unsafe_current" "$root/opt/ci-fleet/current"
-export FAKE_FAIL_UP_ONCE=$tmp/permission-unsafe-current-fail-up
-: >"$FAKE_FAIL_UP_ONCE"
-permission_unsafe_current_output=$tmp/permission-unsafe-current.out
-if "$installer" --upgrade "${base_args[@]}" --ref "$permission_unsafe_ref" >"$permission_unsafe_current_output" 2>&1; then
-  fail 'permission-unsafe current authority fixture unexpectedly succeeded'
-fi
-unset FAKE_FAIL_UP_ONCE
-grep -Fq 'ROLLBACK_RESTORED' "$permission_unsafe_current_output" || fail "permission-unsafe current rollback was not restored: $(<"$permission_unsafe_current_output")"
-permission_unsafe_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$permission_unsafe_current_output")
-grep -Fxq "$authority_active_release" "$permission_unsafe_checkpoint/release-target" || fail 'permission-unsafe current checkpoint did not select the trusted fallback release'
-grep -Fxq "$authority_active_release" "$permission_unsafe_checkpoint/current-link" || fail 'permission-unsafe current checkpoint retained the untrusted raw link'
-[[ $(readlink -f "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'permission-unsafe current rollback restored the untrusted raw link'
-rm -rf "$permission_unsafe_current"
 authority_ref=$(write_config drained 1 1)
 incomplete_current_output=$tmp/incomplete-current-authority.out
 export FAKE_COMPOSE_LOG=$tmp/incomplete-current-authority-compose.log
