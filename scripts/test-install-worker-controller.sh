@@ -1458,7 +1458,7 @@ rm -rf "$raw_manager_release"
 unset FAKE_ALL_RUNNER_STATE
 [[ ${CI_FLEET_TEST_STOP_AFTER_DANGLING_MANAGER_UNINSTALL:-0} != 1 ]] || { printf 'DANGLING_MANAGER_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
-authority_ref=$(write_config drained 1 1)
+permission_unsafe_ref=$(write_config active 1 1)
 permission_unsafe_current=$root/opt/ci-fleet/releases/permission-unsafe-current
 cp -a "$authority_active_release" "$permission_unsafe_current"
 chmod g+w "$permission_unsafe_current/scripts" "$permission_unsafe_current/scripts/docker-network-policy-adapter.sh"
@@ -1467,7 +1467,7 @@ ln -sfn "$permission_unsafe_current" "$root/opt/ci-fleet/current"
 export FAKE_FAIL_UP_ONCE=$tmp/permission-unsafe-current-fail-up
 : >"$FAKE_FAIL_UP_ONCE"
 permission_unsafe_current_output=$tmp/permission-unsafe-current.out
-if "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref" >"$permission_unsafe_current_output" 2>&1; then
+if "$installer" --upgrade "${base_args[@]}" --ref "$permission_unsafe_ref" >"$permission_unsafe_current_output" 2>&1; then
   fail 'permission-unsafe current authority fixture unexpectedly succeeded'
 fi
 unset FAKE_FAIL_UP_ONCE
@@ -1477,6 +1477,7 @@ grep -Fxq "$authority_active_release" "$permission_unsafe_checkpoint/release-tar
 grep -Fxq "$authority_active_release" "$permission_unsafe_checkpoint/current-link" || fail 'permission-unsafe current checkpoint retained the untrusted raw link'
 [[ $(readlink -f "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'permission-unsafe current rollback restored the untrusted raw link'
 rm -rf "$permission_unsafe_current"
+authority_ref=$(write_config drained 1 1)
 incomplete_current_output=$tmp/incomplete-current-authority.out
 export FAKE_COMPOSE_LOG=$tmp/incomplete-current-authority-compose.log
 export FAKE_ACTIVE_MANAGED_STATE=$tmp/incomplete-current-authority-blocker
