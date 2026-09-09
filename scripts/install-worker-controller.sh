@@ -1125,7 +1125,7 @@ PY
 }
 
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref fallback_selected=false
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref fallback_selected=false current_candidate='' current_ref='' permission_unsafe_current=false
   capture_current_pointer
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   status=$(controller_status)
@@ -1144,13 +1144,21 @@ make_checkpoint() {
   elif [[ -e "$manager_current" ]]; then
     die 'manager current pointer is invalid'
   fi
+  if [[ -L "$current_link" ]]; then
+    current_candidate=$(readlink -f "$current_link" 2>/dev/null || true)
+    if [[ -n "$current_candidate" && -f "$current_candidate/.ci-fleet-engine-ref" ]]; then
+      current_ref=$(<"$current_candidate/.ci-fleet-engine-ref")
+      if [[ "$current_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$current_candidate" "$current_ref" \
+        && ! release_tree_permissions_trusted "$current_candidate"; then permission_unsafe_current=true; fi
+    fi
+  fi
   target=$(current_runtime_release)
   if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
     fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
     if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref" \
       && release_tree_permissions_trusted "$fallback_release"; then target=$fallback_release; fallback_selected=true; fi
   fi
-  if $fallback_selected && [[ "$captured_current_state" == link ]]; then
+  if $fallback_selected && $permission_unsafe_current && [[ "$captured_current_state" == link ]]; then
     printf '%s' "$target" >"$temporary/current-link"
     chmod 0600 "$temporary/current-link"
   fi
