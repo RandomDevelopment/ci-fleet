@@ -1875,17 +1875,15 @@ perform_converge() {
     manager_target=$(canonical_release_target_from_raw_pointer "$manager_current" "$manager_releases" || true)
     [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
     manager_ref=${manager_target##*/}
-    if ! manager_release_complete "$manager_target" "$manager_ref"; then
+    if [[ "$mode" == upgrade ]] && release_tree_permissions_trusted "$manager_target"; then
+      CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
+        || die 'manager current pointer is invalid'
+    elif ! manager_release_complete "$manager_target" "$manager_ref"; then
       [[ "$mode" == install ]] || die 'manager current pointer is incomplete; operator recovery or reinstall required'
       manager_source=$releases_dir/$manager_ref
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
-    elif release_tree_permissions_trusted "$manager_target"; then
-      if [[ "$mode" == upgrade ]]; then
-        CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
-          || die 'manager current pointer is invalid'
-      fi
-    else
+    elif ! release_tree_permissions_trusted "$manager_target"; then
       manager_source=$releases_dir/$manager_ref
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
