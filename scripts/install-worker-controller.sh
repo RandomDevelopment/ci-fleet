@@ -403,7 +403,7 @@ controller_status() {
 }
 
 current_runtime_release() {
-  local allow_legacy_adapter_gap=${1:-0} target='' marker
+  local target='' marker
   if [[ -L "$current_link" ]]; then
     target=$(readlink -f "$current_link" 2>/dev/null || true)
   elif [[ -f "$install_root/deploy/compose.yaml" ]]; then
@@ -411,7 +411,7 @@ current_runtime_release() {
   fi
   [[ -n "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 0
   marker=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" 0 0 "$allow_legacy_adapter_gap" \
+  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" \
     && release_tree_permissions_trusted "$target" || return 0
   printf '%s' "$target"
 }
@@ -591,7 +591,7 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} allow_legacy_adapter_gap=${5:-0} marker required stored_digest actual_digest policy_script
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script
   local -a capability_args=()
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
@@ -609,9 +609,7 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))
 raise SystemExit(value.get("capabilities", {}).get(sys.argv[2]) is not True)
 PY
       then
-        if [[ ! -f "$path/scripts/$policy_script" || -L "$path/scripts/$policy_script" || ! -x "$path/scripts/$policy_script" ]]; then
-          [[ "$allow_legacy_adapter_gap" == 1 && "$policy_script" == docker-network-policy-adapter.sh ]] || return 1
-        fi
+        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" && -x "$path/scripts/$policy_script" ]] || return 1
       fi
     done
   fi
@@ -633,8 +631,8 @@ PY
 }
 
 manager_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} allow_legacy_adapter_gap=${5:-0} marker required unit
-  runtime_release_complete "$path" "$expected" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" || return 1
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required unit
+  runtime_release_complete "$path" "$expected" "$require_status" "$require_schema" || return 1
   [[ -x "$path/scripts/install-worker-controller.sh" && -x "$path/scripts/check-installed-state.sh" ]] || return 1
   for required in scripts/desired_state.py scripts/scan_committed_secrets.py templates/config-repository/fleet.schema.json templates/config-repository/scripts/validate.py; do
     [[ -f "$path/$required" ]] || return 1
@@ -661,7 +659,7 @@ manager_release_from_raw_pointer() {
   local target ref
   target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases") || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
-  manager_release_complete "$target" "$ref" 0 0 1 && release_tree_permissions_trusted "$target" || return 1
+  manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
   printf '%s' "$target"
 }
 
@@ -911,9 +909,9 @@ PY
 
 install_release() {
   local install_ref=${1:-$engine_ref} install_dir=${2:-$release_dir}
-  local require_status=${3:-$status_reporting_required} require_schema=${4:-$status_reporting_configured} allow_legacy_adapter_gap=${5:-0}
+  local require_status=${3:-$status_reporting_required} require_schema=${4:-$status_reporting_configured}
   local archive checkout resolved staged_release
-  if runtime_release_complete "$install_dir" "$install_ref" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" &&
+  if runtime_release_complete "$install_dir" "$install_ref" "$require_status" "$require_schema" &&
     release_tree_permissions_trusted "$install_dir"; then
     return
   fi
@@ -939,7 +937,7 @@ install_release() {
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
   chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
-  if ! runtime_release_complete "$staged_release" "$install_ref" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" ||
+  if ! runtime_release_complete "$staged_release" "$install_ref" "$require_status" "$require_schema" ||
     ! release_tree_permissions_trusted "$staged_release"; then
     die 'staged engine release is incomplete or untrusted'
   fi
@@ -949,11 +947,11 @@ install_release() {
 install_manager() {
   local manager_commit=${1:-$engine_ref} source_release=${2:-$release_dir}
   local manager_release=${3:-$manager_releases/$manager_commit}
-  local require_status=${4:-$status_reporting_required} require_schema=${5:-$status_reporting_configured} allow_legacy_adapter_gap=${6:-0}
-  local activate=${7:-true} archive staged_manager
+  local require_status=${4:-$status_reporting_required} require_schema=${5:-$status_reporting_configured}
+  local activate=${6:-true} archive staged_manager
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
-  runtime_release_complete "$source_release" "$manager_commit" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" || die 'desired engine release is unavailable for installer manager activation'
-  if ! manager_release_complete "$manager_release" "$manager_commit" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" ||
+  runtime_release_complete "$source_release" "$manager_commit" "$require_status" "$require_schema" || die 'desired engine release is unavailable for installer manager activation'
+  if ! manager_release_complete "$manager_release" "$manager_commit" "$require_status" "$require_schema" ||
     ! release_tree_permissions_trusted "$manager_release"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager-$manager_commit.tar
@@ -964,7 +962,7 @@ install_manager() {
     (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager")
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    if ! manager_release_complete "$staged_manager" "$manager_commit" "$require_status" "$require_schema" "$allow_legacy_adapter_gap" ||
+    if ! manager_release_complete "$staged_manager" "$manager_commit" "$require_status" "$require_schema" ||
       ! release_tree_permissions_trusted "$staged_manager"; then
       die 'staged installer manager release is incomplete or untrusted'
     fi
@@ -1149,7 +1147,7 @@ make_checkpoint() {
       manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
       [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
       manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref" 0 0 1 ||
+      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref" ||
         ! release_tree_permissions_trusted "$manager_target"; then
         die 'manager current pointer is invalid'
       fi
@@ -1157,7 +1155,7 @@ make_checkpoint() {
   elif [[ -e "$manager_current" ]]; then
     die 'manager current pointer is invalid'
   fi
-  target=$(current_runtime_release 1)
+  target=$(current_runtime_release)
   if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
     fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
     if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref" \
@@ -1545,7 +1543,7 @@ PY
       return 1
     fi
     target=$(<"$checkpoint_release/.ci-fleet-engine-ref")
-    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target" 0 0 1 ||
+    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target" ||
       ! release_tree_permissions_trusted "$checkpoint_release"; then
       note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
       return 1
@@ -1565,7 +1563,7 @@ PY
       return 1
     fi
     restored_state=$(<"$target/.ci-fleet-engine-ref")
-    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state" 0 0 1 ||
+    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state" ||
       ! release_tree_permissions_trusted "$target"; then
       note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
       return 1
@@ -1827,7 +1825,7 @@ perform_converge() {
     if [[ -n "$current_target" ]]; then
       current_ref=$(<"$current_target/.ci-fleet-engine-ref")
       if ! runtime_release_complete "$current_target" "$current_ref" || ! release_tree_permissions_trusted "$current_target"; then
-        install_release "$current_ref" "$current_target" 0 0 1
+        install_release "$current_ref" "$current_target" 0 0
       fi
     fi
   fi
@@ -1842,10 +1840,10 @@ perform_converge() {
       fi
     else
       manager_source=$releases_dir/$manager_ref
-      install_release "$manager_ref" "$manager_source" 0 0 1
-      install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 1 false
+      install_release "$manager_ref" "$manager_source" 0 0
+      install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
     fi
-    if ! manager_release_complete "$manager_target" "$manager_ref" 0 0 1 || ! release_tree_permissions_trusted "$manager_target"; then
+    if ! manager_release_complete "$manager_target" "$manager_ref" || ! release_tree_permissions_trusted "$manager_target"; then
       die 'manager current pointer is invalid'
     fi
   elif [[ -e "$manager_current" ]]; then
