@@ -1857,7 +1857,8 @@ perform_converge() {
     current_target=$(release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
       current_ref=$(<"$current_target/.ci-fleet-engine-ref")
-      if ! runtime_release_complete "$current_target" "$current_ref" || ! release_tree_permissions_trusted "$current_target"; then
+      runtime_release_complete "$current_target" "$current_ref" || die 'current release is incomplete; operator recovery or reinstall required'
+      if ! release_tree_permissions_trusted "$current_target"; then
         install_release "$current_ref" "$current_target" 0 0
       fi
     fi
@@ -1872,6 +1873,7 @@ perform_converge() {
           || die 'manager current pointer is invalid'
       fi
     else
+      manager_release_complete "$manager_target" "$manager_ref" || die 'manager current pointer is incomplete; operator recovery or reinstall required'
       manager_source=$releases_dir/$manager_ref
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
