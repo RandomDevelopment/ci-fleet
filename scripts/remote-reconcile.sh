@@ -277,12 +277,13 @@ PY
 }
 
 save_lkg() {
-  local commit=$1
+  local commit=$1 replace=${2:-false}
   install -d -m 0700 "$lkg_dir"
-  python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" <<'PY' 2>/dev/null || true
+  python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" "$replace" <<'PY' 2>/dev/null || true
 import json, os, stat, sys, tempfile
 
 path = sys.argv[1]
+replace = sys.argv[5] == "true"
 meta = {
     "config_repository": sys.argv[2],
     "config_ref": sys.argv[3],
@@ -295,7 +296,7 @@ try:
 except (OSError, TypeError, ValueError):
     metadata = None
     current = None
-if (
+valid = (
     metadata is not None
     and stat.S_ISREG(metadata.st_mode)
     and not stat.S_ISLNK(metadata.st_mode)
@@ -303,9 +304,13 @@ if (
     and stat.S_IMODE(metadata.st_mode) == 0o600
     and isinstance(current, dict)
     and set(current) == set(meta)
-    and all(current[key] == meta[key] for key in ("config_repository", "config_ref", "controller"))
+    and all(isinstance(current[key], str) and current[key] for key in ("config_repository", "config_ref", "controller"))
     and type(current["saved_at"]) is int
     and current["saved_at"] >= 0
+)
+if valid and (
+    not replace
+    or all(current[key] == meta[key] for key in ("config_repository", "config_ref", "controller"))
 ):
     raise SystemExit(0)
 fd, tmp = tempfile.mkstemp(prefix=".lkg-meta.", dir=os.path.dirname(path), text=True)
@@ -479,9 +484,17 @@ if [[ "$no_op" == true ]]; then
   exit 0
 fi
 
-# Save LKG before reconciling
-restored_config_ref=$installed_config_ref
+# Preserve an existing accepted LKG; bootstrap it only when absent or invalid.
 save_lkg "$installed_config_ref"
+restored_config_ref=$(python3 - "$lkg_dir/metadata.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+ref = value.get("config_ref")
+if not isinstance(ref, str) or not ref:
+    raise SystemExit(1)
+print(ref)
+PY
+) || die 'LKG metadata incomplete'
 
 # Create a pinned local checkout for the installer.
 # Keep the durable repository identity while the installer reads the fetched checkout.
@@ -525,7 +538,7 @@ PY
       ;;
   esac
 
-  save_lkg "$desired_commit"
+  save_lkg "$desired_commit" true
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0

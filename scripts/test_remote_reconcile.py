@@ -524,6 +524,21 @@ exec {shlex.quote(real_git or 'git')} "$@"
 
                 self._assert_rolled_back(result, rollback_health)
 
+    def test_unaccepted_installed_state_does_not_replace_prior_lkg(self):
+        interrupted_ref = "1" * 40
+        self._write_installed_ref(interrupted_ref)
+        lkg_file = self.lkg_dir / "metadata.json"
+        lkg = json.loads(lkg_file.read_text(encoding="utf-8"))
+        lkg["saved_at"] = 1
+        lkg_file.write_text(json.dumps(lkg), encoding="utf-8")
+        lkg_file.chmod(0o600)
+
+        result = self._run("unhealthy", rollback_health="healthy")
+
+        self._assert_rolled_back(result, "healthy")
+        calls = self._installer_calls()
+        self.assertEqual(calls[1]["args"][calls[1]["args"].index("--ref") + 1], self.prior_ref)
+
     def test_state_aware_final_health_rejection_rolls_back(self):
         for applied_state, health, reported_state in (
             ("active", "maintenance", "active"),

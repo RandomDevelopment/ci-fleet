@@ -848,7 +848,7 @@ if phase == "removal-pending":
     and not isinstance(state["removal_managed_default_address_pools"], list)
     ):
         raise SystemExit(1)
-elif phase == "first-apply-pending":
+elif phase in ("first-apply-pending", "reapply-pending"):
     if set(state) != required | {"phase", "verified_generation"}:
         raise SystemExit(1)
 elif phase is not None or set(state) not in (required, required | {"verified_generation"}):
@@ -901,10 +901,18 @@ PY
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
   [[ "$checkpoint_phase" != verified ]] || clear_recovery_artifacts || die 'failed to clear obsolete network-policy recovery data'
-  if [[ "$removal_phase" == first-apply-pending || "$removal_pending" == true ]]; then
+  managed_recovery_daemon=
+  restore_full_managed=false
+  if [[ "$removal_phase" == first-apply-pending || "$removal_phase" == reapply-pending || "$removal_pending" == true ]]; then
     recovery_info=$(authoritative_recovery) || die 'network-policy transaction recovery is invalid'
-    IFS='|' read -r transaction_recovery _ <<<"$recovery_info"
+    IFS='|' read -r transaction_recovery recovery_present <<<"$recovery_info"
     prior_env=$transaction_recovery/prior-ci-fleet.env
+    if [[ "$removal_phase" == reapply-pending ]]; then
+      [[ "$recovery_present" == true ]] || die 'network-policy transaction recovery is invalid'
+      managed_recovery_daemon=$transaction_recovery/daemon.json.before
+      prior_verified_generation=$(file_generation "$managed_recovery_daemon") || die 'failed to identify recovered daemon.json generation'
+      restore_full_managed=true
+    fi
   fi
   if [[ "$removal_phase" == first-apply-pending ]]; then
     cancelling_first_apply=true
@@ -968,25 +976,26 @@ PY
     managed_gid=$(stat -c %g "$daemon_config")
     managed_metadata=$(stat -c '%d:%i:%u:%a:%g' "$daemon_config")
     cp -- "$daemon_config" "$managed_snapshot" || { rm -rf "$work_dir"; die 'failed to snapshot managed daemon.json'; }
-    python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" "$repo_root/scripts" 2>/dev/null <<'PY' || {
+    python3 - "$managed_snapshot" "$state_file" "$managed_daemon" "$removal_daemon" "$repo_root/scripts" "$managed_recovery_daemon" 2>/dev/null <<'PY' || {
 import json, sys
-daemon_path, state_path, managed_path, removal_path, scripts_path = sys.argv[1:]
+daemon_path, state_path, managed_path, removal_path, scripts_path, recovery_path = sys.argv[1:]
 sys.path.insert(0, scripts_path)
 from desired_state import validate_docker_address_pools
 try:
     current = json.load(open(daemon_path, encoding="utf-8"))
+    accepted = json.load(open(recovery_path, encoding="utf-8")) if recovery_path else current
     state = json.load(open(state_path, encoding="utf-8"))
-    if not isinstance(current, dict):
+    if not isinstance(current, dict) or not isinstance(accepted, dict):
         raise ValueError
     if state.get("phase") == "removal-pending":
         managed_pools = state["removal_managed_default_address_pools"]
     else:
-        managed_pools = current.get("default-address-pools")
-        if "default-address-pools" in current:
+        managed_pools = accepted.get("default-address-pools")
+        if "default-address-pools" in accepted:
             validate_docker_address_pools(managed_pools, path="managed daemon default address pools")
 except (OSError, json.JSONDecodeError, KeyError, ValueError):
     raise SystemExit(1)
-managed = dict(current)
+managed = dict(accepted)
 if managed_pools is None:
     managed.pop("default-address-pools", None)
 else:
@@ -1029,9 +1038,9 @@ PY
       run_primitive rollback-drain || failed=1
     fi
     if ((failed == 0)); then
-      python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" <<'PY' || failed=1
+      python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" "$restore_full_managed" <<'PY' || failed=1
 import json, os, sys
-current_path, managed_path, output_path, expected_path = sys.argv[1:]
+current_path, managed_path, output_path, expected_path, restore_full = sys.argv[1:]
 try:
     current_present = os.path.exists(current_path)
     current_text = open(current_path, encoding="utf-8").read() if current_present else ""
@@ -1045,10 +1054,13 @@ with open(expected_path, "w", encoding="utf-8") as handle:
     handle.write(current_text)
 with open(expected_path + ".present", "w", encoding="utf-8") as handle:
     handle.write("true" if current_present else "false")
-if "default-address-pools" in managed:
-    current["default-address-pools"] = managed["default-address-pools"]
+if restore_full == "true":
+    current = managed
 else:
-    current.pop("default-address-pools", None)
+    if "default-address-pools" in managed:
+        current["default-address-pools"] = managed["default-address-pools"]
+    else:
+        current.pop("default-address-pools", None)
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
