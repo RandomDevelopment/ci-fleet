@@ -1034,6 +1034,7 @@ fi
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ ${CI_FLEET_TEST_STOP_AFTER_CROSS_REF_RESTAGE:-0} != 1 ]] || { printf 'CROSS_REF_RESTAGE_REGRESSION_OK\n'; exit 0; }
 
 drift_policy() {
