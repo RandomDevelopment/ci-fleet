@@ -643,14 +643,19 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
-canonical_release_target_from_raw_pointer() {
-  local link=$1 releases=$2 target relative
-  target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
-  target=${target%x}
+canonical_release_target() {
+  local target=$1 releases=$2 relative
   [[ "$target" == "$releases/"* ]] || return 1
   relative=${target#"$releases/"}
   [[ "$relative" =~ ^[0-9a-f]{40}$ && ! -L "$target" ]] || return 1
   printf '%s' "$target"
+}
+
+canonical_release_target_from_raw_pointer() {
+  local link=$1 releases=$2 target
+  target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
+  target=${target%x}
+  canonical_release_target "$target" "$releases"
 }
 
 release_target_from_raw_pointer() {
@@ -1094,6 +1099,19 @@ repair_pending_checkpoint_authority() {
       manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
     fi
   done
+  file=$checkpoint/current-link
+  [[ -e "$file" || -L "$file" ]] || return 0
+  [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+    && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
+    && $(stat -c %s "$file") -le 4095 ]] || return 1
+  target=$(<"$file")
+  target=$(canonical_release_target "$target" "$releases_dir") || return 1
+  ref=${target##*/}
+  runtime_release_complete "$target" "$ref" || return 1
+  if ! release_tree_permissions_trusted "$target"; then
+    install_release "$ref" "$target" 0 0
+  fi
+  runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
 }
 
 pending_policy_checkpoint() {
@@ -1861,12 +1879,14 @@ perform_converge() {
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
   fi
-  if [[ "$mode" != install && -L "$current_link" ]]; then
+  if [[ -L "$current_link" ]]; then
     current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
       current_ref=${current_target##*/}
-      runtime_release_complete "$current_target" "$current_ref" || die 'current release is incomplete; operator recovery or reinstall required'
-      if ! release_tree_permissions_trusted "$current_target"; then
+      if ! runtime_release_complete "$current_target" "$current_ref"; then
+        [[ "$mode" == install ]] || die 'current release is incomplete; operator recovery or reinstall required'
+        install_release "$current_ref" "$current_target" 0 0
+      elif ! release_tree_permissions_trusted "$current_target"; then
         install_release "$current_ref" "$current_target" 0 0
       fi
     fi
