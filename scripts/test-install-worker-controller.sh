@@ -20,10 +20,15 @@ export REAL_DF
 REAL_DF=$(command -v df)
 export REAL_MV
 REAL_MV=$(command -v mv)
+export REAL_PYTHON3
+REAL_PYTHON3=$(command -v python3)
+export REAL_TIMEOUT
+REAL_TIMEOUT=$(command -v timeout)
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
+[[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'docker %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
@@ -205,7 +210,7 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "$stopped_state" ]] || rm -f "$stopped_state"
-        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || printf '%s\n' "${FAKE_ENGINE_REF:?}" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$env_file" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
@@ -268,6 +273,7 @@ EOF
 
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+[[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
@@ -279,6 +285,12 @@ fi
 if [[ -n "${FAKE_DISABLED_TIMER:-}" && ( "${1:-}" == is-enabled || "${1:-}" == is-active ) && $# == 3 && "${3:-}" == "$FAKE_DISABLED_TIMER" ]]; then
   exit 1
 fi
+if [[ -n "${FAKE_PAUSE_SYSTEMCTL_ONCE:-}" && -f "$FAKE_PAUSE_SYSTEMCTL_ONCE" && "${1:-}" == enable && "${2:-}" == --now ]]; then
+  pause=$FAKE_PAUSE_SYSTEMCTL_ONCE
+  rm -f "$pause"
+  printf '%s\n' "$$" >"$pause.entered"
+  while [[ ! -f "$pause.continue" ]]; do sleep 0.05; done
+fi
 exit 0
 EOF
 
@@ -289,6 +301,10 @@ if [[ -n "${FAKE_WRONG_HOST_CONFIG_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u
   exit 0
 fi
 if [[ -n "${FAKE_WRONG_INSTALL_STATE_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$FAKE_WRONG_INSTALL_STATE_OWNER" ]]; then
+  printf '99999\n'
+  exit 0
+fi
+if [[ -n "${FAKE_WRONG_SOURCE_INSTALLER_OWNER:-}" && "${1:-}" == -c && "${2:-}" == %u && "${3:-}" == "$FAKE_WRONG_SOURCE_INSTALLER_OWNER" ]]; then
   printf '99999\n'
   exit 0
 fi
@@ -313,6 +329,20 @@ cat >"$fake_bin/tar" <<'EOF'
 if [[ -n "${FAKE_FAIL_TAR_ONCE:-}" && -f "$FAKE_FAIL_TAR_ONCE" ]]; then
   rm -f "$FAKE_FAIL_TAR_ONCE"
   exit 45
+fi
+if [[ -n "${FAKE_GROUP_WRITABLE_ARCHIVE:-}" && " $* " == *' -xf '* ]]; then
+  destination= previous=
+  for argument in "$@"; do
+    [[ "$previous" != -C ]] || destination=$argument
+    previous=$argument
+  done
+  "$REAL_TAR" "$@" || exit $?
+  mask=$((8#$(umask)))
+  # Model mode 0775 archive entries: both extraction policy and umask must be safe.
+  if [[ " $* " != *' --no-same-permissions '* ]] || (( (mask & 8#22) != 8#22 )); then
+    chmod g+w "$destination" "$destination/scripts/docker-network-policy-adapter.sh" || exit $?
+  fi
+  exit 0
 fi
 exec "$REAL_TAR" "$@"
 EOF
@@ -354,6 +384,38 @@ if [[ -n ${used:-} ]]; then
 fi
 EOF
 chmod 700 "$fake_bin/df"
+
+cat >"$fake_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_FAIL_RECOVERY_CLEANUP_ONCE:-}" && -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE" && "${1:-}" == - && "${2:-}" == "${FAKE_POLICY_CHECKPOINT_DIR:-}" ]]; then
+  script=$(</dev/stdin)
+  if [[ "$script" == *'shutil.rmtree(recovery)'* ]] && "$REAL_PYTHON3" -c 'import json, pathlib, sys; assert json.loads((pathlib.Path(sys.argv[1]) / "docker-network-policy.json").read_text())["verified_generation"]' "$2"; then
+    rm -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE"
+    script=${script/'    shutil.rmtree(recovery)'/'    raise OSError("injected recovery deletion failure")'}
+  fi
+  exec "$REAL_PYTHON3" "$@" <<<"$script"
+fi
+exec "$REAL_PYTHON3" "$@"
+EOF
+chmod 700 "$fake_bin/python3"
+
+cat >"$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+"$REAL_TIMEOUT" "$@"
+status=$?
+if [[ -n "${FAKE_TIMEOUT_LOG:-}" && "$*" == *docker-network-policy-adapter.sh* ]]; then
+  previous=
+  for argument in "$@"; do
+    if [[ "$previous" == *docker-network-policy-adapter.sh ]]; then
+      printf '%s|%s\n' "$argument" "$status" >>"$FAKE_TIMEOUT_LOG"
+      break
+    fi
+    previous=$argument
+  done
+fi
+exit "$status"
+EOF
+chmod 700 "$fake_bin/timeout"
 
 export PATH="$fake_bin:$PATH"
 
@@ -402,6 +464,22 @@ expect_failure() {
 expect_command_failure() {
   local output
   if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+}
+wait_for_file() {
+  local path=$1 label=$2 attempt
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    [[ ! -f "$path" ]] || return 0
+    sleep 0.05
+  done
+  fail "$label"
+}
+descendant_pids() {
+  local parent=$1 child
+  [[ -r "/proc/$parent/task/$parent/children" ]] || return 0
+  for child in $(<"/proc/$parent/task/$parent/children"); do
+    printf '%s\n' "$child"
+    descendant_pids "$child"
+  done
 }
 
 engine_ref=$(git -C "$repo_root" rev-parse 'HEAD^{commit}')
@@ -484,7 +562,7 @@ PY
 root=$tmp/host
 export CI_FLEET_ROOT_PREFIX=$root
 export CI_FLEET_DOCKER_ROOT=$root/var/lib/docker
-mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
+mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/etc/docker" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 printf 'fixture CA bundle\n' >"$root/etc/ssl/certs/ca-certificates.crt"
 : >"$root/var/run/docker.sock"
@@ -547,13 +625,534 @@ expect_failure 'host configuration must be owned by root' "$installer" --install
 unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
+export FAKE_WRONG_SOURCE_INSTALLER_OWNER=$installer
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+unset FAKE_WRONG_SOURCE_INSTALLER_OWNER
 fresh_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); print $2; exit}' <<<"$first")
 expect_success env DOCKER_CONTEXT=default "$installer" --check "${base_args[@]}" --ref "$ref_one"
 grep -Fq 'CONVERGED mode=install' <<<"$first" || fail 'fresh install did not converge'
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not apply the advertised Docker network policy through the staged callback'
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+
+daemon_config=$root/etc/docker/daemon.json
+python3 - "$daemon_config" <<'PY' || fail 'fresh install did not apply the advertised Docker network policy'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["default-address-pools"] == [{"base": "10.64.0.0/24", "size": 28}]
+PY
+policy_marker=$root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["prior_present"] = "false"; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$policy_marker"
+strict_marker_output=$tmp/strict-policy-marker.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$strict_marker_output" 2>&1
+strict_marker_status=$?
+set -e
+[[ "$strict_marker_status" == 3 ]] || fail "string prior_present marker drift returned $strict_marker_status instead of 3: $(<"$strict_marker_output")"
+grep -Fq 'DRIFT docker_network_policy' "$strict_marker_output" || fail "string prior_present marker drift was not reported: $(<"$strict_marker_output")"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["prior_present"] = False; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$policy_marker"
+
+policy_checkpoint_dir=$(dirname "$policy_marker")
+chmod 0770 "$policy_checkpoint_dir"
+untrusted_checkpoint_output=$tmp/untrusted-policy-checkpoint.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$untrusted_checkpoint_output" 2>&1
+untrusted_checkpoint_status=$?
+set -e
+chmod 0700 "$policy_checkpoint_dir"
+[[ "$untrusted_checkpoint_status" == 3 ]] || fail "group-writable policy checkpoint drift returned $untrusted_checkpoint_status instead of 3: $(<"$untrusted_checkpoint_output")"
+grep -Fq 'DRIFT docker_network_policy' "$untrusted_checkpoint_output" || fail "group-writable policy checkpoint drift was not reported: $(<"$untrusted_checkpoint_output")"
+
+assert_single_policy_transaction() {
+  local log=$1
+  [[ $(grep -Ec '^systemctl restart docker(\.service)?$' "$log") == 1 ]] || fail 'installer did not own exactly one Docker policy restart'
+  [[ $(grep -Ec '^docker compose .* pause controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller drain'
+  [[ $(grep -Ec '^docker compose .* stop .* controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller stop'
+  [[ $(grep -Ec '^docker compose .* up .* controller$' "$log") == 1 ]] || fail 'installer ran a sibling or missing controller resume'
+  [[ $(grep -Ec '^docker network create ' "$log") == 1 ]] || fail 'installer did not run exactly one bounded network probe'
+  [[ $(grep -Ec '^docker network rm ' "$log") == 1 ]] || fail 'installer did not clean up exactly one bounded network probe'
+}
+
+export FAKE_TRANSACTION_LOG=$tmp/docker-policy-transaction.log
+managed_daemon_snapshot=$tmp/managed-daemon.json
+managed_marker_snapshot=$tmp/managed-policy-marker.json
+malformed_daemon_snapshot=$tmp/malformed-daemon.json
+cp "$daemon_config" "$managed_daemon_snapshot"
+cp "$policy_marker" "$managed_marker_snapshot"
+printf '{"unrelated-setting": "preserve"\n' >"$daemon_config"
+cp "$daemon_config" "$malformed_daemon_snapshot"
+export FAKE_COMPOSE_LOG=$tmp/malformed-daemon-compose.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_TRANSACTION_LOG"
+malformed_checkpoint_count=$(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d | wc -l)
+malformed_daemon_output=$tmp/malformed-daemon.out
+set +e
+"$installer" --install "${base_args[@]}" --ref "$ref_one" >"$malformed_daemon_output" 2>&1
+malformed_daemon_status=$?
+set -e
+((malformed_daemon_status != 0)) || fail 'malformed managed daemon.json was reconciled'
+[[ $(find "$root/var/lib/ci-fleet/checkpoints" -mindepth 1 -maxdepth 1 -type d | wc -l) == "$malformed_checkpoint_count" ]] || fail 'malformed managed daemon.json created a checkpoint before rejection'
+cmp -s "$malformed_daemon_snapshot" "$daemon_config" || fail 'malformed managed daemon.json changed before rejection'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'malformed managed daemon.json changed its policy marker before rejection'
+malformed_policy_transaction_log=$tmp/malformed-policy-transaction.log
+grep -E '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up) .*controller|network (create|rm) )' "$FAKE_TRANSACTION_LOG" >"$malformed_policy_transaction_log" || true
+[[ ! -s "$malformed_policy_transaction_log" ]] || fail "malformed managed daemon.json entered a policy transaction: $(<"$malformed_policy_transaction_log")"
+if grep -Eq '^(pause|stop|up|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'malformed managed daemon.json mutated the controller'; fi
+cp "$managed_daemon_snapshot" "$daemon_config"
+cp "$managed_marker_snapshot" "$policy_marker"
+unset FAKE_COMPOSE_LOG
+
+chmod 0660 "$daemon_config"
+untrusted_daemon_output=$tmp/untrusted-daemon-metadata.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$untrusted_daemon_output" 2>&1
+untrusted_daemon_status=$?
+set -e
+[[ "$untrusted_daemon_status" == 3 ]] || fail "group-writable daemon.json drift returned $untrusted_daemon_status instead of 3: $(<"$untrusted_daemon_output")"
+grep -Fq 'DRIFT docker_network_policy' "$untrusted_daemon_output" || fail "group-writable daemon.json drift was not reported: $(<"$untrusted_daemon_output")"
+cmp -s "$managed_daemon_snapshot" "$daemon_config" || fail 'daemon metadata fixture changed daemon.json bytes'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'daemon metadata fixture changed the verified policy generation'
+chmod 0600 "$daemon_config"
+
+daemon_config_dir=$(dirname "$daemon_config")
+chmod 0770 "$daemon_config_dir"
+untrusted_daemon_parent_output=$tmp/untrusted-daemon-parent.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$untrusted_daemon_parent_output" 2>&1
+untrusted_daemon_parent_status=$?
+set -e
+chmod 0755 "$daemon_config_dir"
+[[ "$untrusted_daemon_parent_status" == 3 ]] || fail "group-writable daemon config parent drift returned $untrusted_daemon_parent_status instead of 3: $(<"$untrusted_daemon_parent_output")"
+grep -Fq 'DRIFT docker_network_policy' "$untrusted_daemon_parent_output" || fail "group-writable daemon config parent drift was not reported: $(<"$untrusted_daemon_parent_output")"
+cmp -s "$managed_daemon_snapshot" "$daemon_config" || fail 'daemon parent metadata fixture changed daemon.json bytes'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'daemon parent metadata fixture changed the verified policy generation'
+[[ ${CI_FLEET_TEST_STOP_AFTER_UNTRUSTED_DAEMON_PARENT:-0} != 1 ]] || { printf 'UNTRUSTED_DAEMON_PARENT_REGRESSION_OK\n'; exit 0; }
+
+rm -f "$daemon_config"
+expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+: >"$FAKE_TRANSACTION_LOG"
+missing_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$missing_policy_repair" || fail 'same-commit missing Docker policy was not repaired by the apply engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+
+printf '{"unrelated-setting":"preserve","default-address-pools":[{"base":"10.64.0.0/24","size":27}]}\n' >"$daemon_config"
+expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+: >"$FAKE_TRANSACTION_LOG"
+corrupt_policy_repair=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$corrupt_policy_repair" || fail 'same-commit corrupt Docker policy was not repaired by the apply engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+python3 -c 'import json, sys; assert json.load(open(sys.argv[1], encoding="utf-8"))["unrelated-setting"] == "preserve"' "$daemon_config" || fail 'Docker policy repair did not preserve unrelated daemon config'
+
+without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
+: >"$FAKE_TRANSACTION_LOG"
+policy_removal=$(expect_success "$installer" --upgrade "${base_args[@]}" --ref "$without_policy_ref")
+grep -Fq 'NETWORK_POLICY_REMOVED' <<<"$policy_removal" || fail 'omitted managed Docker policy did not enter transactional removal'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+python3 - "$daemon_config" <<'PY' || fail 'transactional policy removal retained the managed key'
+import json
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+except FileNotFoundError:
+    value = {}
+assert "default-address-pools" not in value
+PY
+no_policy_rendered=$tmp/no-policy-rendered.env
+cp "$root/etc/ci-fleet/ci-fleet.env" "$no_policy_rendered"
+export FAKE_COMPOSE_LOG=$tmp/policy-mismatch-rollback-compose.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_TRANSACTION_LOG"
+policy_mismatch_rollback_output=$tmp/policy-mismatch-rollback.out
+set +e
+"$installer" --rollback >"$policy_mismatch_rollback_output" 2>&1
+policy_mismatch_rollback_status=$?
+set -e
+((policy_mismatch_rollback_status != 0)) || fail 'manual rollback accepted a Docker network-policy mismatch'
+if grep -Fq 'ROLLBACK_OK' "$policy_mismatch_rollback_output"; then fail 'policy-mismatched rollback reported success'; fi
+grep -Fq 'rollback requires Docker network-policy reconciliation' "$policy_mismatch_rollback_output" || fail "policy-mismatched rollback returned the wrong error: $(<"$policy_mismatch_rollback_output")"
+cmp -s "$no_policy_rendered" "$root/etc/ci-fleet/ci-fleet.env" || fail 'policy-mismatched rollback changed the installed no-policy configuration'
+[[ ! -e "$policy_marker" && ! -L "$policy_marker" ]] || fail 'policy-mismatched rollback recreated the managed policy marker'
+python3 - "$daemon_config" <<'PY' || fail 'policy-mismatched rollback restored managed daemon pools'
+import json
+import os
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
+assert "default-address-pools" not in value
+PY
+if grep -Eq '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up|kill|down|rm) .*controller|network (create|rm) |rm )' "$FAKE_TRANSACTION_LOG"; then
+  fail 'policy-mismatched rollback caused a Compose, Docker, or controller mutation'
+fi
+if grep -Eq '^(pause|stop|up|kill|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'policy-mismatched rollback invoked Compose'; fi
+unset FAKE_COMPOSE_LOG
+: >"$FAKE_TRANSACTION_LOG"
+no_policy=$(expect_success "$installer" --install "${base_args[@]}" --ref "$without_policy_ref")
+grep -Fq 'NO_CHANGE' <<<"$no_policy" || fail 'no-policy host without a managed marker was not a no-op'
+if grep -Eq '^systemctl restart docker(\.service)?$|^docker (compose .* (pause|stop|up) .*controller|network (create|rm) )' "$FAKE_TRANSACTION_LOG"; then
+  fail 'no-policy host without a managed marker entered a policy transaction'
+fi
+ref_one=$(write_config active 1 1)
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+
+pre_adapter_ref=003de44f7e27d7bfe5bb753098efb6eb5f9712f1
+pre_adapter_manifest=$tmp/pre-adapter-engine-capabilities.json
+git -C "$repo_root" show "$pre_adapter_ref:engine-capabilities.json" >"$pre_adapter_manifest"
+python3 - "$pre_adapter_manifest" <<'PY' || fail 'pre-adapter release does not advertise Docker network-policy configuration'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["capabilities"]["docker_network_policy_config"] is True
+PY
+if git -C "$repo_root" cat-file -e "$pre_adapter_ref:scripts/docker-network-policy-adapter.sh" 2>/dev/null; then
+  fail 'pre-adapter release unexpectedly contains the Docker network-policy adapter'
+fi
+pre_adapter_checkout=$tmp/pre-adapter-checkout
+git clone -q --no-checkout "$repo_root" "$pre_adapter_checkout"
+git -C "$pre_adapter_checkout" checkout -q --detach "$pre_adapter_ref"
+[[ $(git -C "$pre_adapter_checkout" rev-parse HEAD) == "$pre_adapter_ref" ]] || fail 'pre-adapter checkout did not resolve to the exact historical engine'
+pre_adapter_root=$tmp/pre-adapter-host
+pre_adapter_pem=$pre_adapter_root/etc/ci-fleet/secrets/github-app.pem
+pre_adapter_host_config=$pre_adapter_root/etc/ci-fleet/host.env
+pre_adapter_args=(--config-repo "$config_repo" --controller example-ci-01 --host-config "$pre_adapter_host_config")
+pre_adapter_env=(
+  env
+  CI_FLEET_ROOT_PREFIX="$pre_adapter_root"
+  CI_FLEET_DOCKER_ROOT="$pre_adapter_root/var/lib/docker"
+  FAKE_DOCKER_STATE="$tmp/pre-adapter-controller-running"
+  FAKE_CONTROLLER_STATUS_FILE="$tmp/pre-adapter-controller-status"
+  FAKE_PAUSED_STATE="$tmp/pre-adapter-controller-paused"
+  FAKE_CONTROLLER_PROVENANCE_FILE="$tmp/pre-adapter-controller-provenance"
+  FAKE_CONTROLLER_IMAGE_ID_FILE="$tmp/pre-adapter-controller-image-id"
+  FAKE_CONTROLLER_ENV_FILE="$tmp/pre-adapter-controller-env"
+  FAKE_RUNNER_IMAGE_STATE="$tmp/pre-adapter-runner-image-present"
+  FAKE_CONTROLLER_IMAGE_STATE="$tmp/pre-adapter-controller-image-present"
+  FAKE_RUNNER_IMAGE_ID_STATE="$tmp/pre-adapter-runner-image-id"
+  FAKE_CONTROLLER_IMAGE_ID_STATE="$tmp/pre-adapter-controller-image-id-state"
+  FAKE_AVAILABLE_IMAGE_IDS="$tmp/pre-adapter-available-image-ids"
+)
+mkdir -p "$pre_adapter_root/etc/ci-fleet/secrets" "$pre_adapter_root/etc/ssl/certs" "$pre_adapter_root/etc/docker" "$pre_adapter_root/var/run" "$pre_adapter_root/var/lib/docker"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$pre_adapter_root/etc/os-release"
+printf 'fixture CA bundle\n' >"$pre_adapter_root/etc/ssl/certs/ca-certificates.crt"
+: >"$pre_adapter_root/var/run/docker.sock"
+printf 'fixture only\n' >"$pre_adapter_pem"
+chmod 600 "$pre_adapter_pem"
+printf '%s\n' \
+  'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
+  'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
+  "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$pre_adapter_pem" \
+  'CI_FLEET_RUNNER_TTL=6h' >"$pre_adapter_host_config"
+chmod 600 "$pre_adapter_host_config"
+head_runner_image=$FAKE_RUNNER_IMAGE
+head_controller_image=$FAKE_CONTROLLER_IMAGE
+pre_adapter_runner_image=ci-fleet-runner:${pre_adapter_ref:0:12}
+pre_adapter_controller_image=ci-fleet-controller:${pre_adapter_ref:0:12}
+pre_adapter_config_ref=$(write_config active 1 1 "$pre_adapter_ref" omit omit)
+FAKE_ENGINE_REF=$pre_adapter_ref
+FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
+pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$pre_adapter_checkout/scripts/install-worker-controller.sh" --install "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref")
+grep -Fq 'CONVERGED mode=install' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
+pre_adapter_runtime=$pre_adapter_root/opt/ci-fleet/releases/$pre_adapter_ref
+pre_adapter_manager=$pre_adapter_root/opt/ci-fleet/manager/releases/$pre_adapter_ref
+pre_adapter_current=$(readlink "$pre_adapter_root/opt/ci-fleet/current")
+pre_adapter_manager_current=$(readlink "$pre_adapter_root/opt/ci-fleet/manager/current")
+[[ "$pre_adapter_current" == "$pre_adapter_runtime" ]] || fail 'historical installer did not activate the pre-adapter runtime'
+[[ "$pre_adapter_manager_current" == "$pre_adapter_manager" ]] || fail 'historical installer did not activate the pre-adapter manager'
+[[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'historical installer added the adapter to a pre-adapter tree'
+pre_adapter_rendered=$tmp/pre-adapter-rendered.env
+cp "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" "$pre_adapter_rendered"
+FAKE_ENGINE_REF=$engine_ref
+FAKE_RUNNER_IMAGE=$head_runner_image
+FAKE_CONTROLLER_IMAGE=$head_controller_image
+export FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
+export FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
+pre_adapter_upgrade_ref=$(write_config active 1 1 "$engine_ref")
+export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
+: >"$FAKE_RESTART_AFTER_UP"
+pre_adapter_upgrade_output=$tmp/pre-adapter-upgrade.out
+set +e
+CI_FLEET_TRANSACTION_RESULT_FD=7 "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref" 7>/dev/null >"$pre_adapter_upgrade_output" 2>&1
+pre_adapter_upgrade_status=$?
+set -e
+unset FAKE_RESTART_AFTER_UP
+[[ "$pre_adapter_upgrade_status" == 20 ]] || fail "pre-adapter upgrade rollback returned $pre_adapter_upgrade_status instead of 20: $(<"$pre_adapter_upgrade_output")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED' "$pre_adapter_upgrade_output" || true) == 1 ]] || fail "pre-adapter upgrade did not emit exactly one restored marker: $(<"$pre_adapter_upgrade_output")"
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager_current" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
+cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
+pre_adapter_converged=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref")
+grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_converged" || fail 'post-rollback upgrade did not converge to the current engine'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current manager'
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+
+FAKE_ENGINE_REF=$pre_adapter_ref
+FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
+export FAKE_PRIOR_RUNNER_IMAGE=$head_runner_image
+export FAKE_PRIOR_CONTROLLER_IMAGE=$head_controller_image
+pre_adapter_policy_ref=$(write_config active 1 1 "$pre_adapter_ref")
+pre_adapter_snapshot=$tmp/pre-adapter-policy-snapshot
+pre_adapter_output=$tmp/pre-adapter-policy.out
+export FAKE_COMPOSE_LOG=$tmp/pre-adapter-policy-compose.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_TRANSACTION_LOG"
+cp -a "$pre_adapter_root" "$pre_adapter_snapshot"
+if "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_policy_ref" >"$pre_adapter_output" 2>&1; then
+  fail 'adapterless engine accepted a retained managed Docker policy'
+fi
+diff --no-dereference -r "$pre_adapter_snapshot" "$pre_adapter_root" >/dev/null || fail 'adapterless retained-policy rejection changed installed state'
+if grep -Eq '^(build|up|stop|pause|unpause|kill|down|rm|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then
+  fail 'adapterless retained-policy rejection invoked Compose or mutated Docker state'
+fi
+if grep -Eq '^systemctl restart docker(\.service)?$|^docker (network (create|rm) |rm |image (tag|rm) )' "$FAKE_TRANSACTION_LOG"; then
+  fail 'adapterless retained-policy rejection mutated Docker'
+fi
+rm -rf "$pre_adapter_snapshot"
+
+FAKE_ENGINE_REF=$engine_ref
+FAKE_RUNNER_IMAGE=$head_runner_image
+FAKE_CONTROLLER_IMAGE=$head_controller_image
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+pre_adapter_current_without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
+: >"$FAKE_TRANSACTION_LOG"
+pre_adapter_policy_removal=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_current_without_policy_ref")
+grep -Fq 'NETWORK_POLICY_REMOVED' <<<"$pre_adapter_policy_removal" || fail 'current engine did not remove managed policy before selecting the adapterless engine'
+assert_single_policy_transaction "$FAKE_TRANSACTION_LOG"
+pre_adapter_policy_marker=$pre_adapter_root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+[[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'current engine retained the managed policy marker before selecting the adapterless engine'
+
+FAKE_ENGINE_REF=$pre_adapter_ref
+FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
+export FAKE_PRIOR_RUNNER_IMAGE=$head_runner_image
+export FAKE_PRIOR_CONTROLLER_IMAGE=$head_controller_image
+pre_adapter_without_policy_ref=$(write_config active 1 1 "$pre_adapter_ref" false omit)
+: >"$FAKE_COMPOSE_LOG"
+pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_without_policy_ref")
+grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'adapterless engine with omitted policy did not converge'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'adapterless no-policy upgrade did not activate its runtime'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'adapterless no-policy upgrade did not activate its manager'
+[[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'adapterless no-policy upgrade retained the managed policy marker'
+[[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'installed pre-adapter release gained an adapter'
+
+FAKE_ENGINE_REF=$engine_ref
+FAKE_RUNNER_IMAGE=$head_runner_image
+FAKE_CONTROLLER_IMAGE=$head_controller_image
+FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
+FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
+ref_one=$(write_config active 1 1)
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+
+drift_policy() {
+  python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
+}
+
+# Equal wrapper and drain deadlines must leave timeout ownership with the
+# nested installer, which unpauses before returning its ordinary failure.
+timeout_ref=$(write_config active 2 2)
+drift_policy
+export CI_FLEET_COMMAND_TIMEOUT_SECONDS=1 CI_FLEET_DRAIN_TIMEOUT_SECONDS=1
+export FAKE_TIMEOUT_LOG=$tmp/policy-timeout.log
+export FAKE_RUNNER_STATE=$tmp/policy-timeout-runner
+export FAKE_KEEP_RUNNER_ON_PAUSE=1
+: >"$FAKE_TIMEOUT_LOG"
+: >"$FAKE_RUNNER_STATE"
+(
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    [[ ! -f "$FAKE_PAUSED_STATE" ]] || break
+    sleep 0.05
+  done
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    [[ -f "$FAKE_PAUSED_STATE" ]] || break
+    sleep 0.05
+  done
+  rm -f "$FAKE_RUNNER_STATE"
+) &
+timeout_runner_reaper=$!
+timeout_output=$tmp/policy-timeout.out
+set +e
+"$installer" --upgrade "${base_args[@]}" --ref "$timeout_ref" >"$timeout_output" 2>&1
+timeout_status=$?
+set -e
+wait "$timeout_runner_reaper"
+[[ "$timeout_status" != 124 ]] || fail 'outer policy command stole the nested drain timeout status'
+grep -Fq 'drain|2' "$FAKE_TIMEOUT_LOG" || fail "nested drain did not return its ordinary failure before the outer deadline: $(<"$FAKE_TIMEOUT_LOG")"
+[[ ! -f "$FAKE_PAUSED_STATE" ]] || fail 'nested drain timeout returned with the controller paused'
+unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+
+# A failure after resume must still run one bounded rollback-drain.
+drift_policy
+post_resume_pause=$tmp/post-resume-pause
+post_resume_result=$tmp/post-resume-result.json
+post_resume_output=$tmp/post-resume.out
+: >"$post_resume_pause"
+: >"$post_resume_result"
+: >"$FAKE_TIMEOUT_LOG"
+export FAKE_PAUSE_SYSTEMCTL_ONCE=$post_resume_pause
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$timeout_ref" 7>"$post_resume_result" >"$post_resume_output" 2>&1 &
+post_resume_pid=$!
+wait_for_file "$post_resume_pause.entered" 'post-resume rollback regression did not reach candidate activation'
+printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
+: >"$post_resume_pause.continue"
+set +e
+wait "$post_resume_pid"
+post_resume_status=$?
+set -e
+[[ "$post_resume_status" == 20 ]] || fail "post-resume failure returned $post_resume_status instead of 20: $(<"$post_resume_output")"
+grep -Fxq 'rollback-drain|0' "$FAKE_TIMEOUT_LOG" || fail "post-resume rollback-drain did not complete inside its own deadline: $(<"$FAKE_TIMEOUT_LOG")"
+[[ $(<"$post_resume_result") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] || fail 'post-resume failure did not report verified rollback'
+unset FAKE_PAUSE_SYSTEMCTL_ONCE CI_FLEET_COMMAND_TIMEOUT_SECONDS FAKE_TIMEOUT_LOG
+export CI_FLEET_DRAIN_TIMEOUT_SECONDS=2
+
+# Preserve A's durable recovery if B is hard-stopped after nested activation.
+interrupted_ref=$(write_config active 3 3)
+interrupted_env=$tmp/interrupted-a.env
+interrupted_state=$tmp/interrupted-a-state.json
+interrupted_daemon=$tmp/interrupted-a-daemon.json
+interrupted_marker=$tmp/interrupted-a-marker.json
+cp "$root/etc/ci-fleet/ci-fleet.env" "$interrupted_env"
+cp "$root/var/lib/ci-fleet/install-state.json" "$interrupted_state"
+cp "$daemon_config" "$interrupted_daemon"
+cp "$policy_marker" "$interrupted_marker"
+interrupted_current=$(readlink "$root/opt/ci-fleet/current")
+interrupted_manager=$(readlink "$root/opt/ci-fleet/manager/current")
+drift_policy
+interrupted_pause=$tmp/interrupted-policy-pause
+: >"$interrupted_pause"
+export FAKE_PAUSE_SYSTEMCTL_ONCE=$interrupted_pause
+setsid "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref" >"$tmp/interrupted-policy.out" 2>&1 &
+interrupted_pid=$!
+wait_for_file "$interrupted_pause.entered" 'interrupted recovery regression did not reach nested activation'
+interrupted_recovery=$(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*')
+[[ -n "$interrupted_recovery" && $(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*' | wc -l) == 1 ]] || fail 'interrupted policy apply did not retain one authoritative recovery'
+interrupted_recovery_inode=$(stat -c %i "$interrupted_recovery")
+mapfile -t interrupted_descendants < <(descendant_pids "$interrupted_pid")
+kill -KILL -- "-$interrupted_pid" "${interrupted_descendants[@]}" 2>/dev/null || true
+set +e
+wait "$interrupted_pid"
+set -e
+deadline=$((SECONDS + 5))
+for child in "${interrupted_descendants[@]}"; do
+  while [[ -e "/proc/$child" ]]; do
+    child_state=unknown
+    if IFS= read -r child_stat <"/proc/$child/stat" 2>/dev/null; then
+      child_state=${child_stat##*) }
+      child_state=${child_state%% *}
+    fi
+    [[ "$child_state" == Z ]] && break
+    ((SECONDS < deadline)) || fail "interrupted hard stop left child $child running (state $child_state)"
+    sleep 0.05
+  done
+done
+: >"$interrupted_pause.continue"
+grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'hard stop did not occur after B controller state was written'
+
+retry_pause=$tmp/interrupted-retry-pause
+retry_result=$tmp/interrupted-retry-result.json
+: >"$retry_pause"
+: >"$retry_result"
+FAKE_PAUSE_SYSTEMCTL_ONCE=$retry_pause CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref" 7>"$retry_result" >"$tmp/interrupted-retry.out" 2>&1 &
+retry_pid=$!
+wait_for_file "$retry_pause.entered" 'interrupted policy retry did not reach nested activation'
+[[ -d "$interrupted_recovery" && $(stat -c %i "$interrupted_recovery") == "$interrupted_recovery_inode" ]] || fail 'interrupted policy retry replaced the original recovery checkpoint'
+[[ $(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*' | wc -l) == 1 ]] || fail 'interrupted policy retry created a second recovery checkpoint'
+printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
+: >"$retry_pause.continue"
+set +e
+wait "$retry_pid"
+retry_status=$?
+set -e
+[[ "$retry_status" == 20 && $(<"$retry_result") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] || fail "interrupted policy retry did not roll back through the original checkpoint: $(<"$tmp/interrupted-retry.out")"
+cmp -s "$interrupted_env" "$root/etc/ci-fleet/ci-fleet.env" || fail 'interrupted policy rollback restored B instead of A environment'
+cmp -s "$interrupted_state" "$root/var/lib/ci-fleet/install-state.json" || fail 'interrupted policy rollback restored B instead of A install state'
+cmp -s "$interrupted_daemon" "$daemon_config" || fail 'interrupted policy rollback did not restore A daemon.json'
+cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollback did not restore A policy marker'
+[[ $(readlink "$root/opt/ci-fleet/current") == "$interrupted_current" && $(readlink "$root/opt/ci-fleet/manager/current") == "$interrupted_manager" ]] || fail 'interrupted policy rollback did not restore A pointers'
+unset FAKE_PAUSE_SYSTEMCTL_ONCE
+
+# TERM only the outer installer while its nested resume is paused.
+term_ref=$(write_config active 4 4)
+term_daemon=$tmp/parent-term-daemon.json
+term_marker=$tmp/parent-term-marker.json
+term_env=$tmp/parent-term.env
+term_state=$tmp/parent-term-state.json
+cp "$daemon_config" "$term_daemon"
+cp "$policy_marker" "$term_marker"
+cp "$root/etc/ci-fleet/ci-fleet.env" "$term_env"
+cp "$root/var/lib/ci-fleet/install-state.json" "$term_state"
+term_current=$(readlink "$root/opt/ci-fleet/current")
+term_manager=$(readlink "$root/opt/ci-fleet/manager/current")
+drift_policy
+parent_term_pause=$tmp/parent-only-term-pause
+parent_term_result=$tmp/parent-only-term-result.json
+: >"$parent_term_pause"
+: >"$parent_term_result"
+export FAKE_PAUSE_SYSTEMCTL_ONCE=$parent_term_pause
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$term_ref" 7>"$parent_term_result" >"$tmp/parent-only-term.out" 2>&1 &
+parent_term_pid=$!
+wait_for_file "$parent_term_pause.entered" 'parent-only TERM regression did not reach nested activation'
+mapfile -t parent_term_descendants < <(descendant_pids "$parent_term_pid")
+kill -TERM "$parent_term_pid"
+: >"$parent_term_pause.continue"
+set +e
+wait "$parent_term_pid"
+parent_term_status=$?
+set -e
+[[ "$parent_term_status" == 20 ]] || fail "parent-only TERM returned $parent_term_status instead of 20: $(<"$tmp/parent-only-term.out")"
+[[ $(wc -l <"$parent_term_result") == 1 && $(<"$parent_term_result") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] || fail 'parent-only TERM did not emit exactly one rollback_verified result'
+cmp -s "$term_daemon" "$daemon_config" || fail 'parent-only TERM did not restore daemon.json byte-for-byte'
+cmp -s "$term_marker" "$policy_marker" || fail 'parent-only TERM did not restore the policy marker byte-for-byte'
+cmp -s "$term_env" "$root/etc/ci-fleet/ci-fleet.env" || fail 'parent-only TERM did not restore the prior environment'
+cmp -s "$term_state" "$root/var/lib/ci-fleet/install-state.json" || fail 'parent-only TERM did not restore the prior controller state'
+[[ $(readlink "$root/opt/ci-fleet/current") == "$term_current" && $(readlink "$root/opt/ci-fleet/manager/current") == "$term_manager" ]] || fail 'parent-only TERM did not restore prior pointers'
+for child in "${parent_term_descendants[@]}"; do
+  [[ ! -e "/proc/$child" ]] || fail "parent-only TERM left child $child running"
+done
+unset FAKE_PAUSE_SYSTEMCTL_ONCE
+
+# Cleanup failure after the verified generation is committed is not rollback.
+post_commit_ref=$(write_config active 5 5)
+drift_policy
+post_commit_pause=$tmp/post-commit-pause
+post_commit_result=$tmp/post-commit-result.json
+post_commit_cleanup=$tmp/post-commit-cleanup-failure
+: >"$post_commit_pause"
+: >"$post_commit_result"
+export FAKE_PAUSE_SYSTEMCTL_ONCE=$post_commit_pause
+export FAKE_FAIL_RECOVERY_CLEANUP_ONCE=$post_commit_cleanup
+export FAKE_POLICY_CHECKPOINT_DIR=$policy_checkpoint_dir
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$post_commit_ref" 7>"$post_commit_result" >"$tmp/post-commit-cleanup.out" 2>&1 &
+post_commit_pid=$!
+wait_for_file "$post_commit_pause.entered" 'post-commit cleanup regression did not reach nested activation'
+: >"$post_commit_cleanup"
+: >"$post_commit_pause.continue"
+set +e
+wait "$post_commit_pid"
+post_commit_status=$?
+set -e
+[[ "$post_commit_status" == 2 ]] || fail "post-commit cleanup failure returned $post_commit_status instead of original status 2: $(<"$tmp/post-commit-cleanup.out")"
+[[ $(wc -l <"$post_commit_result") == 1 && $(<"$post_commit_result") == '{"schema_version":1,"outcome":"applied"}' ]] || fail 'post-commit cleanup failure did not emit exactly one applied result'
+grep -Fxq 'CI_FLEET_MAX_RUNNERS=5' "$root/etc/ci-fleet/ci-fleet.env" || fail 'post-commit cleanup failure rolled back the candidate controller'
+grep -Fxq 'CI_FLEET_MAX_RUNNERS=5' "$FAKE_CONTROLLER_ENV_FILE" || fail 'post-commit cleanup failure deactivated the candidate controller'
+python3 - "$daemon_config" "$policy_marker" <<'PY' || fail 'post-commit cleanup failure left an uncommitted policy generation'
+import hashlib, json, pathlib, sys
+daemon = pathlib.Path(sys.argv[1]).read_bytes()
+marker = json.loads(pathlib.Path(sys.argv[2]).read_text())
+assert marker["verified_generation"] == hashlib.sha256(daemon).hexdigest()
+PY
+unset FAKE_PAUSE_SYSTEMCTL_ONCE FAKE_FAIL_RECOVERY_CLEANUP_ONCE FAKE_POLICY_CHECKPOINT_DIR
+expect_success "$installer" --install "${base_args[@]}" --ref "$post_commit_ref" >/dev/null
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_COMPOSE_LOG FAKE_TRANSACTION_LOG
+
 git -C "$config_repo" commit -q --allow-empty -m 'missing manager upgrade fixture'
 missing_manager_ref=$(git -C "$config_repo" rev-parse HEAD)
 rm -f "$root/opt/ci-fleet/manager/current"
@@ -987,6 +1586,7 @@ rm -rf "$fallback_checkpoint"
 [[ ${CI_FLEET_TEST_STOP_AFTER_FALLBACK_AUTHORITY:-0} != 1 ]] || { printf 'FALLBACK_AUTHORITY_REGRESSIONS_OK\n'; exit 0; }
 format_two_baseline=$tmp/format-two-no-target-baseline
 cp -a "$root" "$format_two_baseline"
+expect_success "$installer" --upgrade "${base_args[@]}" --ref "$without_policy_ref" >/dev/null
 format_two_no_target=$root/var/lib/ci-fleet/checkpoints/format-two-no-target
 cp -a "$pointer_checkpoint" "$format_two_no_target"
 printf '2\n' >"$format_two_no_target/format-version"
@@ -1213,12 +1813,7 @@ printf 'sha256:%064d\n' 0 >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$FAKE_CANDIDATE_CONTROLLER_IMAGE_ID" ]] || fail 'controller convergence did not restore live image identity'
-python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace("CI_FLEET_MAX_RUNNERS=1", "CI_FLEET_MAX_RUNNERS=9"))' "$FAKE_CONTROLLER_ENV_FILE"
-grep -Fxq 'CI_FLEET_MAX_RUNNERS=9' "$FAKE_CONTROLLER_ENV_FILE" || fail 'live-environment fixture did not mutate'
-expect_failure 'DRIFT controller_runtime' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
-grep -Fxq 'CI_FLEET_MAX_RUNNERS=1' "$FAKE_CONTROLLER_ENV_FILE" || fail 'controller convergence did not restore live environment'
-for key in CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
+for key in CI_FLEET_MAX_RUNNERS CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
   expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$FAKE_CONTROLLER_ENV_FILE")
   [[ $expected =~ ^[0-9]+$ ]] || fail "live environment lacks numeric $key"
   replacement=$((expected + 1))
@@ -1282,6 +1877,26 @@ printf '{"schema_version":1,"capabilities":null}\n' >"$active_release/engine-cap
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" >/dev/null || fail 'engine capability declaration was not repaired'
+python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" --require-docker-network-policy-config >/dev/null || fail 'active release does not advertise Docker network policy support'
+for required_policy_script in apply-docker-network-policy.sh docker-network-policy-adapter.sh; do
+  required_policy_path=$active_release/scripts/$required_policy_script
+  rm -f "$required_policy_path"
+  expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+  [[ -f "$required_policy_path" && ! -L "$required_policy_path" && -x "$required_policy_path" ]] || fail "advertised policy capability did not restore trusted executable $required_policy_script"
+done
+chmod 0644 "$active_release/scripts/docker-network-policy-adapter.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$active_release/scripts/docker-network-policy-adapter.sh" && ! -L "$active_release/scripts/docker-network-policy-adapter.sh" && -x "$active_release/scripts/docker-network-policy-adapter.sh" ]] || fail 'non-executable production policy adapter was not repaired as a trusted path'
+external_policy_adapter=$tmp/external-policy-adapter.sh
+printf '#!/usr/bin/env bash\nexit 0\n' >"$external_policy_adapter"
+chmod 0755 "$external_policy_adapter"
+rm -f "$active_release/scripts/docker-network-policy-adapter.sh"
+ln -s "$external_policy_adapter" "$active_release/scripts/docker-network-policy-adapter.sh"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -f "$active_release/scripts/docker-network-policy-adapter.sh" && ! -L "$active_release/scripts/docker-network-policy-adapter.sh" && -x "$active_release/scripts/docker-network-policy-adapter.sh" ]] || fail 'symlinked production policy adapter was not repaired as a trusted path'
 rm -f "$active_release/deploy/compose.yaml"
 export FAKE_FAIL_TAR_ONCE=$tmp/fail-tar-once
 : >"$FAKE_FAIL_TAR_ONCE"
@@ -1291,6 +1906,16 @@ unset FAKE_FAIL_TAR_ONCE
 if compgen -G "$root/opt/ci-fleet/releases/.${engine_ref}.staging.*" >/dev/null; then fail 'interrupted release staging was not cleaned'; fi
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+rm -f "$root/opt/ci-fleet/manager/current" "$active_release/scripts/docker-network-policy-adapter.sh"
+rm -rf "$manager_release"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
+archive_permissions=$(umask 0002; expect_success env FAKE_GROUP_WRITABLE_ARCHIVE=1 "$installer" --install "${base_args[@]}" --ref "$ref_one")
+grep -Fq 'CONVERGED mode=install' <<<"$archive_permissions" || fail 'safe archive extraction did not converge the policy repair'
+manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+for archive_path in "$active_release" "$active_release/scripts/docker-network-policy-adapter.sh" "$manager_release" "$manager_release/scripts/docker-network-policy-adapter.sh"; do
+  archive_mode=$(stat -c %a "$archive_path")
+  (( (8#$archive_mode & 8#22) == 0 )) || fail "archive extraction installed an untrusted group/world-writable path: $archive_path"
+done
 manager_release_backup=$tmp/manager-release-backup
 cp -a "$manager_release" "$manager_release_backup"
 printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"
@@ -1909,10 +2534,15 @@ unset FAKE_RUNNER_STATE
 export FAKE_ALL_RUNNER_STATE=$tmp/drained-exited-managed-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 : >"$FAKE_DOCKER_PS_LOG"
+python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["default-address-pools"][0]["size"] = 27; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$daemon_config"
 expect_failure 'DRIFT managed_runners' "$installer" --check "${base_args[@]}" --ref "$ref_three"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_three" >/dev/null
-[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'non-active convergence did not remove stopped managed runners'
-grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'managed runner cleanup was not scoped to the selected instance'
+policy_runner_cleanup=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_three")
+grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$policy_runner_cleanup" || fail 'drained policy drift did not use the policy apply path'
+[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'policy apply did not remove the stopped managed runner'
+grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'policy-path runner cleanup was not scoped to the selected instance'
+policy_runner_check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_three")
+grep -Fq 'CHECK_OK' <<<"$policy_runner_check" || fail "post-policy runner cleanup did not pass check: $policy_runner_check"
+if grep -Fq 'DRIFT managed_runners' <<<"$policy_runner_check"; then fail 'post-policy check retained managed-runner drift'; fi
 unset FAKE_ALL_RUNNER_STATE
 
 ref_four=$(write_config disabled 2 2)
@@ -1988,7 +2618,7 @@ unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
 export FAKE_DOCKER_STATE=$tmp/adopt-controller-running
-mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
+mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/etc/docker" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$adopt_root/etc/os-release"
 printf 'fixture CA bundle\n' >"$adopt_root/etc/ssl/certs/ca-certificates.crt"
 : >"$adopt_root/var/run/docker.sock"
@@ -2022,11 +2652,34 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
-expect_failure 'ROLLBACK_RESTORED' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+adopt_failure_output=$tmp/adopt-restart-loop.out
+set +e
+"$installer" --adopt "${base_args[@]}" --ref "$ref_one" >"$adopt_failure_output" 2>&1
+adopt_failure_status=$?
+set -e
+[[ "$adopt_failure_status" == 20 ]] || fail "adoption restart-loop rollback returned $adopt_failure_status instead of 20: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$adopt_failure_output" || true) == 1 ]] || fail "adoption restart-loop rollback did not emit exactly one restored marker: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ ! -e "$adopt_root/etc/docker/daemon.json" && ! -L "$adopt_root/etc/docker/daemon.json" ]] || fail 'adoption restart-loop rollback did not restore absent daemon.json'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
-unset FAKE_RESTART_AFTER_UP
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
+
+adopt_result_file=$adopt_root/transaction-result.json
+adopt_fd7_output=$tmp/adopt-restart-loop-fd7.out
+: >"$adopt_result_file"
+chmod 0600 "$adopt_result_file"
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_RESTART_AFTER_UP"
+set +e
+CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --adopt "${base_args[@]}" --ref "$ref_one" 7>"$adopt_result_file" >"$adopt_fd7_output" 2>&1
+adopt_fd7_status=$?
+set -e
+[[ "$adopt_fd7_status" == 20 ]] || fail "FD7 adoption restart-loop rollback returned $adopt_fd7_status instead of 20: $(<"$adopt_fd7_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$adopt_fd7_output" || true) == 1 ]] || fail "FD7 adoption restart-loop rollback did not emit exactly one restored marker: $(<"$adopt_fd7_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
+[[ $(wc -l <"$adopt_result_file") == 1 ]] || fail 'FD7 adoption restart-loop rollback did not write exactly one result line'
+[[ $(<"$adopt_result_file") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] || fail 'FD7 adoption restart-loop rollback wrote an unexpected result'
+[[ ! -e "$adopt_root/etc/docker/daemon.json" && ! -L "$adopt_root/etc/docker/daemon.json" ]] || fail 'FD7 adoption restart-loop rollback did not restore absent daemon.json'
+unset FAKE_RESTART_AFTER_UP
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_SYSTEMCTL_LOG=$tmp/reconcile-timer-state-systemctl.log
 : >"$FAKE_SYSTEMCTL_LOG"
@@ -2065,14 +2718,6 @@ legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
 legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
-legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit omit)
-export FAKE_PREVIOUS_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE
-export FAKE_PREVIOUS_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE
-export FAKE_ENGINE_REF=$legacy_engine_ref
-export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
-export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
-expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
-[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
 
 grep -Fq 'Issue #7' "$repo_root/docs/DESIGN-DECISIONS.md" || fail 'isolated proof approval is not recorded'
 if grep -Fq '/etc/ci-fleet/ci-fleet.env.before-max2' "$repo_root/docs/CAPACITY-PROMOTION.md"; then fail 'capacity runbook still edits rendered host state'; fi

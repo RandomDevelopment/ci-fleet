@@ -7,12 +7,16 @@
 #
 # Environment variables (all injected, never host-defaulted):
 #   CI_FLEET_DOCKER_DAEMON_CONFIG   absolute path to daemon.json
-#   CI_FLEET_DOCKER_DRAIN_COMMAND   path to a host drain script (runs before mutation)
+#   CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER trusted production primitive adapter
+#   CI_FLEET_DOCKER_DRAIN_COMMAND   test-only injected drain command
 #   CI_FLEET_DOCKER_RESTART_COMMAND path to a Docker restart script
 #   CI_FLEET_CONTROLLER_RESUME_COMMAND path to a controller resume/start script
 #   CI_FLEET_DOCKER_NETWORK_PROBE   path to a capacity probe script
 #   CI_FLEET_HEALTH_CHECK_COMMAND   path to a health-check script
+#   CI_FLEET_POLICY_CHECKPOINT      original installer checkpoint for recovery
 #   CI_FLEET_COMMAND_TIMEOUT_SECONDS command timeout in seconds (default 300)
+#   CI_FLEET_DRAIN_TIMEOUT_SECONDS  controller drain timeout in seconds (default 300)
+#   CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS adapter resume timeout in seconds (default 3600)
 #   CI_FLEET_TESTING                when 1, relaxes root/strict checks
 set -Eeuo pipefail
 
@@ -228,7 +232,11 @@ restart_command=${CI_FLEET_DOCKER_RESTART_COMMAND:-}
 resume_command=${CI_FLEET_CONTROLLER_RESUME_COMMAND:-}
 probe_command=${CI_FLEET_DOCKER_NETWORK_PROBE:-}
 health_command=${CI_FLEET_HEALTH_CHECK_COMMAND:-}
+adapter_command=${CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER:-}
+controller_checkpoint=${CI_FLEET_POLICY_CHECKPOINT:-}
 command_timeout=${CI_FLEET_COMMAND_TIMEOUT_SECONDS:-300}
+drain_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
+resume_timeout=${CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS:-3600}
 
 validate_command() {
   local name=$1 path=$2
@@ -240,13 +248,49 @@ run_command() {
   timeout --kill-after=5 "$command_timeout" "$@" 9>&- >/dev/null 2>&1
 }
 
+run_primitive() {
+  local action=$1
+  shift
+  if [[ -n "$adapter_command" ]]; then
+    local status=0 timeout_seconds=$command_timeout
+    case "$action" in
+      drain|rollback-drain|restore)
+        timeout_seconds=$((2 * drain_timeout + 30))
+        ((timeout_seconds >= command_timeout)) || timeout_seconds=$command_timeout
+        ;;
+      resume) timeout_seconds=$resume_timeout ;;
+    esac
+    timeout --kill-after=5 "$timeout_seconds" "$adapter_command" "$action" "$@" >/dev/null || status=$?
+    return "$status"
+  fi
+  case "$action" in
+    drain|rollback-drain) run_command "$drain_command" "$@" ;;
+    restart) run_command "$restart_command" "$@" ;;
+    probe) run_command "$probe_command" "$@" ;;
+    resume|restore) run_command "$resume_command" "$@" ;;
+    health) run_command "$health_command" "$@" ;;
+  esac
+}
+
+transaction_result_enabled() {
+  [[ ${CI_FLEET_TRANSACTION_RESULT_FD:-} == 7 && -e /proc/self/fd/7 ]]
+}
+
+write_transaction_result() {
+  local outcome=$1
+  transaction_result_enabled || return 0
+  printf '{"schema_version":1,"outcome":"%s"}\n' "$outcome" >&7
+}
+
 run_health() {
   local status=0
-  CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1 run_command "$health_command" --env "$1" || status=$?
+  CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1 run_primitive health --env "$1" || status=$?
   ((status < 2))
 }
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
+[[ "$drain_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_DRAIN_TIMEOUT_SECONDS must be a positive integer'
+[[ "$resume_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS must be a positive integer'
 [[ -n "$daemon_config" ]] || die 'CI_FLEET_DOCKER_DAEMON_CONFIG is required when a network policy is configured'
 validate_trusted_path CI_FLEET_DOCKER_DAEMON_CONFIG "$daemon_config" regular true
 [[ ! -e "$daemon_config" || ! /proc/self/fd/9 -ef "$daemon_config" ]] || die 'installer lock and daemon paths must be separate'
@@ -258,11 +302,16 @@ if [[ "$removing" == true && ! -e "$checkpoint_dir" ]]; then
   printf 'NETWORK_POLICY_NOOP\n'
   exit 0
 fi
-validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
-validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
-validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
-validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
-validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
+if [[ -n "$adapter_command" ]]; then
+  validate_command CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER "$adapter_command"
+  [[ -z "$controller_checkpoint" ]] || validate_trusted_path CI_FLEET_POLICY_CHECKPOINT "$controller_checkpoint" checkpoint
+else
+  validate_command CI_FLEET_DOCKER_DRAIN_COMMAND "$drain_command"
+  validate_command CI_FLEET_DOCKER_RESTART_COMMAND "$restart_command"
+  validate_command CI_FLEET_CONTROLLER_RESUME_COMMAND "$resume_command"
+  validate_command CI_FLEET_HEALTH_CHECK_COMMAND "$health_command"
+  validate_command CI_FLEET_DOCKER_NETWORK_PROBE "$probe_command"
+fi
 
 checkpoint_path_is_pinned() {
   [[ ! -L "$checkpoint_dir" && $(readlink -f /proc/self/fd/8) == "$checkpoint_dir" ]]
@@ -289,11 +338,15 @@ fi
 
 # Snapshot the installer's authoritative pre-transaction environment while
 # holding its lock. Rollback must not validate against the rejected candidate.
-installed_env=${CI_FLEET_ROOT_PREFIX:-}/etc/ci-fleet/ci-fleet.env
-validate_trusted_path 'installed rendered env' "$installed_env" regular
-[[ -r "$installed_env" ]] || die "installed rendered env must be readable: $installed_env"
 prior_env=$work_dir/prior-ci-fleet.env
-install -m 0600 -- "$installed_env" "$prior_env"
+installed_env=${CI_FLEET_ROOT_PREFIX:-}/etc/ci-fleet/ci-fleet.env
+if [[ -e "$installed_env" || -z "$adapter_command" ]]; then
+  validate_trusted_path 'installed rendered env' "$installed_env" regular
+  [[ -r "$installed_env" ]] || die "installed rendered env must be readable: $installed_env"
+  install -m 0600 -- "$installed_env" "$prior_env"
+else
+  install -m 0600 /dev/null "$prior_env"
+fi
 
 drain_failure=
 new_marker=false
@@ -305,13 +358,13 @@ apply_phase=
 cancelling_first_apply=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
-  local status=$? resume_failed=0 health_failed=0
+  local status=$? resume_failed=0 health_failed=0 result
   trap '' INT TERM
   trap - EXIT
   if [[ "$controller_resumed" == true ]]; then
-    run_command "$drain_command" || resume_failed=1
+    run_primitive rollback-drain || resume_failed=1
   fi
-  ((resume_failed != 0)) || run_command "$resume_command" --env "$prior_env" || resume_failed=1
+  ((resume_failed != 0)) || run_primitive restore --env "$prior_env" || resume_failed=1
   ((resume_failed != 0)) || run_health "$prior_env" || health_failed=1
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" == true ]]; then
     complete_first_apply_rollback || resume_failed=1
@@ -334,7 +387,15 @@ resume_after_failed_drain() {
   else
     printf 'ERROR: %s\n' "$drain_failure" >&2
   fi
-  exit "$status"
+  result=$status
+  if ((resume_failed == 0 && health_failed == 0)); then
+    write_transaction_result rollback_verified
+    if transaction_result_enabled; then result=20; fi
+  else
+    write_transaction_result rollback_unverified
+    if transaction_result_enabled; then result=21; fi
+  fi
+  exit "$result"
 }
 
 drain_controller() {
@@ -343,7 +404,7 @@ drain_controller() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap resume_after_failed_drain EXIT
-  run_command "$drain_command" || status=$?
+  run_primitive drain || status=$?
   ((status == 0)) || exit "$status"
 }
 
@@ -620,10 +681,10 @@ PY
 persist_recovery() {
   local daemon_source=${1:-} env_source=${2:-$prior_env}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "$daemon_source" "$env_source" <<'PY'
+  python3 - "$state_file" "$daemon_source" "$env_source" "$controller_checkpoint" <<'PY'
 import os, shutil, sys, tempfile
 
-state_path, daemon_source, env_source = sys.argv[1:]
+state_path, daemon_source, env_source, controller_checkpoint = sys.argv[1:]
 parent = os.path.dirname(state_path)
 staged = tempfile.mkdtemp(prefix=".recovery.", dir=parent)
 try:
@@ -635,6 +696,13 @@ try:
         target = os.path.join(staged, name)
         with open(source, "rb") as source_handle, open(target, "xb") as target_handle:
             shutil.copyfileobj(source_handle, target_handle)
+            os.fchmod(target_handle.fileno(), 0o600)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+    if controller_checkpoint:
+        target = os.path.join(staged, "controller-checkpoint")
+        with open(target, "x", encoding="utf-8") as target_handle:
+            target_handle.write(controller_checkpoint + "\n")
             os.fchmod(target_handle.fileno(), 0o600)
             target_handle.flush()
             os.fsync(target_handle.fileno())
@@ -659,7 +727,7 @@ PY
 
 clear_recovery_artifacts() {
   checkpoint_path_is_pinned || return 1
-  python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY'
+  python3 - "$checkpoint_dir" "$checkpoint_owner" <<'PY' || return $?
 import os, shutil, stat, sys
 
 parent, owner = sys.argv[1], int(sys.argv[2])
@@ -672,7 +740,7 @@ for entry in os.scandir(parent):
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise SystemExit(1)
     files = {child.name: child for child in os.scandir(entry.path)}
-    if not set(files) <= {"daemon.json.before", "prior-ci-fleet.env"}:
+    if not set(files) <= {"controller-checkpoint", "daemon.json.before", "prior-ci-fleet.env"}:
         raise SystemExit(1)
     for child in files.values():
         metadata = child.stat(follow_symlinks=False)
@@ -707,7 +775,7 @@ metadata = recovery.stat(follow_symlinks=False)
 if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o700:
     raise SystemExit(1)
 entries = {entry.name: entry for entry in os.scandir(recovery.path)}
-if set(entries) not in ({"prior-ci-fleet.env"}, {"daemon.json.before", "prior-ci-fleet.env"}):
+if not {"prior-ci-fleet.env"} <= set(entries) <= {"controller-checkpoint", "daemon.json.before", "prior-ci-fleet.env"}:
     raise SystemExit(1)
 for entry in entries.values():
     metadata = entry.stat(follow_symlinks=False)
@@ -844,10 +912,10 @@ PY
   absent_removal_recovery=false
   if [[ "$prior_present" == false && -z "$prior_verified_generation" && "$has_verified_generation" == true && ! -e "$daemon_config" && ! -L "$daemon_config" && "$removal_pending" != true ]]; then
     drain_controller 'drain command failed before interrupted network-policy recovery'
-    run_command "$restart_command" "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
-    run_command "$probe_command" || die 'capacity probe failed while recovering interrupted network-policy apply'
+    run_primitive restart "$daemon_dir" || die 'Docker restart command failed while recovering interrupted network-policy apply'
+    run_primitive probe || die 'capacity probe failed while recovering interrupted network-policy apply'
     controller_resumed=true
-    run_command "$resume_command" --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
+    run_primitive resume --env "$env_file" || die 'controller resume command failed while recovering interrupted network-policy apply'
     run_health "$env_file" || die 'health check failed while recovering interrupted network-policy apply'
     complete_first_apply_rollback || die 'failed to complete interrupted network-policy rollback'
     trap - EXIT INT TERM
@@ -958,7 +1026,7 @@ PY
   rollback_removal() {
     local failed=0 rollback_daemon=$work_dir/daemon.json.rollback rollback_expected=$work_dir/daemon.json.rollback-expected
     if [[ "$controller_resumed" == true ]]; then
-      run_command "$drain_command" || failed=1
+      run_primitive rollback-drain || failed=1
     fi
     if ((failed == 0)); then
       python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" <<'PY' || failed=1
@@ -991,10 +1059,10 @@ PY
       cmp -s "$rollback_daemon" "$daemon_config" || failed=1
     fi
     if ((failed == 0)); then
-      run_command "$restart_command" "$daemon_dir" || failed=1
+      run_primitive restart "$daemon_dir" || failed=1
     fi
     if ((failed == 0)); then
-      run_command "$resume_command" --env "$prior_env" || failed=1
+      run_primitive restore --env "$prior_env" || failed=1
     fi
     if ((failed == 0)); then
       run_health "$prior_env" || failed=1
@@ -1009,26 +1077,33 @@ PY
   }
   # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
   removal_on_exit() {
-    local status=$?
+    local status=$? result
     trap '' INT TERM
     trap - EXIT
     ((status != 0)) || status=1
+    result=$status
     if rollback_removal; then
       rm -rf "$work_dir"
       printf 'ERROR: %s; managed daemon.json restored\n' "$removal_failure" >&2
+      write_transaction_result rollback_verified
+      if transaction_result_enabled; then result=20; fi
     else
       if [[ -n "$transaction_recovery" ]]; then
         recovery_path=$transaction_recovery
       else
         recovery_path=$(persist_recovery "$managed_snapshot" "$prior_env") || {
           printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$removal_failure" >&2
+          write_transaction_result rollback_unverified
+          if transaction_result_enabled; then exit 21; fi
           exit "$status"
         }
       fi
       rm -rf "$work_dir"
       printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$removal_failure" "$recovery_path" >&2
+      write_transaction_result rollback_unverified
+      if transaction_result_enabled; then result=21; fi
     fi
-    exit "$status"
+    exit "$result"
   }
   trap removal_on_exit EXIT
   trap 'exit 130' INT
@@ -1055,12 +1130,12 @@ PY
     atomic_replace_daemon "$removal_daemon" "$managed_mode" "$managed_gid" || { removal_failure='failed to install prior network-policy key state'; exit 2; }
     cmp -s "$removal_daemon" "$daemon_config" || { removal_failure='failed to verify prior network-policy key state'; exit 2; }
   fi
-  run_command "$restart_command" "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
-  run_command "$probe_command" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
+  run_primitive restart "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
+  run_primitive probe || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   controller_resumed=true
   activation_env=$env_file
   [[ "$cancelling_first_apply" != true ]] || activation_env=$prior_env
-  run_command "$resume_command" --env "$activation_env" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
+  run_primitive resume --env "$activation_env" || { removal_failure='controller resume command failed during network-policy removal'; exit 2; }
   run_health "$activation_env" || { removal_failure='health check failed after network-policy removal'; exit 2; }
 
   # Marker deletion commits removal. Ignore catchable signals across the atomic
@@ -1196,7 +1271,7 @@ PY
 fi
 
 daemon_matches=false
-if [[ -f "$daemon_config" ]] && python3 - "$daemon_config" "$staging_daemon" <<'PY'
+if [[ -f "$daemon_config" ]] && python3 - "$daemon_config" "$staging_daemon" 2>/dev/null <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as current, open(sys.argv[2], encoding="utf-8") as staged:
     raise SystemExit(json.load(current) != json.load(staged))
@@ -1274,9 +1349,8 @@ try:
     current_present = os.path.exists(current_path)
     current_text = open(current_path, encoding="utf-8").read() if current_present else ""
     current = json.loads(current_text) if current_present else {}
-    prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
     staged = json.load(open(staged_path, encoding="utf-8"))
-    if not isinstance(current, dict) or not isinstance(prior, dict) or not isinstance(staged, dict):
+    if not isinstance(current, dict) or not isinstance(staged, dict):
         raise ValueError
 except (OSError, json.JSONDecodeError, ValueError):
     raise SystemExit(1)
@@ -1284,6 +1358,15 @@ with open(expected_path, "w", encoding="utf-8") as handle:
     handle.write(current_text)
 with open(expected_path + ".present", "w", encoding="utf-8") as handle:
     handle.write("true" if current_present else "false")
+try:
+    prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
+    if not isinstance(prior, dict):
+        raise ValueError
+except (OSError, json.JSONDecodeError, ValueError):
+    if had_prior == "true" and current == staged:
+        print("exact")
+        raise SystemExit
+    raise SystemExit(1)
 current_unrelated = {key: value for key, value in current.items() if key != "default-address-pools"}
 staged_unrelated = {key: value for key, value in staged.items() if key != "default-address-pools"}
 if current_unrelated == staged_unrelated:
@@ -1381,16 +1464,16 @@ fi
 rollback_daemon() {
   local failed=0
   if [[ "$controller_resumed" == true ]]; then
-    run_command "$drain_command" || failed=1
+    run_primitive rollback-drain || failed=1
   fi
   if ((failed == 0)); then
     restore_daemon || failed=1
   fi
   if ((failed == 0)); then
-    run_command "$restart_command" "$daemon_dir" || failed=1
+    run_primitive restart "$daemon_dir" || failed=1
   fi
   if ((failed == 0)); then
-    run_command "$resume_command" --env "$prior_env" || failed=1
+    run_primitive restore --env "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
     run_health "$prior_env" || failed=1
@@ -1407,10 +1490,11 @@ rollback_daemon() {
 
 transaction_failure='network-policy apply interrupted'
 rollback_on_exit() {
-  local status=$?
+  local status=$? result
   trap '' INT TERM
   trap - EXIT
   ((status != 0)) || status=1
+  result=$status
   if rollback_daemon >/dev/null 2>&1 && {
     if [[ "$new_marker" == true || "$apply_phase" == first-apply-pending ]]; then
       complete_first_apply_rollback
@@ -1420,6 +1504,8 @@ rollback_on_exit() {
   }; then
     rm -rf "$work_dir"
     printf 'ERROR: %s; prior daemon.json restored\n' "$transaction_failure" >&2
+    write_transaction_result rollback_verified
+    if transaction_result_enabled; then result=20; fi
   else
     if [[ -n "$transaction_recovery" ]]; then
       recovery_path=$transaction_recovery
@@ -1428,13 +1514,17 @@ rollback_on_exit() {
       [[ "$snapshot_present" != true ]] || recovery_daemon=$backup_dir/$backup_name
       recovery_path=$(persist_recovery "$recovery_daemon" "$prior_env") || {
         printf 'ERROR: %s; rollback verification failed; failed to persist recovery data\n' "$transaction_failure" >&2
+        write_transaction_result rollback_unverified
+        if transaction_result_enabled; then exit 21; fi
         exit "$status"
       }
     fi
     rm -rf "$work_dir"
     printf 'ERROR: %s; rollback verification failed; recovery data retained at %s\n' "$transaction_failure" "$recovery_path" >&2
+    write_transaction_result rollback_unverified
+    if transaction_result_enabled; then result=21; fi
   fi
-  exit "$status"
+  exit "$result"
 }
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
@@ -1464,18 +1554,18 @@ if [[ "$daemon_matches" == false ]]; then
 fi
 
 # Restart Docker through the injected command boundary (never host-direct).
-if ! run_command "$restart_command" "$daemon_dir"; then
+if ! run_primitive restart "$daemon_dir"; then
   fail_after_apply "Docker restart command failed"
 fi
 
 # Bounded capacity probe
-if ! run_command "$probe_command"; then
+if ! run_primitive probe; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
 # Resume the drained controller before health verification.
 controller_resumed=true
-if ! run_command "$resume_command" --env "$env_file"; then
+if ! run_primitive resume --env "$env_file"; then
   fail_after_apply "controller resume command failed after network-policy restart"
 fi
 

@@ -68,8 +68,10 @@ changing the engine or evidence. Transition validation reads the evidence from
 the previous integrated state, so a commit that adds evidence and policy together
 cannot satisfy the gate. Do not add the field while the old engine still performs
 reconciliation. Once present, the policy requires current evidence naming the
-selected engine and declaring `docker_network_policy_config: true`; remove the
-policy before selecting an engine without that evidence.
+selected engine and declaring `docker_network_policy_config: true`. The selected
+engine manifest must also advertise both `docker_network_policy_config` and
+`docker_network_policy_adapter`. Remove the policy before selecting an engine
+without that evidence or either capability, including an adapterless engine.
 
 This accepted phase permits the executable policy stage to apply or remove the
 managed `default-address-pools` key on an isolated ordinary-CI controller only

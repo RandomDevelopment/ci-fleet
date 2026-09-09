@@ -59,6 +59,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
 DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
+DOCKER_NETWORK_POLICY_ADAPTER_CAPABILITY = "docker_network_policy_adapter"
 MAX_DOCKER_ADDRESS_POOLS = 64
 
 
@@ -382,6 +383,8 @@ def build_rendered_env(
         )
         if DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in (engine_capabilities or set()):
             raise DesiredStateError("selected engine does not support Docker network policy configuration")
+        if DOCKER_NETWORK_POLICY_ADAPTER_CAPABILITY not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support the Docker network policy adapter")
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),

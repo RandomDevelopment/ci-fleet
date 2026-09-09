@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -135,6 +136,7 @@ class TestRemoteReconcile(unittest.TestCase):
             "CI_FLEET_REMOTE_STATE_FILE": str(self.state_file),
             "CI_FLEET_RENDERED_ENV": str(self.td / "ci-fleet.env"),
             "CI_FLEET_HOST_ENV": str(self.host_env),
+            "CI_FLEET_INSTALLER_LOCK": str(self.td / "installer.lock"),
             "CI_FLEET_LKG_DIR": str(self.lkg_dir),
             "CI_FLEET_RECONCILE_STATE_DIR": str(self.td / "reconcile-state"),
             "CI_FLEET_RECONCILE_MAX_ATTEMPTS": "1",
@@ -271,6 +273,321 @@ class TestRemoteReconcile(unittest.TestCase):
         # Must not contain raw host.env values
         self.assertNotIn("installation_id=456", combined.lower())
         self.assertNotIn("client_id=123", combined.lower())
+
+
+class TestRemoteReconcileTransaction(unittest.TestCase):
+    """Runs reconciliation against local command fixtures, without Docker or GitHub."""
+
+    prior_ref = "0" * 40
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.root = self.td / "engine"
+        scripts = self.root / "scripts"
+        template_scripts = self.root / "templates" / "config-repository" / "scripts"
+        scripts.mkdir(parents=True)
+        template_scripts.mkdir(parents=True)
+        shutil.copy2(RECONCILE_SCRIPT, scripts / RECONCILE_SCRIPT.name)
+        (scripts / RECONCILE_SCRIPT.name).chmod(0o755)
+
+        self.installer_log = self.td / "installer.jsonl"
+        self.policy_marker = self.td / "policy-called"
+        self.health_observed_lkg = self.td / "health-observed-lkg"
+        self.lkg_dir = self.td / "lkg"
+        self.state_file = self.td / "state" / "install-state.json"
+        self.state_file.parent.mkdir()
+        self.host_env = self.td / "host.env"
+        self.host_env.write_text("fixture=1\n", encoding="utf-8")
+        self.lock_file = self.td / "installer.lock"
+
+        self._write_executable(
+            scripts / "github-app-token.sh",
+            "#!/usr/bin/env bash\nprintf 'fixture-token\\n'\n",
+        )
+        self._write_executable(
+            scripts / "install-worker-controller.sh",
+            """#!/usr/bin/env bash
+python3 - "$FAKE_INSTALLER_LOG" "$@" <<'PY'
+import json, os, sys
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "args": sys.argv[2:],
+        "fd9": os.path.realpath("/proc/self/fd/9"),
+        "lock_fd": os.environ.get("CI_FLEET_INSTALLER_LOCK_FD"),
+    }) + "\\n")
+PY
+if [[ ${1:-} == --check && ${FAKE_POLICY_STATE:-healthy} != healthy ]]; then
+  exit 3
+fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == unverified ]]; then
+  printf 'ERROR: network-policy rollback verification failed\\n' >&2
+  exit 2
+fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} =~ ^(success|cleanup_failure)$ ]]; then
+  printf '{"schema_version":1,"outcome":"applied"}\\n' >&7
+fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == cleanup_failure ]]; then
+  printf 'ERROR: post-commit cleanup failed\\n' >&2
+  exit 1
+fi
+exit 0
+""",
+        )
+        self._write_executable(
+            scripts / "apply-docker-network-policy.sh",
+            f"#!/usr/bin/env bash\n: > {shlex.quote(str(self.policy_marker))}\n",
+        )
+        (scripts / "health.py").write_text(
+            """import json, os, sys
+output = sys.argv[sys.argv.index("--output") + 1]
+lkg = os.path.join(os.environ["CI_FLEET_LKG_DIR"], "metadata.json")
+try:
+    observed = json.load(open(lkg, encoding="utf-8"))["config_ref"]
+except (FileNotFoundError, KeyError, TypeError, json.JSONDecodeError):
+    observed = ""
+with open(os.environ["FAKE_HEALTH_OBSERVED_LKG"], "w", encoding="utf-8") as handle:
+    handle.write(observed + "\\n")
+installer_calls = open(os.environ["FAKE_INSTALLER_LOG"], encoding="utf-8").read().splitlines()
+rollback = len(installer_calls) > 1
+status = os.environ["FAKE_ROLLBACK_HEALTH_STATUS"] if rollback else os.environ["FAKE_HEALTH_STATUS"]
+desired_state = os.environ["FAKE_ROLLBACK_HEALTH_DESIRED_STATE"] if rollback else os.environ["FAKE_HEALTH_DESIRED_STATE"]
+with open(output, "w", encoding="utf-8") as handle:
+    if status == "malformed":
+        handle.write("{")
+    else:
+        json.dump({"status": status, "desired_state": desired_state}, handle)
+""",
+            encoding="utf-8",
+        )
+        for path in (
+            scripts / "desired_state.py",
+            scripts / "scan_committed_secrets.py",
+            template_scripts / "validate.py",
+        ):
+            path.write_text("raise SystemExit(0)\n", encoding="utf-8")
+
+        self.config_repo = self.td / "config"
+        self.assertEqual(git("init", "-q", str(self.config_repo)).returncode, 0)
+        self.assertEqual(git("config", "user.name", "fixture", cwd=self.config_repo).returncode, 0)
+        self.assertEqual(git("config", "user.email", "fixture@example.invalid", cwd=self.config_repo).returncode, 0)
+        (self.config_repo / "fleet.json").write_text("{}\n", encoding="utf-8")
+        self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
+        self.assertEqual(git("commit", "-q", "-m", "fixture", cwd=self.config_repo).returncode, 0)
+        self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+
+        fake_bin = self.td / "bin"
+        fake_bin.mkdir()
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        self._write_executable(
+            fake_bin / "git",
+            f"""#!/usr/bin/env bash
+if [[ ${{1:-}} == -C && ${{3:-}} == fetch ]]; then
+  exec {shlex.quote(real_git or 'git')} -C "$2" fetch -q --depth=1 "$REMOTE_FIXTURE_REPO" "$REMOTE_FIXTURE_REF"
+fi
+exec {shlex.quote(real_git or 'git')} "$@"
+""",
+        )
+
+        self.env = os.environ.copy()
+        self.env.update({
+            "CI_FLEET_HOST_ENV": str(self.host_env),
+            "CI_FLEET_INSTALLER_LOCK": str(self.lock_file),
+            "CI_FLEET_LKG_DIR": str(self.lkg_dir),
+            "CI_FLEET_RECONCILE_MAX_ATTEMPTS": "1",
+            "CI_FLEET_RECONCILE_STATE_DIR": str(self.td / "reconcile-state"),
+            "CI_FLEET_REMOTE_STATE_FILE": str(self.state_file),
+            "CI_FLEET_RENDERED_ENV": str(self.td / "ci-fleet.env"),
+            "CI_FLEET_TESTING": "1",
+            "FAKE_HEALTH_OBSERVED_LKG": str(self.health_observed_lkg),
+            "FAKE_INSTALLER_LOG": str(self.installer_log),
+            "PATH": f"{fake_bin}:{self.env['PATH']}",
+            "REMOTE_FIXTURE_REF": self.desired_ref,
+            "REMOTE_FIXTURE_REPO": str(self.config_repo),
+        })
+        self._reset(self.prior_ref)
+
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    def _write_installed_ref(self, config_ref: str, desired_state: str = "active") -> None:
+        self.state_file.write_text(json.dumps({
+            "config_repository": "example-org/private-config",
+            "config_ref": config_ref,
+            "controller": "example-ci-01",
+            "controller_state": desired_state,
+        }), encoding="utf-8")
+        self.state_file.chmod(0o600)
+
+    def _reset(self, lkg_ref: str, desired_state: str = "active") -> None:
+        self.installer_log.unlink(missing_ok=True)
+        self.health_observed_lkg.unlink(missing_ok=True)
+        self.policy_marker.unlink(missing_ok=True)
+        self._write_installed_ref(self.prior_ref, desired_state)
+        self.lkg_dir.mkdir(mode=0o700, exist_ok=True)
+        (self.lkg_dir / "metadata.json").write_text(json.dumps({
+            "config_repository": "example-org/private-config",
+            "config_ref": lkg_ref,
+            "controller": "example-ci-01",
+        }), encoding="utf-8")
+
+    def _run(
+        self,
+        health: str,
+        *,
+        desired_state: str = "active",
+        rollback_health: str = "healthy",
+        rollback_desired_state: str | None = None,
+        installer_result: str = "success",
+        policy_state: str = "healthy",
+    ):
+        env = dict(self.env)
+        env.update(
+            FAKE_HEALTH_STATUS=health,
+            FAKE_HEALTH_DESIRED_STATE=desired_state,
+            FAKE_ROLLBACK_HEALTH_STATUS=rollback_health,
+            FAKE_ROLLBACK_HEALTH_DESIRED_STATE=rollback_desired_state or desired_state,
+            FAKE_INSTALLER_RESULT=installer_result,
+            FAKE_POLICY_STATE=policy_state,
+        )
+        return subprocess.run(
+            [str(self.root / "scripts" / "remote-reconcile.sh")],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def _installer_calls(self) -> list[dict]:
+        return [json.loads(line) for line in self.installer_log.read_text(encoding="utf-8").splitlines()]
+
+    def _lkg_ref(self) -> str:
+        return json.loads((self.lkg_dir / "metadata.json").read_text(encoding="utf-8"))["config_ref"]
+
+    def _reconcile_state(self) -> dict:
+        path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _assert_rolled_back(self, result: subprocess.CompletedProcess, health: str) -> None:
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--upgrade", "--upgrade"])
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "rolled_back")
+        self.assertEqual(state["desired_commit"], self.desired_ref)
+        self.assertEqual(state["applied_commit"], self.prior_ref)
+        self.assertEqual(state["health"], health)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertEqual((result.stdout + result.stderr).count("ROLLBACK_OK"), 1)
+
+    def test_normal_reconcile_delegates_one_locked_transaction_to_installer(self):
+        result = self._run("healthy")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._installer_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"][0], "--upgrade")
+        self.assertEqual(calls[0]["lock_fd"], "9")
+        self.assertEqual(calls[0]["fd9"], str(self.lock_file))
+        self.assertFalse(self.policy_marker.exists())
+
+    def test_state_aware_final_health_acceptance_advances_candidate_lkg(self):
+        for desired_state, health in (
+            ("active", "healthy"),
+            ("active", "warning"),
+            ("drained", "maintenance"),
+            ("drained", "warning"),
+            ("disabled", "maintenance"),
+            ("disabled", "warning"),
+        ):
+            with self.subTest(desired_state=desired_state, health=health):
+                self._reset(self.prior_ref, desired_state)
+                result = self._run(health, desired_state=desired_state)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--upgrade"])
+                self.assertEqual(self.health_observed_lkg.read_text(encoding="utf-8").strip(), self.prior_ref)
+                self.assertEqual(self._lkg_ref(), self.desired_ref)
+                state = self._reconcile_state()
+                self.assertEqual(state["status"], "converged")
+                self.assertEqual(state["desired_commit"], self.desired_ref)
+                self.assertEqual(state["applied_commit"], self.desired_ref)
+                self.assertEqual(state["health"], health)
+
+    def test_final_health_rejection_persists_truthful_rollback_state(self):
+        for health, rollback_health in (("unhealthy", "warning"), ("unknown", "healthy")):
+            with self.subTest(health=health, rollback_health=rollback_health):
+                self._reset(self.prior_ref)
+                result = self._run(health, rollback_health=rollback_health)
+
+                self._assert_rolled_back(result, rollback_health)
+
+    def test_unaccepted_installed_state_does_not_replace_prior_lkg(self):
+        interrupted_ref = "1" * 40
+        self._write_installed_ref(interrupted_ref)
+        lkg_file = self.lkg_dir / "metadata.json"
+        lkg = json.loads(lkg_file.read_text(encoding="utf-8"))
+        lkg["saved_at"] = 1
+        lkg_file.write_text(json.dumps(lkg), encoding="utf-8")
+        lkg_file.chmod(0o600)
+
+        result = self._run("unhealthy", rollback_health="healthy")
+
+        self._assert_rolled_back(result, "healthy")
+        calls = self._installer_calls()
+        self.assertEqual(calls[1]["args"][calls[1]["args"].index("--ref") + 1], self.prior_ref)
+
+    def test_state_aware_final_health_rejection_rolls_back(self):
+        for applied_state, health, reported_state in (
+            ("active", "maintenance", "active"),
+            ("drained", "healthy", "drained"),
+            ("disabled", "healthy", "disabled"),
+            ("active", "warning", "drained"),
+            ("active", "malformed", "active"),
+        ):
+            with self.subTest(applied_state=applied_state, health=health, reported_state=reported_state):
+                self._reset(self.prior_ref, applied_state)
+                result = self._run(
+                    health,
+                    desired_state=reported_state,
+                    rollback_desired_state=applied_state,
+                )
+
+                self._assert_rolled_back(result, "healthy")
+
+    def test_unverified_installer_rollback_does_not_trigger_outer_lkg_apply(self):
+        result = self._run("healthy", installer_result="unverified")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self._installer_calls()), 1)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+
+    def test_applied_cleanup_failure_records_failed_applied_state(self):
+        result = self._run("healthy", installer_result="cleanup_failure")
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(len(self._installer_calls()), 1)
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["desired_commit"], self.desired_ref)
+        self.assertEqual(state["applied_commit"], self.desired_ref)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertIn("post-commit cleanup failed", state["message"])
+        self.assertNotIn("ROLLBACK_UNVERIFIED", result.stdout + result.stderr)
+        self.assertNotIn("ROLLBACK_UNVERIFIED", json.dumps(state))
+
+    def test_same_commit_policy_loss_or_corruption_is_drift_and_repaired(self):
+        for policy_state in ("missing", "corrupt"):
+            with self.subTest(policy_state=policy_state):
+                self._reset(self.desired_ref)
+                self._write_installed_ref(self.desired_ref)
+                result = self._run("healthy", policy_state=policy_state)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DRIFT", result.stdout)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check", "--upgrade"])
 
 
 class TestSystemdUnits(unittest.TestCase):

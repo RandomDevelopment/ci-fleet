@@ -70,7 +70,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
         value = config()
         policy = docker_network_policy()
         value["controllers"]["example-ci-01"]["docker_network_policy"] = policy
-        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"}
+        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"}
         rendered, _ = build_rendered_env(
             value,
             "example-ci-01",
@@ -124,7 +124,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"},
         )
         return rendered
 
@@ -138,7 +138,7 @@ class RenderDaemonConfigTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+            engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"},
         )
         rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"] = "-1"
 
@@ -471,7 +471,7 @@ class ApplyScriptTests(unittest.TestCase):
     def _rendered_with_policy(self) -> dict[str, str]:
         value = config()
         value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
-        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"}
+        capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"}
         rendered, _ = build_rendered_env(
             value,
             "example-ci-01",
@@ -1473,6 +1473,52 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), daemon_a)
 
+    def test_pending_reapply_removal_requires_operator_recovery(self) -> None:
+        daemon = self._write_daemon('{"live-restore":true}\n')
+        checkpoint = Path(self.tmp) / "checkpoint-interrupted-reapply-removal"
+        self._write_success_commands()
+        policy_a = self._rendered_with_policy()
+        env_a = self._write_env_file(policy_a)
+        applied = self._run(str(env_a), checkpoint_dir=str(checkpoint))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(env_a.read_bytes())
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["verified_generation"] = None
+        state["phase"] = "reapply-pending"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        state_file.chmod(0o600)
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "daemon.json.before").write_bytes(daemon.read_bytes())
+        (recovery / "prior-ci-fleet.env").write_bytes(env_a.read_bytes())
+        for path in recovery.iterdir():
+            path.chmod(0o600)
+        policy_b = dict(policy_a)
+        policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
+        daemon.write_text(json.dumps(render_docker_daemon_config(policy_b)), encoding="utf-8")
+        no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+        command_log = Path(self.tmp) / "pending-reapply-removal.log"
+        for name, command in (
+            ("drain", self.drain_command),
+            ("restart", Path(self.tmp) / "restart.sh"),
+            ("probe", Path(self.tmp) / "probe.sh"),
+            ("resume", Path(self.tmp) / "resume.sh"),
+            ("health", Path(self.tmp) / "health.sh"),
+        ):
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+        daemon_before = daemon.read_bytes()
+        state_before = state_file.read_bytes()
+        recovery_before = {path.name: path.read_bytes() for path in recovery.iterdir()}
+
+        result = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(daemon.read_bytes(), daemon_before)
+        self.assertEqual(state_file.read_bytes(), state_before)
+        self.assertEqual({path.name: path.read_bytes() for path in recovery.iterdir()}, recovery_before)
+        self.assertFalse(command_log.exists())
+
     def test_failed_unverified_retry_preserves_new_unrelated_keys_after_absent_baseline(self) -> None:
         rendered = self._rendered_with_policy()
         daemon = self._write_daemon(json.dumps({
@@ -2248,6 +2294,84 @@ class ApplyScriptTests(unittest.TestCase):
         for path in hooks.values():
             self.assertTrue(any(line.startswith(f"--kill-after=5 300 {path}") for line in lines), path)
         self.assertEqual(sorted(hook_log.read_text(encoding="utf-8").splitlines()), sorted(path.name for path in hooks.values()))
+
+    def test_adapter_resume_uses_reconciliation_timeout_budget(self) -> None:
+        self._write_daemon("{}\n")
+        env_file = self._write_env_file(self._rendered_with_policy())
+        timeout_log = Path(self.tmp) / "adapter-timeouts.log"
+        adapter_log = Path(self.tmp) / "adapter-actions.log"
+        failed_health = Path(self.tmp) / "failed-health"
+        fake_bin = Path(self.tmp) / "adapter-bin"
+        fake_bin.mkdir()
+        fake_timeout = fake_bin / "timeout"
+        fake_timeout.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s %s\\n' \"$2\" \"$4\" >> {timeout_log}\n"
+            f"exec {shutil.which('timeout')} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_timeout.chmod(0o755)
+        adapter = Path(self.tmp) / "policy-adapter.sh"
+        adapter.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$1\" >> {adapter_log}\n"
+            'if [[ $1 == resume && ${SLOW_RESUME:-0} == 1 ]]; then sleep 2; fi\n'
+            f"if [[ $1 == health && ${{FAIL_HEALTH_ONCE:-0}} == 1 && ! -e {failed_health} ]]; then touch {failed_health}; exit 2; fi\n",
+            encoding="utf-8",
+        )
+        adapter.chmod(0o755)
+        command = [
+            str(SCRIPTS / "apply-docker-network-policy.sh"),
+            "--checkpoint",
+            str(Path(self.tmp) / "checkpoint-adapter-timeout"),
+            "--env",
+            str(env_file),
+        ]
+        run_env = self._env(
+            CI_FLEET_COMMAND_TIMEOUT_SECONDS="1",
+            CI_FLEET_DRAIN_TIMEOUT_SECONDS="1",
+            CI_FLEET_CONTROLLER_RESUME_TIMEOUT_SECONDS="3",
+            CI_FLEET_DOCKER_NETWORK_POLICY_ADAPTER=str(adapter),
+            PATH=f"{fake_bin}:{os.environ['PATH']}",
+        )
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env={**run_env, "SLOW_RESUME": "1", "FAIL_HEALTH_ONCE": "0"},
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self._write_daemon("{}\n")
+        command[2] = str(Path(self.tmp) / "checkpoint-adapter-rollback-timeout")
+        rollback = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env={**run_env, "SLOW_RESUME": "0", "FAIL_HEALTH_ONCE": "1"},
+            timeout=15,
+        )
+
+        self.assertNotEqual(rollback.returncode, 0)
+        actions = adapter_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            actions,
+            [
+                "drain", "restart", "probe", "resume", "health",
+                "drain", "restart", "probe", "resume", "health",
+                "rollback-drain", "restart", "restore", "health",
+            ],
+        )
+        self.assertEqual(
+            timeout_log.read_text(encoding="utf-8").splitlines(),
+            [
+                f"{32 if action in {'drain', 'rollback-drain', 'restore'} else 3 if action == 'resume' else 1} {action}"
+                for action in actions
+            ],
+        )
 
     def test_health_accepts_only_success_and_warning_results(self) -> None:
         env_file = self._write_env_file(self._rendered_with_policy())
