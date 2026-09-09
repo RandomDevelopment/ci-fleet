@@ -717,6 +717,20 @@ cmp -s "$managed_daemon_snapshot" "$daemon_config" || fail 'daemon metadata fixt
 cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'daemon metadata fixture changed the verified policy generation'
 chmod 0600 "$daemon_config"
 
+daemon_config_dir=$(dirname "$daemon_config")
+chmod 0770 "$daemon_config_dir"
+untrusted_daemon_parent_output=$tmp/untrusted-daemon-parent.out
+set +e
+"$installer" --check "${base_args[@]}" --ref "$ref_one" >"$untrusted_daemon_parent_output" 2>&1
+untrusted_daemon_parent_status=$?
+set -e
+chmod 0755 "$daemon_config_dir"
+[[ "$untrusted_daemon_parent_status" == 3 ]] || fail "group-writable daemon config parent drift returned $untrusted_daemon_parent_status instead of 3: $(<"$untrusted_daemon_parent_output")"
+grep -Fq 'DRIFT docker_network_policy' "$untrusted_daemon_parent_output" || fail "group-writable daemon config parent drift was not reported: $(<"$untrusted_daemon_parent_output")"
+cmp -s "$managed_daemon_snapshot" "$daemon_config" || fail 'daemon parent metadata fixture changed daemon.json bytes'
+cmp -s "$managed_marker_snapshot" "$policy_marker" || fail 'daemon parent metadata fixture changed the verified policy generation'
+[[ ${CI_FLEET_TEST_STOP_AFTER_UNTRUSTED_DAEMON_PARENT:-0} != 1 ]] || { printf 'UNTRUSTED_DAEMON_PARENT_REGRESSION_OK\n'; exit 0; }
+
 rm -f "$daemon_config"
 expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 : >"$FAKE_TRANSACTION_LOG"

@@ -643,21 +643,42 @@ systemd_matches() {
 docker_daemon_config_trusted() {
   local expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
-  python3 - "$docker_daemon_config" "$expected_owner" <<'PY'
+  python3 - "$docker_daemon_config" "$expected_owner" "$root_prefix" <<'PY'
 import json
 import os
 import stat
 import sys
 
-path, expected_owner = sys.argv[1:]
-if not os.path.lexists(path):
-    raise SystemExit(0)
+path, expected_owner, root_prefix = sys.argv[1:]
+expected_owner = int(expected_owner)
+anchor = os.path.realpath(root_prefix) if root_prefix else "/"
 try:
+    if (
+        not path.startswith("/")
+        or os.path.normpath(path) != path
+        or os.path.realpath(path) != path
+        or os.path.commonpath((anchor, path)) != anchor
+    ):
+        raise ValueError
+    current = os.path.dirname(path)
+    while True:
+        metadata = os.lstat(current)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != expected_owner
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ValueError
+        if current == anchor:
+            break
+        current = os.path.dirname(current)
+    if not os.path.lexists(path):
+        raise SystemExit(0)
     metadata = os.lstat(path)
     if (
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != int(expected_owner)
+        or metadata.st_uid != expected_owner
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or not isinstance(json.load(open(path, encoding="utf-8")), dict)
     ):
