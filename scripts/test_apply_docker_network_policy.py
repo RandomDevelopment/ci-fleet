@@ -1473,7 +1473,7 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(daemon.read_bytes(), daemon_a)
 
-    def test_interrupted_reapply_removal_failure_restores_accepted_policy(self) -> None:
+    def test_pending_reapply_removal_requires_operator_recovery(self) -> None:
         daemon = self._write_daemon('{"live-restore":true}\n')
         checkpoint = Path(self.tmp) / "checkpoint-interrupted-reapply-removal"
         self._write_success_commands()
@@ -1481,7 +1481,6 @@ class ApplyScriptTests(unittest.TestCase):
         env_a = self._write_env_file(policy_a)
         applied = self._run(str(env_a), checkpoint_dir=str(checkpoint))
         self.assertEqual(applied.returncode, 0, applied.stderr)
-        daemon_a = daemon.read_bytes()
         self.installed_env.write_bytes(env_a.read_bytes())
         state_file = checkpoint / "docker-network-policy.json"
         state = json.loads(state_file.read_text(encoding="utf-8"))
@@ -1491,7 +1490,7 @@ class ApplyScriptTests(unittest.TestCase):
         state_file.chmod(0o600)
         recovery = checkpoint / "recovery.interrupted"
         recovery.mkdir(mode=0o700)
-        (recovery / "daemon.json.before").write_bytes(daemon_a)
+        (recovery / "daemon.json.before").write_bytes(daemon.read_bytes())
         (recovery / "prior-ci-fleet.env").write_bytes(env_a.read_bytes())
         for path in recovery.iterdir():
             path.chmod(0o600)
@@ -1499,23 +1498,26 @@ class ApplyScriptTests(unittest.TestCase):
         policy_b["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE"] = "192.0.2.0/24"
         daemon.write_text(json.dumps(render_docker_daemon_config(policy_b)), encoding="utf-8")
         no_policy_env = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
-        (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        command_log = Path(self.tmp) / "pending-reapply-removal.log"
+        for name, command in (
+            ("drain", self.drain_command),
+            ("restart", Path(self.tmp) / "restart.sh"),
+            ("probe", Path(self.tmp) / "probe.sh"),
+            ("resume", Path(self.tmp) / "resume.sh"),
+            ("health", Path(self.tmp) / "health.sh"),
+        ):
+            command.write_text(f"#!/usr/bin/env bash\necho {name} >> {command_log}\n", encoding="utf-8")
+        daemon_before = daemon.read_bytes()
+        state_before = state_file.read_bytes()
+        recovery_before = {path.name: path.read_bytes() for path in recovery.iterdir()}
 
         result = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(daemon.read_bytes(), daemon_a)
-        restored = json.loads(state_file.read_text(encoding="utf-8"))
-        self.assertNotIn("phase", restored)
-        self.assertEqual(restored["verified_generation"], hashlib.sha256(daemon_a).hexdigest())
-        self._write_success_commands()
-        retry = self._run(str(no_policy_env), checkpoint_dir=str(checkpoint))
-
-        self.assertEqual(retry.returncode, 0, retry.stderr)
-        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"live-restore": True})
-        self.assertFalse(state_file.exists())
-        self.assertFalse(list(checkpoint.glob("recovery.*")))
+        self.assertEqual(daemon.read_bytes(), daemon_before)
+        self.assertEqual(state_file.read_bytes(), state_before)
+        self.assertEqual({path.name: path.read_bytes() for path in recovery.iterdir()}, recovery_before)
+        self.assertFalse(command_log.exists())
 
     def test_failed_unverified_retry_preserves_new_unrelated_keys_after_absent_baseline(self) -> None:
         rendered = self._rendered_with_policy()
