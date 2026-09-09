@@ -644,21 +644,20 @@ manager_release_complete() {
 }
 
 release_target_from_raw_pointer() {
-  local link=$1 releases=$2 require_ref_path=${3:-1} target relative ref
+  local link=$1 releases=$2 target relative ref
   target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
   target=${target%x}
   [[ "$target" == "$releases/"* ]] || return 1
   relative=${target#"$releases/"}
   [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [[ "$require_ref_path" != 1 || "$relative" == "$ref" ]] || return 1
+  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] || return 1
   printf '%s' "$target"
 }
 
 manager_release_from_raw_pointer() {
   local target ref
-  target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases" 0) || return 1
+  target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases") || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
   manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
   printf '%s' "$target"
@@ -1831,7 +1830,7 @@ perform_converge() {
     fi
   fi
   if [[ -L "$manager_current" ]]; then
-    manager_target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases" 0 || true)
+    manager_target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases" || true)
     [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
     manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
     if release_tree_permissions_trusted "$manager_target"; then

@@ -2139,8 +2139,11 @@ grep -Fq "CI_FLEET_CONFIG_REF=$warning_ref" "$root/etc/ci-fleet/ci-fleet.env" ||
 rm -f "$root/etc/ci-fleet/monitoring.env"
 ref_one=$warning_ref
 
-prior_manager=$root/opt/ci-fleet/manager/releases/prior-manager
+prior_manager_ref=1111111111111111111111111111111111111111
+prior_manager=$root/opt/ci-fleet/manager/releases/$prior_manager_ref
 cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$prior_manager"
+printf '%s\n' "$prior_manager_ref" >"$prior_manager/.ci-fleet-engine-ref"
+refresh_release_digest "$prior_manager"
 ln -sfn "$prior_manager" "$root/opt/ci-fleet/manager/current"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 
