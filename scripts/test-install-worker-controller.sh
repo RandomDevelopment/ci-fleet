@@ -465,6 +465,48 @@ expect_command_failure() {
   local output
   if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
 }
+refresh_release_digest() {
+  local release=$1
+  python3 - "$release" <<'PY' >"$release/.ci-fleet-tree-sha256"
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+excluded = {".ci-fleet-engine-ref", ".ci-fleet-tree-sha256"}
+digest = hashlib.sha256()
+
+
+def add(kind, relative, mode, payload=b""):
+    for value in (kind, relative.encode("utf-8", "surrogateescape"), f"{mode:o}".encode("ascii"), payload):
+        digest.update(value)
+        digest.update(b"\0")
+
+
+def visit(directory):
+    for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+        relative = os.path.relpath(entry.path, root)
+        if relative in excluded:
+            continue
+        metadata = entry.stat(follow_symlinks=False)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            add(b"directory", relative, mode)
+            visit(entry.path)
+        elif stat.S_ISREG(metadata.st_mode):
+            with open(entry.path, "rb") as handle:
+                add(b"file", relative, mode, hashlib.sha256(handle.read()).digest())
+        elif stat.S_ISLNK(metadata.st_mode):
+            add(b"symlink", relative, mode, os.readlink(entry.path).encode("utf-8", "surrogateescape"))
+        else:
+            raise SystemExit(1)
+
+
+visit(root)
+print(digest.hexdigest())
+PY
+}
 wait_for_file() {
   local path=$1 label=$2 attempt
   for ((attempt = 0; attempt < 200; attempt++)); do
@@ -1438,6 +1480,18 @@ authority_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); v
 grep -Fxq "$authority_active_release" "$authority_checkpoint/release-target" || fail 'checkpoint did not select the complete fallback release'
 if grep -Fxq "$incomplete_current" "$authority_checkpoint/release-target"; then fail 'checkpoint accepted an incomplete current release as executable authority'; fi
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
+authority_manager=$(<"$authority_checkpoint/manager-target")
+for checkpoint_kind in release manager; do
+  if [[ "$checkpoint_kind" == release ]]; then unsafe_target=$authority_active_release; else unsafe_target=$authority_manager; fi
+  chmod g+w "$unsafe_target/scripts" "$unsafe_target/scripts/docker-network-policy-adapter.sh"
+  refresh_release_digest "$unsafe_target"
+  : >"$FAKE_COMPOSE_LOG"
+  expect_failure "checkpoint $checkpoint_kind target is invalid" "$installer" --rollback
+  [[ -f "$FAKE_DOCKER_STATE" ]] || fail "unsafe checkpoint $checkpoint_kind target stopped the controller"
+  if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "unsafe checkpoint $checkpoint_kind target caused an operational mutation"; fi
+  chmod g-w "$unsafe_target/scripts" "$unsafe_target/scripts/docker-network-policy-adapter.sh"
+  refresh_release_digest "$unsafe_target"
+done
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"
 printf '2\n' >"$authority_checkpoint/format-version"
 rm -f "$authority_checkpoint/current-link" "$authority_checkpoint/current-absent"
@@ -1919,44 +1973,7 @@ done
 
 for unsafe_release in "$active_release" "$manager_release"; do
   chmod g+w "$unsafe_release/scripts" "$unsafe_release/scripts/docker-network-policy-adapter.sh"
-  python3 - "$unsafe_release" <<'PY' >"$unsafe_release/.ci-fleet-tree-sha256"
-import hashlib
-import os
-import stat
-import sys
-
-root = os.path.abspath(sys.argv[1])
-excluded = {".ci-fleet-engine-ref", ".ci-fleet-tree-sha256"}
-digest = hashlib.sha256()
-
-
-def add(kind, relative, mode, payload=b""):
-    for value in (kind, relative.encode("utf-8", "surrogateescape"), f"{mode:o}".encode("ascii"), payload):
-        digest.update(value)
-        digest.update(b"\0")
-
-
-def visit(directory):
-    for entry in sorted(os.scandir(directory), key=lambda item: item.name):
-        relative = os.path.relpath(entry.path, root)
-        if relative in excluded:
-            continue
-        metadata = entry.stat(follow_symlinks=False)
-        mode = stat.S_IMODE(metadata.st_mode)
-        if stat.S_ISDIR(metadata.st_mode):
-            add(b"directory", relative, mode)
-            visit(entry.path)
-        elif stat.S_ISREG(metadata.st_mode):
-            add(b"file", relative, mode, hashlib.sha256(open(entry.path, "rb").read()).digest())
-        elif stat.S_ISLNK(metadata.st_mode):
-            add(b"symlink", relative, mode, os.readlink(entry.path).encode("utf-8", "surrogateescape"))
-        else:
-            raise SystemExit(1)
-
-
-visit(root)
-print(digest.hexdigest())
-PY
+  refresh_release_digest "$unsafe_release"
 done
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -1964,6 +1981,12 @@ for repaired_path in "$active_release/scripts" "$active_release/scripts/docker-n
   repaired_mode=$(stat -c %a "$repaired_path")
   (( (8#$repaired_mode & 8#22) == 0 )) || fail "convergence retained an untrusted group/world-writable release path: $repaired_path"
 done
+chmod g+w "$root/opt/ci-fleet/releases"
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+chmod g-w "$root/opt/ci-fleet/releases"
+chmod g+w "$root/opt/ci-fleet/manager/releases"
+expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+chmod g-w "$root/opt/ci-fleet/manager/releases"
 manager_release_backup=$tmp/manager-release-backup
 cp -a "$manager_release" "$manager_release_backup"
 printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"

@@ -543,15 +543,16 @@ PY
 }
 
 release_tree_permissions_trusted() {
-  local path=$1 expected_owner=0
+  local path=$1 expected_owner=0 boundary=${root_prefix:-/}
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
-  python3 - "$path" "$expected_owner" <<'PY'
+  python3 - "$path" "$expected_owner" "$boundary" <<'PY'
 import os
 import stat
 import sys
 
 root = os.path.abspath(sys.argv[1])
 expected_owner = int(sys.argv[2])
+boundary = os.path.abspath(sys.argv[3])
 
 
 def trusted(path):
@@ -567,8 +568,19 @@ def trusted(path):
 
 
 try:
-    if not trusted(root) or not stat.S_ISDIR(os.lstat(root).st_mode):
+    if os.path.commonpath((root, boundary)) != boundary:
         raise ValueError
+    anchor = root
+    while True:
+        metadata = os.lstat(anchor)
+        if metadata.st_uid != expected_owner or not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ValueError
+        if anchor == boundary:
+            break
+        parent = os.path.dirname(anchor)
+        if parent == anchor:
+            raise ValueError
+        anchor = parent
     for directory, directories, files in os.walk(root, followlinks=False):
         if any(not trusted(os.path.join(directory, name)) for name in directories + files):
             raise ValueError
@@ -1516,7 +1528,8 @@ PY
       return 1
     fi
     target=$(<"$checkpoint_release/.ci-fleet-engine-ref")
-    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target"; then
+    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target" ||
+      ! release_tree_permissions_trusted "$checkpoint_release"; then
       note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
       return 1
     fi
@@ -1535,7 +1548,8 @@ PY
       return 1
     fi
     restored_state=$(<"$target/.ci-fleet-engine-ref")
-    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state"; then
+    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state" ||
+      ! release_tree_permissions_trusted "$target"; then
       note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
       return 1
     fi
