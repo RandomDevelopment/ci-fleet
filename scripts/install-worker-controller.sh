@@ -1148,7 +1148,7 @@ make_checkpoint() {
     current_candidate=$(readlink -f "$current_link" 2>/dev/null || true)
     if [[ -n "$current_candidate" && -f "$current_candidate/.ci-fleet-engine-ref" ]]; then
       current_ref=$(<"$current_candidate/.ci-fleet-engine-ref")
-      if [[ "$current_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$current_candidate" "$current_ref" \
+      if [[ "$current_ref" =~ ^[0-9a-f]{40}$ ]] \
         && ! release_tree_permissions_trusted "$current_candidate"; then permission_unsafe_current=true; fi
     fi
   fi
