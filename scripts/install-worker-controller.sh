@@ -328,7 +328,7 @@ select_engine() {
 prepare_engine_capabilities() {
   local checkout resolved manifest_mode
   engine_capabilities=$temporary/engine-capabilities.json
-  if runtime_release_complete "$release_dir" "$engine_ref"; then
+  if runtime_release_complete "$release_dir" "$engine_ref" && release_tree_permissions_trusted "$release_dir"; then
     if [[ -f "$release_dir/engine-capabilities.json" ]]; then
       cp "$release_dir/engine-capabilities.json" "$engine_capabilities"
     else
@@ -1125,7 +1125,7 @@ PY
 }
 
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref fallback_selected=false
   capture_current_pointer
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   status=$(controller_status)
@@ -1148,7 +1148,11 @@ make_checkpoint() {
   if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
     fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
     if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref" \
-      && release_tree_permissions_trusted "$fallback_release"; then target=$fallback_release; fi
+      && release_tree_permissions_trusted "$fallback_release"; then target=$fallback_release; fallback_selected=true; fi
+  fi
+  if $fallback_selected && [[ "$captured_current_state" == link ]]; then
+    printf '%s' "$target" >"$temporary/current-link"
+    chmod 0600 "$temporary/current-link"
   fi
   [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)

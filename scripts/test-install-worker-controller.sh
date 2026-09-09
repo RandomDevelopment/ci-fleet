@@ -1478,6 +1478,7 @@ grep -Fq 'DRAIN_OK managed_runners=0' "$incomplete_current_output" || fail "inco
 grep -Fq 'ROLLBACK_RESTORED' "$incomplete_current_output" || fail "incomplete current became rollback authority: $(<"$incomplete_current_output")"
 authority_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$incomplete_current_output")
 grep -Fxq "$authority_active_release" "$authority_checkpoint/release-target" || fail 'checkpoint did not select the complete fallback release'
+grep -Fxq "$authority_active_release" "$authority_checkpoint/current-link" || fail 'checkpoint retained an untrusted current link instead of the complete fallback release'
 if grep -Fxq "$incomplete_current" "$authority_checkpoint/release-target"; then fail 'checkpoint accepted an incomplete current release as executable authority'; fi
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 authority_manager=$(<"$authority_checkpoint/manager-target")
@@ -1975,6 +1976,18 @@ for unsafe_release in "$active_release" "$manager_release"; do
   chmod g+w "$unsafe_release/scripts" "$unsafe_release/scripts/docker-network-policy-adapter.sh"
   refresh_release_digest "$unsafe_release"
 done
+python3 - "$active_release/engine-capabilities.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["capabilities"]["docker_network_policy_config"] = False
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(value, output, sort_keys=True)
+    output.write("\n")
+PY
+refresh_release_digest "$active_release"
 export FAKE_COMPOSE_LOG=$tmp/unsafe-release-uninstall-compose.log
 export FAKE_SYSTEMCTL_LOG=$tmp/unsafe-release-uninstall-systemctl.log
 export FAKE_MV_LOG=$tmp/unsafe-release-uninstall-mv.log
@@ -1988,6 +2001,7 @@ if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_L
 unset FAKE_COMPOSE_LOG FAKE_SYSTEMCTL_LOG FAKE_MV_LOG
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$active_release/engine-capabilities.json" --require-docker-network-policy-config >/dev/null || fail 'unsafe local capability manifest was reused instead of the pinned declaration'
 for repaired_path in "$active_release/scripts" "$active_release/scripts/docker-network-policy-adapter.sh" "$manager_release/scripts" "$manager_release/scripts/docker-network-policy-adapter.sh"; do
   repaired_mode=$(stat -c %a "$repaired_path")
   (( (8#$repaired_mode & 8#22) == 0 )) || fail "convergence retained an untrusted group/world-writable release path: $repaired_path"
