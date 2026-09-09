@@ -2120,20 +2120,20 @@ manager_release_backup=$tmp/manager-release-backup
 cp -a "$manager_release" "$manager_release_backup"
 printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-expect_failure 'manager current pointer is invalid' "$installer" --install "${base_args[@]}" --ref "$ref_one"
-grep -Fq 'tampered manager fixture' "$manager_release/scripts/check-installed-state.sh" || fail 'invalid manager pointer was mutated before rejection'
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+! grep -Fq 'tampered manager fixture' "$manager_release/scripts/check-installed-state.sh" || fail 'explicit reinstall retained tampered manager content'
 rm -rf "$manager_release"
 cp -a "$manager_release_backup" "$manager_release"
 rm -f "$manager_release/scripts/check-installed-state.sh"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-expect_failure 'manager current pointer is invalid' "$installer" --install "${base_args[@]}" --ref "$ref_one"
-[[ ! -e "$manager_release/scripts/check-installed-state.sh" ]] || fail 'incomplete manager pointer was mutated before rejection'
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -e "$manager_release/scripts/check-installed-state.sh" ]] || fail 'explicit reinstall did not restore an incomplete manager release'
 rm -rf "$manager_release"
 cp -a "$manager_release_backup" "$manager_release"
 rm -f "$manager_release/scripts/desired_state.py" "$manager_release/templates/config-repository/fleet.schema.json"
 expect_failure 'DRIFT maintenance_timers' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-expect_failure 'manager current pointer is invalid' "$installer" --install "${base_args[@]}" --ref "$ref_one"
-[[ ! -e "$manager_release/scripts/desired_state.py" && ! -e "$manager_release/templates/config-repository/fleet.schema.json" ]] || fail 'manager helper inputs were mutated before rejection'
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+[[ -e "$manager_release/scripts/desired_state.py" && -e "$manager_release/templates/config-repository/fleet.schema.json" ]] || fail 'explicit reinstall did not restore manager helper inputs'
 rm -rf "$manager_release"
 cp -a "$manager_release_backup" "$manager_release"
 mv "$active_release" "$active_release.saved"
