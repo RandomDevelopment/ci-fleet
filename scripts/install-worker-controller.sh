@@ -1628,6 +1628,18 @@ PY
       return 1
     fi
   fi
+  if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
+    target=$(<"$validated_current_target")
+    target=$(canonical_release_target "$target" "$releases_dir") || {
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    }
+    restored_state=${target##*/}
+    if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    fi
+  fi
   if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
     if [[ ! -f "$image_ids" || -L "$image_ids" || $(stat -c %u "$image_ids") != "$expected_owner" || $(stat -c %a "$image_ids") != 600 ]] \
       || ! load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$image_ids"; then
