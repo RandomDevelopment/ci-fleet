@@ -542,6 +542,41 @@ print(digest.hexdigest())
 PY
 }
 
+release_tree_permissions_trusted() {
+  local path=$1 expected_owner=0
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  python3 - "$path" "$expected_owner" <<'PY'
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+expected_owner = int(sys.argv[2])
+
+
+def trusted(path):
+    metadata = os.lstat(path)
+    if metadata.st_uid != expected_owner:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    return (
+        (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+    )
+
+
+try:
+    if not trusted(root) or not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise ValueError
+    for directory, directories, files in os.walk(root, followlinks=False):
+        if any(not trusted(os.path.join(directory, name)) for name in directories + files):
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
 runtime_release_complete() {
   local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script
   local -a capability_args=()
@@ -609,6 +644,7 @@ manager_release_from_raw_pointer() {
 
 release_matches() {
   runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
+  release_tree_permissions_trusted "$release_dir" || return 1
   [[ -L "$current_link" ]] || return 1
   [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
 }
@@ -628,6 +664,7 @@ systemd_matches() {
   local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
   manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
+  release_tree_permissions_trusted "$expected_manager" || return 1
   [[ -L "$manager_current" ]] || return 1
   [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
   for unit in "${unit_names[@]}"; do
@@ -851,7 +888,8 @@ PY
 
 install_release() {
   local archive checkout resolved staged_release
-  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured"; then
+  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" &&
+    release_tree_permissions_trusted "$release_dir"; then
     return
   fi
   install -d -m 0755 "$releases_dir"
@@ -876,7 +914,10 @@ install_release() {
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
   chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
-  runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || die 'staged engine release is incomplete'
+  if ! runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" ||
+    ! release_tree_permissions_trusted "$staged_release"; then
+    die 'staged engine release is incomplete or untrusted'
+  fi
   atomic_replace_directory "$staged_release" "$release_dir"
 }
 
@@ -886,7 +927,8 @@ install_manager() {
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
   runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'desired engine release is unavailable for installer manager activation'
   manager_release=$manager_releases/$manager_commit
-  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required" "$status_reporting_configured"; then
+  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" ||
+    ! release_tree_permissions_trusted "$manager_release"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager.tar
     tar -cf "$archive" -C "$release_dir" .
@@ -896,7 +938,10 @@ install_manager() {
     (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager")
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'staged installer manager release is incomplete'
+    if ! manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" ||
+      ! release_tree_permissions_trusted "$staged_manager"; then
+      die 'staged installer manager release is incomplete or untrusted'
+    fi
     atomic_replace_directory "$staged_manager" "$manager_release"
   fi
   install -d -m 0755 "$manager_root"

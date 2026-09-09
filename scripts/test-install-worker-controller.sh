@@ -1916,6 +1916,54 @@ for archive_path in "$active_release" "$active_release/scripts/docker-network-po
   archive_mode=$(stat -c %a "$archive_path")
   (( (8#$archive_mode & 8#22) == 0 )) || fail "archive extraction installed an untrusted group/world-writable path: $archive_path"
 done
+
+for unsafe_release in "$active_release" "$manager_release"; do
+  chmod g+w "$unsafe_release/scripts" "$unsafe_release/scripts/docker-network-policy-adapter.sh"
+  python3 - "$unsafe_release" <<'PY' >"$unsafe_release/.ci-fleet-tree-sha256"
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+excluded = {".ci-fleet-engine-ref", ".ci-fleet-tree-sha256"}
+digest = hashlib.sha256()
+
+
+def add(kind, relative, mode, payload=b""):
+    for value in (kind, relative.encode("utf-8", "surrogateescape"), f"{mode:o}".encode("ascii"), payload):
+        digest.update(value)
+        digest.update(b"\0")
+
+
+def visit(directory):
+    for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+        relative = os.path.relpath(entry.path, root)
+        if relative in excluded:
+            continue
+        metadata = entry.stat(follow_symlinks=False)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            add(b"directory", relative, mode)
+            visit(entry.path)
+        elif stat.S_ISREG(metadata.st_mode):
+            add(b"file", relative, mode, hashlib.sha256(open(entry.path, "rb").read()).digest())
+        elif stat.S_ISLNK(metadata.st_mode):
+            add(b"symlink", relative, mode, os.readlink(entry.path).encode("utf-8", "surrogateescape"))
+        else:
+            raise SystemExit(1)
+
+
+visit(root)
+print(digest.hexdigest())
+PY
+done
+expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+for repaired_path in "$active_release/scripts" "$active_release/scripts/docker-network-policy-adapter.sh" "$manager_release/scripts" "$manager_release/scripts/docker-network-policy-adapter.sh"; do
+  repaired_mode=$(stat -c %a "$repaired_path")
+  (( (8#$repaired_mode & 8#22) == 0 )) || fail "convergence retained an untrusted group/world-writable release path: $repaired_path"
+done
 manager_release_backup=$tmp/manager-release-backup
 cp -a "$manager_release" "$manager_release_backup"
 printf '\n# tampered manager fixture\n' >>"$manager_release/scripts/check-installed-state.sh"
