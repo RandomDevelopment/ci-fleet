@@ -1055,6 +1055,39 @@ PY
   fi
 }
 
+repair_pending_checkpoint_authority() {
+  local checkpoint=$1 kind file target ref expected_owner=0 source
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  for kind in release manager; do
+    file=$checkpoint/$kind-target
+    [[ -e "$file" || -L "$file" ]] || continue
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+      && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 2 \
+      && $(stat -c %s "$file") -le 4096 && $(wc -l <"$file") == 1 ]] || return 1
+    target=$(<"$file")
+    [[ -f "$target/.ci-fleet-engine-ref" && ! -L "$target" ]] || return 1
+    ref=$(<"$target/.ci-fleet-engine-ref")
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+    if [[ "$kind" == release ]]; then
+      [[ "$target" == "$releases_dir/$ref" ]] || return 1
+      runtime_release_complete "$target" "$ref" || return 1
+      if ! release_tree_permissions_trusted "$target"; then
+        install_release "$ref" "$target" 0 0
+      fi
+      runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
+    else
+      [[ "$target" == "$manager_releases/$ref" ]] || return 1
+      manager_release_complete "$target" "$ref" || return 1
+      if ! release_tree_permissions_trusted "$target"; then
+        source=$releases_dir/$ref
+        install_release "$ref" "$source" 0 0
+        install_manager "$ref" "$source" "$target" 0 0 false
+      fi
+      manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
+    fi
+  done
+}
+
 pending_policy_checkpoint() {
   local expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -1880,7 +1913,10 @@ perform_converge() {
   pending_checkpoint_status=0
   pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
   case "$pending_checkpoint_status" in
-    0) checkpoint_dir=$pending_checkpoint ;;
+    0)
+      repair_pending_checkpoint_authority "$pending_checkpoint" || die 'pending network-policy controller checkpoint is invalid'
+      checkpoint_dir=$pending_checkpoint
+      ;;
     1) make_checkpoint "$release_dir" ;;
     *) die 'pending network-policy controller checkpoint is invalid' ;;
   esac

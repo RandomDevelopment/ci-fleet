@@ -1142,6 +1142,21 @@ for child in "${interrupted_descendants[@]}"; do
 done
 : >"$interrupted_pause.continue"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'hard stop did not occur after B controller state was written'
+interrupted_checkpoint=$(<"$interrupted_recovery/controller-checkpoint")
+stale_checkpoint_release=$root/opt/ci-fleet/releases/$cross_ref_old
+stale_checkpoint_manager=$root/opt/ci-fleet/manager/releases/$cross_ref_old
+cp -a "$(readlink -f "$root/opt/ci-fleet/current")" "$stale_checkpoint_release"
+printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_release/.ci-fleet-engine-ref"
+chmod g+w "$stale_checkpoint_release/scripts" "$stale_checkpoint_release/scripts/docker-network-policy-adapter.sh"
+refresh_release_digest "$stale_checkpoint_release"
+cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$stale_checkpoint_manager"
+printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_manager/.ci-fleet-engine-ref"
+chmod g+w "$stale_checkpoint_manager/scripts" "$stale_checkpoint_manager/scripts/docker-network-policy-adapter.sh"
+refresh_release_digest "$stale_checkpoint_manager"
+printf '%s\n' "$stale_checkpoint_release" >"$interrupted_checkpoint/release-target"
+printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-target"
+[[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_release" ]] || fail 'stale checkpoint release was still live'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") != "$stale_checkpoint_manager" ]] || fail 'stale checkpoint manager was still live'
 
 retry_pause=$tmp/interrupted-retry-pause
 retry_result=$tmp/interrupted-retry-result.json
@@ -1150,6 +1165,11 @@ retry_result=$tmp/interrupted-retry-result.json
 FAKE_PAUSE_SYSTEMCTL_ONCE=$retry_pause CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref" 7>"$retry_result" >"$tmp/interrupted-retry.out" 2>&1 &
 retry_pid=$!
 wait_for_file "$retry_pause.entered" 'interrupted policy retry did not reach nested activation'
+for repaired_checkpoint_target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
+  if find "$repaired_checkpoint_target" \( -type d -o -type f \) -perm /022 -print -quit | grep -q .; then
+    fail "pending checkpoint target remained permission-unsafe: $repaired_checkpoint_target"
+  fi
+done
 [[ -d "$interrupted_recovery" && $(stat -c %i "$interrupted_recovery") == "$interrupted_recovery_inode" ]] || fail 'interrupted policy retry replaced the original recovery checkpoint'
 [[ $(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*' | wc -l) == 1 ]] || fail 'interrupted policy retry created a second recovery checkpoint'
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"
@@ -1163,8 +1183,11 @@ cmp -s "$interrupted_env" "$root/etc/ci-fleet/ci-fleet.env" || fail 'interrupted
 cmp -s "$interrupted_state" "$root/var/lib/ci-fleet/install-state.json" || fail 'interrupted policy rollback restored B instead of A install state'
 cmp -s "$interrupted_daemon" "$daemon_config" || fail 'interrupted policy rollback did not restore A daemon.json'
 cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollback did not restore A policy marker'
-[[ $(readlink "$root/opt/ci-fleet/current") == "$interrupted_current" && $(readlink "$root/opt/ci-fleet/manager/current") == "$interrupted_manager" ]] || fail 'interrupted policy rollback did not restore A pointers'
+[[ $(readlink "$root/opt/ci-fleet/current") == "$interrupted_current" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore checkpoint pointers'
+ln -sfn "$interrupted_manager" "$root/opt/ci-fleet/manager/current"
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 unset FAKE_PAUSE_SYSTEMCTL_ONCE
+[[ ${CI_FLEET_TEST_STOP_AFTER_PENDING_CHECKPOINT_REPAIR:-0} != 1 ]] || { printf 'PENDING_CHECKPOINT_REPAIR_REGRESSION_OK\n'; exit 0; }
 
 # TERM only the outer installer while its nested resume is paused.
 term_ref=$(write_config active 4 4)
