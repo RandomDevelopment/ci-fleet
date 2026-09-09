@@ -1853,7 +1853,7 @@ perform_converge() {
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
   fi
-  if [[ -L "$current_link" ]]; then
+  if [[ "$mode" != install && -L "$current_link" ]]; then
     current_target=$(release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
       current_ref=$(<"$current_target/.ci-fleet-engine-ref")

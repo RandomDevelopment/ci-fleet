@@ -1005,7 +1005,6 @@ printf '%s\n' "$cross_ref_old" >"$cross_ref_runtime/.ci-fleet-engine-ref"
 printf 'invalid\n' >"$cross_ref_runtime/.ci-fleet-tree-sha256"
 ln -sfn "$cross_ref_runtime" "$root/opt/ci-fleet/current"
 expect_failure 'current release is incomplete; operator recovery or reinstall required' "$installer" --upgrade "${base_args[@]}" --ref "$ref_one"
-expect_failure 'current release is incomplete; operator recovery or reinstall required' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 [[ $(<"$cross_ref_runtime/.ci-fleet-engine-ref") == "$cross_ref_old" ]] || fail 'incomplete current release was replaced instead of failing closed'
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 rm -rf "$cross_ref_runtime"
