@@ -1975,6 +1975,17 @@ for unsafe_release in "$active_release" "$manager_release"; do
   chmod g+w "$unsafe_release/scripts" "$unsafe_release/scripts/docker-network-policy-adapter.sh"
   refresh_release_digest "$unsafe_release"
 done
+export FAKE_COMPOSE_LOG=$tmp/unsafe-release-uninstall-compose.log
+export FAKE_SYSTEMCTL_LOG=$tmp/unsafe-release-uninstall-systemctl.log
+export FAKE_MV_LOG=$tmp/unsafe-release-uninstall-mv.log
+: >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_SYSTEMCTL_LOG"
+: >"$FAKE_MV_LOG"
+expect_failure 'a trusted complete release is required to uninstall the controller' "$installer" --uninstall
+if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe uninstall authority caused a Compose or Docker mutation'; fi
+if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail 'unsafe uninstall authority caused a systemd mutation'; fi
+[[ ! -s "$FAKE_MV_LOG" ]] || fail 'unsafe uninstall authority replaced a link'
+unset FAKE_COMPOSE_LOG FAKE_SYSTEMCTL_LOG FAKE_MV_LOG
 expect_failure 'DRIFT engine_release' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 for repaired_path in "$active_release/scripts" "$active_release/scripts/docker-network-policy-adapter.sh" "$manager_release/scripts" "$manager_release/scripts/docker-network-policy-adapter.sh"; do

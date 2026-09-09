@@ -411,7 +411,8 @@ current_runtime_release() {
   fi
   [[ -n "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 0
   marker=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" || return 0
+  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" \
+    && release_tree_permissions_trusted "$target" || return 0
   printf '%s' "$target"
 }
 
@@ -650,7 +651,8 @@ manager_release_from_raw_pointer() {
   relative=${target#"$manager_releases/"}
   [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] && manager_release_complete "$target" "$ref" || return 1
+  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] && manager_release_complete "$target" "$ref" \
+    && release_tree_permissions_trusted "$target" || return 1
   printf '%s' "$target"
 }
 
@@ -1134,7 +1136,8 @@ make_checkpoint() {
       manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
       [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
       manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref" ||
+        ! release_tree_permissions_trusted "$manager_target"; then
         die 'manager current pointer is invalid'
       fi
     fi
@@ -1144,7 +1147,8 @@ make_checkpoint() {
   target=$(current_runtime_release)
   if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
     fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
-    if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref"; then target=$fallback_release; fi
+    if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref" \
+      && release_tree_permissions_trusted "$fallback_release"; then target=$fallback_release; fi
   fi
   [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -1827,6 +1831,9 @@ perform_converge() {
   fi
   capture_current_pointer
   install_release
+  if [[ -n ${manager_target:-} ]] && ! release_tree_permissions_trusted "$manager_target"; then
+    install_manager
+  fi
   compose "$release_dir" "$candidate_env" config --quiet
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
   candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
@@ -1961,7 +1968,8 @@ perform_uninstall() {
   for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
     old_ref=$(<"$candidate/.ci-fleet-engine-ref")
-    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref"; then old_release=$candidate; break; fi
+    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref" \
+      && release_tree_permissions_trusted "$candidate"; then old_release=$candidate; break; fi
   done
   [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint "$old_release"
