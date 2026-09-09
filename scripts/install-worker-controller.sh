@@ -643,15 +643,23 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
-release_target_from_raw_pointer() {
-  local link=$1 releases=$2 target relative ref
+canonical_release_target_from_raw_pointer() {
+  local link=$1 releases=$2 target relative
   target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
   target=${target%x}
   [[ "$target" == "$releases/"* ]] || return 1
   relative=${target#"$releases/"}
-  [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
+  [[ "$relative" =~ ^[0-9a-f]{40}$ && ! -L "$target" ]] || return 1
+  printf '%s' "$target"
+}
+
+release_target_from_raw_pointer() {
+  local link=$1 releases=$2 target relative ref
+  target=$(canonical_release_target_from_raw_pointer "$link" "$releases") || return 1
+  relative=${target#"$releases/"}
+  [[ -f "$target/.ci-fleet-engine-ref" ]] || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] || return 1
+  [[ "$relative" == "$ref" ]] || return 1
   printf '%s' "$target"
 }
 
@@ -1854,9 +1862,9 @@ perform_converge() {
     die 'an unmanaged controller configuration exists; use --adopt'
   fi
   if [[ "$mode" != install && -L "$current_link" ]]; then
-    current_target=$(release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
+    current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
-      current_ref=$(<"$current_target/.ci-fleet-engine-ref")
+      current_ref=${current_target##*/}
       runtime_release_complete "$current_target" "$current_ref" || die 'current release is incomplete; operator recovery or reinstall required'
       if ! release_tree_permissions_trusted "$current_target"; then
         install_release "$current_ref" "$current_target" 0 0
@@ -1864,16 +1872,20 @@ perform_converge() {
     fi
   fi
   if [[ -L "$manager_current" ]]; then
-    manager_target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases" || true)
+    manager_target=$(canonical_release_target_from_raw_pointer "$manager_current" "$manager_releases" || true)
     [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
-    manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-    if release_tree_permissions_trusted "$manager_target"; then
+    manager_ref=${manager_target##*/}
+    if ! manager_release_complete "$manager_target" "$manager_ref"; then
+      [[ "$mode" == install ]] || die 'manager current pointer is incomplete; operator recovery or reinstall required'
+      manager_source=$releases_dir/$manager_ref
+      install_release "$manager_ref" "$manager_source" 0 0
+      install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
+    elif release_tree_permissions_trusted "$manager_target"; then
       if [[ "$mode" == upgrade ]]; then
         CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
           || die 'manager current pointer is invalid'
       fi
     else
-      manager_release_complete "$manager_target" "$manager_ref" || die 'manager current pointer is incomplete; operator recovery or reinstall required'
       manager_source=$releases_dir/$manager_ref
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false

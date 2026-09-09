@@ -1006,6 +1006,9 @@ printf 'invalid\n' >"$cross_ref_runtime/.ci-fleet-tree-sha256"
 ln -sfn "$cross_ref_runtime" "$root/opt/ci-fleet/current"
 expect_failure 'current release is incomplete; operator recovery or reinstall required' "$installer" --upgrade "${base_args[@]}" --ref "$ref_one"
 [[ $(<"$cross_ref_runtime/.ci-fleet-engine-ref") == "$cross_ref_old" ]] || fail 'incomplete current release was replaced instead of failing closed'
+rm -f "$cross_ref_runtime/.ci-fleet-engine-ref"
+expect_failure 'current release is incomplete; operator recovery or reinstall required' "$installer" --upgrade "${base_args[@]}" --ref "$ref_one"
+[[ ! -e "$cross_ref_runtime/.ci-fleet-engine-ref" ]] || fail 'markerless current release was replaced instead of failing closed'
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 rm -rf "$cross_ref_runtime"
 cp -a "$authority_active_release" "$cross_ref_runtime"
@@ -1019,6 +1022,8 @@ chmod g+w "$cross_ref_manager/scripts" "$cross_ref_manager/scripts/docker-networ
 ln -sfn "$cross_ref_manager" "$root/opt/ci-fleet/manager/current"
 expect_failure 'manager current pointer is incomplete; operator recovery or reinstall required' "$installer" --upgrade "${base_args[@]}" --ref "$ref_one"
 [[ $(<"$cross_ref_manager/.ci-fleet-engine-ref") == "$cross_ref_old" ]] || fail 'incomplete manager release was replaced instead of failing closed'
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one"
+[[ $(<"$cross_ref_manager/.ci-fleet-tree-sha256") != invalid ]] || fail 'explicit reinstall did not restage the incomplete manager release'
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$cross_ref_manager"
 cp -a "$authority_active_manager" "$cross_ref_manager"
