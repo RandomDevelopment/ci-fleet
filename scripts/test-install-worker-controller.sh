@@ -2716,7 +2716,7 @@ grep -Fq 'managed containers already active for this instance' "$failed_current_
 grep -Fq 'ROLLBACK_RESTORED' "$failed_current_output" || fail "failed-current rollback did not restore the prior controller: $(<"$failed_current_output")"
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$failed_current_output")
 grep -Fxq "$root/opt/ci-fleet/releases/$engine_ref" "$checkpoint_path/release-target" || fail 'failed-current checkpoint omitted its validated rollback release'
-[[ -L "$root/opt/ci-fleet/current" && $(readlink "$root/opt/ci-fleet/current") == "$dangling_current_target" ]] || fail 'failed-current rollback did not preserve the original dangling link'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == $(<"$checkpoint_path/release-target") ]] || fail 'failed-current rollback did not normalize the dangling link to validated fallback authority'
 [[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_STOPPED_CONTROLLER_STATE" ]] || fail 'failed-current rollback did not recreate the prior running controller'
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$prior_controller_image_id" ]] || fail 'failed-current rollback did not restore the prior controller image'
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=1' "$FAKE_CONTROLLER_ENV_FILE" || fail 'failed-current rollback did not restore the prior controller identity'
