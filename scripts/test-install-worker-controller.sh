@@ -2824,7 +2824,6 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 expect_success "$installer" --rollback >/dev/null
 dangling_uninstall_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$uninstall_output")
 [[ $(readlink -f "$root/opt/ci-fleet/current") == $(<"$dangling_uninstall_checkpoint/release-target") ]] || fail 'explicit rollback did not normalize a dangling current pointer to trusted release authority'
-damaged_uninstall_output=$tmp/damaged-uninstall.out
 export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log
 : >"$FAKE_COMPOSE_LOG"
 ln -sfn "$root/opt/ci-fleet/releases/missing/runtime" "$root/opt/ci-fleet/current"
@@ -2836,19 +2835,10 @@ if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'untrusted presen
 rm -f "$FAKE_DOCKER_STATE"
 export FAKE_ALL_RUNNER_STATE=$tmp/damaged-no-controller-inactive-runner
 : >"$FAKE_ALL_RUNNER_STATE"
-if ! "$installer" --uninstall >"$damaged_uninstall_output" 2>&1; then
-  fail "damaged no-controller uninstall failed: $(<"$damaged_uninstall_output")"
-fi
-grep -Fq 'UNINSTALL_OK' "$damaged_uninstall_output" || fail 'damaged no-controller uninstall did not complete'
-[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'damaged no-controller uninstall retained an inactive managed runner'
+expect_failure 'a trusted complete runtime release is required before controller mutation' "$installer" --uninstall
+[[ -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'damaged no-controller uninstall removed a runner before validating runtime authority'
+[[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'damaged no-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'damaged no-controller uninstall invoked Compose'; fi
-for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer; do
-  [[ ! -e "$root/etc/systemd/system/$unit" ]] || fail "damaged no-controller uninstall retained managed unit: $unit"
-done
-[[ ! -e "$root/opt/ci-fleet/current" && ! -L "$root/opt/ci-fleet/current" && ! -e "$root/opt/ci-fleet/manager/current" && ! -L "$root/opt/ci-fleet/manager/current" ]] || fail 'damaged no-controller uninstall retained managed links'
-[[ ! -e "$root/etc/ci-fleet/ci-fleet.env" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'damaged no-controller uninstall retained managed state'
-[[ -f "$host_config" && -f "$pem" && -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'damaged no-controller uninstall removed host configuration or secrets'
-[[ -d "$root/opt/ci-fleet/releases" && -d "$root/opt/ci-fleet/manager/releases" ]] || fail 'damaged no-controller uninstall removed retained releases'
 unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_DAMAGED_UNINSTALL:-0} != 1 ]] || { printf 'DAMAGED_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 [[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_LINK_FALLBACK:-0} != 1 ]] || { printf 'CURRENT_LINK_FALLBACK_REGRESSIONS_OK\n'; exit 0; }
