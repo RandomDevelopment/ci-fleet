@@ -1122,7 +1122,8 @@ repair_pending_checkpoint_authority() {
   [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
     && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
     && $(stat -c %s "$file") -le 4095 ]] || return 1
-  target=$(<"$file")
+  if IFS= read -r -d '' target <"$file"; then return 1; fi
+  [[ "$target" != *$'\n'* ]] || return 1
   source=$(raw_link_target_path "$target" "$current_link") || return 1
   if [[ ! -e "$source" && ! -L "$source" ]]; then
     [[ -n "$release_authority" ]] || return 1
@@ -1663,7 +1664,14 @@ PY
     fi
   fi
   if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
-    restored_state=$(<"$validated_current_target")
+    if IFS= read -r -d '' restored_state <"$validated_current_target"; then
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    fi
+    if [[ "$restored_state" == *$'\n'* ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    fi
     source=$(raw_link_target_path "$restored_state" "$current_link") || {
       note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
       return 1
@@ -1946,6 +1954,11 @@ perform_converge() {
         install_release "$current_ref" "$current_target" 0 0
       elif ! release_tree_permissions_trusted "$current_target"; then
         install_release "$current_ref" "$current_target" 0 0
+      fi
+    elif [[ -e "$current_link" ]]; then
+      current_target=$(readlink -f -- "$current_link" || true)
+      if [[ -z "$current_target" ]] || ! release_tree_permissions_trusted "$current_target"; then
+        die 'current pointer is invalid'
       fi
     fi
   fi

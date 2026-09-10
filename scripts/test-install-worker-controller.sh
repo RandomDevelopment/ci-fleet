@@ -1582,6 +1582,11 @@ grep -Fq 'ROLLBACK_RESTORED' "$incomplete_current_output" || fail "incomplete cu
 authority_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$incomplete_current_output")
 grep -Fxq "$authority_active_release" "$authority_checkpoint/release-target" || fail 'checkpoint did not select the complete fallback release'
 if grep -Fxq "$incomplete_current" "$authority_checkpoint/release-target"; then fail 'checkpoint accepted an incomplete current release as executable authority'; fi
+chmod g+w "$incomplete_current"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'current pointer is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref"
+if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe noncanonical current target caused an operational mutation'; fi
+chmod g-w "$incomplete_current"
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 authority_manager=$(<"$authority_checkpoint/manager-target")
 for checkpoint_kind in release manager; do
@@ -1613,6 +1618,16 @@ refresh_release_digest "$authority_active_release"
 expect_failure 'checkpoint current target is invalid' "$installer" --rollback
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'invalid checkpoint current target stopped the controller'
 if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'invalid checkpoint current target caused an operational mutation'; fi
+python3 - "$authority_checkpoint/current-link" "$authority_active_release" <<'PY'
+import os
+import sys
+
+with open(os.fsencode(sys.argv[1]), "wb") as output:
+    output.write(os.fsencode(sys.argv[2]) + b"\n")
+PY
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'checkpoint current target is invalid' "$installer" --rollback
+if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'newline checkpoint current target caused an operational mutation'; fi
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"
 printf '2\n' >"$authority_checkpoint/format-version"
 rm -f "$authority_checkpoint/current-link" "$authority_checkpoint/current-absent"
