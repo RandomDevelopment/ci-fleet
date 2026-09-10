@@ -1105,6 +1105,7 @@ repair_pending_checkpoint_authority() {
     && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
     && $(stat -c %s "$file") -le 4095 ]] || return 1
   target=$(<"$file")
+  [[ -e "$target" || -L "$target" ]] || return 0
   target=$(canonical_release_target "$target" "$releases_dir") || return 1
   ref=${target##*/}
   runtime_release_complete "$target" "$ref" || return 1
@@ -1630,14 +1631,14 @@ PY
   fi
   if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
     restored_state=$(<"$validated_current_target")
-    if target=$(canonical_release_target "$restored_state" "$releases_dir"); then
+    if [[ ! -e "$restored_state" && ! -L "$restored_state" && -n "$checkpoint_release" ]]; then
+      printf '%s' "$checkpoint_release" >"$validated_current_target"
+    elif target=$(canonical_release_target "$restored_state" "$releases_dir"); then
       restored_state=${target##*/}
       if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
         note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
         return 1
       fi
-    elif [[ ! -e "$restored_state" && ! -L "$restored_state" && -n "$checkpoint_release" ]]; then
-      printf '%s' "$checkpoint_release" >"$validated_current_target"
     else
       note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
       return 1
