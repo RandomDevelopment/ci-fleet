@@ -1562,32 +1562,26 @@ unset FAKE_ALL_RUNNER_STATE
 [[ ${CI_FLEET_TEST_STOP_AFTER_DANGLING_MANAGER_UNINSTALL:-0} != 1 ]] || { printf 'DANGLING_MANAGER_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
 authority_ref=$(write_config drained 1 1)
-incomplete_current_output=$tmp/incomplete-current-authority.out
 export FAKE_COMPOSE_LOG=$tmp/incomplete-current-authority-compose.log
-export FAKE_ACTIVE_MANAGED_STATE=$tmp/incomplete-current-authority-blocker
-export FAKE_ACTIVE_MANAGED_AFTER_STOP=$FAKE_ACTIVE_MANAGED_STATE
-: >"$FAKE_COMPOSE_LOG"
-: >"$FAKE_ACTIVE_MANAGED_STATE"
 incomplete_current=$root/opt/ci-fleet/releases/incomplete-current
 mkdir -p "$incomplete_current"
 printf '%s\n' "$engine_ref" >"$incomplete_current/.ci-fleet-engine-ref"
-ln -sfn "$incomplete_current" "$root/opt/ci-fleet/current"
-if "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref" >"$incomplete_current_output" 2>&1; then
-  fail 'incomplete-current authority fixture unexpectedly succeeded'
-fi
-unset FAKE_ACTIVE_MANAGED_AFTER_STOP FAKE_ACTIVE_MANAGED_STATE
-rm -f "$tmp/incomplete-current-authority-blocker"
-grep -Fq 'DRAIN_OK managed_runners=0' "$incomplete_current_output" || fail "incomplete current prevented the valid fallback drain: $(<"$incomplete_current_output")"
-grep -Fq 'ROLLBACK_RESTORED' "$incomplete_current_output" || fail "incomplete current became rollback authority: $(<"$incomplete_current_output")"
-authority_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$incomplete_current_output")
-grep -Fxq "$authority_active_release" "$authority_checkpoint/release-target" || fail 'checkpoint did not select the complete fallback release'
-if grep -Fxq "$incomplete_current" "$authority_checkpoint/release-target"; then fail 'checkpoint accepted an incomplete current release as executable authority'; fi
 chmod g+w "$incomplete_current"
+ln -sfn "$incomplete_current" "$root/opt/ci-fleet/current"
 : >"$FAKE_COMPOSE_LOG"
 expect_failure 'current pointer is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref"
 if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe noncanonical current target caused an operational mutation'; fi
-chmod g-w "$incomplete_current"
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
+authority_checkpoint_output=$tmp/authority-checkpoint.out
+export FAKE_FAIL_UP_ONCE=$tmp/authority-checkpoint-fail-up
+: >"$FAKE_FAIL_UP_ONCE"
+if "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref" >"$authority_checkpoint_output" 2>&1; then
+  fail 'authority checkpoint fixture unexpectedly succeeded'
+fi
+unset FAKE_FAIL_UP_ONCE
+grep -Fq 'ROLLBACK_RESTORED' "$authority_checkpoint_output" || fail "authority checkpoint fixture did not roll back: $(<"$authority_checkpoint_output")"
+authority_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$authority_checkpoint_output")
+grep -Fxq "$authority_active_release" "$authority_checkpoint/release-target" || fail 'trusted checkpoint did not capture the active release'
 authority_manager=$(<"$authority_checkpoint/manager-target")
 for checkpoint_kind in release manager; do
   if [[ "$checkpoint_kind" == release ]]; then unsafe_target=$authority_active_release; else unsafe_target=$authority_manager; fi

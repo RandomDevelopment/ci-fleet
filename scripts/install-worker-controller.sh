@@ -1956,10 +1956,7 @@ perform_converge() {
         install_release "$current_ref" "$current_target" 0 0
       fi
     elif [[ -e "$current_link" ]]; then
-      current_target=$(readlink -f -- "$current_link" || true)
-      if [[ -z "$current_target" ]] || ! release_tree_permissions_trusted "$current_target"; then
-        die 'current pointer is invalid'
-      fi
+      die 'current pointer is invalid'
     fi
   fi
   if [[ -L "$manager_current" ]]; then
