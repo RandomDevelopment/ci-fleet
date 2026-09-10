@@ -694,10 +694,11 @@ manager_release_from_raw_pointer() {
 }
 
 release_matches() {
+  local target
   runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   release_tree_permissions_trusted "$release_dir" || return 1
-  [[ -L "$current_link" ]] || return 1
-  [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
+  target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir") || return 1
+  [[ "$target" == "$release_dir" ]]
 }
 
 managed_images_match() {
@@ -2119,10 +2120,9 @@ perform_uninstall() {
   local candidate manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
   status=$(controller_status)
-  if [[ -z "$status" ]]; then
-    manager_candidate=$(manager_release_from_raw_pointer || true)
-  else
-    manager_candidate=$(readlink -f "$manager_current" 2>/dev/null || true)
+  manager_candidate=$(manager_release_from_raw_pointer || true)
+  if [[ -n "$status" && -z "$manager_candidate" ]]; then
+    die 'a trusted complete canonical manager release is required to uninstall the running controller'
   fi
   for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
