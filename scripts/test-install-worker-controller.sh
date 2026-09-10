@@ -1199,6 +1199,10 @@ for repaired_checkpoint_target in "$stale_checkpoint_release" "$stale_checkpoint
     fail "pending checkpoint target remained permission-unsafe: $repaired_checkpoint_target"
   fi
 done
+[[ -f "$interrupted_checkpoint/current-link" && ! -L "$interrupted_checkpoint/current-link" \
+  && $(stat -c %a "$interrupted_checkpoint/current-link") == 600 \
+  && $(<"$interrupted_checkpoint/current-link") == "$stale_checkpoint_release" ]] || fail 'missing checkpoint current link was not atomically normalized'
+[[ -z $(find "$interrupted_checkpoint" -maxdepth 1 -name '.current-link.*' -print -quit) ]] || fail 'checkpoint current-link staging file leaked'
 [[ -d "$interrupted_recovery" && $(stat -c %i "$interrupted_recovery") == "$interrupted_recovery_inode" ]] || fail 'interrupted policy retry replaced the original recovery checkpoint'
 [[ $(find "$policy_checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'recovery.*' | wc -l) == 1 ]] || fail 'interrupted policy retry created a second recovery checkpoint'
 printf 'restarting\n' >"$FAKE_CONTROLLER_STATUS_FILE"

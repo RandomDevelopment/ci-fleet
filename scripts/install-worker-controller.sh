@@ -1086,7 +1086,7 @@ PY
 }
 
 repair_pending_checkpoint_authority() {
-  local checkpoint=$1 kind file target ref expected_owner=0 source release_authority=''
+  local checkpoint=$1 kind file target ref expected_owner=0 source staged_link release_authority=''
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   for kind in release manager; do
     file=$checkpoint/$kind-target
@@ -1126,7 +1126,16 @@ repair_pending_checkpoint_authority() {
   source=$(raw_link_target_path "$target" "$current_link") || return 1
   if [[ ! -e "$source" && ! -L "$source" ]]; then
     [[ -n "$release_authority" ]] || return 1
-    printf '%s' "$release_authority" >"$file"
+    staged_link=$(mktemp "$checkpoint/.current-link.XXXXXX") || return 1
+    if ! chmod 600 "$staged_link" || ! printf '%s' "$release_authority" >"$staged_link" \
+      || [[ ! -f "$staged_link" || -L "$staged_link" || $(stat -c %u "$staged_link") != "$expected_owner" \
+        || $(stat -c %a "$staged_link") != 600 || $(<"$staged_link") != "$release_authority" ]] \
+      || ! mv -f -- "$staged_link" "$file"; then
+      rm -f -- "$staged_link"
+      return 1
+    fi
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+      && $(stat -c %a "$file") == 600 && $(<"$file") == "$release_authority" ]] || return 1
     return 0
   fi
   target=$(resolve_link_target "$target" "$current_link") || return 1
