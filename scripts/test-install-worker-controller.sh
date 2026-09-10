@@ -1498,7 +1498,7 @@ assert_uninstall_manager_rejected_without_mutation() {
   : >"$FAKE_MV_LOG"
   cp -a "$root" "$snapshot"
   if "$installer" --uninstall >"$output" 2>&1; then fail "invalid uninstall manager pointer was accepted: $label"; fi
-  grep -Fq 'manager current pointer is invalid' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
+  grep -Fq 'a trusted complete canonical manager release is required to uninstall the running controller' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
   diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid uninstall manager pointer mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid uninstall manager pointer caused a Compose or Docker mutation: $label"; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid uninstall manager pointer caused a systemd mutation: $label"; fi
@@ -2124,7 +2124,7 @@ export FAKE_MV_LOG=$tmp/unsafe-release-uninstall-mv.log
 : >"$FAKE_COMPOSE_LOG"
 : >"$FAKE_SYSTEMCTL_LOG"
 : >"$FAKE_MV_LOG"
-expect_failure 'a trusted complete release is required to uninstall the controller' "$installer" --uninstall
+expect_failure 'a trusted complete canonical manager release is required to uninstall the running controller' "$installer" --uninstall
 if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe uninstall authority caused a Compose or Docker mutation'; fi
 if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail 'unsafe uninstall authority caused a systemd mutation'; fi
 [[ ! -s "$FAKE_MV_LOG" ]] || fail 'unsafe uninstall authority replaced a link'
@@ -2823,7 +2823,7 @@ export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log
 ln -sfn "$root/opt/ci-fleet/releases/missing/runtime" "$root/opt/ci-fleet/current"
 ln -sfn "$root/opt/ci-fleet/manager/releases/missing" "$root/opt/ci-fleet/manager/current"
 : >"$FAKE_DOCKER_STATE"
-expect_failure 'a trusted complete release is required to uninstall the controller' "$installer" --uninstall
+expect_failure 'a trusted complete canonical manager release is required to uninstall the running controller' "$installer" --uninstall
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'untrusted present-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'untrusted present-controller uninstall invoked Compose'; fi
 rm -f "$FAKE_DOCKER_STATE"
