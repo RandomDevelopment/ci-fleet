@@ -1618,6 +1618,9 @@ PY
 : >"$FAKE_COMPOSE_LOG"
 expect_failure 'checkpoint current target is invalid' "$installer" --rollback
 if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'newline checkpoint current target caused an operational mutation'; fi
+printf 'releases/%s' "${authority_active_release##*/}" >"$authority_checkpoint/current-link"
+expect_success "$installer" --rollback >/dev/null
+[[ $(readlink "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'relative checkpoint current target was not normalized to absolute authority'
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"
 printf '2\n' >"$authority_checkpoint/format-version"
 rm -f "$authority_checkpoint/current-link" "$authority_checkpoint/current-absent"

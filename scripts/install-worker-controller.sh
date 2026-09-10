@@ -1693,6 +1693,14 @@ PY
         note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
         return 1
       fi
+      printf '%s' "$target" >"$validated_current_target" || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      }
+      [[ $(<"$validated_current_target") == "$target" ]] || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      }
     fi
   fi
   if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -2123,6 +2131,9 @@ perform_uninstall() {
   if [[ -L "$current_link" && -e "$current_link" ]]; then
     current_candidate=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     [[ -n "$current_candidate" ]] || die 'current pointer is invalid; operator recovery or reinstall required'
+    if ! runtime_release_complete "$current_candidate" "${current_candidate##*/}" || ! release_tree_permissions_trusted "$current_candidate"; then
+      die 'a trusted complete canonical runtime release is required to uninstall'
+    fi
   fi
   manager_candidate=$(manager_release_from_raw_pointer || true)
   if [[ -z "$manager_candidate" && ( -n "$status" || ( -L "$manager_current" && -e "$manager_current" ) ) ]]; then
