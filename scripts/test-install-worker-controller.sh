@@ -1533,10 +1533,8 @@ mkdir "$incomplete_uninstall_manager"
 printf '%s\n' "$engine_ref" >"$incomplete_uninstall_manager/.ci-fleet-engine-ref"
 ln -sfn "$incomplete_uninstall_manager" "$root/opt/ci-fleet/manager/current"
 : >"$FAKE_ALL_RUNNER_STATE"
-incomplete_manager_uninstall_output=$(expect_success "$installer" --uninstall)
-grep -Fq 'UNINSTALL_OK' <<<"$incomplete_manager_uninstall_output" || fail 'incomplete-manager no-controller uninstall did not complete'
-[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'incomplete-manager no-controller uninstall did not remove inactive runners'
-expect_success "$installer" --rollback >/dev/null
+expect_failure 'a trusted complete canonical manager release is required to uninstall the running controller' "$installer" --uninstall
+[[ -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'incomplete-manager no-controller uninstall removed runners before rejecting manager authority'
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$incomplete_uninstall_manager"
 rm -f "$FAKE_DOCKER_STATE"
@@ -1551,11 +1549,8 @@ os.unlink(link)
 os.symlink(target + b"\n", link)
 PY
 : >"$FAKE_ALL_RUNNER_STATE"
-raw_manager_uninstall_output=$(expect_success "$installer" --uninstall)
-raw_manager_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' <<<"$raw_manager_uninstall_output")
-[[ ! -e "$raw_manager_checkpoint/manager-target" ]] || fail "raw invalid manager pointer was normalized into checkpoint authority: $(<"$raw_manager_checkpoint/manager-target")"
-[[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'raw-manager no-controller uninstall did not remove inactive runners'
-expect_success "$installer" --rollback >/dev/null
+expect_failure 'a trusted complete canonical manager release is required to uninstall the running controller' "$installer" --uninstall
+[[ -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'raw-manager no-controller uninstall removed runners before rejecting manager authority'
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$raw_manager_release"
 unset FAKE_ALL_RUNNER_STATE
