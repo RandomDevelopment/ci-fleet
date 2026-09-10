@@ -2114,7 +2114,7 @@ export FAKE_MV_LOG=$tmp/unsafe-release-uninstall-mv.log
 : >"$FAKE_COMPOSE_LOG"
 : >"$FAKE_SYSTEMCTL_LOG"
 : >"$FAKE_MV_LOG"
-expect_failure 'a trusted complete canonical manager release is required to uninstall the running controller' "$installer" --uninstall
+expect_failure 'a trusted complete canonical runtime release is required to uninstall' "$installer" --uninstall
 if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe uninstall authority caused a Compose or Docker mutation'; fi
 if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail 'unsafe uninstall authority caused a systemd mutation'; fi
 [[ ! -s "$FAKE_MV_LOG" ]] || fail 'unsafe uninstall authority replaced a link'
