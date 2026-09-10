@@ -1608,6 +1608,7 @@ if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail
 rm "$authority_active_release/scripts/cleanup.sh"
 mv "$saved_cleanup" "$authority_active_release/scripts/cleanup.sh"
 refresh_release_digest "$authority_active_release"
+printf '%s' "$incomplete_current" >"$authority_checkpoint/current-link"
 : >"$FAKE_COMPOSE_LOG"
 expect_failure 'checkpoint current target is invalid' "$installer" --rollback
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'invalid checkpoint current target stopped the controller'
