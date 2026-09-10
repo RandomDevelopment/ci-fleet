@@ -1574,7 +1574,7 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
+  local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
   local restore_controller_tag_after_start=false
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
@@ -1654,6 +1654,19 @@ PY
       note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
       return 1
     fi
+    runtime_target=$(canonical_release_target "$checkpoint_release" "$releases_dir" || true)
+    if [[ -z "$runtime_target" ]]; then
+      if [[ "$checkpoint_release" != "$manager_releases/"* || -L "$checkpoint_release" ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
+        return 1
+      fi
+      runtime_target=$releases_dir/$target
+      if ! install_release "$target" "$runtime_target" 0 0; then
+        note 'ROLLBACK_FAILED reason=checkpoint release target normalization failed'
+        return 1
+      fi
+    fi
+    checkpoint_release=$runtime_target
   fi
 
   if [[ -e "$checkpoint_dir/manager-target" || -L "$checkpoint_dir/manager-target" ]]; then
