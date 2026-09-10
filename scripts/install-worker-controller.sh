@@ -2152,7 +2152,7 @@ perform_uninstall() {
   if [[ -z "$manager_candidate" && ( -n "$status" || ( -L "$manager_current" && -e "$manager_current" ) ) ]]; then
     die 'a trusted complete canonical manager release is required to uninstall the running controller'
   fi
-  for candidate in "$(current_runtime_release)" "$releases_dir/${manager_candidate##*/}" "$release_dir"; do
+  for candidate in "$(current_runtime_release)" "$releases_dir/${manager_candidate##*/}"; do
     candidate=$(canonical_release_target "$candidate" "$releases_dir" || true)
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
     old_ref=$(<"$candidate/.ci-fleet-engine-ref")
