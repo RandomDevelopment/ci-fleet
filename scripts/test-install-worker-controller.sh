@@ -1185,7 +1185,7 @@ cp -a "$(readlink -f "$root/opt/ci-fleet/manager/current")" "$stale_checkpoint_m
 printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_manager/.ci-fleet-engine-ref"
 chmod g+w "$stale_checkpoint_manager/scripts" "$stale_checkpoint_manager/scripts/docker-network-policy-adapter.sh"
 refresh_release_digest "$stale_checkpoint_manager"
-printf '%s' "$stale_checkpoint_current" >"$interrupted_checkpoint/current-link"
+printf 'releases/%s' "$stale_current_ref" >"$interrupted_checkpoint/current-link"
 printf '%s\n' "$stale_checkpoint_release" >"$interrupted_checkpoint/release-target"
 printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-target"
 [[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_current" ]] || fail 'stale checkpoint current target was still live'
@@ -1217,7 +1217,7 @@ cmp -s "$interrupted_env" "$root/etc/ci-fleet/ci-fleet.env" || fail 'interrupted
 cmp -s "$interrupted_state" "$root/var/lib/ci-fleet/install-state.json" || fail 'interrupted policy rollback restored B instead of A install state'
 cmp -s "$interrupted_daemon" "$daemon_config" || fail 'interrupted policy rollback did not restore A daemon.json'
 cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollback did not restore A policy marker'
-[[ $(readlink "$root/opt/ci-fleet/current") == "$stale_checkpoint_current" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore checkpoint pointers'
+[[ $(readlink "$root/opt/ci-fleet/current") == "releases/$stale_current_ref" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore checkpoint pointers'
 ln -sfn "$interrupted_current" "$root/opt/ci-fleet/current"
 ln -sfn "$interrupted_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$stale_checkpoint_current" "$stale_checkpoint_release" "$stale_checkpoint_manager"
@@ -2789,7 +2789,7 @@ export FAKE_STOPPED_CONTROLLER_STATE=$tmp/uninstall-created-controller
 : >"$FAKE_STOPPED_CONTROLLER_STATE"
 printf 'created\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 canonical_missing_current=$root/opt/ci-fleet/releases/1111111111111111111111111111111111111111
-ln -sfn "$canonical_missing_current" "$root/opt/ci-fleet/current"
+ln -sfn "releases/${canonical_missing_current##*/}" "$root/opt/ci-fleet/current"
 if ! "$installer" --uninstall >"$uninstall_output" 2>&1; then
   grep -Fq 'cannot stop restartable controller state without its runtime release: created' "$uninstall_output" || fail "dangling-current uninstall failed unexpectedly: $(<"$uninstall_output")"
   if grep -Eq '^(stop|build|up|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'dangling-current uninstall mutated the controller before validating a drain release'; fi

@@ -643,6 +643,14 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
+resolve_link_target() {
+  local target=$1 link=$2
+  if [[ "$target" != /* ]]; then
+    target=$(realpath -m -- "$(dirname "$link")/$target") || return 1
+  fi
+  printf '%s' "$target"
+}
+
 canonical_release_target() {
   local target=$1 releases=$2 relative
   [[ "$target" == "$releases/"* ]] || return 1
@@ -1105,6 +1113,7 @@ repair_pending_checkpoint_authority() {
     && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
     && $(stat -c %s "$file") -le 4095 ]] || return 1
   target=$(<"$file")
+  target=$(resolve_link_target "$target" "$current_link") || return 1
   [[ -e "$target" || -L "$target" ]] || return 0
   target=$(canonical_release_target "$target" "$releases_dir") || return 1
   ref=${target##*/}
@@ -1631,6 +1640,10 @@ PY
   fi
   if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
     restored_state=$(<"$validated_current_target")
+    restored_state=$(resolve_link_target "$restored_state" "$current_link") || {
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    }
     if [[ ! -e "$restored_state" && ! -L "$restored_state" && -n "$checkpoint_release" ]]; then
       printf '%s' "$checkpoint_release" >"$validated_current_target"
     elif target=$(canonical_release_target "$restored_state" "$releases_dir"); then
