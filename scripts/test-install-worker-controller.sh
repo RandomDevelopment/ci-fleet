@@ -1498,7 +1498,7 @@ assert_uninstall_manager_rejected_without_mutation() {
   : >"$FAKE_MV_LOG"
   cp -a "$root" "$snapshot"
   if "$installer" --uninstall >"$output" 2>&1; then fail "invalid uninstall manager pointer was accepted: $label"; fi
-  grep -Fq 'a trusted complete canonical manager release is required to uninstall the running controller' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
+  grep -Fq 'manager current pointer is invalid' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
   diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid uninstall manager pointer mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid uninstall manager pointer caused a Compose or Docker mutation: $label"; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid uninstall manager pointer caused a systemd mutation: $label"; fi
