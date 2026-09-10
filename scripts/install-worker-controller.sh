@@ -1629,13 +1629,16 @@ PY
     fi
   fi
   if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
-    target=$(<"$validated_current_target")
-    target=$(canonical_release_target "$target" "$releases_dir") || {
-      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
-      return 1
-    }
-    restored_state=${target##*/}
-    if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
+    restored_state=$(<"$validated_current_target")
+    if target=$(canonical_release_target "$restored_state" "$releases_dir"); then
+      restored_state=${target##*/}
+      if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      fi
+    elif [[ ! -e "$restored_state" && ! -L "$restored_state" && -n "$checkpoint_release" ]]; then
+      printf '%s' "$checkpoint_release" >"$validated_current_target"
+    else
       note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
       return 1
     fi

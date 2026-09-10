@@ -2806,6 +2806,8 @@ unset FAKE_RUNNER_STATE_ONCE FAKE_ALL_RUNNER_STATE
 [[ -f "$root/etc/ci-fleet/monitoring.env" ]] || fail 'uninstall removed host-local monitoring configuration'
 [[ ! -e "$root/var/lib/ci-fleet/health" ]] || fail 'uninstall retained fleet-owned health state'
 expect_success "$installer" --rollback >/dev/null
+latest_uninstall_checkpoint=$(latest_complete_checkpoint)
+[[ $(readlink -f "$root/opt/ci-fleet/current") == $(<"$latest_uninstall_checkpoint/release-target") ]] || fail 'explicit rollback did not normalize a dangling current pointer to trusted release authority'
 damaged_uninstall_output=$tmp/damaged-uninstall.out
 export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log
 : >"$FAKE_COMPOSE_LOG"
