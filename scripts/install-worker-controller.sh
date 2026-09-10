@@ -643,6 +643,14 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
+raw_link_target_path() {
+  local target=$1 link=$2
+  if [[ "$target" != /* ]]; then
+    target=$(dirname "$link")/$target
+  fi
+  printf '%s' "$target"
+}
+
 resolve_link_target() {
   local target=$1 link=$2
   if [[ "$target" != /* ]]; then
@@ -1114,8 +1122,9 @@ repair_pending_checkpoint_authority() {
     && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
     && $(stat -c %s "$file") -le 4095 ]] || return 1
   target=$(<"$file")
+  source=$(raw_link_target_path "$target" "$current_link") || return 1
+  [[ -e "$source" || -L "$source" ]] || return 0
   target=$(resolve_link_target "$target" "$current_link") || return 1
-  [[ -e "$target" || -L "$target" ]] || return 0
   target=$(canonical_release_target "$target" "$releases_dir") || return 1
   ref=${target##*/}
   runtime_release_complete "$target" "$ref" || return 1
@@ -1641,21 +1650,26 @@ PY
   fi
   if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
     restored_state=$(<"$validated_current_target")
-    restored_state=$(resolve_link_target "$restored_state" "$current_link") || {
+    source=$(raw_link_target_path "$restored_state" "$current_link") || {
       note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
       return 1
     }
-    if [[ ! -e "$restored_state" && ! -L "$restored_state" && -n "$checkpoint_release" ]]; then
+    if [[ ! -e "$source" && ! -L "$source" && -n "$checkpoint_release" ]]; then
       printf '%s' "$checkpoint_release" >"$validated_current_target"
-    elif target=$(canonical_release_target "$restored_state" "$releases_dir"); then
+    else
+      restored_state=$(resolve_link_target "$restored_state" "$current_link") || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      }
+      target=$(canonical_release_target "$restored_state" "$releases_dir") || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      }
       restored_state=${target##*/}
       if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
         note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
         return 1
       fi
-    else
-      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
-      return 1
     fi
   fi
   if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then

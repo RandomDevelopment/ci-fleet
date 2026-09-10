@@ -2792,8 +2792,7 @@ export FAKE_COMPOSE_LOG=$tmp/dangling-current-uninstall-compose.log
 export FAKE_STOPPED_CONTROLLER_STATE=$tmp/uninstall-created-controller
 : >"$FAKE_STOPPED_CONTROLLER_STATE"
 printf 'created\n' >"$FAKE_CONTROLLER_STATUS_FILE"
-canonical_missing_current=$root/opt/ci-fleet/releases/1111111111111111111111111111111111111111
-ln -sfn "releases/${canonical_missing_current##*/}" "$root/opt/ci-fleet/current"
+ln -sfn '../../unavailable-relative-release' "$root/opt/ci-fleet/current"
 if ! "$installer" --uninstall >"$uninstall_output" 2>&1; then
   grep -Fq 'cannot stop restartable controller state without its runtime release: created' "$uninstall_output" || fail "dangling-current uninstall failed unexpectedly: $(<"$uninstall_output")"
   if grep -Eq '^(stop|build|up|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'dangling-current uninstall mutated the controller before validating a drain release'; fi
