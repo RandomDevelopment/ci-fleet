@@ -646,6 +646,7 @@ manager_release_complete() {
 resolve_link_target() {
   local target=$1 link=$2
   if [[ "$target" != /* ]]; then
+    [[ "/$target/" != *"/../"* ]] || return 1
     target=$(realpath -ms -- "$(dirname "$link")/$target") || return 1
   fi
   printf '%s' "$target"
