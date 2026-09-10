@@ -1086,7 +1086,7 @@ PY
 }
 
 repair_pending_checkpoint_authority() {
-  local checkpoint=$1 kind file target ref expected_owner=0 source
+  local checkpoint=$1 kind file target ref expected_owner=0 source release_authority=''
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   for kind in release manager; do
     file=$checkpoint/$kind-target
@@ -1115,6 +1115,7 @@ repair_pending_checkpoint_authority() {
       fi
       manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
     fi
+    [[ "$kind" != release ]] || release_authority=$target
   done
   file=$checkpoint/current-link
   [[ -e "$file" || -L "$file" ]] || return 0
@@ -1123,7 +1124,11 @@ repair_pending_checkpoint_authority() {
     && $(stat -c %s "$file") -le 4095 ]] || return 1
   target=$(<"$file")
   source=$(raw_link_target_path "$target" "$current_link") || return 1
-  [[ -e "$source" || -L "$source" ]] || return 0
+  if [[ ! -e "$source" && ! -L "$source" ]]; then
+    [[ -n "$release_authority" ]] || return 1
+    printf '%s' "$release_authority" >"$file"
+    return 0
+  fi
   target=$(resolve_link_target "$target" "$current_link") || return 1
   target=$(canonical_release_target "$target" "$releases_dir") || return 1
   ref=${target##*/}

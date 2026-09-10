@@ -1167,16 +1167,8 @@ done
 : >"$interrupted_pause.continue"
 grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'hard stop did not occur after B controller state was written'
 interrupted_checkpoint=$(<"$interrupted_recovery/controller-checkpoint")
-stale_current_ref=$(printf 'stale current-link fixture\n' | env \
-  GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid \
-  git -C "$repo_root" commit-tree "$cross_ref_tree" -p "$cross_ref_old")
-stale_checkpoint_current=$root/opt/ci-fleet/releases/$stale_current_ref
 stale_checkpoint_release=$root/opt/ci-fleet/releases/$cross_ref_old
 stale_checkpoint_manager=$root/opt/ci-fleet/manager/releases/$cross_ref_old
-cp -a "$(readlink -f "$root/opt/ci-fleet/current")" "$stale_checkpoint_current"
-printf '%s\n' "$stale_current_ref" >"$stale_checkpoint_current/.ci-fleet-engine-ref"
-chmod g+w "$stale_checkpoint_current/scripts" "$stale_checkpoint_current/scripts/docker-network-policy-adapter.sh"
-refresh_release_digest "$stale_checkpoint_current"
 cp -a "$(readlink -f "$root/opt/ci-fleet/current")" "$stale_checkpoint_release"
 printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_release/.ci-fleet-engine-ref"
 chmod g+w "$stale_checkpoint_release/scripts" "$stale_checkpoint_release/scripts/docker-network-policy-adapter.sh"
@@ -1186,13 +1178,12 @@ printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_manager/.ci-fleet-engine-ref"
 chmod g+w "$stale_checkpoint_manager/scripts" "$stale_checkpoint_manager/scripts/docker-network-policy-adapter.sh"
 refresh_release_digest "$stale_checkpoint_manager"
 ln -s releases "$root/opt/ci-fleet/release-aliases"
-printf 'release-aliases/../releases/%s' "$stale_current_ref" >"$interrupted_checkpoint/current-link"
+printf 'release-aliases/../releases/%s' "$engine_ref" >"$interrupted_checkpoint/current-link"
 expect_failure 'pending network-policy controller checkpoint is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref"
 rm "$root/opt/ci-fleet/release-aliases"
-printf 'releases/%s' "$stale_current_ref" >"$interrupted_checkpoint/current-link"
+printf '../../unavailable-relative-release' >"$interrupted_checkpoint/current-link"
 printf '%s\n' "$stale_checkpoint_release" >"$interrupted_checkpoint/release-target"
 printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-target"
-[[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_current" ]] || fail 'stale checkpoint current target was still live'
 [[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_release" ]] || fail 'stale checkpoint release was still live'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") != "$stale_checkpoint_manager" ]] || fail 'stale checkpoint manager was still live'
 
@@ -1203,7 +1194,7 @@ retry_result=$tmp/interrupted-retry-result.json
 FAKE_PAUSE_SYSTEMCTL_ONCE=$retry_pause CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref" 7>"$retry_result" >"$tmp/interrupted-retry.out" 2>&1 &
 retry_pid=$!
 wait_for_file "$retry_pause.entered" 'interrupted policy retry did not reach nested activation'
-for repaired_checkpoint_target in "$stale_checkpoint_current" "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
+for repaired_checkpoint_target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
   if find "$repaired_checkpoint_target" \( -type d -o -type f \) -perm /022 -print -quit | grep -q .; then
     fail "pending checkpoint target remained permission-unsafe: $repaired_checkpoint_target"
   fi
@@ -1221,10 +1212,10 @@ cmp -s "$interrupted_env" "$root/etc/ci-fleet/ci-fleet.env" || fail 'interrupted
 cmp -s "$interrupted_state" "$root/var/lib/ci-fleet/install-state.json" || fail 'interrupted policy rollback restored B instead of A install state'
 cmp -s "$interrupted_daemon" "$daemon_config" || fail 'interrupted policy rollback did not restore A daemon.json'
 cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollback did not restore A policy marker'
-[[ $(readlink "$root/opt/ci-fleet/current") == "releases/$stale_current_ref" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore checkpoint pointers'
+[[ $(readlink "$root/opt/ci-fleet/current") == "$stale_checkpoint_release" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore normalized checkpoint pointers'
 ln -sfn "$interrupted_current" "$root/opt/ci-fleet/current"
 ln -sfn "$interrupted_manager" "$root/opt/ci-fleet/manager/current"
-rm -rf "$stale_checkpoint_current" "$stale_checkpoint_release" "$stale_checkpoint_manager"
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 unset FAKE_PAUSE_SYSTEMCTL_ONCE
 [[ ${CI_FLEET_TEST_STOP_AFTER_PENDING_CHECKPOINT_REPAIR:-0} != 1 ]] || { printf 'PENDING_CHECKPOINT_REPAIR_REGRESSION_OK\n'; exit 0; }
 
