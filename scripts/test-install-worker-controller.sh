@@ -1635,7 +1635,7 @@ export FAKE_FAIL_UP_ONCE=$tmp/absolute-dangling-fail-up
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$pointer_ref"
 unset FAKE_FAIL_UP_ONCE
-[[ -L "$root/opt/ci-fleet/current" && $(readlink "$root/opt/ci-fleet/current") == "$absolute_dangling_target" ]] || fail 'rollback did not restore the exact absolute dangling current link'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'automatic rollback did not normalize the absolute dangling current link to trusted fallback authority'
 relative_dangling_target=../../unavailable-relative-release
 ln -sfn "$relative_dangling_target" "$root/opt/ci-fleet/current"
 relative_pointer_ref=$(write_config active 3 3)
@@ -1643,7 +1643,7 @@ export FAKE_FAIL_UP_ONCE=$tmp/relative-dangling-fail-up
 : >"$FAKE_FAIL_UP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$relative_pointer_ref"
 unset FAKE_FAIL_UP_ONCE
-[[ -L "$root/opt/ci-fleet/current" && $(readlink "$root/opt/ci-fleet/current") == "$relative_dangling_target" ]] || fail 'rollback did not restore the exact relative dangling current link'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'automatic rollback did not normalize the relative dangling current link to trusted fallback authority'
 raw_current_target=$tmp/raw-current-target
 python3 - "$root/opt/ci-fleet/current" "$raw_current_target" <<'PY'
 import os
