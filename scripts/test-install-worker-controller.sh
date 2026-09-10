@@ -1489,7 +1489,7 @@ rm -rf "$manager_cache"
 [[ ${CI_FLEET_TEST_STOP_AFTER_BYTECODE_REPAIR:-0} != 1 ]] || { printf 'BYTECODE_REPAIR_REGRESSION_OK\n'; exit 0; }
 initial_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
 assert_uninstall_manager_rejected_without_mutation() {
-  local label=$1 snapshot=$tmp/uninstall-manager-$1-snapshot output=$tmp/uninstall-manager-$1.out
+  local label=$1 expected=$2 snapshot=$tmp/uninstall-manager-$1-snapshot output=$tmp/uninstall-manager-$1.out
   export FAKE_COMPOSE_LOG=$tmp/uninstall-manager-$1-compose.log
   export FAKE_SYSTEMCTL_LOG=$tmp/uninstall-manager-$1-systemctl.log
   export FAKE_MV_LOG=$tmp/uninstall-manager-$1-mv.log
@@ -1498,7 +1498,7 @@ assert_uninstall_manager_rejected_without_mutation() {
   : >"$FAKE_MV_LOG"
   cp -a "$root" "$snapshot"
   if "$installer" --uninstall >"$output" 2>&1; then fail "invalid uninstall manager pointer was accepted: $label"; fi
-  grep -Fq 'manager current pointer is invalid' "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
+  grep -Fq "$expected" "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
   diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid uninstall manager pointer mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid uninstall manager pointer caused a Compose or Docker mutation: $label"; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid uninstall manager pointer caused a systemd mutation: $label"; fi
@@ -1507,14 +1507,14 @@ assert_uninstall_manager_rejected_without_mutation() {
   unset FAKE_COMPOSE_LOG FAKE_SYSTEMCTL_LOG FAKE_MV_LOG
 }
 ln -sfn "$root/opt/ci-fleet/manager/releases/missing" "$root/opt/ci-fleet/manager/current"
-assert_uninstall_manager_rejected_without_mutation present-dangling
+assert_uninstall_manager_rejected_without_mutation present-dangling 'a trusted complete canonical manager release is required to uninstall the running controller'
 rm -f "$FAKE_DOCKER_STATE"
 rm -f "$root/opt/ci-fleet/manager/current"
 printf 'not a link\n' >"$root/opt/ci-fleet/manager/current"
-assert_uninstall_manager_rejected_without_mutation absent-file
+assert_uninstall_manager_rejected_without_mutation absent-file 'manager current pointer is invalid'
 rm -f "$root/opt/ci-fleet/manager/current"
 mkdir "$root/opt/ci-fleet/manager/current"
-assert_uninstall_manager_rejected_without_mutation absent-directory
+assert_uninstall_manager_rejected_without_mutation absent-directory 'manager current pointer is invalid'
 rmdir "$root/opt/ci-fleet/manager/current"
 ln -sfn "$root/opt/ci-fleet/manager/releases/missing" "$root/opt/ci-fleet/manager/current"
 export FAKE_ALL_RUNNER_STATE=$tmp/dangling-manager-uninstall-runner
