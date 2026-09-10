@@ -1667,15 +1667,7 @@ export FAKE_MV_LOG=$tmp/raw-current-mv.log
 : >"$FAKE_MV_LOG"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$relative_pointer_ref"
 unset FAKE_FAIL_UP_ONCE
-python3 - "$root/opt/ci-fleet/current" "$raw_current_target" <<'PY' || fail 'rollback did not restore the trailing-newline current target byte-for-byte'
-import os
-import sys
-
-link, expected = map(os.fsencode, sys.argv[1:])
-with open(expected, "rb") as source:
-    expected_target = source.read()
-raise SystemExit(0 if os.path.islink(link) and os.readlink(link) == expected_target else 1)
-PY
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'automatic rollback did not normalize a dangling current pointer to trusted fallback authority'
 python3 - "$FAKE_MV_LOG" "$root/opt/ci-fleet/current" <<'PY' || fail 'rollback current replacement was not an atomic same-parent mv -Tf'
 import os
 import sys

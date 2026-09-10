@@ -717,8 +717,7 @@ systemd_matches() {
   expected_manager=$manager_releases/$engine_ref
   manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
   release_tree_permissions_trusted "$expected_manager" || return 1
-  [[ -L "$manager_current" ]] || return 1
-  [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
+  [[ $(manager_release_from_raw_pointer || true) == "$expected_manager" ]] || return 1
   for unit in "${unit_names[@]}"; do
     [[ -f "$systemd_dir/$unit" ]] || return 1
     cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
@@ -1111,8 +1110,9 @@ repair_pending_checkpoint_authority() {
       manager_release_complete "$target" "$ref" || return 1
       if ! release_tree_permissions_trusted "$target"; then
         source=$releases_dir/$ref
-        install_release "$ref" "$source" 0 0
-        install_manager "$ref" "$source" "$target" 0 0 false
+        install_release "$ref" "$source" 0 0 || return 1
+        release_tree_permissions_trusted "$source" || return 1
+        install_manager "$ref" "$source" "$target" 0 0 false || return 1
       fi
       manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
     fi
@@ -1664,12 +1664,8 @@ PY
       return 1
     fi
   fi
-  if [[ "$mode" == rollback && -n "$validated_current_target" ]]; then
+  if [[ -n "$validated_current_target" ]]; then
     if IFS= read -r -d '' restored_state <"$validated_current_target"; then
-      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
-      return 1
-    fi
-    if [[ "$restored_state" == *$'\n'* ]]; then
       note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
       return 1
     fi
@@ -1680,6 +1676,10 @@ PY
     if [[ ! -e "$source" && ! -L "$source" && -n "$checkpoint_release" ]]; then
       printf '%s' "$checkpoint_release" >"$validated_current_target"
     else
+      if [[ "$restored_state" == *$'\n'* ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      fi
       restored_state=$(resolve_link_target "$restored_state" "$current_link") || {
         note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
         return 1
@@ -2117,11 +2117,15 @@ perform_rollback() {
 }
 
 perform_uninstall() {
-  local candidate manager_candidate='' old_release='' old_ref='' status
+  local candidate current_candidate='' manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
   status=$(controller_status)
+  if [[ -L "$current_link" && -e "$current_link" ]]; then
+    current_candidate=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
+    [[ -n "$current_candidate" ]] || die 'current pointer is invalid; operator recovery or reinstall required'
+  fi
   manager_candidate=$(manager_release_from_raw_pointer || true)
-  if [[ -n "$status" && -z "$manager_candidate" ]]; then
+  if [[ -z "$manager_candidate" && ( -n "$status" || ( -L "$manager_current" && -e "$manager_current" ) ) ]]; then
     die 'a trusted complete canonical manager release is required to uninstall the running controller'
   fi
   for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
