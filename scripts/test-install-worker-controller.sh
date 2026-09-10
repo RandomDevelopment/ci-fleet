@@ -1561,7 +1561,7 @@ rm -rf "$raw_manager_release"
 unset FAKE_ALL_RUNNER_STATE
 [[ ${CI_FLEET_TEST_STOP_AFTER_DANGLING_MANAGER_UNINSTALL:-0} != 1 ]] || { printf 'DANGLING_MANAGER_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
-authority_ref=$(write_config drained 1 1)
+authority_ref=$(write_config active 1 1)
 export FAKE_COMPOSE_LOG=$tmp/incomplete-current-authority-compose.log
 incomplete_current=$root/opt/ci-fleet/releases/incomplete-current
 mkdir -p "$incomplete_current"
