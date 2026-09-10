@@ -1643,7 +1643,8 @@ cp -a "$root/opt/ci-fleet/manager/releases/$legacy_checkpoint_manager_ref" "$leg
 rm -rf "$authority_active_release"
 printf '%s\n' "$legacy_release_fallback" >"$authority_checkpoint/release-target"
 printf '%s' "$root/opt/ci-fleet/releases/missing-legacy-runtime" >"$authority_checkpoint/current-link"
-expect_success "$installer" --rollback >/dev/null
+installed_manager_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+expect_success "$installed_manager_installer" --rollback >/dev/null
 [[ $(readlink "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$legacy_checkpoint_manager_ref" ]] || fail 'legacy checkpoint release fallback was not restaged to canonical runtime authority'
 rm -rf "$legacy_release_fallback"
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"

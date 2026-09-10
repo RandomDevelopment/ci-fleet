@@ -6,6 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode=
 config_repo=
+engine_repository=RandomDevelopment/ci-fleet
 config_identity_arg=
 config_ref=
 controller_id=
@@ -168,7 +169,8 @@ trap cleanup_temporary EXIT
 require_commands() {
   local command docker_root disk_used os_id os_release os_version socket
   local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp)
-  if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(git tar cmp); fi
+  [[ "$mode" == uninstall ]] || required+=(git tar)
+  if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(cmp); fi
   for command in "${required[@]}"; do
     command -v "$command" >/dev/null || die "$command is required"
   done
