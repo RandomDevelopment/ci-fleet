@@ -1567,6 +1567,14 @@ ln -sfn "$incomplete_current" "$root/opt/ci-fleet/current"
 expect_failure 'current pointer is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref"
 if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'unsafe noncanonical current target caused an operational mutation'; fi
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
+dangling_release_entry=$root/opt/ci-fleet/releases/2222222222222222222222222222222222222222
+ln -s "$tmp/missing-release-entry" "$dangling_release_entry"
+ln -sfn "$dangling_release_entry" "$root/opt/ci-fleet/current"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'current pointer is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$authority_ref"
+if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'dangling release-entry symlink caused an operational mutation'; fi
+rm "$dangling_release_entry"
+ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 authority_checkpoint_output=$tmp/authority-checkpoint.out
 export FAKE_FAIL_UP_ONCE=$tmp/authority-checkpoint-fail-up
 : >"$FAKE_FAIL_UP_ONCE"
@@ -1621,6 +1629,15 @@ if grep -Eq '^(stop|up|down|rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail
 printf 'releases/%s' "${authority_active_release##*/}" >"$authority_checkpoint/current-link"
 expect_success "$installer" --rollback >/dev/null
 [[ $(readlink "$root/opt/ci-fleet/current") == "$authority_active_release" ]] || fail 'relative checkpoint current target was not normalized to absolute authority'
+legacy_checkpoint_manager=$root/opt/ci-fleet/manager/releases/prior-manager
+cp -a "$authority_manager" "$legacy_checkpoint_manager"
+legacy_checkpoint_manager_ref=$(<"$legacy_checkpoint_manager/.ci-fleet-engine-ref")
+rm -rf "$authority_manager"
+printf '%s\n' "$legacy_checkpoint_manager" >"$authority_checkpoint/manager-target"
+expect_success "$installer" --rollback >/dev/null
+[[ $(readlink "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$legacy_checkpoint_manager_ref" ]] || fail 'legacy checkpoint manager target was not normalized to canonical authority'
+rm -rf "$legacy_checkpoint_manager"
+printf '%s\n' "$root/opt/ci-fleet/manager/releases/$legacy_checkpoint_manager_ref" >"$authority_checkpoint/manager-target"
 printf '%s\n' "$incomplete_current" >"$authority_checkpoint/release-target"
 printf '2\n' >"$authority_checkpoint/format-version"
 rm -f "$authority_checkpoint/current-link" "$authority_checkpoint/current-absent"

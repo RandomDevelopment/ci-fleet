@@ -651,6 +651,14 @@ raw_link_target_path() {
   printf '%s' "$target"
 }
 
+raw_pointer_target_exists() {
+  local link=$1 target
+  target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
+  target=${target%x}
+  target=$(raw_link_target_path "$target" "$link") || return 1
+  [[ -e "$target" || -L "$target" ]]
+}
+
 resolve_link_target() {
   local target=$1 link=$2
   if [[ "$target" != /* ]]; then
@@ -1231,7 +1239,7 @@ PY
 }
 
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref fallback_candidate status manager_target='' manager_ref
   capture_current_pointer
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   status=$(controller_status)
@@ -1251,12 +1259,15 @@ make_checkpoint() {
     die 'manager current pointer is invalid'
   fi
   target=$(current_runtime_release)
-  if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
-    fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
-    if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref" \
-      && release_tree_permissions_trusted "$fallback_release"; then target=$fallback_release; fi
+  if [[ -z "$target" && -n "$fallback_release" ]]; then
+    fallback_candidate=$(canonical_release_target "$fallback_release" "$releases_dir" || true)
+    if [[ -n "$fallback_candidate" && -f "$fallback_candidate/.ci-fleet-engine-ref" ]]; then
+      fallback_ref=$(<"$fallback_candidate/.ci-fleet-engine-ref")
+      if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_candidate" "$fallback_ref" \
+        && release_tree_permissions_trusted "$fallback_candidate"; then target=$fallback_candidate; fi
+    fi
   fi
-  [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
+  [[ -n "$target" || ( -z "$status" && "$captured_current_state" != link ) ]] || die 'a trusted complete runtime release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
   install -d -m 0700 "$checkpoints_dir"
@@ -1563,7 +1574,7 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target=''
+  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
   local restore_controller_tag_after_start=false
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
@@ -1662,6 +1673,13 @@ PY
       ! release_tree_permissions_trusted "$target"; then
       note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
       return 1
+    fi
+    validated_manager_target=$manager_releases/$restored_state
+    if [[ "$target" != "$validated_manager_target" ]]; then
+      if ! install_manager "$restored_state" "$target" "$validated_manager_target" 0 0 false; then
+        note 'ROLLBACK_FAILED reason=checkpoint manager target normalization failed'
+        return 1
+      fi
     fi
   fi
   if [[ -n "$validated_current_target" ]]; then
@@ -1768,13 +1786,8 @@ PY
   else
     if [[ ! -L "$current_link" || -e "$current_link" ]]; then rm -f "$current_link" || failed=1; fi
   fi
-  if [[ -f "$checkpoint_dir/manager-target" ]]; then
-    target=$(<"$checkpoint_dir/manager-target")
-    if [[ "$target" == "$manager_releases/"* && -d "$target" ]]; then
-      ln -sfn "$target" "$temporary/rollback-manager" && mv -Tf "$temporary/rollback-manager" "$manager_current" || failed=1
-    else
-      failed=1
-    fi
+  if [[ -n "$validated_manager_target" ]]; then
+    ln -sfn "$validated_manager_target" "$temporary/rollback-manager" && mv -Tf "$temporary/rollback-manager" "$manager_current" || failed=1
   else
     rm -f "$manager_current" || failed=1
   fi
@@ -1964,7 +1977,7 @@ perform_converge() {
       elif ! release_tree_permissions_trusted "$current_target"; then
         install_release "$current_ref" "$current_target" 0 0
       fi
-    elif [[ -e "$current_link" ]]; then
+    elif raw_pointer_target_exists "$current_link"; then
       die 'current pointer is invalid'
     fi
   fi
@@ -2128,7 +2141,7 @@ perform_uninstall() {
   local candidate current_candidate='' manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
   status=$(controller_status)
-  if [[ -L "$current_link" && -e "$current_link" ]]; then
+  if [[ -L "$current_link" ]] && raw_pointer_target_exists "$current_link"; then
     current_candidate=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     [[ -n "$current_candidate" ]] || die 'current pointer is invalid; operator recovery or reinstall required'
     if ! runtime_release_complete "$current_candidate" "${current_candidate##*/}" || ! release_tree_permissions_trusted "$current_candidate"; then
@@ -2139,7 +2152,8 @@ perform_uninstall() {
   if [[ -z "$manager_candidate" && ( -n "$status" || ( -L "$manager_current" && -e "$manager_current" ) ) ]]; then
     die 'a trusted complete canonical manager release is required to uninstall the running controller'
   fi
-  for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
+  for candidate in "$(current_runtime_release)" "$releases_dir/${manager_candidate##*/}" "$release_dir"; do
+    candidate=$(canonical_release_target "$candidate" "$releases_dir" || true)
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
     old_ref=$(<"$candidate/.ci-fleet-engine-ref")
     if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref" \
