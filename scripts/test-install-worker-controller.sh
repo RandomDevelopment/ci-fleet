@@ -419,11 +419,10 @@ chmod 700 "$fake_bin/python3"
 fake_printf_env=$tmp/fake-printf-env.bash
 cat >"$fake_printf_env" <<'EOF'
 printf() {
-  local destination value
-  destination=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
-  if [[ -n "${FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE:-}" && -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE" && "$destination" == */validated-current-link ]]; then
+  local value=${2:-}
+  if [[ -n "${FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE:-}" && -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE" && "${1:-}" == %s \
+    && -n "${FAKE_VALIDATED_CURRENT_VALUE:-}" && "$value" == "$FAKE_VALIDATED_CURRENT_VALUE" ]]; then
     rm -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
-    value=${2:-}
     builtin printf '%s' "${value:0:1}"
     return 1
   fi
@@ -1725,9 +1724,10 @@ printf '%s' "$root/opt/ci-fleet/releases/missing-legacy-runtime" >"$authority_ch
 installed_manager_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
 normalization_current=$(readlink "$root/opt/ci-fleet/current")
 export FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE=$tmp/validated-current-write-failure
+export FAKE_VALIDATED_CURRENT_VALUE=$root/opt/ci-fleet/releases/$legacy_checkpoint_manager_ref
 : >"$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
 expect_failure 'checkpoint current target normalization failed' env BASH_ENV="$fake_printf_env" "$installed_manager_installer" --rollback
-unset FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE
+unset FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE FAKE_VALIDATED_CURRENT_VALUE
 [[ $(readlink "$root/opt/ci-fleet/current") == "$normalization_current" ]] || fail 'failed current target normalization installed a partial rollback pointer'
 [[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_TARGET_NORMALIZATION_FAILURE:-0} != 1 ]] || { printf 'CURRENT_TARGET_NORMALIZATION_FAILURE_REGRESSION_OK\n'; exit 0; }
 expect_success "$installed_manager_installer" --rollback >/dev/null
