@@ -326,6 +326,11 @@ chmod 700 "$fake_bin/dpkg"
 
 cat >"$fake_bin/tar" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_FAIL_TAR_EXTRACT_ONCE:-}" && -f "$FAKE_FAIL_TAR_EXTRACT_ONCE" && " $* " == *' -xf '* ]]; then
+  rm -f "$FAKE_FAIL_TAR_EXTRACT_ONCE"
+  "$REAL_TAR" "$@"
+  exit 45
+fi
 if [[ -n "${FAKE_FAIL_TAR_ONCE:-}" && -f "$FAKE_FAIL_TAR_ONCE" ]]; then
   rm -f "$FAKE_FAIL_TAR_ONCE"
   exit 45
@@ -361,6 +366,11 @@ chmod 700 "$fake_bin/mv"
 
 cat >"$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n ${FAKE_FAIL_GIT_ARCHIVE_ONCE:-} && -f "$FAKE_FAIL_GIT_ARCHIVE_ONCE" && " $* " == *" archive "* ]]; then
+  rm -f "$FAKE_FAIL_GIT_ARCHIVE_ONCE"
+  "$REAL_GIT" "$@" -- . ':(exclude)README.md'
+  exit 90
+fi
 if [[ -n ${FAKE_FAIL_GIT_FETCH:-} && " $* " == *" fetch "* ]]; then
   exit 90
 fi
@@ -677,6 +687,40 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+
+staging_failure_ref=$(write_config active 2 2)
+export FAKE_FAIL_UP_ONCE=$tmp/staging-failure-up
+: >"$FAKE_FAIL_UP_ONCE"
+staging_failure_output=$tmp/staging-failure.out
+if "$installer" --upgrade "${base_args[@]}" --ref "$staging_failure_ref" >"$staging_failure_output" 2>&1; then
+  fail 'staging failure checkpoint fixture unexpectedly succeeded'
+fi
+unset FAKE_FAIL_UP_ONCE
+staging_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$staging_failure_output")
+[[ -n "$staging_failure_checkpoint" ]] || fail 'staging failure checkpoint was not created'
+active_release=$(readlink -f "$root/opt/ci-fleet/current")
+manager_release=$(readlink -f "$root/opt/ci-fleet/manager/current")
+printf '%s\n' "$manager_release" >"$staging_failure_checkpoint/release-target"
+rm -f "$active_release/deploy/compose.yaml"
+printf 'preserve\n' >"$active_release/preserve-on-staging-failure"
+
+export FAKE_FAIL_GIT_ARCHIVE_ONCE=$tmp/fail-git-archive-once
+: >"$FAKE_FAIL_GIT_ARCHIVE_ONCE"
+expect_command_failure "$installer" --rollback
+unset FAKE_FAIL_GIT_ARCHIVE_ONCE
+[[ -f "$active_release/preserve-on-staging-failure" && ! -f "$active_release/deploy/compose.yaml" ]] || fail 'failed git archive replaced the existing final release'
+
+export FAKE_FAIL_TAR_EXTRACT_ONCE=$tmp/fail-tar-extract-once
+: >"$FAKE_FAIL_TAR_EXTRACT_ONCE"
+expect_command_failure "$installer" --rollback
+unset FAKE_FAIL_TAR_EXTRACT_ONCE
+[[ -f "$active_release/preserve-on-staging-failure" && ! -f "$active_release/deploy/compose.yaml" ]] || fail 'failed archive extraction replaced the existing final release'
+
+expect_success "$installer" --rollback >/dev/null
+[[ -f "$active_release/deploy/compose.yaml" && ! -e "$active_release/preserve-on-staging-failure" ]] || fail 'successful release staging did not replace the incomplete final release'
+rm -rf "$staging_failure_checkpoint"
+git -C "$config_repo" reset -q --hard "$ref_one"
+[[ ${CI_FLEET_TEST_STOP_AFTER_RELEASE_STAGING_FAILURE:-0} != 1 ]] || { printf 'RELEASE_STAGING_FAILURE_REGRESSION_OK\n'; exit 0; }
 
 daemon_config=$root/etc/docker/daemon.json
 python3 - "$daemon_config" <<'PY' || fail 'fresh install did not apply the advertised Docker network policy'

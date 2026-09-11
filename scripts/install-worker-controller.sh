@@ -958,7 +958,7 @@ install_release() {
   install -d -m 0755 "$releases_dir"
   archive=$temporary/engine-$install_ref.tar
   if is_git_checkout "$repo_root" && git -C "$repo_root" cat-file -e "$install_ref^{commit}" 2>/dev/null; then
-    git -C "$repo_root" archive --format=tar --output "$archive" "$install_ref"
+    git -C "$repo_root" archive --format=tar --output "$archive" "$install_ref" || return 1
   else
     [[ "$engine_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'delivery engine repository is invalid'
     checkout=$temporary/engine-repository-$install_ref
@@ -967,12 +967,12 @@ install_release() {
     GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$install_ref" || die 'pinned ci-fleet engine commit could not be fetched'
     resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
     [[ "$resolved" == "$install_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
-    git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD
+    git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD || return 1
   fi
   staged_release=$(mktemp -d "$releases_dir/.${install_ref}.staging.XXXXXX")
   staging_paths+=("$staged_release")
   chmod 0755 "$staged_release"
-  (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_release")
+  (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_release") || return 1
   printf '%s\n' "$install_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
@@ -981,7 +981,7 @@ install_release() {
     ! release_tree_permissions_trusted "$staged_release"; then
     die 'staged engine release is incomplete or untrusted'
   fi
-  atomic_replace_directory "$staged_release" "$install_dir"
+  atomic_replace_directory "$staged_release" "$install_dir" || return 1
 }
 
 install_manager() {
@@ -995,18 +995,18 @@ install_manager() {
     ! release_tree_permissions_trusted "$manager_release"; then
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager-$manager_commit.tar
-    tar -cf "$archive" -C "$source_release" .
+    tar -cf "$archive" -C "$source_release" . || return 1
     staged_manager=$(mktemp -d "$manager_releases/.${manager_commit}.staging.XXXXXX")
     staging_paths+=("$staged_manager")
     chmod 0755 "$staged_manager"
-    (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager")
+    (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager") || return 1
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
     if ! manager_release_complete "$staged_manager" "$manager_commit" "$require_status" "$require_schema" ||
       ! release_tree_permissions_trusted "$staged_manager"; then
       die 'staged installer manager release is incomplete or untrusted'
     fi
-    atomic_replace_directory "$staged_manager" "$manager_release"
+    atomic_replace_directory "$staged_manager" "$manager_release" || return 1
   fi
   [[ "$activate" == true ]] || return 0
   install -d -m 0755 "$manager_root"
