@@ -169,8 +169,7 @@ trap cleanup_temporary EXIT
 require_commands() {
   local command docker_root disk_used os_id os_release os_version socket
   local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp)
-  [[ "$mode" == uninstall ]] || required+=(git tar)
-  if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(cmp); fi
+  if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(git tar cmp); fi
   for command in "${required[@]}"; do
     command -v "$command" >/dev/null || die "$command is required"
   done
@@ -955,6 +954,7 @@ install_release() {
     release_tree_permissions_trusted "$install_dir"; then
     return
   fi
+  command -v git >/dev/null && command -v tar >/dev/null || return 1
   install -d -m 0755 "$releases_dir"
   archive=$temporary/engine-$install_ref.tar
   if is_git_checkout "$repo_root" && git -C "$repo_root" cat-file -e "$install_ref^{commit}" 2>/dev/null; then
@@ -993,6 +993,7 @@ install_manager() {
   runtime_release_complete "$source_release" "$manager_commit" "$require_status" "$require_schema" || die 'desired engine release is unavailable for installer manager activation'
   if ! manager_release_complete "$manager_release" "$manager_commit" "$require_status" "$require_schema" ||
     ! release_tree_permissions_trusted "$manager_release"; then
+    command -v tar >/dev/null || return 1
     install -d -m 0755 "$manager_releases"
     archive=$temporary/manager-$manager_commit.tar
     tar -cf "$archive" -C "$source_release" . || return 1

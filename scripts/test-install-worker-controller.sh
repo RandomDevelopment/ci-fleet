@@ -430,6 +430,16 @@ printf() {
 }
 EOF
 
+missing_recovery_tools_env=$tmp/missing-recovery-tools-env.bash
+cat >"$missing_recovery_tools_env" <<'EOF'
+command() {
+  if [[ "${1:-}" == -v && ( "${2:-}" == git || "${2:-}" == tar ) ]]; then return 1; fi
+  builtin command "$@"
+}
+git() { return 127; }
+tar() { return 127; }
+EOF
+
 cat >"$fake_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
 "$REAL_TIMEOUT" "$@"
@@ -1603,7 +1613,8 @@ if ! "$installer" --uninstall >"$dangling_manager_uninstall_output" 2>&1; then
 fi
 grep -Fq 'UNINSTALL_OK' "$dangling_manager_uninstall_output" || fail 'dangling-manager no-controller uninstall did not complete'
 [[ ! -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'dangling-manager no-controller uninstall did not remove inactive runners'
-expect_success "$installer" --rollback >/dev/null
+expect_success env BASH_ENV="$missing_recovery_tools_env" "$installer" --rollback >/dev/null
+[[ ${CI_FLEET_TEST_STOP_AFTER_ROLLBACK_WITHOUT_GIT_TAR:-0} != 1 ]] || { printf 'ROLLBACK_WITHOUT_GIT_TAR_OK\n'; exit 0; }
 ln -sfn "$initial_manager" "$root/opt/ci-fleet/manager/current"
 rm -f "$FAKE_DOCKER_STATE"
 incomplete_uninstall_manager=$root/opt/ci-fleet/manager/releases/incomplete-uninstall-manager
