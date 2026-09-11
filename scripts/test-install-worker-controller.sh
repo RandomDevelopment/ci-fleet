@@ -416,21 +416,20 @@ exec "$REAL_PYTHON3" "$@"
 EOF
 chmod 700 "$fake_bin/python3"
 
-cat >"$fake_bin/printf" <<'EOF'
-#!/usr/bin/env bash
-enable printf
-destination=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
-if [[ -n "${FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE:-}" && -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE" && "$destination" == */validated-current-link ]]; then
-  rm -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
-  value=${2:-}
-  printf '%s' "${value:0:1}"
-  exit 1
-fi
-printf "$@"
+fake_printf_env=$tmp/fake-printf-env.bash
+cat >"$fake_printf_env" <<'EOF'
+printf() {
+  local destination value
+  destination=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
+  if [[ -n "${FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE:-}" && -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE" && "$destination" == */validated-current-link ]]; then
+    rm -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
+    value=${2:-}
+    builtin printf '%s' "${value:0:1}"
+    return 1
+  fi
+  builtin printf "$@"
+}
 EOF
-chmod 700 "$fake_bin/printf"
-fake_external_printf=$tmp/external-printf.bash
-printf 'enable -n printf\n' >"$fake_external_printf"
 
 cat >"$fake_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
@@ -1727,9 +1726,10 @@ installed_manager_installer=$root/opt/ci-fleet/manager/current/scripts/install-w
 normalization_current=$(readlink "$root/opt/ci-fleet/current")
 export FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE=$tmp/validated-current-write-failure
 : >"$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
-expect_failure 'checkpoint current target normalization failed' env BASH_ENV="$fake_external_printf" "$installed_manager_installer" --rollback
+expect_failure 'checkpoint current target normalization failed' env BASH_ENV="$fake_printf_env" "$installed_manager_installer" --rollback
 unset FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE
 [[ $(readlink "$root/opt/ci-fleet/current") == "$normalization_current" ]] || fail 'failed current target normalization installed a partial rollback pointer'
+[[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_TARGET_NORMALIZATION_FAILURE:-0} != 1 ]] || { printf 'CURRENT_TARGET_NORMALIZATION_FAILURE_REGRESSION_OK\n'; exit 0; }
 expect_success "$installed_manager_installer" --rollback >/dev/null
 [[ $(readlink "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$legacy_checkpoint_manager_ref" ]] || fail 'legacy checkpoint release fallback was not restaged to canonical runtime authority'
 rm -rf "$legacy_release_fallback"
