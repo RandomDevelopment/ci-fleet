@@ -397,7 +397,14 @@ chmod 700 "$fake_bin/df"
 
 cat >"$fake_bin/python3" <<'EOF'
 #!/usr/bin/env bash
-if [[ -n "${FAKE_FAIL_RECOVERY_CLEANUP_ONCE:-}" && -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE" && "${1:-}" == - && "${2:-}" == "${FAKE_POLICY_CHECKPOINT_DIR:-}" ]]; then
+if [[ -n "${FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE:-}" && -f "$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE" && "${1:-}" == - ]]; then
+  script=$(</dev/stdin)
+  if [[ "$script" == *'renameat2(-100'* && "$script" == *'os.fsync(parent)'* ]]; then
+    rm -f "$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE"
+    script=${script/'    os.fsync(parent)'/'    raise OSError("injected parent fsync failure")'}
+  fi
+  exec "$REAL_PYTHON3" "$@" <<<"$script"
+elif [[ -n "${FAKE_FAIL_RECOVERY_CLEANUP_ONCE:-}" && -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE" && "${1:-}" == - && "${2:-}" == "${FAKE_POLICY_CHECKPOINT_DIR:-}" ]]; then
   script=$(</dev/stdin)
   if [[ "$script" == *'shutil.rmtree(recovery)'* ]] && "$REAL_PYTHON3" -c 'import json, pathlib, sys; assert json.loads((pathlib.Path(sys.argv[1]) / "docker-network-policy.json").read_text())["verified_generation"]' "$2"; then
     rm -f "$FAKE_FAIL_RECOVERY_CLEANUP_ONCE"
@@ -408,6 +415,22 @@ fi
 exec "$REAL_PYTHON3" "$@"
 EOF
 chmod 700 "$fake_bin/python3"
+
+cat >"$fake_bin/printf" <<'EOF'
+#!/usr/bin/env bash
+enable printf
+destination=$(readlink -f /proc/self/fd/1 2>/dev/null || true)
+if [[ -n "${FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE:-}" && -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE" && "$destination" == */validated-current-link ]]; then
+  rm -f "$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
+  value=${2:-}
+  printf '%s' "${value:0:1}"
+  exit 1
+fi
+printf "$@"
+EOF
+chmod 700 "$fake_bin/printf"
+fake_external_printf=$tmp/external-printf.bash
+printf 'enable -n printf\n' >"$fake_external_printf"
 
 cat >"$fake_bin/timeout" <<'EOF'
 #!/usr/bin/env bash
@@ -1231,6 +1254,19 @@ printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-targ
 [[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_release" ]] || fail 'stale checkpoint release was still live'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") != "$stale_checkpoint_manager" ]] || fail 'stale checkpoint manager was still live'
 
+pending_fsync_daemon=$tmp/pending-fsync-daemon.json
+pending_fsync_marker=$tmp/pending-fsync-marker.json
+cp "$daemon_config" "$pending_fsync_daemon"
+cp "$policy_marker" "$pending_fsync_marker"
+export FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE=$tmp/pending-fsync-failure
+: >"$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE"
+expect_failure 'pending network-policy controller checkpoint is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref"
+unset FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE
+cmp -s "$pending_fsync_daemon" "$daemon_config" || fail 'failed pending release restage mutated Docker network policy'
+cmp -s "$pending_fsync_marker" "$policy_marker" || fail 'failed pending release restage mutated the policy checkpoint'
+chmod g+w "$stale_checkpoint_release/scripts" "$stale_checkpoint_release/scripts/docker-network-policy-adapter.sh"
+refresh_release_digest "$stale_checkpoint_release"
+
 retry_pause=$tmp/interrupted-retry-pause
 retry_result=$tmp/interrupted-retry-result.json
 : >"$retry_pause"
@@ -1688,6 +1724,12 @@ rm -rf "$authority_active_release"
 printf '%s\n' "$legacy_release_fallback" >"$authority_checkpoint/release-target"
 printf '%s' "$root/opt/ci-fleet/releases/missing-legacy-runtime" >"$authority_checkpoint/current-link"
 installed_manager_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+normalization_current=$(readlink "$root/opt/ci-fleet/current")
+export FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE=$tmp/validated-current-write-failure
+: >"$FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE"
+expect_failure 'checkpoint current target normalization failed' env BASH_ENV="$fake_external_printf" "$installed_manager_installer" --rollback
+unset FAKE_FAIL_VALIDATED_CURRENT_WRITE_ONCE
+[[ $(readlink "$root/opt/ci-fleet/current") == "$normalization_current" ]] || fail 'failed current target normalization installed a partial rollback pointer'
 expect_success "$installed_manager_installer" --rollback >/dev/null
 [[ $(readlink "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$legacy_checkpoint_manager_ref" ]] || fail 'legacy checkpoint release fallback was not restaged to canonical runtime authority'
 rm -rf "$legacy_release_fallback"

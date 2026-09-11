@@ -1112,7 +1112,7 @@ repair_pending_checkpoint_authority() {
       [[ "$target" == "$releases_dir/$ref" ]] || return 1
       runtime_release_complete "$target" "$ref" || return 1
       if ! release_tree_permissions_trusted "$target"; then
-        install_release "$ref" "$target" 0 0
+        install_release "$ref" "$target" 0 0 || return 1
       fi
       runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
     else
@@ -1155,7 +1155,7 @@ repair_pending_checkpoint_authority() {
   ref=${target##*/}
   runtime_release_complete "$target" "$ref" || return 1
   if ! release_tree_permissions_trusted "$target"; then
-    install_release "$ref" "$target" 0 0
+    install_release "$ref" "$target" 0 0 || return 1
   fi
   runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
 }
@@ -1707,7 +1707,15 @@ PY
       return 1
     }
     if [[ ! -e "$source" && ! -L "$source" && -n "$checkpoint_release" ]]; then
-      printf '%s' "$checkpoint_release" >"$validated_current_target"
+      if ! printf '%s' "$checkpoint_release" >"$validated_current_target" \
+        || [[ ! -f "$validated_current_target" || -L "$validated_current_target" \
+          || $(stat -c %u "$validated_current_target") != "$expected_owner" \
+          || $(stat -c %a "$validated_current_target") != 600 \
+          || $(stat -c %s "$validated_current_target") != "${#checkpoint_release}" \
+          || $(<"$validated_current_target") != "$checkpoint_release" ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      fi
     else
       if [[ "$restored_state" == *$'\n'* ]]; then
         note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
