@@ -179,6 +179,43 @@ class HealthTests(unittest.TestCase):
         result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
         self.assertEqual(result["legacy"], 1)
 
+    def test_builtin_null_ipam_keeps_transactional_health_below_failure(self) -> None:
+        networks = {
+            "bridge": [{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}],
+            "ci-fleet_default": [{"IPAM": {"Config": [{"Subnet": "172.18.0.0/16"}]}}],
+            "host": [{"IPAM": {"Config": None}}],
+            "none": [{"IPAM": {"Config": None}}],
+        }
+
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\nci-fleet_default\nhost\nnone\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+
+        network = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual(
+            network,
+            {"configured": 16, "used": 1, "free": 15, "reserve": 1, "legacy": 1, "state": "warning"},
+        )
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": network}, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("warning", 1))
+        self.assertNotIn("docker_network_inspection", {check["id"] for check in report["checks"]})
+
+    def test_custom_null_ipam_still_fails_closed(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "custom\n", "")
+            return health.subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps([{"IPAM": {"Config": None}}]),
+                "",
+            )
+
+        self.assert_unavailable_network(
+            health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        )
+
     def test_overlapping_builtin_bridge_consumes_allocation_without_legacy_warning(self) -> None:
         def run(args):
             if args[:3] == ["docker", "network", "ls"]:

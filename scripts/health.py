@@ -384,6 +384,8 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         saw_ipv6 = False
         for entry in payload:
             configs = entry.get("IPAM", {}).get("Config", []) if isinstance(entry, dict) else []
+            if configs is None and name in {"host", "none"}:
+                configs = []
             if not isinstance(configs, list):
                 return unavailable
             for config in configs:
