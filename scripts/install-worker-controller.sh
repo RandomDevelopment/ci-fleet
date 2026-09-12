@@ -6,6 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode=
 config_repo=
+engine_repository=RandomDevelopment/ci-fleet
 config_identity_arg=
 config_ref=
 controller_id=
@@ -328,7 +329,7 @@ select_engine() {
 prepare_engine_capabilities() {
   local checkout resolved manifest_mode
   engine_capabilities=$temporary/engine-capabilities.json
-  if runtime_release_complete "$release_dir" "$engine_ref"; then
+  if runtime_release_complete "$release_dir" "$engine_ref" && release_tree_permissions_trusted "$release_dir"; then
     if [[ -f "$release_dir/engine-capabilities.json" ]]; then
       cp "$release_dir/engine-capabilities.json" "$engine_capabilities"
     else
@@ -411,7 +412,8 @@ current_runtime_release() {
   fi
   [[ -n "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 0
   marker=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" || return 0
+  [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" \
+    && release_tree_permissions_trusted "$target" || return 0
   printf '%s' "$target"
 }
 
@@ -542,6 +544,53 @@ print(digest.hexdigest())
 PY
 }
 
+release_tree_permissions_trusted() {
+  local path=$1 expected_owner=0 boundary=${root_prefix:-/}
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  python3 - "$path" "$expected_owner" "$boundary" <<'PY'
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+expected_owner = int(sys.argv[2])
+boundary = os.path.abspath(sys.argv[3])
+
+
+def trusted(path):
+    metadata = os.lstat(path)
+    if metadata.st_uid != expected_owner:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return False
+    return (
+        (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+    )
+
+
+try:
+    if os.path.commonpath((root, boundary)) != boundary:
+        raise ValueError
+    anchor = root
+    while True:
+        metadata = os.lstat(anchor)
+        if metadata.st_uid != expected_owner or not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ValueError
+        if anchor == boundary:
+            break
+        parent = os.path.dirname(anchor)
+        if parent == anchor:
+            raise ValueError
+        anchor = parent
+    for directory, directories, files in os.walk(root, followlinks=False):
+        if any(not trusted(os.path.join(directory, name)) for name in directories + files):
+            raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
 runtime_release_complete() {
   local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script
   local -a capability_args=()
@@ -595,22 +644,70 @@ manager_release_complete() {
   [[ "$marker" == "$expected" ]]
 }
 
-manager_release_from_raw_pointer() {
-  local target relative ref
-  target=$(readlink -n "$manager_current" 2>/dev/null && printf x) || return 1
+raw_link_target_path() {
+  local target=$1 link=$2
+  if [[ "$target" != /* ]]; then
+    target=$(dirname "$link")/$target
+  fi
+  printf '%s' "$target"
+}
+
+raw_pointer_target_exists() {
+  local link=$1 target
+  target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
   target=${target%x}
-  [[ "$target" == "$manager_releases/"* ]] || return 1
-  relative=${target#"$manager_releases/"}
-  [[ -n "$relative" && "$relative" != */* && "$relative" != . && "$relative" != .. && ! -L "$target" && -f "$target/.ci-fleet-engine-ref" ]] || return 1
+  target=$(raw_link_target_path "$target" "$link") || return 1
+  [[ -e "$target" || -L "$target" ]]
+}
+
+resolve_link_target() {
+  local target=$1 link=$2
+  if [[ "$target" != /* ]]; then
+    [[ "/$target/" != *"/../"* ]] || return 1
+    target=$(realpath -ms -- "$(dirname "$link")/$target") || return 1
+  fi
+  printf '%s' "$target"
+}
+
+canonical_release_target() {
+  local target=$1 releases=$2 relative
+  [[ "$target" == "$releases/"* ]] || return 1
+  relative=${target#"$releases/"}
+  [[ "$relative" =~ ^[0-9a-f]{40}$ && ! -L "$target" ]] || return 1
+  printf '%s' "$target"
+}
+
+canonical_release_target_from_raw_pointer() {
+  local link=$1 releases=$2 target
+  target=$(readlink -n "$link" 2>/dev/null && printf x) || return 1
+  target=${target%x}
+  canonical_release_target "$target" "$releases"
+}
+
+release_target_from_raw_pointer() {
+  local link=$1 releases=$2 target relative ref
+  target=$(canonical_release_target_from_raw_pointer "$link" "$releases") || return 1
+  relative=${target#"$releases/"}
+  [[ -f "$target/.ci-fleet-engine-ref" ]] || return 1
   ref=$(<"$target/.ci-fleet-engine-ref")
-  [[ "$ref" =~ ^[0-9a-f]{40}$ && "$relative" == "$ref" ]] && manager_release_complete "$target" "$ref" || return 1
+  [[ "$relative" == "$ref" ]] || return 1
+  printf '%s' "$target"
+}
+
+manager_release_from_raw_pointer() {
+  local target ref
+  target=$(release_target_from_raw_pointer "$manager_current" "$manager_releases") || return 1
+  ref=$(<"$target/.ci-fleet-engine-ref")
+  manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
   printf '%s' "$target"
 }
 
 release_matches() {
+  local target
   runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
-  [[ -L "$current_link" ]] || return 1
-  [[ $(readlink -f "$current_link") == $(readlink -f "$release_dir") ]]
+  release_tree_permissions_trusted "$release_dir" || return 1
+  target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir") || return 1
+  [[ "$target" == "$release_dir" ]]
 }
 
 managed_images_match() {
@@ -628,8 +725,8 @@ systemd_matches() {
   local expected_manager unit
   expected_manager=$manager_releases/$engine_ref
   manager_release_complete "$expected_manager" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || return 1
-  [[ -L "$manager_current" ]] || return 1
-  [[ $(readlink -f "$manager_current") == $(readlink -f "$expected_manager") ]] || return 1
+  release_tree_permissions_trusted "$expected_manager" || return 1
+  [[ $(manager_release_from_raw_pointer || true) == "$expected_manager" ]] || return 1
   for unit in "${unit_names[@]}"; do
     [[ -f "$systemd_dir/$unit" ]] || return 1
     cmp -s "$expected_manager/host/systemd/$unit" "$systemd_dir/$unit" || return 1
@@ -850,55 +947,69 @@ PY
 }
 
 install_release() {
+  local install_ref=${1:-$engine_ref} install_dir=${2:-$release_dir}
+  local require_status=${3:-$status_reporting_required} require_schema=${4:-$status_reporting_configured}
   local archive checkout resolved staged_release
-  if runtime_release_complete "$release_dir" "$engine_ref" "$status_reporting_required" "$status_reporting_configured"; then
+  if runtime_release_complete "$install_dir" "$install_ref" "$require_status" "$require_schema" &&
+    release_tree_permissions_trusted "$install_dir"; then
     return
   fi
+  command -v git >/dev/null && command -v tar >/dev/null || return 1
   install -d -m 0755 "$releases_dir"
-  archive=$temporary/engine.tar
-  if is_git_checkout "$repo_root" && [[ $(git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$engine_ref" ]]; then
-    git -C "$repo_root" archive --format=tar --output "$archive" HEAD
+  archive=$temporary/engine-$install_ref.tar
+  if is_git_checkout "$repo_root" && git -C "$repo_root" cat-file -e "$install_ref^{commit}" 2>/dev/null; then
+    git -C "$repo_root" archive --format=tar --output "$archive" "$install_ref" || return 1
   else
     [[ "$engine_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'delivery engine repository is invalid'
-    checkout=$temporary/engine-repository
+    checkout=$temporary/engine-repository-$install_ref
     git init -q "$checkout"
     git -C "$checkout" remote add origin "https://github.com/${engine_repository}.git"
-    GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$engine_ref" || die 'pinned ci-fleet engine commit could not be fetched'
+    GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --depth=1 origin "$install_ref" || die 'pinned ci-fleet engine commit could not be fetched'
     resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
-    [[ "$resolved" == "$engine_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
-    git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD
+    [[ "$resolved" == "$install_ref" ]] || die 'fetched ci-fleet engine commit does not match desired state'
+    git -C "$checkout" archive --format=tar --output "$archive" FETCH_HEAD || return 1
   fi
-  staged_release=$(mktemp -d "$releases_dir/.${engine_ref}.staging.XXXXXX")
+  staged_release=$(mktemp -d "$releases_dir/.${install_ref}.staging.XXXXXX")
   staging_paths+=("$staged_release")
   chmod 0755 "$staged_release"
-  (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_release")
-  printf '%s\n' "$engine_ref" >"$staged_release/.ci-fleet-engine-ref"
+  (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_release") || return 1
+  printf '%s\n' "$install_ref" >"$staged_release/.ci-fleet-engine-ref"
   chmod 0644 "$staged_release/.ci-fleet-engine-ref"
   release_tree_digest "$staged_release" >"$staged_release/.ci-fleet-tree-sha256"
   chmod 0644 "$staged_release/.ci-fleet-tree-sha256"
-  runtime_release_complete "$staged_release" "$engine_ref" "$status_reporting_required" "$status_reporting_configured" || die 'staged engine release is incomplete'
-  atomic_replace_directory "$staged_release" "$release_dir"
+  if ! runtime_release_complete "$staged_release" "$install_ref" "$require_status" "$require_schema" ||
+    ! release_tree_permissions_trusted "$staged_release"; then
+    die 'staged engine release is incomplete or untrusted'
+  fi
+  atomic_replace_directory "$staged_release" "$install_dir" || return 1
 }
 
 install_manager() {
-  local manager_commit manager_release archive staged_manager
-  manager_commit=$engine_ref
+  local manager_commit=${1:-$engine_ref} source_release=${2:-$release_dir}
+  local manager_release=${3:-$manager_releases/$manager_commit}
+  local require_status=${4:-$status_reporting_required} require_schema=${5:-$status_reporting_configured}
+  local activate=${6:-true} archive staged_manager
   [[ "$manager_commit" =~ ^[0-9a-f]{40}$ ]] || die 'installer manager commit is invalid'
-  runtime_release_complete "$release_dir" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'desired engine release is unavailable for installer manager activation'
-  manager_release=$manager_releases/$manager_commit
-  if ! manager_release_complete "$manager_release" "$manager_commit" "$status_reporting_required" "$status_reporting_configured"; then
+  runtime_release_complete "$source_release" "$manager_commit" "$require_status" "$require_schema" || die 'desired engine release is unavailable for installer manager activation'
+  if ! manager_release_complete "$manager_release" "$manager_commit" "$require_status" "$require_schema" ||
+    ! release_tree_permissions_trusted "$manager_release"; then
+    command -v tar >/dev/null || return 1
     install -d -m 0755 "$manager_releases"
-    archive=$temporary/manager.tar
-    tar -cf "$archive" -C "$release_dir" .
+    archive=$temporary/manager-$manager_commit.tar
+    tar -cf "$archive" -C "$source_release" . || return 1
     staged_manager=$(mktemp -d "$manager_releases/.${manager_commit}.staging.XXXXXX")
     staging_paths+=("$staged_manager")
     chmod 0755 "$staged_manager"
-    (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager")
+    (umask 0022; tar --no-same-permissions -xf "$archive" -C "$staged_manager") || return 1
     printf '%s\n' "$manager_commit" >"$staged_manager/.ci-fleet-engine-ref"
     chmod 0644 "$staged_manager/.ci-fleet-engine-ref"
-    manager_release_complete "$staged_manager" "$manager_commit" "$status_reporting_required" "$status_reporting_configured" || die 'staged installer manager release is incomplete'
-    atomic_replace_directory "$staged_manager" "$manager_release"
+    if ! manager_release_complete "$staged_manager" "$manager_commit" "$require_status" "$require_schema" ||
+      ! release_tree_permissions_trusted "$staged_manager"; then
+      die 'staged installer manager release is incomplete or untrusted'
+    fi
+    atomic_replace_directory "$staged_manager" "$manager_release" || return 1
   fi
+  [[ "$activate" == true ]] || return 0
   install -d -m 0755 "$manager_root"
   ln -sfn "$manager_release" "$temporary/manager-current"
   mv -Tf "$temporary/manager-current" "$manager_current"
@@ -985,6 +1096,71 @@ PY
   fi
 }
 
+repair_pending_checkpoint_authority() {
+  local checkpoint=$1 kind file target ref expected_owner=0 source staged_link release_authority=''
+  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  for kind in release manager; do
+    file=$checkpoint/$kind-target
+    [[ -e "$file" || -L "$file" ]] || continue
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+      && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 2 \
+      && $(stat -c %s "$file") -le 4096 && $(wc -l <"$file") == 1 ]] || return 1
+    target=$(<"$file")
+    [[ -f "$target/.ci-fleet-engine-ref" && ! -L "$target" ]] || return 1
+    ref=$(<"$target/.ci-fleet-engine-ref")
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+    if [[ "$kind" == release ]]; then
+      [[ "$target" == "$releases_dir/$ref" ]] || return 1
+      runtime_release_complete "$target" "$ref" || return 1
+      if ! release_tree_permissions_trusted "$target"; then
+        install_release "$ref" "$target" 0 0 || return 1
+      fi
+      runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
+    else
+      [[ "$target" == "$manager_releases/$ref" ]] || return 1
+      manager_release_complete "$target" "$ref" || return 1
+      if ! release_tree_permissions_trusted "$target"; then
+        source=$releases_dir/$ref
+        install_release "$ref" "$source" 0 0 || return 1
+        release_tree_permissions_trusted "$source" || return 1
+        install_manager "$ref" "$source" "$target" 0 0 false || return 1
+      fi
+      manager_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
+    fi
+    [[ "$kind" != release ]] || release_authority=$target
+  done
+  file=$checkpoint/current-link
+  [[ -e "$file" || -L "$file" ]] || return 0
+  [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+    && $(stat -c %a "$file") == 600 && $(stat -c %s "$file") -ge 1 \
+    && $(stat -c %s "$file") -le 4095 ]] || return 1
+  if IFS= read -r -d '' target <"$file"; then return 1; fi
+  [[ "$target" != *$'\n'* ]] || return 1
+  source=$(raw_link_target_path "$target" "$current_link") || return 1
+  if [[ ! -e "$source" && ! -L "$source" ]]; then
+    [[ -n "$release_authority" ]] || return 1
+    staged_link=$(mktemp "$checkpoint/.current-link.XXXXXX") || return 1
+    if ! chmod 600 "$staged_link" || ! printf '%s' "$release_authority" >"$staged_link" \
+      || [[ ! -f "$staged_link" || -L "$staged_link" || $(stat -c %u "$staged_link") != "$expected_owner" \
+        || $(stat -c %a "$staged_link") != 600 || $(<"$staged_link") != "$release_authority" ]] \
+      || ! mv -f -- "$staged_link" "$file"; then
+      rm -f -- "$staged_link"
+      return 1
+    fi
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$expected_owner" \
+      && $(stat -c %a "$file") == 600 && $(<"$file") == "$release_authority" ]] || return 1
+    return 0
+  fi
+  target=$(resolve_link_target "$target" "$current_link") || return 1
+  target=$(canonical_release_target "$target" "$releases_dir") || return 1
+  ref=${target##*/}
+  runtime_release_complete "$target" "$ref" || return 1
+  if ! release_tree_permissions_trusted "$target"; then
+    install_release "$ref" "$target" 0 0 || return 1
+  fi
+  runtime_release_complete "$target" "$ref" && release_tree_permissions_trusted "$target" || return 1
+}
+
 pending_policy_checkpoint() {
   local expected_owner=0
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -1066,7 +1242,7 @@ PY
 }
 
 make_checkpoint() {
-  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref status manager_target='' manager_ref
+  local timestamp target unit timer final_checkpoint staged_checkpoint expected_owner=0 runner_id controller_id controller_live_id='' fallback_release=${1:-} fallback_ref fallback_candidate status manager_target='' manager_ref
   capture_current_pointer
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   status=$(controller_status)
@@ -1077,7 +1253,8 @@ make_checkpoint() {
       manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
       [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
       manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+      if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref" ||
+        ! release_tree_permissions_trusted "$manager_target"; then
         die 'manager current pointer is invalid'
       fi
     fi
@@ -1085,11 +1262,15 @@ make_checkpoint() {
     die 'manager current pointer is invalid'
   fi
   target=$(current_runtime_release)
-  if [[ -z "$target" && -n "$fallback_release" && -f "$fallback_release/.ci-fleet-engine-ref" ]]; then
-    fallback_ref=$(<"$fallback_release/.ci-fleet-engine-ref")
-    if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_release" "$fallback_ref"; then target=$fallback_release; fi
+  if [[ -z "$target" && -n "$fallback_release" ]]; then
+    fallback_candidate=$(canonical_release_target "$fallback_release" "$releases_dir" || true)
+    if [[ -n "$fallback_candidate" && -f "$fallback_candidate/.ci-fleet-engine-ref" ]]; then
+      fallback_ref=$(<"$fallback_candidate/.ci-fleet-engine-ref")
+      if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_candidate" "$fallback_ref" \
+        && release_tree_permissions_trusted "$fallback_candidate"; then target=$fallback_candidate; fi
+    fi
   fi
-  [[ -n "$target" || -z "$status" ]] || die 'a trusted complete release is required before controller mutation'
+  [[ -n "$target" || ( -z "$status" && "$captured_current_state" != link ) ]] || die 'a trusted complete runtime release is required before controller mutation'
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   final_checkpoint=$checkpoints_dir/${timestamp}-$$
   install -d -m 0700 "$checkpoints_dir"
@@ -1396,7 +1577,7 @@ restore_systemd_snapshot() {
 }
 
 restore_checkpoint() {
-  local target restored_state actual index expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target=''
+  local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
   local restore_controller_tag_after_start=false
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
@@ -1471,10 +1652,24 @@ PY
       return 1
     fi
     target=$(<"$checkpoint_release/.ci-fleet-engine-ref")
-    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target"; then
+    if [[ ! "$target" =~ ^[0-9a-f]{40}$ ]] || ! runtime_release_complete "$checkpoint_release" "$target" ||
+      ! release_tree_permissions_trusted "$checkpoint_release"; then
       note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
       return 1
     fi
+    runtime_target=$(canonical_release_target "$checkpoint_release" "$releases_dir" || true)
+    if [[ -z "$runtime_target" ]]; then
+      if [[ "$checkpoint_release" != "$manager_releases/"* || -L "$checkpoint_release" ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
+        return 1
+      fi
+      runtime_target=$releases_dir/$target
+      if ! install_release "$target" "$runtime_target" 0 0; then
+        note 'ROLLBACK_FAILED reason=checkpoint release target normalization failed'
+        return 1
+      fi
+    fi
+    checkpoint_release=$runtime_target
   fi
 
   if [[ -e "$checkpoint_dir/manager-target" || -L "$checkpoint_dir/manager-target" ]]; then
@@ -1490,9 +1685,64 @@ PY
       return 1
     fi
     restored_state=$(<"$target/.ci-fleet-engine-ref")
-    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state"; then
+    if [[ ! "$restored_state" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$target" "$restored_state" ||
+      ! release_tree_permissions_trusted "$target"; then
       note 'ROLLBACK_FAILED reason=checkpoint manager target is invalid'
       return 1
+    fi
+    validated_manager_target=$manager_releases/$restored_state
+    if [[ "$target" != "$validated_manager_target" ]]; then
+      if ! install_manager "$restored_state" "$target" "$validated_manager_target" 0 0 false; then
+        note 'ROLLBACK_FAILED reason=checkpoint manager target normalization failed'
+        return 1
+      fi
+    fi
+  fi
+  if [[ -n "$validated_current_target" ]]; then
+    if IFS= read -r -d '' restored_state <"$validated_current_target"; then
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    fi
+    source=$(raw_link_target_path "$restored_state" "$current_link") || {
+      note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+      return 1
+    }
+    if [[ ! -e "$source" && ! -L "$source" && -n "$checkpoint_release" ]]; then
+      if ! printf '%s' "$checkpoint_release" >"$validated_current_target" \
+        || [[ ! -f "$validated_current_target" || -L "$validated_current_target" \
+          || $(stat -c %u "$validated_current_target") != "$expected_owner" \
+          || $(stat -c %a "$validated_current_target") != 600 \
+          || $(stat -c %s "$validated_current_target") != "${#checkpoint_release}" \
+          || $(<"$validated_current_target") != "$checkpoint_release" ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      fi
+    else
+      if [[ "$restored_state" == *$'\n'* ]]; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      fi
+      restored_state=$(resolve_link_target "$restored_state" "$current_link") || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      }
+      target=$(canonical_release_target "$restored_state" "$releases_dir") || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      }
+      restored_state=${target##*/}
+      if ! runtime_release_complete "$target" "$restored_state" || ! release_tree_permissions_trusted "$target"; then
+        note 'ROLLBACK_FAILED reason=checkpoint current target is invalid'
+        return 1
+      fi
+      printf '%s' "$target" >"$validated_current_target" || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      }
+      [[ $(<"$validated_current_target") == "$target" ]] || {
+        note 'ROLLBACK_FAILED reason=checkpoint current target normalization failed'
+        return 1
+      }
     fi
   fi
   if $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -1560,13 +1810,8 @@ PY
   else
     if [[ ! -L "$current_link" || -e "$current_link" ]]; then rm -f "$current_link" || failed=1; fi
   fi
-  if [[ -f "$checkpoint_dir/manager-target" ]]; then
-    target=$(<"$checkpoint_dir/manager-target")
-    if [[ "$target" == "$manager_releases/"* && -d "$target" ]]; then
-      ln -sfn "$target" "$temporary/rollback-manager" && mv -Tf "$temporary/rollback-manager" "$manager_current" || failed=1
-    else
-      failed=1
-    fi
+  if [[ -n "$validated_manager_target" ]]; then
+    ln -sfn "$validated_manager_target" "$temporary/rollback-manager" && mv -Tf "$temporary/rollback-manager" "$manager_current" || failed=1
   else
     rm -f "$manager_current" || failed=1
   fi
@@ -1731,17 +1976,13 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 manager_target manager_ref policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
+  local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 current_target current_ref manager_target manager_ref manager_source policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
   if ! docker_network_policy_matches && ! docker_daemon_config_trusted; then
     die 'failed to stage Docker network policy'
-  fi
-  if [[ "$mode" == upgrade && ( -e "$manager_current" || -L "$manager_current" ) ]]; then
-    CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
-      || die 'manager current pointer is invalid'
   fi
   existing_status=$(controller_status)
   if [[ "$mode" == adopt && ! -f "$rendered_env" && ! -f "$state_file" && -z "$existing_status" ]]; then
@@ -1750,11 +1991,38 @@ perform_converge() {
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
   fi
+  if [[ -L "$current_link" ]]; then
+    current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
+    if [[ -n "$current_target" ]]; then
+      current_ref=${current_target##*/}
+      if ! runtime_release_complete "$current_target" "$current_ref"; then
+        [[ "$mode" == install ]] || die 'current release is incomplete; operator recovery or reinstall required'
+        install_release "$current_ref" "$current_target" 0 0
+      elif ! release_tree_permissions_trusted "$current_target"; then
+        install_release "$current_ref" "$current_target" 0 0
+      fi
+    elif raw_pointer_target_exists "$current_link"; then
+      die 'current pointer is invalid'
+    fi
+  fi
   if [[ -L "$manager_current" ]]; then
-    manager_target=$(readlink -f "$manager_current" 2>/dev/null || true)
-    [[ "$manager_target" == "$manager_releases/"* && -f "$manager_target/.ci-fleet-engine-ref" ]] || die 'manager current pointer is invalid'
-    manager_ref=$(<"$manager_target/.ci-fleet-engine-ref")
-    if [[ ! "$manager_ref" =~ ^[0-9a-f]{40}$ ]] || ! manager_release_complete "$manager_target" "$manager_ref"; then
+    manager_target=$(canonical_release_target_from_raw_pointer "$manager_current" "$manager_releases" || true)
+    [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
+    manager_ref=${manager_target##*/}
+    if [[ "$mode" == upgrade ]] && release_tree_permissions_trusted "$manager_target"; then
+      CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
+        || die 'manager current pointer is invalid'
+    elif ! manager_release_complete "$manager_target" "$manager_ref"; then
+      [[ "$mode" == install ]] || die 'manager current pointer is incomplete; operator recovery or reinstall required'
+      manager_source=$releases_dir/$manager_ref
+      install_release "$manager_ref" "$manager_source" 0 0
+      install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
+    elif ! release_tree_permissions_trusted "$manager_target"; then
+      manager_source=$releases_dir/$manager_ref
+      install_release "$manager_ref" "$manager_source" 0 0
+      install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
+    fi
+    if ! manager_release_complete "$manager_target" "$manager_ref" || ! release_tree_permissions_trusted "$manager_target"; then
       die 'manager current pointer is invalid'
     fi
   elif [[ -e "$manager_current" ]]; then
@@ -1791,7 +2059,10 @@ perform_converge() {
   pending_checkpoint_status=0
   pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
   case "$pending_checkpoint_status" in
-    0) checkpoint_dir=$pending_checkpoint ;;
+    0)
+      repair_pending_checkpoint_authority "$pending_checkpoint" || die 'pending network-policy controller checkpoint is invalid'
+      checkpoint_dir=$pending_checkpoint
+      ;;
     1) make_checkpoint "$release_dir" ;;
     *) die 'pending network-policy controller checkpoint is invalid' ;;
   esac
@@ -1891,18 +2162,26 @@ perform_rollback() {
 }
 
 perform_uninstall() {
-  local candidate manager_candidate='' old_release='' old_ref='' status
+  local candidate current_candidate='' manager_candidate='' old_release='' old_ref='' status
   load_installed_controller_identity
   status=$(controller_status)
-  if [[ -z "$status" ]]; then
-    manager_candidate=$(manager_release_from_raw_pointer || true)
-  else
-    manager_candidate=$(readlink -f "$manager_current" 2>/dev/null || true)
+  if [[ -L "$current_link" ]] && raw_pointer_target_exists "$current_link"; then
+    current_candidate=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
+    [[ -n "$current_candidate" ]] || die 'current pointer is invalid; operator recovery or reinstall required'
+    if ! runtime_release_complete "$current_candidate" "${current_candidate##*/}" || ! release_tree_permissions_trusted "$current_candidate"; then
+      die 'a trusted complete canonical runtime release is required to uninstall'
+    fi
   fi
-  for candidate in "$(current_runtime_release)" "$manager_candidate" "$repo_root"; do
+  manager_candidate=$(manager_release_from_raw_pointer || true)
+  if [[ -z "$manager_candidate" && ( -n "$status" || ( -L "$manager_current" && -e "$manager_current" ) ) ]]; then
+    die 'a trusted complete canonical manager release is required to uninstall the running controller'
+  fi
+  for candidate in "$(current_runtime_release)" "$releases_dir/${manager_candidate##*/}"; do
+    candidate=$(canonical_release_target "$candidate" "$releases_dir" || true)
     [[ -n "$candidate" && -f "$candidate/.ci-fleet-engine-ref" ]] || continue
     old_ref=$(<"$candidate/.ci-fleet-engine-ref")
-    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref"; then old_release=$candidate; break; fi
+    if [[ "$old_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$candidate" "$old_ref" \
+      && release_tree_permissions_trusted "$candidate"; then old_release=$candidate; break; fi
   done
   [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint "$old_release"
