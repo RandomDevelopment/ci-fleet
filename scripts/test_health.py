@@ -111,6 +111,23 @@ class HealthTests(unittest.TestCase):
         report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": mismatch}, health.Thresholds())
         self.assertIn("docker_default_bridge", {check["id"] for check in report["checks"] if check["status"] == "critical"})
 
+    def test_empty_default_bridge_placeholder_is_unconfigured(self) -> None:
+        values = {**network_policy_values(), "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR": ""}
+
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]}}]),
+                "",
+            )
+
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual(result["state"], "healthy")
+        self.assertNotIn("default_bridge", result)
+
     def test_docker_network_headroom_collection_handles_inspection_failure(self) -> None:
         def run(args):
             if args[:2] == ["docker", "info"]:

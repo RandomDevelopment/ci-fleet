@@ -359,7 +359,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         return unavailable
     bridge_value = values.get("CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR")
     try:
-        expected_bridge = ipaddress.ip_interface(bridge_value) if bridge_value is not None else None
+        expected_bridge = ipaddress.ip_interface(bridge_value) if bridge_value else None
     except ValueError:
         return unavailable
     if expected_bridge is not None and expected_bridge.version != 4:
