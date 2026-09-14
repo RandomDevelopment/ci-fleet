@@ -448,8 +448,13 @@ controller_environment_matches() {
     CI_FLEET_RUNNER_IMAGE CI_FLEET_INSTANCE CI_FLEET_GITHUB_APP_CLIENT_ID \
     CI_FLEET_GITHUB_APP_INSTALLATION_ID CI_FLEET_MIN_RUNNERS CI_FLEET_MAX_RUNNERS \
     CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID \
-    CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
+    CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
     expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    if [[ -z "$expected" && "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR ]]; then
+      actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
+      [[ -z "$actual" ]] || return 1
+      continue
+    fi
     if [[ -z "$expected" && ( "$key" == CI_FLEET_DOCKER_NETWORKS_PER_RUNNER || "$key" == CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS ) ]]; then
       actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
       [[ -z "$actual" || "$actual" == 0 ]] || return 1
@@ -804,7 +809,7 @@ from pathlib import Path
 
 environment, daemon_path, marker_path, scripts_path, expected_owner, checkpoint_dir, root_prefix = sys.argv[1:]
 sys.path.insert(0, scripts_path)
-from desired_state import parse_env, render_docker_daemon_config, validate_docker_address_pools
+from desired_state import parse_env, render_docker_daemon_config, validate_ipv4_interface_cidr, validate_docker_address_pools
 
 values = parse_env(Path(environment), allow_unknown=True)
 managed = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT" in values
@@ -864,8 +869,23 @@ try:
         "prior_present",
         "verified_generation",
     }
-    if not isinstance(marker, dict) or set(marker) != required or marker["managed"] is not True:
+    bip = {"bip_managed", "prior_bip", "prior_bip_present"}
+    desired_bip = "bip" in desired
+    marker_bip = bip <= set(marker) if isinstance(marker, dict) else False
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != required | (bip if marker_bip else set())
+        or marker["managed"] is not True
+        or marker_bip != desired_bip
+    ):
         raise ValueError
+    if marker_bip:
+        if marker["bip_managed"] is not True or not isinstance(marker["prior_bip_present"], bool):
+            raise ValueError
+        if marker["prior_bip_present"]:
+            validate_ipv4_interface_cidr(marker["prior_bip"], path="checkpoint prior bip")
+        elif marker["prior_bip"] is not None:
+            raise ValueError
     if not isinstance(marker["prior_present"], bool) or not isinstance(marker["prior_default_address_pools_present"], bool):
         raise ValueError
     if marker["prior_default_address_pools_present"]:
@@ -886,6 +906,7 @@ try:
         or not re.fullmatch(r"[0-9a-f]{64}", generation)
         or not isinstance(daemon, dict)
         or daemon.get("default-address-pools") != desired.get("default-address-pools")
+        or (desired_bip and daemon.get("bip") != desired["bip"])
         or hashlib.sha256(daemon_bytes).hexdigest() != generation
     ):
         raise ValueError

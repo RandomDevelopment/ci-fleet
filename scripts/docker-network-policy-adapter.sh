@@ -45,7 +45,33 @@ case "$action" in
     systemctl restart docker.service 9>&- 7>&-
     ;;
   probe)
-    [[ $# -eq 0 ]] || die 'invalid network probe arguments'
+    [[ $# -eq 0 || ( $# -eq 2 && $1 == --daemon-config && $2 == /* && -f $2 && ! -L $2 ) ]] || die 'invalid network probe arguments'
+    expected_bip=
+    if [[ $# -eq 2 ]]; then
+      expected_bip=$(python3 - "$2" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(value, dict):
+    raise SystemExit(1)
+print(value.get("bip", ""))
+PY
+      ) || die 'invalid expected daemon config'
+    fi
+    if [[ -n "$expected_bip" ]]; then
+      effective_bridge=$(docker network inspect bridge --format '{{json .IPAM.Config}}' 9>&- 7>&-) || die 'failed to inspect default bridge network'
+      python3 - "$expected_bip" "$effective_bridge" <<'PY' || die 'effective default bridge does not match managed bip'
+import ipaddress, json, sys
+expected = ipaddress.ip_interface(sys.argv[1])
+configs = json.loads(sys.argv[2])
+if not isinstance(configs, list) or not any(
+    isinstance(item, dict)
+    and item.get("Subnet") == str(expected.network)
+    and item.get("Gateway") == str(expected.ip)
+    for item in configs
+):
+    raise SystemExit(1)
+PY
+    fi
     probe=ci-fleet-network-policy-probe-$$
     trap 'docker network rm "$probe" 9>&- 7>&- >/dev/null 2>&1 || true' EXIT
     docker network create \

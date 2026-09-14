@@ -157,9 +157,10 @@ def validate_docker_network_policy(
         validation.errors.append(f"{path}: must be an object")
         return 0, 0, []
     required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
+    optional = {"default_bridge_cidr"}
     keys = set(policy)
     missing = sorted(required - keys)
-    unknown = sorted(keys - required)
+    unknown = sorted(keys - required - optional)
     if missing or unknown:
         parts = []
         if missing:
@@ -221,6 +222,35 @@ def validate_docker_network_policy(
             if item["network"].overlaps(parsed[right]["network"]):
                 validation.errors.append(f"{path}.default_address_pools[{left}].base: overlaps configured pool {right}")
                 return 0, 0, []
+    if "default_bridge_cidr" in policy:
+        bridge_path = f"{path}.default_bridge_cidr"
+        value = policy["default_bridge_cidr"]
+        if not isinstance(value, str):
+            validation.errors.append(f"{bridge_path}: must be an IPv4 interface CIDR")
+            return 0, 0, []
+        try:
+            bridge = ipaddress.ip_interface(value)
+        except ValueError:
+            validation.errors.append(f"{bridge_path}: malformed IPv4 interface CIDR")
+            return 0, 0, []
+        if bridge.version != 4:
+            validation.errors.append(f"{bridge_path}: must be an IPv4 interface CIDR")
+            return 0, 0, []
+        if bridge.network.prefixlen > 29:
+            validation.errors.append(f"{bridge_path}: prefix must provide at least six usable addresses")
+            return 0, 0, []
+        if bridge.ip in {bridge.network.network_address, bridge.network.broadcast_address}:
+            validation.errors.append(f"{bridge_path}: must use a usable host address as the bridge gateway")
+            return 0, 0, []
+        if any(bridge.network.overlaps(item["network"]) for item in parsed):
+            validation.errors.append(f"{bridge_path}: must not overlap default_address_pools")
+            return 0, 0, []
+        if bridge.network.num_addresses - 3 < max_runners + reserve:
+            validation.errors.append(f"{bridge_path}: must provide at least max_runners + reserve_subnets usable container addresses")
+            return 0, 0, []
+        if strict and any(bridge.network.overlaps(documentation) for documentation in RFC_5737_NETWORKS):
+            validation.errors.append(f"{bridge_path}: replace the RFC 5737 documentation address with a reviewed operational Docker bridge CIDR")
+            return 0, 0, []
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
     if configured < max_runners * networks_per_runner + reserve + 1:
         validation.errors.append(
@@ -528,21 +558,25 @@ def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, d
             evidence,
             path,
             {"engine_ref", "status_reporting_config", "required_status_reporting"},
-            {"docker_network_policy_config"},
+            {"docker_network_policy_config", "docker_default_bridge_cidr_config"},
         ):
             continue
         ref = evidence.get("engine_ref")
         configured = evidence.get("status_reporting_config")
         required = evidence.get("required_status_reporting")
         network_policy = evidence.get("docker_network_policy_config")
+        default_bridge = evidence.get("docker_default_bridge_cidr_config")
         ref_valid = isinstance(ref, str) and bool(COMMIT_SHA.fullmatch(ref)) and ref != "0" * 40
         validation.require(ref_valid, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
         validation.require(type(configured) is bool, f"{path}.status_reporting_config", "must be a boolean")
         validation.require(type(required) is bool, f"{path}.required_status_reporting", "must be a boolean")
         if "docker_network_policy_config" in evidence:
             validation.require(type(network_policy) is bool, f"{path}.docker_network_policy_config", "must be a boolean")
+        if "docker_default_bridge_cidr_config" in evidence:
+            validation.require(type(default_bridge) is bool, f"{path}.docker_default_bridge_cidr_config", "must be a boolean")
         network_policy_valid = "docker_network_policy_config" not in evidence or type(network_policy) is bool
-        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid:
+        default_bridge_valid = "docker_default_bridge_cidr_config" not in evidence or type(default_bridge) is bool
+        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid and default_bridge_valid:
             valid[controller] = {
                 "engine_ref": ref,
                 "status_reporting_config": configured,
@@ -550,6 +584,8 @@ def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, d
             }
             if "docker_network_policy_config" in evidence:
                 valid[controller]["docker_network_policy_config"] = network_policy
+            if "docker_default_bridge_cidr_config" in evidence:
+                valid[controller]["docker_default_bridge_cidr_config"] = default_bridge
     return valid
 
 
@@ -611,6 +647,10 @@ def validate_transition(
         previous_evidence = previous_evidence_source.get(name, {})
         old_reporting = old.get("status_reporting")
         new_reporting = new.get("status_reporting")
+        old_network_policy = old.get("docker_network_policy")
+        new_network_policy = new.get("docker_network_policy")
+        old_default_bridge = isinstance(old_network_policy, dict) and "default_bridge_cidr" in old_network_policy
+        new_default_bridge = isinstance(new_network_policy, dict) and "default_bridge_cidr" in new_network_policy
         if "docker_network_policy" not in old and "docker_network_policy" in new:
             validation.require(
                 old.get("engine_ref") == new.get("engine_ref"),
@@ -629,6 +669,31 @@ def validate_transition(
                 and current_evidence.get("docker_network_policy_config") is True,
                 f"$.controllers.{name}.docker_network_policy",
                 "requires Docker network policy configuration capability evidence for this controller and engine_ref",
+            )
+        if not old_default_bridge and new_default_bridge:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                "must be introduced in a later commit after the compatible engine_ref is active",
+            )
+            validation.require(
+                previous_evidence.get("engine_ref") == new.get("engine_ref")
+                and previous_evidence.get("docker_default_bridge_cidr_config") is True,
+                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with default bridge CIDR capability",
+            )
+        if old_default_bridge and not new_default_bridge:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                "must be removed before changing engine_ref",
+            )
+        if new_default_bridge:
+            validation.require(
+                current_evidence.get("engine_ref") == new.get("engine_ref")
+                and current_evidence.get("docker_default_bridge_cidr_config") is True,
+                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                "requires default bridge CIDR capability evidence for this controller and engine_ref",
             )
         staged_capability_required = (
             "status_reporting" not in old

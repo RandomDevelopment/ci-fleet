@@ -86,6 +86,7 @@
           "additionalProperties": false,
           "required": ["default_address_pools", "networks_per_runner", "reserve_subnets"],
           "properties": {
+            "default_bridge_cidr": {"type": "string"},
             "networks_per_runner": {"type": "integer", "minimum": 1},
             "reserve_subnets": {"type": "integer", "minimum": 1},
             "default_address_pools": {

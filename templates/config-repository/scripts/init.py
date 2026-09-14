@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capacity-budget", type=positive_integer, default=1, help="maximum capacity reserved by the pool")
     parser.add_argument("--max-runners", type=positive_integer, default=1, help="initial controller maximum")
     parser.add_argument("--networks-per-runner", type=positive_integer, default=1, help="reviewed maximum Compose networks per runner")
+    parser.add_argument("--default-bridge-cidr", help="reviewed IPv4 default bridge gateway and prefix (Docker bip)")
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
@@ -166,6 +167,8 @@ def main() -> int:
             }
         },
     }
+    if args.default_bridge_cidr:
+        config["controllers"][args.controller]["docker_network_policy"]["default_bridge_cidr"] = args.default_bridge_cidr
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent, text=True)
     temporary = Path(temporary_name)
@@ -183,7 +186,7 @@ def main() -> int:
     finally:
         temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
-    print("Next: replace the RFC 5737 Docker pool, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
+    print("Next: replace RFC 5737 Docker network values, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
     return 0
 
 

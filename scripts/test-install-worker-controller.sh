@@ -584,6 +584,8 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
   grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
+# shellcheck disable=SC2016 # Match the literal Compose interpolation.
+grep -Fq '      CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR: ${CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR:-}' "$repo_root/deploy/compose.yaml" || fail 'controller does not receive the optional default bridge CIDR for health verification'
 for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh; do
   grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/$entrypoint" || fail "$entrypoint may write Python bytecode into the immutable manager release"
 done
@@ -771,6 +773,23 @@ set -e
 [[ "$strict_marker_status" == 3 ]] || fail "string prior_present marker drift returned $strict_marker_status instead of 3: $(<"$strict_marker_output")"
 grep -Fq 'DRIFT docker_network_policy' "$strict_marker_output" || fail "string prior_present marker drift was not reported: $(<"$strict_marker_output")"
 python3 -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["prior_present"] = False; path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")' "$policy_marker"
+
+python3 - "$policy_marker" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value.update({"bip_managed": True, "prior_bip": None, "prior_bip_present": False})
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY
+expect_failure 'DRIFT docker_network_policy' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+python3 - "$policy_marker" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+for key in ("bip_managed", "prior_bip", "prior_bip_present"):
+    value.pop(key)
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY
 
 policy_checkpoint_dir=$(dirname "$policy_marker")
 chmod 0770 "$policy_checkpoint_dir"

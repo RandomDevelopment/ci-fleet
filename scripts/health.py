@@ -149,6 +149,8 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
                 reserve=network.get("reserve", 0),
             )
             add("docker_network_legacy", "warning" if network.get("legacy", 0) else "ok", count=network.get("legacy", 0))
+            if "default_bridge" in network:
+                add("docker_default_bridge", "ok" if network["default_bridge"] == "matched" else "critical")
 
     desired = snapshot["desired_state"]
     controller_state = snapshot["controller"]["state"]
@@ -355,6 +357,13 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         pools.append(pool)
     if not pools or configured_max < 0 or networks_per_runner < 1 or reserve < 1:
         return unavailable
+    bridge_value = values.get("CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR")
+    try:
+        expected_bridge = ipaddress.ip_interface(bridge_value) if bridge_value else None
+    except ValueError:
+        return unavailable
+    if expected_bridge is not None and expected_bridge.version != 4:
+        return unavailable
     configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
     unavailable = {"configured": configured, "reserve": reserve, "state": "unavailable"}
     if not docker_ok:
@@ -364,6 +373,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         return unavailable
     occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     bridge_occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
+    default_bridge_matches = expected_bridge is None
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
         inspected = run(["docker", "network", "inspect", name])
@@ -390,12 +400,18 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
                 return unavailable
             for config in configs:
                 subnet = config.get("Subnet") if isinstance(config, dict) else None
+                gateway = config.get("Gateway") if isinstance(config, dict) else None
                 if not isinstance(subnet, str):
                     return unavailable
                 try:
                     network = ipaddress.ip_network(subnet, strict=False)
+                    gateway_address = ipaddress.ip_address(gateway) if isinstance(gateway, str) else None
                 except ValueError:
                     return unavailable
+                if name == "bridge" and expected_bridge is not None:
+                    default_bridge_matches = default_bridge_matches or (
+                        network == expected_bridge.network and gateway_address == expected_bridge.ip
+                    )
                 if network.version == 6:
                     saw_ipv6 = True
                     continue
@@ -447,13 +463,13 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     free = max(configured - used, 0)
     policy_max = 0 if values.get("CI_FLEET_CONTROLLER_STATE") == "disabled" else configured_max
     required = policy_max * networks_per_runner + reserve + 1
-    if free == 0:
+    if not default_bridge_matches or free == 0:
         state = "critical"
     elif legacy_networks > 0 or configured - bridge_used < required or free <= reserve:
         state = "warning"
     else:
         state = "healthy"
-    return {
+    result = {
         "configured": configured,
         "used": used,
         "free": free,
@@ -461,6 +477,9 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         "legacy": legacy_networks,
         "state": state,
     }
+    if expected_bridge is not None:
+        result["default_bridge"] = "matched" if default_bridge_matches else "mismatch"
+    return result
 
 
 def _timespan_seconds(value: str) -> float | None:

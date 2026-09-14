@@ -60,6 +60,7 @@ class DesiredStateTests(unittest.TestCase):
                 "status_reporting_config",
                 "docker_network_policy_config",
                 "docker_network_policy_adapter",
+                "docker_default_bridge_cidr_config",
             }
             if capabilities is None
             else capabilities,
@@ -164,6 +165,37 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(metadata["docker_network_default_address_pools"], 1)
         self.assertEqual(metadata["docker_networks_per_runner"], 2)
         self.assertEqual(metadata["docker_network_reserve_subnets"], 1)
+
+    def test_default_bridge_cidr_renders_bip_and_requires_capability(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"]["default_bridge_cidr"] = "192.0.2.1/28"
+        environment, metadata = self.render(value)
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR"], "192.0.2.1/28")
+        self.assertTrue(metadata["docker_default_bridge_cidr_configured"])
+        with self.assertRaisesRegex(DesiredStateError, "default bridge CIDR"):
+            self.render(value, {"status_reporting_config", "docker_network_policy_config", "docker_network_policy_adapter"})
+
+    def test_default_bridge_cidr_validation(self) -> None:
+        policy = docker_network_policy()
+        policy["default_bridge_cidr"] = "192.0.2.1/28"
+        validate_docker_network_policy(policy, path="policy", max_runners=1)
+        invalid = (
+            (42, "IPv4 interface"),
+            ("bad", "malformed"),
+            ("2001:db8::1/64", "IPv4 interface"),
+            ("192.0.2.0/28", "usable host"),
+            ("192.0.2.15/28", "usable host"),
+            ("192.0.2.1/30", "at least six usable"),
+            ("198.51.100.1/28", "must not overlap"),
+        )
+        for cidr, message in invalid:
+            with self.subTest(cidr=cidr):
+                policy["default_bridge_cidr"] = cidr
+                with self.assertRaisesRegex(DesiredStateError, message):
+                    validate_docker_network_policy(policy, path="policy", max_runners=1)
+        policy["default_bridge_cidr"] = "192.0.2.1/29"
+        with self.assertRaisesRegex(DesiredStateError, "max_runners.*reserve_subnets"):
+            validate_docker_network_policy(policy, path="policy", max_runners=5)
 
     def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
         value = config()
