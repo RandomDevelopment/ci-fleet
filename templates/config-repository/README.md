@@ -124,8 +124,10 @@ subnets. The final subnet is reserved for the persistent controller Compose
 network. The optional `default_bridge_cidr` is an IPv4 interface address and
 prefix such as `192.0.2.1/28`, not a canonical network base. Its address must be
 a usable gateway, its prefix must leave room for containers, and its subnet must
-not overlap the default-address pools. Size this bridge for containers that use
-Docker's default network. Size the pools separately for job and controller
+not overlap the default-address pools. After excluding the network, broadcast,
+and bridge gateway addresses, it must provide at least
+`max_runners + reserve_subnets` container addresses. Size this bridge for
+containers that use Docker's default network. Size the pools separately for job and controller
 networks. The pool-capacity arithmetic above does not change when the bridge
 field is present.
 

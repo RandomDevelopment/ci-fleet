@@ -264,6 +264,10 @@ def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_run
         bridge = validate_default_bridge_cidr(policy["default_bridge_cidr"], path=f"{path}.default_bridge_cidr")
         if any(bridge.network.overlaps(item["network"]) for item in parsed):
             raise DesiredStateError(f"{path}.default_bridge_cidr: must not overlap default_address_pools")
+        if bridge.network.num_addresses - 3 < max_runners + reserve:
+            raise DesiredStateError(
+                f"{path}.default_bridge_cidr: must provide at least max_runners + reserve_subnets usable container addresses"
+            )
     configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
     if configured < max_runners * networks_per_runner + reserve + 1:
         raise DesiredStateError(

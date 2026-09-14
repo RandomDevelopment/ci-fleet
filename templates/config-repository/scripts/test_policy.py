@@ -128,6 +128,11 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(cidr=cidr):
                 policy["default_bridge_cidr"] = cidr
                 self.assert_rejected(config, message)
+        policy["default_bridge_cidr"] = "192.0.2.1/29"
+        controller = first_controller(config)
+        controller["max_runners"] = 5
+        config["runner_pools"][controller["pool"]]["capacity_budget"] = 5
+        self.assert_rejected(config, "max_runners + reserve_subnets")
 
     def test_present_null_docker_network_policy_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())

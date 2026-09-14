@@ -245,6 +245,9 @@ def validate_docker_network_policy(
         if any(bridge.network.overlaps(item["network"]) for item in parsed):
             validation.errors.append(f"{bridge_path}: must not overlap default_address_pools")
             return 0, 0, []
+        if bridge.network.num_addresses - 3 < max_runners + reserve:
+            validation.errors.append(f"{bridge_path}: must provide at least max_runners + reserve_subnets usable container addresses")
+            return 0, 0, []
         if strict and any(bridge.network.overlaps(documentation) for documentation in RFC_5737_NETWORKS):
             validation.errors.append(f"{bridge_path}: replace the RFC 5737 documentation address with a reviewed operational Docker bridge CIDR")
             return 0, 0, []

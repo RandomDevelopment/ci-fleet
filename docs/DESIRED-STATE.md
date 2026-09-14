@@ -56,7 +56,9 @@ runner subnet capacity, but their retained policy must still cover the reserve
 and controller network. `default_bridge_cidr`, when present, is an IPv4
 interface address and prefix such as `192.0.2.1/28`, not a canonical network
 base. Its address must be a usable gateway, its prefix must leave room for
-containers, and its subnet must not overlap any default-address pool. Size the
+containers, and its subnet must not overlap any default-address pool. After
+excluding the network, broadcast, and bridge gateway addresses, it must provide
+at least `max_runners + reserve_subnets` container addresses. Size the
 default bridge for concurrent containers attached without an explicit network.
 Size `default_address_pools` separately for job and controller networks. The
 existing `max_runners * networks_per_runner + reserve_subnets + 1` arithmetic

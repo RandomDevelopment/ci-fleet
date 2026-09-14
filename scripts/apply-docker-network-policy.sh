@@ -529,6 +529,15 @@ raise SystemExit(not isinstance(value, dict) or "bip" not in value)
 PY
 }
 
+run_policy_probe() {
+  local expected=$1 verify_bip=$2
+  if [[ "$verify_bip" == true ]] && daemon_has_bip "$expected"; then
+    run_probe "$expected" true
+  else
+    run_probe "$expected" false
+  fi
+}
+
 daemon_policy_matches() {
   local expected=$1 verify_bip=${2:-false}
   python3 - "$daemon_config" "$expected" "$verify_bip" 2>/dev/null <<'PY'
@@ -607,11 +616,12 @@ elif action in ("reapply-pending", "rollback-complete"):
     state.pop("removal_managed_bip_present", None)
     if action == "reapply-pending" and "bip" in json.loads(desired_policy_json) and not state.get("bip_managed"):
         prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
+        prior_bip = prior.get("bip")
         state.update(
             bip_managed=True,
             bip_adoption_pending=True,
-            prior_bip=prior.get("bip"),
-            prior_bip_present="bip" in prior,
+            prior_bip=prior_bip,
+            prior_bip_present=prior_bip is not None,
         )
 if action == "rollback-reapply":
     state.pop("phase", None)
@@ -1184,8 +1194,8 @@ PY
     if ((failed == 0)); then
       run_primitive restart "$daemon_dir" || failed=1
     fi
-    if ((failed == 0)) && [[ "$bip_managed_before" == true ]] && daemon_has_bip "$managed_daemon"; then
-      run_probe "$managed_daemon" true || failed=1
+    if ((failed == 0)) && [[ "$bip_managed_before" == true ]]; then
+      run_policy_probe "$managed_daemon" true || failed=1
     fi
     if ((failed == 0)); then
       run_primitive restore --env "$prior_env" || failed=1
@@ -1257,7 +1267,7 @@ PY
     cmp -s "$removal_daemon" "$daemon_config" || { removal_failure='failed to verify prior network-policy key state'; exit 2; }
   fi
   run_primitive restart "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
-  run_probe "$removal_daemon" "$bip_managed_before" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
+  run_policy_probe "$removal_daemon" "$bip_managed_before" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   controller_resumed=true
   activation_env=$env_file
   [[ "$cancelling_first_apply" != true ]] || activation_env=$prior_env
@@ -1313,6 +1323,12 @@ if os.path.exists(daemon_path):
         raise SystemExit(f"ERROR: existing daemon.json is not a valid JSON object: {exc}")
 desired_policy = json.loads(desired_policy_json)
 state = json.load(open(state_path, encoding="utf-8")) if os.path.exists(state_path) else {}
+bip_touched = "bip" in desired_policy or state.get("bip_managed") is True
+prior_bip = prior.get("bip")
+if bip_touched and prior_bip is not None:
+    sys.path.insert(0, scripts_path)
+    from desired_state import validate_ipv4_interface_cidr
+    validate_ipv4_interface_cidr(prior_bip, path="existing daemon bip")
 bip_keys = {"bip_managed", "prior_bip", "prior_bip_present"}
 if set(state) & bip_keys:
     if not bip_keys <= set(state) or state["bip_managed"] is not True or not isinstance(state["prior_bip_present"], bool):
@@ -1321,7 +1337,7 @@ if set(state) & bip_keys:
         raise SystemExit("ERROR: invalid default bridge checkpoint state")
 merged = dict(prior)
 merged["default-address-pools"] = desired_policy.get("default-address-pools", [])
-if ("bip" in desired_policy or state.get("bip_managed") is True) and "fixed-cidr" in prior:
+if bip_touched and "fixed-cidr" in prior:
     raise SystemExit("ERROR: existing daemon fixed-cidr conflicts with managed bip")
 if "bip" in desired_policy:
     merged["bip"] = desired_policy["bip"]
@@ -1624,10 +1640,11 @@ state = {
     "verified_generation": None,
 }
 if "bip" in desired_policy:
+    prior_bip = prior.get("bip")
     state.update(
         bip_managed=True,
-        prior_bip=prior.get("bip"),
-        prior_bip_present="bip" in prior,
+        prior_bip=prior_bip,
+        prior_bip_present=prior_bip is not None,
     )
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -1661,8 +1678,8 @@ rollback_daemon() {
   if ((failed == 0)); then
     run_primitive restart "$daemon_dir" || failed=1
   fi
-  if ((failed == 0)) && [[ "$touch_bip" == true ]] && daemon_has_bip "$rollback_source"; then
-    run_probe "$rollback_source" true || failed=1
+  if ((failed == 0)) && [[ "$touch_bip" == true ]]; then
+    run_policy_probe "$rollback_source" true || failed=1
   fi
   if ((failed == 0)); then
     run_primitive restore --env "$prior_env" || failed=1
@@ -1751,7 +1768,7 @@ if ! run_primitive restart "$daemon_dir"; then
 fi
 
 # Bounded capacity and effective bridge probe
-if ! run_probe "$staging_daemon" "$touch_bip"; then
+if ! run_policy_probe "$staging_daemon" "$touch_bip"; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 

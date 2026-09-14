@@ -193,6 +193,9 @@ class DesiredStateTests(unittest.TestCase):
                 policy["default_bridge_cidr"] = cidr
                 with self.assertRaisesRegex(DesiredStateError, message):
                     validate_docker_network_policy(policy, path="policy", max_runners=1)
+        policy["default_bridge_cidr"] = "192.0.2.1/29"
+        with self.assertRaisesRegex(DesiredStateError, "max_runners.*reserve_subnets"):
+            validate_docker_network_policy(policy, path="policy", max_runners=5)
 
     def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
         value = config()

@@ -3255,6 +3255,25 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(restart_log.read_text(encoding="utf-8").splitlines(), ["restart", "restart"])
         self.assertEqual(health_log.read_text(encoding="utf-8").splitlines(), ["health"])
 
+    def test_default_bridge_rollback_probes_when_prior_bip_is_absent(self) -> None:
+        probe_log = Path(self.tmp) / "default-bridge-rollback-probe.log"
+        self._write_success_commands()
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$#\" >>{probe_log}\n"
+            "[[ $# == 0 ]]\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.daemon_dir / "daemon.json").exists())
+        self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), ["2", "0"])
+
     def test_absent_apply_rollback_fsyncs_daemon_dir_after_unlink(self) -> None:
         self._write_success_commands()
         (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
@@ -4074,6 +4093,29 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertNotIn("bip_managed", marker)
         self.assertNotIn("prior_bip", marker)
         self.assertNotIn("prior_bip_present", marker)
+
+    def test_default_bridge_normalizes_null_prior_bip_as_absent(self) -> None:
+        daemon = self._write_daemon(json.dumps({"bip": None, "icc": False}))
+        checkpoint = Path(self.tmp) / "checkpoint-default-bridge-null-prior"
+        self._write_success_commands()
+        managed_env = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        applied = self._run(str(managed_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        marker = json.loads((checkpoint / "docker-network-policy.json").read_text(encoding="utf-8"))
+        self.assertFalse(marker["prior_bip_present"])
+        self.assertIsNone(marker["prior_bip"])
+        self.installed_env.write_bytes(managed_env.read_bytes())
+        without_bridge = self._write_env_file(self._rendered_with_policy())
+
+        released = self._run(str(without_bridge), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {
+            "default-address-pools": docker_network_policy()["default_address_pools"],
+            "icc": False,
+        })
 
     def test_default_bridge_readback_mismatch_rolls_back_change(self) -> None:
         first_bip = "10.20.0.1/27"
