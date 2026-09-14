@@ -744,13 +744,14 @@ class ApplyScriptTests(unittest.TestCase):
 
     def test_first_apply_pending_bridge_adoption_survives_failed_drain(self) -> None:
         prior_bip = "172.30.0.1/24"
+        recovery_bip = "172.29.0.1/24"
         rendered = self._rendered_with_policy()
         current = render_docker_daemon_config(rendered)
         current["bip"] = prior_bip
         daemon = self._write_daemon(json.dumps(current))
         checkpoint = Path(self.tmp) / "checkpoint-first-pending-bridge-adoption"
         state_file = self._seed_checkpoint(checkpoint, "first-apply-pending")
-        self._write_recovery(checkpoint, json.dumps({"bip": prior_bip}).encode())
+        self._write_recovery(checkpoint, json.dumps({"bip": recovery_bip}).encode())
         self._write_success_commands()
         self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
         candidate = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
@@ -773,6 +774,30 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertTrue(state["bip_managed"])
         self.assertEqual(state["prior_bip"], prior_bip)
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], "10.20.0.1/27")
+
+    def test_pending_bridge_adoption_rollback_uses_current_bip(self) -> None:
+        recovery_bip = "172.29.0.1/24"
+        current_bip = "172.30.0.1/24"
+        current = render_docker_daemon_config(self._rendered_with_policy())
+        current["bip"] = current_bip
+        daemon = self._write_daemon(json.dumps(current))
+        checkpoint = Path(self.tmp) / "checkpoint-pending-bridge-adoption-rollback"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending")
+        self._write_recovery(checkpoint, json.dumps({"bip": recovery_bip}).encode())
+        self._write_success_commands()
+        restart_count = Path(self.tmp) / "adoption-restart-count"
+        restart_command = Path(self.tmp) / "restart.sh"
+        restart_command.write_text(
+            f"#!/usr/bin/env bash\nif [[ ! -e '{restart_count}' ]]; then : >'{restart_count}'; exit 1; fi\nexit 0\n",
+            encoding="utf-8",
+        )
+        candidate = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        result = self._run(str(candidate), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"bip": current_bip})
+        self.assertFalse(state_file.exists())
 
     def test_removal_pending_bridge_adoption_records_ownership(self) -> None:
         prior_bip = "172.30.0.1/24"
@@ -879,6 +904,47 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"bip": prior_bip})
         self.assertFalse(state_file.exists())
         self.assertFalse(list(checkpoint.glob("recovery.*")))
+
+    def test_failed_removal_clears_pending_bridge_adoption_and_restores_generation(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        managed = render_docker_daemon_config(self._rendered_with_policy())
+        managed["bip"] = prior_bip
+        daemon = self._write_daemon(json.dumps(managed))
+        checkpoint = Path(self.tmp) / "checkpoint-removal-pending-adoption-failure"
+        state_file = self._seed_checkpoint(checkpoint, "removal-pending")
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(
+            bip_managed=True,
+            bip_adoption_pending=True,
+            prior_bip=prior_bip,
+            prior_bip_present=True,
+            removal_managed_default_address_pools=managed["default-address-pools"],
+            removal_managed_bip=prior_bip,
+            removal_managed_bip_present=True,
+        )
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self._write_recovery(checkpoint, json.dumps(managed).encode())
+        self._write_success_commands()
+        health_count = Path(self.tmp) / "removal-health-count"
+        health_command = Path(self.tmp) / "health.sh"
+        health_command.write_text(
+            f"#!/usr/bin/env bash\nif [[ ! -e '{health_count}' ]]; then : >'{health_count}'; exit 2; fi\nexit 0\n",
+            encoding="utf-8",
+        )
+        no_policy = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        failed = self._run(str(no_policy), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(failed.returncode, 0)
+        restored = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", restored)
+        self.assertNotIn("bip_adoption_pending", restored)
+        self.assertNotIn("removal_managed_bip", restored)
+        self.assertTrue(restored["bip_managed"])
+        self.assertEqual(restored["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
+        retried = self._run(str(no_policy), checkpoint_dir=str(checkpoint))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertFalse(state_file.exists())
 
     def test_retried_removal_failed_drain_restores_verified_marker(self) -> None:
         daemon = self._write_daemon("{}\n")

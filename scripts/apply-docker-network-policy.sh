@@ -368,6 +368,7 @@ transaction_recovery=
 removal_checkpoint_started=false
 apply_checkpoint_started=false
 bip_adoption_started=false
+bip_adoption_pending_before=false
 apply_phase=
 bip_managed_before=false
 cancelling_first_apply=false
@@ -542,6 +543,24 @@ run_policy_probe() {
   fi
 }
 
+build_adoption_rollback_source() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+base_path, state_path, output_path = sys.argv[1:]
+base = json.load(open(base_path, encoding="utf-8"))
+state = json.load(open(state_path, encoding="utf-8"))
+if not isinstance(base, dict):
+    raise SystemExit(1)
+if state["prior_bip_present"]:
+    base["bip"] = state["prior_bip"]
+else:
+    base.pop("bip", None)
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(base, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
 daemon_policy_matches() {
   local expected=$1 verify_bip=${2:-false}
   python3 - "$daemon_config" "$expected" "$verify_bip" 2>/dev/null <<'PY'
@@ -621,6 +640,7 @@ elif action in ("clear-removal", "clear-removal-release-bip"):
     state.pop("removal_managed_default_address_pools", None)
     state.pop("removal_managed_bip", None)
     state.pop("removal_managed_bip_present", None)
+    state.pop("bip_adoption_pending", None)
 elif action in ("reapply-pending", "rollback-complete"):
     state["phase"] = action
     state.pop("removal_managed_default_address_pools", None)
@@ -1147,6 +1167,8 @@ PY
     }
   fi
 
+  prior_verified_generation=$(file_generation "$managed_daemon") || { rm -rf "$work_dir"; die 'failed to identify managed daemon.json generation'; }
+
   if [[ "$bip_managed_before" == true ]] && python3 - "$managed_daemon" <<'PY'
 import json, sys
 raise SystemExit("fixed-cidr" not in json.load(open(sys.argv[1], encoding="utf-8")))
@@ -1457,11 +1479,11 @@ elif state["prior_mode"] is not None:
 print(
     f"{generation or ''}|{'true' if phase == 'removal-pending' else 'false'}|"
     f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}|{phase or ''}|"
-    f"{'true' if bip_managed else 'false'}"
+    f"{'true' if bip_managed else 'false'}|{'true' if state.get('bip_adoption_pending') is True else 'false'}"
 )
 PY
   ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode apply_phase bip_managed_before <<<"$apply_checkpoint_state"
+  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode apply_phase bip_managed_before bip_adoption_pending_before <<<"$apply_checkpoint_state"
   managed_before=true
   [[ "$checkpoint_phase" != verified ]] || clear_recovery_artifacts || { rm -rf "$work_dir"; die 'failed to clear obsolete network-policy recovery data'; }
 fi
@@ -1762,8 +1784,14 @@ if [[ "$managed_before" == true && -z "$apply_phase" ]]; then
   set_verified_generation "" reapply-pending "$rollback_source" "$desired_policy_json" || die 'failed to mark network-policy verification pending'
   apply_checkpoint_started=true
 elif [[ "$managed_before" == true && -n "$apply_phase" && "$desired_bip_configured" == true && "$bip_managed_before" != true ]]; then
-  set_verified_generation "" adopt-bip-pending "$rollback_source" "$desired_policy_json" || die 'failed to record pending bridge ownership'
+  set_verified_generation "" adopt-bip-pending "$backup_dir/$backup_name" "$desired_policy_json" || die 'failed to record pending bridge ownership'
   bip_adoption_started=true
+  bip_adoption_pending_before=true
+fi
+if [[ "$bip_adoption_pending_before" == true ]]; then
+  adoption_rollback_source=$work_dir/daemon.json.rollback-adoption
+  build_adoption_rollback_source "$rollback_source" "$state_file" "$adoption_rollback_source" || die 'failed to construct bridge-adoption rollback source'
+  rollback_source=$adoption_rollback_source
 fi
 drain_controller 'drain command failed before network-policy apply'
 if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$snapshot_present" "$daemon_metadata"; then
