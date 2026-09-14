@@ -221,6 +221,19 @@ class PolicyTests(unittest.TestCase):
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
 
+    def test_initializer_includes_default_bridge_cidr_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40,
+                "--default-bridge-cidr", "192.0.2.1/24",
+                "--output", str(output),
+            ], check=True, stdout=subprocess.DEVNULL)
+            policy = first_controller(json.loads(output.read_text()))["docker_network_policy"]
+        self.assertEqual(policy["default_bridge_cidr"], "192.0.2.1/24")
+
     def test_initializer_sizes_policy_for_sixteen_runners(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fleet.json"

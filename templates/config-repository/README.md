@@ -44,11 +44,12 @@ flowchart LR
      --capacity-budget 1 \
      --max-runners 1 \
      --networks-per-runner 1 \
+     --default-bridge-cidr 192.0.2.1/24 \
      --engine-ref <reviewed-ci-fleet-commit>
    ```
 
 3. Edit `fleet.json` to add the organization's real logical mappings and replace
-   the generated RFC 5737 Docker pool with a reviewed operational Docker pool.
+   the generated RFC 5737 Docker network values with reviewed operational values.
 4. Run the strict policy check:
 
    ```bash
@@ -57,7 +58,7 @@ flowchart LR
 
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
-The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, resource, and output options.
+The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation network values are intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, bridge, resource, and output options.
 
 ## Schema v3: Git-authored controller desired state
 
