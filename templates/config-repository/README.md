@@ -5,11 +5,11 @@ This is the public, secret-free starting point for an organization's private `ci
 It does **not** contain runner registration tokens, deploy credentials, private keys, host addresses, VM IDs, storage names, backup identifiers, or `.env` files.
 
 One explicit exception permits reviewed operational Docker
-`default_address_pools[].base` CIDRs in this private Git-authored policy. The
-controller must render and inspect those exact capacity ranges. They are not host
-addresses, credentials, host identity, or routable service endpoints. All VM,
-storage, backup, SSH, rendered runtime, and unrelated infrastructure details stay
-outside Git.
+`default_address_pools[].base` CIDRs and the optional `default_bridge_cidr`
+gateway/interface CIDR in this private Git-authored policy. The controller must
+render and inspect those exact Docker network ranges. They are not credentials,
+host identity, or routable service endpoints. All VM, storage, backup, SSH,
+rendered runtime, and unrelated infrastructure details stay outside Git.
 
 ```mermaid
 flowchart LR
@@ -88,20 +88,22 @@ can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
 The same per-controller evidence record may declare
-`docker_network_policy_config`. A controller may omit this boolean only while it
-omits `docker_network_policy`. A retained policy requires current evidence for
-the selected engine with this boolean set to `true`, and the selected engine
-manifest must advertise both `docker_network_policy_config` and
-`docker_network_policy_adapter`. Remove the policy before selecting an engine
-without either capability, including an adapterless engine. A complete record
-has this shape after an operator has verified the named engine is active:
+`docker_network_policy_config` and `docker_default_bridge_cidr_config`. A
+controller may omit the first boolean only while it omits `docker_network_policy`.
+It may omit the second while it omits `default_bridge_cidr`. Retained fields
+require current evidence for the selected engine, and the selected engine
+manifest must advertise the matching capabilities plus
+`docker_network_policy_adapter`. Remove unsupported fields before selecting an
+older engine. A complete record has this shape after an operator has verified
+the named engine is active:
 
 ```json
 {
   "engine_ref": "1111111111111111111111111111111111111111",
   "status_reporting_config": false,
   "required_status_reporting": false,
-  "docker_network_policy_config": true
+  "docker_network_policy_config": true,
+  "docker_default_bridge_cidr_config": true
 }
 ```
 
@@ -118,9 +120,16 @@ subnet prefix `size`. The size must be no longer than `/29` and cannot be
 broader than its base. A policy may declare at most 64 pools. Pools must not
 overlap, and active or drained controllers must provide at least
 `max_runners * networks_per_runner + reserve_subnets + 1`
-subnets. The final
-subnet is reserved for the persistent controller Compose network. Real pool
-values belong in the private configuration; this template uses RFC 5737
+subnets. The final subnet is reserved for the persistent controller Compose
+network. The optional `default_bridge_cidr` is an IPv4 interface address and
+prefix such as `192.0.2.1/28`, not a canonical network base. Its address must be
+a usable gateway, its prefix must leave room for containers, and its subnet must
+not overlap the default-address pools. Size this bridge for containers that use
+Docker's default network. Size the pools separately for job and controller
+networks. The pool-capacity arithmetic above does not change when the bridge
+field is present.
+
+Real values belong in the private configuration; this template uses RFC 5737
 documentation ranges only. Non-strict validation accepts those public examples.
 Strict validation rejects them until the private configuration uses a reviewed
 operational Docker pool CIDR. This is the narrow capacity-policy exception
@@ -135,17 +144,21 @@ engine rejects the new key, so skipped commits must not satisfy the gate.
 Transition validation requires the activation evidence to exist in the previous
 integrated state when introducing the policy. It also requires matching current
 evidence whenever a controller retains the policy, including across engine
-changes or rollbacks.
+changes or rollbacks. Adding `default_bridge_cidr` later repeats the prior-state
+gate with `docker_default_bridge_cidr_config: true`.
 
 After the three-commit engine activation gate above, the pinned public engine
 can apply or remove a validated policy with at most 64 pools. The executable
-stage holds the installer lock, drains the controller and managed runners,
-changes only Docker's managed `default-address-pools` key, restarts Docker,
-probes capacity, resumes the intended controller state, and checks health. It
-uses prior-key provenance and the prior rendered environment to roll back a
-failed or interrupted transaction, and retains recovery data if rollback cannot
-be verified. A merged or configured policy does not authorize host mutation;
-rollout still requires separate operator approval, exact-head CI, and proof for
+stage holds the installer lock, drains the controller and managed runners, and
+changes Docker's `default-address-pools` key plus `bip` only when
+`default_bridge_cidr` is configured. It preserves each prior key value, restarts
+Docker, verifies the effective bridge subnet and gateway, probes capacity,
+resumes the intended controller state, and checks health. Incompatible daemon
+settings such as `fixed-cidr` fail before the drain. The transaction uses prior
+key provenance and the prior rendered environment to roll back a failed or
+interrupted operation, and retains recovery data if rollback cannot be verified.
+A merged or configured policy does not authorize host mutation; rollout still
+requires separate operator approval, exact-head CI, and proof for
 the reviewed engine and desired-state commits. This stage does not create or
 delete networks, prune resources, change controller scale or consumer labels,
 or authorize application deployment.

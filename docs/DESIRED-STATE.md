@@ -13,12 +13,12 @@ Schema v3 makes a reviewed private configuration repository the authority for co
 
 Host addresses, VM IDs, storage names, backup identifiers, SSH details, tokens, private keys, and rendered `.env` files are rejected from the Git-authored configuration.
 
-Private policy has one explicit address exception. Each reviewed
-`docker_network_policy.default_address_pools[].base` CIDR is committed because
-the controller must render and inspect that exact allocation pool. It is capacity
-policy, not a host address, host identity, credential, or routable service
-endpoint. The exception does not admit any other infrastructure address or
-runtime detail.
+Private policy has one explicit Docker address exception. Reviewed
+`docker_network_policy.default_address_pools[].base` CIDRs define allocation
+pools. The optional `docker_network_policy.default_bridge_cidr` defines the
+Docker default bridge gateway/interface and prefix. These values are capacity
+policy, not host identity, credentials, or routable service endpoints. The
+exception does not admit other infrastructure addresses or runtime details.
 
 ## Schema v3
 
@@ -40,8 +40,8 @@ Each controller has a unique object key and declares:
 - a full pinned ci-fleet engine commit;
 - a zero managed minimum and reviewed maximum runner capacity;
 - CPU cores and memory per ephemeral runner;
-- reviewed Docker default-address pools, a positive per-runner network bound,
-  and a reserved subnet count.
+- reviewed Docker default-address pools, an optional default-bridge gateway CIDR,
+  a positive per-runner network bound, and a reserved subnet count.
 
 Active and drained controllers reserve their configured maximum against the pool budget. A drained controller has zero effective runtime capacity but keeps its reservation, so an undrain cannot silently overcommit the pool. Disabled controllers reserve no capacity.
 
@@ -53,10 +53,19 @@ base, and active or drained policies with fewer subnets than
 `max_runners * networks_per_runner + reserve_subnets + 1`. The final subnet is reserved for the
 persistent controller Compose network. Disabled controllers do not reserve
 runner subnet capacity, but their retained policy must still cover the reserve
-and controller network. Real pool values belong only in the private desired-state
-repository under the narrow address-pool exception above. Public examples use
-RFC 5737 documentation ranges, which strict validation rejects until the operator
-supplies a reviewed operational Docker pool CIDR.
+and controller network. `default_bridge_cidr`, when present, is an IPv4
+interface address and prefix such as `192.0.2.1/28`, not a canonical network
+base. Its address must be a usable gateway, its prefix must leave room for
+containers, and its subnet must not overlap any default-address pool. Size the
+default bridge for concurrent containers attached without an explicit network.
+Size `default_address_pools` separately for job and controller networks. The
+existing `max_runners * networks_per_runner + reserve_subnets + 1` arithmetic
+applies only to those pools.
+
+Real Docker network values belong only in the private desired-state repository
+under the narrow exception above. Public examples use RFC 5737 documentation
+ranges, which strict validation rejects until the operator supplies reviewed
+operational CIDRs.
 
 `docker_network_policy` is optional only to preserve a staged upgrade path from
 older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
@@ -68,24 +77,28 @@ changing the engine or evidence. Transition validation reads the evidence from
 the previous integrated state, so a commit that adds evidence and policy together
 cannot satisfy the gate. Do not add the field while the old engine still performs
 reconciliation. Once present, the policy requires current evidence naming the
-selected engine and declaring `docker_network_policy_config: true`. The selected
-engine manifest must also advertise both `docker_network_policy_config` and
-`docker_network_policy_adapter`. Remove the policy before selecting an engine
-without that evidence or either capability, including an adapterless engine.
+selected engine and declaring `docker_network_policy_config: true`. Adding
+`default_bridge_cidr` to an existing policy has the same prior-state gate with
+`docker_default_bridge_cidr_config: true`. A retained bridge field requires
+matching current evidence. The selected engine manifest must advertise
+`docker_network_policy_config`, `docker_network_policy_adapter`, and, when the
+bridge field is present, `docker_default_bridge_cidr_config`. Remove unsupported
+fields before selecting an older engine.
 
-This accepted phase permits the executable policy stage to apply or remove the
-managed `default-address-pools` key on an isolated ordinary-CI controller only
-from validated desired state. Before mutation, the stage must persist a
-root-only checkpoint with prior-key provenance, acquire the shared installer
-lock for serialized mutation, and drain the controller and managed runners. It
-must atomically and durably write or remove only the managed key, restart
-Docker, run the bounded capacity probe, resume the controller to its intended
-state, and verify health against the exact candidate rendered environment.
+This accepted phase permits the executable policy stage to own Docker's
+`default-address-pools` key and, only when configured, its `bip` key. The stage
+records each prior key's presence and value in the existing root-only checkpoint,
+then drains the controller and managed runners. It rejects incompatible daemon
+authority such as `fixed-cidr` before the drain. The transaction writes only the
+managed keys, restarts Docker, verifies the effective default-bridge subnet and
+gateway when `bip` is owned, runs the bounded capacity probe, resumes the
+controller, and checks health against the candidate rendered environment.
 
-On interruption or failure, rollback must restore the managed key and prior
-rendered environment from the checkpoint, restart Docker, resume the prior
-controller state, and verify prior health. A failed rollback must retain its
-recovery checkpoint. Rollout requires exact-head CI and proof for the reviewed
+On interruption or failure, rollback must restore the managed keys and prior
+rendered environment from the checkpoint, restart Docker, verify effective
+network state, resume the prior controller state, and verify prior health. A
+failed rollback must retain its recovery checkpoint. Rollout requires exact-head
+CI and proof for the reviewed
 engine and desired-state commits before any host mutation. No deployment occurs
 in this PR. This scope does not create or remove networks, prune resources,
 alter controller scale, change downstream-consumer labels, or authorize

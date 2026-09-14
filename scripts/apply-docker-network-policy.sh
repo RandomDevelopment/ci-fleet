@@ -209,7 +209,7 @@ PY
   die 'rendered env must declare desired-state schema 3'
 
 # Validate the locked candidate snapshot before mutation.
-desired_pools_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
+desired_policy_json=$(python3 - "$env_file" "$repo_root/scripts" 2>/dev/null <<'PY'
 import json, sys
 env_path, scripts_dir = sys.argv[1], sys.argv[2]
 sys.path.insert(0, scripts_dir)
@@ -222,8 +222,12 @@ PY
 
 # --- No-op when no network policy is rendered ---
 removing=false
+desired_bip_configured=false
 [[ -n "$checkpoint_dir" ]] || die '--checkpoint is required'
-[[ "$desired_pools_json" != '{}' ]] || removing=true
+[[ "$desired_policy_json" != '{}' ]] || removing=true
+if [[ "$removing" != true ]]; then
+  desired_bip_configured=$(python3 -c 'import json,sys; print("true" if "bip" in json.loads(sys.argv[1]) else "false")' "$desired_policy_json")
+fi
 
 # --- Resolve required injected commands ---
 daemon_config=${CI_FLEET_DOCKER_DAEMON_CONFIG:-}
@@ -286,6 +290,15 @@ run_health() {
   local status=0
   CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1 run_primitive health --env "$1" || status=$?
   ((status < 2))
+}
+
+run_probe() {
+  local expected=$1 verify_bip=$2
+  if [[ "$verify_bip" == true ]]; then
+    run_primitive probe --daemon-config "$expected"
+  else
+    run_primitive probe
+  fi
 }
 
 [[ "$command_timeout" =~ ^[1-9][0-9]*$ ]] || die 'CI_FLEET_COMMAND_TIMEOUT_SECONDS must be a positive integer'
@@ -355,6 +368,7 @@ transaction_recovery=
 removal_checkpoint_started=false
 apply_checkpoint_started=false
 apply_phase=
+bip_managed_before=false
 cancelling_first_apply=false
 # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
 resume_after_failed_drain() {
@@ -374,7 +388,7 @@ resume_after_failed_drain() {
     ((resume_failed != 0)) || set_verified_generation "$restored_generation" clear-removal || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$apply_checkpoint_started" == true ]]; then
-    set_verified_generation "$prior_verified_generation" || resume_failed=1
+    set_verified_generation "$prior_verified_generation" rollback-reapply || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" != true && -z "$apply_phase" && "$cancelling_first_apply" != true ]]; then
     clear_recovery_artifacts || resume_failed=1
@@ -507,16 +521,26 @@ with open(sys.argv[1], "rb") as handle:
 PY
 }
 
-daemon_pools_match() {
-  python3 - "$daemon_config" "$1" 2>/dev/null <<'PY'
+daemon_has_bip() {
+  python3 - "$1" 2>/dev/null <<'PY'
+import json, os, sys
+value = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
+raise SystemExit(not isinstance(value, dict) or "bip" not in value)
+PY
+}
+
+daemon_policy_matches() {
+  local expected=$1 verify_bip=${2:-false}
+  python3 - "$daemon_config" "$expected" "$verify_bip" 2>/dev/null <<'PY'
 import json, os, sys
 current = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
 expected = json.load(open(sys.argv[2], encoding="utf-8")) if os.path.exists(sys.argv[2]) else {}
 missing = object()
-if (
-    not isinstance(current, dict)
-    or not isinstance(expected, dict)
-    or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
+keys = ["default-address-pools"]
+if sys.argv[3] == "true":
+    keys.append("bip")
+if not isinstance(current, dict) or not isinstance(expected, dict) or any(
+    current.get(key, missing) != expected.get(key, missing) for key in keys
 ):
     raise SystemExit(1)
 PY
@@ -564,20 +588,47 @@ PY
 }
 
 set_verified_generation() {
+  local generation=${1:-} action=${2:-} prior_daemon=${3:-} desired_policy
+  desired_policy=${4:-"{}"}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "${1:-}" "${2:-}" <<'PY'
+  python3 - "$state_file" "$generation" "$action" "$prior_daemon" "$desired_policy" <<'PY'
 import json, os, sys, tempfile
-path, generation, action = sys.argv[1:]
+path, generation, action, prior_path, desired_policy_json = sys.argv[1:]
 state = json.load(open(path, encoding="utf-8"))
-if action == "clear-removal":
+if action in ("clear-removal", "clear-removal-release-bip"):
     state.pop("phase", None)
     state.pop("removal_managed_default_address_pools", None)
+    state.pop("removal_managed_bip", None)
+    state.pop("removal_managed_bip_present", None)
 elif action in ("reapply-pending", "rollback-complete"):
     state["phase"] = action
     state.pop("removal_managed_default_address_pools", None)
+    state.pop("removal_managed_bip", None)
+    state.pop("removal_managed_bip_present", None)
+    if action == "reapply-pending" and "bip" in json.loads(desired_policy_json) and not state.get("bip_managed"):
+        prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
+        state.update(
+            bip_managed=True,
+            bip_adoption_pending=True,
+            prior_bip=prior.get("bip"),
+            prior_bip_present="bip" in prior,
+        )
+if action == "rollback-reapply":
+    state.pop("phase", None)
+    if state.pop("bip_adoption_pending", False):
+        state.pop("bip_managed", None)
+        state.pop("prior_bip", None)
+        state.pop("prior_bip_present", None)
 if generation:
     state.pop("phase", None)
     state.pop("removal_managed_default_address_pools", None)
+    state.pop("removal_managed_bip", None)
+    state.pop("removal_managed_bip_present", None)
+    state.pop("bip_adoption_pending", None)
+    if action in ("release-bip", "clear-removal-release-bip"):
+        state.pop("bip_managed", None)
+        state.pop("prior_bip", None)
+        state.pop("prior_bip_present", None)
 state["verified_generation"] = generation or None
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -600,11 +651,11 @@ PY
 }
 
 clear_managed_marker() {
-  local expected_daemon=${1:-}
+  local expected_daemon=${1:-} verify_bip=${2:-false}
   checkpoint_path_is_pinned || return 1
-  python3 - "$state_file" "$expected_daemon" "$daemon_config" <<'PY'
+  python3 - "$state_file" "$expected_daemon" "$daemon_config" "$verify_bip" <<'PY'
 import json, os, shutil, sys, tempfile
-path, expected_path, daemon_path = sys.argv[1:]
+path, expected_path, daemon_path, verify_bip = sys.argv[1:]
 parent = os.path.dirname(path)
 fd, backup = tempfile.mkstemp(prefix=".docker-network-policy.clear.", dir=parent)
 try:
@@ -624,10 +675,13 @@ try:
                     current = json.load(open(daemon_path, encoding="utf-8")) if os.path.exists(daemon_path) else {}
                     expected = json.load(open(expected_path, encoding="utf-8")) if os.path.exists(expected_path) else {}
                     missing = object()
+                    keys = ["default-address-pools"]
+                    if verify_bip == "true":
+                        keys.append("bip")
                     if (
                         not isinstance(current, dict)
                         or not isinstance(expected, dict)
-                        or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
+                        or any(current.get(key, missing) != expected.get(key, missing) for key in keys)
                     ):
                         raise ValueError
                 except (OSError, json.JSONDecodeError, ValueError):
@@ -657,6 +711,9 @@ if state.get("phase") != "removal-pending":
     managed = json.load(open(managed_path, encoding="utf-8"))
     state["phase"] = "removal-pending"
     state["removal_managed_default_address_pools"] = managed.get("default-address-pools")
+    if state.get("bip_managed") is True:
+        state["removal_managed_bip"] = managed.get("bip")
+        state["removal_managed_bip_present"] = "bip" in managed
 state["verified_generation"] = None
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
@@ -797,9 +854,18 @@ generation = state.get("verified_generation")
 if phase is not None and generation is not None:
     raise SystemExit(1)
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
+bip = {"bip_managed", "prior_bip", "prior_bip_present"}
 if phase == "rollback-complete":
-    if set(state) != required | {"phase", "verified_generation"} or state["managed"] is not True:
+    allowed = required | {"phase", "verified_generation"}
+    if bip <= set(state):
+        allowed |= bip
+    if set(state) != allowed or state["managed"] is not True:
         raise SystemExit(1)
+    if bip & set(state):
+        if not bip <= set(state) or state["bip_managed"] is not True or not isinstance(state["prior_bip_present"], bool):
+            raise SystemExit(1)
+        if state["prior_bip_present"] != (state["prior_bip"] is not None):
+            raise SystemExit(1)
     if not isinstance(state["prior_present"], bool) or not isinstance(state["prior_default_address_pools_present"], bool):
         raise SystemExit(1)
     if state["prior_default_address_pools_present"]:
@@ -836,23 +902,45 @@ if [[ "$removing" == true ]]; then
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
 sys.path.insert(0, sys.argv[2])
-from desired_state import validate_docker_address_pools
+from desired_state import validate_ipv4_interface_cidr, validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
 pending = {"phase", "removal_managed_default_address_pools"}
+bip = {"bip_managed", "prior_bip", "prior_bip_present"}
+removal_bip = {"removal_managed_bip", "removal_managed_bip_present"}
 phase = state.get("phase")
 if state["managed"] is not True:
     raise SystemExit(1)
+bip_managed = bool(bip <= set(state))
+if bip & set(state) and not bip_managed:
+    raise SystemExit(1)
+allowed = required | (bip if bip_managed else set())
 if phase == "removal-pending":
-    if set(state) != required | pending | {"verified_generation"} or (
+    if bip_managed:
+        allowed |= removal_bip
+    if set(state) != allowed | pending | {"verified_generation"} or (
         state["removal_managed_default_address_pools"] is not None
-    and not isinstance(state["removal_managed_default_address_pools"], list)
+        and not isinstance(state["removal_managed_default_address_pools"], list)
     ):
         raise SystemExit(1)
 elif phase == "first-apply-pending":
-    if set(state) != required | {"phase", "verified_generation"}:
+    if set(state) != allowed | {"phase", "verified_generation"}:
         raise SystemExit(1)
-elif phase is not None or set(state) not in (required, required | {"verified_generation"}):
+elif phase is not None or set(state) not in (allowed, allowed | {"verified_generation"}):
     raise SystemExit(1)
+if bip_managed:
+    if state["bip_managed"] is not True or not isinstance(state["prior_bip_present"], bool):
+        raise SystemExit(1)
+    if state["prior_bip_present"]:
+        validate_ipv4_interface_cidr(state["prior_bip"], path="checkpoint prior bip")
+    elif state["prior_bip"] is not None:
+        raise SystemExit(1)
+    if phase == "removal-pending":
+        if not isinstance(state["removal_managed_bip_present"], bool):
+            raise SystemExit(1)
+        if state["removal_managed_bip_present"]:
+            validate_ipv4_interface_cidr(state["removal_managed_bip"], path="checkpoint removal managed bip")
+        elif state["removal_managed_bip"] is not None:
+            raise SystemExit(1)
 if phase == "removal-pending" and state["removal_managed_default_address_pools"] is not None:
     validate_docker_address_pools(
         state["removal_managed_default_address_pools"],
@@ -887,9 +975,10 @@ print(mode or "")
 print(generation or "")
 print(phase or "")
 print("true" if "verified_generation" in state else "false")
+print("true" if bip_managed else "false")
 PY
   ) || die 'network-policy checkpoint state is invalid'
-  [[ ${#managed_state[@]} == 5 ]] || die 'network-policy checkpoint state is invalid'
+  [[ ${#managed_state[@]} == 6 ]] || die 'network-policy checkpoint state is invalid'
   prior_present=${managed_state[0]}
   prior_mode=${managed_state[1]}
   prior_verified_generation=${managed_state[2]}
@@ -897,6 +986,7 @@ PY
   removal_pending=false
   [[ "$removal_phase" != removal-pending ]] || removal_pending=true
   has_verified_generation=${managed_state[4]}
+  bip_managed_before=${managed_state[5]}
   if [[ "$prior_present" == true ]]; then
     [[ "$prior_mode" =~ ^[0-7]{3,4}$ ]] || die 'network-policy checkpoint state is invalid'
   fi
@@ -940,7 +1030,12 @@ state = json.load(open(state_path, encoding="utf-8"))
 managed = {}
 if state["removal_managed_default_address_pools"] is not None:
     managed["default-address-pools"] = state["removal_managed_default_address_pools"]
-for path, value in ((managed_path, managed), (removal_path, {})):
+if state.get("bip_managed") is True and state["removal_managed_bip_present"]:
+    managed["bip"] = state["removal_managed_bip"]
+removal = {}
+if state.get("bip_managed") is True and state["prior_bip_present"]:
+    removal["bip"] = state["prior_bip"]
+for path, value in ((managed_path, managed), (removal_path, removal)):
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -980,8 +1075,12 @@ try:
         raise ValueError
     if state.get("phase") == "removal-pending":
         managed_pools = state["removal_managed_default_address_pools"]
+        managed_bip_present = state.get("removal_managed_bip_present", False)
+        managed_bip = state.get("removal_managed_bip")
     else:
         managed_pools = current.get("default-address-pools")
+        managed_bip_present = state.get("bip_managed") is True and "bip" in current
+        managed_bip = current.get("bip")
         if "default-address-pools" in current:
             validate_docker_address_pools(managed_pools, path="managed daemon default address pools")
 except (OSError, json.JSONDecodeError, KeyError, ValueError):
@@ -991,6 +1090,11 @@ if managed_pools is None:
     managed.pop("default-address-pools", None)
 else:
     managed["default-address-pools"] = managed_pools
+if state.get("bip_managed") is True:
+    if managed_bip_present:
+        managed["bip"] = managed_bip
+    else:
+        managed.pop("bip", None)
 with open(managed_path, "w", encoding="utf-8") as handle:
     json.dump(managed, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -998,6 +1102,11 @@ if state["prior_default_address_pools_present"]:
     current["default-address-pools"] = state["prior_default_address_pools"]
 else:
     current.pop("default-address-pools", None)
+if state.get("bip_managed") is True:
+    if state["prior_bip_present"]:
+        current["bip"] = state["prior_bip"]
+    else:
+        current.pop("bip", None)
 with open(removal_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -1005,6 +1114,15 @@ PY
       rm -rf "$work_dir"
       die 'managed daemon.json is not a valid JSON object'
     }
+  fi
+
+  if [[ "$bip_managed_before" == true ]] && python3 - "$managed_daemon" <<'PY'
+import json, sys
+raise SystemExit("fixed-cidr" not in json.load(open(sys.argv[1], encoding="utf-8")))
+PY
+  then
+    rm -rf "$work_dir"
+    die 'existing daemon fixed-cidr conflicts with managed bip'
   fi
 
   if [[ "$cancelling_first_apply" != true ]]; then
@@ -1029,9 +1147,9 @@ PY
       run_primitive rollback-drain || failed=1
     fi
     if ((failed == 0)); then
-      python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" <<'PY' || failed=1
+      python3 - "$daemon_config" "$managed_daemon" "$rollback_daemon" "$rollback_expected" "$bip_managed_before" <<'PY' || failed=1
 import json, os, sys
-current_path, managed_path, output_path, expected_path = sys.argv[1:]
+current_path, managed_path, output_path, expected_path, restore_bip = sys.argv[1:]
 try:
     current_present = os.path.exists(current_path)
     current_text = open(current_path, encoding="utf-8").read() if current_present else ""
@@ -1049,6 +1167,11 @@ if "default-address-pools" in managed:
     current["default-address-pools"] = managed["default-address-pools"]
 else:
     current.pop("default-address-pools", None)
+if restore_bip == "true":
+    if "bip" in managed:
+        current["bip"] = managed["bip"]
+    else:
+        current.pop("bip", None)
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -1061,6 +1184,9 @@ PY
     if ((failed == 0)); then
       run_primitive restart "$daemon_dir" || failed=1
     fi
+    if ((failed == 0)) && [[ "$bip_managed_before" == true ]] && daemon_has_bip "$managed_daemon"; then
+      run_probe "$managed_daemon" true || failed=1
+    fi
     if ((failed == 0)); then
       run_primitive restore --env "$prior_env" || failed=1
     fi
@@ -1068,7 +1194,7 @@ PY
       run_health "$prior_env" || failed=1
     fi
     if ((failed == 0)); then
-      daemon_pools_match "$managed_daemon" || failed=1
+      daemon_policy_matches "$managed_daemon" "$bip_managed_before" || failed=1
     fi
     if ((failed == 0)) && [[ "$cancelling_first_apply" != true ]]; then
       set_verified_generation "$prior_verified_generation" clear-removal || failed=1
@@ -1131,7 +1257,7 @@ PY
     cmp -s "$removal_daemon" "$daemon_config" || { removal_failure='failed to verify prior network-policy key state'; exit 2; }
   fi
   run_primitive restart "$daemon_dir" || { removal_failure='Docker restart command failed during network-policy removal'; exit 2; }
-  run_primitive probe || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
+  run_probe "$removal_daemon" "$bip_managed_before" || { removal_failure='capacity probe failed after network-policy removal'; exit 2; }
   controller_resumed=true
   activation_env=$env_file
   [[ "$cancelling_first_apply" != true ]] || activation_env=$prior_env
@@ -1142,25 +1268,14 @@ PY
   # unlink so failure still rolls back and success cannot leave a stale marker.
   trap '' INT TERM
   checkpoint_path_is_pinned || { removal_failure='checkpoint directory changed during network-policy removal'; exit 2; }
-  python3 - "$daemon_config" "$removal_daemon" 2>/dev/null <<'PY' || { removal_failure='daemon.json changed after network-policy removal verification'; exit 2; }
-import json, os, sys
-current = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
-expected = json.load(open(sys.argv[2], encoding="utf-8"))
-missing = object()
-if (
-    not isinstance(current, dict)
-    or not isinstance(expected, dict)
-    or current.get("default-address-pools", missing) != expected.get("default-address-pools", missing)
-):
-    raise SystemExit(1)
-PY
+  daemon_policy_matches "$removal_daemon" "$bip_managed_before" || { removal_failure='daemon.json changed after network-policy removal verification'; exit 2; }
   if [[ "$cancelling_first_apply" == true ]]; then
     trap - EXIT
     complete_first_apply_rollback || { removal_failure='failed to complete interrupted first-apply rollback'; exit 2; }
   else
     set_verified_generation "" rollback-complete || { removal_failure='failed to commit network-policy removal'; exit 2; }
     clear_recovery_artifacts || { removal_failure='failed to clear obsolete network-policy recovery data'; exit 2; }
-    clear_managed_marker "$removal_daemon" || { removal_failure='failed to clear network-policy managed marker'; exit 2; }
+    clear_managed_marker "$removal_daemon" "$bip_managed_before" || { removal_failure='failed to clear network-policy managed marker'; exit 2; }
   fi
   trap - EXIT INT TERM
   rm -rf "$work_dir"
@@ -1182,9 +1297,9 @@ fi
 snapshot_present=$had_prior
 rollback_source=$backup_dir/$backup_name
 
-python3 - "$env_file" "$rollback_source" "$staging_daemon" "$desired_pools_json" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
+python3 - "$env_file" "$rollback_source" "$staging_daemon" "$desired_policy_json" "$state_file" "$repo_root/scripts" <<'PY' || { rm -rf "$work_dir"; die "failed to stage merged daemon.json"; }
 import json, os, sys
-_, _, daemon_path, staging_path, desired_pools_json = sys.argv
+_, _, daemon_path, staging_path, desired_policy_json, state_path, scripts_path = sys.argv
 def reject_constant(_value):
     raise ValueError
 prior = {}
@@ -1196,9 +1311,25 @@ if os.path.exists(daemon_path):
             raise ValueError("daemon.json root must be an object")
     except (json.JSONDecodeError, ValueError) as exc:
         raise SystemExit(f"ERROR: existing daemon.json is not a valid JSON object: {exc}")
-desired_pools = json.loads(desired_pools_json)
+desired_policy = json.loads(desired_policy_json)
+state = json.load(open(state_path, encoding="utf-8")) if os.path.exists(state_path) else {}
+bip_keys = {"bip_managed", "prior_bip", "prior_bip_present"}
+if set(state) & bip_keys:
+    if not bip_keys <= set(state) or state["bip_managed"] is not True or not isinstance(state["prior_bip_present"], bool):
+        raise SystemExit("ERROR: invalid default bridge checkpoint state")
+    if state["prior_bip_present"] != (state["prior_bip"] is not None):
+        raise SystemExit("ERROR: invalid default bridge checkpoint state")
 merged = dict(prior)
-merged["default-address-pools"] = desired_pools.get("default-address-pools", [])
+merged["default-address-pools"] = desired_policy.get("default-address-pools", [])
+if ("bip" in desired_policy or state.get("bip_managed") is True) and "fixed-cidr" in prior:
+    raise SystemExit("ERROR: existing daemon fixed-cidr conflicts with managed bip")
+if "bip" in desired_policy:
+    merged["bip"] = desired_policy["bip"]
+elif state.get("bip_managed") is True:
+    if state["prior_bip_present"]:
+        merged["bip"] = state["prior_bip"]
+    else:
+        merged.pop("bip", None)
 with open(staging_path, "w", encoding="utf-8") as handle:
     json.dump(merged, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -1217,20 +1348,47 @@ if [[ -e "$state_file" ]]; then
 import json, re, sys
 state = json.load(open(sys.argv[1], encoding="utf-8"))
 sys.path.insert(0, sys.argv[2])
-from desired_state import validate_docker_address_pools
+from desired_state import validate_ipv4_interface_cidr, validate_docker_address_pools
 required = {"managed", "prior_default_address_pools", "prior_default_address_pools_present", "prior_mode", "prior_present"}
+bip = {"bip_managed", "prior_bip", "prior_bip_present"}
+removal_bip = {"removal_managed_bip", "removal_managed_bip_present"}
 phase = state.get("phase")
-extra = set(state) - required - {"verified_generation", "phase", "removal_managed_default_address_pools"}
-if extra or not required <= set(state) or state["managed"] is not True:
+bip_managed = bool(bip <= set(state))
+if bip & set(state) and not bip_managed:
+    raise SystemExit(1)
+optional = {"verified_generation", "phase", "removal_managed_default_address_pools"}
+if bip_managed:
+    optional |= bip
+if state.get("bip_adoption_pending") is True:
+    if phase != "reapply-pending" or not bip_managed:
+        raise SystemExit(1)
+    optional.add("bip_adoption_pending")
+if phase == "removal-pending" and bip_managed:
+    optional |= removal_bip
+if set(state) - required - optional or not required <= set(state) or state["managed"] is not True:
     raise SystemExit(1)
 if phase == "removal-pending":
-    if "removal_managed_default_address_pools" not in state:
+    if "removal_managed_default_address_pools" not in state or (bip_managed and not removal_bip <= set(state)):
         raise SystemExit(1)
 elif phase in ("first-apply-pending", "reapply-pending"):
-    if "removal_managed_default_address_pools" in state:
+    if "removal_managed_default_address_pools" in state or removal_bip & set(state):
         raise SystemExit(1)
-elif phase is not None or "removal_managed_default_address_pools" in state:
+elif phase is not None or "removal_managed_default_address_pools" in state or removal_bip & set(state):
     raise SystemExit(1)
+if bip_managed:
+    if state["bip_managed"] is not True or not isinstance(state["prior_bip_present"], bool):
+        raise SystemExit(1)
+    if state["prior_bip_present"]:
+        validate_ipv4_interface_cidr(state["prior_bip"], path="checkpoint prior bip")
+    elif state["prior_bip"] is not None:
+        raise SystemExit(1)
+    if phase == "removal-pending":
+        if not isinstance(state["removal_managed_bip_present"], bool):
+            raise SystemExit(1)
+        if state["removal_managed_bip_present"]:
+            validate_ipv4_interface_cidr(state["removal_managed_bip"], path="checkpoint removal managed bip")
+        elif state["removal_managed_bip"] is not None:
+            raise SystemExit(1)
 if phase == "removal-pending" and state["removal_managed_default_address_pools"] is not None:
     validate_docker_address_pools(
         state["removal_managed_default_address_pools"],
@@ -1261,11 +1419,12 @@ elif state["prior_mode"] is not None:
     raise SystemExit(1)
 print(
     f"{generation or ''}|{'true' if phase == 'removal-pending' else 'false'}|"
-    f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}|{phase or ''}"
+    f"{'true' if state['prior_present'] else 'false'}|{state['prior_mode'] or ''}|{phase or ''}|"
+    f"{'true' if bip_managed else 'false'}"
 )
 PY
   ) || { rm -rf "$work_dir"; die 'network-policy checkpoint state is invalid'; }
-  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode apply_phase <<<"$apply_checkpoint_state"
+  IFS='|' read -r prior_verified_generation apply_removal_pending checkpoint_prior_present checkpoint_prior_mode apply_phase bip_managed_before <<<"$apply_checkpoint_state"
   managed_before=true
   [[ "$checkpoint_phase" != verified ]] || clear_recovery_artifacts || { rm -rf "$work_dir"; die 'failed to clear obsolete network-policy recovery data'; }
 fi
@@ -1292,6 +1451,7 @@ installed = parse_env(Path(sys.argv[2]), allow_unknown=True)
 fields = {
     "CI_FLEET_CONFIGURED_MAX_RUNNERS",
     "CI_FLEET_CONTROLLER_STATE",
+    "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR",
     "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
     "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
 }
@@ -1331,6 +1491,15 @@ elif state["prior_default_address_pools_present"]:
     current["default-address-pools"] = state["prior_default_address_pools"]
 else:
     current.pop("default-address-pools", None)
+if state.get("bip_managed") is True:
+    if state.get("phase") == "removal-pending" and state["removal_managed_bip_present"]:
+        current["bip"] = state["removal_managed_bip"]
+    elif state.get("phase") == "removal-pending":
+        current.pop("bip", None)
+    elif state["prior_bip_present"]:
+        current["bip"] = state["prior_bip"]
+    else:
+        current.pop("bip", None)
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(current, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -1340,11 +1509,16 @@ PY
   fi
 fi
 
+touch_bip=false
+if [[ "$desired_bip_configured" == true || "$bip_managed_before" == true ]]; then
+  touch_bip=true
+fi
+
 restore_daemon() {
   local rollback_daemon=$work_dir/daemon.json.apply-rollback rollback_expected=$work_dir/daemon.json.apply-rollback-expected rollback_action
-  rollback_action=$(python3 - "$daemon_config" "$rollback_source" "$had_prior" "$rollback_daemon" "$staging_daemon" "$rollback_expected" <<'PY'
+  rollback_action=$(python3 - "$daemon_config" "$rollback_source" "$had_prior" "$rollback_daemon" "$staging_daemon" "$rollback_expected" "$touch_bip" <<'PY'
 import json, os, sys
-current_path, prior_path, had_prior, output_path, staged_path, expected_path = sys.argv[1:]
+current_path, prior_path, had_prior, output_path, staged_path, expected_path, restore_bip = sys.argv[1:]
 try:
     current_present = os.path.exists(current_path)
     current_text = open(current_path, encoding="utf-8").read() if current_present else ""
@@ -1367,8 +1541,11 @@ except (OSError, json.JSONDecodeError, ValueError):
         print("exact")
         raise SystemExit
     raise SystemExit(1)
-current_unrelated = {key: value for key, value in current.items() if key != "default-address-pools"}
-staged_unrelated = {key: value for key, value in staged.items() if key != "default-address-pools"}
+managed_keys = {"default-address-pools"}
+if restore_bip == "true":
+    managed_keys.add("bip")
+current_unrelated = {key: value for key, value in current.items() if key not in managed_keys}
+staged_unrelated = {key: value for key, value in staged.items() if key not in managed_keys}
 if current_unrelated == staged_unrelated:
     print("exact" if had_prior == "true" or prior else "remove")
     raise SystemExit
@@ -1376,6 +1553,11 @@ if "default-address-pools" in prior:
     current["default-address-pools"] = prior["default-address-pools"]
 else:
     current.pop("default-address-pools", None)
+if restore_bip == "true":
+    if "bip" in prior:
+        current["bip"] = prior["bip"]
+    else:
+        current.pop("bip", None)
 if not current and had_prior != "true":
     print("remove")
 else:
@@ -1422,10 +1604,11 @@ fi
 
 # Recovery is authoritative before the pending marker becomes visible.
 if [[ "$managed_before" == false ]]; then
-  python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" "$repo_root/scripts" 2>/dev/null <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
+  python3 - "$state_file" "$had_prior" "$daemon_mode" "$backup_dir/$backup_name" "$repo_root/scripts" "$desired_policy_json" 2>/dev/null <<'PY' || { transaction_failure='failed to record network-policy checkpoint state'; exit 2; }
 import json, os, sys, tempfile
 path = sys.argv[1]
 prior = json.load(open(sys.argv[4], encoding="utf-8")) if sys.argv[2] == "true" else {}
+desired_policy = json.loads(sys.argv[6])
 prior_key_present = "default-address-pools" in prior
 if prior_key_present:
     sys.path.insert(0, sys.argv[5])
@@ -1440,6 +1623,12 @@ state = {
     "prior_present": sys.argv[2] == "true",
     "verified_generation": None,
 }
+if "bip" in desired_policy:
+    state.update(
+        bip_managed=True,
+        prior_bip=prior.get("bip"),
+        prior_bip_present="bip" in prior,
+    )
 fd, tmp = tempfile.mkstemp(prefix=".docker-network-policy.", dir=os.path.dirname(path), text=True)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1472,6 +1661,9 @@ rollback_daemon() {
   if ((failed == 0)); then
     run_primitive restart "$daemon_dir" || failed=1
   fi
+  if ((failed == 0)) && [[ "$touch_bip" == true ]] && daemon_has_bip "$rollback_source"; then
+    run_probe "$rollback_source" true || failed=1
+  fi
   if ((failed == 0)); then
     run_primitive restore --env "$prior_env" || failed=1
   fi
@@ -1479,11 +1671,11 @@ rollback_daemon() {
     run_health "$prior_env" || failed=1
   fi
   if ((failed == 0)); then
-    daemon_pools_match "$rollback_source" || failed=1
+    daemon_policy_matches "$rollback_source" "$touch_bip" || failed=1
   fi
   if [[ "$managed_before" == true && "$apply_phase" != first-apply-pending && "$failed" == 0 ]]; then
     restored_generation=$(file_generation "$daemon_config") || failed=1
-    ((failed != 0)) || set_verified_generation "$restored_generation" || failed=1
+    ((failed != 0)) || set_verified_generation "$restored_generation" rollback-reapply || failed=1
   fi
   return "$failed"
 }
@@ -1529,7 +1721,7 @@ rollback_on_exit() {
 
 # --- Drain after local validation/checkpointing, before mutation or restart ---
 if [[ "$managed_before" == true && -z "$apply_phase" ]]; then
-  set_verified_generation "" reapply-pending || die 'failed to mark network-policy verification pending'
+  set_verified_generation "" reapply-pending "$rollback_source" "$desired_policy_json" || die 'failed to mark network-policy verification pending'
   apply_checkpoint_started=true
 fi
 drain_controller 'drain command failed before network-policy apply'
@@ -1558,8 +1750,8 @@ if ! run_primitive restart "$daemon_dir"; then
   fail_after_apply "Docker restart command failed"
 fi
 
-# Bounded capacity probe
-if ! run_primitive probe; then
+# Bounded capacity and effective bridge probe
+if ! run_probe "$staging_daemon" "$touch_bip"; then
   fail_after_apply "capacity probe failed after network-policy restart"
 fi
 
@@ -1574,10 +1766,16 @@ if ! run_health "$env_file"; then
   fail_after_apply "health check failed after network-policy restart"
 fi
 
-daemon_pools_match "$staging_daemon" || fail_after_apply "daemon.json changed after network-policy verification"
+daemon_policy_matches "$staging_daemon" "$touch_bip" || fail_after_apply "daemon.json changed after network-policy verification"
 verified_generation=$(file_generation "$daemon_config") || fail_after_apply "failed to identify verified daemon.json generation"
 verified_action=
-[[ "$apply_removal_pending" != true ]] || verified_action=clear-removal
+if [[ "$apply_removal_pending" == true && "$bip_managed_before" == true && "$desired_bip_configured" != true ]]; then
+  verified_action=clear-removal-release-bip
+elif [[ "$apply_removal_pending" == true ]]; then
+  verified_action=clear-removal
+elif [[ "$bip_managed_before" == true && "$desired_bip_configured" != true ]]; then
+  verified_action=release-bip
+fi
 set_verified_generation "$verified_generation" "$verified_action" || fail_after_apply "failed to record verified daemon.json generation"
 
 # The verified generation commits the apply. Disarm rollback before deleting

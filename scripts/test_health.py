@@ -92,6 +92,25 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(legacy["status"], "warning")
         self.assertIn("docker_network_legacy", {check["id"] for check in legacy["checks"] if check["status"] == "warning"})
 
+    def test_default_bridge_health_verifies_effective_subnet_and_gateway(self) -> None:
+        values = {**network_policy_values(), "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR": "192.0.2.1/28"}
+
+        def inspect(subnet: str, gateway: str):
+            def run(args):
+                if args[:3] == ["docker", "network", "ls"]:
+                    return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+                return health.subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]}}]), ""
+                )
+            return health._docker_network_headroom(run, values, docker_ok=True)
+
+        matched = inspect("192.0.2.0/28", "192.0.2.1")
+        self.assertEqual(matched["default_bridge"], "matched")
+        mismatch = inspect("192.0.2.0/28", "192.0.2.2")
+        self.assertEqual((mismatch["default_bridge"], mismatch["state"]), ("mismatch", "critical"))
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": mismatch}, health.Thresholds())
+        self.assertIn("docker_default_bridge", {check["id"] for check in report["checks"] if check["status"] == "critical"})
+
     def test_docker_network_headroom_collection_handles_inspection_failure(self) -> None:
         def run(args):
             if args[:2] == ["docker", "info"]:

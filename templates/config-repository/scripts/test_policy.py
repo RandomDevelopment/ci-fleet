@@ -89,6 +89,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(set(controller), {"type", "additionalProperties", "required", "properties"})
         self.assertEqual(controller["required"], ["default_address_pools", "networks_per_runner", "reserve_subnets"])
         self.assertEqual(controller["properties"]["networks_per_runner"], {"type": "integer", "minimum": 1})
+        self.assertEqual(controller["properties"]["default_bridge_cidr"], {"type": "string"})
         pools = controller["properties"]["default_address_pools"]
         self.assertEqual(pools["maxItems"], MAX_DOCKER_ADDRESS_POOLS)
         pool = pools["items"]
@@ -108,6 +109,25 @@ class PolicyTests(unittest.TestCase):
             "default_address_pools": [{"base": "198.51.100.0/29", "size": 29}],
         }
         self.assert_rejected(config, "capacity")
+
+    def test_default_bridge_cidr_validation(self) -> None:
+        config = copy.deepcopy(reference_config())
+        policy = first_controller(config)["docker_network_policy"]
+        policy["default_bridge_cidr"] = "192.0.2.1/28"
+        self.assertEqual(errors_for(config), [])
+        invalid = (
+            (42, "IPv4 interface"),
+            ("bad", "malformed"),
+            ("2001:db8::1/64", "IPv4 interface"),
+            ("192.0.2.0/28", "usable host"),
+            ("192.0.2.15/28", "usable host"),
+            ("192.0.2.1/30", "at least six usable"),
+            ("198.51.100.1/28", "must not overlap"),
+        )
+        for cidr, message in invalid:
+            with self.subTest(cidr=cidr):
+                policy["default_bridge_cidr"] = cidr
+                self.assert_rejected(config, message)
 
     def test_present_null_docker_network_policy_is_rejected(self) -> None:
         config = copy.deepcopy(reference_config())
@@ -327,6 +347,27 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, evidence, validation, {})
         self.assertTrue(any("previous integrated" in error for error in validation.errors), validation.errors)
 
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation, evidence)
+        self.assertEqual(validation.errors, [])
+
+    def test_default_bridge_cidr_requires_previous_engine_evidence(self) -> None:
+        previous = reference_config()
+        current = copy.deepcopy(previous)
+        first_controller(current)["docker_network_policy"]["default_bridge_cidr"] = "192.0.2.1/28"
+        controller = next(iter(current["controllers"]))
+        evidence = {
+            controller: {
+                "engine_ref": first_controller(current)["engine_ref"],
+                "status_reporting_config": False,
+                "required_status_reporting": False,
+                "docker_network_policy_config": True,
+                "docker_default_bridge_cidr_config": True,
+            }
+        }
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation, {})
+        self.assertTrue(any("default bridge CIDR" in error for error in validation.errors), validation.errors)
         validation = Validation()
         validate_transition(previous, current, evidence, validation, evidence)
         self.assertEqual(validation.errors, [])

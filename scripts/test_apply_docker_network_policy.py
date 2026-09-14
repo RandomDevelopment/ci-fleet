@@ -412,6 +412,58 @@ class HealthcheckScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class DockerNetworkPolicyAdapterTests(unittest.TestCase):
+    def test_probe_verifies_effective_default_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            daemon = root / "daemon.json"
+            daemon.write_text(json.dumps({"bip": "10.20.0.1/27"}), encoding="utf-8")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            docker = fake_bin / "docker"
+            docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$*\" == 'network inspect bridge --format {{json .IPAM.Config}}' ]]; then printf '%s\\n' \"$FAKE_BRIDGE_IPAM\"; fi\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "CI_FLEET_INSTALLER_LOCK_FD": "9",
+                "CI_FLEET_POLICY_INSTALLER": str(SCRIPTS / "docker-network-policy-adapter.sh"),
+                "CI_FLEET_TESTING": "1",
+            }
+            command = [
+                str(SCRIPTS / "docker-network-policy-adapter.sh"),
+                "probe",
+                "--daemon-config",
+                str(daemon),
+            ]
+            matched = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env={
+                    **environment,
+                    "FAKE_BRIDGE_IPAM": json.dumps([{"Subnet": "10.20.0.0/27", "Gateway": "10.20.0.1"}]),
+                },
+            )
+            mismatched = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env={
+                    **environment,
+                    "FAKE_BRIDGE_IPAM": json.dumps([{"Subnet": "10.20.0.0/27", "Gateway": "10.20.0.2"}]),
+                },
+            )
+
+            self.assertEqual(matched.returncode, 0, matched.stderr)
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("effective default bridge does not match managed bip", mismatched.stderr)
+
+
 class ApplyScriptTests(unittest.TestCase):
     """Integration tests for scripts/apply-docker-network-policy.sh.
 
@@ -468,10 +520,15 @@ class ApplyScriptTests(unittest.TestCase):
         path.write_text("".join(f"{k}={v}\n" for k, v in sorted(rendered.items())), encoding="utf-8")
         return path
 
-    def _rendered_with_policy(self) -> dict[str, str]:
+    def _rendered_with_policy(self, default_bridge_cidr: str | None = None) -> dict[str, str]:
         value = config()
-        value["controllers"]["example-ci-01"]["docker_network_policy"] = docker_network_policy()
+        policy = docker_network_policy()
+        if default_bridge_cidr is not None:
+            policy["default_bridge_cidr"] = default_bridge_cidr
+        value["controllers"]["example-ci-01"]["docker_network_policy"] = policy
         capabilities = {"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"}
+        if default_bridge_cidr is not None:
+            capabilities.add("docker_default_bridge_cidr_config")
         rendered, _ = build_rendered_env(
             value,
             "example-ci-01",
@@ -632,6 +689,57 @@ class ApplyScriptTests(unittest.TestCase):
         state = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertNotIn("phase", state)
         self.assertEqual(state["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
+    def test_interrupted_bridge_adoption_failure_restores_unowned_bip(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        rendered = self._rendered_with_policy()
+        daemon_config = render_docker_daemon_config(rendered)
+        daemon_config["bip"] = prior_bip
+        daemon = self._write_daemon(json.dumps(daemon_config))
+        checkpoint = Path(self.tmp) / "checkpoint-bridge-adoption-retry"
+        self._write_success_commands()
+        prior_env = self._write_env_file(rendered)
+        self.assertEqual(self._run(str(prior_env), checkpoint_dir=str(checkpoint)).returncode, 0)
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(
+            bip_managed=True,
+            bip_adoption_pending=True,
+            phase="reapply-pending",
+            prior_bip=prior_bip,
+            prior_bip_present=True,
+            verified_generation=None,
+        )
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        recovery = checkpoint / "recovery.interrupted"
+        recovery.mkdir(mode=0o700)
+        (recovery / "daemon.json.before").write_bytes(daemon.read_bytes())
+        (recovery / "prior-ci-fleet.env").write_bytes(self.installed_env.read_bytes())
+        for path in recovery.iterdir():
+            path.chmod(0o600)
+        self._write_success_commands()
+        probe_log = Path(self.tmp) / "bridge-adoption-probes.log"
+        (Path(self.tmp) / "probe.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "value=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"bip\"])' \"$2\")\n"
+            f"printf '%s\\n' \"$value\" >>{probe_log}\n"
+            "[[ $value != 10.20.0.1/27 ]]\n",
+            encoding="utf-8",
+        )
+        (Path(self.tmp) / "probe.sh").chmod(0o755)
+        candidate = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        result = self._run(str(candidate), checkpoint_dir=str(checkpoint))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), ["10.20.0.1/27", prior_bip])
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], prior_bip)
+        restored = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", restored)
+        self.assertNotIn("bip_managed", restored)
+        self.assertNotIn("bip_adoption_pending", restored)
+        self.assertEqual(restored["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
         self.assertFalse(list(checkpoint.glob("recovery.*")))
 
     def test_retried_removal_failed_drain_restores_verified_marker(self) -> None:
@@ -3933,6 +4041,132 @@ class ApplyScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(daemon.stat().st_mode & 0o777, 0o600)
+
+    def test_default_bridge_apply_and_release_preserve_prior_bip(self) -> None:
+        prior_bip = "172.30.0.1/30"
+        desired_bip = "10.20.0.1/27"
+        daemon = self._write_daemon(json.dumps({"bip": prior_bip, "icc": False}))
+        checkpoint = Path(self.tmp) / "checkpoint-default-bridge-ownership"
+        self._write_success_commands()
+        managed_env = self._write_env_file(self._rendered_with_policy(desired_bip))
+
+        applied = self._run(str(managed_env), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {
+            "bip": desired_bip,
+            "default-address-pools": docker_network_policy()["default_address_pools"],
+            "icc": False,
+        })
+        marker_path = checkpoint / "docker-network-policy.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertTrue(marker["bip_managed"])
+        self.assertTrue(marker["prior_bip_present"])
+        self.assertEqual(marker["prior_bip"], prior_bip)
+
+        self.installed_env.write_bytes(managed_env.read_bytes())
+        without_bridge = self._write_env_file(self._rendered_with_policy())
+        released = self._run(str(without_bridge), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], prior_bip)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertNotIn("bip_managed", marker)
+        self.assertNotIn("prior_bip", marker)
+        self.assertNotIn("prior_bip_present", marker)
+
+    def test_default_bridge_readback_mismatch_rolls_back_change(self) -> None:
+        first_bip = "10.20.0.1/27"
+        changed_bip = "10.21.0.1/27"
+        daemon = self._write_daemon("{}\n")
+        checkpoint = Path(self.tmp) / "checkpoint-default-bridge-readback"
+        self._write_success_commands()
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text(
+            "#!/usr/bin/env bash\n"
+            "[[ $# == 2 && $1 == --daemon-config && -f $2 ]] || exit 1\n"
+            "python3 - \"$2\" \"$FAKE_EFFECTIVE_BRIDGE_CIDR\" <<'PY'\n"
+            "import ipaddress, json, sys\n"
+            "expected = json.load(open(sys.argv[1], encoding='utf-8')).get('bip')\n"
+            "raise SystemExit(expected is not None and ipaddress.ip_interface(expected) != ipaddress.ip_interface(sys.argv[2]))\n"
+            "PY\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        first_env = self._write_env_file(self._rendered_with_policy(first_bip))
+        command = [
+            str(SCRIPTS / "apply-docker-network-policy.sh"),
+            "--checkpoint", str(checkpoint),
+            "--env", str(first_env),
+        ]
+
+        applied = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=self._env(FAKE_EFFECTIVE_BRIDGE_CIDR=first_bip),
+            timeout=30,
+        )
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.installed_env.write_bytes(first_env.read_bytes())
+        changed_env = self._write_env_file(self._rendered_with_policy(changed_bip))
+        command[-1] = str(changed_env)
+        rejected = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=self._env(FAKE_EFFECTIVE_BRIDGE_CIDR=first_bip),
+            timeout=30,
+        )
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("capacity probe failed", rejected.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], first_bip)
+
+    def test_default_bridge_conflicting_fixed_cidr_fails_before_drain(self) -> None:
+        daemon = self._write_daemon(json.dumps({"fixed-cidr": "192.0.2.0/28", "icc": False}))
+        command_log = Path(self.tmp) / "default-bridge-conflict-commands"
+        for command in (self.drain_command, *(Path(self.tmp) / name for name in ("restart.sh", "probe.sh", "resume.sh", "health.sh"))):
+            command.write_text(f"#!/usr/bin/env bash\necho command >> {command_log}\n", encoding="utf-8")
+            command.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy("192.0.3.1/28"))
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixed-cidr conflicts", result.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"fixed-cidr": "192.0.2.0/28", "icc": False})
+        self.assertFalse(command_log.exists())
+
+    def test_default_bridge_release_and_removal_reject_fixed_cidr_before_drain(self) -> None:
+        checkpoint = Path(self.tmp) / "checkpoint-default-bridge-release-conflict"
+        self._write_success_commands()
+        managed_env = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+        self.assertEqual(self._run(str(managed_env), checkpoint_dir=str(checkpoint)).returncode, 0)
+        daemon = self.daemon_dir / "daemon.json"
+        value = json.loads(daemon.read_text(encoding="utf-8"))
+        value["fixed-cidr"] = "172.30.0.0/24"
+        daemon.write_text(json.dumps(value), encoding="utf-8")
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["verified_generation"] = hashlib.sha256(daemon.read_bytes()).hexdigest()
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        prior_daemon = daemon.read_bytes()
+        prior_state = state_file.read_bytes()
+        drain_marker = Path(self.tmp) / "default-bridge-release-conflict-drain.marker"
+        self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
+        self.drain_command.chmod(0o755)
+        for rendered in (self._rendered_with_policy(), {}):
+            candidate_env = self._write_env_file(rendered)
+            with self.subTest(policy_present=bool(rendered)):
+                result = self._run(str(candidate_env), checkpoint_dir=str(checkpoint))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("fixed-cidr", result.stderr)
+                self.assertFalse(drain_marker.exists())
+                self.assertEqual(daemon.read_bytes(), prior_daemon)
+                self.assertEqual(state_file.read_bytes(), prior_state)
 
     def test_applies_daemon_config_preserving_unrelated_keys(self) -> None:
         """GREEN: applying a policy preserves unrelated daemon.json keys."""
