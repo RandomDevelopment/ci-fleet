@@ -682,6 +682,12 @@ def validate_transition(
                 f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
                 "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with default bridge CIDR capability",
             )
+        if old_default_bridge and not new_default_bridge:
+            validation.require(
+                old.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                "must be removed before changing engine_ref",
+            )
         if new_default_bridge:
             validation.require(
                 current_evidence.get("engine_ref") == new.get("engine_ref")

@@ -94,8 +94,9 @@ controller may omit the first boolean only while it omits `docker_network_policy
 It may omit the second while it omits `default_bridge_cidr`. Retained fields
 require current evidence for the selected engine, and the selected engine
 manifest must advertise the matching capabilities plus
-`docker_network_policy_adapter`. Remove unsupported fields before selecting an
-older engine. A complete record has this shape after an operator has verified
+`docker_network_policy_adapter`. Remove unsupported fields while retaining the
+current engine, reconcile that release, and select an older engine only in a
+later commit. A complete record has this shape after an operator has verified
 the named engine is active:
 
 ```json

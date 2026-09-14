@@ -390,6 +390,32 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, evidence, validation, evidence)
         self.assertEqual(validation.errors, [])
 
+    def test_default_bridge_cidr_removal_requires_same_engine(self) -> None:
+        previous = reference_config()
+        first_controller(previous)["docker_network_policy"]["default_bridge_cidr"] = "192.0.2.1/28"
+        current = copy.deepcopy(previous)
+        first_controller(current)["docker_network_policy"].pop("default_bridge_cidr")
+        first_controller(current)["engine_ref"] = "2" * 40
+        controller = next(iter(current["controllers"]))
+        evidence = {
+            controller: {
+                "engine_ref": "2" * 40,
+                "status_reporting_config": False,
+                "required_status_reporting": False,
+                "docker_network_policy_config": True,
+            }
+        }
+
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation)
+        self.assertTrue(any("must be removed before changing engine_ref" in error for error in validation.errors), validation.errors)
+
+        first_controller(current)["engine_ref"] = first_controller(previous)["engine_ref"]
+        evidence[controller]["engine_ref"] = first_controller(current)["engine_ref"]
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation)
+        self.assertEqual(validation.errors, [])
+
     def test_rollout_evidence_accepts_network_policy_capability(self) -> None:
         evidence = {
             "engine_ref": "1" * 40,
