@@ -3274,6 +3274,26 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertFalse((self.daemon_dir / "daemon.json").exists())
         self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), ["2", "0"])
 
+    def test_default_bridge_rollback_treats_null_prior_bip_as_unconfigured(self) -> None:
+        daemon = self._write_daemon(json.dumps({"bip": None, "icc": False}))
+        probe_log = Path(self.tmp) / "default-bridge-null-rollback-probe.log"
+        self._write_success_commands()
+        probe = Path(self.tmp) / "probe.sh"
+        probe.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$#\" >>{probe_log}\n"
+            "[[ $# == 0 ]]\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        env_file = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        result = self._run(str(env_file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"bip": None, "icc": False})
+        self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), ["2", "0"])
+
     def test_absent_apply_rollback_fsyncs_daemon_dir_after_unlink(self) -> None:
         self._write_success_commands()
         (Path(self.tmp) / "probe.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")

@@ -525,7 +525,7 @@ daemon_has_bip() {
   python3 - "$1" 2>/dev/null <<'PY'
 import json, os, sys
 value = json.load(open(sys.argv[1], encoding="utf-8")) if os.path.exists(sys.argv[1]) else {}
-raise SystemExit(not isinstance(value, dict) or "bip" not in value)
+raise SystemExit(not isinstance(value, dict) or not isinstance(value.get("bip"), str) or not value["bip"])
 PY
 }
 
