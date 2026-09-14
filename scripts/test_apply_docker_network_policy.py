@@ -804,6 +804,82 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(state["prior_bip"], prior_bip)
         self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], "10.20.0.1/27")
 
+    def test_policy_removal_recovers_pending_bridge_adoption_and_terminal_retry(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        current = render_docker_daemon_config(self._rendered_with_policy("10.20.0.1/27"))
+        daemon = self._write_daemon(json.dumps(current))
+        checkpoint = Path(self.tmp) / "checkpoint-pending-bridge-adoption-removal"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending")
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(
+            bip_managed=True,
+            bip_adoption_pending=True,
+            prior_bip=prior_bip,
+            prior_bip_present=True,
+        )
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self._write_recovery(checkpoint, json.dumps({"bip": prior_bip}).encode())
+        self._write_success_commands()
+        audit = Path(self.tmp) / "pending-adoption-terminal-fault"
+        audit.mkdir()
+        (audit / "sitecustomize.py").write_text(
+            "import os\n_unlink = os.unlink\ndef unlink(path, *a, **k):\n"
+            " if os.path.basename(path) == os.path.basename(os.environ['STATE']): raise OSError('injected')\n"
+            " return _unlink(path, *a, **k)\nos.unlink = unlink\n",
+            encoding="utf-8",
+        )
+        no_policy = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        interrupted = subprocess.run(
+            [str(SCRIPTS / "apply-docker-network-policy.sh"), "--checkpoint", str(checkpoint), "--env", str(no_policy)],
+            capture_output=True,
+            text=True,
+            env=self._env(PYTHONPATH=str(audit), STATE=str(state_file)),
+            timeout=30,
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        terminal = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(terminal["phase"], "rollback-complete")
+        self.assertNotIn("bip_adoption_pending", terminal)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"bip": prior_bip})
+
+        retried = self._run(str(no_policy), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(retried.stdout, "NETWORK_POLICY_NOOP\n")
+        self.assertFalse(state_file.exists())
+
+    def test_policy_removal_recovers_removal_pending_bridge_adoption(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        rendered = self._rendered_with_policy()
+        managed = render_docker_daemon_config(rendered)
+        managed["bip"] = prior_bip
+        daemon = self._write_daemon(json.dumps(managed))
+        checkpoint = Path(self.tmp) / "checkpoint-removal-pending-adoption-removal"
+        state_file = self._seed_checkpoint(checkpoint, "removal-pending")
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(
+            bip_managed=True,
+            bip_adoption_pending=True,
+            prior_bip=prior_bip,
+            prior_bip_present=True,
+            removal_managed_default_address_pools=managed["default-address-pools"],
+            removal_managed_bip=prior_bip,
+            removal_managed_bip_present=True,
+        )
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self._write_recovery(checkpoint, json.dumps(managed).encode())
+        self._write_success_commands()
+        no_policy = self._write_env_file({"CI_FLEET_INSTANCE": "example-ci-01"})
+
+        result = self._run(str(no_policy), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8")), {"bip": prior_bip})
+        self.assertFalse(state_file.exists())
+        self.assertFalse(list(checkpoint.glob("recovery.*")))
+
     def test_retried_removal_failed_drain_restores_verified_marker(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-retry-drain"

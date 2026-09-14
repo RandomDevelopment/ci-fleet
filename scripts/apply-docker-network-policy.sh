@@ -626,6 +626,8 @@ elif action in ("reapply-pending", "rollback-complete"):
     state.pop("removal_managed_default_address_pools", None)
     state.pop("removal_managed_bip", None)
     state.pop("removal_managed_bip_present", None)
+    if action == "rollback-complete":
+        state.pop("bip_adoption_pending", None)
 if action in ("reapply-pending", "adopt-bip-pending") and "bip" in json.loads(desired_policy_json) and not state.get("bip_managed"):
     prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
     prior_bip = prior.get("bip")
@@ -939,6 +941,10 @@ bip_managed = bool(bip <= set(state))
 if bip & set(state) and not bip_managed:
     raise SystemExit(1)
 allowed = required | (bip if bip_managed else set())
+if state.get("bip_adoption_pending") is True:
+    if phase not in ("first-apply-pending", "removal-pending") or not bip_managed:
+        raise SystemExit(1)
+    allowed.add("bip_adoption_pending")
 if phase == "removal-pending":
     if bip_managed:
         allowed |= removal_bip
