@@ -742,6 +742,68 @@ class ApplyScriptTests(unittest.TestCase):
         self.assertEqual(restored["verified_generation"], hashlib.sha256(daemon.read_bytes()).hexdigest())
         self.assertFalse(list(checkpoint.glob("recovery.*")))
 
+    def test_first_apply_pending_bridge_adoption_survives_failed_drain(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        rendered = self._rendered_with_policy()
+        current = render_docker_daemon_config(rendered)
+        current["bip"] = prior_bip
+        daemon = self._write_daemon(json.dumps(current))
+        checkpoint = Path(self.tmp) / "checkpoint-first-pending-bridge-adoption"
+        state_file = self._seed_checkpoint(checkpoint, "first-apply-pending")
+        self._write_recovery(checkpoint, json.dumps({"bip": prior_bip}).encode())
+        self._write_success_commands()
+        self.drain_command.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        candidate = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        failed = self._run(str(candidate), checkpoint_dir=str(checkpoint), expected_rc=1)
+
+        self.assertNotEqual(failed.returncode, 0)
+        failed_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(failed_state["phase"], "first-apply-pending")
+        self.assertNotIn("bip_managed", failed_state)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], prior_bip)
+
+        self.drain_command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        retried = self._run(str(candidate), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", state)
+        self.assertNotIn("bip_adoption_pending", state)
+        self.assertTrue(state["bip_managed"])
+        self.assertEqual(state["prior_bip"], prior_bip)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], "10.20.0.1/27")
+
+    def test_removal_pending_bridge_adoption_records_ownership(self) -> None:
+        prior_bip = "172.30.0.1/24"
+        daemon = self._write_daemon(json.dumps({"bip": prior_bip}))
+        checkpoint = Path(self.tmp) / "checkpoint-removal-pending-bridge-adoption"
+        self._write_success_commands()
+        pool_only = self._write_env_file(self._rendered_with_policy())
+        self.assertEqual(self._run(str(pool_only), checkpoint_dir=str(checkpoint)).returncode, 0)
+        managed = daemon.read_bytes()
+        state_file = checkpoint / "docker-network-policy.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state.update(
+            phase="removal-pending",
+            removal_managed_default_address_pools=json.loads(managed)["default-address-pools"],
+            verified_generation=None,
+        )
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self._write_recovery(checkpoint, managed)
+        candidate = self._write_env_file(self._rendered_with_policy("10.20.0.1/27"))
+
+        result = self._run(str(candidate), checkpoint_dir=str(checkpoint))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("phase", state)
+        self.assertNotIn("bip_adoption_pending", state)
+        self.assertNotIn("removal_managed_default_address_pools", state)
+        self.assertTrue(state["bip_managed"])
+        self.assertEqual(state["prior_bip"], prior_bip)
+        self.assertEqual(json.loads(daemon.read_text(encoding="utf-8"))["bip"], "10.20.0.1/27")
+
     def test_retried_removal_failed_drain_restores_verified_marker(self) -> None:
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "checkpoint-removal-retry-drain"

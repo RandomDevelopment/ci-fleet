@@ -367,6 +367,7 @@ controller_resumed=false
 transaction_recovery=
 removal_checkpoint_started=false
 apply_checkpoint_started=false
+bip_adoption_started=false
 apply_phase=
 bip_managed_before=false
 cancelling_first_apply=false
@@ -389,6 +390,9 @@ resume_after_failed_drain() {
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$apply_checkpoint_started" == true ]]; then
     set_verified_generation "$prior_verified_generation" rollback-reapply || resume_failed=1
+  fi
+  if ((resume_failed == 0 && health_failed == 0)) && [[ "$bip_adoption_started" == true ]]; then
+    set_verified_generation "" rollback-adoption || resume_failed=1
   fi
   if ((resume_failed == 0 && health_failed == 0)) && [[ "$new_marker" != true && -z "$apply_phase" && "$cancelling_first_apply" != true ]]; then
     clear_recovery_artifacts || resume_failed=1
@@ -604,7 +608,15 @@ set_verified_generation() {
 import json, os, sys, tempfile
 path, generation, action, prior_path, desired_policy_json = sys.argv[1:]
 state = json.load(open(path, encoding="utf-8"))
-if action in ("clear-removal", "clear-removal-release-bip"):
+if action == "rollback-adoption":
+    if state.pop("bip_adoption_pending", False) is not True:
+        raise SystemExit(1)
+    state.pop("bip_managed", None)
+    state.pop("prior_bip", None)
+    state.pop("prior_bip_present", None)
+    state.pop("removal_managed_bip", None)
+    state.pop("removal_managed_bip_present", None)
+elif action in ("clear-removal", "clear-removal-release-bip"):
     state.pop("phase", None)
     state.pop("removal_managed_default_address_pools", None)
     state.pop("removal_managed_bip", None)
@@ -614,15 +626,18 @@ elif action in ("reapply-pending", "rollback-complete"):
     state.pop("removal_managed_default_address_pools", None)
     state.pop("removal_managed_bip", None)
     state.pop("removal_managed_bip_present", None)
-    if action == "reapply-pending" and "bip" in json.loads(desired_policy_json) and not state.get("bip_managed"):
-        prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
-        prior_bip = prior.get("bip")
-        state.update(
-            bip_managed=True,
-            bip_adoption_pending=True,
-            prior_bip=prior_bip,
-            prior_bip_present=prior_bip is not None,
-        )
+if action in ("reapply-pending", "adopt-bip-pending") and "bip" in json.loads(desired_policy_json) and not state.get("bip_managed"):
+    prior = json.load(open(prior_path, encoding="utf-8")) if os.path.exists(prior_path) else {}
+    prior_bip = prior.get("bip")
+    state.update(
+        bip_managed=True,
+        bip_adoption_pending=True,
+        prior_bip=prior_bip,
+        prior_bip_present=prior_bip is not None,
+    )
+    if state.get("phase") == "removal-pending":
+        state["removal_managed_bip"] = prior_bip
+        state["removal_managed_bip_present"] = prior_bip is not None
 if action == "rollback-reapply":
     state.pop("phase", None)
     if state.pop("bip_adoption_pending", False):
@@ -1376,7 +1391,7 @@ optional = {"verified_generation", "phase", "removal_managed_default_address_poo
 if bip_managed:
     optional |= bip
 if state.get("bip_adoption_pending") is True:
-    if phase != "reapply-pending" or not bip_managed:
+    if phase not in ("first-apply-pending", "reapply-pending", "removal-pending") or not bip_managed:
         raise SystemExit(1)
     optional.add("bip_adoption_pending")
 if phase == "removal-pending" and bip_managed:
@@ -1740,6 +1755,9 @@ rollback_on_exit() {
 if [[ "$managed_before" == true && -z "$apply_phase" ]]; then
   set_verified_generation "" reapply-pending "$rollback_source" "$desired_policy_json" || die 'failed to mark network-policy verification pending'
   apply_checkpoint_started=true
+elif [[ "$managed_before" == true && -n "$apply_phase" && "$desired_bip_configured" == true && "$bip_managed_before" != true ]]; then
+  set_verified_generation "" adopt-bip-pending "$rollback_source" "$desired_policy_json" || die 'failed to record pending bridge ownership'
+  bip_adoption_started=true
 fi
 drain_controller 'drain command failed before network-policy apply'
 if daemon_changed_since_snapshot "$backup_dir/$backup_name" "$snapshot_present" "$daemon_metadata"; then
