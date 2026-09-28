@@ -7,7 +7,7 @@ services:
       context: ../runner
       args:
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
-        RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.335.1}
+        RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.337.0}
     command: ["/bin/true"]
     deploy:
       replicas: 0
