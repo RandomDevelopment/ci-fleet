@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.18
-FROM debian:13.6-slim
+FROM debian:13.7-slim
 
 ARG TARGETARCH
 ARG CI_FLEET_COMMIT=unknown
