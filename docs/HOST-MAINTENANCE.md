@@ -61,4 +61,8 @@ The manual cleanup command is intentionally a dry-run. Enable the applying servi
 
 Dependabot proposes updates for GitHub Actions, Go modules, and both Dockerfiles. Those pull requests must pass inert validation and be reviewed before merge. This preserves unattended host security patching without silently changing the runner control plane.
 
+The `Update GitHub Actions runner release` workflow checks the official `actions/runner` releases each Monday. It ignores drafts and prereleases, validates the stable tag and exact Linux x64 and arm64 assets, downloads both archives, and calculates their SHA-256 checksums. When an update exists, it updates the three pins in `runner/Dockerfile` and the `CI_FLEET_RUNNER_VERSION` default in `deploy/compose.yaml` on the machine-managed `automation/update-actions-runner` branch. It creates or refreshes one pull request for normal review and validation. If all four pins are current, it makes no branch or pull-request change.
+
+Run the same check on demand from **Actions → Update GitHub Actions runner release → Run workflow**. The workflow only proposes a repository change. It does not build or deploy a host update.
+
 Controller and runner engine updates are also pinned. A merged private configuration change is applied with `install-worker-controller.sh --upgrade`; the host never follows a moving engine or configuration branch automatically. See [Git-authored controller desired state](DESIRED-STATE.md).
