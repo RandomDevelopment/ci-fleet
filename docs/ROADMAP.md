@@ -43,7 +43,7 @@ The recorded proof covered:
 - zero final job residue and controller health;
 - preservation of existing project runners.
 
-Each project still needs failure, cancellation, timeout, repeated-run, and rollback evidence before migration cutover.
+Failure, cancellation, timeout, repeated-run cleanup, disk usage, controller credential isolation, and rollback require retained evidence before migration cutover or broader adoption.
 
 ## Phase 3: Parallel project validation
 
