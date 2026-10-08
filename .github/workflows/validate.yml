@@ -143,7 +143,14 @@ jobs:
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
             git rev-list --reverse "$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
           else
-            git rev-list --reverse "$BASE_SHA..$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
+            if ! git rev-list --reverse "$BASE_SHA..$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"; then
+              if [[ "$EVENT_NAME" == push && "$REF_TYPE" == tag ]]; then
+                # A moved tag's old object may no longer be fetchable.
+                git rev-list --reverse "$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
+              else
+                exit 1
+              fi
+            fi
           fi
           mapfile -t commits <"$RUNNER_TEMP/proposed-commits"
           if [[ ! " ${commits[*]} " == *" $HEAD_SHA "* ]]; then
