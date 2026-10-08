@@ -114,7 +114,8 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.runtime = Path(self.temp.name) / "runtime"
         self.runtime.mkdir()
         self.env = {**os.environ, "RUNNER_TEMP": str(self.runtime),
-                    "GITHUB_WORKSPACE": str(self.repo), "BASE_REF": "main"}
+                    "GITHUB_WORKSPACE": str(self.repo), "BASE_REF": "main",
+                    "REF_TYPE": "tag", "TAG_NAME": "v0.1.0-rc.1"}
         self.git("init", "-b", "main")
         self.git("config", "user.name", "CI test")
         self.git("config", "user.email", "ci@example.invalid")
@@ -245,8 +246,9 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no commits to validate", result.stdout)
 
-    def release_validation(self, conclusion: str = "success"):
-        self.git("tag", "v0.1.0", self.base)
+    def release_validation(self, conclusion: str = "success", prior_release: bool = True):
+        if prior_release:
+            self.git("tag", "v0.1.0", self.base)
         tools = self.runtime / "bin"
         tools.mkdir()
         gh = tools / "gh"
@@ -266,6 +268,54 @@ class WorkflowExecutionTests(unittest.TestCase):
             env={**self.env, "GITHUB_REPOSITORY": "test/repo",
                  "PATH": str(tools) + os.pathsep + self.env["PATH"]},
         )
+
+    def stable_history_with_removed_environment(self) -> str:
+        self.git("checkout", "main")
+        self.write(".env", "EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden environment file")
+        (self.repo / ".env").unlink()
+        return self.commit("fix: remove forbidden environment file")
+
+    def test_stable_tag_scans_removed_secrets_since_previous_release(self) -> None:
+        head = self.stable_history_with_removed_environment()
+        self.git("tag", "v0.1.0", self.base)
+        self.git("tag", "v0.1.1", head)
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
+                               BASE_SHA="0" * 40, HEAD_SHA=head, TAG_NAME="v0.1.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_initial_release_scans_removed_secrets_in_history(self) -> None:
+        self.main = self.stable_history_with_removed_environment()
+        result = self.release_validation(prior_release=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+        self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
+
+    def test_stable_tag_proposed_range_rejects_intermediate_invalid_commit(self) -> None:
+        self.git("checkout", "main")
+        self.git("tag", "v0.1.0", self.main)
+        self.write("payload.txt", "invalid intermediate fixture\n")
+        self.commit("not conventional")
+        self.write("payload.txt", "valid final fixture\n")
+        head = self.commit("fix: finish release")
+        self.git("tag", "v0.1.1", head)
+        self.assertEqual(self.load_validator().returncode, 0)
+        result = self.run_step("Validate proposed commit messages", EVENT_NAME="push",
+                               BASE_SHA="0" * 40, HEAD_SHA=head, TAG_NAME="v0.1.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
+
+    def test_tag_rejects_nonconventional_release_commits(self) -> None:
+        self.git("checkout", "main")
+        self.write("payload.txt", "invalid release message fixture\n")
+        head = self.commit("not conventional")
+        self.git("tag", "v0.1.0", self.main)
+        self.assertEqual(self.load_validator().returncode, 0)
+        result = self.run_step("Validate release tags are SemVer 2.0.0",
+                               TAG_NAME="v0.1.1", TAG_COMMIT=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
 
     def test_prepublication_validation_leaves_tag_absent(self) -> None:
         result = self.release_validation()

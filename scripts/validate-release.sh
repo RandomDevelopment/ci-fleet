@@ -24,12 +24,19 @@ fi
 release_base=$(python3 "$runtime/validate_commits.py" --release-base-for "$commit")
 python3 "$runtime/validate_commits.py" --version "$version" --tag-commit "$commit" \
   --base "$release_base" --head "$commit"
-scan_base=$release_base
-if [[ -z "$scan_base" ]]; then
-  scan_base=$(git merge-base "$commit" origin/main)
+if [[ -n "$release_base" ]]; then
+  python3 "$runtime/validate_commits.py" --base "$release_base" --head "$commit"
+  git rev-list --reverse "$release_base..$commit" >"$runtime/commits"
+else
+  # Legacy commit messages remain exempt, but the proposed commit is checked.
+  if parent=$(git rev-parse "$commit^" 2>/dev/null); then
+    python3 "$runtime/validate_commits.py" --base "$parent" --head "$commit"
+  else
+    python3 "$runtime/validate_commits.py" --head "$commit"
+  fi
+  # Credentials are scanned across the full reachable history on first release.
+  git rev-list --reverse "$commit" >"$runtime/commits"
 fi
-python3 "$runtime/validate_commits.py" --base "$scan_base" --head "$commit"
-git rev-list --reverse "$scan_base..$commit" >"$runtime/commits"
 # Include the final tree even when the proposed commit range is empty.
 printf '%s\n' "$commit" >>"$runtime/commits"
 while IFS= read -r revision; do
