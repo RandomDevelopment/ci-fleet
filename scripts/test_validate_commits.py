@@ -735,6 +735,29 @@ class CliTests(unittest.TestCase):
                 result = vc.check_required_bump(version, base_sha, head_sha, directory)
                 self.assertTrue(result, f"{version} must reset lower components")
 
+    def test_release_requires_exact_component_increment(self) -> None:
+        for message, expected, skipped in (
+            ("fix: patch contract", "v1.2.8", "v1.2.9"),
+            ("feat: add capability", "v1.3.0", "v1.9.0"),
+            ("feat!: replace contract", "v2.0.0", "v9.0.0"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                self._init_repo(directory)
+                base = self._commit(directory, "chore: bootstrap")
+                subprocess.run(["git", "-C", directory, "tag", "v1.2.7"], check=True)
+                head = self._commit(directory, message)
+                self.assertEqual(vc.check_required_bump(expected, base, head, directory), [])
+                self.assertTrue(vc.check_required_bump(skipped, base, head, directory))
+
+    def test_initial_release_rejects_zero_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            head = self._commit(directory, "feat: initial release")
+            for version in ("v0.0.0", "0.0.0-rc.1", "0.0.0+build.1"):
+                with self.subTest(version=version):
+                    self.assertTrue(vc.check_required_bump(version, "", head, directory))
+            self.assertEqual(vc.check_required_bump("v0.1.0", "", head, directory), [])
+
     def test_release_version_cannot_regress_from_later_main_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)

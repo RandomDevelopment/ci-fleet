@@ -245,6 +245,46 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no commits to validate", result.stdout)
 
+    def release_validation(self, conclusion: str = "success"):
+        self.git("tag", "v0.1.0", self.base)
+        tools = self.runtime / "bin"
+        tools.mkdir()
+        gh = tools / "gh"
+        checks = [
+            {"name": name, "head_sha": self.main, "status": "completed",
+             "conclusion": conclusion, "app_id": 15368}
+            for name in ("Build without registering a runner",
+                         "Enforce conventional commits and pull-request title")
+        ]
+        gh.write_text("#!/usr/bin/env python3\nimport json\n"
+                      + f"checks = {checks!r}\n"
+                      + "for check in checks: print(json.dumps(check))\n")
+        gh.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(ROOT / "scripts" / "validate-release.sh"), "v0.1.1", self.main],
+            cwd=self.repo, capture_output=True, text=True,
+            env={**self.env, "GITHUB_REPOSITORY": "test/repo",
+                 "PATH": str(tools) + os.pathsep + self.env["PATH"]},
+        )
+
+    def test_prepublication_validation_leaves_tag_absent(self) -> None:
+        result = self.release_validation()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no tag was created", result.stdout)
+        self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
+
+    def test_prepublication_validation_rejects_failed_ci(self) -> None:
+        result = self.release_validation("failure")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("successful exact-commit check", result.stderr)
+        self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
+
+    def test_prepublication_validation_rejects_existing_tag(self) -> None:
+        self.git("tag", "v0.1.1", self.main)
+        result = self.release_validation()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stderr)
+
     def test_secret_scan_rejects_an_unresolvable_range(self) -> None:
         result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
                                BASE_SHA="not-a-commit", HEAD_SHA=self.head)

@@ -419,7 +419,7 @@ def check_required_bump(
     The required bump is computed from the conventional classification of the
     release range base..head (docs/CONTRIBUTING.md release gate: "the SemVer
     bump matches the Conventional Commits classification"). With no prior
-    release tag, any valid SemVer satisfies the pre-1.0 gate.
+    release tag, a nonzero valid SemVer satisfies the pre-1.0 gate.
     ponytail: compares only major.minor.patch; prerelease/build metadata of
     the candidate is ignored, upgrade if tag-vs-range metadata ever matters.
     """
@@ -427,6 +427,8 @@ def check_required_bump(
     if parsed is None:
         return []
     latest = latest_release_tag(workspace, main_ref, exclude_tag or version)
+    if latest is None and parsed == (0, 0, 0):
+        return ["initial release version must exceed '0.0.0'"]
     if latest is not None and parsed <= latest:
         return [
             f"version '{version}' does not exceed the latest released "
@@ -447,12 +449,12 @@ def check_required_bump(
     def _bumped(level: str) -> bool:
         """True when the candidate implements exactly `level` over prior."""
         if level == "MAJOR":
-            return new_major > old_major and (new_minor, new_patch) == (0, 0)
+            return new_major == old_major + 1 and (new_minor, new_patch) == (0, 0)
         if level == "MINOR":
-            # MINOR keeps major and increases minor (0.y.z included).
-            return new_major == old_major and new_minor > old_minor and new_patch == 0
-        # PATCH: same major.minor, higher patch.
-        return (new_major, new_minor) == (old_major, old_minor) and new_patch > old_patch
+            # MINOR keeps major and increases minor by exactly one.
+            return new_major == old_major and new_minor == old_minor + 1 and new_patch == 0
+        # PATCH: same major.minor, increasing patch by exactly one.
+        return (new_major, new_minor) == (old_major, old_minor) and new_patch == old_patch + 1
 
     satisfied = _bumped(required)
     if not satisfied:
