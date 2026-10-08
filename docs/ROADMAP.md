@@ -34,23 +34,16 @@ Exit condition: accepted architecture decisions and a reversible proof-of-concep
 
 Completed on 2026-07-15. [Issue #7](https://github.com/RandomDevelopment/ci-fleet/issues/7) records the read-only one-job lifecycle proof, scoped cleanup, zero final job residue, controller health, and preservation of existing project runners.
 
-The proof-of-concept checklist was:
+The recorded proof covered:
 
-- Build one runner image.
-- Deploy one test runner without modifying existing runners.
-- Register it with a new experimental label.
-- Add one manual, read-only smoke workflow.
-- Use explicit `permissions: contents: read`.
-- Verify success, failure, cancellation, timeout, cleanup, and runner replacement.
-- Record disk usage before and after the job.
-- Confirm that long-lived controller credentials are unavailable to the job.
+- an organization-owned App and selected private runner group;
+- an isolated controller with `MIN=0` and `MAX=1`;
+- one manually dispatched job with `permissions: contents: read`;
+- one-job ephemeral runner lifecycle and scoped cleanup;
+- zero final job residue and controller health;
+- preservation of existing project runners.
 
-Exit condition:
-
-- the runner processes exactly one job;
-- no job-owned container, network, volume, or workspace residue remains;
-- existing CI remains unchanged and its checks pass;
-- rollback requires removing only the experimental runner and workflow.
+Each project still needs failure, cancellation, timeout, repeated-run, and rollback evidence before migration cutover.
 
 ## Phase 3: Parallel project validation
 
