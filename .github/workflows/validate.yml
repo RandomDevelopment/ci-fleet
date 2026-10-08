@@ -66,12 +66,21 @@ jobs:
       - name: Validate proposed commit messages
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG_NAME: ${{ github.ref_name }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           # The merge base selects commits, never executable validation policy.
           if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
-            BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+            if [[ "$REF_TYPE" == tag ]]; then
+              BASE_SHA="$(python3 "$RUNNER_TEMP/trusted-validator.py" --release-base-for "$HEAD_SHA" --exclude-tag "$TAG_NAME")"
+              if [[ -z "$BASE_SHA" ]]; then
+                BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+              fi
+            else
+              BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+            fi
           fi
           python3 "$RUNNER_TEMP/trusted-validator.py" --base "$BASE_SHA" --head "$HEAD_SHA"
 
@@ -84,6 +93,9 @@ jobs:
           # Tag policy uses the same current-main validator loaded above.
           validator="$RUNNER_TEMP/trusted-validator.py"
           RELEASE_BASE="$(python3 "$validator" --release-base-for "$TAG_COMMIT" --exclude-tag "$TAG_NAME")"
+          if [[ -n "$RELEASE_BASE" ]]; then
+            python3 "$validator" --base "$RELEASE_BASE" --head "$TAG_COMMIT"
+          fi
           # Stable tags must point into the main line (fetch-depth 0 gives us
           # origin/main); prerelease tags must NOT point into it (they are
           # branch-local per docs/CONTRIBUTING.md).
@@ -106,6 +118,8 @@ jobs:
       - name: Scan every proposed commit for secrets
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG_NAME: ${{ github.ref_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -118,7 +132,13 @@ jobs:
           fi
           git show "$TRUSTED_SHA:scripts/scan_committed_secrets.py" >"$scanner"
           if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
-            BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+            if [[ "$REF_TYPE" == tag ]]; then
+              validator="$RUNNER_TEMP/trusted-release-validator.py"
+              git show "$TRUSTED_SHA:scripts/validate_commits.py" >"$validator"
+              BASE_SHA="$(python3 "$validator" --release-base-for "$HEAD_SHA" --exclude-tag "$TAG_NAME")"
+            else
+              BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
+            fi
           fi
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
             git rev-list --reverse "$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
