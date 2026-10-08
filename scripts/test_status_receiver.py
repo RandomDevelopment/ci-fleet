@@ -92,6 +92,37 @@ class StatusReceiverTests(unittest.TestCase):
         self.submit(report)
         self.assertEqual(self.receiver.latest("example-ci-01", "reader-token"), report)
 
+    def test_network_aggregates_are_optional_but_strict_when_present(self) -> None:
+        current = valid_report()
+        current["docker"]["network"] = {"configured": 16, "used": 2, "free": 14, "legacy": 0}
+        self.submit(current)
+        self.assertEqual(self.receiver.latest("example-ci-01", "reader-token"), current)
+
+        for malformed in (
+            {"configured": 16, "used": 2, "free": 14},
+            {"configured": 16, "used": -1, "free": 17, "legacy": 0},
+            {"configured": 16, "used": 2, "free": 15, "legacy": 0},
+            {"configured": 16, "used": True, "free": 15, "legacy": 0},
+        ):
+            report = valid_report(generated_at=1_001)
+            report["docker"]["network"] = malformed
+            self.assert_status_error(400, "invalid_report", lambda report=report: self.submit(report, timestamp=1_001, nonce="b" * 32))
+
+    def test_present_null_network_is_rejected(self) -> None:
+        report = valid_report()
+        report["docker"]["network"] = None
+        self.assert_status_error(400, "invalid_report", lambda: self.submit(report))
+
+    def test_non_object_docker_sections_are_rejected_cleanly(self) -> None:
+        for index, malformed in enumerate((None, [], "docker", 1)):
+            report = valid_report(generated_at=1_010 + index)
+            report["docker"] = malformed
+            self.assert_status_error(
+                400,
+                "invalid_report",
+                lambda report=report, index=index: self.submit(report, timestamp=1_010 + index, nonce=f"{index:032x}"),
+            )
+
     def test_concurrent_report_writes_are_serialized(self) -> None:
         body, headers = self.signed(
             valid_report("other-ci-01"), controller="other-ci-01", key=b"other-key"

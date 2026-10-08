@@ -13,6 +13,13 @@ Schema v3 makes a reviewed private configuration repository the authority for co
 
 Host addresses, VM IDs, storage names, backup identifiers, SSH details, tokens, private keys, and rendered `.env` files are rejected from the Git-authored configuration.
 
+Private policy has one explicit Docker address exception. Reviewed
+`docker_network_policy.default_address_pools[].base` CIDRs define allocation
+pools. The optional `docker_network_policy.default_bridge_cidr` defines the
+Docker default bridge gateway/interface and prefix. These values are capacity
+policy, not host identity, credentials, or routable service endpoints. The
+exception does not admit other infrastructure addresses or runtime details.
+
 ## Schema v3
 
 Each runner pool declares:
@@ -32,9 +39,72 @@ Each controller has a unique object key and declares:
 - `experimental`, `stable`, or `retiring` lifecycle;
 - a full pinned ci-fleet engine commit;
 - a zero managed minimum and reviewed maximum runner capacity;
-- CPU cores and memory per ephemeral runner.
+- CPU cores and memory per ephemeral runner;
+- reviewed Docker default-address pools, an optional default-bridge gateway CIDR,
+  a positive per-runner network bound, and a reserved subnet count.
 
 Active and drained controllers reserve their configured maximum against the pool budget. A drained controller has zero effective runtime capacity but keeps its reservation, so an undrain cannot silently overcommit the pool. Disabled controllers reserve no capacity.
+
+The Docker network policy uses IPv4 CIDR `base` values and a Docker subnet
+prefix `size` no longer than `/29`, which leaves enough addresses for an
+ordinary Compose network. A policy may declare at most 64 pools. Validation
+rejects malformed or overlapping pools, allocation prefixes broader than their
+base, and active or drained policies with fewer subnets than
+`max_runners * networks_per_runner + reserve_subnets + 1`. The final subnet is reserved for the
+persistent controller Compose network. Disabled controllers do not reserve
+runner subnet capacity, but their retained policy must still cover the reserve
+and controller network. `default_bridge_cidr`, when present, is an IPv4
+interface address and prefix such as `192.0.2.1/28`, not a canonical network
+base. Its address must be a usable gateway, its prefix must leave room for
+containers, and its subnet must not overlap any default-address pool. After
+excluding the network, broadcast, and bridge gateway addresses, it must provide
+at least `max_runners + reserve_subnets` container addresses. Size the
+default bridge for concurrent containers attached without an explicit network.
+Size `default_address_pools` separately for job and controller networks. The
+existing `max_runners * networks_per_runner + reserve_subnets + 1` arithmetic
+applies only to those pools.
+
+Real Docker network values belong only in the private desired-state repository
+under the narrow exception above. Public examples use RFC 5737 documentation
+ranges, which strict validation rejects until the operator supplies reviewed
+operational CIDRs.
+
+`docker_network_policy` is optional only to preserve a staged upgrade path from
+older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
+an existing controller in three reviewed desired-state commits. First change
+only `engine_ref`. After routine reconciliation shows that exact engine is active,
+record `docker_network_policy_config: true` for that controller and ref in
+`engine-rollout-evidence.json`. Only then add the reviewed network policy without
+changing the engine or evidence. Transition validation reads the evidence from
+the previous integrated state, so a commit that adds evidence and policy together
+cannot satisfy the gate. Do not add the field while the old engine still performs
+reconciliation. Once present, the policy requires current evidence naming the
+selected engine and declaring `docker_network_policy_config: true`. Adding
+`default_bridge_cidr` to an existing policy has the same prior-state gate with
+`docker_default_bridge_cidr_config: true`. A retained bridge field requires
+matching current evidence. The selected engine manifest must advertise
+`docker_network_policy_config`, `docker_network_policy_adapter`, and, when the
+bridge field is present, `docker_default_bridge_cidr_config`. Remove unsupported
+fields before selecting an older engine.
+
+This accepted phase permits the executable policy stage to own Docker's
+`default-address-pools` key and, only when configured, its `bip` key. The stage
+records each prior key's presence and value in the existing root-only checkpoint,
+then drains the controller and managed runners. It rejects incompatible daemon
+authority such as `fixed-cidr` before the drain. The transaction writes only the
+managed keys, restarts Docker, verifies the effective default-bridge subnet and
+gateway when `bip` is owned, runs the bounded capacity probe, resumes the
+controller, and checks health against the candidate rendered environment.
+
+On interruption or failure, rollback must restore the managed keys and prior
+rendered environment from the checkpoint, restart Docker, verify effective
+network state, resume the prior controller state, and verify prior health. A
+failed rollback must retain its recovery checkpoint. Rollout requires exact-head
+CI and proof for the reviewed
+engine and desired-state commits before any host mutation. No deployment occurs
+in this PR. This scope does not create or remove networks, prune resources,
+alter controller scale, change downstream-consumer labels, or authorize
+application production deployment.
 
 Managed prewarmed runners are not currently supported: `min_runners` is fixed at zero in schema, semantic validation, rendering, and preflight. This keeps idle privileged workers absent and prevents reviewed configuration from passing validation only to fail host adoption.
 
@@ -62,6 +132,8 @@ GitHub App and runner-group creation remain the bootstrap responsibility tracked
 
 ## Install a fresh controller
 
+The managed installer supports Debian 12 or newer. Before reading configuration or changing the host, it verifies Docker Engine and Compose v2, Git, curl, jq, the system CA bundle, direct Docker-socket access, and that the Docker filesystem is below the documented 80% warning threshold. It rejects alternate Docker endpoints and contexts, then pins every lifecycle command to the verified local Unix socket. Rollback and uninstall require only their recovery tools, not Git, tar, cmp, host-release metadata, CA bootstrap, or capacity checks.
+
 Run the command from a reviewed checkout of ci-fleet on the target Linux Docker machine:
 
 ```bash
@@ -81,12 +153,13 @@ The installer:
 3. selects exactly one logical controller;
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
-6. creates a root-only controller checkpoint;
-7. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
-8. runs managed preflight and builds the pinned runner and controller images;
-9. installs health, cleanup, and pinned-state drift unit definitions;
-10. starts the controller only when its desired state is active and verifies runtime health;
-11. atomically records redacted installation state, then enables the maintenance timers.
+6. validates the candidate Compose configuration and builds images before the transaction when no active installed controller uses the candidate runner tag;
+7. creates a root-only controller checkpoint;
+8. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
+9. runs managed preflight and, when the candidate would retag the active controller's runner image, builds the images after drain;
+10. installs health, cleanup, and pinned-state drift unit definitions;
+11. starts the controller only when its desired state is active and verifies runtime health;
+12. atomically records redacted installation state, then enables the maintenance timers.
 
 A successful second `--install` run reports `NO_CHANGE` and performs no unnecessary replacement. A successful engine upgrade advances both the runtime release and the maintenance installer-manager to the same pinned commit; rollback restores both.
 
@@ -185,9 +258,9 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Build and validation happen before the active release changes. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Compose validation happens before the checkpoint. A build using a distinct inert runner tag may also happen before the checkpoint; failure may leave candidate image or layer artifacts, but installed state and the active controller remain unchanged. A build that would retag the active controller's runner image happens only after checkpoint and drain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
 
-Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy.
+Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy. Rollback is a bounded convenience, not a guarantee that every catastrophic or major-version interruption leaves the controller operational. The installer repairs only canonical, digest-valid artifacts from their pinned revisions; otherwise it fails closed and reports that an operator must recover or reinstall from reviewed desired state rather than executing untrusted rollback material.
 
 Monitoring thresholds, heartbeat endpoints, and backup hooks are host-local operational facts, not fleet desired state. Keep them in the protected file documented by [Fleet health monitoring](HEALTH-MONITORING.md); the installer preserves that file across upgrades and rollback.
 

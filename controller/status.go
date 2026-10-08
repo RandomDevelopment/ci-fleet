@@ -53,14 +53,12 @@ func (s *Scaler) writeStatus() {
 	if err != nil { s.logger.Warn("write controller status", "error", err) }
 }
 
-func (s *Scaler) publishStatus(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func (s *Scaler) publishStatus(ctx context.Context, ticks <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			s.writeStatus()
 		}
 	}

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -28,8 +29,40 @@ HOST_REQUIRED = {
     "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE",
 }
 HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
+RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
+    "CI_FLEET_CAPACITY_BUDGET",
+    "CI_FLEET_COMMIT",
+    "CI_FLEET_CONFIGURED_MAX_RUNNERS",
+    "CI_FLEET_CONFIG_REF",
+    "CI_FLEET_CONFIG_REPOSITORY",
+    "CI_FLEET_CONTROLLER_IMAGE",
+    "CI_FLEET_CONTROLLER_STATE",
+    "CI_FLEET_DESIRED_STATE_SCHEMA",
+    "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT",
+    "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR",
+    "CI_FLEET_DOCKER_GID",
+    "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
+    "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
+    "CI_FLEET_ENGINE_REF",
+    "CI_FLEET_GITHUB_URL",
+    "CI_FLEET_INSTANCE",
+    "CI_FLEET_LABELS",
+    "CI_FLEET_MAX_RUNNERS",
+    "CI_FLEET_MIN_RUNNERS",
+    "CI_FLEET_RUNNER_CPUS",
+    "CI_FLEET_RUNNER_GROUP",
+    "CI_FLEET_RUNNER_IMAGE",
+    "CI_FLEET_RUNNER_MEMORY_MIB",
+    "CI_FLEET_SCALE_SET_NAME",
+    "CI_FLEET_STATUS_REPORTING_REQUIRED",
+    "CI_FLEET_VERSION",
+}
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
+DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
+DOCKER_NETWORK_POLICY_ADAPTER_CAPABILITY = "docker_network_policy_adapter"
+DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY = "docker_default_bridge_cidr_config"
+MAX_DOCKER_ADDRESS_POOLS = 64
 
 
 class DesiredStateError(ValueError):
@@ -110,6 +143,21 @@ def parse_env(path: Path, *, allow_unknown: bool) -> dict[str, str]:
     return values
 
 
+def rendered_env_names(values: dict[str, str]) -> set[str]:
+    names = set(RENDERED_ENV_NAMES)
+    try:
+        count = int(values.get("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT", "0"))
+    except ValueError:
+        count = 0
+    if 0 < count <= MAX_DOCKER_ADDRESS_POOLS:
+        names.update(
+            f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_{field}"
+            for index in range(count)
+            for field in ("BASE", "SIZE")
+        )
+    return names
+
+
 def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     missing = sorted(HOST_REQUIRED - values.keys())
     if missing:
@@ -135,6 +183,203 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
         "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": key_file,
         "CI_FLEET_RUNNER_TTL": ttl,
     }
+
+
+def validate_docker_address_pools(pools: Any, *, path: str) -> list[dict[str, Any]]:
+    if type(pools) is not list or not pools:
+        raise DesiredStateError(f"{path}: must be a non-empty list")
+    if len(pools) > MAX_DOCKER_ADDRESS_POOLS:
+        raise DesiredStateError(f"{path}: must not exceed {MAX_DOCKER_ADDRESS_POOLS} pools")
+    parsed: list[dict[str, Any]] = []
+    for index, pool in enumerate(pools):
+        pool_path = f"{path}[{index}]"
+        if not isinstance(pool, dict) or set(pool) != {"base", "size"}:
+            raise DesiredStateError(f"{pool_path}: must contain only base and size")
+        base = pool.get("base")
+        size = pool.get("size")
+        if not isinstance(base, str):
+            raise DesiredStateError(f"{pool_path}.base: must be a CIDR prefix")
+        if type(size) is not int or size < 0 or size > 29:
+            raise DesiredStateError(f"{pool_path}.size: must be an IPv4 prefix length between 0 and 29")
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError as exc:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix") from exc
+        if network.version != 4:
+            raise DesiredStateError(f"{pool_path}.base: malformed IPv4 prefix")
+        if size < network.prefixlen:
+            raise DesiredStateError(f"{pool_path}.size: impossible subnet count for {base}")
+        parsed.append({"base": base, "network": network, "size": size})
+    for left, item in enumerate(parsed):
+        for right in range(left + 1, len(parsed)):
+            other = parsed[right]
+            if item["network"].overlaps(other["network"]):
+                raise DesiredStateError(f"{path}[{left}].base: overlaps configured pool {right}")
+    return parsed
+
+
+def validate_ipv4_interface_cidr(value: Any, *, path: str) -> ipaddress.IPv4Interface:
+    if not isinstance(value, str):
+        raise DesiredStateError(f"{path}: must be an IPv4 interface CIDR")
+    try:
+        interface = ipaddress.ip_interface(value)
+    except ValueError as exc:
+        raise DesiredStateError(f"{path}: malformed IPv4 interface CIDR") from exc
+    if interface.version != 4:
+        raise DesiredStateError(f"{path}: must be an IPv4 interface CIDR")
+    return interface
+
+
+def validate_default_bridge_cidr(value: Any, *, path: str) -> ipaddress.IPv4Interface:
+    interface = validate_ipv4_interface_cidr(value, path=path)
+    if interface.network.prefixlen > 29:
+        raise DesiredStateError(f"{path}: prefix must provide at least six usable addresses")
+    if interface.ip in {interface.network.network_address, interface.network.broadcast_address}:
+        raise DesiredStateError(f"{path}: must use a usable host address as the bridge gateway")
+    return interface
+
+
+def validate_docker_network_policy(policy: dict[str, Any], *, path: str, max_runners: int) -> tuple[int, int, int, list[dict[str, Any]]]:
+    if not isinstance(policy, dict):
+        raise DesiredStateError(f"{path}: must be an object")
+    required = {"default_address_pools", "networks_per_runner", "reserve_subnets"}
+    optional = {"default_bridge_cidr"}
+    if not required <= set(policy) or set(policy) - required - optional:
+        unknown = sorted(set(policy) - required - optional)
+        missing = sorted(required - set(policy))
+        messages: list[str] = []
+        if missing:
+            messages.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            messages.append(f"unknown keys: {', '.join(unknown)}")
+        raise DesiredStateError(f"{path}: " + "; ".join(messages))
+    reserve = policy.get("reserve_subnets")
+    if type(reserve) is not int or reserve < 1:
+        raise DesiredStateError(f"{path}.reserve_subnets: must be a positive integer")
+    networks_per_runner = policy.get("networks_per_runner")
+    if type(networks_per_runner) is not int or networks_per_runner < 1:
+        raise DesiredStateError(f"{path}.networks_per_runner: must be a positive integer")
+    parsed = validate_docker_address_pools(policy.get("default_address_pools"), path=f"{path}.default_address_pools")
+    if "default_bridge_cidr" in policy:
+        bridge = validate_default_bridge_cidr(policy["default_bridge_cidr"], path=f"{path}.default_bridge_cidr")
+        if any(bridge.network.overlaps(item["network"]) for item in parsed):
+            raise DesiredStateError(f"{path}.default_bridge_cidr: must not overlap default_address_pools")
+        if bridge.network.num_addresses - 3 < max_runners + reserve:
+            raise DesiredStateError(
+                f"{path}.default_bridge_cidr: must provide at least max_runners + reserve_subnets usable container addresses"
+            )
+    configured = sum(1 << (item["size"] - item["network"].prefixlen) for item in parsed)
+    if configured < max_runners * networks_per_runner + reserve + 1:
+        raise DesiredStateError(
+            f"{path}: network capacity cannot satisfy max_runners * networks_per_runner + reserve_subnets + one controller Compose network"
+        )
+    return configured, reserve, networks_per_runner, parsed
+
+
+def render_docker_daemon_config(rendered: dict[str, str]) -> dict[str, Any]:
+    """Build the Docker daemon.json ``default-address-pools`` block from rendered env.
+
+    Reads only the already-validated ``CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_*``
+    values produced by ``build_rendered_env``. Returns a dict suitable for
+    merging into ``daemon.json``. When no policy was rendered, returns an empty
+    dict (no ``default-address-pools`` key).
+    """
+    count_name = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"
+    pool_prefix = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
+    policy_configured = count_name in rendered
+    if not policy_configured:
+        if any(
+            name.startswith(pool_prefix)
+            or name in {
+                "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR",
+                "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
+                "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
+            }
+            for name in rendered
+        ):
+            raise ValueError("rendered Docker network policy fields must include the pool count")
+        if not rendered:
+            return {}
+    count_str = rendered.get(count_name, "0")
+    try:
+        count = int(count_str)
+    except ValueError as exc:
+        raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be an integer, got {count_str!r}") from exc
+    if count < 0:
+        raise ValueError("CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must be non-negative")
+    if count > MAX_DOCKER_ADDRESS_POOLS:
+        raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT: must not exceed {MAX_DOCKER_ADDRESS_POOLS}")
+    actual_pool_fields = {name for name in rendered if name.startswith(pool_prefix) and name != f"{pool_prefix}COUNT"}
+    if len(actual_pool_fields) != count * 2:
+        raise ValueError("rendered Docker address-pool indexed fields must match the declared count")
+    expected_pool_fields = {
+        f"{pool_prefix}{index}_{field}"
+        for index in range(count)
+        for field in ("BASE", "SIZE")
+    }
+    if actual_pool_fields != expected_pool_fields:
+        raise ValueError("rendered Docker address-pool indexed fields must match the declared count")
+    pools: list[dict[str, Any]] = []
+    for index in range(count):
+        base = rendered.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE")
+        size_str = rendered.get(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE")
+        if base is None or size_str is None:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE/SIZE: both required when count > 0")
+        try:
+            network = ipaddress.ip_network(base, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: malformed CIDR") from exc
+        if network.version != 4:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE: must be IPv4")
+        try:
+            size = int(size_str)
+        except ValueError as exc:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: must be an integer, got {size_str!r}") from exc
+        if not isinstance(size, int) or size < 0 or size > 29:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: must be between 0 and 29")
+        if size < network.prefixlen:
+            raise ValueError(f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE: impossible subnet count")
+        pools.append({"base": base, "size": size})
+    state = rendered.get("CI_FLEET_CONTROLLER_STATE")
+    if state not in {"active", "drained", "disabled"}:
+        raise ValueError("CI_FLEET_CONTROLLER_STATE: must be active, drained, or disabled")
+    try:
+        configured_max_runners = int(rendered["CI_FLEET_CONFIGURED_MAX_RUNNERS"])
+        effective_max_runners = int(rendered["CI_FLEET_MAX_RUNNERS"])
+        minimum_runners = int(rendered["CI_FLEET_MIN_RUNNERS"])
+        capacity_budget = int(rendered["CI_FLEET_CAPACITY_BUDGET"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("rendered controller capacity fields must be present integers") from exc
+    if minimum_runners != 0:
+        raise ValueError("CI_FLEET_MIN_RUNNERS: must be zero")
+    if capacity_budget < 1:
+        raise ValueError("CI_FLEET_CAPACITY_BUDGET: must be a positive integer")
+    if configured_max_runners < 1:
+        raise ValueError("CI_FLEET_CONFIGURED_MAX_RUNNERS: must be a positive integer")
+    if state != "disabled" and configured_max_runners > capacity_budget:
+        raise ValueError("CI_FLEET_CONFIGURED_MAX_RUNNERS: must not exceed CI_FLEET_CAPACITY_BUDGET")
+    expected_effective_max = configured_max_runners if state == "active" else 0
+    if effective_max_runners != expected_effective_max:
+        raise ValueError("CI_FLEET_MAX_RUNNERS: must match effective controller capacity")
+    if not policy_configured:
+        return {}
+    try:
+        policy = {
+            "default_address_pools": pools,
+            "networks_per_runner": int(rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"]),
+            "reserve_subnets": int(rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"]),
+        }
+    except (KeyError, ValueError) as exc:
+        raise ValueError("rendered Docker network policy fields must be present integers") from exc
+    bridge_cidr = rendered.get("CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR")
+    if bridge_cidr is not None:
+        policy["default_bridge_cidr"] = bridge_cidr
+    max_runners = 0 if state == "disabled" else configured_max_runners
+    validate_docker_network_policy(policy, path="rendered Docker network policy", max_runners=max_runners)
+    daemon = {"default-address-pools": pools}
+    if bridge_cidr is not None:
+        daemon["bip"] = bridge_cidr
+    return daemon
 
 
 def select_controller(config: dict[str, Any], controller_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -169,6 +414,24 @@ def build_rendered_env(
     state = controller["state"]
     configured_max = controller["max_runners"]
     effective_max = configured_max if state == "active" else 0
+    network_policy_configured = "docker_network_policy" in controller
+    network_policy = controller.get("docker_network_policy")
+    configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = (0, 0, 0, [])
+    if network_policy_configured:
+        configured_subnets, reserve_subnets, networks_per_runner, parsed_pools = validate_docker_network_policy(
+            network_policy,
+            path=f"$.controllers.{controller_id}.docker_network_policy",
+            max_runners=configured_max if state != "disabled" else 0,
+        )
+        if DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support Docker network policy configuration")
+        if DOCKER_NETWORK_POLICY_ADAPTER_CAPABILITY not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support the Docker network policy adapter")
+        if (
+            "default_bridge_cidr" in network_policy
+            and DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY not in (engine_capabilities or set())
+        ):
+            raise DesiredStateError("selected engine does not support default bridge CIDR configuration")
     short_commit = engine_commit[:12]
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
@@ -194,6 +457,15 @@ def build_rendered_env(
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if network_policy_configured:
+        rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
+        rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"] = str(networks_per_runner)
+        rendered["CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS"] = str(reserve_subnets)
+        if "default_bridge_cidr" in network_policy:
+            rendered["CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR"] = network_policy["default_bridge_cidr"]
+        for index, pool_config in enumerate(parsed_pools):
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
+            rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):
@@ -202,6 +474,8 @@ def build_rendered_env(
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if reporting_required:
         rendered["CI_FLEET_STATUS_REPORTING_REQUIRED"] = "1"
+    if set(rendered) - rendered_env_names(rendered):
+        raise DesiredStateError("renderer produced unsupported environment fields")
     for name, value in rendered.items():
         if not SAFE_ENV_VALUE.fullmatch(value):
             raise DesiredStateError(f"rendered value for {name} contains unsafe characters")
@@ -222,6 +496,14 @@ def build_rendered_env(
         "engine_repository": config["organization"]["delivery_engine"],
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
+        "docker_network_policy_configured": network_policy_configured,
+        "docker_default_bridge_cidr_configured": bool(
+            network_policy_configured and "default_bridge_cidr" in network_policy
+        ),
+        "docker_network_default_address_pools": len(parsed_pools),
+        "docker_networks_per_runner": networks_per_runner,
+        "docker_network_reserve_subnets": reserve_subnets,
+        "docker_network_configured_subnets": configured_subnets,
     }
     return rendered, metadata
 
@@ -288,6 +570,10 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
+    if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support Docker network policy configuration")
+    if args.require_docker_default_bridge_cidr_config and DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not support default bridge CIDR configuration")
     if args.require_status_reporting_config and STATUS_REPORTING_CONFIG_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
@@ -327,6 +613,8 @@ def parse_args() -> argparse.Namespace:
 
     capabilities = subparsers.add_parser("validate-engine-capabilities", help="validate an engine capability declaration")
     capabilities.add_argument("--manifest", type=Path, required=True)
+    capabilities.add_argument("--require-docker-network-policy-config", action="store_true")
+    capabilities.add_argument("--require-docker-default-bridge-cidr-config", action="store_true")
     capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)

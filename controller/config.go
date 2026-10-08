@@ -28,6 +28,8 @@ type Config struct {
 	DockerGID       string
 	RunnerTTL       time.Duration
 	StatusFile      string
+	DockerNetworksPerRunner     int
+	DockerNetworkReserveSubnets int
 }
 
 func configFromEnv() (Config, error) {
@@ -61,6 +63,10 @@ func configFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("CI_FLEET_RUNNER_TTL: %w", err)
 	}
+	dockerNetworksPerRunner, err := envInt("CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", 0)
+	if err != nil { return Config{}, err }
+	dockerNetworkReserveSubnets, err := envInt("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", 0)
+	if err != nil { return Config{}, err }
 
 	fleetInstance := strings.TrimSpace(os.Getenv("CI_FLEET_INSTANCE"))
 	scaleSetName := strings.TrimSpace(os.Getenv("CI_FLEET_SCALE_SET_NAME"))
@@ -87,6 +93,8 @@ func configFromEnv() (Config, error) {
 		DockerGID:    os.Getenv("CI_FLEET_DOCKER_GID"),
 		RunnerTTL:    runnerTTL,
 		StatusFile:   getenv("CI_FLEET_STATUS_FILE", "/run/ci-fleet/status.json"),
+		DockerNetworksPerRunner:     dockerNetworksPerRunner,
+		DockerNetworkReserveSubnets: dockerNetworkReserveSubnets,
 	}
 	return cfg, cfg.Validate()
 }
@@ -121,6 +129,9 @@ func (c Config) Validate() error {
 	}
 	if c.RunnerTTL < time.Hour {
 		return fmt.Errorf("runner TTL must be at least one hour")
+	}
+	if (c.DockerNetworksPerRunner == 0) != (c.DockerNetworkReserveSubnets == 0) || c.DockerNetworksPerRunner < 0 || c.DockerNetworkReserveSubnets < 0 {
+		return fmt.Errorf("Docker network policy requires positive networks-per-runner and reserve-subnets values")
 	}
 	return nil
 }

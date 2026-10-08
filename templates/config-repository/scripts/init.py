@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--location", default="primary-site", help="logical location slug; never an address")
     parser.add_argument("--capacity-budget", type=positive_integer, default=1, help="maximum capacity reserved by the pool")
     parser.add_argument("--max-runners", type=positive_integer, default=1, help="initial controller maximum")
+    parser.add_argument("--networks-per-runner", type=positive_integer, default=1, help="reviewed maximum Compose networks per runner")
+    parser.add_argument("--default-bridge-cidr", help="reviewed IPv4 default bridge gateway and prefix (Docker bip)")
     parser.add_argument("--runner-cpu-cores", type=positive_integer, default=2, help="CPU cores available to each runner")
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
@@ -67,6 +69,9 @@ def main() -> int:
         fail("--engine-ref must be a nonzero full lowercase commit SHA")
     if args.max_runners > args.capacity_budget:
         fail("--max-runners must not exceed --capacity-budget")
+    runner_networks = args.max_runners * args.networks_per_runner
+    if runner_networks > 30:
+        fail("--max-runners multiplied by --networks-per-runner must not exceed 30 so generated Docker networks stay at /29 or larger with reserved capacity")
     if args.runner_memory_mib < 512:
         fail("--runner-memory-mib must be at least 512")
 
@@ -115,6 +120,13 @@ def main() -> int:
                     "cpu_cores": args.runner_cpu_cores,
                     "memory_mib": args.runner_memory_mib,
                 },
+                "docker_network_policy": {
+                    "networks_per_runner": args.networks_per_runner,
+                    "reserve_subnets": 1,
+                    "default_address_pools": [
+                        {"base": "198.51.100.0/24", "size": 24 + (runner_networks + 1).bit_length()},
+                    ],
+                },
             }
         },
         "host_groups": {
@@ -155,6 +167,8 @@ def main() -> int:
             }
         },
     }
+    if args.default_bridge_cidr:
+        config["controllers"][args.controller]["docker_network_policy"]["default_bridge_cidr"] = args.default_bridge_cidr
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent, text=True)
     temporary = Path(temporary_name)
@@ -164,7 +178,7 @@ def main() -> int:
             handle.flush()
             os.fsync(handle.fileno())
         subprocess.run(
-            [str(ROOT / "scripts" / "validate.sh"), "--strict", "--skip-path-scan", "--config", str(temporary)],
+            [str(ROOT / "scripts" / "validate.sh"), "--skip-path-scan", "--config", str(temporary)],
             check=True,
         )
         os.chmod(temporary, 0o644)
@@ -172,7 +186,7 @@ def main() -> int:
     finally:
         temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
-    print("Next: review controller capacity, configure GitHub policy, and keep every secret value outside Git.")
+    print("Next: replace RFC 5737 Docker network values, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
     return 0
 
 
