@@ -335,8 +335,16 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("already exists", result.stderr)
 
-    def test_secret_scan_rejects_an_unresolvable_range(self) -> None:
+    def test_updated_tag_missing_old_object_scans_new_target(self) -> None:
+        self.write(".env", "EXAMPLE=placeholder\n")
+        head = self.commit("fix: prepare moved prerelease")
         result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
+                               BASE_SHA="f" * 40, HEAD_SHA=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_secret_scan_rejects_an_unresolvable_pull_request_range(self) -> None:
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="pull_request",
                                BASE_SHA="not-a-commit", HEAD_SHA=self.head)
         self.assertNotEqual(result.returncode, 0)
 
