@@ -436,7 +436,10 @@ def check_required_bump(
     prior = latest_release_tag(workspace, base)
     if prior is None:
         return []
-    required = suggest_bump(msg for _, msg in commit_messages(base, head, workspace=workspace))
+    messages = commit_messages(base, head, workspace=workspace)
+    if not messages:
+        return [f"release range {base}..{head} contains no commits"]
+    required = suggest_bump(msg for _, msg in messages)
     candidate = parse_version(version)
     assert candidate is not None and prior is not None
     old_major, old_minor, old_patch = prior

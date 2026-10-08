@@ -638,6 +638,30 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("MAJOR", result.stderr)
 
+    def test_release_rejects_an_empty_range(self) -> None:
+        for published in (False, True):
+            with self.subTest(published=published), tempfile.TemporaryDirectory() as directory:
+                self._init_repo(directory)
+                head_sha = self._commit(directory, "feat: initial release")
+                subprocess.run(["git", "-C", directory, "tag", "v0.1.0"], check=True)
+                subprocess.run(
+                    ["git", "-C", directory, "branch", "origin/main", head_sha], check=True,
+                )
+                if published:
+                    subprocess.run(["git", "-C", directory, "tag", "v0.1.1"], check=True)
+                base = self._run(
+                    "--release-base-for", head_sha, "--exclude-tag", "v0.1.1", cwd=directory,
+                )
+                self.assertEqual(base.returncode, 0, base.stderr)
+                self.assertEqual(base.stdout.strip(), "v0.1.0")
+                result = self._run(
+                    "--version", "v0.1.1", "--tag-commit", head_sha,
+                    "--base", base.stdout.strip(), "--head", head_sha,
+                    "--exclude-tag", "v0.1.1", cwd=directory,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("contains no commits", result.stderr)
+
     def test_required_bump_uses_release_base_for_prior_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
