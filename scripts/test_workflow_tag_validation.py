@@ -2,13 +2,17 @@
 """Regression tests for the tag-validation step in .github/workflows/validate.yml.
 
 Finding 3861004945: the release-tag step must run the validator extracted from
-a trusted revision (the merge base with origin/main), never the tagged-tree
+current trusted main, never the tagged-tree
 copy, so a branch-local commit cannot weaken its own tag policy.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -42,19 +46,13 @@ class TrustedTagValidatorTests(unittest.TestCase):
             "a tag push must fail when the trusted revision lacks the validator",
         )
 
-    def test_tag_step_uses_trusted_base_extraction(self) -> None:
-        step = self._tag_step()
-        self.assertIn("trusted-validator.py", step)
-        self.assertIn("merge-base", step)
-        self.assertIn("git show", step)
-
-    def test_push_commit_validation_uses_the_trusted_base(self) -> None:
-        step = self.text.split("- name: Validate proposed commit messages", 1)[1]
-        step = step.split("- name: Validate release tags", 1)[0]
-        self.assertNotIn('[[ "$EVENT_NAME" == pull_request ]] && git cat-file', step)
-        self.assertIn('git show "$BASE_SHA:scripts/validate_commits.py"', step)
-        self.assertIn('elif [[ "$EVENT_NAME" != push ]]; then', step)
-        self.assertIn("trusted commit validator unavailable", step)
+    def test_policy_is_loaded_once_from_current_main(self) -> None:
+        loader = step_script("Load current main commit validator")
+        self.assertIn('git rev-parse origin/main', loader)
+        self.assertIn('git show "$TRUSTED_SHA:scripts/validate_commits.py"', loader)
+        self.assertNotIn("merge-base", loader)
+        self.assertIn("trusted commit validator unavailable", loader)
+        self.assertIn('"$RUNNER_TEMP/trusted-validator.py"', self._tag_step())
 
     def test_tag_step_passes_the_release_range(self) -> None:
         step = self._tag_step()
@@ -72,7 +70,8 @@ class TrustedTagValidatorTests(unittest.TestCase):
     def test_tag_secret_scan_uses_the_trusted_scanner(self) -> None:
         scanner = self.text.split("- name: Scan every proposed commit for secrets", 1)[1]
         self.assertNotIn('[[ "$EVENT_NAME" == pull_request ]] && git cat-file', scanner)
-        self.assertIn('git show "$BASE_SHA:$scanner"', scanner)
+        self.assertIn('git show "$TRUSTED_SHA:scripts/scan_committed_secrets.py"', scanner)
+        self.assertIn("trusted secret scanner unavailable", scanner)
 
     def test_validation_runs_after_failure_but_stops_on_cancellation(self) -> None:
         validate_job = self.text.split("\n  validate:\n", 1)[1]
@@ -95,17 +94,161 @@ class TrustedTagValidatorTests(unittest.TestCase):
         self.assertIn("github.event.created == false", reject)
         self.assertIn("startsWith(github.ref, 'refs/tags/')", reject)
 
-    def test_first_main_push_may_bootstrap_the_validator(self) -> None:
-        step = self.text.split("- name: Validate proposed commit messages", 1)[1]
-        step = step.split("- name: Validate release tags", 1)[0]
-        self.assertIn("REF_NAME: ${{ github.ref }}", step)
-        self.assertIn('"$REF_NAME" == refs/heads/main', step)
-        self.assertIn('git rev-list -1 "$BASE_SHA" -- scripts/validate_commits.py', step)
-        self.assertIn('git cat-file -e "$HEAD_SHA:scripts/validate_commits.py"', step)
-
     def test_repository_validation_runs_this_suite(self) -> None:
         validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/test_workflow_tag_validation.py", validation)
+
+
+def step_script(name: str) -> str:
+    step = WORKFLOW.read_text().split(f"      - name: {name}\n", 1)[1]
+    step = step.split("\n      - name:", 1)[0].split("\n  validate:", 1)[0]
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+
+class WorkflowExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.runtime = Path(self.temp.name) / "runtime"
+        self.runtime.mkdir()
+        self.env = {**os.environ, "RUNNER_TEMP": str(self.runtime),
+                    "GITHUB_WORKSPACE": str(self.repo), "BASE_REF": "main"}
+        self.git("init", "-b", "main")
+        self.git("config", "user.name", "CI test")
+        self.git("config", "user.email", "ci@example.invalid")
+        self.git("remote", "add", "origin", str(self.repo))
+        # Both the branch's merge base and tagged tree carry obsolete policy.
+        self.write("scripts/validate_commits.py", "raise SystemExit(0)\n")
+        self.write("scripts/scan_committed_secrets.py", "raise SystemExit(0)\n")
+        self.base = self.commit("feat: introduce old policy")
+        self.git("checkout", "-b", "prerelease")
+        self.write("payload.txt", "ordinary test payload\n")
+        self.head = self.commit("fix: prepare prerelease")
+        self.git("checkout", "main")
+        for script in ("validate_commits.py", "scan_committed_secrets.py"):
+            self.write("scripts/" + script, (ROOT / "scripts" / script).read_text())
+        self.main = self.commit("fix: harden validation policy")
+        self.git("checkout", "prerelease")
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=self.repo, env=self.env,
+                                capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    def write(self, name: str, content: str) -> None:
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def commit(self, message: str) -> str:
+        self.git("add", "--all")
+        self.git("commit", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def run_step(self, name: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", "-euo", "pipefail", "-c", step_script(name)],
+                              cwd=self.repo, env={**self.env, **env},
+                              capture_output=True, text=True)
+
+    def load_validator(self, event: str = "push", head: str | None = None):
+        return self.run_step("Load current main commit validator",
+                             EVENT_NAME=event, HEAD_SHA=head or self.head)
+
+    def test_manual_existing_prerelease_tag_runs_current_main_policy(self) -> None:
+        self.git("tag", "v0.1.0-rc.1")
+        # Evaluate the workflow guard with GitHub's missing-created coercion.
+        guard = WORKFLOW.read_text().split("- name: Reject updates to published tags", 1)[1]
+        guard = guard.split("if: ${{ ", 1)[1].split(" }}", 1)[0]
+        for event, created, expected in (("workflow_dispatch", False, False),
+                                          ("push", False, True), ("push", True, False)):
+            expression = guard.replace("github.event_name", repr(event))
+            expression = expression.replace("startsWith(github.ref, 'refs/tags/')", "True")
+            expression = expression.replace("github.event.created", repr(created))
+            expression = expression.replace("false", "False").replace("&&", " and ")
+            self.assertEqual(eval(expression, {"__builtins__": {}}, {}), expected)
+        result = self.load_validator("workflow_dispatch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_step("Validate proposed commit messages",
+                               EVENT_NAME="workflow_dispatch", BASE_SHA="", HEAD_SHA=self.head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_step("Validate release tags are SemVer 2.0.0",
+                               TAG_NAME="v0.1.0-rc.1", TAG_COMMIT=self.head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_old_merge_base_does_not_supply_commit_or_tag_policy(self) -> None:
+        self.assertEqual(self.load_validator().returncode, 0)
+        self.assertEqual(self.git("merge-base", self.head, "origin/main"), self.base)
+        self.write("payload.txt", "changed\n")
+        bad_head = self.commit("invalid commit message")
+        result = self.run_step("Validate proposed commit messages", EVENT_NAME="push",
+                               BASE_SHA="0" * 40, HEAD_SHA=bad_head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
+        for tag in ("v0.1.0-01", "v0.1.0"):
+            result = self.run_step("Validate release tags are SemVer 2.0.0",
+                                   TAG_NAME=tag, TAG_COMMIT=self.head)
+            self.assertNotEqual(result.returncode, 0, tag)
+
+    def test_current_scanner_inspects_intermediate_prerelease_commits(self) -> None:
+        # No real secret: the current scanner forbids this filename itself.
+        self.write(".env", "EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden environment file")
+        (self.repo / ".env").unlink()
+        head = self.commit("fix: remove forbidden environment file")
+        result = self.run_step("Scan every proposed commit for secrets",
+                               EVENT_NAME="push", BASE_SHA="0" * 40, HEAD_SHA=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_missing_policy_fails_closed_even_when_tagged_copy_exists(self) -> None:
+        self.git("checkout", "main")
+        self.git("rm", "scripts/validate_commits.py", "scripts/scan_committed_secrets.py")
+        self.commit("fix: remove policy")
+        self.git("checkout", "prerelease")
+        for event in ("push", "workflow_dispatch", "pull_request"):
+            result = self.load_validator(event)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("trusted commit validator unavailable", result.stderr)
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
+                               BASE_SHA=self.base, HEAD_SHA=self.head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted secret scanner unavailable", result.stderr)
+
+    def test_initial_validator_introduction_and_first_main_push(self) -> None:
+        # Use the fixture's scanner history but a new validator path history.
+        self.git("checkout", "--orphan", "bootstrap-main")
+        self.git("rm", "-rf", ".")
+        self.write("README.md", "bootstrap fixture\n")
+        before = self.commit("docs: prepare bootstrap")
+        self.git("branch", "-f", "main", before)
+        self.git("checkout", "-b", "bootstrap-pr")
+        self.write("scripts/validate_commits.py", (ROOT / "scripts/validate_commits.py").read_text())
+        head = self.commit("feat: introduce validator")
+        result = self.load_validator("pull_request", head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for event in ("push", "workflow_dispatch"):
+            result = self.load_validator(event, head)
+            self.assertNotEqual(result.returncode, 0)
+        self.git("branch", "-f", "main", head)
+        result = self.load_validator("push", head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_step("Validate proposed commit messages", EVENT_NAME="push",
+                               BASE_SHA=before, HEAD_SHA=head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_new_stable_tag_allows_empty_proposed_commit_range(self) -> None:
+        self.assertEqual(self.load_validator().returncode, 0)
+        result = self.run_step("Validate proposed commit messages", EVENT_NAME="push",
+                               BASE_SHA="0" * 40, HEAD_SHA=self.main)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no commits to validate", result.stdout)
+
+    def test_secret_scan_rejects_an_unresolvable_range(self) -> None:
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
+                               BASE_SHA="not-a-commit", HEAD_SHA=self.head)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

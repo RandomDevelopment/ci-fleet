@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Reject updates to published tags
-        if: ${{ startsWith(github.ref, 'refs/tags/') && github.event.created == false }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.created == false }}
         run: |
           echo "published tags must not be moved" >&2
           exit 1
@@ -36,65 +36,44 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Load current main commit validator
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          TRUSTED_SHA="$(git rev-parse origin/main)"
+          validator="$RUNNER_TEMP/trusted-validator.py"
+          if git cat-file -e "$TRUSTED_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            git show "$TRUSTED_SHA:scripts/validate_commits.py" >"$validator"
+          elif [[ "$EVENT_NAME" == pull_request && "$BASE_REF" == main ]] && \
+               [[ -z "$(git rev-list -1 "$TRUSTED_SHA" -- scripts/validate_commits.py)" ]] && \
+               git cat-file -e "$HEAD_SHA:scripts/validate_commits.py" 2>/dev/null; then
+            # Bootstrap only the PR introducing the validator before it has any main history.
+            git show "$HEAD_SHA:scripts/validate_commits.py" >"$validator"
+          else
+            echo "trusted commit validator unavailable at '$TRUSTED_SHA'" >&2
+            exit 1
+          fi
+
       - name: Validate pull-request title
         if: ${{ github.event_name == 'pull_request' }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          # The convention checks must run trusted code: a PR can edit its own
-          # copy of the validator, so extract it from the base revision when it
-          # exists there. This first PR bootstraps the gate before the script
-          # exists on main; until then the checkout copy is the only available
-          # implementation, and this same commit lands it so the next merge
-          # base contains it and later PRs are fully trusted.
-          validator="$RUNNER_TEMP/trusted-validator.py"
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          if git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
-            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
-          else
-            cp scripts/validate_commits.py "$validator"
-          fi
-          python3 "$validator" --pr-title "$PR_TITLE"
+        run: python3 "$RUNNER_TEMP/trusted-validator.py" --pr-title "$PR_TITLE"
 
       - name: Validate proposed commit messages
         env:
           EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          # Validate only commits proposed on this ref (base..head). Commits
-          # already on the base branch are never re-checked. The validator is
-          # shallow-clone safe: an empty base or empty range falls back to the
-          # head commit alone. For workflow_dispatch, validate only HEAD.
-          #
-          # Like the secret scanner below, the validator itself is extracted
-          # from the trusted base revision when available, so a push cannot
-          # pass these gates by editing its own copy of the script. This PR
-          # still needs its checkout copy until the validator lands on main.
-          # A newly created tag reports an all-zero `before`, which makes
-          # `git rev-list <zero>..<tag>` fail and silently reduce validation
-          # to the tagged commit alone. Derive the real range start from the
-          # merge base with origin/main so every commit behind a branch-local
-          # (prerelease) tag is validated too. workflow_dispatch keeps its
-          # intentional HEAD-only behavior.
+          # The merge base selects commits, never executable validation policy.
           if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
             BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
           fi
-          validator="$RUNNER_TEMP/trusted-validator.py"
-          if git cat-file -e "$BASE_SHA:scripts/validate_commits.py" 2>/dev/null; then
-            git show "$BASE_SHA:scripts/validate_commits.py" >"$validator"
-          elif [[ "$EVENT_NAME" != push ]]; then
-            cp scripts/validate_commits.py "$validator"
-          elif [[ "$REF_NAME" == refs/heads/main ]] && \
-               [[ -z "$(git rev-list -1 "$BASE_SHA" -- scripts/validate_commits.py)" ]] && \
-               git cat-file -e "$HEAD_SHA:scripts/validate_commits.py" 2>/dev/null; then
-            git show "$HEAD_SHA:scripts/validate_commits.py" >"$validator"
-          else
-            echo "trusted commit validator unavailable at '$BASE_SHA'" >&2
-            exit 1
-          fi
-          python3 "$validator" --base "$BASE_SHA" --head "$HEAD_SHA"
+          python3 "$RUNNER_TEMP/trusted-validator.py" --base "$BASE_SHA" --head "$HEAD_SHA"
 
       - name: Validate release tags are SemVer 2.0.0
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -102,19 +81,8 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
           TAG_COMMIT: ${{ github.sha }}
         run: |
-          # Like the commit gates above, tag policy must run trusted code: a
-          # branch-local tagged commit could otherwise weaken its own tag
-          # validation by editing scripts/validate_commits.py. Extract the
-          # validator from the merge base with origin/main and fail closed if
-          # that trusted revision predates the validator.
+          # Tag policy uses the same current-main validator loaded above.
           validator="$RUNNER_TEMP/trusted-validator.py"
-          TRUSTED_SHA="$(git merge-base "$TAG_COMMIT" origin/main)"
-          if git cat-file -e "$TRUSTED_SHA:scripts/validate_commits.py" 2>/dev/null; then
-            git show "$TRUSTED_SHA:scripts/validate_commits.py" >"$validator"
-          else
-            echo "trusted tag validator unavailable at '$TRUSTED_SHA'" >&2
-            exit 1
-          fi
           RELEASE_BASE="$(python3 "$validator" --release-base-for "$TAG_COMMIT" --exclude-tag "$TAG_NAME")"
           # Stable tags must point into the main line (fetch-depth 0 gives us
           # origin/main); prerelease tags must NOT point into it (they are
@@ -141,19 +109,23 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          scanner=scripts/scan_committed_secrets.py
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          TRUSTED_SHA="$(git rev-parse origin/main)"
+          scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
+          if ! git cat-file -e "$TRUSTED_SHA:scripts/scan_committed_secrets.py" 2>/dev/null; then
+            echo "trusted secret scanner unavailable at '$TRUSTED_SHA'" >&2
+            exit 1
+          fi
+          git show "$TRUSTED_SHA:scripts/scan_committed_secrets.py" >"$scanner"
           if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
             BASE_SHA="$(git merge-base "$HEAD_SHA" origin/main)"
           fi
-          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
-            git show "$BASE_SHA:$scanner" >"$RUNNER_TEMP/trusted-secret-scanner.py"
-            scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
-          fi
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-            mapfile -t commits < <(git rev-list --reverse "$HEAD_SHA")
+            git rev-list --reverse "$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
           else
-            mapfile -t commits < <(git rev-list --reverse "$BASE_SHA..$HEAD_SHA")
+            git rev-list --reverse "$BASE_SHA..$HEAD_SHA" >"$RUNNER_TEMP/proposed-commits"
           fi
+          mapfile -t commits <"$RUNNER_TEMP/proposed-commits"
           if [[ ! " ${commits[*]} " == *" $HEAD_SHA "* ]]; then
             commits+=("$HEAD_SHA")
           fi
