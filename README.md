@@ -8,7 +8,7 @@
 
 Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, virtual machines, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
 
-> **Status:** Experimental. Ephemeral runner pilots and multi-job workloads have been proven, and the schema-v3 Git-authored controller installer is available for reviewed adoption testing. The project is not production-ready.
+> **Status:** Controlled migration. The isolated one-job pilot passed on 2026-07-15. Reviewed schema-v3 desired state now governs managed ordinary-CI controller lifecycle. Tester and deployer components remain under review, and production readiness remains gated. See [accepted design decisions](docs/DESIGN-DECISIONS.md).
 
 ## What problem does this solve?
 
@@ -143,15 +143,13 @@ Read-only validation, repository-writing releases, staging, production deploymen
 | --- | --- |
 | Public architecture, standards, examples, and migration rules | Available |
 | Docker runner and controller prototype | Available |
-| First isolated controller host | Deployed |
-| First manually dispatched private-repository pilot job | Proven |
-| Schema-v3 worker-controller installer | Available for experimental install and adoption |
-| downstream service migration | Parallel task-matrix validation in progress |
-| downstream application migration | Planned after pilot |
-| Reusable tester and deployer components | Planned |
-| Production-ready release | Not yet |
+| Isolated one-job pilot | Completed on 2026-07-15, recorded in [Issue #7](https://github.com/RandomDevelopment/ci-fleet/issues/7) |
+| Schema-v3 worker-controller installer | Accepted for reviewed ordinary-CI lifecycle on isolated fleet hosts |
+| Downstream project migration | Requires per-project parallel validation, compliance, and rollback evidence |
+| Reusable tester and deployer components | Under review, not production-ready |
+| Production-ready release | Gated by migration evidence and separate privileged-delivery approval |
 
-The current live milestone is deliberately narrow: one manually triggered, read-only job on one ephemeral worker without modifying or replacing existing project CI.
+The completed pilot proved read-only permissions, one-job ephemeral runner lifecycle, scoped cleanup, zero final job residue, controller health, and preservation of existing project runners. The current phase is controlled migration through reviewed schema-v3 desired state, as recorded in [accepted design decisions](docs/DESIGN-DECISIONS.md). Each project must complete [parallel validation](docs/MIGRATING-EXISTING-CI.md), the [compliance checklist](docs/COMPLIANCE-CHECKLIST.md), and rollback verification before cutover. The pilot does not authorize production deployment, privileged delivery on ordinary-CI workers, legacy-runner retirement, or unreviewed capacity increases.
 
 ## Requirements
 
