@@ -176,6 +176,11 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         )
         self.assertEqual(vc.bump_kind(message), "MINOR")
 
+    def test_whitespace_only_footer_separator_counts(self) -> None:
+        message = "fix: change compatibility\n \nBREAKING CHANGE: incompatible API\n"
+        self.assertEqual(vc.validate_message(message), [])
+        self.assertEqual(vc.bump_kind(message), "MAJOR")
+
     def test_footer_after_body_still_counts(self) -> None:
         message = (
             "feat: add guard rails\n"

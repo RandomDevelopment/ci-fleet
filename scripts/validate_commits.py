@@ -324,7 +324,7 @@ def has_breaking_change(message: str) -> bool:
     # line glued to body text without that separator is body prose, not a
     # footer.
     for index, line in enumerate(lines[1:], 1):
-        if line == "" and index + 1 < len(lines) and TRAILER_RE.match(lines[index + 1]):
+        if line.strip() == "" and index + 1 < len(lines) and TRAILER_RE.match(lines[index + 1]):
             return any(
                 candidate.startswith(BREAKING_HEADER)
                 or candidate.startswith(BREAKING_HEADER_ALT)
