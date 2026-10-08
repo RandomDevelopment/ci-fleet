@@ -72,12 +72,11 @@ CONVENTIONAL_HEADER = re.compile(
 # Git trailers (e.g. "Reviewed-by: ...", "Signed-off-by: ...") and the
 # BREAKING CHANGE / BREAKING-CHANGE trailer. Trailers are optional.
 #
-# Trailer tokens follow git's own grammar (trailing-attrs): a token of three
-# or more alphanumerics with an inner hyphen permitted, followed by ": ".
+# Trailer tokens contain one or more alphanumerics, with inner hyphens permitted.
 # This accepts conventional trailers like "Reviewed-by" and "Co-authored-by"
 # that the uppercase-only FOOTER_TOKEN class would reject, so a footer block
 # beginning with them is still recognized as footers by has_breaking_change().
-TRAILER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]")
+TRAILER_TOKEN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 TRAILER_RE = re.compile(
     r"^(?:" + TRAILER_TOKEN_RE.pattern + r"(?:: | #)" + FOOTER_VALUE + r"|"
     + re.escape(BREAKING_HEADER) + r" " + FOOTER_VALUE + r"|"

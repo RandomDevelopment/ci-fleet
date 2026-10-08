@@ -214,6 +214,14 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
             self.assertEqual(vc.validate_message(message), [], message)
             self.assertEqual(vc.bump_kind(message), "MAJOR", message)
 
+    def test_single_character_trailer_before_breaking_change_counts(self) -> None:
+        for opener in ("X: value", "X #42", "x: value", "7: value"):
+            for marker in ("BREAKING CHANGE", "BREAKING-CHANGE"):
+                with self.subTest(opener=opener, marker=marker):
+                    message = f"fix: update compatibility\n\n{opener}\n{marker}: incompatible\n"
+                    self.assertEqual(vc.validate_message(message), [])
+                    self.assertEqual(vc.bump_kind(message), "MAJOR")
+
 
 class PullRequestTitleTests(unittest.TestCase):
     def test_conventional_pr_title_passes(self) -> None:
