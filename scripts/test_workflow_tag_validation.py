@@ -307,6 +307,16 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("header is not conventional", result.stderr)
 
+    def test_initial_tag_rejects_nonconventional_target(self) -> None:
+        self.git("checkout", "main")
+        self.write("payload.txt", "first release fixture\n")
+        head = self.commit("not conventional")
+        self.assertEqual(self.load_validator().returncode, 0)
+        result = self.run_step("Validate release tags are SemVer 2.0.0",
+                               TAG_NAME="v0.1.0", TAG_COMMIT=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
+
     def test_tag_rejects_nonconventional_release_commits(self) -> None:
         self.git("checkout", "main")
         self.write("payload.txt", "invalid release message fixture\n")
