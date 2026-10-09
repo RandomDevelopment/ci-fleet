@@ -246,34 +246,6 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no commits to validate", result.stdout)
 
-    def release_validation(self, conclusion: str = "success", prior_release: bool = True,
-                           older_result: str | None = None, latest_status: str = "completed"):
-        if prior_release:
-            self.git("tag", "v0.1.0", self.base)
-        tools = self.runtime / "bin"
-        tools.mkdir()
-        gh = tools / "gh"
-        checks = [
-            {"id": 100 + index, "name": name, "head_sha": self.main, "status": latest_status,
-             "conclusion": conclusion, "app_id": 15368}
-            for index, name in enumerate(("Build without registering a runner",
-                         "Enforce conventional commits and pull-request title"))
-        ]
-        if older_result is not None:
-            checks += [{**check, "id": check["id"] - 50, "status": "completed",
-                        "conclusion": older_result} for check in checks]
-        gh.write_text("#!/usr/bin/env python3\nimport json\n"
-                      + f"checks = {checks!r}\n"
-                      + "for check in checks: print(json.dumps(check))\n")
-        gh.chmod(0o755)
-        return subprocess.run(
-            ["bash", str(ROOT / "scripts" / "validate-release.sh"),
-             "v0.1.1" if prior_release else "v0.1.0", self.main],
-            cwd=self.repo, capture_output=True, text=True,
-            env={**self.env, "GITHUB_REPOSITORY": "test/repo",
-                 "PATH": str(tools) + os.pathsep + self.env["PATH"]},
-        )
-
     def stable_history_with_removed_environment(self) -> str:
         self.git("checkout", "main")
         self.write(".env", "EXAMPLE=placeholder\n")
@@ -292,7 +264,8 @@ class WorkflowExecutionTests(unittest.TestCase):
 
     def test_initial_release_scans_removed_secrets_in_history(self) -> None:
         self.main = self.stable_history_with_removed_environment()
-        result = self.release_validation(prior_release=False)
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="push",
+                               BASE_SHA="0" * 40, HEAD_SHA=self.main, TAG_NAME="v0.1.0")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(".env", result.stdout + result.stderr)
         self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
@@ -331,38 +304,6 @@ class WorkflowExecutionTests(unittest.TestCase):
                                TAG_NAME="v0.1.1", TAG_COMMIT=head)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("header is not conventional", result.stderr)
-
-    def test_prepublication_validation_leaves_tag_absent(self) -> None:
-        result = self.release_validation()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("no tag was created", result.stdout)
-        self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
-
-    def test_prepublication_validation_rejects_failed_ci(self) -> None:
-        result = self.release_validation("failure")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("successful exact-commit check", result.stderr)
-        self.assertNotIn("v0.1.1", self.git("tag", "--list").splitlines())
-
-    def test_prepublication_validation_accepts_successful_retry(self) -> None:
-        result = self.release_validation(older_result="failure")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_prepublication_validation_cannot_reuse_old_success(self) -> None:
-        result = self.release_validation("failure", older_result="success")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("successful exact-commit check", result.stderr)
-
-    def test_prepublication_validation_waits_for_newest_run(self) -> None:
-        result = self.release_validation(older_result="success", latest_status="in_progress")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("successful exact-commit check", result.stderr)
-
-    def test_prepublication_validation_rejects_existing_tag(self) -> None:
-        self.git("tag", "v0.1.1", self.main)
-        result = self.release_validation()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already exists", result.stderr)
 
     def test_updated_tag_missing_old_object_scans_new_target(self) -> None:
         self.write(".env", "EXAMPLE=placeholder\n")

@@ -112,42 +112,9 @@ class ConventionalCommitHeaderTests(unittest.TestCase):
         self.assertIsNotNone(bump, "expected a bump from a BREAKING CHANGE commit")
         self.assertEqual(bump, "MAJOR")
 
-    def test_revert_shaped_subject_without_plumbing_form_is_validated(self) -> None:
-        # A revert must use the approved `revert:` type; only git's own
-        # generated form (subject + "This reverts commit <sha>." proof) is
-        # exempt, and the proof line alone is not enough.
+    def test_revert_requires_a_conventional_subject(self) -> None:
         self.assertTrue(vc.validate_message('Revert "skip validation"'))
         self.assertEqual(vc.validate_message("revert: skip validation"), [])
-
-    def test_git_generated_revert_form_with_body_proof_is_exempt(self) -> None:
-        # `git revert --no-edit` produces `Revert "<original subject>"` with
-        # a `This reverts commit <sha>.` body line; docs/CONTRIBUTING.md
-        # instructs its use, so this exact pair is exempt.
-        message = (
-            'Revert "feat: add capacity telemetry"\n'
-            "\n"
-            "This reverts commit 1234567890abcdef1234567890abcdef12345678.\n"
-        )
-        self.assertEqual(vc.validate_message(message), [])
-        self.assertIsNone(vc.bump_kind(message))
-
-    def test_revert_subject_without_body_proof_is_validated(self) -> None:
-        # The subject shape alone proves nothing: without the generated body
-        # line it must satisfy the normal grammar.
-        self.assertTrue(vc.validate_message('Revert "skip validation"'))
-
-    def test_git_generated_merge_revert_is_exempt(self) -> None:
-        # `git revert -m 1 --no-edit <merge>` produces a two-line proof
-        # ("This reverts commit <sha>, reversing" / "changes made to <N>."),
-        # so the proof line does not end with a period.
-        message = (
-            'Revert "Merge branch \'feature\'"\n'
-            "\n"
-            "This reverts commit 1234567890abcdef1234567890abcdef12345678, reversing\n"
-            "changes made to 1.\n"
-        )
-        self.assertEqual(vc.validate_message(message), [])
-        self.assertIsNone(vc.bump_kind(message))
 
     def test_revert_proof_line_without_generated_subject_is_validated(self) -> None:
         message = (
@@ -488,41 +455,7 @@ class CliTests(unittest.TestCase):
             errors = vc.validate_message("Merge definitely not conventional", sha=fake_merge_sha)
             self.assertTrue(errors, "single-parent 'Merge ...' commit must not be exempt")
 
-    def test_fabricated_revert_reference_in_range_is_rejected(self) -> None:
-        # In range validation (sha + workspace available), the referenced
-        # commit must exist; a fabricated or all-zero reference is not proof.
-        with tempfile.TemporaryDirectory() as directory:
-            self._init_repo(directory)
-            base_sha = self._commit(directory, "feat: base commit")
-            fabricated = (
-                'Revert "feat: never happened"\n'
-                "\n"
-                "This reverts commit ffffffffffffffffffffffffffffffffffffffff.\n"
-            )
-            sha = self._commit(directory, fabricated)
-            result = self._range_result(directory, base_sha, sha)
-            self.assertNotEqual(
-                result.returncode, 0,
-                "a revert referencing a nonexistent commit must be rejected",
-            )
-
-    def test_revert_of_unrelated_existing_commit_in_range_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            self._init_repo(directory)
-            self._commit(directory, "chore: bootstrap")
-            referenced = self._commit(directory, "feat: referenced change")
-            forged = self._commit(
-                directory,
-                'Revert "feat: referenced change"\n\nThis reverts commit '
-                + referenced + ".",
-            )
-            result = self._range_result(directory, referenced, forged)
-            self.assertNotEqual(
-                result.returncode, 0,
-                "a generated-looking message must actually reverse the reference",
-            )
-
-    def test_actual_git_revert_in_range_is_exempt(self) -> None:
+    def test_actual_git_revert_requires_a_conventional_subject(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
             path = Path(directory) / "value.txt"
@@ -542,25 +475,12 @@ class CliTests(unittest.TestCase):
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
             result = self._range_result(directory, referenced, revert_sha)
-            self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_actual_git_revert_of_root_commit_in_range_is_exempt(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            self._init_repo(directory)
-            root_path = Path(directory) / "root.txt"
-            root_path.write_text("root\n", encoding="utf-8")
-            subprocess.run(["git", "-C", directory, "add", "root.txt"], check=True)
-            root_sha = self._commit(directory, "feat: root change")
-            base_sha = self._commit(directory, "chore: retain history")
+            self.assertNotEqual(result.returncode, 0)
             subprocess.run(
-                ["git", "-C", directory, "revert", "--no-edit", root_sha],
+                ["git", "-C", directory, "commit", "--amend", "-m", "revert: restore value"],
                 check=True, capture_output=True, text=True, env=self._git_env(),
             )
-            revert_sha = subprocess.run(
-                ["git", "-C", directory, "rev-parse", "HEAD"],
-                check=True, capture_output=True, text=True,
-            ).stdout.strip()
-            result = self._range_result(directory, base_sha, revert_sha)
+            result = self._range_result(directory, referenced, "HEAD")
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_empty_base_validates_head_commit_only(self) -> None:
@@ -747,7 +667,7 @@ class CliTests(unittest.TestCase):
                 result = vc.check_required_bump(version, base_sha, head_sha, directory)
                 self.assertTrue(result, f"{version} must reset lower components")
 
-    def test_release_requires_exact_component_increment(self) -> None:
+    def test_release_allows_larger_component_increments(self) -> None:
         for message, expected, skipped in (
             ("fix: patch contract", "v1.2.8", "v1.2.9"),
             ("feat: add capability", "v1.3.0", "v1.9.0"),
@@ -759,20 +679,17 @@ class CliTests(unittest.TestCase):
                 subprocess.run(["git", "-C", directory, "tag", "v1.2.7"], check=True)
                 head = self._commit(directory, message)
                 self.assertEqual(vc.check_required_bump(expected, base, head, directory), [])
-                self.assertTrue(vc.check_required_bump(skipped, base, head, directory))
+                self.assertEqual(vc.check_required_bump(skipped, base, head, directory), [])
 
-    def test_initial_release_uses_classified_increment_from_zero(self) -> None:
-        for message, expected, skipped in (
-            ("fix: initial fix", "v0.0.1", "v9.0.0"),
-            ("feat: initial feature", "v0.1.0", "v0.7.0"),
-            ("feat!: initial breaking change", "v1.0.0", "v9.0.0"),
-        ):
-            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
-                self._init_repo(directory)
-                self._commit(directory, message)
-                head = self._commit(directory, "fix: finish initial release")
-                self.assertEqual(vc.check_required_bump(expected, "", head, directory), [])
-                self.assertTrue(vc.check_required_bump(skipped, "", head, directory))
+    def test_initial_release_version_is_operator_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            self._commit(directory, "old nonconventional history")
+            self._commit(directory, "ci: add policy\n\nBREAKING CHANGE: none")
+            head = self._commit(directory, "fix: prepare first release")
+            for version in ("v0.1.0", "v0.7.0", "v1.0.0"):
+                with self.subTest(version=version):
+                    self.assertEqual(vc.check_required_bump(version, "", head, directory), [])
 
     def test_release_target_cannot_precede_latest_release_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

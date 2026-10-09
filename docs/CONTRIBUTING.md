@@ -19,7 +19,8 @@ and agents editing this repository.
   or publish a release merely to satisfy versioning rules; releases are gated
   by `docs/CONTRIBUTING.md` and the operator review window below.
 - **No force-push** of published history and no rebased rewrites of shared
-  branches. Use `git revert` for corrections.
+  branches. Use `git revert` for corrections and edit its generated subject
+  to a conventional `revert: <description>` before committing.
 
 ## Conventional Commits 1.0.0
 
@@ -115,23 +116,15 @@ A version is released (tagged on `main`) only when:
 - an operator has confirmed the live pilot evidence for any engine rollout
   evidence schema change.
 
-The selected version component must increase by exactly one. A MAJOR bump
-resets MINOR and PATCH to zero; a MINOR bump resets PATCH to zero. The initial
-release classifies all reachable commits against a `0.0.0` baseline and must
-be greater than `0.0.0`, including prerelease and build variants. A new release
-must include the latest released commit in its history.
+The selected version component must increase. A MAJOR bump resets MINOR and
+PATCH to zero; a MINOR bump resets PATCH to zero. Operators select the initial
+nonzero version without classifying legacy commit history. A new release must
+include the latest released commit in its history.
 
-Run the `Validate a proposed release` workflow from `main` with the proposed
-version and full commit SHA before publication. It executes policy from current
-trusted main, scans the proposed commits, rejects an existing tag, and requires
-both successful CI checks on that exact commit. It has read-only permissions and
-creates no tag. Operators must still confirm any required live pilot evidence.
-
-Publication remains gated until a dedicated publisher and tag-creation ruleset
-are configured. A check on a tag-push event detects problems after publication;
-it cannot prevent publication. Workflow trust also requires a required workflow
-from an independently protected source or a dedicated GitHub App check. Requiring
-the GitHub Actions check name alone does not protect its workflow definition.
+Organization members publish releases after the checks and review above.
+Tag-push validation detects violations after publication; it does not prevent
+an authorized writer from creating a tag. Review workflow changes along with
+other PR code. Ordinary CI remains read-only.
 
 Do not tag a release to force a version number. This repository is pre-1.0;
 avoid `1.0.0` until the controlled migration and compliance checklist

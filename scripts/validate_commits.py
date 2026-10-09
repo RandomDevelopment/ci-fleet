@@ -22,7 +22,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from typing import Iterable
 
 # ---------------------------------------------------------------------------
@@ -83,29 +82,9 @@ TRAILER_RE = re.compile(
     + re.escape(BREAKING_HEADER_ALT) + r" " + FOOTER_VALUE + r")$"
 )
 
-# Git-generated plumbing commits are exempt: they are produced by git itself,
-# not authored per the contract, and existing base-branch commits are never
-# re-checked here.
-#
-# A real merge is verified by parent count (see is_true_merge_commit); the
-# subject prefix alone only exempts git's own generated revert form
-# `Revert "<sha>"`, where <sha> is a full 40-hex commit id. Any other
-# "Revert ..." shape (including `Revert "<subject>"` with arbitrary text) is
-# ordinary authored content and must use the approved `revert:` type.
+# Only real merge commits are exempt; reverts use the conventional grammar.
 MERGE_RE = re.compile(r"^Merge ", re.IGNORECASE)
-# Git's own generated revert subject is `Revert "<original subject>"` with a
-# body containing `This reverts commit <40-hex sha>.` (see git-revert(1) and
-# the revert instruction in docs/CONTRIBUTING.md). Exempt only that exact
-# subject/body pair: the body line carries the proof, so an authored
-# `Revert "..."` subject without it still goes through normal validation and
-# must use the approved `revert:` type.
-REVERT_SUBJECT_RE = re.compile(r'^Revert ".+"$')
-# The generated proof line ends with a period for ordinary reverts; for
-# merge reverts (`git revert -m 1`) it ends with ", reversing" and is
-# followed by a "changes made to <N>." continuation line.
-REVERT_BODY_PROOF_RE = re.compile(
-    r"^This reverts commit ([0-9a-fA-F]{40})(?:\.$|, reversing$)"
-)
+
 
 def is_true_merge_commit(sha: str, workspace: str = ".") -> bool:
     """Return True if the commit is a true merge commit (has 2+ parents)."""
@@ -160,123 +139,13 @@ def is_zero_major(version: str) -> bool:
     return parsed[0] == 0
 
 
-def referenced_revert_commit(message: str) -> str | None:
-    """Return the 40-hex sha from git's generated revert proof line, if any.
-
-    Matches both the ordinary form (`...<sha>.`) and the merge-revert form
-    (`...<sha>, reversing`).
-    """
-    match = REVERT_BODY_PROOF_RE.match
-    for line in message.splitlines()[1:]:
-        found = match(line)
-        if found:
-            return found.group(1)
-    return None
-
-
-def referenced_commit_exists(sha: str, workspace: str = ".") -> bool:
-    """Return True when `sha` resolves to a commit object in `workspace`."""
-    result = subprocess.run(
-        ["git", "-C", workspace, "cat-file", "-e", sha + "^{commit}"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    return result.returncode == 0
-
-
-def reverses_commit(revert_sha: str, referenced_sha: str, workspace: str = ".") -> bool:
-    """Return True when `revert_sha` applies the inverse of `referenced_sha`."""
-    def parents(sha: str) -> list[str]:
-        result = subprocess.run(
-            ["git", "-C", workspace, "rev-list", "--parents", "-n", "1", sha],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        return result.stdout.strip().split()[1:] if result.returncode == 0 else []
-
-    revert_parents = parents(revert_sha)
-    referenced_parents = parents(referenced_sha)
-    if len(revert_parents) != 1:
-        return False
-    if not referenced_parents:
-        empty_tree = subprocess.run(
-            ["git", "-C", workspace, "hash-object", "-t", "tree", "--stdin"],
-            input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        if empty_tree.returncode != 0:
-            return False
-        referenced_parents = [empty_tree.stdout.decode().strip()]
-
-    target = subprocess.run(
-        ["git", "-C", workspace, "rev-parse", revert_sha + "^{tree}"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    ).stdout.strip()
-    for referenced_parent in referenced_parents:
-        patch = subprocess.run(
-            ["git", "-C", workspace, "diff", "--binary", referenced_parent, referenced_sha],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        with tempfile.NamedTemporaryFile() as index:
-            env = {**os.environ, "GIT_INDEX_FILE": index.name}
-            read_tree = subprocess.run(
-                ["git", "-C", workspace, "read-tree", revert_parents[0]],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-            )
-            applied = subprocess.run(
-                ["git", "-C", workspace, "apply", "--cached", "--reverse"],
-                input=patch.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-            )
-            if read_tree.returncode != 0 or applied.returncode != 0:
-                continue
-            tree = subprocess.run(
-                ["git", "-C", workspace, "write-tree"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-            )
-            if tree.returncode == 0 and tree.stdout.strip() == target:
-                return True
-    return False
-
-
-def is_git_generated_revert(
-    message: str, *, sha: str | None = None, workspace: str = ".",
-    verify_reference: bool = False,
-) -> bool:
-    """Return True only for git's own generated revert form.
-
-    Requires the `Revert "<original subject>"` subject AND the
-    `This reverts commit <sha>.` proof line in the body, matching what
-    `git revert` produces (docs/CONTRIBUTING.md instructs its use).
-
-    With verify_reference=True the referenced commit must actually exist in
-    the repository; this closes the fabricated-reference bypass in range
-    validation where a workspace is always available.
-    """
-    lines = message.splitlines()
-    if not lines or not REVERT_SUBJECT_RE.match(lines[0]):
-        return False
-    if not any(REVERT_BODY_PROOF_RE.match(line) for line in lines[1:]):
-        return False
-    if verify_reference:
-        referenced = referenced_revert_commit(message)
-        # An all-zero reference is never a real commit object.
-        if (
-            referenced is None
-            or set(referenced) == {"0"}
-            or not referenced_commit_exists(referenced, workspace)
-            or sha is None
-            or not reverses_commit(sha, referenced, workspace)
-        ):
-            return False
-    return True
-
-
 def bump_kind(message: str) -> str | None:
     """Classify a single conventional commit for SemVer bump selection.
 
     Returns "MAJOR", "MINOR", or "PATCH", or None when the commit is not a
-    conventional change (e.g. a merge or refactor-only commit carries no bump).
+    conventional change (e.g. a merge commit carries no bump).
     """
     header = message.splitlines()[0] if message else ""
-    if is_git_generated_revert(message):
-        return None
     if not is_conventional_header(header):
         return None
     # Check for explicit breaking marker "!" after type/scope (e.g., "feat!: ...")
@@ -348,15 +217,6 @@ def validate_message(message: str, *, skip_merge: bool = True, sha: str | None =
     header = lines[0]
 
     if skip_merge:
-        if is_git_generated_revert(
-            message, sha=sha, workspace=workspace, verify_reference=bool(sha),
-        ):
-            # Only git's own generated revert form (subject + body proof line)
-            # is exempt; anything else must be conventional. When a sha is
-            # available (range validation), the referenced commit must exist,
-            # so an authored commit cannot forge the proof with a fabricated
-            # reference.
-            return errors
         if MERGE_RE.match(header):
             # "Merge " prefix alone is not proof: a single-parent commit can be
             # named anything. Only true merges (2+ parents, verified via sha)
@@ -385,7 +245,7 @@ def validate_title(title: str) -> list[str]:
     """Validate a PR title (treated as a single conventional subject)."""
     if not title:
         return ["PR title is empty"]
-    if REVERT_SUBJECT_RE.match(title) or MERGE_RE.match(title):
+    if MERGE_RE.match(title):
         return ["PR title must be a conventional commit subject, not a merge/plumbing title"]
     if not is_conventional_header(title):
         return [f"PR title is not conventional: '{title}'"]
@@ -418,8 +278,8 @@ def check_required_bump(
 
     The required bump is computed from the conventional classification of the
     release range base..head (docs/CONTRIBUTING.md release gate: "the SemVer
-    bump matches the Conventional Commits classification"). The first release
-    classifies all reachable commits against a 0.0.0 baseline.
+    bump matches the Conventional Commits classification"). Operators select
+    the initial nonzero version without classifying legacy history.
     ponytail: compares only major.minor.patch; prerelease/build metadata of
     the candidate is ignored, upgrade if tag-vs-range metadata ever matters.
     """
@@ -439,14 +299,8 @@ def check_required_bump(
         ]
     prior = latest_release_tag(workspace, base)
     if prior is None:
-        prior = (0, 0, 0)
-        initial_commits = subprocess.run(
-            ["git", "-C", workspace, "rev-list", "--reverse", head],
-            check=True, capture_output=True, text=True,
-        ).stdout.splitlines()
-        messages = [(sha, commit_message(workspace, sha)) for sha in initial_commits]
-    else:
-        messages = commit_messages(base, head, workspace=workspace)
+        return []
+    messages = commit_messages(base, head, workspace=workspace)
     if not messages:
         return [f"release range {base}..{head} contains no commits"]
     required = suggest_bump(msg for _, msg in messages)
@@ -458,12 +312,12 @@ def check_required_bump(
     def _bumped(level: str) -> bool:
         """True when the candidate implements exactly `level` over prior."""
         if level == "MAJOR":
-            return new_major == old_major + 1 and (new_minor, new_patch) == (0, 0)
+            return new_major > old_major and (new_minor, new_patch) == (0, 0)
         if level == "MINOR":
-            # MINOR keeps major and increases minor by exactly one.
-            return new_major == old_major and new_minor == old_minor + 1 and new_patch == 0
-        # PATCH: same major.minor, increasing patch by exactly one.
-        return (new_major, new_minor) == (old_major, old_minor) and new_patch == old_patch + 1
+            # MINOR keeps major and increases minor.
+            return new_major == old_major and new_minor > old_minor and new_patch == 0
+        # PATCH: same major.minor, higher patch.
+        return (new_major, new_minor) == (old_major, old_minor) and new_patch > old_patch
 
     satisfied = _bumped(required)
     if not satisfied:
