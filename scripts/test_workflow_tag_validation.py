@@ -157,6 +157,15 @@ class WorkflowExecutionTests(unittest.TestCase):
         return self.run_step("Load current main commit validator",
                              EVENT_NAME=event, HEAD_SHA=head or self.head)
 
+    def test_required_build_reflects_convention_result(self) -> None:
+        step = WORKFLOW.read_text().split("- name: Require successful convention validation", 1)[1]
+        self.assertIn("${{ needs.commit-convention.result }}", step)
+        for result in ("success", "failure", "skipped", "cancelled", ""):
+            with self.subTest(result=result):
+                checked = self.run_step("Require successful convention validation",
+                                        CONVENTION_RESULT=result)
+                self.assertEqual(checked.returncode == 0, result == "success")
+
     def test_manual_existing_prerelease_tag_runs_current_main_policy(self) -> None:
         self.git("tag", "v0.1.0-rc.1")
         # Evaluate the workflow guard with GitHub's missing-created coercion.

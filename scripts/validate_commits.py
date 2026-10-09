@@ -297,8 +297,10 @@ def check_required_bump(
             f"version '{version}' does not exceed the latest released "
             f"'{latest[0]}.{latest[1]}.{latest[2]}' on '{main_ref}'"
         ]
-    prior = latest_release_tag(workspace, base)
+    prior = latest_release_tag(workspace, base) if base else None
     if prior is None:
+        if latest is not None:
+            return ["release base must include a prior stable release"]
         return []
     messages = commit_messages(base, head, workspace=workspace)
     if not messages:
@@ -402,7 +404,7 @@ def latest_release(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     if result.returncode != 0:
-        return None
+        raise RuntimeError(f"unable to inspect release tags at '{main_ref}': {result.stderr.strip()}")
     best: tuple[tuple[int, int, int], str] | None = None
     for tag in result.stdout.split():
         if tag == exclude_tag:

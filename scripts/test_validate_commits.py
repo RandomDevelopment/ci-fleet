@@ -578,6 +578,30 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("MAJOR", result.stderr)
 
+    def test_release_rejects_unavailable_or_untagged_bases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            untagged = self._commit(directory, "chore: before first release")
+            base = self._commit(directory, "chore: initial release")
+            subprocess.run(["git", "-C", directory, "tag", "v1.0.0"], check=True)
+            head = self._commit(directory, "feat!: replace public interface")
+            subprocess.run(["git", "-C", directory, "branch", "origin/main", head], check=True)
+            for invalid_base in ("missing-release-base", "", untagged):
+                with self.subTest(base=invalid_base):
+                    result = self._run(
+                        "--version", "v1.0.1", "--tag-commit", head,
+                        "--base", invalid_base, "--head", head, cwd=directory,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+            lookup = self._run("--release-base-for", "missing-release-base", cwd=directory)
+            self.assertNotEqual(lookup.returncode, 0)
+            self.assertIn("unable to inspect release tags", lookup.stderr)
+            result = self._run(
+                "--version", "v2.0.0", "--tag-commit", head,
+                "--base", base, "--head", head, cwd=directory,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_release_rejects_an_empty_range(self) -> None:
         for published in (False, True):
             with self.subTest(published=published), tempfile.TemporaryDirectory() as directory:
@@ -664,7 +688,7 @@ class CliTests(unittest.TestCase):
                     ["git", "-C", directory, "tag", "v1.2.7"], check=True,
                 )
                 head_sha = self._commit(directory, message)
-                result = vc.check_required_bump(version, base_sha, head_sha, directory)
+                result = vc.check_required_bump(version, base_sha, head_sha, directory, main_ref="HEAD")
                 self.assertTrue(result, f"{version} must reset lower components")
 
     def test_release_allows_larger_component_increments(self) -> None:
@@ -678,8 +702,8 @@ class CliTests(unittest.TestCase):
                 base = self._commit(directory, "chore: bootstrap")
                 subprocess.run(["git", "-C", directory, "tag", "v1.2.7"], check=True)
                 head = self._commit(directory, message)
-                self.assertEqual(vc.check_required_bump(expected, base, head, directory), [])
-                self.assertEqual(vc.check_required_bump(skipped, base, head, directory), [])
+                self.assertEqual(vc.check_required_bump(expected, base, head, directory, main_ref="HEAD"), [])
+                self.assertEqual(vc.check_required_bump(skipped, base, head, directory, main_ref="HEAD"), [])
 
     def test_initial_release_version_is_operator_selected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -689,7 +713,7 @@ class CliTests(unittest.TestCase):
             head = self._commit(directory, "fix: prepare first release")
             for version in ("v0.1.0", "v0.7.0", "v1.0.0"):
                 with self.subTest(version=version):
-                    self.assertEqual(vc.check_required_bump(version, "", head, directory), [])
+                    self.assertEqual(vc.check_required_bump(version, "", head, directory, main_ref="HEAD"), [])
 
     def test_release_target_cannot_precede_latest_release_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -710,8 +734,8 @@ class CliTests(unittest.TestCase):
             head = self._commit(directory, "feat: initial release")
             for version in ("v0.0.0", "0.0.0-rc.1", "0.0.0+build.1"):
                 with self.subTest(version=version):
-                    self.assertTrue(vc.check_required_bump(version, "", head, directory))
-            self.assertEqual(vc.check_required_bump("v0.1.0", "", head, directory), [])
+                    self.assertTrue(vc.check_required_bump(version, "", head, directory, main_ref="HEAD"))
+            self.assertEqual(vc.check_required_bump("v0.1.0", "", head, directory, main_ref="HEAD"), [])
 
     def test_release_version_cannot_regress_from_later_main_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
