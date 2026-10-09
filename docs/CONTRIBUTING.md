@@ -117,7 +117,9 @@ A version is released (tagged on `main`) only when:
 
 The selected version component must increase by exactly one. A MAJOR bump
 resets MINOR and PATCH to zero; a MINOR bump resets PATCH to zero. The initial
-release must be greater than `0.0.0`, including prerelease and build variants.
+release classifies all reachable commits against a `0.0.0` baseline and must
+be greater than `0.0.0`, including prerelease and build variants. A new release
+must include the latest released commit in its history.
 
 Run the `Validate a proposed release` workflow from `main` with the proposed
 version and full commit SHA before publication. It executes policy from current

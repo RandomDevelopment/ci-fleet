@@ -418,15 +418,18 @@ def check_required_bump(
 
     The required bump is computed from the conventional classification of the
     release range base..head (docs/CONTRIBUTING.md release gate: "the SemVer
-    bump matches the Conventional Commits classification"). With no prior
-    release tag, a nonzero valid SemVer satisfies the pre-1.0 gate.
+    bump matches the Conventional Commits classification"). The first release
+    classifies all reachable commits against a 0.0.0 baseline.
     ponytail: compares only major.minor.patch; prerelease/build metadata of
     the candidate is ignored, upgrade if tag-vs-range metadata ever matters.
     """
     parsed = parse_version(version)
     if parsed is None:
         return []
-    latest = latest_release_tag(workspace, main_ref, exclude_tag or version)
+    released = latest_release(workspace, main_ref, exclude_tag or version)
+    latest = released[0] if released else None
+    if released and not is_ancestor(released[1], head, workspace):
+        return [f"release target must follow latest released commit '{released[1]}'"]
     if latest is None and parsed == (0, 0, 0):
         return ["initial release version must exceed '0.0.0'"]
     if latest is not None and parsed <= latest:
@@ -436,8 +439,14 @@ def check_required_bump(
         ]
     prior = latest_release_tag(workspace, base)
     if prior is None:
-        return []
-    messages = commit_messages(base, head, workspace=workspace)
+        prior = (0, 0, 0)
+        initial_commits = subprocess.run(
+            ["git", "-C", workspace, "rev-list", "--reverse", head],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        messages = [(sha, commit_message(workspace, sha)) for sha in initial_commits]
+    else:
+        messages = commit_messages(base, head, workspace=workspace)
     if not messages:
         return [f"release range {base}..{head} contains no commits"]
     required = suggest_bump(msg for _, msg in messages)

@@ -263,7 +263,8 @@ class WorkflowExecutionTests(unittest.TestCase):
                       + "for check in checks: print(json.dumps(check))\n")
         gh.chmod(0o755)
         return subprocess.run(
-            ["bash", str(ROOT / "scripts" / "validate-release.sh"), "v0.1.1", self.main],
+            ["bash", str(ROOT / "scripts" / "validate-release.sh"),
+             "v0.1.1" if prior_release else "v0.1.0", self.main],
             cwd=self.repo, capture_output=True, text=True,
             env={**self.env, "GITHUB_REPOSITORY": "test/repo",
                  "PATH": str(tools) + os.pathsep + self.env["PATH"]},

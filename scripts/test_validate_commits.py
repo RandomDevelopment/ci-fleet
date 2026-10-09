@@ -754,6 +754,32 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(vc.check_required_bump(expected, base, head, directory), [])
                 self.assertTrue(vc.check_required_bump(skipped, base, head, directory))
 
+    def test_initial_release_uses_classified_increment_from_zero(self) -> None:
+        for message, expected, skipped in (
+            ("fix: initial fix", "v0.0.1", "v9.0.0"),
+            ("feat: initial feature", "v0.1.0", "v0.7.0"),
+            ("feat!: initial breaking change", "v1.0.0", "v9.0.0"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                self._init_repo(directory)
+                self._commit(directory, message)
+                head = self._commit(directory, "fix: finish initial release")
+                self.assertEqual(vc.check_required_bump(expected, "", head, directory), [])
+                self.assertTrue(vc.check_required_bump(skipped, "", head, directory))
+
+    def test_release_target_cannot_precede_latest_release_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            base = self._commit(directory, "chore: bootstrap")
+            subprocess.run(["git", "-C", directory, "tag", "v1.0.0"], check=True)
+            historical = self._commit(directory, "feat!: break earlier contract")
+            latest = self._commit(directory, "feat: ship later capability")
+            subprocess.run(["git", "-C", directory, "tag", "v1.1.0", latest], check=True)
+            subprocess.run(["git", "-C", directory, "branch", "origin/main", latest], check=True)
+            result = vc.check_required_bump("v2.0.0", base, historical, directory)
+            self.assertTrue(result)
+            self.assertIn("follow latest released commit", result[0])
+
     def test_initial_release_rejects_zero_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self._init_repo(directory)
