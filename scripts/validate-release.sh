@@ -44,7 +44,7 @@ while IFS= read -r revision; do
 done <"$runtime/commits"
 
 gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$commit/check-runs?filter=latest&per_page=100" \
-  --jq '.check_runs[] | {name,head_sha,status,conclusion,app_id:.app.id}' >"$runtime/checks.jsonl"
+  --jq '.check_runs[] | {id,name,head_sha,status,conclusion,app_id:.app.id}' >"$runtime/checks.jsonl"
 python3 - "$runtime/checks.jsonl" "$commit" <<'PY'
 import json
 import sys
@@ -55,9 +55,9 @@ for name in (
     "Enforce conventional commits and pull-request title",
 ):
     matching = [check for check in checks if check["name"] == name and check["app_id"] == 15368]
-    if not matching or any(check["head_sha"] != sys.argv[2]
-                           or check["status"] != "completed"
-                           or check["conclusion"] != "success" for check in matching):
+    latest = max(matching, key=lambda check: check["id"]) if matching else None
+    if (latest is None or latest["head_sha"] != sys.argv[2]
+            or latest["status"] != "completed" or latest["conclusion"] != "success"):
         raise SystemExit(f"release requires successful exact-commit check: {name}")
 PY
 printf 'Validated %s at %s; no tag was created.\n' "$version" "$commit"

@@ -478,9 +478,8 @@ def check_required_bump(
 def git_revision_list(base: str | None, head: str, *, workspace: str = ".") -> list[str]:
     """Return commit SHAs in the range base..head (shallow-clone safe).
 
-    Falls back to single-commit resolution when git range semantics are not
-    available (shallow clones, single-commit histories).
-    For workflow_dispatch (empty base), validate only the HEAD commit.
+    An unavailable explicit range fails closed. With no base, validate only
+    HEAD, including single-commit histories without a parent.
     """
     if base and base.strip():
         spec = f"{base}..{head}"
@@ -494,6 +493,8 @@ def git_revision_list(base: str | None, head: str, *, workspace: str = ".") -> l
     commits = [line for line in result.stdout.splitlines() if line.strip()]
     if result.returncode == 0:
         return commits
+    if base and base.strip():
+        raise RuntimeError(f"unable to evaluate commit range '{spec}': {result.stderr.strip()}")
     if not commits:
         # Shallow clone or unavailable range: resolve the head alone.
         resolved = subprocess.run(
@@ -526,8 +527,8 @@ def commit_messages(
 
     Returns a list of (sha, message) tuples.
 
-    Falls back to resolving the head SHA alone when the range is unavailable
-    (shallow clones, single-commit histories).
+    An unavailable explicit range fails closed. With no base, the head alone
+    is resolved for single-commit histories.
     """
     commits = git_revision_list(base, head, workspace=workspace)
     return [(sha, commit_message(workspace, sha)) for sha in commits]

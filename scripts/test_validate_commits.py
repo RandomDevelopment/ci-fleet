@@ -419,10 +419,17 @@ class CliTests(unittest.TestCase):
                 [middle_sha, head_sha],
             )
             self.assertEqual(vc.git_revision_list(None, head_sha, workspace=directory), [head_sha])
-            self.assertEqual(
-                vc.git_revision_list("missing", head_sha, workspace=directory),
-                [head_sha],
-            )
+            with self.assertRaisesRegex(RuntimeError, "unable to evaluate commit range"):
+                vc.git_revision_list("missing", head_sha, workspace=directory)
+
+    def test_missing_explicit_base_cannot_hide_intermediate_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._init_repo(directory)
+            self._commit(directory, "not conventional")
+            head = self._commit(directory, "fix: conventional tip")
+            result = self._range_result(directory, "f" * 40, head)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unable to evaluate commit range", result.stderr)
 
     def test_equal_base_and_head_accepts_an_empty_range(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
