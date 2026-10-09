@@ -95,6 +95,10 @@ jobs:
           RELEASE_BASE="$(python3 "$validator" --release-base-for "$TAG_COMMIT" --exclude-tag "$TAG_NAME")"
           if [[ -n "$RELEASE_BASE" ]]; then
             python3 "$validator" --base "$RELEASE_BASE" --head "$TAG_COMMIT"
+          elif parent=$(git rev-parse "$TAG_COMMIT^" 2>/dev/null); then
+            python3 "$validator" --base "$parent" --head "$TAG_COMMIT"
+          else
+            python3 "$validator" --head "$TAG_COMMIT"
           fi
           # Stable tags must point into the main line (fetch-depth 0 gives us
           # origin/main); prerelease tags must NOT point into it (they are
