@@ -146,6 +146,19 @@ flowchart TD
 
 Host-wide pruning must not run as an uncoordinated per-job operation. Hard cancellation and host failure may bypass project traps, so resources must remain identifiable by run and age.
 
+The existing host cleanup timer also reclaims empty networks at least ten
+minutes old whose allocations
+lie entirely inside rendered Docker default address pools. This includes
+unlabeled project Compose networks left after a failure. Controller networks,
+the default bridge, and any network with an attached container remain intact.
+An independent credential-free Docker socket proxy shares a maintenance gate
+with cleanup. It completes dispatched reference mutations even after caller
+cancellation. Cleanup takes the exclusive gate only after ordinary work is
+idle; durable boot-scoped markers preserve uncertain operations across process
+restarts. Raw host-root clients outside this gate and asynchronous orchestrators
+are outside the ordinary fleet contract.
+See [Network reclamation](HOST-MAINTENANCE.md#network-reclamation).
+
 ## Update layers
 
 - Project runtime versions are controlled by project Dockerfiles.

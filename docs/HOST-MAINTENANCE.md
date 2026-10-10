@@ -1,6 +1,6 @@
 # Host maintenance standard
 
-Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean only fleet-owned expired resources.
+Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean expired fleet resources and empty job networks in their configured Docker address pools.
 
 ## Policy
 
@@ -31,7 +31,7 @@ Review `/etc/apt/apt.conf.d/50unattended-upgrades` and confirm only the intended
 `scripts/install-worker-controller.sh` installs and enables all three timer pairs:
 
 - `ci-fleet-health.timer` runs the complete [fleet health contract](HEALTH-MONITORING.md);
-- `ci-fleet-cleanup.timer` removes only expired inactive fleet-owned resources;
+- `ci-fleet-cleanup.timer` removes expired inactive fleet-owned resources and empty networks in the configured Docker default address pools;
 - `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes;
 - `ci-fleet-reconcile.timer` fetches the latest reviewed desired-state commit from the private repository over authenticated HTTPS and applies it automatically.
 
@@ -42,11 +42,96 @@ sudo systemctl start ci-fleet-health.service
 sudo systemctl start ci-fleet-drift.service
 sudo journalctl -u ci-fleet-health.service --since today
 sudo journalctl -u ci-fleet-drift.service --since today
-sudo /opt/ci-fleet/current/scripts/cleanup.sh
-sudo systemctl start ci-fleet-cleanup.service
+sudo systemd-run --wait --pipe --collect \
+  --property=User=root \
+  --property=EnvironmentFile=/etc/ci-fleet/ci-fleet.env \
+  --property=WorkingDirectory=/opt/ci-fleet/current \
+  /opt/ci-fleet/current/scripts/cleanup.sh
 ```
 
-The manual cleanup command is intentionally a dry-run. Enable the applying service only after its candidates are understood.
+This transient service runs a dry-run with the same root-owned rendered
+environment and working directory as the applying cleanup service. After
+reviewing its candidates, run `sudo systemctl start ci-fleet-cleanup.service`.
+
+## Network reclamation
+
+The cleanup service reads the default address pools from its rendered
+`/etc/ci-fleet/ci-fleet.env`. The documented dry-run loads that file through
+systemd, exactly as the applying service does. Without rendered pool values,
+cleanup uses only the existing fleet-label expiry rule. Pool reclamation removes
+a network with zero attached containers once it is at least ten minutes old
+and every allocated subnet lies inside those pools, including project Compose
+networks without fleet ownership or expiry labels. It does not infer ownership
+from a project name or require a changed desired-state commit.
+
+The fixed ten-minute grace is twice the ordinary job timeout and protects the
+gap between network creation and container attachment. Cleanup preserves fresh
+networks and networks whose `Created` timestamp is missing, invalid, lacks a
+timezone, or lies in the future. Explicit fleet-label expiry cleanup keeps its
+existing age policy.
+
+Cleanup always preserves `ci-fleet_default`, networks with the controller's
+`com.docker.compose.project=ci-fleet` identity, and the daemon's default bridge.
+It preserves networks with any attached container, including stopped containers.
+It reports unlabeled networks outside the configured pools without deleting them.
+Mixed allocations and networks without allocation information do not qualify for
+pool reclamation. Existing instance-scoped expiry cleanup still applies to other
+fleet-labeled networks.
+
+Cleanup checks network endpoints and all container references with
+`docker ps -aq` with filters for both the exact network ID and name, including
+stopped and created containers. It repeats those checks before each individual
+`docker network rm`. Docker's endpoint check alone cannot protect a container
+created between inspection and removal, so ordinary fleet Docker requests use
+an independent `docker-socket-proxy` Compose service. The controller starts only
+after that service is healthy. The proxy has no GitHub credentials. It gates
+container creation, network connection, and other operations that can introduce
+container references through `/run/lock/ci-fleet/docker-maintenance.lock`.
+Cleanup holds that same lock exclusively while it inspects and removes networks.
+The proxy retains its shared lock until Docker completes a dispatched mutation,
+including when the caller disconnects. Nested raw socket bind requests are
+redirected to the proxy socket without project-specific changes.
+
+Before removal, cleanup waits up to ten minutes for runnable noncontroller
+containers to finish. It releases the exclusive lock between checks so jobs can
+finish their Docker work. It requires two idle checks separated by one second.
+It never pauses or removes active work. It exempts only current-protocol
+controller and proxy containers with the expected shared-directory mount and
+Docker endpoint. Older controllers and unknown active workloads defer cleanup.
+The applying service also takes the installer lock nonblockingly. An active
+installer, including uninstall's inherited lock, produces `DEFER` without
+network deletion. The service has a fifteen-minute start timeout.
+
+Proxy mutations and raw cleanup removals create empty, durable markers under
+`/run/lock/ci-fleet/inflight/<boot-id>/` and `removals/<boot-id>/` before dispatch.
+Markers contain no request bodies or credentials. A complete response clears
+the marker. A killed process or uncertain response preserves it. Cleanup defers
+while a current-boot or unknown marker remains, and the proxy refuses new
+reference mutations while an unresolved cleanup-removal marker remains.
+Restarting the proxy or controller does not clear uncertainty. A host reboot
+changes the kernel boot ID; cleanup may then clear older boot directories and
+recover capacity automatically. Never delete current-boot markers to bypass
+this guard.
+
+This coordination applies to an isolated ordinary Docker/Compose fleet. It
+does not make direct host-root Docker requests outside the proxy atomic.
+Cleanup defers on an active or unknown Swarm state because Swarm can create
+tasks asynchronously after an API response. Do not use this reclamation policy
+on a daemon with independent API writers or other asynchronous orchestrators.
+The direct runner uses the shared directory and `DOCKER_HOST` so it can reconnect
+after the proxy rebinds its socket. `/var/run/docker.sock` remains available for
+explicit-path clients. Such clients and nested socket-file mounts can retain an
+old inode across a proxy restart, which can interrupt their job. Controller-only
+restarts leave the independent proxy running.
+
+Cleanup rechecks the network after a confirmed removal failure and retries a
+clean network once.
+Repeated transient endpoint conflicts defer that network and let later cleanup
+candidates proceed. Other persistent Docker errors fail the cleanup service;
+uncertain transport failures also preserve the removal marker.
+Cleanup never invokes `docker network prune` or `docker system prune`. The controller's
+low-water gate remains a backstop while the existing daily timer restores leaked
+subnet capacity.
 
 ## Reboot procedure
 
