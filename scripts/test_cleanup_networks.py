@@ -34,10 +34,11 @@ def network(name="job", subnet="198.51.100.0/29", *, labels=None, containers=Non
 
 
 class CleanupNetworksTests(unittest.TestCase):
-    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None):
+    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None):
         remaining = copy.deepcopy(inventory)
         calls = []
         inspections = {}
+        failures = copy.deepcopy(remove_failures or {})
 
         def docker(*args):
             calls.append(args)
@@ -60,6 +61,8 @@ class CleanupNetworksTests(unittest.TestCase):
                     remaining[network_id]["Containers"] = {"new-container": {}}
                 return json.dumps([remaining[network_id]])
             self.assertEqual(args[:2], ("network", "rm"))
+            if failures.get(args[2]):
+                raise cleanup.subprocess.CalledProcessError(1, ["docker", *args], stderr=failures[args[2]].pop(0))
             if args[2] == attach_on_remove:
                 remaining[args[2]]["Containers"] = {"new-container": {}}
                 raise cleanup.subprocess.CalledProcessError(1, ["docker", *args])
@@ -188,6 +191,25 @@ class CleanupNetworksTests(unittest.TestCase):
         remaining, _, _ = self.run_cleanup(inventory, attach_on_remove="race")
         self.assertEqual(set(remaining), {"race"})
         self.assertEqual(remaining["race"]["Containers"], {"new-container": {}})
+
+    def test_cleared_attachment_race_retries_once_and_reclaims_later_networks(self):
+        inventory = {"race": network("race"), "abandoned": network("abandoned", "198.51.100.8/29")}
+        remaining, calls, _ = self.run_cleanup(inventory, remove_failures={"race": ["network has active endpoints"]})
+        self.assertEqual(remaining, {})
+        self.assertEqual(calls.count(("network", "rm", "race")), 2)
+        self.assertIn(("network", "rm", "abandoned"), calls)
+
+    def test_repeated_cleared_endpoint_races_defer_after_two_attempts(self):
+        inventory = {"race": network("race"), "abandoned": network("abandoned", "198.51.100.8/29")}
+        remaining, calls, output = self.run_cleanup(inventory, remove_failures={"race": ["has active endpoints"] * 2})
+        self.assertEqual(set(remaining), {"race"})
+        self.assertEqual(calls.count(("network", "rm", "race")), 2)
+        self.assertIn("DEFER network race active-endpoint-race", output)
+
+    def test_persistent_genuine_removal_error_remains_fatal(self):
+        with self.assertRaises(cleanup.subprocess.CalledProcessError) as raised:
+            self.run_cleanup({"denied": network()}, remove_failures={"denied": ["permission denied"] * 2})
+        self.assertEqual(raised.exception.stderr, "permission denied")
 
     def test_incomplete_inspection_and_invalid_policy_fail_before_removal(self):
         missing = network()

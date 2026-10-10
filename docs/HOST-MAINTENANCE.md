@@ -80,9 +80,13 @@ fleet-labeled networks.
 
 Cleanup checks network endpoints and all container references with
 `docker ps -aq` with filters for both the exact network ID and name, including
-stopped and created containers. It repeats those checks before each individual `docker network rm`.
-Docker refuses removal if another job attaches an active endpoint after that check. Cleanup
-never invokes `docker network prune` or `docker system prune`. The controller's
+stopped and created containers. It repeats those checks before each individual
+`docker network rm`. Docker refuses removal if another job attaches an active
+endpoint after that check. Cleanup rechecks the network after a removal failure
+and retries a clean network once.
+Repeated transient endpoint conflicts defer that network and let later cleanup
+candidates proceed. Other persistent Docker errors fail the cleanup service.
+Cleanup never invokes `docker network prune` or `docker system prune`. The controller's
 low-water gate remains a backstop while the existing daily timer restores leaked
 subnet capacity.
 

@@ -81,6 +81,14 @@ def has_containers(item: dict, network_id: str) -> bool:
     ).strip())
 
 
+def protected_network(item: dict) -> bool:
+    return (
+        item["Name"] in {"bridge", "host", "none", "ci-fleet_default"}
+        or (item.get("Labels") or {}).get("com.docker.compose.project") == "ci-fleet"
+        or (item.get("Options") or {}).get("com.docker.network.bridge.default_bridge") == "true"
+    )
+
+
 def cleanup_networks(*, apply: bool, instance: str) -> None:
     pools = configured_pools()
     now = int(time.time())
@@ -90,11 +98,7 @@ def cleanup_networks(*, apply: bool, instance: str) -> None:
             continue
         name = item["Name"]
         labels = item.get("Labels") or {}
-        if (
-            name in {"bridge", "host", "none", "ci-fleet_default"}
-            or labels.get("com.docker.compose.project") == "ci-fleet"
-            or (item.get("Options") or {}).get("com.docker.network.bridge.default_bridge") == "true"
-        ):
+        if protected_network(item):
             continue
         if has_containers(item, network_id):
             continue
@@ -114,16 +118,22 @@ def cleanup_networks(*, apply: bool, instance: str) -> None:
         if apply:
             # Inspect immediately before removal; Docker refuses a concurrent attachment.
             current = inspect_network(network_id)
-            if current is None or has_containers(current, network_id):
+            if current is None or protected_network(current) or has_containers(current, network_id):
                 continue
-            print(f"REMOVE network {name} {reason}", flush=True)
-            try:
-                docker("network", "rm", network_id)
-            except subprocess.CalledProcessError:
-                current = inspect_network(network_id)
-                if current is None or has_containers(current, network_id):
-                    continue
-                raise
+            for attempt in range(2):
+                try:
+                    docker("network", "rm", network_id)
+                    print(f"REMOVE network {name} {reason}", flush=True)
+                    break
+                except subprocess.CalledProcessError as error:
+                    current = inspect_network(network_id)
+                    if current is None or protected_network(current) or has_containers(current, network_id):
+                        break
+                    if attempt == 1:
+                        if "has active endpoints" in (error.stderr or ""):
+                            print(f"DEFER network {name} active-endpoint-race")
+                            break
+                        raise
         else:
             print(f"WOULD_REMOVE network {name} {reason}")
 
