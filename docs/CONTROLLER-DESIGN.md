@@ -34,6 +34,8 @@ On startup, it looks up its configured scale-set name in its configured runner g
 
 On restart, it recovers only managed runners carrying the same fleet-instance and scale-set labels. Running, paused, and restarting runners remain intact, count against capacity, and resume completion and exit tracking. Until a completion event or container exit, it conservatively counts every surviving runner as busy because its job-start event may have already been acknowledged. Inactive leftovers are removed without force so a concurrent start cannot be killed. Startup and listener errors preserve active runners for the next attempt. It does not manage unrelated Docker workloads or another host's scale set.
 
+The listener ignores late authenticated events for this instance's generated runner names only after Docker confirms their containers are gone; unrelated names and inspection errors still fail.
+
 ## Security boundary
 
 Docker socket access is host-root-equivalent. This pool is therefore limited to trusted repositories and trusted workflow revisions. Containers provide repeatability and cleanup; they do not make hostile workflow code safe.

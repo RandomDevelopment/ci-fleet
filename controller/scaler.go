@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -55,8 +56,16 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	return s.runners.count(), nil
 }
 
-func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) error {
+func (s *Scaler) HandleJobStarted(ctx context.Context, job *scaleset.JobStarted) error {
 	if !s.runners.markBusy(job.RunnerName) {
+		missing, err := s.missingPriorRunner(ctx, job.RunnerName)
+		if err != nil {
+			return err
+		}
+		if missing {
+			s.logger.Info("ignored late job start for removed runner", "runner", job.RunnerName, "jobID", job.JobID)
+			return nil
+		}
 		return fmt.Errorf("job started for unknown runner %q", job.RunnerName)
 	}
 	s.writeStatus()
@@ -67,6 +76,14 @@ func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) e
 func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobCompleted) error {
 	id, cleanup, ok := s.runners.markDone(job.RunnerName)
 	if !ok {
+		missing, err := s.missingPriorRunner(ctx, job.RunnerName)
+		if err != nil {
+			return err
+		}
+		if missing {
+			s.logger.Info("ignored late job completion for removed runner", "runner", job.RunnerName, "jobID", job.JobID)
+			return nil
+		}
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
 	s.writeStatus()
@@ -75,6 +92,25 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobComple
 		return nil
 	}
 	return s.logAndRemove(ctx, job.RunnerName, id, true)
+}
+
+// The selected scale-set session can report runners removed before this controller started.
+func (s *Scaler) missingPriorRunner(ctx context.Context, name string) (bool, error) {
+	suffix, owned := strings.CutPrefix(name, "ci-fleet-"+s.config.FleetInstance+"-")
+	if !owned || len(suffix) != 8 {
+		return false, nil
+	}
+	if _, err := hex.DecodeString(suffix); err != nil {
+		return false, nil
+	}
+	_, err := s.dockerClient.ContainerInspect(ctx, name)
+	if errdefs.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect untracked runner %q: %w", name, err)
+	}
+	return false, nil
 }
 
 func (s *Scaler) startRunner(ctx context.Context) (string, error) {
