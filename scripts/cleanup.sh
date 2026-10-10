@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
@@ -55,20 +56,21 @@ while IFS= read -r id; do
   fi
 done < <(docker ps -aq "${filters[@]}")
 
-for kind in volume network; do
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    expires=$(docker "$kind" inspect --format "{{index .Labels \"${label_prefix}expires-at\"}}" "$name")
-    if [[ ! "$expires" =~ ^[0-9]+$ ]] || ((expires > now)); then continue; fi
-    found=$((found + 1))
-    if $apply; then
-      echo "REMOVE $kind $name expired=$expires"
-      docker "$kind" rm "$name"
-    else
-      echo "WOULD_REMOVE $kind $name expired=$expires"
-    fi
-  done < <(docker "$kind" ls -q "${filters[@]}")
-done
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
+  expires=$(docker volume inspect --format "{{index .Labels \"${label_prefix}expires-at\"}}" "$name")
+  if [[ ! "$expires" =~ ^[0-9]+$ ]] || ((expires > now)); then continue; fi
+  found=$((found + 1))
+  if $apply; then
+    echo "REMOVE volume $name expired=$expires"
+    docker volume rm "$name"
+  else
+    echo "WOULD_REMOVE volume $name expired=$expires"
+  fi
+done < <(docker volume ls -q "${filters[@]}")
 
-if ((!found)); then echo "OK no expired ci-fleet resources found"; fi
+if ((!found)); then echo "OK no expired ci-fleet containers or volumes found"; fi
+network_args=(--instance "$instance")
+if $apply; then network_args+=(--apply); fi
+python3 "$repo_root/scripts/cleanup_networks.py" "${network_args[@]}"
 if ! $apply; then echo "DRY_RUN no changes made; pass --apply to remove listed inactive resources"; fi

@@ -586,7 +586,7 @@ done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
 # shellcheck disable=SC2016 # Match the literal Compose interpolation.
 grep -Fq '      CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR: ${CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR:-}' "$repo_root/deploy/compose.yaml" || fail 'controller does not receive the optional default bridge CIDR for health verification'
-for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh; do
+for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh cleanup.sh; do
   grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/$entrypoint" || fail "$entrypoint may write Python bytecode into the immutable manager release"
 done
 grep -Fq '    trap - ERR' "$repo_root/scripts/install-worker-controller.sh" || fail 'warning health subprocess inherits the transactional rollback trap'

@@ -1,6 +1,6 @@
 # Host maintenance standard
 
-Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean only fleet-owned expired resources.
+Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean expired fleet resources and empty job networks in their configured Docker address pools.
 
 ## Policy
 
@@ -31,7 +31,7 @@ Review `/etc/apt/apt.conf.d/50unattended-upgrades` and confirm only the intended
 `scripts/install-worker-controller.sh` installs and enables all three timer pairs:
 
 - `ci-fleet-health.timer` runs the complete [fleet health contract](HEALTH-MONITORING.md);
-- `ci-fleet-cleanup.timer` removes only expired inactive fleet-owned resources;
+- `ci-fleet-cleanup.timer` removes expired inactive fleet-owned resources and empty networks in the configured Docker default address pools;
 - `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes;
 - `ci-fleet-reconcile.timer` fetches the latest reviewed desired-state commit from the private repository over authenticated HTTPS and applies it automatically.
 
@@ -47,6 +47,32 @@ sudo systemctl start ci-fleet-cleanup.service
 ```
 
 The manual cleanup command is intentionally a dry-run. Enable the applying service only after its candidates are understood.
+
+## Network reclamation
+
+The cleanup service reads the default address pools from its rendered
+`/etc/ci-fleet/ci-fleet.env`. A manual dry-run must receive the same environment
+to list pool cleanup candidates. Without rendered pool values, cleanup uses only
+the existing fleet-label expiry rule. It removes a network with zero attached containers
+when every allocated subnet lies inside those pools, including project Compose
+networks without fleet ownership or expiry labels. It does not infer ownership
+from a project name or require a changed desired-state commit.
+
+Cleanup always preserves `ci-fleet_default`, networks with the controller's
+`com.docker.compose.project=ci-fleet` identity, and the daemon's default bridge.
+It preserves networks with any attached container, including stopped containers.
+It reports unlabeled networks outside the configured pools without deleting them.
+Mixed allocations and networks without allocation information do not qualify for
+pool reclamation. Existing instance-scoped expiry cleanup still applies to other
+fleet-labeled networks.
+
+Cleanup checks network endpoints and all container references with
+`docker ps -aq` with filters for both the exact network ID and name, including
+stopped and created containers. It repeats those checks before each individual `docker network rm`.
+Docker refuses removal if another job attaches an active endpoint after that check. Cleanup
+never invokes `docker network prune` or `docker system prune`. The controller's
+low-water gate remains a backstop while the existing daily timer restores leaked
+subnet capacity.
 
 ## Reboot procedure
 

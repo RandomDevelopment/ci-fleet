@@ -15,7 +15,8 @@ services:
   controller:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
     build:
-      context: ../controller
+      context: ..
+      dockerfile: controller/Dockerfile
       args:
         CI_FLEET_VERSION: ${CI_FLEET_VERSION:-dev}
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}

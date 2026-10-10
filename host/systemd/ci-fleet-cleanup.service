@@ -1,5 +1,5 @@
 [Unit]
-Description=Remove expired inactive ci-fleet Docker resources
+Description=Remove expired ci-fleet resources and empty Docker pool networks
 After=docker.service
 Wants=docker.service
 

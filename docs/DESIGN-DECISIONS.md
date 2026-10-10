@@ -15,6 +15,28 @@ The isolated one-job proof required by [Issue #7](https://github.com/RandomDevel
 
 This decision does not authorize application production deployment, privileged delivery on ordinary-CI runners, unreviewed capacity increases, public-repository runner access, unrestricted Docker cleanup, legacy-runner retirement, or VM deletion. Those remain separately gated by repository policy and operator approval.
 
+## Reclaim empty networks inside reviewed Docker address pools
+
+The cleanup contract in [Issue #81](https://github.com/RandomDevelopment/ci-fleet/issues/81)
+requires an amendment. Ownership and expiry labels alone cannot recover address
+capacity occupied by abandoned, unlabeled project Compose networks.
+
+The existing cleanup timer may remove a zero-container network when all of its
+allocated subnets lie inside the controller's rendered default address pools.
+Fleet labels and an expiry are not prerequisites for that pool-scoped removal.
+The controller Compose networks and daemon bridge remain protected, even when
+empty. Active networks and unlabeled networks outside the pools remain intact.
+Removal uses individual network IDs and Docker's active-endpoint protection.
+The low-water gate remains enabled.
+
+This policy assumes configured pools on an isolated fleet daemon contain
+disposable job networks. An empty, intentionally reusable network inside a pool
+can also be removed unless it belongs to the controller. Put persistent
+infrastructure outside those job pools. Revisit this rule before allowing a
+shared daemon whose persistent networks cannot satisfy that boundary. This
+amendment changes neither pool capacity nor timer frequency, and it authorizes
+no host deployment or cleanup during repository development.
+
 ## Project name
 
 **Status:** accepted on 2026-08-16; retain `ci-fleet`.

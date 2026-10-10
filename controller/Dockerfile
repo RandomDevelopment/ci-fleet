@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1.18
 FROM golang:1.27.1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY go.mod *.go ./
+COPY controller/go.mod controller/*.go ./
+COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/desired_state.py /scripts/
 RUN go mod tidy && go mod verify
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev
