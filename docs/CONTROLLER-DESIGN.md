@@ -30,6 +30,8 @@ The controller:
 7. destroys the runner and its writable state;
 8. reconciles capacity with current demand.
 
+On startup, it looks up its configured scale-set name in its configured runner group. It creates the set only when absent. If an existing set's name, group ID, and routing labels match, it opens a message session on that set, including after a power cut. A mismatch stops startup without deleting the set. Graceful shutdown still deletes the selected set.
+
 On restart, it recovers only stale runners carrying the same fleet-instance label. It does not manage unrelated Docker workloads or another host's scale set.
 
 ## Security boundary

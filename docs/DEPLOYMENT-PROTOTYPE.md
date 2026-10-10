@@ -65,7 +65,9 @@ Inspect the dry-run. After confirming there is no active job, rerun with `--appl
 
 ### Recover an orphaned idle scale set
 
-An unclean controller exit can leave its exact GitHub-side scale-set name behind and make the replacement fail with `already exists`. Use the controller's `--delete-idle-scale-set` administrative mode only after all of these are true:
+An unclean controller exit can leave its exact GitHub-side scale-set name behind. Normal startup now reuses that set when its name, runner group, and routing labels match the installed configuration. It opens a new listener without deleting or recreating the set. A mismatch stops startup and leaves the set in place.
+
+The controller's `--delete-idle-scale-set` administrative mode remains a manual tool, including for recovery with older create-only controller images. Use it only after all of these are true:
 
 - the selected scale-set name and runner group come from trusted installed configuration;
 - no repository workflow targeting its label is queued or running;

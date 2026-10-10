@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	dockerclient "github.com/docker/docker/client"
 )
@@ -46,20 +45,12 @@ func run(ctx context.Context) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	client, err := cfg.scaleSetClient()
 	if err != nil { return fmt.Errorf("create scale-set client: %w", err) }
-	runnerGroupID := 1
-	if cfg.RunnerGroup != scaleset.DefaultRunnerGroup {
-		group, err := client.GetRunnerGroupByName(ctx, cfg.RunnerGroup)
-		if err != nil { return fmt.Errorf("find runner group: %w", err) }
-		runnerGroupID = group.ID
-	}
-	set, err := client.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
-		Name: cfg.ScaleSetName, RunnerGroupID: runnerGroupID,
-		Labels: cfg.buildLabels(),
-		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
-	})
-	if err != nil { return fmt.Errorf("create runner scale set: %w", err) }
+	set, err := ensureScaleSet(ctx, cfg, client)
+	if err != nil { return err }
 	client.SetSystemInfo(systemInfo(set.ID))
+	ready := false
 	defer func() {
+		if !ready { return }
 		if err := client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), set.ID); err != nil {
 			logger.Error("delete runner scale set", "scaleSetID", set.ID, "error", err)
 		}
@@ -87,6 +78,7 @@ func run(ctx context.Context) error {
 	defer session.Close(context.Background())
 	l, err := listener.New(session, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
 	if err != nil { return fmt.Errorf("create listener: %w", err) }
+	ready = true
 	logger.Info("controller ready", "scaleSet", cfg.ScaleSetName, "minRunners", cfg.MinRunners, "maxRunners", cfg.MaxRunners)
 	if err := l.Run(ctx, scaler); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("listener: %w", err)
