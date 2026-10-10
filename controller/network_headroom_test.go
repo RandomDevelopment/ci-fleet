@@ -20,6 +20,20 @@ import (
 )
 
 func TestCleanupRestoresHeadroomFromEmptyUnlabeledJobNetworks(t *testing.T) {
+	root := t.TempDir()
+	boot := filepath.Join(root, "proc/sys/kernel/random/boot_id")
+	if err := os.MkdirAll(filepath.Dir(boot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(boot, []byte("11111111-1111-4111-8111-111111111111"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	contender := &Scaler{
+		runners: newRunnerState(), logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		config:              Config{MaxRunners: 1, StatusFile: filepath.Join(root, "contender-status.json")},
+		maintenanceLockPath: filepath.Join(root, "run/lock/ci-fleet/docker-maintenance.lock"),
+	}
+	var deferrals atomic.Int32
 	inventory := map[string]map[string]any{}
 	addNetwork := func(id, name, subnet string) {
 		inventory[id] = map[string]any{
@@ -82,6 +96,10 @@ func TestCleanupRestoresHeadroomFromEmptyUnlabeledJobNetworks(t *testing.T) {
 					http.Error(w, "network has active endpoints", http.StatusConflict)
 					return
 				}
+				if got, err := contender.HandleDesiredRunnerCount(context.Background(), 1); err != nil || got != 0 {
+					t.Errorf("new runner raced pool cleanup: count=%d error=%v", got, err)
+				}
+				deferrals.Add(1)
 				delete(inventory, id)
 				_, _ = w.Write([]byte(`{}`))
 				return
@@ -111,14 +129,17 @@ def request(path, method="GET"):
     with urllib.request.urlopen(urllib.request.Request(os.environ["CI_FLEET_CLEANUP_TEST_URL"] + path, method=method)) as response:
         return json.load(response)
 if args[0] == "info":
-    print(json.dumps(request("/info")))
+    if "--format" in args:
+        print("inactive")
+    else:
+        print(json.dumps(request("/info")))
 elif args[0] == "ps":
     filters = {}
     for index, arg in enumerate(args):
         if arg == "--filter":
             key, value = args[index + 1].split("=", 1)
             filters.setdefault(key, []).append(value)
-    if not filters or set(filters) - {"label", "network"}:
+    if not filters or set(filters) - {"label", "network", "status"}:
         sys.exit("unexpected container filters")
     query = urllib.parse.urlencode({"all": "true", "filters": json.dumps(filters)})
     for item in request("/containers/json?" + query):
@@ -147,6 +168,7 @@ else:
 	command.Env = append(command.Env,
 		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"CI_FLEET_CLEANUP_TEST_URL="+server.URL,
+		"CI_FLEET_ROOT_PREFIX="+root,
 		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=1",
 		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE=198.51.100.0/24",
 		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE=29",
@@ -156,6 +178,9 @@ else:
 	}
 	if slots, err := scaler.availableNetworkRunnerSlots(context.Background()); err != nil || slots != 6 {
 		t.Fatalf("cleaned pool returned %d runner slots and error %v, want 6", slots, err)
+	}
+	if deferrals.Load() != 30 {
+		t.Fatalf("cleanup allowed runner creation during %d network removals", 30-deferrals.Load())
 	}
 	mutex.Lock()
 	defer mutex.Unlock()

@@ -31,6 +31,10 @@ func main() {
 		err = run(ctx)
 	case len(os.Args) == 2 && os.Args[1] == "--delete-idle-scale-set":
 		err = deleteIdleScaleSet(ctx)
+	case len(os.Args) == 2 && os.Args[1] == "--docker-socket-proxy":
+		err = runDockerSocketProxy(ctx)
+	case len(os.Args) == 2 && os.Args[1] == "--check-docker-socket-proxy":
+		err = checkDockerSocketProxy(ctx)
 	default:
 		err = fmt.Errorf("unsupported arguments")
 	}

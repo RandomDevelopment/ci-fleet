@@ -394,6 +394,7 @@ compose() {
     [[ ! -v $variable ]] || clean_environment+=("$variable=${!variable}")
   done
   if [[ "$testing" == 1 ]]; then
+    clean_environment+=("CI_FLEET_ROOT_PREFIX=$root_prefix")
     for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done
   fi
   "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
@@ -1529,7 +1530,7 @@ activate_candidate() {
   install_manager
   install_systemd_units "$(readlink -f "$manager_current")"
   if [[ "$target_state" == active ]]; then
-    compose "$release_dir" "$rendered_env" up -d --no-deps controller
+    compose "$release_dir" "$rendered_env" up -d --remove-orphans controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
     runtime_matches active || die 'controller did not remain running after activation'
   else
@@ -1869,7 +1870,7 @@ PY
       if [[ $(managed_runner_count) != 0 ]]; then
         failed=1
       else
-        compose "$release_dir" "$rendered_env" up -d --no-deps controller || failed=1
+        compose "$release_dir" "$rendered_env" up -d --remove-orphans controller || failed=1
         if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" true || failed=1; fi
       fi
     fi

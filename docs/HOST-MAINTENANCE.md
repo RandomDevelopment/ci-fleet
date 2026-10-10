@@ -81,11 +81,54 @@ fleet-labeled networks.
 Cleanup checks network endpoints and all container references with
 `docker ps -aq` with filters for both the exact network ID and name, including
 stopped and created containers. It repeats those checks before each individual
-`docker network rm`. Docker refuses removal if another job attaches an active
-endpoint after that check. Cleanup rechecks the network after a removal failure
-and retries a clean network once.
+`docker network rm`. Docker's endpoint check alone cannot protect a container
+created between inspection and removal, so ordinary fleet Docker requests use
+an independent `docker-socket-proxy` Compose service. The controller starts only
+after that service is healthy. The proxy has no GitHub credentials. It gates
+container creation, network connection, and other operations that can introduce
+container references through `/run/lock/ci-fleet/docker-maintenance.lock`.
+Cleanup holds that same lock exclusively while it inspects and removes networks.
+The proxy retains its shared lock until Docker completes a dispatched mutation,
+including when the caller disconnects. Nested raw socket bind requests are
+redirected to the proxy socket without project-specific changes.
+
+Before removal, cleanup waits up to ten minutes for runnable noncontroller
+containers to finish. It releases the exclusive lock between checks so jobs can
+finish their Docker work. It requires two idle checks separated by one second.
+It never pauses or removes active work. It exempts only current-protocol
+controller and proxy containers with the expected shared-directory mount and
+Docker endpoint. Older controllers and unknown active workloads defer cleanup.
+The applying service also takes the installer lock nonblockingly. An active
+installer, including uninstall's inherited lock, produces `DEFER` without
+network deletion. The service has a fifteen-minute start timeout.
+
+Proxy mutations and raw cleanup removals create empty, durable markers under
+`/run/lock/ci-fleet/inflight/<boot-id>/` and `removals/<boot-id>/` before dispatch.
+Markers contain no request bodies or credentials. A complete response clears
+the marker. A killed process or uncertain response preserves it. Cleanup defers
+while a current-boot or unknown marker remains, and the proxy refuses new
+reference mutations while an unresolved cleanup-removal marker remains.
+Restarting the proxy or controller does not clear uncertainty. A host reboot
+changes the kernel boot ID; cleanup may then clear older boot directories and
+recover capacity automatically. Never delete current-boot markers to bypass
+this guard.
+
+This coordination applies to an isolated ordinary Docker/Compose fleet. It
+does not make direct host-root Docker requests outside the proxy atomic.
+Cleanup defers on an active or unknown Swarm state because Swarm can create
+tasks asynchronously after an API response. Do not use this reclamation policy
+on a daemon with independent API writers or other asynchronous orchestrators.
+The direct runner uses the shared directory and `DOCKER_HOST` so it can reconnect
+after the proxy rebinds its socket. `/var/run/docker.sock` remains available for
+explicit-path clients. Such clients and nested socket-file mounts can retain an
+old inode across a proxy restart, which can interrupt their job. Controller-only
+restarts leave the independent proxy running.
+
+Cleanup rechecks the network after a confirmed removal failure and retries a
+clean network once.
 Repeated transient endpoint conflicts defer that network and let later cleanup
-candidates proceed. Other persistent Docker errors fail the cleanup service.
+candidates proceed. Other persistent Docker errors fail the cleanup service;
+uncertain transport failures also preserve the removal marker.
 Cleanup never invokes `docker network prune` or `docker system prune`. The controller's
 low-water gate remains a backstop while the existing daily timer restores leaked
 subnet capacity.

@@ -5,6 +5,7 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=15min
 User=root
 WorkingDirectory=/opt/ci-fleet/current
 EnvironmentFile=/etc/ci-fleet/ci-fleet.env

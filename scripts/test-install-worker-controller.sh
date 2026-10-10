@@ -584,6 +584,11 @@ for dockerfile in "$repo_root/controller/Dockerfile" "$repo_root/runner/Dockerfi
   grep -Fq 'io.randomdevelopment.ci-fleet.managed="true"' "$dockerfile" || fail "managed image lacks fleet ownership label: $dockerfile"
 done
 grep -Fq '    user: "0:0"' "$repo_root/deploy/compose.yaml" || fail 'controller cannot read the required root-owned mode-0600 GitHub App PEM'
+grep -Fq '    command: ["--docker-socket-proxy"]' "$repo_root/deploy/compose.yaml" || fail 'controller Docker proxy dependency is missing'
+grep -Fq '      DOCKER_HOST: unix:///run/ci-fleet/locks/docker.sock' "$repo_root/deploy/compose.yaml" || fail 'controller bypasses the coordinated Docker endpoint'
+[[ $(grep -Fc 'up -d --remove-orphans controller' "$repo_root/scripts/install-worker-controller.sh") == 2 ]] || fail 'activation or rollback bypasses the Docker proxy dependency or retains a legacy proxy orphan'
+# shellcheck disable=SC2016 # Match the literal Compose interpolation.
+grep -Fq '      - ${CI_FLEET_ROOT_PREFIX:-}/run/lock/ci-fleet:/run/ci-fleet/locks' "$repo_root/deploy/compose.yaml" || fail 'Docker maintenance gate is not shared with the host'
 # shellcheck disable=SC2016 # Match the literal Compose interpolation.
 grep -Fq '      CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR: ${CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR:-}' "$repo_root/deploy/compose.yaml" || fail 'controller does not receive the optional default bridge CIDR for health verification'
 for entrypoint in install-worker-controller.sh remote-reconcile.sh healthcheck.sh cleanup.sh; do

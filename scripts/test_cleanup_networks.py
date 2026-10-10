@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -20,6 +21,7 @@ POLICY = {
     "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE": "198.51.100.0/24",
     "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE": "29",
 }
+BOOT_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def network(name="job", subnet="198.51.100.0/29", *, labels=None, containers=None, options=None):
@@ -34,14 +36,23 @@ def network(name="job", subnet="198.51.100.0/29", *, labels=None, containers=Non
 
 
 class CleanupNetworksTests(unittest.TestCase):
-    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None):
+    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None, root=None, active_containers=None, attempt_create_on_remove=False, check_wait_unlock=False, swarm_state="inactive"):
         remaining = copy.deepcopy(inventory)
         calls = []
         inspections = {}
         failures = copy.deepcopy(remove_failures or {})
+        swarm_states = copy.deepcopy(swarm_state)
 
         def docker(*args):
             calls.append(args)
+            if args[0] == "info":
+                if isinstance(swarm_states, list):
+                    return swarm_states.pop(0) if len(swarm_states) > 1 else swarm_states[0]
+                return swarm_states
+            if args[:3] == ("ps", "-aq", "--no-trunc"):
+                return "\n".join(active_containers or {})
+            if args[0] == "inspect":
+                return json.dumps([active_containers[args[1]]])
             if args[:2] == ("network", "ls"):
                 return "\n".join(remaining)
             if args[:3] == ("ps", "-aq", "--filter"):
@@ -61,18 +72,34 @@ class CleanupNetworksTests(unittest.TestCase):
                     remaining[network_id]["Containers"] = {"new-container": {}}
                 return json.dumps([remaining[network_id]])
             self.assertEqual(args[:2], ("network", "rm"))
+            if attempt_create_on_remove:
+                with (Path(cleanup.host_path("/run/lock/ci-fleet/docker-maintenance.lock"))).open("r+") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        cleanup.fcntl.flock(contender, cleanup.fcntl.LOCK_SH | cleanup.fcntl.LOCK_NB)
+                self.assertTrue(cleanup.pending_requests("removals"))
             if failures.get(args[2]):
                 raise cleanup.subprocess.CalledProcessError(1, ["docker", *args], stderr=failures[args[2]].pop(0))
             if args[2] == attach_on_remove:
                 remaining[args[2]]["Containers"] = {"new-container": {}}
-                raise cleanup.subprocess.CalledProcessError(1, ["docker", *args])
+                raise cleanup.subprocess.CalledProcessError(1, ["docker", *args], stderr="Error response from daemon: network has active endpoints")
             self.assertFalse(remaining[args[2]]["Containers"])
             del remaining[args[2]]
             return ""
 
         output = io.StringIO()
-        with patch.dict(os.environ, POLICY if policy is None else policy, clear=True), patch.object(cleanup, "docker", docker), redirect_stdout(output):
-            cleanup.cleanup_networks(apply=apply, instance=instance)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(root or temporary)
+            boot = root / "proc/sys/kernel/random/boot_id"
+            boot.parent.mkdir(parents=True, exist_ok=True)
+            boot.write_text(BOOT_ID)
+            environment = {**(POLICY if policy is None else policy), "CI_FLEET_ROOT_PREFIX": str(root)}
+            def sleep(_seconds):
+                if check_wait_unlock:
+                    with (root / "run/lock/ci-fleet/docker-maintenance.lock").open("r+") as lock:
+                        cleanup.fcntl.flock(lock, cleanup.fcntl.LOCK_SH | cleanup.fcntl.LOCK_NB)
+
+            with patch.dict(os.environ, environment, clear=True), patch.object(cleanup, "docker", docker), patch.object(cleanup.time, "sleep", sleep), redirect_stdout(output):
+                cleanup.cleanup_networks(apply=apply, instance=instance)
         return remaining, calls, output.getvalue()
 
     def test_empty_unlabeled_pool_networks_are_removed_and_active_and_legacy_remain(self):
@@ -97,6 +124,121 @@ class CleanupNetworksTests(unittest.TestCase):
         self.assertEqual(remaining, inventory)
         self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
         self.assertIn("WOULD_REMOVE network job empty-default-address-pool", output)
+
+    def test_final_removal_blocks_a_new_created_container_reference(self):
+        remaining, _, _ = self.run_cleanup({"old": network()}, attempt_create_on_remove=True)
+        self.assertEqual(remaining, {})
+
+    def test_active_work_defers_cleanup_and_releases_maintenance_lock(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(cleanup, "IDLE_WAIT_SECONDS", 0):
+            root = Path(temporary)
+            active = {"job": {"State": {"Status": "running"}, "Config": {"Labels": {}}, "Mounts": []}}
+            remaining, calls, output = self.run_cleanup({"old": network()}, root=root, active_containers=active)
+            self.assertEqual(set(remaining), {"old"})
+            self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+            self.assertIn("DEFER network cleanup active-work-or-maintenance-timeout", output)
+            with (root / "run/lock/ci-fleet/docker-maintenance.lock").open("r+") as lock:
+                cleanup.fcntl.flock(lock, cleanup.fcntl.LOCK_SH | cleanup.fcntl.LOCK_NB)
+
+    def test_cleanup_waits_without_holding_exclusive_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checks = []
+
+            def active_work():
+                checks.append(True)
+                return len(checks) == 1
+
+            with patch.object(cleanup, "active_work", active_work):
+                remaining, _, _ = self.run_cleanup({"old": network()}, root=root, check_wait_unlock=True)
+            self.assertEqual(remaining, {})
+            self.assertEqual(len(checks), 3)
+
+    def test_installer_lock_defers_network_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "run").mkdir()
+            with (root / "run/ci-fleet-installer.lock").open("w+") as lock:
+                cleanup.fcntl.flock(lock, cleanup.fcntl.LOCK_EX)
+                remaining, calls, output = self.run_cleanup({"old": network()}, root=root)
+            self.assertEqual(set(remaining), {"old"})
+            self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+            self.assertIn("DEFER network cleanup installer-active", output)
+
+    def test_swarm_or_unknown_daemon_state_defers_network_cleanup(self):
+        for state in ("active", "pending", "error", ""):
+            with self.subTest(state=state):
+                remaining, calls, output = self.run_cleanup({"old": network()}, swarm_state=state)
+                self.assertEqual(set(remaining), {"old"})
+                self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+                self.assertIn("unsupported-or-unknown-swarm-state", output)
+
+    def test_swarm_activation_between_idle_checks_defers_removal(self):
+        remaining, calls, output = self.run_cleanup({"old": network()}, swarm_state=["inactive", "active"])
+        self.assertEqual(set(remaining), {"old"})
+        self.assertEqual(sum(call[0] == "info" for call in calls), 2)
+        self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+        self.assertIn("unsupported-or-unknown-swarm-state", output)
+
+    def test_current_boot_and_unknown_request_markers_defer_cleanup(self):
+        for kind in ("inflight", "removals"):
+            for entry in (f"{BOOT_ID}/interrupted.json", "unknown/marker", "unexpected-file"):
+                with self.subTest(kind=kind, entry=entry), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    marker = root / "run/lock/ci-fleet" / kind / entry
+                    marker.parent.mkdir(mode=0o700, parents=True)
+                    marker.touch(mode=0o600)
+                    remaining, calls, output = self.run_cleanup({"old": network()}, root=root)
+                    self.assertEqual(set(remaining), {"old"})
+                    self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+                    self.assertIn("DEFER network cleanup unresolved-Docker-request", output)
+                    self.assertTrue(marker.exists())
+
+    def test_old_boot_markers_are_cleared_before_reclaiming_networks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_boot = "22222222-2222-4222-8222-222222222222"
+            for kind in ("inflight", "removals"):
+                directory = root / "run/lock/ci-fleet" / kind / old_boot
+                directory.mkdir(mode=0o700, parents=True)
+                (directory / "interrupted.json").touch(mode=0o600)
+            remaining, _, _ = self.run_cleanup({"old": network()}, root=root)
+            self.assertEqual(remaining, {})
+            for kind in ("inflight", "removals"):
+                self.assertFalse((root / "run/lock/ci-fleet" / kind / old_boot).exists())
+
+    def test_uncertain_removal_keeps_marker_and_blocks_later_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(cleanup.subprocess.CalledProcessError):
+                self.run_cleanup({"old": network()}, root=root, remove_failures={"old": ["connection reset by peer"]})
+            self.assertTrue(any((root / "run/lock/ci-fleet/removals" / BOOT_ID).iterdir()))
+            remaining, calls, output = self.run_cleanup({"old": network()}, root=root)
+            self.assertEqual(set(remaining), {"old"})
+            self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+            self.assertIn("unresolved-Docker-request", output)
+
+    def test_only_current_coordinated_services_are_exempt_from_active_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mounts = [{"Type": "bind", "RW": True, "Source": str(root / "run/lock/ci-fleet"), "Destination": "/run/ci-fleet/locks"}]
+            containers = {}
+            for service in ("controller", "docker-socket-proxy"):
+                containers[service] = {"State": {"Status": "running"}, "Mounts": mounts, "Config": {
+                    "Labels": {"com.docker.compose.project": "ci-fleet", "com.docker.compose.service": service, cleanup.PROXY_PROTOCOL_LABEL: "v1"},
+                    "Env": ["DOCKER_HOST=unix:///run/ci-fleet/locks/docker.sock"] if service == "controller" else [],
+                    "Cmd": ["--docker-socket-proxy"] if service == "docker-socket-proxy" else None,
+                }}
+            remaining, _, _ = self.run_cleanup({"old": network()}, root=root, active_containers=containers)
+            self.assertEqual(remaining, {})
+            for service in containers:
+                with self.subTest(service=service):
+                    legacy = copy.deepcopy(containers)
+                    del legacy[service]["Config"]["Labels"][cleanup.PROXY_PROTOCOL_LABEL]
+                    with patch.object(cleanup, "IDLE_WAIT_SECONDS", 0):
+                        remaining, calls, _ = self.run_cleanup({"old": network()}, root=root, active_containers=legacy)
+                    self.assertEqual(set(remaining), {"old"})
+                    self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
 
     def test_pool_cleanup_preserves_fresh_and_unknown_creation_times(self):
         now = 2_000_000_000
@@ -142,6 +284,7 @@ class CleanupNetworksTests(unittest.TestCase):
         self.assertEqual(properties["User"], service["User"])
         self.assertEqual(args[-1], shlex.split(service["ExecStart"])[0])
         self.assertNotIn("--apply", args)
+        self.assertEqual(service["TimeoutStartSec"], "15min")
 
     def test_expired_labels_remain_instance_scoped_and_protect_infrastructure(self):
         expired = {f"{cleanup.LABEL_PREFIX}managed": "true", f"{cleanup.LABEL_PREFIX}expires-at": "1", f"{cleanup.LABEL_PREFIX}instance": "example"}
@@ -233,22 +376,22 @@ class CleanupNetworksTests(unittest.TestCase):
 
     def test_cleared_attachment_race_retries_once_and_reclaims_later_networks(self):
         inventory = {"race": network("race"), "abandoned": network("abandoned", "198.51.100.8/29")}
-        remaining, calls, _ = self.run_cleanup(inventory, remove_failures={"race": ["network has active endpoints"]})
+        remaining, calls, _ = self.run_cleanup(inventory, remove_failures={"race": ["Error response from daemon: network has active endpoints"]})
         self.assertEqual(remaining, {})
         self.assertEqual(calls.count(("network", "rm", "race")), 2)
         self.assertIn(("network", "rm", "abandoned"), calls)
 
     def test_repeated_cleared_endpoint_races_defer_after_two_attempts(self):
         inventory = {"race": network("race"), "abandoned": network("abandoned", "198.51.100.8/29")}
-        remaining, calls, output = self.run_cleanup(inventory, remove_failures={"race": ["has active endpoints"] * 2})
+        remaining, calls, output = self.run_cleanup(inventory, remove_failures={"race": ["Error response from daemon: has active endpoints"] * 2})
         self.assertEqual(set(remaining), {"race"})
         self.assertEqual(calls.count(("network", "rm", "race")), 2)
         self.assertIn("DEFER network race active-endpoint-race", output)
 
     def test_persistent_genuine_removal_error_remains_fatal(self):
         with self.assertRaises(cleanup.subprocess.CalledProcessError) as raised:
-            self.run_cleanup({"denied": network()}, remove_failures={"denied": ["permission denied"] * 2})
-        self.assertEqual(raised.exception.stderr, "permission denied")
+            self.run_cleanup({"denied": network()}, remove_failures={"denied": ["Error response from daemon: permission denied"] * 2})
+        self.assertEqual(raised.exception.stderr, "Error response from daemon: permission denied")
 
     def test_incomplete_inspection_and_invalid_policy_fail_before_removal(self):
         missing = network()
