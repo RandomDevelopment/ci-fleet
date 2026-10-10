@@ -24,7 +24,8 @@ func TestCleanupRestoresHeadroomFromEmptyUnlabeledJobNetworks(t *testing.T) {
 	addNetwork := func(id, name, subnet string) {
 		inventory[id] = map[string]any{
 			"Id": id, "Name": name, "Driver": "bridge", "Containers": map[string]any{},
-			"Labels": map[string]string{}, "IPAM": map[string]any{"Config": []map[string]string{{"Subnet": subnet}}},
+			"Created": "2000-01-01T00:00:00.000000001Z",
+			"Labels":  map[string]string{}, "IPAM": map[string]any{"Config": []map[string]string{{"Subnet": subnet}}},
 		}
 	}
 	for index := 0; index < 30; index++ {

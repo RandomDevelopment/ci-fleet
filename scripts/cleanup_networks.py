@@ -2,6 +2,7 @@
 """Remove expired fleet networks and empty networks in rendered address pools."""
 
 import argparse
+from datetime import datetime
 import ipaddress
 import json
 import os
@@ -12,6 +13,7 @@ from desired_state import MAX_DOCKER_ADDRESS_POOLS, validate_docker_address_pool
 
 LABEL_PREFIX = "io.randomdevelopment.ci-fleet."
 POOL_PREFIX = "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_"
+NETWORK_CREATION_GRACE_SECONDS = 10 * 60
 
 
 def configured_pools() -> list[ipaddress.IPv4Network]:
@@ -43,6 +45,19 @@ def in_pools(item: dict, pools: list[ipaddress.IPv4Network]) -> bool:
         return False
     subnets = [ipaddress.ip_network(config["Subnet"], strict=True) for config in configs]
     return all(subnet.version == 4 and any(subnet.subnet_of(pool) for pool in pools) for subnet in subnets)
+
+
+def past_creation_grace(item: dict, now: int) -> bool:
+    created = item.get("Created")
+    if not isinstance(created, str):
+        return False
+    try:
+        timestamp = datetime.fromisoformat(created)
+        if timestamp.tzinfo is None:
+            return False
+        return now - timestamp.timestamp() >= NETWORK_CREATION_GRACE_SECONDS
+    except (ValueError, OverflowError):
+        return False
 
 
 def inspect_network(network_id: str) -> dict | None:
@@ -91,7 +106,7 @@ def cleanup_networks(*, apply: bool, instance: str) -> None:
         )
         if expired:
             reason = f"expired={expires}"
-        elif pools and in_pools(item, pools):
+        elif pools and in_pools(item, pools) and past_creation_grace(item, now):
             reason = "empty-default-address-pool"
         else:
             print(f"REPORT network {name} outside-cleanup-scope")

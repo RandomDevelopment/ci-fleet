@@ -146,7 +146,8 @@ flowchart TD
 
 Host-wide pruning must not run as an uncoordinated per-job operation. Hard cancellation and host failure may bypass project traps, so resources must remain identifiable by run and age.
 
-The existing host cleanup timer also reclaims empty networks whose allocations
+The existing host cleanup timer also reclaims empty networks at least ten
+minutes old whose allocations
 lie entirely inside rendered Docker default address pools. This includes
 unlabeled project Compose networks left after a failure. Controller networks,
 the default bridge, and any network with an attached container remain intact.

@@ -42,21 +42,33 @@ sudo systemctl start ci-fleet-health.service
 sudo systemctl start ci-fleet-drift.service
 sudo journalctl -u ci-fleet-health.service --since today
 sudo journalctl -u ci-fleet-drift.service --since today
-sudo /opt/ci-fleet/current/scripts/cleanup.sh
-sudo systemctl start ci-fleet-cleanup.service
+sudo systemd-run --wait --pipe --collect \
+  --property=User=root \
+  --property=EnvironmentFile=/etc/ci-fleet/ci-fleet.env \
+  --property=WorkingDirectory=/opt/ci-fleet/current \
+  /opt/ci-fleet/current/scripts/cleanup.sh
 ```
 
-The manual cleanup command is intentionally a dry-run. Enable the applying service only after its candidates are understood.
+This transient service runs a dry-run with the same root-owned rendered
+environment and working directory as the applying cleanup service. After
+reviewing its candidates, run `sudo systemctl start ci-fleet-cleanup.service`.
 
 ## Network reclamation
 
 The cleanup service reads the default address pools from its rendered
-`/etc/ci-fleet/ci-fleet.env`. A manual dry-run must receive the same environment
-to list pool cleanup candidates. Without rendered pool values, cleanup uses only
-the existing fleet-label expiry rule. It removes a network with zero attached containers
-when every allocated subnet lies inside those pools, including project Compose
+`/etc/ci-fleet/ci-fleet.env`. The documented dry-run loads that file through
+systemd, exactly as the applying service does. Without rendered pool values,
+cleanup uses only the existing fleet-label expiry rule. Pool reclamation removes
+a network with zero attached containers once it is at least ten minutes old
+and every allocated subnet lies inside those pools, including project Compose
 networks without fleet ownership or expiry labels. It does not infer ownership
 from a project name or require a changed desired-state commit.
+
+The fixed ten-minute grace is twice the ordinary job timeout and protects the
+gap between network creation and container attachment. Cleanup preserves fresh
+networks and networks whose `Created` timestamp is missing, invalid, lacks a
+timezone, or lies in the future. Explicit fleet-label expiry cleanup keeps its
+existing age policy.
 
 Cleanup always preserves `ci-fleet_default`, networks with the controller's
 `com.docker.compose.project=ci-fleet` identity, and the daemon's default bridge.

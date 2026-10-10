@@ -2,9 +2,12 @@
 """Regression coverage for scoped network cleanup."""
 
 import copy
+from datetime import datetime, timezone
 import io
 import json
 import os
+from pathlib import Path
+import shlex
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -22,6 +25,7 @@ POLICY = {
 def network(name="job", subnet="198.51.100.0/29", *, labels=None, containers=None, options=None):
     return {
         "Name": name,
+        "Created": "2000-01-01T00:00:00.000000001Z",
         "Labels": labels or {},
         "Containers": containers or {},
         "Options": options or {},
@@ -90,6 +94,51 @@ class CleanupNetworksTests(unittest.TestCase):
         self.assertEqual(remaining, inventory)
         self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
         self.assertIn("WOULD_REMOVE network job empty-default-address-pool", output)
+
+    def test_pool_cleanup_preserves_fresh_and_unknown_creation_times(self):
+        now = 2_000_000_000
+        cases = {
+            "fresh": datetime.fromtimestamp(now - 599, timezone.utc).isoformat(),
+            "future": datetime.fromtimestamp(now + 1, timezone.utc).isoformat(),
+            "invalid": "not-a-timestamp",
+            "timezone-less": "2000-01-01T00:00:00",
+            "empty": "",
+            "null": None,
+            "numeric": now - 1000,
+        }
+        for name, created in cases.items():
+            with self.subTest(name=name), patch.object(cleanup.time, "time", return_value=now):
+                item = {**network(), "Created": created}
+                remaining, calls, _ = self.run_cleanup({name: item})
+                self.assertEqual(remaining, {name: item})
+                self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
+        item = network()
+        del item["Created"]
+        remaining, _, _ = self.run_cleanup({"missing": item})
+        self.assertEqual(remaining, {"missing": item})
+
+    def test_pool_cleanup_removes_network_after_full_creation_grace(self):
+        now = 2_000_000_000
+        item = {**network(), "Created": datetime.fromtimestamp(now - 600, timezone.utc).isoformat()}
+        with patch.object(cleanup.time, "time", return_value=now):
+            remaining, _, _ = self.run_cleanup({"old": item})
+        self.assertEqual(remaining, {})
+
+    def test_documented_dry_run_uses_the_same_environment_as_applying_service(self):
+        root = Path(__file__).resolve().parents[1]
+        service = dict(
+            line.split("=", 1) for line in (root / "host/systemd/ci-fleet-cleanup.service").read_text().splitlines()
+            if "=" in line
+        )
+        docs = (root / "docs/HOST-MAINTENANCE.md").read_text()
+        command = docs[docs.index("sudo systemd-run "):].split("\n```", 1)[0]
+        args = shlex.split(command.replace("\\\n", " "))
+        properties = dict(arg.removeprefix("--property=").split("=", 1) for arg in args if arg.startswith("--property="))
+        self.assertEqual(properties["EnvironmentFile"], service["EnvironmentFile"])
+        self.assertEqual(properties["WorkingDirectory"], service["WorkingDirectory"])
+        self.assertEqual(properties["User"], service["User"])
+        self.assertEqual(args[-1], shlex.split(service["ExecStart"])[0])
+        self.assertNotIn("--apply", args)
 
     def test_expired_labels_remain_instance_scoped_and_protect_infrastructure(self):
         expired = {f"{cleanup.LABEL_PREFIX}managed": "true", f"{cleanup.LABEL_PREFIX}expires-at": "1", f"{cleanup.LABEL_PREFIX}instance": "example"}

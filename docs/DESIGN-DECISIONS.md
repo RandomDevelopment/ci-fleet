@@ -21,9 +21,11 @@ The cleanup contract in [Issue #81](https://github.com/RandomDevelopment/ci-flee
 requires an amendment. Ownership and expiry labels alone cannot recover address
 capacity occupied by abandoned, unlabeled project Compose networks.
 
-The existing cleanup timer may remove a zero-container network when all of its
+The existing cleanup timer may remove a zero-container network at least ten
+minutes after creation when all of its
 allocated subnets lie inside the controller's rendered default address pools.
 Fleet labels and an expiry are not prerequisites for that pool-scoped removal.
+Unknown, invalid, and future creation timestamps preserve the network.
 The controller Compose networks and daemon bridge remain protected, even when
 empty. Active networks and unlabeled networks outside the pools remain intact.
 Removal uses individual network IDs and Docker's active-endpoint protection.
