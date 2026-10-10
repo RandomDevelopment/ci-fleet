@@ -40,11 +40,22 @@ def docker(*args: str) -> str:
 
 
 def in_pools(item: dict, pools: list[ipaddress.IPv4Network]) -> bool:
-    configs = item.get("IPAM", {}).get("Config")
+    ipam = item.get("IPAM")
+    if not isinstance(ipam, dict):
+        return False
+    configs = ipam.get("Config")
     if not isinstance(configs, list) or not configs:
         return False
-    subnets = [ipaddress.ip_network(config["Subnet"], strict=True) for config in configs]
-    return all(subnet.version == 4 and any(subnet.subnet_of(pool) for pool in pools) for subnet in subnets)
+    for config in configs:
+        if not isinstance(config, dict) or not isinstance(config.get("Subnet"), str):
+            return False
+        try:
+            subnet = ipaddress.ip_network(config["Subnet"], strict=True)
+        except ValueError:
+            return False
+        if str(subnet) != config["Subnet"] or subnet.version != 4 or not any(subnet.subnet_of(pool) for pool in pools):
+            return False
+    return True
 
 
 def past_creation_grace(item: dict, now: int) -> bool:

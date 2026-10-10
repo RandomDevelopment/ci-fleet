@@ -147,15 +147,19 @@ class CleanupNetworksTests(unittest.TestCase):
         expired = {f"{cleanup.LABEL_PREFIX}managed": "true", f"{cleanup.LABEL_PREFIX}expires-at": "1", f"{cleanup.LABEL_PREFIX}instance": "example"}
         inventory = {
             "expired": network("old", "192.0.2.0/24", labels=expired),
+            "expired-unknown": {**network("old-unknown", labels=expired), "IPAM": None},
             "other-instance": network("other", "192.0.2.0/24", labels={**expired, f"{cleanup.LABEL_PREFIX}instance": "other"}),
             "unexpired": network("fresh", "192.0.2.0/24", labels={**expired, f"{cleanup.LABEL_PREFIX}expires-at": "99999999999"}),
             "active-expired": network("active", labels=expired, containers={"running": {}}),
             "controller": network("ci-fleet_default", labels=expired),
             "bridge": network("bridge", labels=expired),
         }
-        remaining, _, output = self.run_cleanup(inventory, policy={})
-        self.assertEqual(set(remaining), set(inventory) - {"expired"})
-        self.assertIn("REMOVE network old expired=1", output)
+        for policy in ({}, POLICY):
+            with self.subTest(policy=policy):
+                remaining, _, output = self.run_cleanup(inventory, policy=policy)
+                self.assertEqual(set(remaining), set(inventory) - {"expired", "expired-unknown"})
+                self.assertIn("REMOVE network old expired=1", output)
+                self.assertIn("REMOVE network old-unknown expired=1", output)
 
     def test_mixed_allocations_and_supernets_are_outside_pool_cleanup(self):
         mixed = network()
@@ -165,6 +169,41 @@ class CleanupNetworksTests(unittest.TestCase):
         inventory = {"mixed": mixed, "ipv6": ipv6, "supernet": network("supernet", "198.51.100.0/23")}
         remaining, _, _ = self.run_cleanup(inventory)
         self.assertEqual(remaining, inventory)
+
+    def test_unknown_allocations_are_reported_without_blocking_later_pool_cleanup(self):
+        allocations = {
+            "missing-ipam": {},
+            **{f"ipam-{name}": {"IPAM": value} for name, value in {
+                "null": None, "string": "unknown", "number": 1, "boolean": True, "list": [],
+            }.items()},
+            "missing-config": {"IPAM": {}},
+            **{f"config-{name}": {"IPAM": {"Config": value}} for name, value in {
+                "null": None, "string": "unknown", "number": 1, "boolean": True, "mapping": {}, "empty": [],
+            }.items()},
+            **{f"entry-{name}": {"IPAM": {"Config": [value]}} for name, value in {
+                "null": None, "string": "unknown", "number": 1, "boolean": True, "list": [], "missing-subnet": {},
+            }.items()},
+            **{f"subnet-{name}": {"IPAM": {"Config": [{"Subnet": value}]}} for name, value in {
+                "null": None, "empty": "", "number": 1, "boolean": True, "list": [], "mapping": {},
+                "invalid": "unknown", "host-bits": "198.51.100.1/29", "bare-address": "198.51.100.0",
+                "netmask": "198.51.100.0/255.255.255.248", "whitespace": " 198.51.100.0/29",
+            }.items()},
+            "mixed-unknown": {"IPAM": {"Config": [{"Subnet": "198.51.100.0/29"}, {}]}},
+        }
+        inventory = {}
+        for name, allocation in allocations.items():
+            item = network(name)
+            del item["IPAM"]
+            inventory[name] = {**item, **allocation}
+        inventory["valid"] = network("valid", "198.51.100.8/29")
+        remaining, calls, output = self.run_cleanup(inventory)
+        self.assertEqual(remaining, {name: item for name, item in inventory.items() if name != "valid"})
+        for name in allocations:
+            with self.subTest(name=name):
+                self.assertIn(f"REPORT network {name} outside-cleanup-scope", output)
+                self.assertNotIn(("network", "rm", name), calls)
+        self.assertIn(("network", "rm", "valid"), calls)
+        self.assertIn("REMOVE network valid empty-default-address-pool", output)
 
     def test_concurrent_container_attachment_is_preserved(self):
         remaining, calls, _ = self.run_cleanup({"empty": network()}, attach_on_recheck=True)
