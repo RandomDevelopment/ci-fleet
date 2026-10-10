@@ -44,6 +44,7 @@ case "${1:-}" in
   info)
     if [[ -n ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} && -f $FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT ]]; then exit 1; fi
     [[ "$*" != *DockerRootDir* ]] || printf '%s\n' "${CI_FLEET_DOCKER_ROOT:?}"
+    [[ "$*" != *Swarm.LocalNodeState* ]] || printf 'inactive\n'
     exit 0
     ;;
   inspect)
@@ -53,6 +54,8 @@ case "${1:-}" in
       cat "$FAKE_CONTROLLER_ENV_FILE"
     elif [[ "$*" == *'org.opencontainers.image.revision'* ]]; then
       if [[ -n "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" && -f "$FAKE_CONTROLLER_PROVENANCE_FILE" ]]; then cat "$FAKE_CONTROLLER_PROVENANCE_FILE"; else printf '%s\n' "${FAKE_ENGINE_REF:?}"; fi
+    elif [[ "$*" == *'io.randomdevelopment.ci-fleet.network-cleanup-lock'* ]]; then
+      if [[ -n "${FAKE_CONTROLLER_PROTOCOL_FILE:-}" && -f "$FAKE_CONTROLLER_PROTOCOL_FILE" ]]; then cat "$FAKE_CONTROLLER_PROTOCOL_FILE"; else printf 'v1\n'; fi
     elif [[ "$*" == *'{{.Image}}'* ]]; then
       [[ -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" ]] || exit 1
       cat "$FAKE_CONTROLLER_IMAGE_ID_FILE"
@@ -63,6 +66,11 @@ case "${1:-}" in
     else
       printf 'running\n'
     fi
+    ;;
+  exec)
+    [[ $# == 4 && ${3:-} == /usr/local/bin/ci-fleet-controller && ${4:-} == --check-docker-socket-proxy ]] || exit 1
+    [[ -f "$state" && ( -z "$paused_state" || ! -f "$paused_state" ) && ( -z "$status_file" || ! -f "$status_file" || $(<"$status_file") == running ) && ${FAKE_CONTROLLER_STATUS:-running} == running ]] || exit 1
+    [[ ${FAKE_DOCKER_PROXY_UNAVAILABLE:-0} == 0 ]] || exit 1
     ;;
   ps)
     [[ -z "${FAKE_DOCKER_PS_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_DOCKER_PS_LOG"
@@ -180,9 +188,10 @@ case "${1:-}" in
   compose)
     if [[ "${2:-}" == version ]]; then exit 0; fi
     [[ -z "${COMPOSE_PROJECT_NAME:-}" && -z "${CI_FLEET_MAX_RUNNERS:-}" ]] || exit 44
-    command= env_file= previous=
+    command= env_file= compose_file= previous=
     for argument in "$@"; do
       [[ "$previous" != --env-file ]] || env_file=$argument
+      [[ "$previous" != -f ]] || compose_file=$argument
       case "$argument" in config|build|up|stop|pause|unpause|kill|down|logs|rm) command=$argument ;; esac
       previous=$argument
     done
@@ -213,6 +222,12 @@ case "${1:-}" in
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$env_file" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
+        if [[ -n "${FAKE_CONTROLLER_PROTOCOL_FILE:-}" ]]; then
+          printf '<no value>\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
+          if grep -Fq 'io.randomdevelopment.ci-fleet.network-cleanup-lock="v1"' "${compose_file%/deploy/compose.yaml}/controller/Dockerfile" 2>/dev/null; then
+            printf 'v1\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
+          fi
+        fi
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
           printf 'restarting\n' >"$status_file"
@@ -482,6 +497,7 @@ export FAKE_PAUSED_STATE=$tmp/docker-controller-paused
 export FAKE_CONTROLLER_PROVENANCE_FILE=$tmp/docker-controller-provenance
 export FAKE_CONTROLLER_IMAGE_ID_FILE=$tmp/docker-controller-image-id
 export FAKE_CONTROLLER_ENV_FILE=$tmp/docker-controller-env
+export FAKE_CONTROLLER_PROTOCOL_FILE=$tmp/docker-controller-protocol
 export FAKE_DOCKER_PS_LOG=$tmp/docker-ps.log
 export CI_FLEET_TESTING=1
 export CI_FLEET_DOCKER_GID_OVERRIDE=998
@@ -652,7 +668,8 @@ PY
 root=$tmp/host
 export CI_FLEET_ROOT_PREFIX=$root
 export CI_FLEET_DOCKER_ROOT=$root/var/lib/docker
-mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/etc/docker" "$root/var/run" "$CI_FLEET_DOCKER_ROOT"
+mkdir -p "$root/etc/ci-fleet/secrets" "$root/etc/ssl/certs" "$root/etc/docker" "$root/var/run" "$root/proc/sys/kernel/random" "$CI_FLEET_DOCKER_ROOT"
+printf '11111111-1111-4111-8111-111111111111\n' >"$root/proc/sys/kernel/random/boot_id"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 printf 'fixture CA bundle\n' >"$root/etc/ssl/certs/ca-certificates.crt"
 : >"$root/var/run/docker.sock"
@@ -725,6 +742,19 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+
+[[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v1 ]] || fail 'current controller did not retain its cleanup protocol label'
+export FAKE_DOCKER_PROXY_UNAVAILABLE=1
+proxy_health_result=0
+"$repo_root/scripts/healthcheck.sh" >/dev/null || proxy_health_result=$?
+[[ "$proxy_health_result" == 2 ]] || fail 'manual healthcheck accepted an unavailable Docker proxy'
+python3 - "$root/var/lib/ci-fleet/health/latest.json" <<'PY' || fail 'unavailable Docker proxy was not the failed health check'
+import json, sys
+checks = json.load(open(sys.argv[1], encoding="utf-8"))["checks"]
+assert any(check["id"] == "docker_socket_proxy" and check["status"] == "critical" for check in checks)
+PY
+unset FAKE_DOCKER_PROXY_UNAVAILABLE
+[[ ${CI_FLEET_TEST_STOP_AFTER_DOCKER_PROXY_HEALTH:-0} != 1 ]] || { printf 'DOCKER_PROXY_HEALTH_REGRESSION_OK\n'; exit 0; }
 
 staging_failure_ref=$(write_config active 2 2)
 export FAKE_FAIL_UP_ONCE=$tmp/staging-failure-up
@@ -970,6 +1000,7 @@ pre_adapter_env=(
   FAKE_CONTROLLER_PROVENANCE_FILE="$tmp/pre-adapter-controller-provenance"
   FAKE_CONTROLLER_IMAGE_ID_FILE="$tmp/pre-adapter-controller-image-id"
   FAKE_CONTROLLER_ENV_FILE="$tmp/pre-adapter-controller-env"
+  FAKE_CONTROLLER_PROTOCOL_FILE="$tmp/pre-adapter-controller-protocol"
   FAKE_RUNNER_IMAGE_STATE="$tmp/pre-adapter-runner-image-present"
   FAKE_CONTROLLER_IMAGE_STATE="$tmp/pre-adapter-controller-image-present"
   FAKE_RUNNER_IMAGE_ID_STATE="$tmp/pre-adapter-runner-image-id"
@@ -997,6 +1028,7 @@ FAKE_ENGINE_REF=$pre_adapter_ref
 FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
 pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$pre_adapter_checkout/scripts/install-worker-controller.sh" --install "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref")
+[[ $(<"$tmp/pre-adapter-controller-protocol") == '<no value>' ]] || fail 'historical controller gained the current cleanup protocol label'
 grep -Fq 'CONVERGED mode=install' <<<"$pre_adapter_install" || fail 'pre-adapter installer did not build an installed historical release'
 pre_adapter_runtime=$pre_adapter_root/opt/ci-fleet/releases/$pre_adapter_ref
 pre_adapter_manager=$pre_adapter_root/opt/ci-fleet/manager/releases/$pre_adapter_ref
@@ -2976,6 +3008,8 @@ unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 adopt_root=$tmp/adopt-host
 export CI_FLEET_ROOT_PREFIX=$adopt_root
 export FAKE_DOCKER_STATE=$tmp/adopt-controller-running
+export FAKE_CONTROLLER_PROTOCOL_FILE=$tmp/adopt-controller-protocol
+printf '<no value>\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
 mkdir -p "$adopt_root/etc/ci-fleet/secrets" "$adopt_root/etc/ssl/certs" "$adopt_root/etc/docker" "$adopt_root/var/run" "$adopt_root/opt/ci-fleet/deploy" "$adopt_root/opt/ci-fleet/scripts"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$adopt_root/etc/os-release"
 printf 'fixture CA bundle\n' >"$adopt_root/etc/ssl/certs/ca-certificates.crt"
