@@ -12,6 +12,7 @@ type scaleSetStartup interface {
 	GetRunnerGroupByName(context.Context, string) (*scaleset.RunnerGroup, error)
 	GetRunnerScaleSet(context.Context, int, string) (*scaleset.RunnerScaleSet, error)
 	CreateRunnerScaleSet(context.Context, *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
+	UpdateRunnerScaleSet(context.Context, int, *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 }
 
 func ensureScaleSet(ctx context.Context, cfg Config, client scaleSetStartup) (*scaleset.RunnerScaleSet, error) {
@@ -37,8 +38,34 @@ func ensureScaleSet(ctx context.Context, cfg Config, client scaleSetStartup) (*s
 			return nil, fmt.Errorf("create runner scale set: %w", err)
 		}
 	}
-	if set == nil || set.Name != cfg.ScaleSetName || set.RunnerGroupID != runnerGroupID {
-		return nil, fmt.Errorf("runner scale set identity does not match the selected configuration")
+	if err := validateScaleSet(cfg, runnerGroupID, set); err != nil {
+		return nil, err
+	}
+	if !set.RunnerSetting.DisableUpdate {
+		id := set.ID
+		updated := *set
+		updated.Labels = slices.Clone(set.Labels)
+		updated.RunnerSetting.DisableUpdate = true
+		set, err = client.UpdateRunnerScaleSet(ctx, id, &updated)
+		if err != nil {
+			return nil, fmt.Errorf("disable runner updates: %w", err)
+		}
+		if err := validateScaleSet(cfg, runnerGroupID, set); err != nil {
+			return nil, err
+		}
+		if set.ID != id {
+			return nil, fmt.Errorf("runner scale set identity changed while disabling runner updates")
+		}
+		if !set.RunnerSetting.DisableUpdate {
+			return nil, fmt.Errorf("runner scale set did not disable runner updates")
+		}
+	}
+	return set, nil
+}
+
+func validateScaleSet(cfg Config, runnerGroupID int, set *scaleset.RunnerScaleSet) error {
+	if set == nil || set.ID <= 0 || set.Name != cfg.ScaleSetName || set.RunnerGroupID != runnerGroupID {
+		return fmt.Errorf("runner scale set identity does not match the selected configuration")
 	}
 	labels := make([]string, 0, len(set.Labels))
 	for _, label := range set.Labels {
@@ -48,7 +75,7 @@ func ensureScaleSet(ctx context.Context, cfg Config, client scaleSetStartup) (*s
 	slices.Sort(labels)
 	slices.Sort(expected)
 	if !slices.Equal(labels, expected) {
-		return nil, fmt.Errorf("runner scale set labels do not match the selected configuration")
+		return fmt.Errorf("runner scale set labels do not match the selected configuration")
 	}
-	return set, nil
+	return nil
 }

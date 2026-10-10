@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	version = "dev"
+	version   = "dev"
 	commitSHA = "unknown"
 )
 
@@ -41,47 +41,67 @@ func main() {
 
 func run(ctx context.Context) error {
 	cfg, err := configFromEnv()
-	if err != nil { return fmt.Errorf("configuration: %w", err) }
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	client, err := cfg.scaleSetClient()
-	if err != nil { return fmt.Errorf("create scale-set client: %w", err) }
+	if err != nil {
+		return fmt.Errorf("create scale-set client: %w", err)
+	}
 	set, err := ensureScaleSet(ctx, cfg, client)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	client.SetSystemInfo(systemInfo(set.ID))
-	ready := false
+	stoppedNormally := false
 	defer func() {
-		if !ready { return }
+		if !stoppedNormally {
+			return
+		}
 		if err := client.DeleteRunnerScaleSet(context.WithoutCancel(ctx), set.ID); err != nil {
 			logger.Error("delete runner scale set", "scaleSetID", set.ID, "error", err)
 		}
 	}()
 
 	docker, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil { return fmt.Errorf("create Docker client: %w", err) }
+	if err != nil {
+		return fmt.Errorf("create Docker client: %w", err)
+	}
 	defer docker.Close()
-	if _, err := docker.Ping(ctx); err != nil { return fmt.Errorf("ping Docker: %w", err) }
+	if _, err := docker.Ping(ctx); err != nil {
+		return fmt.Errorf("ping Docker: %w", err)
+	}
 	if _, err := docker.ImageInspect(ctx, cfg.RunnerImage); err != nil {
 		return fmt.Errorf("inspect runner image %q (build it before starting the controller): %w", cfg.RunnerImage, err)
 	}
 
 	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, scalesetClient: client, logger: logger, config: cfg, scaleSetID: set.ID}
-	if err := scaler.recoverStale(ctx); err != nil { return err }
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("get hostname: %w", err)
+	}
+	session, err := client.MessageSessionClient(ctx, set.ID, cfg.FleetInstance+"@"+hostname)
+	if err != nil {
+		return fmt.Errorf("create message session: %w", err)
+	}
+	defer session.Close(context.Background())
+	l, err := listener.New(session, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
+	if err != nil {
+		return fmt.Errorf("create listener: %w", err)
+	}
+	if err := scaler.recoverRunners(ctx); err != nil {
+		return err
+	}
 	scaler.writeStatus()
 	statusTicker := time.NewTicker(time.Minute)
 	defer statusTicker.Stop()
 	go scaler.publishStatus(ctx, statusTicker.C)
-	defer scaler.shutdown(context.WithoutCancel(ctx))
-	hostname, err := os.Hostname()
-	if err != nil { return fmt.Errorf("get hostname: %w", err) }
-	session, err := client.MessageSessionClient(ctx, set.ID, cfg.FleetInstance+"@"+hostname)
-	if err != nil { return fmt.Errorf("create message session: %w", err) }
-	defer session.Close(context.Background())
-	l, err := listener.New(session, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
-	if err != nil { return fmt.Errorf("create listener: %w", err) }
-	ready = true
 	logger.Info("controller ready", "scaleSet", cfg.ScaleSetName, "minRunners", cfg.MinRunners, "maxRunners", cfg.MaxRunners)
 	if err := l.Run(ctx, scaler); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("listener: %w", err)
 	}
+	scaler.shutdown(context.WithoutCancel(ctx))
+	stoppedNormally = true
 	return nil
 }
