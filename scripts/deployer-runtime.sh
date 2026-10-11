@@ -50,6 +50,19 @@ restore_encoded_file() {
   chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
   mv -Tf "$temporary" "$destination"
 }
+restore_rollback_pair() {
+  local path
+  [[ ${lkg_captured:-0} == 1 ]] || return 0
+  if [[ ${lkg_backed_up:-0} == 1 ]]; then
+    restore_encoded_file "$previous_state" "$lkg_state_backup" || return
+    restore_encoded_file "$previous_policy" "$lkg_policy_backup" || return
+  else
+    for path in "$previous_state" "$previous_policy"; do
+      prepare_restore_target "$path" && rm -f -- "$path" || return
+    done
+  fi
+  sync -f "$state_root" 2>/dev/null
+}
 restore_consumed_requests() {
   local id entry
   local -a entries=()
@@ -190,10 +203,7 @@ deploy_exit() {
     fi
   fi
 
-  if [[ ${lkg_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
-    restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" 2>/dev/null || status=1
-    restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" 2>/dev/null || status=1
-  fi
+  if [[ $state_root_safe == 1 ]]; then restore_rollback_pair 2>/dev/null || status=1; fi
   if [[ ${audit_pending:-0} == 1 && ${last_request_captured:-0} == 1 && ${completed_request_published:-0} != 1 && $state_root_safe == 1 ]]; then
     if [[ ${last_request_backed_up:-0} == 1 ]]; then
       restore_encoded_file "$last_request" "$last_request_backup" 2>/dev/null || status=1
@@ -613,6 +623,7 @@ PY
       lkg_policy_backup=$(base64 -w0 "$previous_policy")
       lkg_backed_up=1
     fi
+    lkg_captured=1
     if [[ -f "$last_request" && ! -L "$last_request" ]]; then
       last_request_backup=$(base64 -w0 "$last_request")
       last_request_backed_up=1
@@ -680,12 +691,8 @@ PY
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment success audit is not durable'
     # All fallible commit work is done; restore the retained pair if the
     # adapter touched it, then retire the incumbent snapshot.
-    if [[ ${lkg_backed_up:-0} == 1 ]]; then
-      restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" || die 'retained rollback state restoration failed'
-      restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" || die 'retained rollback policy restoration failed'
-      sync -f "$state_root" 2>/dev/null || die 'retained rollback pair restoration is not durable'
-      lkg_backed_up=0
-    fi
+    restore_rollback_pair || die 'retained rollback pair restoration failed'
+    lkg_captured=0
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
     audit_pending=0

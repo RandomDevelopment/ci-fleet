@@ -20,6 +20,8 @@ Production remains separately gated during the controlled-migration phase. Insta
 
 The systemd services run as root because access to the Docker socket is root-equivalent and protected credential references may be root-only. `NoNewPrivileges`, a read-only host filesystem, explicit writable paths, private temporary storage, and no supplementary service account reduce accidental reach, but they do not turn Docker access into a low-privilege boundary. Put nothing else on this host. Read-only mounts constrain direct filesystem access by the adapter process. They do not constrain Docker-mediated writes: the host daemon can mount and modify host paths outside that process namespace. The current runtime requires a reviewed, trusted root adapter and does not isolate recovery journals from its Docker authority. Stronger containment needs a constrained daemon/API boundary or recovery storage unavailable to that daemon; neither exists here. This remains an open acceptance finding, not a verified journal-isolation guarantee.
 
+Deployment adapters also inherit the deploy service's writable state and log roots. Their direct writes can alter replay markers, audits, and rollback records. Current restoration uses unexported process memory and requires the runtime to reach its EXIT handler; SIGKILL or host power loss can bypass it. Installer adapter namespaces and scheduled read-only health/cleanup do not establish deployment-adapter isolation. This separate direct-write/crash-recovery boundary is also unaccepted. A reviewed inner read-only adapter namespace and durable recovery design, or an explicit trusted-root-adapter acceptance decision covering both limits, is still required.
+
 ## Supported host and prerequisites
 
 The installer supports Debian 12/13 and Ubuntu 22.04/24.04 with systemd. It checks Docker Engine, synchronized time, disk capacity, DNS, HTTPS reachability, and Compose v2 when `REQUIRE_COMPOSE=1`. The configured network host is supplied to curl over standard input so a private endpoint is not placed in the process argument list.
@@ -336,7 +338,7 @@ The [historical synthetic proof](https://github.com/RandomDevelopment/ci-fleet/p
 
 Before any host work, an operator must separately authorize an isolated test or staging host, its target, the reviewed adapter, credential provisioning, checkpoint creation and restoration, and the permitted deployment and failure exercises. Keep host inventory and protected evidence outside this public repository.
 
-Before host activation, resolve the Docker-mediated journal-containment finding through a reviewed design and evidence, or an explicit acceptance decision for the documented trusted-root-adapter model with its risks and recovery procedure. Do not infer that decision from a passing namespace test.
+Before host activation, resolve the Docker-mediated journal-containment and direct deployment-adapter state/log findings through a reviewed design and evidence, or an explicit acceptance decision for the documented trusted-root-adapter model with its risks and recovery procedure. Do not infer that decision from a passing namespace test.
 
 Record the following evidence against the exact reviewed ci-fleet commit and adapter digest:
 
@@ -350,6 +352,6 @@ Record the following evidence against the exact reviewed ci-fleet commit and ada
 
 Retain detailed evidence privately. Post only the reviewed commit and adapter digest, pass/fail results, redacted reports, and an operator attestation in the PR. Keep the PR draft if any item lacks evidence. Production deployment, cleanup, and rollback require a separate accepted policy decision and authorization.
 
-The next acceptance step is review of the unresolved Docker/journal trust boundary, followed by separate operator authorization of the isolated test or staging host and application adapter, followed by host-local preparation and the documented one-command install and unchanged-rerun proof. Do not begin that step from repository CI or ordinary fleet runners.
+The next acceptance step is review of the unresolved direct-write/crash-recovery and Docker/journal trust boundaries, followed by separate operator authorization of the isolated test or staging host and application adapter, followed by host-local preparation and the documented one-command install and unchanged-rerun proof. Do not begin that step from repository CI or ordinary fleet runners.
 
 Drain requires an existing managed deployer installation and rejects another host role before creating a drain marker. A committed application rollback restores and verifies its pinned core pointer and systemd units before retiring the recovery journal. The runtime verifies the inherited operation lock when it changes to the active revision.

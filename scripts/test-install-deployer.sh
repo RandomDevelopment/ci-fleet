@@ -292,6 +292,12 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_REPLACE_RUNTIME_TARGET:-} ]]; then
   rm -f -- "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
   mkdir "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
 fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_INJECT_LKG:-} ]]; then
+  install -m 0600 "$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer/install-state.json" "$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer/last-known-good.json"
+  if [[ $FAKE_ADAPTER_INJECT_LKG == pair ]]; then
+    install -m 0600 "$CI_FLEET_DEPLOYER_CONFIG" "$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer/last-known-good-policy.conf"
+  fi
+fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_REDIRECT_LOG_ROOT:-} ]]; then
   mv "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer" "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer.saved"
   ln -s "$FAKE_ADAPTER_REDIRECT_LOG_ROOT" "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer"
@@ -2343,6 +2349,26 @@ PYTEST
       [[ $(base64 -w0 "$target_path") == "$target_before" ]] || fail 'directory recovery changed protected bytes'
     fi
   done
+done
+
+# Original absence of both rollback files survives successful and failed adapters.
+for name in last-known-good.json last-known-good-policy.conf; do
+  if [[ -f $root/var/lib/ci-fleet-deployer/$name ]]; then mv "$root/var/lib/ci-fleet-deployer/$name" "$tmp/$name.absence-saved"; fi
+done
+for outcome in success failure; do
+  for injected in partial pair; do
+    runtime_request
+    if [[ $outcome == failure ]]; then : >"$tmp/runtime-fail"; export FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail; fi
+    export FAKE_ADAPTER_INJECT_LKG=$injected
+    if [[ $outcome == success ]]; then expect_success "$runtime" deploy >/dev/null; else expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null; fi
+    unset FAKE_ADAPTER_INJECT_LKG FAKE_ADAPTER_FAIL_AFTER_MUTATION
+    for name in last-known-good.json last-known-good-policy.conf; do
+      [[ ! -e $root/var/lib/ci-fleet-deployer/$name && ! -L $root/var/lib/ci-fleet-deployer/$name ]] || fail 'runtime retained fabricated rollback state'
+    done
+  done
+done
+for name in last-known-good.json last-known-good-policy.conf; do
+  if [[ -f $tmp/$name.absence-saved ]]; then mv "$tmp/$name.absence-saved" "$root/var/lib/ci-fleet-deployer/$name"; fi
 done
 
 # Recovery never cleans or appends through an adapter-redirected log parent.
