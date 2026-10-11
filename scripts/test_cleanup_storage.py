@@ -168,7 +168,7 @@ class StorageTests(unittest.TestCase):
                 with patch.object(cleanup.coordination, "docker", side_effect=lambda *args: calls.append(args) or ""), \
                      patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
                     cleanup.cleanup_expired(apply=True, instance="fixture", usage=accounting)
-                mutate.assert_called_once_with("rm", "-v", outcome, timeout=30)
+                mutate.assert_called_once_with("rm", outcome, timeout=30)
                 accounting["Containers"][0]["State"] = "running"
                 with patch.object(cleanup.coordination, "docker", return_value=""), patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
                     cleanup.cleanup_expired(apply=True, instance="fixture", usage=accounting)

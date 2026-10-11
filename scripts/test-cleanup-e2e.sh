@@ -5,10 +5,12 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 temporary=$(mktemp -d)
 instance="cleanup-test-$(basename "$temporary" | tr '[:upper:]' '[:lower:]')"
 prefix=io.randomdevelopment.ci-fleet.
+uncertain_volumes=()
 cleanup_fixtures() {
   docker ps -aq --filter "label=${prefix}instance=$instance" | xargs -r docker rm -f -v >/dev/null
   docker volume ls -q --filter "label=${prefix}instance=$instance" | xargs -r docker volume rm >/dev/null
   docker network ls -q --filter "label=${prefix}instance=$instance" | xargs -r docker network rm >/dev/null
+  if ((${#uncertain_volumes[@]})); then docker volume rm "${uncertain_volumes[@]}" >/dev/null 2>&1 || true; fi
   rm -rf "$temporary"
 }
 trap cleanup_fixtures EXIT
@@ -28,8 +30,10 @@ for outcome in success failure cancellation timeout; do
     duration=2
     command='sleep 2'
   fi
-  container=$(docker create "${labels[@]}" --network "$network" --mount "type=volume,src=$volume,dst=/fixture" \
+  container=$(docker create "${labels[@]}" --network "$network" --mount "type=volume,src=$volume,dst=/fixture" --volume /uncertain \
     --entrypoint /bin/bash "$image" -c "$command")
+  uncertain=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/uncertain"}}{{.Name}}{{end}}{{end}}' "$container")
+  uncertain_volumes+=("$uncertain")
   if [[ "$duration" == 0 ]]; then
     docker start "$container" >/dev/null
     docker wait "$container" >/dev/null
@@ -52,5 +56,6 @@ for outcome in success failure cancellation timeout; do
     echo "ERROR host cleanup left $outcome fixture resources" >&2
     exit 1
   fi
+  docker volume inspect "$uncertain" >/dev/null
   echo "OK host cleanup after $outcome without project teardown"
 done

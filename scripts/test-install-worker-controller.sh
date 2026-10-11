@@ -434,6 +434,10 @@ if [[ ${1:-} == */health.py ]]; then
   # The simulated controller must not inherit the shared test machine's load.
   exec "$REAL_PYTHON3" -c 'import os,runpy,sys; os.getloadavg=lambda: (0.0,0.0,0.0); sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0],run_name="__main__")' "$@"
 fi
+if [[ ${1:-} == */cleanup_storage.py ]]; then
+  # This installer fixture has a simulated CLI and no live Docker accounting socket.
+  exec "$REAL_PYTHON3" -c 'import os,sys; sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); import cleanup_storage; cleanup_storage.docker_usage=lambda: {"Images": [], "Containers": [], "BuildCache": []}; cleanup_storage.disk_percent=lambda: 10; cleanup_storage.main()' "$@"
+fi
 if [[ -n "${FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE:-}" && -f "$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE" && "${1:-}" == - ]]; then
   script=$(</dev/stdin)
   if [[ "$script" == *'renameat2(-100'* && "$script" == *'os.fsync(parent)'* ]]; then

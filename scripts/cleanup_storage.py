@@ -150,7 +150,7 @@ def cleanup_expired(*, apply: bool, instance: str, usage: dict) -> None:
         else:
             print(f"{'REMOVE' if apply else 'WOULD_REMOVE'} container {identity} expired={expires}", flush=True)
             if apply:
-                mutate("rm", "-v", identity, timeout=30)
+                mutate("rm", identity, timeout=30)
     for name in coordination.docker("volume", "ls", "-q").splitlines():
         item = json.loads(coordination.docker("volume", "inspect", name))[0]
         labels = item.get("Labels") or {}
@@ -207,7 +207,7 @@ class RunStatus:
             if len(body) > 1024 * 1024:
                 raise ValueError("run response too large")
             result = json.loads(body)
-            if result.get("id") == int(run) and result.get("run_attempt") == int(attempt):
+            if isinstance(result, dict) and result.get("id") == int(run) and result.get("run_attempt") == int(attempt):
                 status = "terminal-run-leftover" if result.get("status") == "completed" else "active-or-unknown-run"
         except (OSError, ValueError, subprocess.SubprocessError):
             self.token = self.token or ""
