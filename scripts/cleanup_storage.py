@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -219,8 +220,16 @@ class RunStatus:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 return "unknown-lookup-budget"
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=min(5, remaining)) as response:
-                body = response.read(1024 * 1024 + 1)
+            def deadline_expired(*_args):
+                raise TimeoutError("run diagnostic deadline expired")
+            previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, min(5, remaining))
+                with urllib.request.build_opener(NoRedirect()).open(request, timeout=min(5, remaining)) as response:
+                    body = response.read(1024 * 1024 + 1)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
             if len(body) > 1024 * 1024:
                 raise ValueError("run response too large")
             result = json.loads(body)

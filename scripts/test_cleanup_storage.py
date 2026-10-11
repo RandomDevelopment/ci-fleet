@@ -8,9 +8,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -369,6 +371,32 @@ class StorageTests(unittest.TestCase):
                     cleanup.report_workloads(accounting)
                 self.assertIn("unknown-api-unavailable", output.getvalue())
                 self.assertNotIn("fixture-token", output.getvalue())
+
+    def test_run_diagnostics_enforce_total_deadline_during_headers_and_body(self):
+        for phase in ("headers", "body"):
+            with self.subTest(phase=phase):
+                response = unittest.mock.MagicMock()
+                payload = json.dumps({"id": 123, "run_attempt": 2, "status": "completed"}).encode()
+
+                def slow_response(*_args, **_kwargs):
+                    # Simulate a peer that keeps the connection active past the deadline.
+                    for _ in range(20):
+                        time.sleep(0.025)
+                    return response if phase == "headers" else payload
+
+                response.__enter__.return_value.read.side_effect = slow_response if phase == "body" else lambda *_args: payload
+                opener = unittest.mock.Mock()
+                opener.open.side_effect = slow_response if phase == "headers" else lambda *_args, **_kwargs: response
+                runs = cleanup.RunStatus()
+                runs.token = "fixture-token"
+                runs.deadline = time.monotonic() + 0.1
+                previous_handler = signal.getsignal(signal.SIGALRM)
+                started = time.monotonic()
+                with patch.object(cleanup.urllib.request, "build_opener", return_value=opener):
+                    self.assertEqual(runs.get("example-org/example-app", "123", "2"), "unknown-api-unavailable")
+                self.assertLess(time.monotonic() - started, 0.4)
+                self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
     def test_success_failure_cancellation_timeout_host_layer_without_trap(self):
         for outcome in ("success", "failure", "cancellation", "timeout"):
