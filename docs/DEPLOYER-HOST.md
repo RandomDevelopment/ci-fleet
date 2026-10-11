@@ -16,7 +16,7 @@ GitHub-native Environment protection is optional, not assumed. In particular, do
 
 A secret store proves only that a credential exists. It is not approval evidence. Every provider still binds the environment, target, source commit, artifact digest, approving identity, policy identity, approval ID, and UTC time.
 
-Production remains separately gated during the controlled-migration phase. `ENVIRONMENT=production` is rejected unless `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH` names an additional protected exact-target, exact-head, exact-artifact authorization record. Ordinary approval or credential access does not satisfy this gate, and the field is rejected outside production.
+Production remains separately gated during the controlled-migration phase. Installing a policy with `ENVIRONMENT=production` requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH` to name an additional protected exact-target, exact-head, exact-artifact authorization record. The runtime still rejects production deployment and cleanup, and the installer rejects production rollback under the current accepted scope. Authorization evidence does not enable those operations. The field is rejected outside production.
 
 The systemd services run as root because access to the Docker socket is root-equivalent and protected credential references may be root-only. `NoNewPrivileges`, a read-only host filesystem, explicit writable paths, private temporary storage, and no supplementary service account reduce accidental reach, but they do not turn Docker access into a low-privilege boundary. Put nothing else on this host.
 
@@ -326,6 +326,26 @@ The deterministic test uses an explicit alternate-root test mode and mocked Dock
 scripts/test-install-deployer.sh
 ```
 
-Prepared-host proof is still required before production use: exercise the reviewed adapter, Docker/systemd behavior, network policy, checkpoint recovery, immutable artifact verification, staging and production isolation, active-deployment drain, health, rollback, and scoped cleanup on a separately authorized isolated deployment host.
+## Prepared-host acceptance
+
+PR #69 remains a draft and issue #22 remains open until separately authorized prepared-host acceptance is complete. Required CI and the alternate-root tests establish repository behavior. They do not establish application adapter correctness, credential scope, recoverable host checkpoints, or deployed application health.
+
+The [historical synthetic proof](https://github.com/RandomDevelopment/ci-fleet/pull/69#issuecomment-5311189387) exercised real Debian 13, Docker, and systemd with credential-free `demo-a` and `demo-b` targets at commit `2ad48c75c1412a146086b7a18fb3027f423515f1`. It does not establish acceptance for the current PR head or an application-owned staging adapter and identity.
+
+Before any host work, an operator must separately authorize an isolated test or staging host, its target, the reviewed adapter, credential provisioning, checkpoint creation and restoration, and the permitted deployment and failure exercises. Keep host inventory and protected evidence outside this public repository.
+
+Record the following evidence against the exact reviewed ci-fleet commit and adapter digest:
+
+- Verify the supported OS, Docker and Compose versions, synchronized clock, disk and network prerequisites, and absence of ordinary runners, controller/receiver state, unrelated workloads, and shared production access.
+- Verify root ownership and permissions for configuration, adapter, credentials, and evidence. Prove that the identity and credential scope belong only to the authorized target and cannot reach production or ordinary CI jobs.
+- Produce exact-source and exact-artifact approval evidence through the chosen approval provider. Verify artifact provenance and digest through the application adapter. Prove missing, mismatched, and replayed approval cannot invoke deployment.
+- Create a recoverable host checkpoint and prove its restoration through the operator's recovery procedure. A syntactically valid checkpoint evidence file alone is insufficient.
+- Run the documented one-command install, then an unchanged rerun and `--check`. Retain the secret-free reports, installed source identity, timer state, and service health. Exercise the adapter through real systemd units, including scheduled health and scoped cleanup.
+- Exercise upgrade, repair, active-deployment refusal, drain, resume, bounded failure and interruption recovery, and rollback to verified application/core state. Prove audit history and consumed approvals survive recovery. Verify cleanup after success, failure, cancellation, and timeout preserves unrelated resources.
+- Exercise repeated uninstall and verify that units and activation are removed while operator-owned configuration, credentials, releases, rollback state, and audit records remain as documented.
+
+Retain detailed evidence privately. Post only the reviewed commit and adapter digest, pass/fail results, redacted reports, and an operator attestation in the PR. Keep the PR draft if any item lacks evidence. Production deployment, cleanup, and rollback require a separate accepted policy decision and authorization.
+
+The next acceptance step is operator authorization of the isolated test or staging host and application adapter, followed by host-local preparation and the documented one-command install and unchanged-rerun proof. Do not begin that step from repository CI or ordinary fleet runners.
 
 Drain requires an existing managed deployer installation and rejects another host role before creating a drain marker. A committed application rollback restores and verifies its pinned core pointer and systemd units before retiring the recovery journal. The runtime verifies the inherited operation lock when it changes to the active revision.
