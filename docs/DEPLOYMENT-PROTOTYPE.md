@@ -43,8 +43,13 @@ set -a
 . /etc/ci-fleet/ci-fleet.env
 set +a
 docker compose -f deploy/compose.yaml build runner-image controller
-docker compose -f deploy/compose.yaml up -d --no-deps controller
+docker compose -f deploy/compose.yaml up -d controller
 ```
+
+Starting the controller also starts its credential-free Docker socket proxy
+dependency and waits for that service to become healthy. Do not bypass
+dependencies with `--no-deps`. Managed rollback to an older engine removes the
+leftover proxy as a ci-fleet Compose orphan after runners have drained.
 
 The controller refuses to start if required settings or the secret file are absent. It also refuses to proceed unless the named runner image already exists on that Docker host.
 

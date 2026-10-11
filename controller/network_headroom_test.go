@@ -3,17 +3,191 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	dockerclient "github.com/docker/docker/client"
 )
+
+func TestCleanupRestoresHeadroomFromEmptyUnlabeledJobNetworks(t *testing.T) {
+	root := t.TempDir()
+	boot := filepath.Join(root, "proc/sys/kernel/random/boot_id")
+	if err := os.MkdirAll(filepath.Dir(boot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(boot, []byte("11111111-1111-4111-8111-111111111111"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	contender := &Scaler{
+		runners: newRunnerState(), logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		config:              Config{MaxRunners: 1, StatusFile: filepath.Join(root, "contender-status.json")},
+		maintenanceLockPath: filepath.Join(root, "run/lock/ci-fleet/docker-maintenance.lock"),
+	}
+	var deferrals atomic.Int32
+	inventory := map[string]map[string]any{}
+	addNetwork := func(id, name, subnet string) {
+		inventory[id] = map[string]any{
+			"Id": id, "Name": name, "Driver": "bridge", "Containers": map[string]any{},
+			"Created": "2000-01-01T00:00:00.000000001Z",
+			"Labels":  map[string]string{}, "IPAM": map[string]any{"Config": []map[string]string{{"Subnet": subnet}}},
+		}
+	}
+	for index := 0; index < 30; index++ {
+		addNetwork(fmt.Sprintf("job-%02d", index), fmt.Sprintf("empty-compose-%02d", index), fmt.Sprintf("198.51.100.%d/29", index*8))
+	}
+	addNetwork("controller", "ci-fleet_default", "192.0.2.0/24")
+	addNetwork("bridge", "bridge", "203.0.113.0/27")
+	addNetwork("stopped-network", "stopped-job", "198.51.100.240/29")
+	addNetwork("created-network", "created-job", "198.51.100.248/29")
+	var mutex sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/info"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"DefaultAddressPools": []map[string]any{{"Base": "198.51.100.0/24", "Size": 29}},
+			})
+		case strings.HasSuffix(r.URL.Path, "/networks"):
+			items := make([]map[string]any, 0, len(inventory))
+			for _, item := range inventory {
+				items = append(items, item)
+			}
+			_ = json.NewEncoder(w).Encode(items)
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			var filters map[string][]string
+			if r.URL.Query().Get("all") != "true" || json.Unmarshal([]byte(r.URL.Query().Get("filters")), &filters) != nil {
+				http.Error(w, "all-container filter required", http.StatusBadRequest)
+				return
+			}
+			items := []map[string]string{}
+			stopped, created := false, false
+			for _, value := range filters["network"] {
+				stopped = stopped || value == "stopped-network" || value == "stopped-job"
+				created = created || value == "created-job"
+			}
+			if stopped {
+				items = append(items, map[string]string{"Id": "stopped-container"})
+			}
+			if created {
+				items = append(items, map[string]string{"Id": "created-container"})
+			}
+			_ = json.NewEncoder(w).Encode(items)
+		case strings.Contains(r.URL.Path, "/networks/"):
+			id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			item, exists := inventory[id]
+			if !exists {
+				http.Error(w, "network disappeared", http.StatusNotFound)
+				return
+			}
+			if r.Method == http.MethodDelete {
+				if len(item["Containers"].(map[string]any)) != 0 {
+					http.Error(w, "network has active endpoints", http.StatusConflict)
+					return
+				}
+				if got, err := contender.HandleDesiredRunnerCount(context.Background(), 1); err != nil || got != 0 {
+					t.Errorf("new runner raced pool cleanup: count=%d error=%v", got, err)
+				}
+				deferrals.Add(1)
+				delete(inventory, id)
+				_, _ = w.Write([]byte(`{}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(item)
+		default:
+			http.Error(w, "unexpected Docker API call", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	docker, err := dockerclient.NewClientWithOpts(
+		dockerclient.WithHost("tcp://"+server.Listener.Addr().String()),
+		dockerclient.WithHTTPClient(server.Client()), dockerclient.WithVersion("1.48"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scaler := &Scaler{dockerClient: docker, config: Config{MaxRunners: 6, DockerNetworksPerRunner: 1, DockerNetworkReserveSubnets: 2}}
+	if slots, err := scaler.availableNetworkRunnerSlots(context.Background()); err != nil || slots != 0 {
+		t.Fatalf("filled pool returned %d runner slots and error %v, want zero", slots, err)
+	}
+	bin := t.TempDir()
+	fakeDocker := `#!/usr/bin/env python3
+import json, os, sys, urllib.parse, urllib.request
+args = sys.argv[1:]
+def request(path, method="GET"):
+    with urllib.request.urlopen(urllib.request.Request(os.environ["CI_FLEET_CLEANUP_TEST_URL"] + path, method=method)) as response:
+        return json.load(response)
+if args[0] == "info":
+    if "--format" in args:
+        print("inactive")
+    else:
+        print(json.dumps(request("/info")))
+elif args[0] == "ps":
+    filters = {}
+    for index, arg in enumerate(args):
+        if arg == "--filter":
+            key, value = args[index + 1].split("=", 1)
+            filters.setdefault(key, []).append(value)
+    if not filters or set(filters) - {"label", "network", "status"}:
+        sys.exit("unexpected container filters")
+    query = urllib.parse.urlencode({"all": "true", "filters": json.dumps(filters)})
+    for item in request("/containers/json?" + query):
+        print(item["Id"])
+elif args[:2] == ["volume", "ls"]:
+    pass
+elif args[:2] == ["network", "ls"]:
+    for item in request("/networks"):
+        print(item["Id"])
+elif args[:2] == ["network", "inspect"]:
+    print(json.dumps([request("/networks/" + args[-1])]))
+elif args[:2] == ["network", "rm"]:
+    request("/networks/" + args[-1], "DELETE")
+else:
+    sys.exit("unexpected fake Docker command: " + repr(args))
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fakeDocker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "../scripts/cleanup.sh", "--apply")
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_") && !strings.HasPrefix(value, "PATH=") {
+			command.Env = append(command.Env, value)
+		}
+	}
+	command.Env = append(command.Env,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"CI_FLEET_CLEANUP_TEST_URL="+server.URL,
+		"CI_FLEET_ROOT_PREFIX="+root,
+		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT=1",
+		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_BASE=198.51.100.0/24",
+		"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_0_SIZE=29",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("cleanup failed: %v\n%s", err, output)
+	}
+	if slots, err := scaler.availableNetworkRunnerSlots(context.Background()); err != nil || slots != 6 {
+		t.Fatalf("cleaned pool returned %d runner slots and error %v, want 6", slots, err)
+	}
+	if deferrals.Load() != 30 {
+		t.Fatalf("cleanup allowed runner creation during %d network removals", 30-deferrals.Load())
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(inventory) != 4 || inventory["controller"] == nil || inventory["bridge"] == nil || inventory["stopped-network"] == nil || inventory["created-network"] == nil {
+		t.Fatalf("cleanup removed infrastructure or left leaked networks: %v", inventory)
+	}
+}
 
 func TestLowDockerNetworkHeadroomStopsRunnerCreation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

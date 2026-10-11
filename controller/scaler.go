@@ -26,10 +26,13 @@ const labelPrefix = "io.randomdevelopment.ci-fleet."
 type Scaler struct {
 	runners        runnerState
 	dockerClient   *dockerclient.Client
-	scalesetClient *scaleset.Client
-	logger         *slog.Logger
-	config         Config
-	scaleSetID     int
+	scalesetClient interface {
+		GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	}
+	logger              *slog.Logger
+	config              Config
+	scaleSetID          int
+	maintenanceLockPath string
 }
 
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
@@ -47,6 +50,17 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		if target <= current {
 			s.logger.Warn("runner creation blocked by Docker network low water")
 		}
+	}
+	if target > current {
+		lock, err := s.lockRunnerCreation()
+		if err != nil {
+			return current, err
+		}
+		if lock == nil {
+			s.logger.Info("runner creation deferred during Docker maintenance")
+			return current, nil
+		}
+		defer lock.Close()
 	}
 	for i := current; i < target; i++ {
 		if _, err := s.startRunner(ctx); err != nil {
@@ -131,10 +145,10 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 	created, err := s.dockerClient.ContainerCreate(ctx,
 		&container.Config{
 			Image: s.config.RunnerImage, User: "runner", Cmd: []string{"/home/runner/run.sh"},
-			Env: []string{"ACTIONS_RUNNER_INPUT_JITCONFIG=" + jit.EncodedJITConfig}, Labels: labels,
+			Env: []string{"ACTIONS_RUNNER_INPUT_JITCONFIG=" + jit.EncodedJITConfig, "DOCKER_HOST=unix:///run/ci-fleet/locks/docker.sock"}, Labels: labels,
 		},
 		&container.HostConfig{
-			Binds:       []string{"/var/run/docker.sock:/var/run/docker.sock"},
+			Binds:       []string{"/run/lock/ci-fleet:/run/ci-fleet/locks", hostDockerProxySocket + ":/var/run/docker.sock"},
 			GroupAdd:    []string{s.config.DockerGID},
 			Resources:   container.Resources{Memory: s.config.RunnerMemory, NanoCPUs: s.config.RunnerCPUs * 1_000_000_000},
 			LogConfig:   container.LogConfig{Type: "json-file", Config: map[string]string{"max-size": "10m", "max-file": "3"}},

@@ -9,12 +9,14 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/cleanup_networks.py \
   scripts/health.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
   scripts/scan_committed_secrets.py \
   scripts/update_actions_runner.py \
   scripts/test_desired_state.py \
+  scripts/test_cleanup_networks.py \
   scripts/test_apply_docker_network_policy.py \
   scripts/test_remote_reconcile.py \
   scripts/test_health.py \
@@ -24,6 +26,7 @@ python3 -m py_compile \
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_cleanup_networks.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py
 python3 scripts/test_health.py

@@ -158,6 +158,9 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     add("controller", "ok" if controller_ok else "critical", state=controller_state, desired_state=desired)
     status_expected = desired == "active" and controller_state == "running"
     add("controller_status", "warning" if status_expected and not snapshot.get("controller_status_valid", True) else "ok")
+    proxy = snapshot.get("docker_socket_proxy", "not_required")
+    if status_expected and proxy != "not_required":
+        add("docker_socket_proxy", "ok" if proxy == "healthy" else "critical")
     restarts = snapshot["controller"]["restart_count"]
     add("restarts", "warning" if restarts >= thresholds.restart_warn_count else "ok", count=restarts)
 
@@ -654,6 +657,16 @@ def _reconcile_state(path: Path) -> dict[str, Any]:
     return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health, "last_success_at": last_success}
 
 
+def _docker_socket_proxy(run: Runner, controller_name: str) -> str:
+    protocol = run(["docker", "inspect", "--format", '{{index .Config.Labels "io.randomdevelopment.ci-fleet.network-cleanup-lock"}}', controller_name])
+    if protocol.returncode != 0:
+        return "unavailable"
+    if protocol.stdout.strip() in {"", "<no value>"}:
+        return "not_required"
+    checked = run(["docker", "exec", controller_name, "/usr/local/bin/ci-fleet-controller", "--check-docker-socket-proxy"])
+    return "healthy" if checked.returncode == 0 else "unavailable"
+
+
 def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Runner = _run) -> dict[str, Any]:
     docker_root = values.get("CI_FLEET_DOCKER_ROOT", "/var/lib/docker")
     available, swap = _memory(root)
@@ -664,6 +677,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     instance = values.get("CI_FLEET_INSTANCE", "unknown")
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     controller, effective = _container(run, controller_name) if docker_ok else ({"state": "missing", "restart_count": 0, "oom_killed": False}, {"min": 0, "max": 0})
+    docker_socket_proxy = _docker_socket_proxy(run, controller_name) if docker_ok and controller["state"] == "running" and values.get("CI_FLEET_CONTROLLER_STATE", "active") == "active" else "not_required"
     runners, software_version, controller_status_valid = _controller_status(run, controller_name, instance, configured["max"]) if docker_ok else ({"current": 0, "busy": 0, "maximum": configured["max"]}, "unknown", False)
     managed = {"running": 0, "inactive": 0, "unhealthy": 0, "restarting": 0}
     if docker_ok:
@@ -723,6 +737,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,
         "recent_oom": oom.returncode == 0 and bool(oom.stdout.strip()),
         "docker_available": docker_ok,
+        "docker_socket_proxy": docker_socket_proxy,
         "controller": controller,
         "configured_capacity": configured,
         "effective_capacity": effective,
