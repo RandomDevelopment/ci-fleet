@@ -35,10 +35,17 @@ retains the configured subnet count and reserve without inventing usage counts.
 Status reports include aggregate configured, used, free, and legacy counts only
 after a successful measurement; otherwise they omit the optional network field.
 
-This detection-only phase does not mutate the Docker daemon or networks.
-Controller circuit breaking, frequent orphan reconciliation, daemon policy
-application, transactional recovery, cleanup, and consumer-label migrations
-remain later issue #81 work.
+Before each scale-up, a controller with rendered network policy values reads the
+effective Docker default pools and current network allocations. It starts no more
+runners than the remaining subnet slots can support after reserving the reviewed
+low-water count and every current runner's declared network budget. This may
+conservatively count a current runner's allocated network twice, but cannot admit
+work based on a subnet that runner still needs. Failed or malformed Docker
+inspection blocks new runners without stopping in-flight jobs. The gate does not
+remove networks, cancel jobs, or change capacity in desired state.
+
+Frequent orphan reconciliation and consumer-label migrations remain later issue
+#81 work. Cleanup stays label-scoped and never uses blind Docker prune.
 
 ## Threshold overrides and hooks
 

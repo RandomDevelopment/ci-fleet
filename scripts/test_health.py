@@ -62,6 +62,42 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0)
         self.assertEqual(report["controller"], "example-ci-01")
 
+    def test_active_controller_requires_its_docker_socket_proxy(self) -> None:
+        for proxy_available in (True, False):
+            with self.subTest(proxy_available=proxy_available):
+                calls = []
+
+                def run(args):
+                    calls.append(args)
+                    if args[:2] == ["docker", "inspect"]:
+                        return health.subprocess.CompletedProcess(args, 0, "v1\n", "")
+                    return health.subprocess.CompletedProcess(args, 0 if proxy_available else 1, "", "")
+
+                proxy = health._docker_socket_proxy(run, "controller")
+                report = health.evaluate({**healthy_snapshot(), "docker_socket_proxy": proxy}, health.Thresholds())
+                self.assertEqual(report["exit_code"], 0 if proxy_available else 2)
+                self.assertIn(
+                    ["docker", "exec", "controller", "/usr/local/bin/ci-fleet-controller", "--check-docker-socket-proxy"],
+                    calls,
+                )
+                if not proxy_available:
+                    self.assertIn("docker_socket_proxy", {check["id"] for check in report["checks"] if check["status"] == "critical"})
+
+    def test_legacy_and_drained_controllers_do_not_require_a_proxy(self) -> None:
+        calls = []
+
+        def run(args):
+            calls.append(args)
+            return health.subprocess.CompletedProcess(args, 0, "<no value>\n", "")
+
+        proxy = health._docker_socket_proxy(run, "legacy-controller")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(health.evaluate({**healthy_snapshot(), "docker_socket_proxy": proxy}, health.Thresholds())["exit_code"], 0)
+        drained = healthy_snapshot()
+        drained.update(desired_state="drained", effective_capacity={"min": 0, "max": 0}, docker_socket_proxy="unavailable")
+        drained["controller"]["state"] = "exited"
+        self.assertEqual(health.evaluate(drained, health.Thresholds())["exit_code"], 0)
+
     def test_disk_warning_and_critical_thresholds(self) -> None:
         warning = healthy_snapshot()
         warning["disks"]["docker"]["used_percent"] = 80
@@ -91,6 +127,42 @@ class HealthTests(unittest.TestCase):
         legacy = health.evaluate({**healthy_snapshot(), "docker_network_headroom": {"configured": 2, "used": 0, "free": 2, "reserve": 1, "legacy": 1, "state": "warning"}}, health.Thresholds())
         self.assertEqual(legacy["status"], "warning")
         self.assertIn("docker_network_legacy", {check["id"] for check in legacy["checks"] if check["status"] == "warning"})
+
+    def test_default_bridge_health_verifies_effective_subnet_and_gateway(self) -> None:
+        values = {**network_policy_values(), "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR": "192.0.2.1/28"}
+
+        def inspect(subnet: str, gateway: str):
+            def run(args):
+                if args[:3] == ["docker", "network", "ls"]:
+                    return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+                return health.subprocess.CompletedProcess(
+                    args, 0, json.dumps([{"IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]}}]), ""
+                )
+            return health._docker_network_headroom(run, values, docker_ok=True)
+
+        matched = inspect("192.0.2.0/28", "192.0.2.1")
+        self.assertEqual(matched["default_bridge"], "matched")
+        mismatch = inspect("192.0.2.0/28", "192.0.2.2")
+        self.assertEqual((mismatch["default_bridge"], mismatch["state"]), ("mismatch", "critical"))
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": mismatch}, health.Thresholds())
+        self.assertIn("docker_default_bridge", {check["id"] for check in report["checks"] if check["status"] == "critical"})
+
+    def test_empty_default_bridge_placeholder_is_unconfigured(self) -> None:
+        values = {**network_policy_values(), "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR": ""}
+
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\n", "")
+            return health.subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps([{"IPAM": {"Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]}}]),
+                "",
+            )
+
+        result = health._docker_network_headroom(run, values, docker_ok=True)
+        self.assertEqual(result["state"], "healthy")
+        self.assertNotIn("default_bridge", result)
 
     def test_docker_network_headroom_collection_handles_inspection_failure(self) -> None:
         def run(args):
@@ -178,6 +250,43 @@ class HealthTests(unittest.TestCase):
             return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
         result = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
         self.assertEqual(result["legacy"], 1)
+
+    def test_builtin_null_ipam_keeps_transactional_health_below_failure(self) -> None:
+        networks = {
+            "bridge": [{"IPAM": {"Config": [{"Subnet": "198.51.100.0/28"}]}}],
+            "ci-fleet_default": [{"IPAM": {"Config": [{"Subnet": "172.18.0.0/16"}]}}],
+            "host": [{"IPAM": {"Config": None}}],
+            "none": [{"IPAM": {"Config": None}}],
+        }
+
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "bridge\nci-fleet_default\nhost\nnone\n", "")
+            return health.subprocess.CompletedProcess(args, 0, json.dumps(networks[args[-1]]), "")
+
+        network = health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        self.assertEqual(
+            network,
+            {"configured": 16, "used": 1, "free": 15, "reserve": 1, "legacy": 1, "state": "warning"},
+        )
+        report = health.evaluate({**healthy_snapshot(), "docker_network_headroom": network}, health.Thresholds())
+        self.assertEqual((report["status"], report["exit_code"]), ("warning", 1))
+        self.assertNotIn("docker_network_inspection", {check["id"] for check in report["checks"]})
+
+    def test_custom_null_ipam_still_fails_closed(self) -> None:
+        def run(args):
+            if args[:3] == ["docker", "network", "ls"]:
+                return health.subprocess.CompletedProcess(args, 0, "custom\n", "")
+            return health.subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps([{"IPAM": {"Config": None}}]),
+                "",
+            )
+
+        self.assert_unavailable_network(
+            health._docker_network_headroom(run, network_policy_values(), docker_ok=True)
+        )
 
     def test_overlapping_builtin_bridge_consumes_allocation_without_legacy_warning(self) -> None:
         def run(args):
@@ -465,8 +574,11 @@ class HealthTests(unittest.TestCase):
             (root / "proc/stat").write_text("cpu  100 0 50 800 50 0 0 0 40 10\nbtime 900\n")
             (root / "proc/meminfo").write_text("MemTotal: 1024 kB\nMemAvailable: 768 kB\nSwapTotal: 512 kB\nSwapFree: 384 kB\n")
             generated_at = [int(health.time.time())]
+            proxy_available = [True]
 
             def run(args):
+                if args[-1] == "--check-docker-socket-proxy":
+                    return health.subprocess.CompletedProcess(args, 0 if proxy_available[0] else 1, "", "")
                 if args[:3] == ["docker", "exec", "controller"]:
                     return health.subprocess.CompletedProcess(args, 0, json.dumps({
                         "controller": "example-ci-01", "software_version": "1" * 40,
@@ -476,6 +588,8 @@ class HealthTests(unittest.TestCase):
                     return health.subprocess.CompletedProcess(args, 0, "", "")
                 if args[:2] == ["docker", "inspect"]:
                     outputs = {"{{.State.Status}}": "running\n", "{{.State.OOMKilled}}": "false\n", "{{.RestartCount}}": "0\n", "{{range .Config.Env}}{{println .}}{{end}}": "CI_FLEET_MIN_RUNNERS=0\nCI_FLEET_MAX_RUNNERS=6\n"}
+                    if "network-cleanup-lock" in args[3]:
+                        return health.subprocess.CompletedProcess(args, 0, "v1\n", "")
                     return health.subprocess.CompletedProcess(args, 0, outputs.get(args[3], ""), "")
                 if args[:2] == ["systemctl", "is-enabled"] and args[-1] in {"ssh.service", "ssh.socket", "sshd.service"}:
                     return health.subprocess.CompletedProcess(args, 1, "disabled\n", "")
@@ -489,6 +603,13 @@ class HealthTests(unittest.TestCase):
             }, root=root, run=run)
             self.assertEqual(snapshot["runners"], {"current": 2, "busy": 1, "maximum": 6})
             self.assertEqual(snapshot["software_version"], "1" * 40)
+            self.assertEqual(snapshot["docker_socket_proxy"], "healthy")
+            proxy_available[0] = False
+            unavailable = health.collect_snapshot({
+                "CI_FLEET_INSTANCE": "example-ci-01", "CI_FLEET_CONTROLLER_CONTAINER": "controller", "CI_FLEET_MAX_RUNNERS": "6",
+            }, root=root, run=run)
+            self.assertTrue(unavailable["controller_status_valid"])
+            self.assertEqual(unavailable["docker_socket_proxy"], "unavailable")
             self.assertEqual(snapshot["boot_time"], 900)
             self.assertEqual(snapshot["ssh"], "disabled")
             self.assertEqual(snapshot["memory"], {"total_bytes": 1048576, "available_bytes": 786432})

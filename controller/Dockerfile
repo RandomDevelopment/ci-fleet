@@ -1,17 +1,21 @@
 # syntax=docker/dockerfile:1.18
-FROM golang:1.26.5-bookworm AS build
+FROM golang:1.27.1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY go.mod *.go ./
+COPY controller/go.mod controller/*.go ./
+COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/desired_state.py /scripts/
 RUN go mod tidy && go mod verify
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev
 ARG CI_FLEET_COMMIT=unknown
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${CI_FLEET_VERSION} -X main.commitSHA=${CI_FLEET_COMMIT}" -o /out/ci-fleet-controller .
 
-FROM debian:13.6-slim
+FROM debian:13.7-slim
 ARG CI_FLEET_COMMIT=unknown
 LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
-      io.randomdevelopment.ci-fleet.managed="true"
+      io.randomdevelopment.ci-fleet.managed="true" \
+      io.randomdevelopment.ci-fleet.network-cleanup-lock="v1"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && install -d -o 65532 -g 65532 /run/ci-fleet \
     && rm -rf /var/lib/apt/lists/*

@@ -15,6 +15,62 @@ The isolated one-job proof required by [Issue #7](https://github.com/RandomDevel
 
 This decision does not authorize application production deployment, privileged delivery on ordinary-CI runners, unreviewed capacity increases, public-repository runner access, unrestricted Docker cleanup, legacy-runner retirement, or VM deletion. Those remain separately gated by repository policy and operator approval.
 
+## Reclaim empty networks inside reviewed Docker address pools
+
+The cleanup contract in [Issue #81](https://github.com/RandomDevelopment/ci-fleet/issues/81)
+requires an amendment. Ownership and expiry labels alone cannot recover address
+capacity occupied by abandoned, unlabeled project Compose networks.
+
+The existing cleanup timer may remove a zero-container network at least ten
+minutes after creation when all of its
+allocated subnets lie inside the controller's rendered default address pools.
+Fleet labels and an expiry are not prerequisites for that pool-scoped removal.
+Unknown, invalid, and future creation timestamps preserve the network.
+The controller Compose networks and daemon bridge remain protected, even when
+empty. Active networks and unlabeled networks outside the pools remain intact.
+Removal uses individual network IDs and an exclusive maintenance gate shared
+with the credential-free Docker socket proxy. The proxy mediates controller and
+ordinary job reference mutations through completion, including caller
+cancellation. Cleanup waits for idle work without holding the exclusive gate,
+then checks existing created/stopped references before removal. Current-boot
+markers preserve uncertain proxy mutations or cleanup removals across process
+restarts; only a new host boot makes their old boot directories safe to clear.
+The low-water gate remains enabled.
+
+This policy assumes configured pools on an isolated fleet daemon contain
+disposable job networks. An empty, intentionally reusable network inside a pool
+can also be removed unless it belongs to the controller. Put persistent
+infrastructure outside those job pools. Revisit this rule before allowing a
+shared daemon whose persistent networks cannot satisfy that boundary. This
+amendment changes neither pool capacity nor timer frequency, and it authorizes
+no host deployment or cleanup during repository development.
+
+This gate covers isolated ordinary Docker/Compose workloads using the proxy.
+Host-root clients bypassing the proxy and asynchronous orchestrators cannot be
+made atomic by this repository's cleanup loop. Cleanup defers on active or
+unknown Swarm state and older/uncoordinated runnable containers. The independent
+proxy survives controller-only restarts; proxy restarts may interrupt clients
+that bind its socket file directly. Direct runners also mount the shared
+directory and use `DOCKER_HOST` so their later jobs can reconnect.
+
+## Independent review of configuration candidates
+
+The opt-in trust boundary prepared under [issue #108](https://github.com/RandomDevelopment/ci-fleet/issues/108)
+keeps review/check requirements in root-owned policy separate from candidate
+Git-authored configuration. It is an explicit exception to the host-file rule:
+numeric repository, workflow, and reviewer trust anchors belong outside the
+repository whose changes they accept. They are not application allowlists,
+capacity policy, credentials, or infrastructure inventory. See
+[the acceptance and recovery contract](CONFIGURATION-APPROVAL.md).
+
+This implementation requires independent exact-head formal review, exact-applied
+commit workflow/job success, and equality of the reviewed and applied trees.
+Existing root-owned installation/checkpoints remain the trusted recovery
+baseline; an enabled host cannot restore a manager that drops the gate.
+Host-root compromise, trusted-engine compromise, and account takeover of an
+allowed reviewer are outside this check's boundary. No deployment, account
+permission change, host activation, or production approval is granted here.
+
 ## Project name
 
 **Status:** accepted on 2026-08-16; retain `ci-fleet`.
