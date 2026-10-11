@@ -159,7 +159,7 @@ def cleanup_expired(*, apply: bool, instance: str, usage: dict) -> None:
         expires = labels.get(f"{PREFIX}expires-at", "")
         owned = labels.get(f"{PREFIX}managed") == "true" and (not instance or labels.get(f"{PREFIX}instance") == instance)
         if not owned or not expires.isascii() or not expires.isdigit() or int(expires) > now:
-            print(f"KEEP container {item['Id']} uncertain-ownership-or-unexpired")
+            print(f"REPORT container {item['Id']} uncertain-ownership-or-unexpired")
             continue
         identity = item["Id"]
         if item.get("State") not in {"exited", "dead", "created"}:
@@ -174,7 +174,7 @@ def cleanup_expired(*, apply: bool, instance: str, usage: dict) -> None:
         expires = labels.get(f"{PREFIX}expires-at", "")
         owned = labels.get(f"{PREFIX}managed") == "true" and (not instance or labels.get(f"{PREFIX}instance") == instance)
         if not owned or not expires.isascii() or not expires.isdigit() or int(expires) > now:
-            print(f"KEEP volume {name} uncertain-ownership-or-unexpired")
+            print(f"REPORT volume {name} uncertain-ownership-or-unexpired")
             continue
         if coordination.docker("ps", "-aq", "--filter", f"volume={name}").strip():
             print(f"KEEP volume {name} container-reference")
@@ -244,8 +244,9 @@ def report_workloads(usage: dict) -> None:
         print(f"REPORT container {container['Id']} state={container.get('State', 'unknown')} {status}; no run-based removal")
 
 
-def cleanup_storage(*, apply: bool) -> None:
-    usage = docker_usage()
+def cleanup_storage(*, apply: bool, usage: dict | None = None) -> None:
+    if usage is None:
+        usage = docker_usage()
     used = disk_percent()
     admission = os.environ.get("CI_FLEET_DOCKER_STORAGE_RETENTION", "")
     if admission not in {"", ADMISSION}:
@@ -279,7 +280,7 @@ def cleanup_storage(*, apply: bool) -> None:
             raise ValueError("invalid Docker image identity")
         aliases = [tag for tag in (image.get("RepoTags") or []) if tag != "<none>:<none>"]
         if not aliases:
-            aliases = image.get("RepoDigests") or []
+            aliases = [digest for digest in (image.get("RepoDigests") or []) if digest != "<none>@<none>"]
         if any(not re.fullmatch(r"[A-Za-z0-9._/:@\[\]-]+", tag) or tag.startswith("-") for tag in aliases):
             raise ValueError("invalid Docker image reference")
         mutate("image", "rm", "--no-prune", "--", *(aliases or [identity]), timeout=max(0.1, deadline - time.monotonic()))
@@ -303,11 +304,12 @@ def main():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--instance", default=os.environ.get("CI_FLEET_INSTANCE", ""))
     args = parser.parse_args()
-    report_workloads(docker_usage())
+    diagnostic_usage = docker_usage()
+    report_workloads(diagnostic_usage)
 
     def maintenance(apply):
-        cleanup_expired(apply=apply, instance=args.instance, usage=docker_usage())
-        cleanup_storage(apply=apply)
+        cleanup_expired(apply=apply, instance=args.instance, usage=docker_usage() if apply else diagnostic_usage)
+        cleanup_storage(apply=apply, usage=None if apply else diagnostic_usage)
 
     coordination.cleanup_networks(apply=args.apply, instance=args.instance, maintenance=maintenance)
     if not args.apply:

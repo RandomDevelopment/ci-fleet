@@ -9,11 +9,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import cleanup_storage as cleanup
+import health
 from test_cleanup_networks import BOOT_ID
 
 
@@ -163,6 +165,65 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", *digests))
                 self.assertEqual(mutations[1].args[-1], "example:old")
                 self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
+
+    def test_legacy_none_digest_uses_image_identity_without_blocking_cleanup(self):
+        accounting = usage()
+        accounting["Images"] = [image(RepoTags=["<none>:<none>"], RepoDigests=["<none>@<none>"]), image(identity=OTHER)]
+        _, mutations = self.run_storage(accounting=accounting)
+        self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", IMAGE))
+        self.assertEqual(mutations[1].args[-1], "example:old")
+        self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
+
+    def test_dry_run_reuses_one_accounting_snapshot(self):
+        with patch.object(sys, "argv", ["cleanup_storage.py"]), patch.dict(os.environ, {}, clear=True), \
+             patch.object(cleanup, "docker_usage", return_value=usage()) as accounting, \
+             patch.object(cleanup, "disk_percent", return_value=10), \
+             patch.object(cleanup.coordination, "docker", return_value=""), \
+             patch.object(cleanup.coordination, "remove_networks") as networks, \
+             patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
+            cleanup.main()
+        accounting.assert_called_once()
+        networks.assert_called_once_with(apply=False, instance="", pools=[])
+        mutate.assert_not_called()
+
+    def test_applying_refreshes_inventory_after_expired_container_removal(self):
+        expired = {"Images": [], "BuildCache": [], "Containers": [{"Id": "expired", "ImageID": IMAGE,
+            "State": "exited", "Labels": {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "expires-at": "1"}}]}
+        fresh = {**usage(), "BuildCache": []}
+        with patch.object(sys, "argv", ["cleanup_storage.py", "--apply"]), \
+             patch.dict(os.environ, {"CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION}, clear=True), \
+             patch.object(cleanup, "docker_usage", side_effect=[expired, expired, fresh]) as accounting, \
+             patch.object(cleanup, "disk_percent", side_effect=[81, 81, 64, 64]), \
+             patch.object(cleanup.time, "time", return_value=NOW), \
+             patch.object(cleanup, "protected_images", return_value=set()), \
+             patch.object(cleanup.coordination, "docker", return_value=""), \
+             patch.object(cleanup.coordination, "cleanup_networks", side_effect=lambda **args: args["maintenance"](args["apply"])), \
+             patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
+            cleanup.main()
+        self.assertEqual(accounting.call_count, 3)
+        self.assertEqual([call.args for call in mutate.call_args_list], [
+            ("rm", "expired"), ("image", "rm", "--no-prune", "--", "example:old")])
+
+    def test_stale_counters_exclude_unowned_and_unexpired_resources(self):
+        expired = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}
+        recent = {**expired, cleanup.PREFIX + "expires-at": str(NOW + 1)}
+        volumes = {"unowned": {}, "recent": recent, "referenced": expired, "expired": expired}
+        accounting = {"Containers": [{"Id": name, "State": "running", "Labels": labels} for name, labels in (
+            ("controller", {}), ("recent", recent), ("expired", expired),
+            ("other-instance", {**expired, cleanup.PREFIX + "instance": "other"}))]}
+
+        def docker(*args):
+            if args[:2] == ("volume", "ls"):
+                return "\n".join(volumes)
+            if args[:2] == ("volume", "inspect"):
+                return json.dumps([{"Labels": volumes[args[-1]]}])
+            return "stopped-container" if args[-1] == "volume=referenced" else ""
+
+        with patch.object(cleanup.coordination, "docker", side_effect=docker), \
+             patch.object(cleanup.time, "time", return_value=NOW), redirect_stdout(io.StringIO()) as output:
+            cleanup.cleanup_expired(apply=False, instance="fixture", usage=accounting)
+        run = lambda args: subprocess.CompletedProcess(args, 0, output.getvalue(), "")
+        self.assertEqual(health._stale_resources(run, "fixture"), {"containers": 1, "networks": 0, "volumes": 2})
 
     def test_service_deadline_stops_expired_resources_before_creating_uncertainty(self):
         labels = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}
