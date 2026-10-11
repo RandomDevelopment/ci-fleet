@@ -40,9 +40,12 @@ Organization permissions:
 | --- | --- | --- |
 | Self-hosted runners | Read & write | mint runner registration tokens |
 
-Nothing else. No `write` on contents, no actions, no administration. If the
-controller ever needs more, that is a reviewed design change, not a settings
-tweak.
+The ordinary controller needs no other repository permissions. The optional
+[configuration approval gate](CONFIGURATION-APPROVAL.md) additionally requires
+read-only Pull requests and Actions on the configuration repository to verify
+reviews and exact-commit workflow/job results. It never needs contents write,
+approval write, or administration. Granting those read permissions and enabling
+the gate remain separately authorized operator actions.
 
 ## 3. Generate and transfer the private key
 

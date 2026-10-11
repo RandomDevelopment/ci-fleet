@@ -493,6 +493,55 @@ exec {shlex.quote(real_git or 'git')} "$@"
         self.assertEqual(calls[0]["fd9"], str(self.lock_file))
         self.assertFalse(self.policy_marker.exists())
 
+    def _activate_approval_fixture(self, reject: bool) -> Path:
+        policy_directory = self.td / "etc" / "ci-fleet"
+        policy_directory.mkdir(parents=True)
+        (policy_directory / "config-review-required").write_text("1\n")
+        (policy_directory / "config-review-policy.json").write_text("{}\n")
+        log = self.td / "approval-call.json"
+        (self.root / "scripts" / "verify_config_approval.py").write_text(
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            f"raise SystemExit({2 if reject else 0})\n", encoding="utf-8",
+        )
+        self.env["CI_FLEET_ROOT_PREFIX"] = str(self.td)
+        return log
+
+    def test_rejected_approval_never_calls_installer_or_changes_lkg(self):
+        log = self._activate_approval_fixture(reject=True)
+        result = self._run("healthy")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(self.installer_log.exists())
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertEqual(self._reconcile_state()["status"], "invalid")
+        args = json.loads(log.read_text())
+        self.assertIn(self.desired_ref, args)
+        self.assertIn(git("rev-parse", "HEAD^{tree}", cwd=self.config_repo).stdout.strip(), args)
+        self.assertIn("example-org/private-config", args)
+
+    def test_missing_policy_still_invokes_guard_when_marker_remains(self):
+        log = self._activate_approval_fixture(reject=True)
+        (self.td / "etc" / "ci-fleet" / "config-review-policy.json").unlink()
+        result = self._run("healthy")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertTrue(log.exists())
+        self.assertFalse(self.installer_log.exists())
+
+    def test_unchanged_commit_still_requires_approval_before_drift_check(self):
+        self._activate_approval_fixture(reject=True)
+        self._write_installed_ref(self.desired_ref)
+        result = self._run("healthy")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(self.installer_log.exists())
+        self.assertNotIn("NO_CHANGE", result.stdout)
+
+    def test_approved_candidate_proceeds_to_locked_installer(self):
+        log = self._activate_approval_fixture(reject=False)
+        result = self._run("healthy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(log.exists())
+        self.assertEqual(self._installer_calls()[0]["args"][0], "--upgrade")
+
     def test_state_aware_final_health_acceptance_advances_candidate_lkg(self):
         for desired_state, health in (
             ("active", "healthy"),
@@ -523,6 +572,9 @@ exec {shlex.quote(real_git or 'git')} "$@"
                 result = self._run(health, rollback_health=rollback_health)
 
                 self._assert_rolled_back(result, rollback_health)
+                calls = self._installer_calls()
+                self.assertNotIn("--restore-last-known-good", calls[0]["args"])
+                self.assertIn("--restore-last-known-good", calls[1]["args"])
 
     def test_unaccepted_installed_state_does_not_replace_prior_lkg(self):
         interrupted_ref = "1" * 40

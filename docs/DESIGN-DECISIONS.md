@@ -53,6 +53,24 @@ proxy survives controller-only restarts; proxy restarts may interrupt clients
 that bind its socket file directly. Direct runners also mount the shared
 directory and use `DOCKER_HOST` so their later jobs can reconnect.
 
+## Independent review of configuration candidates
+
+The opt-in trust boundary prepared under [issue #108](https://github.com/RandomDevelopment/ci-fleet/issues/108)
+keeps review/check requirements in root-owned policy separate from candidate
+Git-authored configuration. It is an explicit exception to the host-file rule:
+numeric repository, workflow, and reviewer trust anchors belong outside the
+repository whose changes they accept. They are not application allowlists,
+capacity policy, credentials, or infrastructure inventory. See
+[the acceptance and recovery contract](CONFIGURATION-APPROVAL.md).
+
+This implementation requires independent exact-head formal review, exact-applied
+commit workflow/job success, and equality of the reviewed and applied trees.
+Existing root-owned installation/checkpoints remain the trusted recovery
+baseline; an enabled host cannot restore a manager that drops the gate.
+Host-root compromise, trusted-engine compromise, and account takeover of an
+allowed reviewer are outside this check's boundary. No deployment, account
+permission change, host activation, or production approval is granted here.
+
 ## Project name
 
 **Status:** accepted on 2026-08-16; retain `ci-fleet`.
