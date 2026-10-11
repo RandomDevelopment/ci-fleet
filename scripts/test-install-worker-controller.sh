@@ -486,6 +486,9 @@ if [[ -n "${FAKE_TIMEOUT_LOG:-}" && "$*" == *docker-network-policy-adapter.sh* ]
   for argument in "$@"; do
     if [[ "$previous" == *docker-network-policy-adapter.sh ]]; then
       printf '%s|%s\n' "$argument" "$status" >>"$FAKE_TIMEOUT_LOG"
+      if [[ "$argument" == drain && "$status" == 2 && "${FAKE_RELEASE_RUNNER_AFTER_DRAIN:-0}" == 1 ]]; then
+        rm -f "${FAKE_RUNNER_STATE:?}"
+      fi
       break
     fi
     previous=$argument
@@ -1263,30 +1266,18 @@ export CI_FLEET_COMMAND_TIMEOUT_SECONDS=1 CI_FLEET_DRAIN_TIMEOUT_SECONDS=1
 export FAKE_TIMEOUT_LOG=$tmp/policy-timeout.log
 export FAKE_RUNNER_STATE=$tmp/policy-timeout-runner
 export FAKE_KEEP_RUNNER_ON_PAUSE=1
+export FAKE_RELEASE_RUNNER_AFTER_DRAIN=1
 : >"$FAKE_TIMEOUT_LOG"
 : >"$FAKE_RUNNER_STATE"
-(
-  for ((attempt = 0; attempt < 200; attempt++)); do
-    [[ ! -f "$FAKE_PAUSED_STATE" ]] || break
-    sleep 0.05
-  done
-  for ((attempt = 0; attempt < 200; attempt++)); do
-    [[ -f "$FAKE_PAUSED_STATE" ]] || break
-    sleep 0.05
-  done
-  rm -f "$FAKE_RUNNER_STATE"
-) &
-timeout_runner_reaper=$!
 timeout_output=$tmp/policy-timeout.out
 set +e
 "$installer" --upgrade "${base_args[@]}" --ref "$timeout_ref" >"$timeout_output" 2>&1
 timeout_status=$?
 set -e
-wait "$timeout_runner_reaper"
 [[ "$timeout_status" != 124 ]] || fail 'outer policy command stole the nested drain timeout status'
 grep -Fq 'drain|2' "$FAKE_TIMEOUT_LOG" || fail "nested drain did not return its ordinary failure before the outer deadline: $(<"$FAKE_TIMEOUT_LOG")"
 [[ ! -f "$FAKE_PAUSED_STATE" ]] || fail 'nested drain timeout returned with the controller paused'
-unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE
+unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE FAKE_RELEASE_RUNNER_AFTER_DRAIN
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 # A failure after resume must still run one bounded rollback-drain.

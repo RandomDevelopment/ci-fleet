@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "example-org/private-config"
 PREFIX = "/repos/" + REPOSITORY
 COMMIT, HEAD, TREE = "1" * 40, "2" * 40, "3" * 40
+PARENT = "5" * 40
 POLICY = {
     "schema_version": 1, "configuration_repository_id": 101, "branch": "main",
     "workflow_id": 501, "required_jobs": ["validate"], "reviewer_ids": [202],
@@ -33,8 +34,9 @@ POLICY = {
 def evidence() -> dict:
     return {
         PREFIX: {"id": 101, "full_name": REPOSITORY, "default_branch": "main"},
-        f"{PREFIX}/git/commits/{COMMIT}": {"sha": COMMIT, "tree": {"sha": TREE}},
+        f"{PREFIX}/git/commits/{COMMIT}": {"sha": COMMIT, "tree": {"sha": TREE}, "parents": [{"sha": PARENT}]},
         f"{PREFIX}/git/commits/{HEAD}": {"sha": HEAD, "tree": {"sha": TREE}},
+        f"{PREFIX}/compare/{PARENT}...{HEAD}": {"merge_base_commit": {"sha": PARENT}, "status": "ahead"},
         f"{PREFIX}/commits/{COMMIT}/pulls": [{"number": 8, "merge_commit_sha": COMMIT, "merged_at": "2026-01-01"}],
         f"{PREFIX}/pulls/8": {
             "merged": True, "state": "closed", "merge_commit_sha": COMMIT,
@@ -105,13 +107,46 @@ class ApprovalTests(unittest.TestCase):
                 data[review_path][0][field] = changed
                 with self.assertRaises(Rejected):
                     verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
-        for state in ("DISMISSED", "CHANGES_REQUESTED", "APPROVED"):
+        for state, commit_id in (("DISMISSED", HEAD), ("CHANGES_REQUESTED", HEAD), ("APPROVED", "4" * 40)):
             data = evidence()
-            data[review_path].append({"id": 901, "user": {"id": 202}, "state": state, "commit_id": "4" * 40})
+            data[review_path].append({"id": 901, "user": {"id": 202}, "state": state, "commit_id": commit_id})
             with self.assertRaises(Rejected):
                 verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
         data = evidence()
         data[review_path] = []
+        with self.assertRaises(Rejected):
+            verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+
+    def test_reviewed_head_must_include_previous_main_for_squash_and_merge(self):
+        data = evidence()
+        data[f"{PREFIX}/git/commits/{COMMIT}"]["parents"].append({"sha": HEAD})
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        for parents in ([], [{"sha": "invalid"}], [{"sha": PARENT}, {"sha": "4" * 40}],
+                        [{"sha": PARENT}] * 3):
+            data = evidence()
+            data[f"{PREFIX}/git/commits/{COMMIT}"]["parents"] = parents
+            with self.subTest(parents=parents), self.assertRaises(Rejected):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        for parent_count in (1, 2):
+            data = evidence()
+            if parent_count == 2:
+                data[f"{PREFIX}/git/commits/{COMMIT}"]["parents"].append({"sha": HEAD})
+            # Equal trees and an exact-head approval cannot authorize deleting later main changes.
+            data[f"{PREFIX}/compare/{PARENT}...{HEAD}"] = {
+                "merge_base_commit": {"sha": "4" * 40}, "status": "diverged",
+            }
+            with self.subTest(parent_count=parent_count), self.assertRaises(Rejected):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+
+    def test_never_started_runs_do_not_hide_newer_success_or_pending_evidence(self):
+        data = evidence()
+        runs = data[f"{PREFIX}/actions/workflows/501/runs"]["workflow_runs"]
+        never_started = copy.deepcopy(runs[0])
+        never_started.update(id=699, run_started_at=None, conclusion="cancelled",
+                             created_at="2025-12-31T00:00:00Z")
+        runs.append(never_started)
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        never_started.update(status="queued", conclusion=None, updated_at="2026-01-02T00:00:00Z")
         with self.assertRaises(Rejected):
             verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
 

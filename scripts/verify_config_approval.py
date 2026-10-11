@@ -126,7 +126,9 @@ class GitHub:
 
 
 def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
-    timestamps = [run.get("created_at"), run.get("run_started_at")]
+    timestamps = [run.get("created_at")]
+    if run.get("run_started_at") is not None:
+        timestamps.append(run["run_started_at"])
     if run.get("status") != "completed":
         timestamps.append(run.get("updated_at"))
     parsed = []
@@ -162,6 +164,16 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
     reviewed = api.get(f"{prefix}/git/commits/{head}")
     require(reviewed.get("sha") == head and reviewed.get("tree", {}).get("sha") == tree,
             "applied tree differs from the reviewed PR head")
+    parents = candidate.get("parents")
+    require(isinstance(parents, list) and 1 <= len(parents) <= 2
+            and all(isinstance(parent, dict) and isinstance(parent.get("sha"), str)
+                    and bool(SHA.fullmatch(parent["sha"])) for parent in parents), "candidate parents are unavailable")
+    require(len(parents) == 1 or parents[1]["sha"] == head, "merge parent differs from reviewed head")
+    parent = parents[0]["sha"]
+    comparison = api.get(f"{prefix}/compare/{parent}...{head}")
+    require(comparison.get("merge_base_commit", {}).get("sha") == parent
+            and comparison.get("status") in {"ahead", "identical"},
+            "reviewed head does not include the candidate's previous base")
     author_id = pr.get("user", {}).get("id")
     require(positive_id(author_id), "PR author identity is unavailable")
     latest: dict[int, dict[str, Any]] = {}

@@ -45,7 +45,10 @@ adapter's resume action, the trusted verifier requires all of the following:
    repository and branch. Direct pushes and ambiguous results are rejected.
 2. Its Git tree equals the current reviewed PR head's tree. This supports squash
    commits without treating approval of different source content as equivalent.
-   Reconcile the PR with its final base and repeat review before merging.
+   Its first parent must be an ancestor of the reviewed head, and a two-parent
+   merge must name that head as its second parent. This rejects a stale reviewed
+   tree that would delete later main changes. Reconcile the PR with its final
+   base and repeat review before merging.
 3. At least one allowed reviewer, other than the PR author, has an `APPROVED`
    formal review on that full head SHA. The reviewer's latest decision applies;
    dismissed or stale approvals do not count, and an outstanding trusted
