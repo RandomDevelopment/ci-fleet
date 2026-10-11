@@ -17,4 +17,7 @@ systemd-analyze verify --root="$root" \
   ci-fleet-deployer-health.service ci-fleet-deployer-health.timer \
   ci-fleet-deployer-cleanup.service ci-fleet-deployer-cleanup.timer \
   ci-fleet-deployer-drain.service
+for unit in ci-fleet-deployer.service ci-fleet-deployer-health.service ci-fleet-deployer-cleanup.service; do
+  grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$root/etc/systemd/system/$unit" || { printf 'unsafe adapter capabilities in %s\n' "$unit" >&2; exit 1; }
+done
 printf 'DEPLOYER_UNIT_TESTS_OK\n'

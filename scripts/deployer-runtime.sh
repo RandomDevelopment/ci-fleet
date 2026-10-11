@@ -13,6 +13,7 @@ root_path() { printf '%s%s' "$root" "$1"; }
 config=${CI_FLEET_DEPLOYER_CONFIG:-$(root_path /var/lib/ci-fleet-deployer/active-policy.conf)}
 request=${CI_FLEET_DEPLOYER_REQUEST:-$(root_path /var/lib/ci-fleet-deployer/request.conf)}
 state_root=$(root_path /var/lib/ci-fleet-deployer)
+transaction_root=$(root_path /opt/ci-fleet-deployer/.installer-transactions)
 log_root=$(root_path /var/log/ci-fleet-deployer)
 lock_dir=$(root_path /var/lock/ci-fleet-deployer)
 evidence_dir=$(root_path /etc/ci-fleet-deployer/evidence)
@@ -30,16 +31,42 @@ audit_log=$log_root/audit.log
 systemd_root=$(root_path /etc/systemd/system)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+prepare_restore_target() {
+  local destination=$1 parent
+  parent=$(dirname "$destination")
+  [[ -d $parent && ! -L $parent && $(realpath -e -- "$parent") == "$parent" && $(stat -c '%u:%a' "$parent") == "$expected_uid:700" ]] || return 1
+  [[ ! -L $destination && ( ! -e $destination || -f $destination || -d $destination ) ]] || return 1
+  if [[ -d $destination ]]; then
+    [[ $(stat -c %u "$destination") == "$expected_uid" ]] || return 1
+    rm -rf -- "$destination" || return
+  fi
+}
 restore_encoded_file() {
   local destination=$1 encoded=$2 temporary
+  prepare_restore_target "$destination" || return
   temporary=$(mktemp "$(dirname "$destination")/.restore.XXXXXX") || return
   printf '%s' "$encoded" | base64 -d >"$temporary" || { rm -f "$temporary"; return 1; }
   chown "$expected_uid" "$temporary" || { rm -f "$temporary"; return 1; }
   chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
   mv -Tf "$temporary" "$destination"
 }
+restore_rollback_pair() {
+  local path
+  [[ ${lkg_captured:-0} == 1 ]] || return 0
+  if [[ ${lkg_backed_up:-0} == 1 ]]; then
+    restore_encoded_file "$previous_state" "$lkg_state_backup" || return
+    restore_encoded_file "$previous_policy" "$lkg_policy_backup" || return
+  else
+    for path in "$previous_state" "$previous_policy"; do
+      prepare_restore_target "$path" && rm -f -- "$path" || return
+    done
+  fi
+  sync -f "$state_root" 2>/dev/null
+}
 restore_consumed_requests() {
-  local id
+  local id entry
+  local -a entries=()
+  [[ -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" && $(stat -c '%u:%a' "$log_root") == "$expected_uid:700" ]] || return 1
   if [[ -e $consumed_root || -L $consumed_root ]]; then
     [[ -d $consumed_root && ! -L $consumed_root ]] || return 1
     chown "$expected_uid" "$consumed_root" || return
@@ -47,6 +74,13 @@ restore_consumed_requests() {
   else
     install -d -m 0700 "$consumed_root" || return
   fi
+  shopt -s nullglob dotglob
+  entries=("$consumed_root"/*)
+  shopt -u nullglob dotglob
+  for entry in "${entries[@]}"; do
+    [[ -f $entry && ! -L $entry ]] || return 1
+  done
+  for entry in "${entries[@]}"; do rm -f -- "$entry" || return; done
   for id in "${consumed_requests[@]}"; do
     [[ ! -L $consumed_root/$id && ( ! -e $consumed_root/$id || -f $consumed_root/$id ) ]] || return 1
     [[ ! -f $consumed_root/$id || $(stat -c '%u:%a:%s' "$consumed_root/$id") != "$expected_uid:600:0" ]] || continue
@@ -84,7 +118,7 @@ fi
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
-  local target state_root_safe=1
+  local target state_root_safe=1 log_parent=${log_root%/*}
   # The adapter may recursively clear its writable state root or drift its
   # metadata. Recreate or repair only a real directory; unsafe types fail.
   if [[ ${audit_pending:-0} == 1 && ! -e "$state_root" && ! -L "$state_root" ]]; then
@@ -97,7 +131,14 @@ deploy_exit() {
     fi
     [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]] || { status=1; state_root_safe=0; }
   fi
-  if [[ ${audit_pending:-0} == 1 ]]; then
+  if [[ ${audit_pending:-0} == 1 && ! -e $log_root && ! -L $log_root ]]; then
+    if [[ -d $log_parent && ! -L $log_parent && $(realpath -e -- "$log_parent") == "$log_parent" && $(stat -c %u "$log_parent") == "$expected_uid" ]]; then
+      install -d -m 0700 "$log_root" 2>/dev/null || status=1
+    else
+      status=1
+    fi
+  fi
+  if [[ ${audit_pending:-0} == 1 && -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" ]]; then
     if [[ -d "$log_root" && ! -L "$log_root" ]]; then
       chown "$expected_uid" "$log_root" 2>/dev/null || status=1
       chmod 0700 "$log_root" 2>/dev/null || status=1
@@ -107,17 +148,17 @@ deploy_exit() {
     # If the adapter replaced the audit log, restore the durable prefix copy
     # (or the opened inode) under its name before appending the terminal
     # failure record, so the record is never written only to an unlinked inode.
-    if [[ -e "$audit_log" && ! -L "$audit_log" && $(stat -c '%u:%a' "$audit_log" 2>/dev/null) != "$expected_uid:600" ]]; then
+    if [[ -f "$audit_log" && ! -L "$audit_log" && $(stat -c '%u:%a' "$audit_log" 2>/dev/null) != "$expected_uid:600" ]]; then
       chown "$expected_uid" "$audit_log" 2>/dev/null || status=1
       chmod 0600 "$audit_log" 2>/dev/null || status=1
     fi
     if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]] ||
        [[ -n ${audit_prefix_sha:-} && $(sha256sum "$audit_log" 2>/dev/null | cut -d' ' -f1) != "$audit_prefix_sha" ]]; then
-      rm -f -- "$audit_log"
+      if [[ -L "$audit_log" ]]; then rm -f -- "$audit_log" || status=1; fi
       if [[ -n ${audit_prefix_backup:-} ]]; then
         restore_encoded_file "$audit_log" "$audit_prefix_backup" 2>/dev/null || status=1
       else
-        cat /proc/self/fd/8 >"$audit_log" 2>/dev/null || status=1
+        restore_encoded_file "$audit_log" "$(base64 -w0 /proc/self/fd/8)" 2>/dev/null || status=1
       fi
       chmod 0600 "$audit_log" 2>/dev/null || true
       printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=failed phase=%s status=%s\n' \
@@ -133,7 +174,8 @@ deploy_exit() {
         "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
     fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
-
+  elif [[ ${audit_pending:-0} == 1 ]]; then
+    status=1
   fi
   if [[ ${application_changed:-0} == 1 && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     publish_deployed_backup 2>/dev/null || { rm -f -- "$deployed_current"; status=1; }
@@ -168,12 +210,13 @@ deploy_exit() {
     fi
   fi
 
-  if [[ ${lkg_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
-    restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" 2>/dev/null || status=1
-    restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" 2>/dev/null || status=1
-  fi
-  if [[ ${audit_pending:-0} == 1 && ${last_request_backed_up:-0} == 1 && $state_root_safe == 1 ]]; then
-    restore_encoded_file "$last_request" "$last_request_backup" 2>/dev/null || status=1
+  if [[ $state_root_safe == 1 ]]; then restore_rollback_pair 2>/dev/null || status=1; fi
+  if [[ ${audit_pending:-0} == 1 && ${last_request_captured:-0} == 1 && ${completed_request_published:-0} != 1 && $state_root_safe == 1 ]]; then
+    if [[ ${last_request_backed_up:-0} == 1 ]]; then
+      restore_encoded_file "$last_request" "$last_request_backup" 2>/dev/null || status=1
+    else
+      { prepare_restore_target "$last_request" && rm -f -- "$last_request"; } 2>/dev/null || status=1
+    fi
   fi
   if [[ ${audit_pending:-0} == 1 && -n ${snapshot_policy_backup:-} && -n ${snapshot_state_backup:-} && $state_root_safe == 1 ]]; then
     restore_encoded_file "$installed_policy" "$snapshot_policy_backup" 2>/dev/null || status=1
@@ -279,7 +322,6 @@ validate_credential() {
   esac
 }
 
-secure_directory "$state_root" 'deployer state directory'
 secure_directory "$lock_dir" 'deployer lock directory'
 if [[ -z ${CI_FLEET_DEPLOYER_REEXEC:-} ]]; then
   exec 9<"$lock_dir"
@@ -290,10 +332,12 @@ else
   [[ ${CI_FLEET_DEPLOYER_REEXEC} == 1 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "$(readlink -f "$lock_dir")" ]] || die 'inherited deployer operation lock is absent or invalid'
   flock -n 9 || die 'another deployer operation is running'
 fi
+[[ ! -e "$lock_dir/adapter-unit" && ! -L "$lock_dir/adapter-unit" ]] || die 'interrupted installer adapter requires recovery'
 shopt -s nullglob
-transactions=("$state_root"/.transaction.*)
+transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
 shopt -u nullglob
 ((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
+secure_directory "$state_root" 'deployer state directory'
 
 if [[ "$operation" == drain ]]; then
   [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'
@@ -306,7 +350,11 @@ if [[ "$operation" == drain ]]; then
 fi
 
 secure_file "$config" 'deployer configuration'
-policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
+if [[ $operation == health || $operation == cleanup ]]; then
+  policy_snapshot=$(mktemp "${TMPDIR:-/tmp}/ci-fleet-deployer-policy.XXXXXX")
+else
+  policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
+fi
 install -m 0600 "$config" "$policy_snapshot"
 config=$policy_snapshot
 trap 'rm -f "${policy_snapshot:-}"' EXIT
@@ -582,10 +630,12 @@ PY
       lkg_policy_backup=$(base64 -w0 "$previous_policy")
       lkg_backed_up=1
     fi
+    lkg_captured=1
     if [[ -f "$last_request" && ! -L "$last_request" ]]; then
       last_request_backup=$(base64 -w0 "$last_request")
       last_request_backed_up=1
     fi
+    last_request_captured=1
     # Capture the validated incumbent pointer independently of adapter-writable
     # state so a failed adapter cannot destroy or falsify the rollback point.
     incumbent_pointer=$(readlink "$deployed_current")
@@ -633,7 +683,9 @@ PY
     [[ -z "$retired_snapshot" || "$retired_snapshot" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'current deployed snapshot pointer is unsafe'
     [[ -z ${CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF:-} || $testing != 1 ]] || kill -"$CI_FLEET_DEPLOYER_TEST_SIGNAL_SELF" $$
     if [[ -f "$request" && ! -L "$request" ]] && cmp -s "$request_snapshot" "$request"; then rm -f "$request"; fi
+    prepare_restore_target "$last_request" || die 'completed request restore target is unsafe'
     mv -Tf "$request_snapshot" "$last_request"
+    completed_request_published=1
     request_snapshot=
     sync -f "$last_request" "$state_root" 2>/dev/null || die 'completed deployment request is not durable'
     secure_file "$audit_log" 'deployer audit log'
@@ -646,12 +698,8 @@ PY
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment success audit is not durable'
     # All fallible commit work is done; restore the retained pair if the
     # adapter touched it, then retire the incumbent snapshot.
-    if [[ ${lkg_backed_up:-0} == 1 ]]; then
-      restore_encoded_file "$state_root/last-known-good.json" "$lkg_state_backup" || die 'retained rollback state restoration failed'
-      restore_encoded_file "$state_root/last-known-good-policy.conf" "$lkg_policy_backup" || die 'retained rollback policy restoration failed'
-      sync -f "$state_root" 2>/dev/null || die 'retained rollback pair restoration is not durable'
-      lkg_backed_up=0
-    fi
+    restore_rollback_pair || die 'retained rollback pair restoration failed'
+    lkg_captured=0
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
     audit_pending=0

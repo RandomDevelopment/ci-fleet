@@ -2110,6 +2110,7 @@ trap on_term TERM
 
 perform_check() {
   local count
+  reject_isolated_host
   display_last_health
   drift_count
   count=$DRIFT_COUNT
@@ -2121,7 +2122,7 @@ perform_check() {
 }
 
 reject_isolated_host() {
-  # Isolated application hosts must not run controller mutations.
+  # Isolated application hosts must not run controller checks or mutations.
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-tester*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-tester)" || -L "$(root_path /var/lib/ci-fleet-tester)" || -e "$(root_path /etc/ci-fleet-tester)" || -L "$(root_path /etc/ci-fleet-tester)" ]]; then
     die 'tester host state is present; controller and tester roles are separate hosts'
   fi

@@ -16,9 +16,11 @@ GitHub-native Environment protection is optional, not assumed. In particular, do
 
 A secret store proves only that a credential exists. It is not approval evidence. Every provider still binds the environment, target, source commit, artifact digest, approving identity, policy identity, approval ID, and UTC time.
 
-Production remains separately gated during the controlled-migration phase. `ENVIRONMENT=production` is rejected unless `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH` names an additional protected exact-target, exact-head, exact-artifact authorization record. Ordinary approval or credential access does not satisfy this gate, and the field is rejected outside production.
+Production remains separately gated during the controlled-migration phase. Installing a policy with `ENVIRONMENT=production` requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH` to name an additional protected exact-target, exact-head, exact-artifact authorization record. The runtime still rejects production deployment and cleanup, and the installer rejects production rollback under the current accepted scope. Authorization evidence does not enable those operations. The field is rejected outside production.
 
-The systemd services run as root because access to the Docker socket is root-equivalent and protected credential references may be root-only. `NoNewPrivileges`, a read-only host filesystem, explicit writable paths, private temporary storage, and no supplementary service account reduce accidental reach, but they do not turn Docker access into a low-privilege boundary. Put nothing else on this host.
+The systemd services run as root because access to the Docker socket is root-equivalent and protected credential references may be root-only. `NoNewPrivileges`, a read-only host filesystem, explicit writable paths, private temporary storage, and no supplementary service account reduce accidental reach, but they do not turn Docker access into a low-privilege boundary. Put nothing else on this host. Read-only mounts constrain direct filesystem access by the adapter process. They do not constrain Docker-mediated writes: the host daemon can mount and modify host paths outside that process namespace. The current runtime requires a reviewed, trusted root adapter and does not isolate recovery journals from its Docker authority. Stronger containment needs a constrained daemon/API boundary or recovery storage unavailable to that daemon; neither exists here. This remains an open acceptance finding, not a verified journal-isolation guarantee.
+
+Deployment adapters also inherit the deploy service's writable state and log roots. Their direct writes can alter replay markers, audits, and rollback records. Current restoration uses unexported process memory and requires the runtime to reach its EXIT handler; SIGKILL or host power loss can bypass it. Installer adapter namespaces and scheduled read-only health/cleanup do not establish deployment-adapter isolation. This separate direct-write/crash-recovery boundary is also unaccepted. A reviewed inner read-only adapter namespace and durable recovery design, or an explicit trusted-root-adapter acceptance decision covering both limits, is still required.
 
 ## Supported host and prerequisites
 
@@ -31,7 +33,7 @@ It rejects:
 - any unrelated custom Docker network or volume;
 - unsafe owners, modes, symlinks, traversal, malformed configuration, or ambiguous identities.
 
-`--check` is read-only: it creates no user, directory, lock, release, service, timer, image, container, registration, or GitHub state. Mutating modes require root.
+`--check` makes no persistent configuration or application change. It takes the existing operation lock and runs health in a bounded transient service, with a temporary protected adapter guard that successful completion removes. An interrupted check can retain that guard and require serialized mutating recovery. It creates no user, release, persistent service/timer, image, container, registration, or GitHub state. Mutating modes require root.
 
 ## Filesystem contract
 
@@ -69,7 +71,7 @@ Every Docker resource the adapter creates (containers, custom networks, volumes)
 
 Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
-Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. Rollback is exposed only through the transactional installer, never as a direct runtime operation. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file as its final successful step. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after core/application alignment. A committed rollback interrupted after the adapter returns is finalized from the retained transaction on the next serialized installer operation.
+Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. Rollback is exposed only through the transactional installer, never as a direct runtime operation. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file in a dedicated writable commit directory as its final successful step. Installer adapters run in bounded transient systemd services with read-only mounts for the install tree and recovery journals. The Docker authority limitation described above still applies. Only rollback receives the writable commit directory. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after core/application alignment. A committed rollback interrupted after the adapter returns is finalized from the retained transaction on the next serialized installer operation.
 
 ## Prepare host-local files
 
@@ -271,7 +273,7 @@ sudo systemctl status --no-pager ci-fleet-deployer.service
 
 The runtime and read-only checks serialize on the same flock. Deploy writes a mode-`0600` active-operation marker and removes it on completion. While the adapter runs, `systemd-inhibit` blocks shutdown and sleep; the deploy service has an explicit 45-minute start/stop bound. Upgrade, rollback, drain, and uninstall refuse while that marker belongs to a live or bounded recent process. A root-owned stale marker older than the fixed one-hour recovery bound is removed only by a serialized mutating installer run. Unsafe or malformed stale state fails closed.
 
-Health runs every five minutes and cleanup daily. Cleanup refuses while drained and is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
+Health runs every five minutes and cleanup daily. Their services keep managed state and logs read-only and use a private temporary policy copy. Cleanup refuses while drained and is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
 
 ## Verification and reports
 
@@ -298,6 +300,8 @@ REPORT action=install result=CHANGED environment=staging target=example-staging 
 `result` is one of `CHANGED`, `NO_CHANGE`, `BLOCKED`, or `FAILED`. `BLOCKED` means an operator prerequisite or safety gate must be resolved. `FAILED` means attempted candidate work failed. The report includes identifiers, never credential contents.
 
 ## Failure recovery
+
+New installer journals live in `/opt/ci-fleet-deployer/.installer-transactions`, outside the application-writable state and log directories. They retain the incumbent core, deployed snapshot, pending/completed requests, drain marker, consumed-approval ledger, and audit history. Candidate health preserves that incumbent snapshot even when health succeeds. Recovery also recognizes older journals under `/var/lib/ci-fleet-deployer`. A legacy journal without an operation kind and with a rollback marker requires operator recovery. Restore the checkpoint or establish the journal's actual operation from trusted evidence before classifying it. Core cannot infer that operation from the marker alone. Runtime refuses work until an interrupted installer journal is recovered. Only a rollback transaction can honor an application rollback commit marker.
 
 1. Do not delete the lock, state, or current release blindly.
 2. Confirm whether `/var/lib/ci-fleet-deployer/active-operation` names a live process.
@@ -326,6 +330,28 @@ The deterministic test uses an explicit alternate-root test mode and mocked Dock
 scripts/test-install-deployer.sh
 ```
 
-Prepared-host proof is still required before production use: exercise the reviewed adapter, Docker/systemd behavior, network policy, checkpoint recovery, immutable artifact verification, staging and production isolation, active-deployment drain, health, rollback, and scoped cleanup on a separately authorized isolated deployment host.
+## Prepared-host acceptance
+
+PR #69 remains a draft and issue #22 remains open until separately authorized prepared-host acceptance is complete. Required CI and the alternate-root tests establish repository behavior. They do not establish application adapter correctness, credential scope, recoverable host checkpoints, or deployed application health.
+
+The [historical synthetic proof](https://github.com/RandomDevelopment/ci-fleet/pull/69#issuecomment-5311189387) exercised real Debian 13, Docker, and systemd with credential-free `demo-a` and `demo-b` targets at commit `2ad48c75c1412a146086b7a18fb3027f423515f1`. It does not establish acceptance for the current PR head or an application-owned staging adapter and identity.
+
+Before any host work, an operator must separately authorize an isolated test or staging host, its target, the reviewed adapter, credential provisioning, checkpoint creation and restoration, and the permitted deployment and failure exercises. Keep host inventory and protected evidence outside this public repository.
+
+Before host activation, resolve the Docker-mediated journal-containment and direct deployment-adapter state/log findings through a reviewed design and evidence, or an explicit acceptance decision for the documented trusted-root-adapter model with its risks and recovery procedure. Do not infer that decision from a passing namespace test.
+
+Record the following evidence against the exact reviewed ci-fleet commit and adapter digest:
+
+- Verify the supported OS, Docker and Compose versions, synchronized clock, disk and network prerequisites, and absence of ordinary runners, controller/receiver state, unrelated workloads, and shared production access.
+- Verify root ownership and permissions for configuration, adapter, credentials, and evidence. Prove that the identity and credential scope belong only to the authorized target and cannot reach production or ordinary CI jobs.
+- Produce exact-source and exact-artifact approval evidence through the chosen approval provider. Verify artifact provenance and digest through the application adapter. Prove missing, mismatched, and replayed approval cannot invoke deployment.
+- Create a recoverable host checkpoint and prove its restoration through the operator's recovery procedure. A syntactically valid checkpoint evidence file alone is insufficient.
+- Run the documented one-command install, then an unchanged rerun and `--check`. Retain the secret-free reports, installed source identity, timer state, and service health. Exercise the adapter through real systemd units, including scheduled health and scoped cleanup.
+- Exercise upgrade, repair, active-deployment refusal, drain, resume, bounded failure and interruption recovery, and rollback to verified application/core state. Prove audit history and consumed approvals survive recovery. Verify cleanup after success, failure, cancellation, and timeout preserves unrelated resources.
+- Exercise repeated uninstall and verify that units and activation are removed while operator-owned configuration, credentials, releases, rollback state, and audit records remain as documented.
+
+Retain detailed evidence privately. Post only the reviewed commit and adapter digest, pass/fail results, redacted reports, and an operator attestation in the PR. Keep the PR draft if any item lacks evidence. Production deployment, cleanup, and rollback require a separate accepted policy decision and authorization.
+
+The next acceptance step is review of the unresolved direct-write/crash-recovery and Docker/journal trust boundaries, followed by separate operator authorization of the isolated test or staging host and application adapter, followed by host-local preparation and the documented one-command install and unchanged-rerun proof. Do not begin that step from repository CI or ordinary fleet runners.
 
 Drain requires an existing managed deployer installation and rejects another host role before creating a drain marker. A committed application rollback restores and verifies its pinned core pointer and systemd units before retiring the recovery journal. The runtime verifies the inherited operation lock when it changes to the active revision.
