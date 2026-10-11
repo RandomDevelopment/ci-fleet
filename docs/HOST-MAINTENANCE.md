@@ -108,11 +108,13 @@ volume cleanup now run inside that gate too. Pulls, image loads, tagging, commit
 image removal, and builder pruning participate in proxy protocol `v2` alongside
 builds and container reference mutations. Storage removal defers with older
 proxies. Image-load uploads use the same 1 GiB spool limit as build contexts.
+Image imports use that bounded spool too and share its two upload slots.
 Neither an installer nor a new job can enter while maintenance applies.
 An interrupted or uncertain removal blocks subsequent mutations until a host
 reboot changes its boot identity. Confirmed daemon rejections clear their marker
-and fail the service. Cleanup never forces removal, stops active work, or prunes
-volumes globally.
+and fail the service. A failure to launch the Docker client clears its marker
+because no request was dispatched. Cleanup never forces removal, stops active
+work, or prunes volumes globally.
 
 The service reports measured filesystem use after applying. If protected or
 recent resources prevent reaching 65%, it reports insufficient headroom and

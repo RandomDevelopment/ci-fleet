@@ -3,6 +3,7 @@
 
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
+import errno
 import io
 import json
 import os
@@ -122,14 +123,52 @@ class StorageTests(unittest.TestCase):
                 cleanup.protected_images()
 
     def test_uncertain_mutation_blocks_later_maintenance(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
-            boot = Path(directory) / "proc/sys/kernel/random/boot_id"
-            boot.parent.mkdir(parents=True)
-            boot.write_text(BOOT_ID)
-            failure = subprocess.TimeoutExpired(["docker", "builder", "prune"], 1)
-            with patch.object(cleanup.subprocess, "run", side_effect=failure), self.assertRaisesRegex(ValueError, "uncertain"):
-                cleanup.mutate("builder", "prune", timeout=1)
-            self.assertTrue(cleanup.coordination.pending_requests("removals"))
+        for failure in (subprocess.TimeoutExpired(["docker", "builder", "prune"], 1), OSError(errno.EIO, "output read failed")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+                boot = Path(directory) / "proc/sys/kernel/random/boot_id"
+                boot.parent.mkdir(parents=True)
+                boot.write_text(BOOT_ID)
+                with patch.object(cleanup.subprocess, "Popen") as popen, self.assertRaisesRegex(ValueError, "uncertain"):
+                    popen.return_value.communicate.side_effect = failure
+                    cleanup.mutate("builder", "prune", timeout=1)
+                self.assertTrue(cleanup.coordination.pending_requests("removals"))
+                if isinstance(failure, subprocess.TimeoutExpired):
+                    popen.return_value.kill.assert_called_once()
+                    popen.return_value.wait.assert_called_once()
+
+    def test_launch_failure_clears_only_its_marker_and_allows_retry(self):
+        for failure in (FileNotFoundError(errno.ENOENT, "missing Docker client"),
+                        PermissionError(errno.EACCES, "cannot execute Docker client"),
+                        BlockingIOError(errno.EAGAIN, "process limit reached")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+                boot = Path(directory) / "proc/sys/kernel/random/boot_id"
+                boot.parent.mkdir(parents=True)
+                boot.write_text(BOOT_ID)
+                previous = cleanup.coordination.removal_marker()
+                with patch.object(cleanup.subprocess, "Popen", side_effect=failure), self.assertRaisesRegex(ValueError, "no request dispatched"):
+                    cleanup.mutate("image", "rm", IMAGE, timeout=1)
+                self.assertEqual(list(previous.parent.iterdir()), [previous])
+                previous.unlink()
+                self.assertFalse(cleanup.coordination.pending_requests("removals"))
+                client = Path(directory) / "docker"
+                client.write_text("#!/bin/sh\nexit 0\n")
+                client.chmod(0o700)
+                with patch.dict(os.environ, {"PATH": directory}):
+                    cleanup.mutate("image", "rm", IMAGE, timeout=1)
+                self.assertFalse(cleanup.coordination.pending_requests("removals"))
+
+    def test_confirmed_daemon_rejection_clears_marker_but_client_error_retains_it(self):
+        for stderr, pending in (("Error response from daemon: image in use", False), ("Docker connection lost", True)):
+            with self.subTest(stderr=stderr), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory, "PATH": directory}):
+                boot = Path(directory) / "proc/sys/kernel/random/boot_id"
+                boot.parent.mkdir(parents=True)
+                boot.write_text(BOOT_ID)
+                client = Path(directory) / "docker"
+                client.write_text(f"#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")
+                client.chmod(0o700)
+                with self.assertRaises(ValueError):
+                    cleanup.mutate("image", "rm", IMAGE, timeout=1)
+                self.assertEqual(cleanup.coordination.pending_requests("removals"), pending)
 
     def test_terminal_run_labels_only_report_and_unlabelled_compose_is_unknown(self):
         accounting = usage()

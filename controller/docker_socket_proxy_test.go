@@ -467,21 +467,28 @@ func TestDockerReferenceMutationRoutes(t *testing.T) {
 	}
 }
 
-func TestDockerSocketProxyBuildContextIsCompleteBeforeDispatch(t *testing.T) {
-	contextBody := bytes.Repeat([]byte("tar context"), 4096)
-	received := make(chan []byte, 1)
-	fixture := newSocketProxyTest(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		body, _ := io.ReadAll(request.Body)
-		received <- body
-		io.WriteString(w, `{"stream":"built"}`)
-	}))
-	response, err := fixture.client.Post("http://docker/v1.48/build", "application/x-tar", bytes.NewReader(contextBody))
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, response.Body)
-	response.Body.Close()
-	if !bytes.Equal(<-received, contextBody) || proxyMarkerCount(t, fixture) != 0 {
-		t.Fatal("build context was truncated or its completed mutation retained a marker")
+func TestDockerSocketProxyUploadIsCompleteBeforeDispatch(t *testing.T) {
+	for _, route := range []string{"/v1.48/build", "/v1.48/images/load", "/v1.48/images/create?fromSrc=-&repo=fixture"} {
+		t.Run(route, func(t *testing.T) {
+			contextBody := bytes.Repeat([]byte("tar context"), 4096)
+			received := make(chan []byte, 1)
+			fixture := newSocketProxyTest(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.RequestURI() != route {
+					t.Errorf("upload route = %q, want %q", request.URL.RequestURI(), route)
+				}
+				body, _ := io.ReadAll(request.Body)
+				received <- body
+				io.WriteString(w, `{"stream":"built"}`)
+			}))
+			response, err := fixture.client.Post("http://docker"+route, "application/x-tar", bytes.NewReader(contextBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			if !bytes.Equal(<-received, contextBody) || proxyMarkerCount(t, fixture) != 0 {
+				t.Fatal("build context was truncated or its completed mutation retained a marker")
+			}
+		})
 	}
 }

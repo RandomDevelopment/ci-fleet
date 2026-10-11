@@ -121,7 +121,21 @@ def cache_reason(record: dict, now: int) -> str:
 def mutate(*args: str, timeout: float) -> None:
     marker = coordination.removal_marker()
     try:
-        subprocess.run(["docker", *args], check=True, capture_output=True, text=True, timeout=timeout)
+        process = subprocess.Popen(["docker", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError:
+        marker.unlink()
+        coordination.sync_directory(marker.parent)
+        raise ValueError("Docker maintenance could not start; no request dispatched") from None
+    try:
+        with process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, process.args, stdout, stderr)
     except subprocess.CalledProcessError as error:
         if "Error response from daemon:" not in (error.stderr or ""):
             raise ValueError("Docker maintenance result uncertain; marker retained") from None
