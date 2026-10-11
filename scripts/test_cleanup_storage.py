@@ -292,6 +292,23 @@ class StorageTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertTrue(request.full_url.endswith("/runs/123/attempts/2"))
 
+    def test_run_diagnostics_http_failures_do_not_abort_maintenance(self):
+        for failure in (cleanup.http.client.IncompleteRead(b"partial"), cleanup.http.client.BadStatusLine("invalid")):
+            with self.subTest(failure=failure):
+                response = unittest.mock.MagicMock()
+                response.__enter__.return_value.read.side_effect = failure
+                opener = unittest.mock.Mock()
+                opener.open.return_value = response
+                accounting = {"Containers": [{"Id": "fixture", "State": "exited", "Labels": {
+                    "com.docker.compose.project": "fixture",
+                    cleanup.PREFIX + "repository": "example-org/example-app",
+                    cleanup.PREFIX + "run-id": "123", cleanup.PREFIX + "run-attempt": "2"}}]}
+                with patch.object(cleanup.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="fixture-token")), \
+                     patch.object(cleanup.urllib.request, "build_opener", return_value=opener), redirect_stdout(io.StringIO()) as output:
+                    cleanup.report_workloads(accounting)
+                self.assertIn("unknown-api-unavailable", output.getvalue())
+                self.assertNotIn("fixture-token", output.getvalue())
+
     def test_success_failure_cancellation_timeout_host_layer_without_trap(self):
         for outcome in ("success", "failure", "cancellation", "timeout"):
             with self.subTest(outcome=outcome):

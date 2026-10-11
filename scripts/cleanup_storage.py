@@ -226,7 +226,7 @@ class RunStatus:
             result = json.loads(body)
             if isinstance(result, dict) and result.get("id") == int(run) and result.get("run_attempt") == int(attempt):
                 status = "terminal-run-leftover" if result.get("status") == "completed" else "active-or-unknown-run"
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, ValueError, http.client.HTTPException, subprocess.SubprocessError):
             self.token = self.token or ""
         self.results[key] = status
         return status
