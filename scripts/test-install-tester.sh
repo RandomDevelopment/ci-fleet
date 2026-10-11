@@ -403,6 +403,8 @@ enable_line=$(grep -n '^systemctl enable --now ' "$tmp/events.log" | tail -1 | c
 # Maintenance probes release the runtime lock but retain lifecycle serialization.
 probe_ready=$tmp/probe-ready
 probe_release=$tmp/probe-release
+# Force the repair path so this test reaches the maintenance probes.
+printf '# fixture drift\n' >>"$root/etc/systemd/system/ci-fleet-tester-health.service"
 FAKE_TESTER_SYSTEMCTL_WAIT_READY=$probe_ready FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE=$probe_release \
   "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null & probe_pid=$!
 while [[ ! -e $probe_ready ]]; do kill -0 "$probe_pid" 2>/dev/null || fail 'maintenance probe fixture exited early'; done
