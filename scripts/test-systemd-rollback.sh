@@ -14,6 +14,8 @@ staging_paths=()
 reconcile_unit=ci-fleet-reconcile.service
 calls=$tmp/systemctl.log
 lock_file=$tmp/installer.lock
+state_file=$tmp/install-state.json
+manager_current=$tmp/manager-current
 deferred_command=()
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
@@ -111,6 +113,8 @@ reset_fixture() {
   rm -rf "$systemd_dir" "$checkpoint_dir" "$expected_dir" "$tmp/enabled" "$tmp/active"
   mkdir -p "$systemd_dir" "$checkpoint_dir/systemd" "$expected_dir" "$tmp/enabled" "$tmp/active"
   : >"$calls"
+  printf '{"engine_ref":"fixture-one"}\n' >"$state_file"
+  ln -sfn "$tmp/manager-release-one" "$manager_current"
   fail_install_unit='' fail_move_unit='' fail_timer='' fail_reload=false fail_show=false fail_dispatch=false
   staging_paths=()
   deferred_command=()
@@ -216,6 +220,24 @@ for failure in install move show reload timer dispatch; do
   if [[ "$failure" != reload && "$failure" != timer && "$failure" != dispatch ]]; then
     ! grep -Fxq daemon-reload "$calls" || fail "$failure failure reloaded an incomplete unit set"
   fi
+  if [[ "$failure" == timer || "$failure" == reload || "$failure" == move ]]; then
+    [[ ${#deferred_command[@]} != 0 ]] || fail "$failure failure did not queue unit restoration"
+  fi
+  if [[ "$failure" == timer || "$failure" == reload ]]; then
+    fail_timer='' fail_reload=false
+    complete_deferred || fail "$failure failure prevented eventual unit restoration"
+  fi
+done
+
+for later_change in manager state; do
+  reset_fixture
+  restore_systemd_snapshot || fail 'could not queue generation fixture'
+  case "$later_change" in
+    manager) ln -sfn "$tmp/manager-release-two" "$manager_current" ;;
+    state) printf '{"engine_ref":"fixture-two"}\n' >"$state_file" ;;
+  esac
+  complete_deferred || fail 'superseded installer generation did not exit successfully'
+  grep -Fq '# candidate definition' "$systemd_dir/$reconcile_unit" || fail 'stale helper overwrote a later installer with identical unit bytes'
 done
 
 for failure in reload changed; do

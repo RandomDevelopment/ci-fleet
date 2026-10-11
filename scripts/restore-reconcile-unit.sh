@@ -2,10 +2,12 @@
 set -Eeuo pipefail
 
 die() { printf 'ERROR: deferred reconcile unit restoration failed: %s\n' "$*" >&2; exit 1; }
-[[ $# == 3 ]] || die 'expected staged units, systemd directory, and installer lock'
+[[ $# == 5 ]] || die 'expected staged units, systemd directory, installed state, manager pointer, and installer lock'
 staged_units=$1
 systemd_dir=$2
-lock_file=$3
+state_file=$3
+manager_current=$4
+lock_file=$5
 unit=ci-fleet-reconcile.service
 [[ "$staged_units" == "$systemd_dir"/.ci-fleet-restore.* && -d "$staged_units" && ! -L "$staged_units" \
   && $(stat -c %u "$staged_units") == "$(id -u)" && $(stat -c %a "$staged_units") == 700 ]] || die 'untrusted staged directory'
@@ -22,6 +24,19 @@ done
 flock -w 300 9 || die 'installer lock is busy'
 pending=$systemd_dir/.ci-fleet-reconcile-unit-restore
 if [[ $(readlink "$pending") != "$staged_units" ]]; then
+  rm -rf -- "$staged_units"
+  printf 'RECONCILE_UNIT_RESTORE_SUPERSEDED\n'
+  exit 0
+fi
+state_matches=false manager_matches=false
+if [[ -f "$staged_units/install-state.json" ]]; then
+  if cmp -s "$staged_units/install-state.json" "$state_file"; then state_matches=true; fi
+elif [[ ! -e "$state_file" && ! -L "$state_file" ]]; then state_matches=true; fi
+if [[ -f "$staged_units/manager-current" ]]; then
+  if [[ -L "$manager_current" && $(readlink "$manager_current") == $(<"$staged_units/manager-current") ]]; then manager_matches=true; fi
+elif [[ ! -e "$manager_current" && ! -L "$manager_current" ]]; then manager_matches=true; fi
+if [[ "$state_matches" != true || "$manager_matches" != true ]]; then
+  rm -f -- "$pending"
   rm -rf -- "$staged_units"
   printf 'RECONCILE_UNIT_RESTORE_SUPERSEDED\n'
   exit 0
