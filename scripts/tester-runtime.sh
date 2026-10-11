@@ -35,6 +35,7 @@ done
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
 required_commands='awk basename chmod cmp date df dirname docker du env find flock grep install mkdir mktemp mv python3 readlink rm stat wc'
 case $action in --check|--health) required_commands+=' curl getent' ;; esac
+case $action in --converge|--reset|--inspect|--health) required_commands+=' timeout' ;; esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 secure_directory() {
@@ -87,7 +88,7 @@ check_disk_threshold() {
 
 check_network_probes() {
   getent ahosts "$probe_host" >/dev/null || die 'test-host DNS probe failed'
-  curl --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
+  curl --noproxy '*' --fail --silent --show-error --head --max-time 10 --output /dev/null "$probe_url" || die 'test-host HTTPS/proxy probe failed'
 }
 
 project_name() { printf 'ci-fleet-test-%s' "$1"; }
@@ -122,14 +123,31 @@ validate_compose() {
   local rendered=$1 empty_env variable
   local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST")
   if ! python3 - "$compose_file" <<'PY'
-import re,sys
-text=open(sys.argv[1],encoding='utf-8').read()
-key=r'(?:(?:!!str|!<[^>\n]+>)[ \t]+)?(?:include|label_file|"(?:include|label_file)"|\x27(?:include|label_file)\x27)[ \t]*:'
-explicit_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\?'
-escaped_key=r'"[^"\n]*\\[^"\n]*"[ \t]*:'
-alias_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)\*[A-Za-z0-9_-]+[ \t]*:'
-anchor_key=r'(?m)(?:^[ \t]*|[,{][ \t]*)&[A-Za-z0-9_-]+[ \t]+'
-if re.search(r'(?m)^[ \t]*'+key,text) or re.search(r'[,{][ \t]*'+key,text) or re.search(escaped_key,text) or re.search(explicit_key,text) or re.search(alias_key,text) or re.search(anchor_key,text): raise SystemExit('Compose include, label_file, or indirect mapping key is forbidden')
+import sys
+try:
+    import yaml
+except ImportError:
+    raise SystemExit('python3-yaml is required for Compose source validation')
+try:
+    with open(sys.argv[1],encoding='utf-8') as source:
+        pending=[yaml.compose(source,Loader=yaml.SafeLoader)]
+    seen=set()
+    while pending:
+        node=pending.pop()
+        if node is None or id(node) in seen: continue
+        seen.add(id(node))
+        if isinstance(node,yaml.MappingNode):
+            keys=set()
+            for key,value in node.value:
+                if not isinstance(key,yaml.ScalarNode) or key.value in keys:
+                    raise SystemExit('Compose complex or duplicate mapping keys are forbidden')
+                keys.add(key.value)
+                if key.value in ('include','label_file','extends','env_file'):
+                    raise SystemExit('Compose external file loading is forbidden')
+                pending.append(value)
+        elif isinstance(node,yaml.SequenceNode): pending.extend(node.value)
+except yaml.YAMLError:
+    raise SystemExit('Compose source is not valid YAML')
 PY
   then return 1; fi
   if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
@@ -140,6 +158,7 @@ PY
   python3 - "$rendered" "$route_service" "$route_port" "$compose_project" "$secret_dir" "$expected_uid" <<'PY' || return 1
 import json,math,os,re,stat,sys
 value=json.load(open(sys.argv[1])); route_service=sys.argv[2]; route_port=int(sys.argv[3]); project=sys.argv[4]; secret_dir=sys.argv[5]; expected_uid=int(sys.argv[6])
+if value.get('name') != project: raise SystemExit('rendered Compose project identity differs from the environment')
 services=value.get('services')
 if not isinstance(services,dict) or route_service not in services: raise SystemExit('route service is missing')
 image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}$')
@@ -191,7 +210,8 @@ PY
 }
 
 validate_existing_resources() {
-  python3 - "$1" "$compose_project" "$(state_path "$environment")" <<'PY'
+  local id=${2:-$environment} live=${3:-false}
+  python3 - "$1" "$(project_name "$id")" "$(state_path "$id")" "$live" <<'PY'
 import ipaddress,json,os,subprocess,sys
 model=json.load(open(sys.argv[1])); project=sys.argv[2]; tracked=os.path.isfile(sys.argv[3])
 def run(*args):
@@ -206,8 +226,10 @@ pools=json.loads(run('docker','info','--format','{{json .DefaultAddressPools}}')
 for kind in ('volume','network'):
     for logical,item in model.get(kind+'s',{}).items():
         name=item.get('name',f'{project}_{logical}')
-        existing=[value for value in run('docker',kind,'ls','-q','--filter',f'name=^{name}$').splitlines() if value == name]
-        if not existing: continue
+        existing=[value for value in run('docker',kind,'ls','--format','{{.Name}}','--filter',f'name=^{name}$').splitlines() if value == name]
+        if not existing:
+            if sys.argv[4]=='true': raise SystemExit(f'live {kind} is missing: {name}')
+            continue
         if not tracked: raise SystemExit(f'untracked pre-existing Docker {kind} is forbidden: {name}')
         actual=inspect(kind,name); labels=actual.get('Labels') or {}
         if labels.get('com.docker.compose.project') != project or labels.get(f'com.docker.compose.{kind}') != logical: raise SystemExit(f'{kind} provenance is invalid: {name}')
@@ -288,6 +310,8 @@ remove_environment() {
     secure_file "$compose" 600
     docker compose -p "$(project_name "$id")" -f "$compose" down --timeout 10 --volumes --remove-orphans || return 1
     rm -f -- "$target" "$(deployed_compose_path "$id")"
+  else
+    reject_orphaned_projects
   fi
   report "REMOVED environment=$id"
 }
@@ -323,16 +347,19 @@ expected_ports={}
 for port in service.get('ports',[]):
     key=f"{int(port['target'])}/{port.get('protocol','tcp')}"
     expected_ports.setdefault(key,[]).append({'HostIp':str(port.get('host_ip','')),'HostPort':str(port['published'])})
-expected_mounts=[(mount['type'],'',mount['target'],not mount.get('read_only',False)) for mount in service.get('volumes',[])]
+expected_mounts=[(mount['type'],model['volumes'][mount['source']]['name'] if mount['type']=='volume' else '',mount['target'],not mount.get('read_only',False)) for mount in service.get('volumes',[])]
 for secret in service.get('secrets',[]):
     item={'source':secret,'target':secret} if isinstance(secret,str) else secret
     expected_mounts.append(('bind',model['secrets'][item['source']]['file'],f"/run/secrets/{item.get('target',item['source'])}",False))
 expected_mounts=sorted(expected_mounts)
-actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
+actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else mount.get('Name','') if mount.get('Type')=='volume' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
+networks={model['networks'][name]['name'] for name in service.get('networks',{'default':{}})}
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
        not host.get('CapAdd') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
-       host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts)
+       host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
+       host.get('OomKillDisable') in (None,False) and host.get('OomScoreAdj',0)==service.get('oom_score_adj',0) and
+       host.get('NetworkMode') in networks and set((actual.get('NetworkSettings') or {}).get('Networks') or {})==networks)
 raise SystemExit(0 if valid else 1)
 PY
   rm -f "$inspection"
@@ -340,7 +367,7 @@ PY
 }
 
 inspect_environment() {
-  local target=$1 id compose route_service status=running resource value bytes=0 mount expected running_state service configured_image
+  local target=$1 id compose route_service route_port status=running resource value bytes=0 mount expected running_state service configured_image
   local -a containers=()
   local -A expected_images=() observed_services=()
   id=$(basename "$target" .state); secure_file "$target" 600
@@ -348,7 +375,12 @@ inspect_environment() {
     case $key in ENVIRONMENT|PROJECT|OWNER|ROUTE_PORT|EXPIRES_AT|SOURCE_REVISION|IMAGE_DIGESTS|UPDATED_AT) printf '%s=%s ' "$key" "$value" ;; esac
   done <"$target"
   compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
+  [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
+  secure_file "$compose" 600
   route_service=$(awk -F= '$1=="ROUTE_SERVICE"{print $2}' "$target")
+  route_port=$(awk -F= '$1=="ROUTE_PORT"{print $2}' "$target")
+  [[ $route_port =~ ^[0-9]+$ && $route_port -ge 1024 && $route_port -le 65535 ]] || die 'stored route port is invalid'
+  validate_existing_resources "$compose" "$id" true || status=unhealthy
   expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
   while read -r service configured_image; do expected_images[$service]=$configured_image; done < <(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\n".join("%s %s" % (name,service["image"]) for name,service in value["services"].items()))' "$compose")
   mapfile -t containers < <(docker compose -p "$(project_name "$id")" -f "$compose" ps -q)
@@ -377,10 +409,18 @@ inspect_environment() {
     [[ -n $resource ]] || continue
     mount=$(docker volume inspect --format '{{.Mountpoint}}' "$resource"); value=$(du -sb "$mount" | awk '{print $1}'); [[ $value =~ ^[0-9]+$ ]] || die 'volume disk size is invalid'; bytes=$((bytes + value))
   done <<<"$inventory"
+  # shellcheck disable=SC2016 # The child shell receives the validated port.
+  timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1"' bash "$route_port" 2>/dev/null || status=unhealthy
   printf 'STATUS=%s DISK_BYTES=%s\n' "$status" "$bytes"
 }
 
 load_global
+for role_path in /etc/ci-fleet /var/lib/ci-fleet /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-status /var/lib/ci-fleet-status; do
+  [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
+done
+for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do
+  [[ ! -e $role_unit && ! -L $role_unit ]] || die 'another ci-fleet host role is present'
+done
 docker_socket=$(root_path /var/run/docker.sock)
 if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
   [[ -f $docker_socket ]] || die 'local Docker socket is unavailable'
@@ -401,6 +441,17 @@ else
   exec 9>"$lock_file"
   flock -x 9
 fi
+for kind in container network volume; do
+  case $kind in
+    container) inventory=$(docker ps -a --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
+    network) inventory=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
+    volume) inventory=$(docker volume ls --format '{{.Name}}|{{.Label "com.docker.compose.project"}}') ;;
+  esac
+  while IFS='|' read -r resource resource_project; do
+    [[ -n $resource ]] || continue
+    [[ $resource_project =~ ^ci-fleet-test-([a-z0-9][a-z0-9-]{0,62})$ && -f $(state_path "${BASH_REMATCH[1]}") ]] || die 'unrelated or untracked Docker workload is present'
+  done <<<"$inventory"
+done
 case $action in
   --check)
     docker info --format '{{.DockerRootDir}}' >/dev/null

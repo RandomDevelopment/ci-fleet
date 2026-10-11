@@ -33,7 +33,7 @@ expected_uid=0
 if [[ ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run installer as root'; fi
 case $action in
   --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat systemctl tar wc' ;;
-  --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir readlink sha256sum stat systemctl' ;;
+  --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir python3 readlink sha256sum stat systemctl' ;;
   --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
   --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat systemctl' ;;
   --uninstall) required_commands='bash chmod dirname docker env find flock grep install mkdir rm stat systemctl' ;;
@@ -85,6 +85,31 @@ acquire_lifecycle_lock() {
   exec 8>"$runtime_lock"
   flock -x 8
   export CI_FLEET_TESTER_LOCK_FD=8
+  exec 7>"$(root_path /run/ci-fleet-role-admission.lock)"
+  flock -n 7 || die 'another ci-fleet role installation is already running'
+}
+
+reject_other_roles() {
+  local path
+  for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" \
+    "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" \
+    "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
+    "$systemd_dir"/ci-fleet-deployer* "$systemd_dir"/ci-fleet-health* "$systemd_dir"/ci-fleet-cleanup* \
+    "$systemd_dir"/ci-fleet-reconcile* "$systemd_dir"/ci-fleet-drift* "$systemd_dir"/ci-fleet-status-receiver* "$systemd_dir"/actions.runner*; do
+    [[ ! -e $path && ! -L $path ]] || die 'another ci-fleet host role is present'
+  done
+}
+
+reject_unit_dropins() {
+  local unit directory dropin kind
+  for unit in "${units[@]}"; do
+    kind=${unit##*.}
+    for directory in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for dropin in "$unit.d" "$kind.d" "ci-.$kind.d" "ci-fleet-.$kind.d" "ci-fleet-tester-.$kind.d"; do
+        [[ ! -e $(root_path "$directory")/$dropin && ! -L $(root_path "$directory")/$dropin ]] || die 'unmanaged tester systemd drop-ins are forbidden'
+      done
+    done
+  done
 }
 
 pin_local_docker() {
@@ -122,6 +147,9 @@ host_preflight() {
   # shellcheck disable=SC1090
   . "$os_release"
   [[ ${ID:-} == debian && ${VERSION_ID:-} =~ ^[0-9]+$ && ${VERSION_ID%%.*} -ge 12 ]] || die 'tester hosts require Debian 12 or newer'
+  reject_other_roles
+  reject_unit_dropins
+  python3 -c 'import yaml' 2>/dev/null || die 'python3-yaml is required for Compose source validation'
   pin_local_docker
   docker compose version >/dev/null
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
@@ -226,6 +254,8 @@ write_lkg() {
 
 activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
+  reject_other_roles
+  reject_unit_dropins
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then

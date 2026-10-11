@@ -15,6 +15,10 @@ A tester host accepts only:
 
 It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, custom volume drivers/options, privileged containers, added capabilities, host or shared namespaces, Docker API access, global container names, and credentials outside the environment secret boundary. Compose environment variables, env files, and configs are forbidden credential channels; use only fixed mode-`0600` Compose secrets. Every service must define positive CPU, memory, and PID limits, remain OOM-killable, be read-only, drop all capabilities, and set `no-new-privileges=true`. The validated rendered Compose model is copied into protected runtime state before activation, so partial starts remain tracked and later cleanup does not depend on a mutable or deleted source definition. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something this repository-only change can prove.
 
+Compose source validation requires Debian's `python3-yaml` package. It decodes YAML keys before Compose runs and rejects external file loaders, including `include`, `extends`, `label_file`, and `env_file`. Escaped, tagged, anchored, and aliased keys follow the same rule. Duplicate and complex mapping keys are unsupported.
+
+Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. They also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
+
 ## Prepare host-local configuration
 
 The installer supports only `/etc/ci-fleet-tester/tester.env`. Create it and all protected directories as root; never commit them:
@@ -67,7 +71,7 @@ sudo ./scripts/install-tester.sh --install \
   --ref "$ref"
 ```
 
-The command fails before mutation unless it sees Debian 12 or newer, root, the local default Docker context/socket/root, Compose v2, required generic tools, protected paths, and Docker storage below 80%. It stages an immutable source release, validates it, switches the `current` symlink, installs health and expiration timers, and verifies both configuration and active environments. Repeating the same command is idempotent.
+The command fails before mutation unless it sees Debian 12 or newer with `python3-yaml`, root, the local default Docker context/socket/root, Compose v2, required generic tools, protected paths, and Docker storage below 80%. It stages an immutable source release, validates it, switches the `current` symlink, installs health and expiration timers, and verifies both configuration and active environments. Repeating the same command is idempotent.
 
 ## Environment lifecycle
 

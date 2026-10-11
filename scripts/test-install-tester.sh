@@ -36,13 +36,26 @@ fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
-printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_CURL_FAIL:-0} != 1 ]]' >"$fake_bin/curl"
+printf '%s\n' '#!/usr/bin/env bash' 'set -e' '[[ ${FAKE_TESTER_CURL_FAIL:-0} != 1 ]]' '[[ " $* " == *" --noproxy * "* ]]' >"$fake_bin/curl"
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
 printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_GETENT_FAIL:-0} != 1 ]]' >"$fake_bin/getent"
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
 printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_TMPFILES_FAIL:-0} != 1 ]]' >"$fake_bin/systemd-tmpfiles"
 chmod 0755 "$fake_bin/df" "$fake_bin/systemctl" "$fake_bin/curl" "$fake_bin/getent" "$fake_bin/systemd-tmpfiles"
+export FAKE_TESTER_REAL_TIMEOUT
+FAKE_TESTER_REAL_TIMEOUT=$(command -v timeout)
+cat >"$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${3:-} == -c && ${4:-} == *'/dev/tcp/127.0.0.1/'* ]]; then
+  printf '%s\n' "${6:-}" >>"${FAKE_TESTER_ROUTE_LOG:?}"
+  [[ ${FAKE_TESTER_ROUTE_FAIL:-0} != 1 ]]
+else
+  exec "$FAKE_TESTER_REAL_TIMEOUT" "$@"
+fi
+EOF
+chmod 0755 "$fake_bin/timeout"
 export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
+export FAKE_TESTER_MODEL_PATH=$tmp/model-path FAKE_TESTER_ROUTE_LOG=$tmp/route.log
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
 export FAKE_TESTER_EVENT_LOG=$tmp/events.log
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
@@ -82,6 +95,10 @@ write_environment() {
 }
 
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
+if FAKE_TESTER_UNRELATED_RESOURCE='other-container|ordinary-ci' "$runtime" --check >/dev/null 2>&1; then fail 'tester admitted unrelated Docker state'; fi
+ln -s /missing "$root/var/lib/ci-fleet-deployer"
+if "$runtime" --check >/dev/null 2>&1; then fail 'tester runtime admitted a dangling deployer marker'; fi
+rm "$root/var/lib/ci-fleet-deployer"
 chmod 0666 "$root/var/run/docker.sock"
 if "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted a world-writable Docker control socket'; fi
 chmod 0600 "$root/var/run/docker.sock"
@@ -119,6 +136,21 @@ if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/
 for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
   write_environment "bad-$policy" 18081
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
+done
+for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority; do
+  if FAKE_TESTER_LIVE_POLICY=$policy "$runtime" --health >/dev/null 2>&1; then fail "unsafe live policy passed health: $policy"; fi
+done
+if FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'unreachable loopback route passed health'; fi
+grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared route port'
+for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
+  if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
+done
+write_environment source-policy 18096
+for source in 'services: {web: {extends: {file: /etc/passwd, service: web}}}' '!!str &external include: [{path: /etc/passwd}]' '!!str &external label_file: /etc/passwd' 'services: {web: {env_file: /etc/passwd}}' 'services: {}\nservices: {}'; do
+  printf '%b\n' "$source" >"$root/etc/ci-fleet-tester/definitions/source-policy.yaml"
+  : >"$tmp/docker.log"
+  if FAKE_TESTER_ROUTE_PORT=18096 "$runtime" --converge --environment source-policy >/dev/null 2>&1; then fail 'external or ambiguous YAML source was accepted'; fi
+  if grep -Fq 'config --format json' "$tmp/docker.log"; then fail 'unsafe YAML reached Compose rendering'; fi
 done
 write_environment bad-include 18091
 printf 'include:\n  - path: /etc/passwd\nservices: {}\n' >"$root/etc/ci-fleet-tester/definitions/bad-include.yaml"
@@ -276,6 +308,17 @@ if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'repaired release failed check'
 installed_unit=$root/etc/systemd/system/ci-fleet-tester-health.service
+for directory in etc/systemd/system run/systemd/system usr/lib/systemd/system lib/systemd/system; do
+  dropin=$root/$directory/ci-fleet-tester-health.service.d
+  mkdir -p "$dropin"
+  printf '[Service]\nExecStart=\nExecStart=/bin/false\n' >"$dropin/override.conf"
+  if "$installer" --check >/dev/null 2>&1; then fail 'unmanaged systemd drop-in passed check'; fi
+  if "$installer" --install --ref "$ref" >/dev/null 2>&1; then fail 'unmanaged systemd drop-in passed install'; fi
+  rm -r "$dropin"
+done
+ln -s /missing "$root/var/lib/ci-fleet-deployer"
+if "$installer" --check >/dev/null 2>&1; then fail 'tester accepted a dangling deployer role marker'; fi
+rm "$root/var/lib/ci-fleet-deployer"
 printf '# drift\n' >>"$installed_unit"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"
