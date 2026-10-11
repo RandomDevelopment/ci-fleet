@@ -118,7 +118,7 @@ fi
 deploy_exit() {
   local status=$?
   local recorded_status=${adapter_status:-$status}
-  local target state_root_safe=1
+  local target state_root_safe=1 log_parent=${log_root%/*}
   # The adapter may recursively clear its writable state root or drift its
   # metadata. Recreate or repair only a real directory; unsafe types fail.
   if [[ ${audit_pending:-0} == 1 && ! -e "$state_root" && ! -L "$state_root" ]]; then
@@ -130,6 +130,13 @@ deploy_exit() {
       chmod 0700 "$state_root" 2>/dev/null || status=1
     fi
     [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]] || { status=1; state_root_safe=0; }
+  fi
+  if [[ ${audit_pending:-0} == 1 && ! -e $log_root && ! -L $log_root ]]; then
+    if [[ -d $log_parent && ! -L $log_parent && $(realpath -e -- "$log_parent") == "$log_parent" && $(stat -c %u "$log_parent") == "$expected_uid" ]]; then
+      install -d -m 0700 "$log_root" 2>/dev/null || status=1
+    else
+      status=1
+    fi
   fi
   if [[ ${audit_pending:-0} == 1 && -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" ]]; then
     if [[ -d "$log_root" && ! -L "$log_root" ]]; then

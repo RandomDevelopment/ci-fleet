@@ -279,6 +279,7 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_LKG_ROOT:-} ]]; then
   if ((EUID == 0)); then chown 65534 "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good.json "$FAKE_ADAPTER_MUTATE_LKG_ROOT"/last-known-good-policy.conf; fi
 fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_DELETE_STATE_ROOT:-} ]]; then rm -rf -- "$FAKE_ADAPTER_DELETE_STATE_ROOT"; fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_DELETE_LOG_ROOT:-} ]]; then rm -rf -- "$FAKE_ADAPTER_DELETE_LOG_ROOT"; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_ACTIVE_ROOT:-} ]]; then
   : >"$FAKE_ADAPTER_MUTATE_ACTIVE_ROOT/active-policy.conf"
   rm -f "$FAKE_ADAPTER_MUTATE_ACTIVE_ROOT/install-state.json"
@@ -2349,6 +2350,28 @@ PYTEST
       [[ $(base64 -w0 "$target_path") == "$target_before" ]] || fail 'directory recovery changed protected bytes'
     fi
   done
+done
+
+# Handled log-root deletion restores all prior consumption and the audit prefix.
+for outcome in success failure; do
+  runtime_request
+  ledger_before=$(find "$ledger" -type f -printf '%f\n' | sort)
+  ledger_count=$(find "$ledger" -type f | wc -l)
+  audit_before=$(base64 -w0 "$root/var/log/ci-fleet-deployer/audit.log")
+  if [[ $outcome == failure ]]; then : >"$tmp/runtime-fail"; export FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail; fi
+  export FAKE_ADAPTER_DELETE_LOG_ROOT=$root/var/log/ci-fleet-deployer
+  if [[ $outcome == success ]]; then expect_failure 'deployer audit log changed' "$runtime" deploy >/dev/null; else expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null; fi
+  unset FAKE_ADAPTER_DELETE_LOG_ROOT FAKE_ADAPTER_FAIL_AFTER_MUTATION
+  [[ $(stat -c '%u:%a' "$root/var/log/ci-fleet-deployer") == "$(id -u):700" ]] || fail 'runtime did not recreate a protected log root'
+  [[ $(find "$ledger" -type f | wc -l) == $((ledger_count + 1)) ]] || fail 'log-root recovery lost consumed approvals'
+  while IFS= read -r id; do [[ -z $id || -f $ledger/$id ]] || fail 'log-root recovery lost an older approval'; done <<<"$ledger_before"
+  python3 - "$root/var/log/ci-fleet-deployer/audit.log" "$audit_before" <<'PYTEST' || fail 'log-root recovery lost audit history'
+import base64, pathlib, sys
+assert pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2]))
+PYTEST
+  grep -Eq "approval=runtime-recovery-$runtime_attempt .*result=failed" "$root/var/log/ci-fleet-deployer/audit.log" || fail 'log-root recovery omitted its terminal failure record'
+  install -m 0600 "$approval" "$request"
+  expect_failure 'deployment request was already' "$runtime" deploy >/dev/null
 done
 
 # Original absence of both rollback files survives successful and failed adapters.

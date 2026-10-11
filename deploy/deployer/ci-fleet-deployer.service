@@ -16,6 +16,7 @@ TimeoutStartSec=45min
 TimeoutStopSec=30s
 UMask=0077
 NoNewPrivileges=yes
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
