@@ -224,9 +224,11 @@ case "${1:-}" in
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_CONTROLLER_PROTOCOL_FILE:-}" ]]; then
           printf '<no value>\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
-          if grep -Fq 'io.randomdevelopment.ci-fleet.network-cleanup-lock="v1"' "${compose_file%/deploy/compose.yaml}/controller/Dockerfile" 2>/dev/null; then
-            printf 'v1\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
-          fi
+          for protocol in v1 v2; do
+            if grep -Fq "io.randomdevelopment.ci-fleet.network-cleanup-lock=\"$protocol\"" "${compose_file%/deploy/compose.yaml}/controller/Dockerfile" 2>/dev/null; then
+              printf '%s\n' "$protocol" >"$FAKE_CONTROLLER_PROTOCOL_FILE"
+            fi
+          done
         fi
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
@@ -804,7 +806,7 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
-[[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v1 ]] || fail 'current controller did not retain its cleanup protocol label'
+[[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
 proxy_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || proxy_health_result=$?
