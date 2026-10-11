@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("health", ROOT / "scripts" / "health.py")
@@ -515,6 +516,23 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((future["status"], future["hosts"][0]["status"]), ("unhealthy", "missing"))
         wrong = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"controller": "other", "timestamp": 980, "status": "healthy"}}, now=1000, grace_seconds=60)
         self.assertEqual((wrong["status"], wrong["hosts"][0]["status"]), ("unhealthy", "missing"))
+
+    def test_collector_detects_missed_hourly_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proc").mkdir()
+            (root / "proc/meminfo").write_text("MemTotal: 100 kB\nMemAvailable: 75 kB\n")
+
+            def run(args):
+                output = "1s\n" if "--property=LastTriggerUSecMonotonic" in args else "success\n"
+                return health.subprocess.CompletedProcess(args, 1 if args[0] == "docker" else 0, output, "")
+
+            for age, expected in ((3900, "ok"), (7200, "ok"), (7201, "stale")):
+                with self.subTest(age=age), patch.object(health.time, "clock_gettime", return_value=age + 1):
+                    snapshot = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled"}, root=root, run=run)
+                    self.assertEqual(snapshot["timers"]["cleanup"], expected)
+                    report = health.evaluate({**healthy_snapshot(), "timers": {"cleanup": snapshot["timers"]["cleanup"]}}, health.Thresholds())
+                    self.assertEqual(report["exit_code"], 1 if expected == "stale" else 0)
 
     def test_collector_uses_sustained_metrics_and_all_service_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

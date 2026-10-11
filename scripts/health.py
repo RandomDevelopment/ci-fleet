@@ -692,7 +692,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["unhealthy"] += int("unhealthy" in status)
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
-    timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    timer_ages = {"health": 900, "cleanup": 7200, "drift": 3600}
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
     if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
