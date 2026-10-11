@@ -59,7 +59,7 @@ rollback_commit_marker_uncommitted() {
 }
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${active_adapter_unit:-} ]] && ! stop_adapter_unit "$active_adapter_unit"; then
+  if [[ -n ${active_adapter_unit:-} ]] && ! { stop_adapter_unit "$active_adapter_unit" && retire_adapter_guard "$active_adapter_unit"; }; then
     recovery_status=1
     status=1
     printf 'ERROR: adapter termination could not be verified; retain the journal before recovery\n' >&2
@@ -208,6 +208,7 @@ deployed_current=$deployed_root/current
 drained=$state_root/drained
 active_operation=$state_root/active-operation
 lock_root=$(root_path /var/lock/ci-fleet-deployer)
+adapter_guard=$lock_root/adapter-unit
 log_root=$(root_path /var/log/ci-fleet-deployer)
 systemd_root=$(root_path /etc/systemd/system)
 unit_source=$repo_root/deploy/deployer
@@ -643,6 +644,7 @@ acquire_lock() {
   install -d -m 0755 "$(root_path /run)"
   exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
   flock -n 8 || block 'another ci-fleet role installation is already running'
+  recover_adapter_guard
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
   if [[ -e "$active_operation" ]] && ! active_deployment; then
@@ -680,6 +682,7 @@ acquire_check_lock() {
   fi
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer operation is running'
+  [[ ! -e $adapter_guard && ! -L $adapter_guard ]] || block 'interrupted installer adapter requires mutating recovery'
 }
 
 begin_transaction() {
@@ -1284,10 +1287,41 @@ adapter_deadline() {
 }
 
 adapter_unit_inactive() {
-  local unit=$1 state
+  local unit=$1 state query_status=0 key value load='' active=''
   [[ $unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || return 1
-  state=$(timeout --signal=TERM --kill-after=5s 10s systemctl show "$unit" --property=ActiveState --value 2>/dev/null) || return 1
-  [[ $state == inactive || $state == failed ]]
+  state=$(timeout --signal=TERM --kill-after=5s 10s systemctl show "$unit" --property=LoadState --property=ActiveState 2>/dev/null) || query_status=$?
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LoadState) [[ -z $load ]] || return 1; load=$value ;;
+      ActiveState) [[ -z $active ]] || return 1; active=$value ;;
+      *) return 1 ;;
+    esac
+  done <<<"$state"
+  [[ $load == loaded || $load == not-found ]] || return 1
+  [[ $active == inactive || $active == failed ]] || return 1
+  # Collected units return 1 with explicit manager-supplied absence evidence.
+  ((query_status == 0)) || { ((query_status == 1)) && [[ $load == not-found && $active == inactive ]]; }
+}
+
+retire_adapter_guard() {
+  local unit=$1 guard
+  local -a guards=("$adapter_guard")
+  [[ -z ${transaction_dir:-} ]] || guards+=("$transaction_dir/adapter-unit")
+  for guard in "${guards[@]}"; do
+    [[ -e $guard || -L $guard ]] || continue
+    [[ ! -L $guard && -f $guard && $(stat -c '%u:%a' "$guard") == "$expected_uid:600" && $(<"$guard") == "$unit" ]] || return 1
+    rm -f -- "$guard" || return
+    sync -f "${guard%/*}" 2>/dev/null || return
+  done
+}
+
+recover_adapter_guard() {
+  local unit
+  [[ -e $adapter_guard || -L $adapter_guard ]] || return 0
+  secure_file "$adapter_guard" 'outstanding adapter guard'
+  unit=$(<"$adapter_guard")
+  adapter_unit_inactive "$unit" || block 'adapter service is still active or its status is unknown; retain its guard until it stops'
+  retire_adapter_guard "$unit" || block 'outstanding adapter guard could not be retired'
 }
 
 stop_adapter_unit() {
@@ -1299,7 +1333,7 @@ stop_adapter_unit() {
 
 run_adapter() {
   local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds status unit
-  local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root $policy"
+  local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root -$lock_root $policy"
   local -a adapter_env=(CI_FLEET_DEPLOYER_CONFIG="$policy") sandbox=() inhibitor=() guard=()
   seconds=$(adapter_deadline "$operation_name")
   if [[ -n "$marker" ]]; then
@@ -1309,13 +1343,16 @@ run_adapter() {
   if [[ $testing != 1 || ${CI_FLEET_DEPLOYER_TEST_SANDBOX:-0} == 1 ]]; then
     unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
     active_adapter_unit=$unit
+    [[ ! -e $adapter_guard && ! -L $adapter_guard ]] || block 'outstanding adapter guard prevents dispatch'
+    (umask 077; printf '%s\n' "$unit" >"$adapter_guard")
+    sync -f "$lock_root" 2>/dev/null || die 'adapter unit guard is not durable'
+    # The service checks the persistent guard even when no transaction exists.
+    # shellcheck disable=SC2016
+    guard=(bash -c 'manifest=$1; unit=$2; shift 2; [[ -f "$manifest" && $(<"$manifest") == "$unit" ]] || exit 2; exec "$@"' -- "$adapter_guard" "$unit")
     if [[ -n ${transaction_dir:-} ]]; then
       printf '%s\n' "$unit" >"$transaction_dir/adapter-unit"
       chmod 0600 "$transaction_dir/adapter-unit"
       sync -f "$transaction_dir" 2>/dev/null || die 'adapter unit guard is not durable'
-      # The service evaluates this guard after its queued start.
-      # shellcheck disable=SC2016
-      guard=(bash -c 'manifest=$1; unit=$2; shift 2; [[ -f "$manifest" && $(<"$manifest") == "$unit" ]] || exit 2; exec "$@"' -- "$transaction_dir/adapter-unit" "$unit")
     fi
     sandbox=(systemd-run --quiet --wait --pipe --collect --service-type=exec --unit="$unit"
       --property=NoNewPrivileges=yes --property=ProtectSystem=strict
@@ -1330,13 +1367,14 @@ run_adapter() {
     seconds=$((seconds + 20))
   fi
   if timeout --signal=TERM --kill-after=10s "${seconds}s" "${inhibitor[@]}" "${sandbox[@]}" "${guard[@]}" env "${adapter_env[@]}" "$adapter_path" "$operation_name" 8>&- 9<&-; then
+    [[ -z ${unit:-} ]] || retire_adapter_guard "$unit" || die 'completed adapter guard could not be retired'
     active_adapter_unit=
     return 0
   else
     status=$?
   fi
   if [[ -n ${unit:-} ]]; then
-    stop_adapter_unit "$unit" || block 'adapter termination could not be verified; retain the journal until it stops'
+    { stop_adapter_unit "$unit" && retire_adapter_guard "$unit"; } || block 'adapter termination could not be verified; retain its guard until it stops'
     active_adapter_unit=
   fi
   return "$status"

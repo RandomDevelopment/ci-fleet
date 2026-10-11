@@ -290,6 +290,7 @@ else
   [[ ${CI_FLEET_DEPLOYER_REEXEC} == 1 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "$(readlink -f "$lock_dir")" ]] || die 'inherited deployer operation lock is absent or invalid'
   flock -n 9 || die 'another deployer operation is running'
 fi
+[[ ! -e "$lock_dir/adapter-unit" && ! -L "$lock_dir/adapter-unit" ]] || die 'interrupted installer adapter requires recovery'
 shopt -s nullglob
 transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
 shopt -u nullglob

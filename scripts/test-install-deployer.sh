@@ -69,15 +69,18 @@ case "${1:-}" in
     ;;
   show)
     [[ -z ${FAKE_ADAPTER_STATUS_ERROR:-} ]] || exit 1
-    if [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" || -e "$TMPDIR/transient-${2:-}" ]]; then printf 'active\n'; else printf 'inactive\n'; fi
+    if [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" || -e "$TMPDIR/transient-${2:-}" ]]; then
+      printf 'LoadState=loaded\nActiveState=active\n'
+    else
+      printf 'LoadState=not-found\nActiveState=inactive\n'
+      exit 1
+    fi
     ;;
   stop)
     if [[ ${2:-} == ci-fleet-deployer-adapter-* ]]; then
       [[ -z ${FAKE_ADAPTER_STOP_FAIL:-} ]] || exit 1
       if [[ -e "$TMPDIR/transient-${2:-}" ]]; then
-        shopt -s nullglob
-        guards=("$root/opt/ci-fleet-deployer/.installer-transactions/".transaction.*/adapter-unit)
-        [[ ${#guards[@]} == 1 && -f ${guards[0]} ]] || exit 52
+        [[ -f "$root/var/lock/ci-fleet-deployer/adapter-unit" && $(<"$root/var/lock/ci-fleet-deployer/adapter-unit") == "${2:-}" ]] || exit 52
         printf '%s\n' "${2:-}" >>"${FAKE_SANDBOX_LOG:?}.stopped"
         rm -f "$TMPDIR/transient-${2:-}"
       fi
@@ -163,6 +166,13 @@ if [[ ${FAKE_SANDBOX_INTERRUPT_OPERATION:-} == "${!#}" ]]; then
   installer_pid=${unit#ci-fleet-deployer-adapter-}
   installer_pid=${installer_pid%%-*}
   kill -TERM "$installer_pid"
+  exit 0
+fi
+if [[ ${FAKE_SANDBOX_KILL_AFTER_SUCCESS:-} == "${!#}" ]]; then
+  "$@"
+  installer_pid=${unit#ci-fleet-deployer-adapter-}
+  installer_pid=${installer_pid%%-*}
+  kill -KILL "$installer_pid"
   exit 0
 fi
 exec "$@"
@@ -510,6 +520,7 @@ first=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --install -
 unset FAKE_ADAPTER_FORBID_CONFIG_PATH
 rm "$root/etc/os-release" "$root/usr/lib/os-release"
 cp "$tmp/os-release" "$root/etc/os-release"
+[[ ! -e $root/var/lock/ci-fleet-deployer/adapter-unit ]] || fail 'successful adapter retained its persistent guard'
 grep -Fq 'REPORT action=install result=CHANGED environment=staging' <<<"$first" || fail 'fresh install report is incomplete'
 [[ -L "$root/opt/ci-fleet-deployer/current" ]] || fail 'fresh install lacks atomic current release'
 [[ $(stat -c %a "$root/var/lib/ci-fleet-deployer/install-state.json") == 600 ]] || fail 'install state mode is not 0600'
@@ -1046,6 +1057,44 @@ for interruption in stopped still-active status-error; do
   fi
   expect_success "$installer" --repair --config "$config" >/dev/null
   expect_success "$installer" --check --config "$config" >/dev/null
+done
+
+# Loss after successful health may leave a guard for a collected unit.
+printf '# collected-adapter\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+unit_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service")
+if CI_FLEET_DEPLOYER_TEST_SANDBOX=1 FAKE_SANDBOX_KILL_AFTER_SUCCESS=health "$installer" --repair --config "$config" >"$tmp/adapter-collected.log" 2>&1; then fail 'lost installer succeeded'; fi
+[[ -f $root/var/lock/ci-fleet-deployer/adapter-unit ]] || fail 'lost installer lacked a persistent guard'
+expect_success "$installer" --repair --config "$config" >/dev/null
+[[ ! -e $root/var/lock/ci-fleet-deployer/adapter-unit ]] || fail 'collected adapter blocked recovery'
+expect_success "$installer" --check --config "$config" >/dev/null
+
+# Every call remains fenced when termination cannot be proved before a transaction exists.
+for operation in health validate; do
+  for uncertainty in still-active status-error; do
+    if [[ $operation == validate ]]; then printf '# pre-transaction-adapter\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"; mode=repair; else mode=check; fi
+    export CI_FLEET_DEPLOYER_TEST_SANDBOX=1 FAKE_SANDBOX_INTERRUPT_OPERATION=$operation
+    if [[ $uncertainty == still-active ]]; then export FAKE_ADAPTER_STOP_FAIL=1; else export FAKE_ADAPTER_STATUS_ERROR=1; fi
+    if "$installer" --"$mode" --config "$config" >"$tmp/adapter-uncommitted.log" 2>&1; then fail 'interrupted nontransactional adapter succeeded'; fi
+    unset CI_FLEET_DEPLOYER_TEST_SANDBOX FAKE_SANDBOX_INTERRUPT_OPERATION FAKE_ADAPTER_STOP_FAIL FAKE_ADAPTER_STATUS_ERROR
+    guard=$root/var/lock/ci-fleet-deployer/adapter-unit
+    [[ -f $guard && $(stat -c %a "$guard") == 600 ]] || fail 'nontransactional adapter lost its protected guard'
+    pending_unit=$(<"$guard")
+    shopt -s nullglob
+    journals=("$root/opt/ci-fleet-deployer/.installer-transactions/".transaction.*)
+    shopt -u nullglob
+    [[ ${#journals[@]} == 0 ]] || fail 'nontransactional fixture unexpectedly created a journal'
+    expect_failure 'interrupted installer adapter' "$installer" --check --config "$config" >/dev/null
+    expect_failure 'interrupted installer adapter' "$runtime" health >/dev/null
+    if [[ $uncertainty == still-active ]]; then
+      expect_failure 'adapter service is still active' "$installer" --repair --config "$config" >/dev/null
+      rm -f "$TMPDIR/transient-$pending_unit"
+    else
+      FAKE_ADAPTER_STATUS_ERROR=1 expect_failure 'status is unknown' "$installer" --repair --config "$config" >/dev/null
+    fi
+    expect_success "$installer" --repair --config "$config" >/dev/null
+    [[ ! -e $guard ]] || fail 'stopped nontransactional adapter guard was not retired'
+    expect_success "$installer" --check --config "$config" >/dev/null
+  done
 done
 
 # Success from health cannot publish the candidate as an undeployed rollback point.
