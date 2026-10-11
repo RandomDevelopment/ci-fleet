@@ -307,7 +307,11 @@ if [[ "$operation" == drain ]]; then
 fi
 
 secure_file "$config" 'deployer configuration'
-policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
+if [[ $operation == health || $operation == cleanup ]]; then
+  policy_snapshot=$(mktemp "${TMPDIR:-/tmp}/ci-fleet-deployer-policy.XXXXXX")
+else
+  policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
+fi
 install -m 0600 "$config" "$policy_snapshot"
 config=$policy_snapshot
 trap 'rm -f "${policy_snapshot:-}"' EXIT

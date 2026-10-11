@@ -69,7 +69,7 @@ Every Docker resource the adapter creates (containers, custom networks, volumes)
 
 Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
-Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. Rollback is exposed only through the transactional installer, never as a direct runtime operation. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file as its final successful step. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after core/application alignment. A committed rollback interrupted after the adapter returns is finalized from the retained transaction on the next serialized installer operation.
+Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. Rollback is exposed only through the transactional installer, never as a direct runtime operation. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`; the adapter atomically creates that root-owned mode-`0600` file in a dedicated writable commit directory as its final successful step. Installer adapters run in bounded transient systemd services that keep the install tree and recovery journals read-only. Only rollback receives the writable commit directory. Core stages and selects the last-known-good core before invoking the adapter, restores the newer core on an uncommitted failure, and consumes committed last-known-good state only after core/application alignment. A committed rollback interrupted after the adapter returns is finalized from the retained transaction on the next serialized installer operation.
 
 ## Prepare host-local files
 
@@ -271,7 +271,7 @@ sudo systemctl status --no-pager ci-fleet-deployer.service
 
 The runtime and read-only checks serialize on the same flock. Deploy writes a mode-`0600` active-operation marker and removes it on completion. While the adapter runs, `systemd-inhibit` blocks shutdown and sleep; the deploy service has an explicit 45-minute start/stop bound. Upgrade, rollback, drain, and uninstall refuse while that marker belongs to a live or bounded recent process. A root-owned stale marker older than the fixed one-hour recovery bound is removed only by a serialized mutating installer run. Unsafe or malformed stale state fails closed.
 
-Health runs every five minutes and cleanup daily. Cleanup refuses while drained and is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
+Health runs every five minutes and cleanup daily. Their services keep managed state and logs read-only and use a private temporary policy copy. Cleanup refuses while drained and is delegated to the application adapter because only application-owned code knows its exact resources. Core itself issues no Docker delete or prune command.
 
 ## Verification and reports
 
@@ -299,7 +299,7 @@ REPORT action=install result=CHANGED environment=staging target=example-staging 
 
 ## Failure recovery
 
-New installer journals live in `/opt/ci-fleet-deployer/.installer-transactions`, outside the application-writable state and log directories. They retain the incumbent core, deployed snapshot, pending/completed requests, drain marker, consumed-approval ledger, and audit history. Candidate health preserves that incumbent snapshot even when health succeeds. Recovery also recognizes older journals under `/var/lib/ci-fleet-deployer`. Runtime refuses work until an interrupted installer journal is recovered. Only a rollback transaction can honor an application rollback commit marker.
+New installer journals live in `/opt/ci-fleet-deployer/.installer-transactions`, outside the application-writable state and log directories. They retain the incumbent core, deployed snapshot, pending/completed requests, drain marker, consumed-approval ledger, and audit history. Candidate health preserves that incumbent snapshot even when health succeeds. Recovery also recognizes older journals under `/var/lib/ci-fleet-deployer`. A legacy journal without an operation kind and with a rollback marker requires operator recovery. Restore the checkpoint or establish the journal's actual operation from trusted evidence before classifying it. Core cannot infer that operation from the marker alone. Runtime refuses work until an interrupted installer journal is recovered. Only a rollback transaction can honor an application rollback commit marker.
 
 1. Do not delete the lock, state, or current release blindly.
 2. Confirm whether `/var/lib/ci-fleet-deployer/active-operation` names a live process.

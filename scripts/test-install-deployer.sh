@@ -24,6 +24,7 @@ expect_failure 'an explicit operating mode is required' "$installer"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+export TMPDIR=$tmp
 root=$tmp/root
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin" "$root/etc/ci-fleet-deployer/adapters" \
@@ -62,6 +63,8 @@ case "${1:-}" in
     [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" ]] || exit 1
     if [[ $1 == is-enabled ]]; then
       if [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}.runtime" ]]; then printf 'enabled-runtime\n'; else printf '%s\n' "${FAKE_SYSTEMD_IS_ENABLED_OUTPUT:-enabled}"; fi
+    else
+      printf 'active\n'
     fi
     ;;
   enable)
@@ -108,9 +111,37 @@ cat >"$fake_bin/df" <<'EOF'
 if [[ -n ${FAKE_DF_REQUIRE_EXISTING:-} && ! -e ${!#} ]]; then exit 1; fi
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 104857600 1 %s 1%% /\n' "${FAKE_DISK_AVAILABLE:-104857599}"
 EOF
+cat >"$fake_bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+readonly_paths= writable_paths= caps= duration= kill_mode= no_privileges= strict=
+while (($#)); do
+  case "$1" in
+    --property=ReadOnlyPaths=*) readonly_paths=${1#--property=ReadOnlyPaths=} ;;
+    --property=ReadWritePaths=*) writable_paths=${1#--property=ReadWritePaths=} ;;
+    --property=CapabilityBoundingSet=*) caps=${1#--property=CapabilityBoundingSet=} ;;
+    --property=RuntimeMaxSec=*) duration=${1#--property=RuntimeMaxSec=} ;;
+    --property=KillMode=*) kill_mode=${1#--property=KillMode=} ;;
+    --property=NoNewPrivileges=*) no_privileges=${1#--property=NoNewPrivileges=} ;;
+    --property=ProtectSystem=*) strict=${1#--property=ProtectSystem=} ;;
+    --*) ;;
+    *) break ;;
+  esac
+  shift
+done
+[[ " $readonly_paths " == *" -$CI_FLEET_DEPLOYER_ROOT/opt/ci-fleet-deployer "* ]] || exit 48
+[[ $caps == '~CAP_SYS_ADMIN CAP_SYS_PTRACE' && $duration =~ ^[0-9]+s$ && $kill_mode == control-group && $no_privileges == yes && $strict == strict ]] || exit 49
+[[ " $readonly_paths " == *" -$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer "* && " $readonly_paths " == *" -$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer "* ]] || exit 50
+for writable_path in $writable_paths; do
+  [[ $writable_path == /run/docker.sock || $writable_path == "$CI_FLEET_DEPLOYER_ROOT/opt/ci-fleet-deployer/.installer-transactions/.transaction."*/commit ]] || exit 51
+done
+printf '%s|%s\n' "$readonly_paths" "$writable_paths" >>"${FAKE_SANDBOX_LOG:?}"
+exec "$@"
+EOF
 chmod 0755 "$fake_bin"/*
 export PATH="$fake_bin:$PATH"
 export FAKE_SYSTEMCTL_LOG=$tmp/systemctl.log
+export FAKE_SANDBOX_LOG=$tmp/sandbox.log
 export CI_FLEET_DEPLOYER_TESTING=1 CI_FLEET_DEPLOYER_ROOT=$root
 export CI_FLEET_DEPLOYER_EUID_OVERRIDE=0 CI_FLEET_DEPLOYER_TEST_NETWORK=ok
 
@@ -131,6 +162,7 @@ if [[ -n ${FAKE_ADAPTER_REPLACE_PATH:-} && -e $FAKE_ADAPTER_REPLACE_PATH ]]; the
 fi
 if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
 if [[ "$1" == validate && -n ${FAKE_ADAPTER_MUTATE_CONFIG_DURING_VALIDATE:-} ]]; then printf '# adapter mutation\n' >>"$CI_FLEET_DEPLOYER_CONFIG"; fi
+if [[ "$1" == health && -n ${FAKE_ADAPTER_ADD_LEDGER_ENTRY:-} ]]; then install -m 0600 /dev/null "$FAKE_ADAPTER_ADD_LEDGER_ENTRY"; fi
 if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
   if ((health_calls > FAKE_ADAPTER_FAIL_HEALTH_AFTER)); then
@@ -142,13 +174,19 @@ if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
     fi
     if [[ -n ${FAKE_ADAPTER_FORGE_ROLLBACK_MARKER:-} ]]; then
       for transaction in "$CI_FLEET_DEPLOYER_ROOT"/{var/lib,opt}/ci-fleet-deployer/{,.installer-transactions/}.transaction.*; do
-        [[ ! -d "$transaction" ]] || install -m 0600 /dev/null "$transaction/application-rollback-committed"
+        [[ -d "$transaction" ]] || continue
+        if [[ -d "$transaction/commit" ]]; then
+          install -m 0600 /dev/null "$transaction/commit/application-rollback-committed"
+        else
+          install -m 0600 /dev/null "$transaction/application-rollback-committed"
+        fi
       done
     fi
     if [[ -n ${FAKE_ADAPTER_HEALTH_READY:-} ]]; then
       : >"$FAKE_ADAPTER_HEALTH_READY"
       while [[ ! -e "$FAKE_ADAPTER_HEALTH_READY.release" ]]; do sleep 0.1; done
     fi
+    if [[ -n ${FAKE_ADAPTER_CHOWN_STATE:-} && $EUID == 0 ]]; then chown 65534 "$FAKE_ADAPTER_CHOWN_STATE"; fi
     exit 42
   fi
 fi
@@ -171,11 +209,11 @@ if [[ "$1" == rollback && -n ${FAKE_ADAPTER_UNSAFE_ROLLBACK_MARKER:-} ]]; then
   exit 42
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_DELETE_ROLLBACK_TRANSACTION:-} ]]; then
-  rm -rf -- "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")"
+  rm -rf -- "$(dirname "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")")"
   exit 42
 fi
 if [[ "$1" == rollback && -n ${FAKE_ADAPTER_CORRUPT_ROLLBACK_TRANSACTION:-} ]]; then
-  : >"$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")/state/install-state.json"
+  : >"$(dirname "$(dirname "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT")")/state/install-state.json"
   rm -f "$CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"
   exit 42
 fi
@@ -439,7 +477,7 @@ cp "$root/etc/os-release" "$root/usr/lib/os-release"
 rm "$root/etc/os-release"
 ln -s ../usr/lib/os-release "$root/etc/os-release"
 export FAKE_ADAPTER_FORBID_CONFIG_PATH=$config
-first=$(expect_success "$installer" --install --config "$config")
+first=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --install --config "$config")
 unset FAKE_ADAPTER_FORBID_CONFIG_PATH
 rm "$root/etc/os-release" "$root/usr/lib/os-release"
 cp "$tmp/os-release" "$root/etc/os-release"
@@ -449,7 +487,7 @@ grep -Fq 'REPORT action=install result=CHANGED environment=staging' <<<"$first" 
 for unit in ci-fleet-deployer.service ci-fleet-deployer-health.service ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.service ci-fleet-deployer-cleanup.timer ci-fleet-deployer-drain.service; do
   [[ -f "$root/etc/systemd/system/$unit" ]] || fail "missing unit $unit"
 done
-second=$(expect_success "$installer" --install --config "$config")
+second=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --install --config "$config")
 grep -Fq 'result=NO_CHANGE' <<<"$second" || fail 'second install was not idempotent'
 check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'REPORT action=check result=NO_CHANGE' <<<"$check" || fail 'check did not report convergence'
@@ -906,6 +944,51 @@ FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DELETE_LOG_ROOT
 [[ $(sha256sum "$root/var/log/ci-fleet-deployer/audit.log") == "$audit_before" ]] || fail 'candidate health lost audit history'
 expect_success "$installer" --repair --config "$config" >/dev/null
 
+# Restoring the replay ledger must remove unexpected entries as well as replace lost markers.
+for extra in $(printf '%064d' 3) unexpected-marker; do
+  printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+  FAKE_ADAPTER_ADD_LEDGER_ENTRY=$ledger/$extra expect_success "$installer" --repair --config "$config" >/dev/null
+  [[ $(find "$ledger" -type f -printf '%f %m %s\n' | sort) == "$ledger_before" ]] || fail 'candidate health retained an injected consumption marker'
+done
+
+# Real state directories with drifted ownership remain recoverable from protected journals.
+if ((EUID == 0)); then
+  printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+  health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+  FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_CHOWN_STATE=$root/var/lib/ci-fleet-deployer \
+    expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
+  [[ $(stat -c '%u:%a' "$root/var/lib/ci-fleet-deployer") == "$(id -u):700" ]] || fail 'candidate health ownership drift prevented recovery'
+  expect_success "$installer" --repair --config "$config" >/dev/null
+  expect_success "$installer" --check --config "$config" >/dev/null
+fi
+
+# A legacy journal without an operation kind cannot authorize an application commit.
+legacy=$root/var/lib/ci-fleet-deployer/.transaction.ambiguous
+mkdir -m 0700 "$legacy" "$legacy/units" "$legacy/state"
+snapshot_state "$legacy"
+install -m 0600 /dev/null "$legacy/application-rollback-committed"
+legacy_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+expect_failure 'legacy rollback marker requires operator recovery' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$legacy" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$legacy_state_before" ]] || fail 'ambiguous legacy marker changed installed state'
+# The test operator classifies the fixture as convergence after checking its saved state.
+printf 'convergence\n' >"$legacy/kind"
+chmod 0600 "$legacy/kind"
+expect_success "$installer" --repair --config "$config" >/dev/null
+
+# Recovery cannot run while a recorded transient adapter unit is still active.
+busy=$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.busy
+mkdir -m 0700 "$busy" "$busy/units" "$busy/state"
+snapshot_state "$busy"
+printf 'convergence\n' >"$busy/kind"
+printf 'ci-fleet-deployer-adapter-999-1.service\n' >"$busy/adapter-unit"
+chmod 0600 "$busy/kind" "$busy/adapter-unit"
+install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-adapter-999-1.service"
+busy_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+expect_failure 'adapter service is still active' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$busy" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$busy_state_before" ]] || fail 'active adapter did not block recovery'
+rm "$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-adapter-999-1.service"
+expect_success "$installer" --repair --config "$config" >/dev/null
+
 # Success from health cannot publish the candidate as an undeployed rollback point.
 printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
 FAKE_ADAPTER_DELETE_DEPLOYED_CURRENT=$root/var/lib/ci-fleet-deployer/deployed \
@@ -1021,7 +1104,7 @@ rm "$root/etc/systemd/system/actions.runner.rollback-drift.service"
 mv "$approval" "$approval.rollback-saved"
 mv "$checkpoint" "$checkpoint.rollback-saved"
 export FAKE_CURL_EXIT=1
-rollback=$(expect_success "$installer" --rollback --config "$config")
+rollback=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --rollback --config "$config")
 unset FAKE_CURL_EXIT
 mv "$approval.rollback-saved" "$approval"
 mv "$checkpoint.rollback-saved" "$checkpoint"
@@ -1042,6 +1125,7 @@ for path in "$root"/etc/systemd/system/ci-fleet-deployer*; do
 done
 printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
 printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$recovery_transaction/timers-enabled"
+printf 'rollback\n' >"$recovery_transaction/kind"; chmod 0600 "$recovery_transaction/kind"
 install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
@@ -1056,6 +1140,7 @@ expect_success "$installer" --check --config "$config" >/dev/null
 # An unsafe rollback commit marker type must block before recovery mutation.
 recovery_transaction=$root/var/lib/ci-fleet-deployer/.transaction.marker-type
 mkdir -m 0700 "$recovery_transaction" "$recovery_transaction/units" "$recovery_transaction/state"
+printf 'rollback\n' >"$recovery_transaction/kind"; chmod 0600 "$recovery_transaction/kind"
 mkdir "$recovery_transaction/application-rollback-committed"
 units_before_marker=$(find "$root/etc/systemd/system" -mindepth 1 -maxdepth 1 -printf '%P %y\n' | sort | sha256sum)
 policy_before_marker=$(sha256sum "$root/var/lib/ci-fleet-deployer/active-policy.conf")
@@ -1083,6 +1168,7 @@ for name in install-state.json active-policy.conf last-known-good.json last-know
   [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
 done
 printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
+printf 'rollback\n' >"$recovery_transaction/kind"; chmod 0600 "$recovery_transaction/kind"
 install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
 recovery=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'unusable-incumbent recovery lacks the operator reconciliation action'
@@ -1160,6 +1246,7 @@ for name in install-state.json active-policy.conf last-known-good.json last-know
   [[ ! -e "$root/var/lib/ci-fleet-deployer/$name" ]] || { cp "$root/var/lib/ci-fleet-deployer/$name" "$recovery_transaction/state/$name"; printf '%s\n' "$name" >>"$recovery_transaction/state-present"; }
 done
 printf '%s\n' "$(readlink "$root/opt/ci-fleet-deployer/current")" >"$recovery_transaction/current-target"
+printf 'rollback\n' >"$recovery_transaction/kind"; chmod 0600 "$recovery_transaction/kind"
 install -m 0600 /dev/null "$recovery_transaction/application-rollback-committed"
 cp "$adapter" "$tmp/adapter.saved"
 printf '# drifted\n' >>"$adapter"
@@ -1584,9 +1671,9 @@ adapter_config=$tmp/adapter-config
 FAKE_ADAPTER_RECORD_CONFIG=$adapter_config expect_success "$runtime" health >/dev/null
 unset FAKE_ADAPTER_RECORD_CONFIG
 [[ -e "$adapter_config.seen" ]] || fail 'adapter config snapshot was not recorded'
-[[ $(<"$adapter_config") == "$root"/var/lib/ci-fleet-deployer/.active-policy.* ]] || fail 'adapter did not receive an immutable policy snapshot path'
+[[ $(<"$adapter_config") == "$TMPDIR"/ci-fleet-deployer-policy.* ]] || fail 'adapter did not receive an immutable policy snapshot path'
 cmp -s "$adapter_config.content" "$root/var/lib/ci-fleet-deployer/active-policy.conf" || fail 'adapter policy snapshot content differs from the validated policy'
-compgen -G "$root/var/lib/ci-fleet-deployer/.active-policy.*" >/dev/null && fail 'policy snapshot was not cleaned up'
+[[ ! -e $(<"$adapter_config") ]] || fail 'policy snapshot was not cleaned up'
 chmod 0644 "$credential"
 cleanup_calls_before=$(grep -Fxc cleanup "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" cleanup >/dev/null
@@ -2114,6 +2201,13 @@ grep -Fq 'scripts/test-deployer-units.sh' "$repo_root/scripts/validate.sh" || fa
 lock_line=$(grep -n 'flock -n 9' "$runtime" | head -n1 | cut -d: -f1)
 policy_line=$(grep -n "secure_file \"\$config\" 'deployer configuration'" "$runtime" | cut -d: -f1)
 ((lock_line < policy_line)) || fail 'runtime loads active policy before acquiring the shared operation lock'
+for scheduled in health cleanup; do
+  scheduled_unit=$repo_root/deploy/deployer/ci-fleet-deployer-$scheduled.service
+  grep -Fq 'ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer' "$scheduled_unit" || fail 'scheduled adapter state is writable'
+  grep -Fxq 'ReadWritePaths=/run/docker.sock' "$scheduled_unit" || fail 'scheduled adapter has unexpected writable paths'
+  grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$scheduled_unit" || fail 'scheduled adapter can bypass its mount namespace'
+done
+
 for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--resume' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
   grep -Fq -- "$phrase" "$repo_root/docs/DEPLOYER-HOST.md" || fail "deployer runbook omits $phrase"
 done

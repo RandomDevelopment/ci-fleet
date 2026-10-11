@@ -23,6 +23,7 @@ transaction_dir=
 transaction_preparing=0
 transaction_committed=0
 transaction_kind=convergence
+rollback_commit_file=
 recovered_rollback=0
 backup_transaction() {
   local path relative
@@ -37,7 +38,7 @@ backup_transaction() {
 }
 restore_transaction_backup() {
   local relative encoded destination
-  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" "$transaction_dir/log" "$transaction_dir/log/consumed-requests" || return
+  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" "$transaction_dir/log" "$transaction_dir/log/consumed-requests" "$transaction_dir/commit" || return
   while IFS='|' read -r relative encoded; do
     [[ -n "$relative" ]] || continue
     [[ "$relative" =~ ^(units|state|deployed|retained|log)/[A-Za-z0-9._-]+$ || "$relative" =~ ^log/consumed-requests/[0-9a-f]{64}$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
@@ -57,9 +58,8 @@ rollback_commit_marker_uncommitted() {
 }
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
-    if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root" || recovery_status=1; fi
-    if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
+  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
+    if restore_state_directory "$state_root"; then
       if ! { rm -rf -- "$transaction_dir" && restore_transaction_backup; }; then recovery_status=1; fi
     else
       recovery_status=1
@@ -71,7 +71,7 @@ on_exit() {
   elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
     if ((recovery_status == 0)); then
-      if rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
+      if rollback_commit_marker_uncommitted "$rollback_commit_file"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
     fi
     set -e
     if ((recovery_status != 0)); then
@@ -423,7 +423,7 @@ require_host() {
   DOCKER_HOST=unix://$(root_path /run/docker.sock)
   export DOCKER_HOST
   unset DOCKER_CONTEXT
-  for command in bash awk base64 cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod ln flock kill timeout env git python3 docker systemctl systemd-analyze systemd-inhibit timedatectl curl df date; do
+  for command in bash awk base64 cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod chown ln flock kill timeout env git python3 docker systemctl systemd-run systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
   local os_release
@@ -462,7 +462,7 @@ require_maintenance_host() {
   export DOCKER_HOST
   unset DOCKER_CONTEXT
   local command
-  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod ln mv flock kill timeout env python3 systemctl systemd-analyze date; do
+  for command in bash awk cut stat sha256sum readlink realpath install cp rm mkdir mktemp chmod chown ln mv flock kill timeout env python3 systemctl systemd-run systemd-analyze date; do
     command -v "$command" >/dev/null || block "$command is required for maintenance"
   done
   [[ -d "$systemd_root" && ! -L "$systemd_root" ]] || block 'systemd unit directory is unavailable'
@@ -629,7 +629,7 @@ acquire_lock() {
     block 'drain requires an installed deployer'
   fi
   secure_directory "$lock_root" 700 1
-  if [[ -e "$state_root" || -L "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
+  [[ ! -L "$state_root" && ( ! -e "$state_root" || -d "$state_root" ) ]] || block 'managed state boundary is unsafe'
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer installer operation is running'
   # Role admission is serialized across the controller and deployer installers:
@@ -664,6 +664,7 @@ acquire_lock() {
   done
   shopt -u nullglob
   recover_interrupted_transaction
+  if [[ -e "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
 }
 
 acquire_check_lock() {
@@ -768,19 +769,31 @@ begin_transaction() {
   transaction_dir=$transaction_ready
   sync -f "$transaction_root" 2>/dev/null || sync "$transaction_root" 2>/dev/null || block 'published recovery journal is not durable'
   transaction_preparing=0
+  install -d -m 0700 "$transaction_dir/commit"
+  rollback_commit_file=$transaction_dir/commit/application-rollback-committed
+  sync -f "$transaction_dir" 2>/dev/null || block 'rollback commit boundary is not durable'
+}
+
+restore_state_directory() {
+  local path=$1
+  [[ ! -L "$path" && $(realpath -m -- "$path") == "$path" ]] || return 1
+  if [[ ! -e "$path" ]]; then install -d -m 0700 "$path" || return; fi
+  [[ -d "$path" && $(realpath -e -- "$path") == "$path" ]] || return 1
+  chown "$expected_uid" "$path" || return
+  chmod 0700 "$path"
 }
 
 restore_adapter_state() {
   local name target_value path
-  secure_directory "$state_root" 700 1 || return
+  restore_state_directory "$state_root" || block 'state restore directory is unsafe'
   if [[ -f "$transaction_dir/deployed-target" ]]; then
     target_value=$(<"$transaction_dir/deployed-target")
     if [[ "$target_value" == absent ]]; then
       rm -f -- "$deployed_current" || return
     else
       if [[ -d "$transaction_dir/deployed" ]]; then
-        secure_directory "$deployed_root" 700 1 || return
-        secure_directory "$deployed_root/$target_value" 700 1 || return
+        restore_state_directory "$deployed_root" || block 'deployed restore directory is unsafe'
+        restore_state_directory "$deployed_root/$target_value" || block 'snapshot restore directory is unsafe'
         for name in policy.conf state.json; do
           secure_file "$transaction_dir/deployed/$name" 'transaction deployed snapshot backup' || return
           [[ ! -L "$deployed_root/$target_value/$name" && ( ! -e "$deployed_root/$target_value/$name" || -f "$deployed_root/$target_value/$name" ) ]] || block 'deployed snapshot restore target is unsafe'
@@ -809,17 +822,28 @@ restore_adapter_state() {
     done
   fi
   if [[ -d "$transaction_dir/log" ]]; then
-    secure_directory "$log_root" 700 1 || return
-    secure_directory "$log_root/consumed-requests" 700 1 || return
+    restore_state_directory "$log_root" || block 'log restore directory is unsafe'
+    restore_state_directory "$log_root/consumed-requests" || block 'ledger restore directory is unsafe'
+    shopt -s dotglob nullglob
+    for path in "$log_root/consumed-requests"/*; do
+      if [[ -d "$path" && ! -L "$path" ]]; then
+        shopt -u dotglob nullglob
+        block 'consumed request restore target is unsafe'
+      fi
+      rm -f -- "$path" || return
+    done
+    shopt -u dotglob nullglob
     for path in "$transaction_dir/log/consumed-requests"/*; do
       [[ -e "$path" ]] || continue
       name=${path##*/}
       [[ ! -L "$log_root/consumed-requests/$name" && ( ! -e "$log_root/consumed-requests/$name" || -f "$log_root/consumed-requests/$name" ) ]] || block 'consumed request restore target is unsafe'
       install -T -m 0600 "$path" "$log_root/consumed-requests/$name" || return
     done
+    [[ ! -L "$log_root/audit.log" && ( ! -e "$log_root/audit.log" || -f "$log_root/audit.log" ) ]] || block 'audit restore target is unsafe'
     if [[ -f "$transaction_dir/log/audit.log" ]]; then
-      [[ ! -L "$log_root/audit.log" && ( ! -e "$log_root/audit.log" || -f "$log_root/audit.log" ) ]] || block 'audit restore target is unsafe'
       install -T -m 0600 "$transaction_dir/log/audit.log" "$log_root/audit.log" || return
+    else
+      rm -f -- "$log_root/audit.log" || return
     fi
     sync -f "$log_root" 2>/dev/null || return
   fi
@@ -898,7 +922,7 @@ restore_transaction() {
   systemd_restore_mode=$(stat -c %a "$systemd_root")
   (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
   [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
-  secure_directory "$state_root" 700 1 || return
+  restore_state_directory "$state_root" || block 'state restore directory is unsafe'
   for name in "${timer_names[@]}"; do
     if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]] || systemctl is-enabled "$name" >/dev/null 2>&1 || systemctl is-active "$name" >/dev/null 2>&1; then
       systemctl disable --now "$name" >/dev/null 2>&1 || return
@@ -958,16 +982,33 @@ recover_interrupted_transaction() {
   ((${#candidates[@]} == 1)) || return 0
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
-  transaction_kind=rollback
+  transaction_kind=convergence
   if [[ -e "$candidate/kind" || -L "$candidate/kind" ]]; then
     secure_file "$candidate/kind" 'transaction kind'
     transaction_kind=$(<"$candidate/kind")
     [[ $transaction_kind == convergence || $transaction_kind == rollback ]] || block 'transaction kind is unsafe'
   elif [[ $candidate == "$transaction_root/"* ]]; then
     block 'transaction kind is missing'
+  elif [[ -e "$candidate/application-rollback-committed" || -L "$candidate/application-rollback-committed" ]]; then
+    block 'legacy rollback marker requires operator recovery'
+  fi
+  if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
+    secure_file "$candidate/adapter-unit" 'adapter unit guard'
+    local pending_unit
+    pending_unit=$(<"$candidate/adapter-unit")
+    [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
+    if [[ $(systemctl is-active "$pending_unit" 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
+      block 'adapter service is still active; retain the journal until it stops'
+    fi
+  fi
+  local candidate_marker=$candidate/application-rollback-committed
+  if [[ -e "$candidate/commit" || -L "$candidate/commit" ]]; then
+    secure_directory "$candidate/commit" 700 0 || block 'rollback commit directory is unsafe'
+    candidate_marker=$candidate/commit/application-rollback-committed
   fi
   transaction_dir=$candidate
-  if ! rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
+  rollback_commit_file=$candidate_marker
+  if ! rollback_commit_marker_uncommitted "$rollback_commit_file"; then
     finalize_committed_rollback
     recovered_rollback=1
     transaction_committed=0
@@ -980,7 +1021,7 @@ recover_interrupted_transaction() {
 }
 
 finalize_committed_rollback() {
-  local marker=$transaction_dir/application-rollback-committed retired journal_root=${transaction_dir%/*}
+  local marker=$rollback_commit_file retired journal_root=${transaction_dir%/*}
   local final_adapter_path final_adapter_sha final_credential_provider final_credential_ref
   rollback_commit_marker_safe "$marker" || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
@@ -1239,21 +1280,48 @@ adapter_deadline() {
 }
 
 run_adapter() {
-  local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds
+  local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds status unit
+  local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root $policy"
+  local -a adapter_env=(CI_FLEET_DEPLOYER_CONFIG="$policy") sandbox=() inhibitor=() guard=()
   seconds=$(adapter_deadline "$operation_name")
-  if [[ -n "$marker" && $testing != 1 ]]; then
-    # The transactional adapter call runs under a shutdown inhibitor, like the
-    # deploy runtime, so a normal shutdown cannot strand a partially applied
-    # rollback between core mutation and commit-marker publication.
-    timeout --signal=TERM --kill-after=10s "${seconds}s" systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 8>&- 9<&-
-    return
-  fi
   if [[ -n "$marker" ]]; then
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 8>&- 9<&-
-  else
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name" 8>&- 9<&-
+    adapter_env+=(CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker")
+    writable_paths+=" ${marker%/*}"
   fi
+  if [[ $testing != 1 || ${CI_FLEET_DEPLOYER_TEST_SANDBOX:-0} == 1 ]]; then
+    unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
+    if [[ -n ${transaction_dir:-} ]]; then
+      printf '%s\n' "$unit" >"$transaction_dir/adapter-unit"
+      chmod 0600 "$transaction_dir/adapter-unit"
+      sync -f "$transaction_dir" 2>/dev/null || die 'adapter unit guard is not durable'
+      # The service evaluates this guard after its queued start.
+      # shellcheck disable=SC2016
+      guard=(bash -c 'manifest=$1; unit=$2; shift 2; [[ -f "$manifest" && $(<"$manifest") == "$unit" ]] || exit 2; exec "$@"' -- "$transaction_dir/adapter-unit" "$unit")
+    fi
+    sandbox=(systemd-run --quiet --wait --pipe --collect --service-type=exec --unit="$unit"
+      --property=NoNewPrivileges=yes --property=ProtectSystem=strict
+      --property='CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE'
+      --property="ReadOnlyPaths=$readonly_paths"
+      --property="ReadWritePaths=$writable_paths"
+      --property="RuntimeMaxSec=${seconds}s" --property=TimeoutStopSec=10s --property=KillMode=control-group)
+    if [[ -n "$marker" ]]; then
+      inhibitor=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback is active' --)
+    fi
+    seconds=$((seconds + 20))
+  fi
+  if timeout --signal=TERM --kill-after=10s "${seconds}s" "${inhibitor[@]}" "${sandbox[@]}" "${guard[@]}" env "${adapter_env[@]}" "$adapter_path" "$operation_name" 8>&- 9<&-; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ -n ${unit:-} ]]; then
+    timeout --signal=TERM --kill-after=5s 15s systemctl stop "$unit" >/dev/null 2>&1 || true
+    if [[ $(systemctl is-active "$unit" 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
+      transaction_committed=1
+      block 'adapter service is still active; retain the journal until it stops'
+    fi
+  fi
+  return "$status"
 }
 
 run_verified_adapter() {
@@ -1445,7 +1513,7 @@ PY
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.
-  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$transaction_dir/application-rollback-committed" && ! rollback_commit_marker_safe "$transaction_dir/application-rollback-committed"; then
+  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$rollback_commit_file" && ! rollback_commit_marker_safe "$rollback_commit_file"; then
     die 'application adapter rollback failed'
   fi
   # The rollback already replaced the activation pointer and units on possibly
@@ -1454,10 +1522,10 @@ PY
   # the pointer, policy, or units reverted.
   sync -f "$install_root" 2>/dev/null || die 'rolled-back install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || die 'rolled-back systemd boundary is not durable'
-  # The authoritative commit marker (on the state filesystem) becomes durable
+  # The authoritative commit marker becomes durable
   # only after the /opt and /etc boundaries, so recovery can never observe it
   # over reverted core state.
-  sync -f "$transaction_dir/application-rollback-committed" 2>/dev/null || sync "$transaction_dir/application-rollback-committed" 2>/dev/null || die 'application rollback commit marker is not durable'
+  sync -f "$rollback_commit_file" 2>/dev/null || sync "$rollback_commit_file" 2>/dev/null || die 'application rollback commit marker is not durable'
   sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
