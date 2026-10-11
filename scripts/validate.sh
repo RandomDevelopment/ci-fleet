@@ -47,6 +47,8 @@ scripts/test-install-tester.sh
 scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh
+scripts/test-install-deployer.sh
+scripts/test-deployer-units.sh
 scripts/test-install-status-receiver.sh
 
 tmp=$(mktemp)
