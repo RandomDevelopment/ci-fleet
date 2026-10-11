@@ -42,7 +42,8 @@ def evidence() -> dict:
             "merged": True, "state": "closed", "merge_commit_sha": COMMIT,
             "base": {"ref": "main", "repo": {"id": 101}}, "head": {"sha": HEAD}, "user": {"id": 201},
         },
-        f"{PREFIX}/pulls/8/reviews": [{"id": 900, "user": {"id": 202}, "state": "APPROVED", "commit_id": HEAD}],
+        f"{PREFIX}/pulls/8/reviews": [{"id": 900, "user": {"id": 202}, "state": "APPROVED", "commit_id": HEAD,
+                                      "submitted_at": "2026-01-01T00:00:00Z"}],
         f"{PREFIX}/actions/workflows/501/runs": {"workflow_runs": [{
             "id": 700, "workflow_id": 501, "head_sha": COMMIT, "event": "push", "head_branch": "main",
             "repository": {"id": 101}, "status": "completed", "conclusion": "success", "run_attempt": 2,
@@ -109,13 +110,29 @@ class ApprovalTests(unittest.TestCase):
                     verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
         for state, commit_id in (("DISMISSED", HEAD), ("CHANGES_REQUESTED", HEAD), ("APPROVED", "4" * 40)):
             data = evidence()
-            data[review_path].append({"id": 901, "user": {"id": 202}, "state": state, "commit_id": commit_id})
+            data[review_path].append({"id": 901, "user": {"id": 202}, "state": state, "commit_id": commit_id,
+                                      "submitted_at": "2026-01-01T00:01:00Z"})
             with self.assertRaises(Rejected):
                 verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
         data = evidence()
         data[review_path] = []
         with self.assertRaises(Rejected):
             verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+
+    def test_review_submission_time_orders_a_previously_pending_review(self):
+        data = evidence()
+        reviews = data[f"{PREFIX}/pulls/8/reviews"]
+        # A review created earlier can be submitted after the approval.
+        reviews.append({"id": 899, "user": {"id": 202}, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                        "submitted_at": "2026-01-01T00:01:00Z"})
+        with self.assertRaises(Rejected):
+            verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        reviews[0]["submitted_at"] = "2026-01-01T00:02:00Z"
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        for invalid in (None, "invalid", "2026-01-01T00:02:00"):
+            reviews[0]["submitted_at"] = invalid
+            with self.subTest(timestamp=invalid), self.assertRaises(ValueError):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
 
     def test_reviewed_head_must_include_previous_main_for_squash_and_merge(self):
         data = evidence()
@@ -154,7 +171,8 @@ class ApprovalTests(unittest.TestCase):
         data = evidence()
         data[f"{PREFIX}/pulls/8/reviews"].append({"id": 901, "user": {"id": 202}, "state": "COMMENTED", "commit_id": HEAD})
         verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
-        data[f"{PREFIX}/pulls/8/reviews"].insert(0, {"id": 899, "user": {"id": 202}, "state": "CHANGES_REQUESTED", "commit_id": HEAD})
+        data[f"{PREFIX}/pulls/8/reviews"].insert(0, {"id": 899, "user": {"id": 202}, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                                                   "submitted_at": "2025-12-31T00:00:00Z"})
         verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
 
     def test_latest_run_and_exact_attempt_jobs_must_pass(self):

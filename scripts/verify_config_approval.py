@@ -125,19 +125,20 @@ class GitHub:
         raise Rejected("GitHub API pagination limit reached")
 
 
+def evidence_timestamp(timestamp: Any) -> datetime:
+    require(isinstance(timestamp, str), "evidence timestamp is unavailable")
+    value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    require(value.tzinfo is not None, "evidence timestamp lacks timezone")
+    return value
+
+
 def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
     timestamps = [run.get("created_at")]
     if run.get("run_started_at") is not None:
         timestamps.append(run["run_started_at"])
     if run.get("status") != "completed":
         timestamps.append(run.get("updated_at"))
-    parsed = []
-    for timestamp in timestamps:
-        require(isinstance(timestamp, str), "workflow attempt timestamp is unavailable")
-        value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        require(value.tzinfo is not None, "workflow attempt timestamp lacks timezone")
-        parsed.append(value)
-    return max(parsed), run["id"]
+    return max(evidence_timestamp(timestamp) for timestamp in timestamps), run["id"]
 
 
 def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str) -> None:
@@ -179,12 +180,15 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
     latest: dict[int, dict[str, Any]] = {}
     reviews = api.pages(f"{prefix}/pulls/{number}/reviews")
     require(all(positive_id(review.get("id")) for review in reviews), "invalid review identifiers")
-    for review in sorted(reviews, key=lambda item: item["id"]):
+    for review in reviews:
         reviewer = review.get("user", {}).get("id")
         state = review.get("state")
         require(state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED", "COMMENTED", "PENDING"}, "invalid review state")
         if reviewer in policy["reviewer_ids"] and state not in {"COMMENTED", "PENDING"}:
-            latest[reviewer] = review
+            order = evidence_timestamp(review.get("submitted_at")), review["id"]
+            previous = latest.get(reviewer)
+            if previous is None or order > (evidence_timestamp(previous.get("submitted_at")), previous["id"]):
+                latest[reviewer] = review
     require(not any(review["state"] == "CHANGES_REQUESTED" for review in latest.values()), "trusted reviewer requested changes")
     require(any(reviewer != author_id and review["state"] == "APPROVED" and review.get("commit_id") == head
                 for reviewer, review in latest.items()), "independent exact-head approval is missing")
