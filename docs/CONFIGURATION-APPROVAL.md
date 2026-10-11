@@ -46,6 +46,10 @@ adapter's resume action, the trusted verifier requires all of the following:
    On an existing installation, it must preserve the installed configuration
    commit's ancestry. Force-pushing a previously approved older commit cannot
    roll the host back or replace its accepted history.
+   Every first-parent commit since that baseline must independently satisfy these
+   review/check rules. A reviewed PR cannot carry an unreviewed direct-pushed
+   base onto the host. Verification stops at the trusted installed baseline and
+   rejects ranges exceeding twenty integrated commits or the evidence budget.
 2. Its Git tree equals the current reviewed PR head's tree. This supports squash
    commits without treating approval of different source content as equivalent.
    Its first parent must be an ancestor of the reviewed head, and a two-parent
@@ -94,6 +98,15 @@ before activation; historical host state is not retroactively attested by this
 gate. A first installation's absent-manager checkpoint is not an approved way to
 remove enforcement. Recovery to an incompatible checkpoint requires a separately
 authorized root-operator procedure, not an automatic downgrade.
+
+Remote health-failure recovery uses an inherited-lock installer upgrade marked
+`--restore-last-known-good`. It accepts only the exact repository, commit, and
+controller in the trusted root-owned mode-`0600` LKG record. This recovery does
+not require forward ancestry or historical hosted approvals, and still rejects
+an engine without approval capability. Candidate policy cannot create this
+record. Before activation, review this baseline as well as the checkpoint.
+An enabled forward install requires an existing trusted installed-state baseline;
+provision the gate after bootstrap, not before a first installation.
 
 The verifier runs from the existing trusted engine before candidate engine code
 or host convergence. Root-owned policy-action metadata carries the approved

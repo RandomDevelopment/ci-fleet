@@ -19,6 +19,7 @@ transaction_active=false
 checkpoint_dir=
 staging_paths=()
 captured_current_state=
+restore_lkg=false
 
 usage() {
   cat >&2 <<'EOF'
@@ -105,6 +106,10 @@ while (($#)); do
       host_config_arg=$2
       shift 2
       ;;
+    --restore-last-known-good)
+      restore_lkg=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -117,6 +122,9 @@ while (($#)); do
 done
 
 [[ -n "$mode" ]] || { usage; die 'an explicit operating mode is required'; }
+if [[ "$restore_lkg" == true ]]; then
+  [[ "$mode" == upgrade && ${CI_FLEET_INSTALLER_LOCK_FD:-} == 9 ]] || die 'last-known-good restoration requires a locked upgrade'
+fi
 if [[ -n "$root_prefix" && "$testing" != 1 ]]; then
   die 'CI_FLEET_ROOT_PREFIX is test-only and requires CI_FLEET_TESTING=1'
 fi
@@ -258,6 +266,13 @@ configuration_approval_required() {
 
 verify_configuration_approval() {
   configuration_approval_required || return 0
+  if [[ "$restore_lkg" == true ]]; then
+    python3 "$repo_root/scripts/verify_config_approval.py" --policy "$config_review_policy" \
+      --repository "$config_identity" --commit "$config_ref" --tree "$config_tree" --installed-state "$state_file" \
+      --recovery-record "${CI_FLEET_LKG_DIR:-$state_root/last-known-good}/metadata.json" --controller "$controller_id" </dev/null \
+      || die 'last-known-good approval baseline rejected'
+    return
+  fi
   local token_env=$default_host_config approval_token=$temporary/approval-token
   [[ -f "$token_env" ]] || token_env=$rendered_env
   effective_host_config=$token_env
@@ -412,12 +427,12 @@ PY
   status_reporting_required=${metadata_values[3]}
   status_reporting_configured=${metadata_values[4]}
   if configuration_approval_required; then
-    python3 - "$candidate_metadata" "$config_tree" <<'PY'
+    python3 - "$candidate_metadata" "$config_tree" "$restore_lkg" <<'PY'
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 value = json.loads(path.read_text())
-value.update(configuration_approval_required=True, config_tree=sys.argv[2])
+value.update(configuration_approval_required=True, config_tree=sys.argv[2], configuration_recovery_required=sys.argv[3] == "true")
 path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 PY
   fi
@@ -2031,11 +2046,16 @@ import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 for field in ("config_repository", "config_ref", "config_tree"):
     print(value[field])
+recovery = value.get("configuration_recovery_required", False)
+if type(recovery) is not bool:
+    raise ValueError("invalid configuration recovery context")
+print("true" if recovery else "false")
 PY
         )
-        [[ ${#approval_context[@]} == 3 && ${approval_context[0]} == "$config_identity" ]] || die 'policy action approval context is invalid'
+        [[ ${#approval_context[@]} == 4 && ${approval_context[0]} == "$config_identity" ]] || die 'policy action approval context is invalid'
         config_ref=${approval_context[1]}
         config_tree=${approval_context[2]}
+        restore_lkg=${approval_context[3]}
         verify_configuration_approval
         require_configuration_approval_capability "$release_dir/engine-capabilities.json" || die 'policy action engine would remove configuration approval enforcement'
       fi

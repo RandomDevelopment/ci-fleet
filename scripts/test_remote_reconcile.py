@@ -572,6 +572,9 @@ exec {shlex.quote(real_git or 'git')} "$@"
                 result = self._run(health, rollback_health=rollback_health)
 
                 self._assert_rolled_back(result, rollback_health)
+                calls = self._installer_calls()
+                self.assertNotIn("--restore-last-known-good", calls[0]["args"])
+                self.assertIn("--restore-last-known-good", calls[1]["args"])
 
     def test_unaccepted_installed_state_does_not_replace_prior_lkg(self):
         interrupted_ref = "1" * 40

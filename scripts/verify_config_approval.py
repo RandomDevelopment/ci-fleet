@@ -85,7 +85,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Rejected("GitHub API redirect rejected")
 
 
-def read_installed_commit(path: Path, repository: str, owner: int = 0) -> str | None:
+def read_installed_commit(path: Path, repository: str, owner: int = 0, controller: str | None = None) -> str | None:
     for parent in path.parents:
         try:
             metadata = parent.lstat()
@@ -100,7 +100,13 @@ def read_installed_commit(path: Path, repository: str, owner: int = 0) -> str | 
         metadata = os.fstat(handle.fileno())
         require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and not metadata.st_mode & 0o022
                 and metadata.st_size <= 1024 * 1024, "installed state is not trusted")
+        if controller is not None:
+            require(stat.S_IMODE(metadata.st_mode) == 0o600, "recovery record requires mode 0600")
         installed = json.load(handle, object_pairs_hook=unique_object)
+    if controller is not None:
+        require(set(installed) == {"config_repository", "config_ref", "controller", "saved_at"}
+                and installed["controller"] == controller and type(installed["saved_at"]) is int
+                and installed["saved_at"] >= 0, "recovery record does not match the controller")
     require(installed["config_repository"].lower() == repository.lower(), "installed repository identity differs")
     previous = installed["config_ref"]
     require(isinstance(previous, str) and bool(SHA.fullmatch(previous)), "installed configuration SHA is invalid")
@@ -200,8 +206,7 @@ def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
     return max(evidence_timestamp(timestamp) for timestamp in timestamps), run["id"]
 
 
-def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str,
-           previous_commit: str | None = None) -> None:
+def verify_one(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str) -> str:
     require(bool(REPOSITORY.fullmatch(repository)) and bool(SHA.fullmatch(commit)) and bool(SHA.fullmatch(tree)),
             "approval requires a repository, full commit SHA, and local tree SHA")
     prefix = f"/repos/{repository}"
@@ -211,11 +216,6 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
     candidate = api.get(f"{prefix}/git/commits/{commit}")
     require(candidate.get("sha") == commit and candidate.get("tree", {}).get("sha") == tree,
             "local candidate does not match GitHub commit tree")
-    if previous_commit is not None and previous_commit != commit:
-        require(bool(SHA.fullmatch(previous_commit)), "installed configuration SHA is invalid")
-        lineage = api.get(f"{prefix}/compare/{previous_commit}...{commit}")
-        require(lineage.get("merge_base_commit", {}).get("sha") == previous_commit and lineage.get("status") == "ahead",
-                "candidate rewrites or replays older installed configuration history")
     associated = api.pages(f"{prefix}/commits/{commit}/pulls")
     matches = [pr for pr in associated if pr.get("merge_commit_sha") == commit and pr.get("merged_at")]
     require(len(matches) == 1 and positive_id(matches[0].get("number")), "candidate must be the unique merged PR result")
@@ -272,6 +272,29 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
         matching = [job for job in jobs if job.get("name") == required]
         require(len(matching) == 1 and matching[0].get("status") == "completed" and matching[0].get("conclusion") == "success",
                 "required workflow job did not pass")
+    return parent
+
+
+def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str,
+           previous_commit: str | None = None) -> None:
+    if previous_commit is None or previous_commit == commit:
+        verify_one(api, policy, repository, commit, tree)
+        return
+    require(bool(SHA.fullmatch(previous_commit)), "installed configuration SHA is invalid")
+    prefix = f"/repos/{repository}"
+    lineage = api.get(f"{prefix}/compare/{previous_commit}...{commit}")
+    require(lineage.get("merge_base_commit", {}).get("sha") == previous_commit and lineage.get("status") == "ahead",
+            "candidate rewrites or replays older installed configuration history")
+    seen = set()
+    for _ in range(20):
+        require(commit not in seen, "configuration history cycle")
+        seen.add(commit)
+        parent = verify_one(api, policy, repository, commit, tree)
+        if parent == previous_commit:
+            return
+        commit = parent
+        tree = api.get(f"{prefix}/git/commits/{commit}")["tree"]["sha"]
+    raise Rejected("configuration history verification limit reached")
 
 
 def main() -> int:
@@ -281,6 +304,8 @@ def main() -> int:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tree", required=True)
     parser.add_argument("--installed-state", type=Path, required=True)
+    parser.add_argument("--recovery-record", type=Path)
+    parser.add_argument("--controller")
     args = parser.parse_args()
 
     def deadline_expired(_signal: int, _frame: Any) -> None:
@@ -290,8 +315,15 @@ def main() -> int:
     signal.setitimer(signal.ITIMER_REAL, 120)
     try:
         policy = read_policy(args.policy)
-        previous = read_installed_commit(args.installed_state, args.repository)
-        verify(GitHub(sys.stdin.read(8192).strip()), policy, args.repository, args.commit, args.tree, previous)
+        if args.recovery_record is not None:
+            require(bool(REPOSITORY.fullmatch(args.repository)) and bool(SHA.fullmatch(args.commit))
+                    and bool(SHA.fullmatch(args.tree)) and bool(args.controller), "invalid recovery identity")
+            require(read_installed_commit(args.recovery_record, args.repository, controller=args.controller) == args.commit,
+                    "candidate is not the trusted last-known-good configuration")
+        else:
+            previous = read_installed_commit(args.installed_state, args.repository)
+            require(previous is not None, "configuration approval requires an installed trusted baseline")
+            verify(GitHub(sys.stdin.read(8192).strip()), policy, args.repository, args.commit, args.tree, previous)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # API responses, policy contents, and authentication material are never logged.
         print("ERROR: configuration approval rejected or evidence unavailable", file=sys.stderr)
@@ -299,7 +331,8 @@ def main() -> int:
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
-    print("APPROVED: exact configuration tree, independent review, and required checks verified")
+    print("APPROVED: trusted last-known-good recovery" if args.recovery_record is not None
+          else "APPROVED: exact configuration tree, independent review, and required checks verified")
     return 0
 
 

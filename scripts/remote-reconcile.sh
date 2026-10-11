@@ -266,6 +266,7 @@ PY
 
   exec 7>"$transaction_result"
   CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
+    --restore-last-known-good \
     --config-repo "$lkg_pinned" \
     --config-identity "$lkg_repo" \
     --ref "$lkg_ref" \

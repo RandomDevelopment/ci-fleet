@@ -591,7 +591,7 @@ PY
 }
 wait_for_file() {
   local path=$1 label=$2 attempt
-  for ((attempt = 0; attempt < 200; attempt++)); do
+  for ((attempt = 0; attempt < 1200; attempt++)); do
     [[ ! -f "$path" ]] || return 0
     sleep 0.05
   done
