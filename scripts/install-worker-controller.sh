@@ -1575,15 +1575,29 @@ PY
 }
 
 restore_systemd_snapshot() {
-  local unit timer failed=0
-  remove_systemd_units || failed=1
-  for unit in "${unit_names[@]}"; do
-    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  local unit timer staged_units reconcile_state failed=0
+  install -d -m 0755 "$systemd_dir" || return 1
+  staged_units=$(mktemp -d "$systemd_dir/.ci-fleet-restore.XXXXXX") || return 1
+  staging_paths+=("$staged_units")
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$staged_units/$unit" || return 1
   done
-  for unit in "${optional_unit_names[@]}"; do
-    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+    if [[ -f "$staged_units/$unit" ]]; then
+      mv -f "$staged_units/$unit" "$systemd_dir/$unit" || return 1
+    elif [[ "$unit" == ci-fleet-reconcile.service && -f "$systemd_dir/$unit" ]]; then
+      reconcile_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+      case "$reconcile_state" in
+        active|activating|reloading|deactivating) continue ;;
+        inactive|failed) rm -f "$systemd_dir/$unit" || return 1 ;;
+        *) return 1 ;;
+      esac
+    else
+      rm -f "$systemd_dir/$unit" || return 1
+    fi
   done
-  systemctl daemon-reload || failed=1
+  # Reload only the complete restored set, with the executing service still present.
+  systemctl daemon-reload || return 1
   for timer in "${timer_names[@]}"; do
     if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
     if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
