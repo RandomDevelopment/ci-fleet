@@ -134,6 +134,16 @@ class ApprovalTests(unittest.TestCase):
             with self.subTest(timestamp=invalid), self.assertRaises(ValueError):
                 verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
 
+    def test_same_second_review_conflicts_cannot_preserve_an_approval(self):
+        for state, commit_id in (("CHANGES_REQUESTED", HEAD), ("DISMISSED", HEAD), ("APPROVED", "4" * 40)):
+            data = evidence()
+            data[f"{PREFIX}/pulls/8/reviews"].append({
+                "id": 899, "user": {"id": 202}, "state": state, "commit_id": commit_id,
+                "submitted_at": "2026-01-01T00:00:00Z",
+            })
+            with self.subTest(state=state), self.assertRaises(Rejected):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+
     def test_reviewed_head_must_include_previous_main_for_squash_and_merge(self):
         data = evidence()
         data[f"{PREFIX}/git/commits/{COMMIT}"]["parents"].append({"sha": HEAD})

@@ -132,6 +132,12 @@ def evidence_timestamp(timestamp: Any) -> datetime:
     return value
 
 
+def review_order(review: dict[str, Any], head: str) -> tuple[datetime, int, int]:
+    # GitHub timestamps have second precision; ambiguous ties must reject approval.
+    rejection = {"APPROVED": int(review.get("commit_id") != head), "DISMISSED": 2, "CHANGES_REQUESTED": 3}
+    return evidence_timestamp(review.get("submitted_at")), rejection[review["state"]], review["id"]
+
+
 def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
     timestamps = [run.get("created_at")]
     if run.get("run_started_at") is not None:
@@ -185,9 +191,9 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
         state = review.get("state")
         require(state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED", "COMMENTED", "PENDING"}, "invalid review state")
         if reviewer in policy["reviewer_ids"] and state not in {"COMMENTED", "PENDING"}:
-            order = evidence_timestamp(review.get("submitted_at")), review["id"]
+            order = review_order(review, head)
             previous = latest.get(reviewer)
-            if previous is None or order > (evidence_timestamp(previous.get("submitted_at")), previous["id"]):
+            if previous is None or order > review_order(previous, head):
                 latest[reviewer] = review
     require(not any(review["state"] == "CHANGES_REQUESTED" for review in latest.values()), "trusted reviewer requested changes")
     require(any(reviewer != author_id and review["state"] == "APPROVED" and review.get("commit_id") == head
