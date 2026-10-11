@@ -27,7 +27,6 @@ done
 use_local_docker
 
 command -v docker >/dev/null || { echo "ERROR docker is unavailable" >&2; exit 1; }
-docker info >/dev/null
 
 args=(--instance "$instance")
 if $apply; then args+=(--apply); fi
