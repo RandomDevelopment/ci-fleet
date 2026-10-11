@@ -287,6 +287,14 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT:-} ]]; then
   snapshot=$(find "$FAKE_ADAPTER_MUTATE_SNAPSHOT_ROOT" -maxdepth 1 -type d -name '.snapshot.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   [[ -n "$snapshot" ]] && printf 'adapter-mutation\n' >>"$snapshot/policy.conf"
 fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_INJECT_DEPLOY_LEDGER:-} ]]; then install -m 0600 /dev/null "$FAKE_ADAPTER_INJECT_DEPLOY_LEDGER"; fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_REPLACE_RUNTIME_TARGET:-} ]]; then
+  rm -f -- "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
+  mkdir "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
+fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_INJECT_COMPLETED_REQUEST:-} ]]; then
+  install -m 0600 "$CI_FLEET_DEPLOYER_REQUEST" "$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer/last-request.conf"
+fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_SIGNAL_PPID:-} ]]; then kill -TERM "$PPID"; sleep 5; fi
 if [[ -e "${FAKE_ADAPTER_FAIL_AFTER_MUTATION:-/nonexistent}" ]]; then exit 42; fi
 EOF
@@ -2280,6 +2288,66 @@ import base64, pathlib, sys
 raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2])) else 1)
 PY
 grep -Eq 'approval=audit-state-delete-attempt .*result=failed phase=adapter status=42$' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit-prefix recovery lost the terminal adapter failure record'
+
+# Runtime recovery must preserve the exact ledger and reject injected completed records.
+runtime_attempt=0
+runtime_request() {
+  runtime_attempt=$((runtime_attempt + 1))
+  write_evidence staging example-staging
+  sed -i "s/APPROVAL_ID=approval-20260808-1/APPROVAL_ID=runtime-recovery-$runtime_attempt/" "$approval"
+  install -m 0600 "$approval" "$request"
+}
+ledger=$root/var/log/ci-fleet-deployer/consumed-requests
+for outcome in success failure; do
+  for injected in "$(printf runtime-injected | sha256sum | cut -d' ' -f1)" malformed-entry; do
+    runtime_request
+    ledger_before=$(find "$ledger" -type f -printf '%f\n' | sort)
+    ledger_count=$(find "$ledger" -type f | wc -l)
+    if [[ $outcome == failure ]]; then : >"$tmp/runtime-fail"; export FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail; fi
+    export FAKE_ADAPTER_INJECT_DEPLOY_LEDGER=$ledger/$injected
+    if [[ $outcome == success ]]; then expect_success "$runtime" deploy >/dev/null; else expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null; fi
+    unset FAKE_ADAPTER_INJECT_DEPLOY_LEDGER FAKE_ADAPTER_FAIL_AFTER_MUTATION
+    [[ ! -e $ledger/$injected && $(find "$ledger" -type f | wc -l) == $((ledger_count + 1)) ]] || fail 'runtime retained injected ledger entries'
+    while IFS= read -r id; do [[ -z $id || -f $ledger/$id ]] || fail 'runtime dropped prior consumption'; done <<<"$ledger_before"
+    install -m 0600 "$approval" "$request"
+    expect_failure 'deployment request was already' "$runtime" deploy >/dev/null
+  done
+done
+
+# Verified real directories at protected file names must be restored as files.
+for outcome in success failure; do
+  for target_path in "$root/var/lib/ci-fleet-deployer/active-policy.conf" "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/var/lib/ci-fleet-deployer/last-request.conf" "$root/var/log/ci-fleet-deployer/audit.log"; do
+    runtime_request
+    target_before=$(base64 -w0 "$target_path")
+    if [[ $outcome == failure ]]; then : >"$tmp/runtime-fail"; export FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail; fi
+    export FAKE_ADAPTER_REPLACE_RUNTIME_TARGET=$target_path
+    if [[ $outcome == failure ]]; then
+      expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null
+    elif [[ $target_path == */audit.log ]]; then
+      expect_failure 'deployer audit log changed' "$runtime" deploy >/dev/null
+    else
+      expect_success "$runtime" deploy >/dev/null
+    fi
+    unset FAKE_ADAPTER_REPLACE_RUNTIME_TARGET FAKE_ADAPTER_FAIL_AFTER_MUTATION
+    [[ -f $target_path && ! -L $target_path && $(stat -c '%u:%a' "$target_path") == "$(id -u):600" ]] || fail 'runtime left a directory at a protected file target'
+    if [[ $target_path == */audit.log ]]; then
+      python3 - "$target_path" "$target_before" <<'PYTEST' || fail 'directory recovery lost the audit prefix'
+import base64, pathlib, sys
+assert pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2]))
+PYTEST
+    elif [[ $target_path != */last-request.conf || $outcome == failure ]]; then
+      [[ $(base64 -w0 "$target_path") == "$target_before" ]] || fail 'directory recovery changed protected bytes'
+    fi
+  done
+done
+
+runtime_request
+last_request=$root/var/lib/ci-fleet-deployer/last-request.conf
+mv "$last_request" "$tmp/completed-request.saved"
+: >"$tmp/runtime-fail"
+FAKE_ADAPTER_INJECT_COMPLETED_REQUEST=1 FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail   expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null
+[[ ! -e $last_request && ! -L $last_request ]] || fail 'failed adapter fabricated a completed-deployment record'
+install -m 0600 "$tmp/completed-request.saved" "$last_request"
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"
