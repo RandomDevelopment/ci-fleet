@@ -22,12 +22,13 @@ checkout_snapshot=
 transaction_dir=
 transaction_preparing=0
 transaction_committed=0
+transaction_kind=convergence
 recovered_rollback=0
 backup_transaction() {
   local path relative
   rollback_transaction_backup=
   shopt -s nullglob
-  for path in "$transaction_dir"/* "$transaction_dir"/units/* "$transaction_dir"/state/* "$transaction_dir"/deployed/* "$transaction_dir"/retained/*; do
+  for path in "$transaction_dir"/* "$transaction_dir"/units/* "$transaction_dir"/state/* "$transaction_dir"/deployed/* "$transaction_dir"/retained/* "$transaction_dir"/log/* "$transaction_dir"/log/consumed-requests/*; do
     [[ -f "$path" && ! -L "$path" ]] || continue
     relative=${path#"$transaction_dir"/}
     rollback_transaction_backup+="$relative|$(base64 -w0 "$path")"$'\n'
@@ -36,10 +37,10 @@ backup_transaction() {
 }
 restore_transaction_backup() {
   local relative encoded destination
-  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" || return
+  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" "$transaction_dir/log" "$transaction_dir/log/consumed-requests" || return
   while IFS='|' read -r relative encoded; do
     [[ -n "$relative" ]] || continue
-    [[ "$relative" =~ ^(units|state|deployed|retained)/[A-Za-z0-9._-]+$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$relative" =~ ^(units|state|deployed|retained|log)/[A-Za-z0-9._-]+$ || "$relative" =~ ^log/consumed-requests/[0-9a-f]{64}$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
     destination=$transaction_dir/$relative
     printf '%s' "$encoded" | base64 -d >"$destination" || return
     chmod 0600 "$destination" || return
@@ -51,6 +52,7 @@ rollback_commit_marker_safe() {
 }
 rollback_commit_marker_uncommitted() {
   local marker=$1
+  [[ $transaction_kind == rollback ]] || return 0
   [[ ! -e "$marker" && ! -L "$marker" ]] || { [[ ! -L "$marker" && -f "$marker" ]] && ! rollback_commit_marker_safe "$marker"; }
 }
 on_exit() {
@@ -187,6 +189,7 @@ if [[ "$mode" != check && "$effective_uid" != 0 ]]; then die 'run this mode as r
 root_path() { printf '%s%s' "$root" "$1"; }
 etc_root=$(root_path /etc/ci-fleet-deployer)
 install_root=$(root_path /opt/ci-fleet-deployer)
+transaction_root=$install_root/.installer-transactions
 releases=$install_root/releases
 current=$install_root/current
 state_root=$(root_path /var/lib/ci-fleet-deployer)
@@ -650,8 +653,12 @@ acquire_lock() {
     done
     shopt -u nullglob
   fi
+  if [[ -e "$transaction_root" || -L "$transaction_root" ]]; then
+    secure_directory "$install_root" 755 0 || return
+    secure_directory "$transaction_root" 700 0 || return
+  fi
   shopt -s nullglob
-  for path in "$state_root"/.transaction-preparing.*; do
+  for path in "$state_root"/.transaction-preparing.* "$transaction_root"/.transaction-preparing.*; do
     [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || block 'incomplete transaction preparation is unsafe'
     rm -rf -- "$path"
   done
@@ -687,9 +694,14 @@ begin_transaction() {
     path=$systemd_root/$name
     [[ ! -e "$path" && ! -L "$path" ]] || [[ -f "$path" && ! -L "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:644" ]] || block 'managed systemd unit has an unsafe owner, mode, or type'
   done
-  transaction_dir=$(mktemp -d "$state_root/.transaction-preparing.XXXXXX")
+  secure_directory "$transaction_root" 700 1
+  transaction_dir=$(mktemp -d "$transaction_root/.transaction-preparing.XXXXXX")
   transaction_preparing=1
   chmod 0700 "$transaction_dir"
+  transaction_kind=convergence
+  [[ $mode != rollback ]] || transaction_kind=rollback
+  printf '%s\n' "$transaction_kind" >"$transaction_dir/kind"
+  chmod 0600 "$transaction_dir/kind"
   install -d -m 0700 "$transaction_dir/units" "$transaction_dir/state"
   for name in install-state.json active-policy.conf last-known-good.json last-known-good-policy.conf; do
     path=$state_root/$name
@@ -734,20 +746,90 @@ begin_transaction() {
       install -m 0600 "$path" "$transaction_dir/retained/$name"
     fi
   done
+  install -d -m 0700 "$transaction_dir/log" "$transaction_dir/log/consumed-requests"
+  if [[ -e "$log_root/audit.log" || -L "$log_root/audit.log" ]]; then
+    secure_file "$log_root/audit.log" 'audit log'
+    install -m 0600 "$log_root/audit.log" "$transaction_dir/log/audit.log"
+  fi
+  if [[ -e "$log_root/consumed-requests" || -L "$log_root/consumed-requests" ]]; then
+    secure_directory "$log_root/consumed-requests" 700 0 || block 'consumed request ledger is unsafe'
+    for path in "$log_root/consumed-requests"/*; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      [[ ${path##*/} =~ ^[0-9a-f]{64}$ ]] || block 'consumed request identity is unsafe'
+      secure_file "$path" 'consumed request marker'
+      [[ ! -s "$path" ]] || block 'consumed request marker must be empty'
+      install -m 0600 "$path" "$transaction_dir/log/consumed-requests/${path##*/}"
+    done
+  fi
   transaction_name=${transaction_dir##*/}
-  transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
+  transaction_ready=$transaction_root/.transaction.${transaction_name#.transaction-preparing.}
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || block 'prepared recovery journal is not durable'
   mv "$transaction_dir" "$transaction_ready"
   transaction_dir=$transaction_ready
-  sync -f "$state_root" 2>/dev/null || sync "$state_root" 2>/dev/null || block 'published recovery journal is not durable'
+  sync -f "$transaction_root" 2>/dev/null || sync "$transaction_root" 2>/dev/null || block 'published recovery journal is not durable'
   transaction_preparing=0
 }
 
+restore_adapter_state() {
+  local name target_value path
+  secure_directory "$state_root" 700 1 || return
+  if [[ -f "$transaction_dir/deployed-target" ]]; then
+    target_value=$(<"$transaction_dir/deployed-target")
+    if [[ "$target_value" == absent ]]; then
+      rm -f -- "$deployed_current" || return
+    else
+      if [[ -d "$transaction_dir/deployed" ]]; then
+        secure_directory "$deployed_root" 700 1 || return
+        secure_directory "$deployed_root/$target_value" 700 1 || return
+        for name in policy.conf state.json; do
+          secure_file "$transaction_dir/deployed/$name" 'transaction deployed snapshot backup' || return
+          [[ ! -L "$deployed_root/$target_value/$name" && ( ! -e "$deployed_root/$target_value/$name" || -f "$deployed_root/$target_value/$name" ) ]] || block 'deployed snapshot restore target is unsafe'
+          install -T -m 0600 "$transaction_dir/deployed/$name" "$deployed_root/$target_value/$name" || return
+        done
+      fi
+      rm -f -- "$deployed_current" || return
+      ln -s "$target_value" "$deployed_current" || return
+    fi
+  fi
+  if [[ -f "$transaction_dir/deployed-created" ]]; then
+    target_value=$(<"$transaction_dir/deployed-created")
+    [[ $target_value =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction created snapshot name is unsafe'
+    if [[ ! -e $deployed_current && ! -L $deployed_current ]] || [[ $(readlink "$deployed_current" 2>/dev/null) != "$target_value" ]]; then
+      [[ ! -d "$deployed_root/$target_value" || -L "$deployed_root/$target_value" ]] || rm -rf -- "${deployed_root:?}/$target_value"
+    fi
+  fi
+  if [[ -d "$transaction_dir/retained" ]]; then
+    for name in request.conf last-request.conf drained; do
+      [[ ! -L "$state_root/$name" && ( ! -e "$state_root/$name" || -f "$state_root/$name" ) ]] || block 'retained state restore target is unsafe'
+      if [[ -f "$transaction_dir/retained/$name" ]]; then
+        install -T -m 0600 "$transaction_dir/retained/$name" "$state_root/$name" || return
+      else
+        rm -f -- "$state_root/$name" || return
+      fi
+    done
+  fi
+  if [[ -d "$transaction_dir/log" ]]; then
+    secure_directory "$log_root" 700 1 || return
+    secure_directory "$log_root/consumed-requests" 700 1 || return
+    for path in "$transaction_dir/log/consumed-requests"/*; do
+      [[ -e "$path" ]] || continue
+      name=${path##*/}
+      [[ ! -L "$log_root/consumed-requests/$name" && ( ! -e "$log_root/consumed-requests/$name" || -f "$log_root/consumed-requests/$name" ) ]] || block 'consumed request restore target is unsafe'
+      install -T -m 0600 "$path" "$log_root/consumed-requests/$name" || return
+    done
+    if [[ -f "$transaction_dir/log/audit.log" ]]; then
+      [[ ! -L "$log_root/audit.log" && ( ! -e "$log_root/audit.log" || -f "$log_root/audit.log" ) ]] || block 'audit restore target is unsafe'
+      install -T -m 0600 "$transaction_dir/log/audit.log" "$log_root/audit.log" || return
+    fi
+    sync -f "$log_root" 2>/dev/null || return
+  fi
+}
+
 restore_transaction() {
-  local name target_value backed_up systemd_restore_mode
+  local name target_value backed_up systemd_restore_mode journal_root=${transaction_dir%/*}
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 1
   transaction_committed=1
-  for name in units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
+  for name in kind units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
     [[ ! -e "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || [[ ! -L "$transaction_dir/$name" && -f "$transaction_dir/$name" ]] || block "transaction manifest $name has an unsafe type"
   done
   if [[ -f "$transaction_dir/units-present" ]]; then
@@ -797,6 +879,17 @@ restore_transaction() {
       done
     fi
   done
+  if [[ -e "$transaction_dir/log" || -L "$transaction_dir/log" ]]; then
+    secure_directory "$transaction_dir/log" 700 0 || return
+    secure_directory "$transaction_dir/log/consumed-requests" 700 0 || return
+    if [[ -e "$transaction_dir/log/audit.log" || -L "$transaction_dir/log/audit.log" ]]; then secure_file "$transaction_dir/log/audit.log" 'transaction audit backup' || return; fi
+    for backed_up in "$transaction_dir/log/consumed-requests"/*; do
+      [[ -e "$backed_up" || -L "$backed_up" ]] || continue
+      [[ ${backed_up##*/} =~ ^[0-9a-f]{64}$ ]] || block 'transaction consumed request identity is unsafe'
+      secure_file "$backed_up" 'transaction consumed request backup' || return
+      [[ ! -s "$backed_up" ]] || block 'transaction consumed request backup must be empty'
+    done
+  fi
   # Validate the deployed-state boundary before any pointer mutation follows it.
   if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then
     [[ -d "$deployed_root" && ! -L "$deployed_root" && $(stat -c '%u:%a' "$deployed_root") == "$expected_uid:700" ]] || block 'deployed snapshot directory is unsafe'
@@ -805,6 +898,7 @@ restore_transaction() {
   systemd_restore_mode=$(stat -c %a "$systemd_root")
   (((8#$systemd_restore_mode & 8#022) == 0)) || block 'systemd unit directory is group- or world-writable'
   [[ -d "$install_root" && ! -L "$install_root" && $(stat -c '%u:%a' "$install_root") == "$expected_uid:755" ]] || block 'managed install boundary has an unsafe owner, mode, or type'
+  secure_directory "$state_root" 700 1 || return
   for name in "${timer_names[@]}"; do
     if [[ -e "$systemd_root/$name" || -L "$systemd_root/$name" ]] || systemctl is-enabled "$name" >/dev/null 2>&1 || systemctl is-active "$name" >/dev/null 2>&1; then
       systemctl disable --now "$name" >/dev/null 2>&1 || return
@@ -827,41 +921,7 @@ restore_transaction() {
     target_value=$(<"$transaction_dir/current-target")
     ln -s "$target_value" "$current" || return
   fi
-  if [[ -f "$transaction_dir/deployed-target" ]]; then
-    target_value=$(<"$transaction_dir/deployed-target")
-    if [[ "$target_value" == absent ]]; then
-      rm -f -- "$deployed_current" || return
-    else
-      if [[ -d "$transaction_dir/deployed" ]]; then
-        secure_directory "$deployed_root" 700 1 || return
-        secure_directory "$deployed_root/$target_value" 700 1 || return
-        for name in policy.conf state.json; do
-          secure_file "$transaction_dir/deployed/$name" 'transaction deployed snapshot backup' || return
-          [[ ! -L "$deployed_root/$target_value/$name" ]] || block 'deployed snapshot restore target is unsafe'
-          install -m 0600 "$transaction_dir/deployed/$name" "$deployed_root/$target_value/$name" || return
-        done
-      fi
-      rm -f -- "$deployed_current" || return
-      ln -s "$target_value" "$deployed_current" || return
-    fi
-  fi
-  if [[ -f "$transaction_dir/deployed-created" ]]; then
-    target_value=$(<"$transaction_dir/deployed-created")
-    [[ $target_value =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'transaction created snapshot name is unsafe'
-    if [[ ! -e $deployed_current && ! -L $deployed_current ]] || [[ $(readlink "$deployed_current" 2>/dev/null) != "$target_value" ]]; then
-      [[ ! -d "$deployed_root/$target_value" || -L "$deployed_root/$target_value" ]] || rm -rf -- "${deployed_root:?}/$target_value"
-    fi
-  fi
-  if [[ -d "$transaction_dir/retained" ]]; then
-    for name in request.conf last-request.conf drained; do
-      [[ ! -L "$state_root/$name" ]] || block 'retained state restore target is unsafe'
-      if [[ -f "$transaction_dir/retained/$name" ]]; then
-        install -m 0600 "$transaction_dir/retained/$name" "$state_root/$name" || return
-      else
-        rm -f -- "$state_root/$name" || return
-      fi
-    done
-  fi
+  restore_adapter_state || return
   systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
     while IFS= read -r name; do
@@ -886,19 +946,26 @@ restore_transaction() {
   sync -f "$systemd_root" 2>/dev/null || block 'restored systemd boundary is not durable'
   rm -rf -- "$transaction_dir" || return
   transaction_dir=
-  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
+  sync -f "$journal_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 recover_interrupted_transaction() {
   local candidates=() candidate
-  [[ -d "$state_root" ]] || return 0
   shopt -s nullglob
-  candidates=("$state_root"/.transaction.*)
+  candidates=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
   ((${#candidates[@]} <= 1)) || block 'multiple interrupted installer transactions require operator recovery'
   ((${#candidates[@]} == 1)) || return 0
   candidate=${candidates[0]}
   [[ ! -L "$candidate" && -d "$candidate" && $(stat -c '%u:%a' "$candidate") == "$expected_uid:700" ]] || block 'interrupted installer transaction is unsafe'
+  transaction_kind=rollback
+  if [[ -e "$candidate/kind" || -L "$candidate/kind" ]]; then
+    secure_file "$candidate/kind" 'transaction kind'
+    transaction_kind=$(<"$candidate/kind")
+    [[ $transaction_kind == convergence || $transaction_kind == rollback ]] || block 'transaction kind is unsafe'
+  elif [[ $candidate == "$transaction_root/"* ]]; then
+    block 'transaction kind is missing'
+  fi
   transaction_dir=$candidate
   if ! rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
     finalize_committed_rollback
@@ -913,7 +980,7 @@ recover_interrupted_transaction() {
 }
 
 finalize_committed_rollback() {
-  local marker=$transaction_dir/application-rollback-committed retired
+  local marker=$transaction_dir/application-rollback-committed retired journal_root=${transaction_dir%/*}
   local final_adapter_path final_adapter_sha final_credential_provider final_credential_ref
   rollback_commit_marker_safe "$marker" || block 'application rollback commit marker is unsafe'
   secure_file "$active_policy" 'active policy' || return
@@ -977,30 +1044,30 @@ PY
   sync -f "$install_root" "$systemd_root" 2>/dev/null || return
   publish_deployed_snapshot "$active_policy" "$state_file" || return
   rm -f "$previous_state" "$previous_policy" || return
-  retired=$state_root/.retired.$$.transaction
+  retired=$journal_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
   transaction_committed=1
   rm -rf -- "$retired"
   # The journal rename and deletion must persist with the finalization, or a
   # reboot can resurrect the committed-rollback transaction and repeat it.
-  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
+  sync -f "$journal_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 commit_transaction() {
-  local retired
+  local retired journal_root=${transaction_dir%/*}
   sync -f "$state_file" "$active_policy" 2>/dev/null || block 'committed host state is not durable'
   sync -f "$state_root" 2>/dev/null || block 'committed host state is not durable'
   sync -f "$install_root" 2>/dev/null || block 'committed install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || block 'committed systemd boundary is not durable'
-  retired=$state_root/.retired.$$.transaction
+  retired=$journal_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
   transaction_dir=
   transaction_committed=1
   rm -rf -- "$retired"
   # The journal rename and deletion must persist with the commit, or a reboot
   # can resurrect the pre-operation transaction and restore stale state.
-  sync -f "$state_root" 2>/dev/null || block 'retired recovery journal is not durable'
+  sync -f "$journal_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 atomic_replace_directory() {
@@ -1225,7 +1292,7 @@ policy_adapter_operation() {
 perform_check() {
   local transactions=()
   shopt -s nullglob
-  transactions=("$state_root"/.transaction.*)
+  transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
   ((${#transactions[@]} == 0)) || block 'interrupted installer transaction requires recovery'
   if active_deployment; then block 'active deployment prevents a consistent check'; fi
@@ -1308,9 +1375,9 @@ PY
   reject_mixed_role
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_root/.install-state.new" "$state_file"
-  # Keep recovery bytes outside the state directory writable by the health adapter.
-  backup_transaction
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
+  restore_adapter_state || die 'candidate health state restoration failed'
+  if ! state_matches || ! current_matches || ! units_match; then die 'candidate health changed installed core state'; fi
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
     publish_deployed_snapshot "$active_policy" "$state_file"
     if [[ -n ${transaction_dir:-} && -d $transaction_dir ]]; then readlink "$deployed_current" >"$transaction_dir/deployed-created"; fi

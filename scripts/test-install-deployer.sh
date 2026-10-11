@@ -135,9 +135,24 @@ if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
   if ((health_calls > FAKE_ADAPTER_FAIL_HEALTH_AFTER)); then
     [[ -z ${FAKE_ADAPTER_DELETE_STATE_ROOT:-} ]] || rm -rf -- "$FAKE_ADAPTER_DELETE_STATE_ROOT"
+    [[ -z ${FAKE_ADAPTER_DELETE_LOG_ROOT:-} ]] || rm -rf -- "$FAKE_ADAPTER_DELETE_LOG_ROOT"
+    if [[ -n ${FAKE_ADAPTER_DIRECTORY_RETAINED:-} ]]; then
+      rm -f "$FAKE_ADAPTER_DIRECTORY_RETAINED"
+      mkdir "$FAKE_ADAPTER_DIRECTORY_RETAINED"
+    fi
+    if [[ -n ${FAKE_ADAPTER_FORGE_ROLLBACK_MARKER:-} ]]; then
+      for transaction in "$CI_FLEET_DEPLOYER_ROOT"/{var/lib,opt}/ci-fleet-deployer/{,.installer-transactions/}.transaction.*; do
+        [[ ! -d "$transaction" ]] || install -m 0600 /dev/null "$transaction/application-rollback-committed"
+      done
+    fi
+    if [[ -n ${FAKE_ADAPTER_HEALTH_READY:-} ]]; then
+      : >"$FAKE_ADAPTER_HEALTH_READY"
+      while [[ ! -e "$FAKE_ADAPTER_HEALTH_READY.release" ]]; do sleep 0.1; done
+    fi
     exit 42
   fi
 fi
+if [[ "$1" == health && -n ${FAKE_ADAPTER_DELETE_DEPLOYED_CURRENT:-} ]]; then rm -rf -- "$FAKE_ADAPTER_DELETE_DEPLOYED_CURRENT"; fi
 if [[ -e "${FAKE_ADAPTER_FAIL:-/nonexistent}" ]]; then
   fail_operation=$(<"$FAKE_ADAPTER_FAIL")
   [[ "$fail_operation" != all && "$fail_operation" != "$1" ]] || exit 42
@@ -597,7 +612,7 @@ transaction_unit=$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service
 FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed' "$installer" --repair --config "$config" >/dev/null
 [[ "$transaction_state" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'failed transaction replaced healthy state'
 [[ "$transaction_unit" == "$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service")" ]] || fail 'failed transaction did not restore units'
-if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'failed transaction left recovery residue'; fi
+if compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null; then fail 'failed transaction left recovery residue'; fi
 
 stale_stage="$root/opt/ci-fleet-deployer/releases/.${core_ref}.staging.interrupted"
 mkdir "$stale_stage"; chmod 0755 "$stale_stage"
@@ -757,9 +772,9 @@ export FAKE_ADAPTER_FAIL_HEALTH_AFTER=$((health_calls_before)) FAKE_SYSTEMCTL_FA
 expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
 unset FAKE_ADAPTER_FAIL_HEALTH_AFTER FAKE_SYSTEMCTL_FAIL_COMMAND
 [[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == $((health_calls_before + 1)) ]] || fail 'repair did not run exactly the candidate health check'
-compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null || fail 'failed restoration deleted its recovery transaction'
+compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null || fail 'failed restoration deleted its recovery transaction'
 expect_success "$installer" --repair --config "$config" >/dev/null
-if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'retry did not recover the retained transaction'; fi
+if compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null; then fail 'retry did not recover the retained transaction'; fi
 
 old_state=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
 new_image='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
@@ -870,10 +885,78 @@ FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DELETE_STATE_RO
 [[ $(sha256sum "$completed_request") == "$completed_request_before" ]] || fail 'state-deleting candidate health removed the completed request'
 [[ $(sha256sum "$root/var/lib/ci-fleet-deployer/request.conf") == "$pending_request_before" ]] || fail 'state-deleting candidate health removed the pending request'
 [[ $(stat -c '%a' "$root/var/lib/ci-fleet-deployer/drained") == 600 ]] || fail 'state-deleting candidate health removed protected drain state'
-compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null && fail 'state-deleting candidate health left an unrecovered transaction'
+compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null && fail 'state-deleting candidate health left an unrecovered transaction'
 rm "$root/var/lib/ci-fleet-deployer/drained" "$root/var/lib/ci-fleet-deployer/request.conf"
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
+
+# Candidate health must retain all previously consumed approvals and audit history.
+ledger=$root/var/log/ci-fleet-deployer/consumed-requests
+install -d -m 0700 "$ledger"
+for id in $(printf '%064d' 1) $(printf '%064d' 2); do install -m 0600 /dev/null "$ledger/$id"; done
+printf 'retained audit history\n' >"$root/var/log/ci-fleet-deployer/audit.log"
+chmod 0600 "$root/var/log/ci-fleet-deployer/audit.log"
+ledger_before=$(find "$ledger" -type f -printf '%f %m %s\n' | sort)
+audit_before=$(sha256sum "$root/var/log/ci-fleet-deployer/audit.log")
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DELETE_LOG_ROOT=$root/var/log/ci-fleet-deployer \
+  expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$ledger" && $(find "$ledger" -type f -printf '%f %m %s\n' | sort) == "$ledger_before" ]] || fail 'candidate health lost historical consumed approvals'
+[[ $(sha256sum "$root/var/log/ci-fleet-deployer/audit.log") == "$audit_before" ]] || fail 'candidate health lost audit history'
+expect_success "$installer" --repair --config "$config" >/dev/null
+
+# Success from health cannot publish the candidate as an undeployed rollback point.
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+FAKE_ADAPTER_DELETE_DEPLOYED_CURRENT=$root/var/lib/ci-fleet-deployer/deployed \
+  expect_success "$installer" --repair --config "$config" >/dev/null
+[[ $(readlink "$root/var/lib/ci-fleet-deployer/deployed/current") == "$deployed_pointer_before" ]] || fail 'successful candidate health replaced the incumbent pointer'
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/deployed/$deployed_pointer_before/"{policy.conf,state.json}) == "$deployed_files_before" ]] || fail 'successful candidate health replaced the incumbent snapshot'
+
+# Unsafe retained restore targets must keep the journal available for a retry.
+for retained in request.conf last-request.conf drained; do
+  install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/$retained"
+  retained_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/$retained")
+  printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+  health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+  FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DIRECTORY_RETAINED=$root/var/lib/ci-fleet-deployer/$retained \
+    expect_failure 'retained state restore target is unsafe' "$installer" --repair --config "$config" >/dev/null
+  [[ -d "$root/var/lib/ci-fleet-deployer/$retained" ]] || fail 'directory restore target was changed'
+  compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null || fail 'unsafe retained target retired the journal'
+  rmdir "$root/var/lib/ci-fleet-deployer/$retained"
+  expect_success "$installer" --repair --config "$config" >/dev/null
+  [[ $(sha256sum "$root/var/lib/ci-fleet-deployer/$retained") == "$retained_before" ]] || fail 'retained target retry lost backup bytes'
+  [[ $retained == last-request.conf ]] || rm "$root/var/lib/ci-fleet-deployer/$retained"
+done
+
+# A health adapter has no authority to commit an application rollback.
+installed_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_FORGE_ROLLBACK_MARKER=1 \
+  expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$installed_state_before" ]] || fail 'health rollback marker committed the candidate'
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || fail 'health rollback marker removed retained rollback state'
+expect_success "$installer" --repair --config "$config" >/dev/null
+
+# Process loss after state deletion must leave durable recovery outside writable state.
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer \
+  FAKE_ADAPTER_HEALTH_READY=$tmp/health-ready "$installer" --repair --config "$config" >"$tmp/killed-installer.log" 2>&1 &
+killed_installer=$!
+for ((attempt=0; attempt<200; attempt++)); do [[ ! -e "$tmp/health-ready" ]] || break; sleep 0.1; done
+[[ -e "$tmp/health-ready" ]] || fail 'candidate health did not reach process-loss boundary'
+kill -KILL "$killed_installer"
+wait "$killed_installer" 2>/dev/null || true
+: >"$tmp/health-ready.release"
+expect_failure 'interrupted installer transaction requires recovery' "$runtime" health >/dev/null
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+[[ $(readlink "$root/var/lib/ci-fleet-deployer/deployed/current") == "$deployed_pointer_before" ]] || fail 'process-loss recovery lost incumbent pointer'
+[[ $(sha256sum "$completed_request") == "$completed_request_before" ]] || fail 'process-loss recovery lost completed request'
+[[ $(find "$ledger" -type f -printf '%f %m %s\n' | sort) == "$ledger_before" ]] || fail 'process-loss recovery lost historical approvals'
+rm -rf "$ledger" "$root/var/log/ci-fleet-deployer/audit.log"
 
 available_check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid completed marker was not reported rollback_available=yes'
@@ -1030,7 +1113,7 @@ PY
 if [[ -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]]; then lkg_before_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); else lkg_before_digest=absent; fi
 expect_failure 'deployed rollback adapter digest does not match its snapshot policy' "$installer" --upgrade --config "$config" >/dev/null
 lkg_after_digest=absent; [[ ! -f "$root/var/lib/ci-fleet-deployer/last-known-good.json" ]] || lkg_after_digest=$(sha256sum "$root/var/lib/ci-fleet-deployer/last-known-good.json"); [[ $lkg_before_digest == "$lkg_after_digest" ]] || fail 'digest-mismatched deployed pair replaced last-known-good'
-if compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null; then fail 'blocked digest promotion left a recovery transaction'; fi
+if compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null; then fail 'blocked digest promotion left a recovery transaction'; fi
 # Rollback intentionally publishes the retained pair over the unusable
 # incumbent snapshot: the drifted deployed pair is retired, never promoted.
 rollback=$(expect_success "$installer" --rollback --config "$config")

@@ -13,6 +13,7 @@ root_path() { printf '%s%s' "$root" "$1"; }
 config=${CI_FLEET_DEPLOYER_CONFIG:-$(root_path /var/lib/ci-fleet-deployer/active-policy.conf)}
 request=${CI_FLEET_DEPLOYER_REQUEST:-$(root_path /var/lib/ci-fleet-deployer/request.conf)}
 state_root=$(root_path /var/lib/ci-fleet-deployer)
+transaction_root=$(root_path /opt/ci-fleet-deployer/.installer-transactions)
 log_root=$(root_path /var/log/ci-fleet-deployer)
 lock_dir=$(root_path /var/lock/ci-fleet-deployer)
 evidence_dir=$(root_path /etc/ci-fleet-deployer/evidence)
@@ -279,7 +280,6 @@ validate_credential() {
   esac
 }
 
-secure_directory "$state_root" 'deployer state directory'
 secure_directory "$lock_dir" 'deployer lock directory'
 if [[ -z ${CI_FLEET_DEPLOYER_REEXEC:-} ]]; then
   exec 9<"$lock_dir"
@@ -291,9 +291,10 @@ else
   flock -n 9 || die 'another deployer operation is running'
 fi
 shopt -s nullglob
-transactions=("$state_root"/.transaction.*)
+transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
 shopt -u nullglob
 ((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
+secure_directory "$state_root" 'deployer state directory'
 
 if [[ "$operation" == drain ]]; then
   [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'

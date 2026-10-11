@@ -299,6 +299,8 @@ REPORT action=install result=CHANGED environment=staging target=example-staging 
 
 ## Failure recovery
 
+New installer journals live in `/opt/ci-fleet-deployer/.installer-transactions`, outside the application-writable state and log directories. They retain the incumbent core, deployed snapshot, pending/completed requests, drain marker, consumed-approval ledger, and audit history. Candidate health preserves that incumbent snapshot even when health succeeds. Recovery also recognizes older journals under `/var/lib/ci-fleet-deployer`. Runtime refuses work until an interrupted installer journal is recovered. Only a rollback transaction can honor an application rollback commit marker.
+
 1. Do not delete the lock, state, or current release blindly.
 2. Confirm whether `/var/lib/ci-fleet-deployer/active-operation` names a live process.
 3. If live, wait or follow the application adapter's documented bounded recovery. Never interrupt an unknown deployment to force an upgrade.
