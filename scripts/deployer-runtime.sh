@@ -53,6 +53,7 @@ restore_encoded_file() {
 restore_consumed_requests() {
   local id entry
   local -a entries=()
+  [[ -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" && $(stat -c '%u:%a' "$log_root") == "$expected_uid:700" ]] || return 1
   if [[ -e $consumed_root || -L $consumed_root ]]; then
     [[ -d $consumed_root && ! -L $consumed_root ]] || return 1
     chown "$expected_uid" "$consumed_root" || return
@@ -117,7 +118,7 @@ deploy_exit() {
     fi
     [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]] || { status=1; state_root_safe=0; }
   fi
-  if [[ ${audit_pending:-0} == 1 ]]; then
+  if [[ ${audit_pending:-0} == 1 && -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" ]]; then
     if [[ -d "$log_root" && ! -L "$log_root" ]]; then
       chown "$expected_uid" "$log_root" 2>/dev/null || status=1
       chmod 0700 "$log_root" 2>/dev/null || status=1
@@ -153,7 +154,8 @@ deploy_exit() {
         "${audit_phase:-post-consumption}" "$recorded_status" >&8 || status=1
     fi
     sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || status=1
-
+  elif [[ ${audit_pending:-0} == 1 ]]; then
+    status=1
   fi
   if [[ ${application_changed:-0} == 1 && ${snapshot_pointer:-} != "$deployed_current" ]]; then
     publish_deployed_backup 2>/dev/null || { rm -f -- "$deployed_current"; status=1; }

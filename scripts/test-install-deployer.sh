@@ -292,6 +292,10 @@ if [[ "$1" == deploy && -n ${FAKE_ADAPTER_REPLACE_RUNTIME_TARGET:-} ]]; then
   rm -f -- "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
   mkdir "$FAKE_ADAPTER_REPLACE_RUNTIME_TARGET"
 fi
+if [[ "$1" == deploy && -n ${FAKE_ADAPTER_REDIRECT_LOG_ROOT:-} ]]; then
+  mv "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer" "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer.saved"
+  ln -s "$FAKE_ADAPTER_REDIRECT_LOG_ROOT" "$CI_FLEET_DEPLOYER_ROOT/var/log/ci-fleet-deployer"
+fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_INJECT_COMPLETED_REQUEST:-} ]]; then
   install -m 0600 "$CI_FLEET_DEPLOYER_REQUEST" "$CI_FLEET_DEPLOYER_ROOT/var/lib/ci-fleet-deployer/last-request.conf"
 fi
@@ -2340,6 +2344,21 @@ PYTEST
     fi
   done
 done
+
+# Recovery never cleans or appends through an adapter-redirected log parent.
+runtime_request
+unrelated_logs=$tmp/unrelated-logs
+mkdir -m 0700 "$unrelated_logs" "$unrelated_logs/consumed-requests"
+printf 'unrelated-audit\n' >"$unrelated_logs/audit.log"
+printf 'unrelated-ledger\n' >"$unrelated_logs/consumed-requests/keep"
+chmod 0644 "$unrelated_logs/audit.log" "$unrelated_logs/consumed-requests/keep"
+unrelated_before=$(find "$unrelated_logs" -type f -exec sha256sum {} +)
+: >"$tmp/runtime-fail"
+FAKE_ADAPTER_REDIRECT_LOG_ROOT=$unrelated_logs FAKE_ADAPTER_FAIL_AFTER_MUTATION=$tmp/runtime-fail   expect_failure 'deployment adapter failed' "$runtime" deploy >/dev/null
+[[ $(find "$unrelated_logs" -type f -exec sha256sum {} +) == "$unrelated_before" ]] || fail 'runtime recovery modified a redirected audit or ledger'
+[[ $(stat -c %a "$unrelated_logs/audit.log") == 644 && $(stat -c %a "$unrelated_logs/consumed-requests/keep") == 644 ]] || fail 'runtime recovery changed redirected file metadata'
+rm "$root/var/log/ci-fleet-deployer"
+mv "$root/var/log/ci-fleet-deployer.saved" "$root/var/log/ci-fleet-deployer"
 
 runtime_request
 last_request=$root/var/lib/ci-fleet-deployer/last-request.conf
