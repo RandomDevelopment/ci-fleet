@@ -66,6 +66,7 @@ if run --install --ref "$first" >/dev/null 2>&1; then
 fi
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
 for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer; do
+  mkdir -p "$(dirname "$root$marker")"
   ln -s /missing "$root$marker"
   if run --install --ref "$first" >/dev/null 2>&1; then
     echo "tester role marker was accepted by the status receiver" >&2; exit 1
