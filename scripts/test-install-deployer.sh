@@ -1970,6 +1970,7 @@ python3 - "$root/var/log/ci-fleet-deployer/audit.log" "$audit_prefix_before" <<'
 import base64, pathlib, sys
 raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes().startswith(base64.b64decode(sys.argv[2])) else 1)
 PY
+grep -Eq 'approval=audit-state-delete-attempt .*result=failed phase=adapter status=42$' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'audit-prefix recovery lost the terminal adapter failure record'
 
 # Bytes substituted into the live checkout after review must never reach a staged release.
 cp "$runtime" "$tmp/runtime.saved"

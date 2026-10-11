@@ -111,7 +111,8 @@ deploy_exit() {
       chown "$expected_uid" "$audit_log" 2>/dev/null || status=1
       chmod 0600 "$audit_log" 2>/dev/null || status=1
     fi
-    if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]]; then
+    if [[ ! -e "$audit_log" || $(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null) != $(stat -c '%d:%i' "$audit_log" 2>/dev/null) ]] ||
+       [[ -n ${audit_prefix_sha:-} && $(sha256sum "$audit_log" 2>/dev/null | cut -d' ' -f1) != "$audit_prefix_sha" ]]; then
       rm -f -- "$audit_log"
       if [[ -n ${audit_prefix_backup:-} ]]; then
         restore_encoded_file "$audit_log" "$audit_prefix_backup" 2>/dev/null || status=1
