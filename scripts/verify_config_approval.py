@@ -92,12 +92,15 @@ class GitHub:
         self.opener = urllib.request.build_opener(NoRedirect())
         self.deadline = time.monotonic() + 120
 
-    def get(self, path: str) -> Any:
-        require(path.startswith("/repos/") and not path.startswith("//"), "invalid GitHub API path")
-        request = urllib.request.Request("https://api.github.com" + path, headers={
+    def get(self, path: str, query: str | None = None) -> Any:
+        require((query is None and path.startswith("/repos/") and not path.startswith("//"))
+                or (query is not None and path == "/graphql"), "invalid GitHub API path")
+        request = urllib.request.Request("https://api.github.com" + path,
+                                        data=None if query is None else json.dumps({"query": query}).encode(), headers={
             "Authorization": "Bearer " + self.token,
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
         })
         try:
             remaining = self.deadline - time.monotonic()
@@ -123,6 +126,34 @@ class GitHub:
             if len(result) < 100:
                 return items
         raise Rejected("GitHub API pagination limit reached")
+
+    def latest_base_change(self, repository: str, number: int) -> datetime | None:
+        owner, name = repository.split("/")
+        cursor = None
+        latest = None
+        for _ in range(20):
+            query = '''query { repository(owner: %s, name: %s) { pullRequest(number: %d) {
+                timelineItems(first: 100, after: %s, itemTypes: [BASE_REF_CHANGED_EVENT]) {
+                    nodes { ... on BaseRefChangedEvent { createdAt } }
+                    pageInfo { hasNextPage endCursor }
+                }
+            } } }''' % (json.dumps(owner), json.dumps(name), number, json.dumps(cursor))
+            result = self.get("/graphql", query)
+            require(isinstance(result, dict) and not result.get("errors"), "PR base history is unavailable")
+            timeline = result["data"]["repository"]["pullRequest"]["timelineItems"]
+            nodes = timeline["nodes"]
+            require(isinstance(nodes, list) and len(nodes) <= 100, "invalid PR base history")
+            for node in nodes:
+                changed = evidence_timestamp(node["createdAt"])
+                latest = changed if latest is None else max(latest, changed)
+            page = timeline["pageInfo"]
+            require(type(page.get("hasNextPage")) is bool, "incomplete PR base history")
+            if not page["hasNextPage"]:
+                return latest
+            following = page.get("endCursor")
+            require(isinstance(following, str) and bool(following) and following != cursor, "invalid PR base history cursor")
+            cursor = following
+        raise Rejected("PR base history pagination limit reached")
 
 
 def evidence_timestamp(timestamp: Any) -> datetime:
@@ -196,7 +227,9 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
             if previous is None or order > review_order(previous, head):
                 latest[reviewer] = review
     require(not any(review["state"] == "CHANGES_REQUESTED" for review in latest.values()), "trusted reviewer requested changes")
+    base_changed = api.latest_base_change(repository, number)
     require(any(reviewer != author_id and review["state"] == "APPROVED" and review.get("commit_id") == head
+                and (base_changed is None or evidence_timestamp(review.get("submitted_at")) > base_changed)
                 for reviewer, review in latest.items()), "independent exact-head approval is missing")
     runs = api.pages(f"{prefix}/actions/workflows/{policy['workflow_id']}/runs?head_sha={commit}&event=push", "workflow_runs")
     require(bool(runs) and all(positive_id(run.get("id")) for run in runs), "exact-commit workflow is missing")

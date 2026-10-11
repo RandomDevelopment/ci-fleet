@@ -53,6 +53,8 @@ adapter's resume action, the trusted verifier requires all of the following:
    formal review on that full head SHA. The reviewer's latest decision applies;
    dismissed or stale approvals do not count, and an outstanding trusted
    `CHANGES_REQUESTED` decision blocks acceptance. Comments do not grant approval.
+   The review must follow any base-branch retargeting. Unavailable or incomplete
+   PR base history rejects the candidate.
 4. The latest push run of the pinned workflow on the applied SHA completed
    successfully for the trusted repository and branch. Each required named job
    also completed successfully in that exact run attempt. Skipped, failed,

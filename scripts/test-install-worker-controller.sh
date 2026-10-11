@@ -1277,7 +1277,7 @@ set -e
 [[ "$timeout_status" != 124 ]] || fail 'outer policy command stole the nested drain timeout status'
 grep -Fq 'drain|2' "$FAKE_TIMEOUT_LOG" || fail "nested drain did not return its ordinary failure before the outer deadline: $(<"$FAKE_TIMEOUT_LOG")"
 [[ ! -f "$FAKE_PAUSED_STATE" ]] || fail 'nested drain timeout returned with the controller paused'
-unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE FAKE_RELEASE_RUNNER_AFTER_DRAIN
+unset FAKE_KEEP_RUNNER_ON_PAUSE FAKE_RUNNER_STATE FAKE_RELEASE_RUNNER_AFTER_DRAIN CI_FLEET_COMMAND_TIMEOUT_SECONDS
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 # A failure after resume must still run one bounded rollback-drain.

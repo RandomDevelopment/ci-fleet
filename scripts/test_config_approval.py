@@ -33,6 +33,9 @@ POLICY = {
 
 def evidence() -> dict:
     return {
+        "/graphql": {"data": {"repository": {"pullRequest": {"timelineItems": {
+            "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}},
         PREFIX: {"id": 101, "full_name": REPOSITORY, "default_branch": "main"},
         f"{PREFIX}/git/commits/{COMMIT}": {"sha": COMMIT, "tree": {"sha": TREE}, "parents": [{"sha": PARENT}]},
         f"{PREFIX}/git/commits/{HEAD}": {"sha": HEAD, "tree": {"sha": TREE}},
@@ -58,7 +61,7 @@ class FixtureAPI(GitHub):
         self.data = data
         self.paths: list[str] = []
 
-    def get(self, path: str):
+    def get(self, path: str, query: str | None = None):
         self.paths.append(path)
         url = urllib.parse.urlsplit(path)
         query = urllib.parse.parse_qs(url.query)
@@ -71,6 +74,35 @@ class FixtureAPI(GitHub):
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_retargeting_requires_a_new_approval_in_the_main_branch_context(self):
+        data = evidence()
+        nodes = data["/graphql"]["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        nodes.append({"createdAt": "2026-01-01T00:01:00Z"})
+        with self.assertRaises(Rejected):
+            verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        data[f"{PREFIX}/pulls/8/reviews"][0]["submitted_at"] = "2026-01-01T00:02:00Z"
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        nodes.append({"createdAt": "2026-01-01T00:02:00Z"})
+        with self.assertRaises(Rejected):
+            verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+
+    def test_base_history_pagination_and_api_errors_fail_closed(self):
+        first = evidence()["/graphql"]
+        timeline = first["data"]["repository"]["pullRequest"]["timelineItems"]
+        timeline["pageInfo"].update(hasNextPage=True, endCursor="fixture-cursor")
+        last = evidence()["/graphql"]
+        last["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = [{"createdAt": "2026-01-01T00:01:00Z"}]
+        api = GitHub("fixture-authentication")
+        with patch.object(api, "get", side_effect=[first, last]) as getter:
+            self.assertEqual(api.latest_base_change(REPOSITORY, 8).isoformat(), "2026-01-01T00:01:00+00:00")
+            self.assertIn('after: "fixture-cursor"', getter.call_args.args[1])
+        with patch.object(api, "get", return_value=first):
+            with self.assertRaises(Rejected):
+                api.latest_base_change(REPOSITORY, 8)
+        with patch.object(api, "get", return_value={"errors": [{"message": "unavailable"}]}):
+            with self.assertRaises(Rejected):
+                api.latest_base_change(REPOSITORY, 8)
+
     def test_squash_tree_equivalence_and_exact_applied_commit_checks(self):
         api = FixtureAPI(evidence())
         verify(api, POLICY, REPOSITORY, COMMIT, TREE)
