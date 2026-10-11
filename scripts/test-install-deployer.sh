@@ -67,6 +67,22 @@ case "${1:-}" in
       printf 'active\n'
     fi
     ;;
+  show)
+    [[ -z ${FAKE_ADAPTER_STATUS_ERROR:-} ]] || exit 1
+    if [[ -e "$root/var/lib/ci-fleet-deployer/unit-${2:-}" || -e "$TMPDIR/transient-${2:-}" ]]; then printf 'active\n'; else printf 'inactive\n'; fi
+    ;;
+  stop)
+    if [[ ${2:-} == ci-fleet-deployer-adapter-* ]]; then
+      [[ -z ${FAKE_ADAPTER_STOP_FAIL:-} ]] || exit 1
+      if [[ -e "$TMPDIR/transient-${2:-}" ]]; then
+        shopt -s nullglob
+        guards=("$root/opt/ci-fleet-deployer/.installer-transactions/".transaction.*/adapter-unit)
+        [[ ${#guards[@]} == 1 && -f ${guards[0]} ]] || exit 52
+        printf '%s\n' "${2:-}" >>"${FAKE_SANDBOX_LOG:?}.stopped"
+        rm -f "$TMPDIR/transient-${2:-}"
+      fi
+    fi
+    ;;
   enable)
     shift
     runtime_flag=0
@@ -114,9 +130,11 @@ EOF
 cat >"$fake_bin/systemd-run" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-readonly_paths= writable_paths= caps= duration= kill_mode= no_privileges= strict=
+readonly_paths= writable_paths= caps= duration= kill_mode= no_privileges= strict= verified_bind= unit=
 while (($#)); do
   case "$1" in
+    --unit=*) unit=${1#--unit=} ;;
+    --property=BindReadOnlyPaths=*) verified_bind=${1#--property=BindReadOnlyPaths=} ;;
     --property=ReadOnlyPaths=*) readonly_paths=${1#--property=ReadOnlyPaths=} ;;
     --property=ReadWritePaths=*) writable_paths=${1#--property=ReadWritePaths=} ;;
     --property=CapabilityBoundingSet=*) caps=${1#--property=CapabilityBoundingSet=} ;;
@@ -135,7 +153,18 @@ done
 for writable_path in $writable_paths; do
   [[ $writable_path == /run/docker.sock || $writable_path == "$CI_FLEET_DEPLOYER_ROOT/opt/ci-fleet-deployer/.installer-transactions/.transaction."*/commit ]] || exit 51
 done
-printf '%s|%s\n' "$readonly_paths" "$writable_paths" >>"${FAKE_SANDBOX_LOG:?}"
+[[ ${verified_bind%%:*} =~ ^/proc/[0-9]+/fd/7$ ]] || exit 53
+[[ ${verified_bind#*:} == "$CI_FLEET_DEPLOYER_ROOT/etc/ci-fleet-deployer/adapters/"* ]] || exit 54
+[[ ${@: -2:1} == "${verified_bind#*:}" ]] || exit 55
+cmp -s "${verified_bind%%:*}" "${verified_bind#*:}" || exit 56
+printf '%s|%s|%s\n' "$readonly_paths" "$writable_paths" "$verified_bind" >>"${FAKE_SANDBOX_LOG:?}"
+if [[ ${FAKE_SANDBOX_INTERRUPT_OPERATION:-} == "${!#}" ]]; then
+  : >"$TMPDIR/transient-$unit"
+  installer_pid=${unit#ci-fleet-deployer-adapter-}
+  installer_pid=${installer_pid%%-*}
+  kill -TERM "$installer_pid"
+  exit 0
+fi
 exec "$@"
 EOF
 chmod 0755 "$fake_bin"/*
@@ -987,7 +1016,37 @@ busy_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.jso
 expect_failure 'adapter service is still active' "$installer" --repair --config "$config" >/dev/null
 [[ -d "$busy" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$busy_state_before" ]] || fail 'active adapter did not block recovery'
 rm "$root/var/lib/ci-fleet-deployer/unit-ci-fleet-deployer-adapter-999-1.service"
+FAKE_ADAPTER_STATUS_ERROR=1 expect_failure 'status is unknown' "$installer" --repair --config "$config" >/dev/null
+[[ -d "$busy" ]] || fail 'failed adapter status query retired its journal'
 expect_success "$installer" --repair --config "$config" >/dev/null
+
+# EXIT must prove manager-owned adapters stopped before it restores or retires a journal.
+for interruption in stopped still-active status-error; do
+  printf '# interrupted-adapter-%s\n' "$interruption" >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+  unit_before=$(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service")
+  export CI_FLEET_DEPLOYER_TEST_SANDBOX=1 FAKE_SANDBOX_INTERRUPT_OPERATION=health
+  case "$interruption" in
+    still-active) export FAKE_ADAPTER_STOP_FAIL=1 ;;
+    status-error) export FAKE_ADAPTER_STATUS_ERROR=1 ;;
+  esac
+  if "$installer" --repair --config "$config" >"$tmp/adapter-interrupted.log" 2>&1; then fail 'interrupted installer succeeded'; fi
+  unset CI_FLEET_DEPLOYER_TEST_SANDBOX FAKE_SANDBOX_INTERRUPT_OPERATION FAKE_ADAPTER_STOP_FAIL FAKE_ADAPTER_STATUS_ERROR
+  shopt -s nullglob
+  journals=("$root/opt/ci-fleet-deployer/.installer-transactions/".transaction.*)
+  shopt -u nullglob
+  if [[ $interruption == stopped ]]; then
+    [[ ${#journals[@]} == 0 && $(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service") == "$unit_before" ]] || fail 'EXIT did not stop the adapter before restoring the journal'
+    [[ -s "$FAKE_SANDBOX_LOG.stopped" ]] || fail 'EXIT skipped transient-unit shutdown'
+  else
+    [[ ${#journals[@]} == 1 ]] || fail 'unproved adapter termination retired its journal'
+    grep -Fq 'adapter termination could not be verified' "$tmp/adapter-interrupted.log" || fail 'unknown adapter termination lacked a diagnostic'
+    [[ $(sha256sum "$root/etc/systemd/system/ci-fleet-deployer.service") != "$unit_before" ]] || fail 'EXIT restored core while adapter termination was unproved'
+    pending_unit=$(<"${journals[0]}/adapter-unit")
+    rm -f "$TMPDIR/transient-$pending_unit"
+  fi
+  expect_success "$installer" --repair --config "$config" >/dev/null
+  expect_success "$installer" --check --config "$config" >/dev/null
+done
 
 # Success from health cannot publish the candidate as an undeployed rollback point.
 printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"

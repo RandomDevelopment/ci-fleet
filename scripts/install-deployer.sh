@@ -25,6 +25,7 @@ transaction_committed=0
 transaction_kind=convergence
 rollback_commit_file=
 recovered_rollback=0
+active_adapter_unit=
 backup_transaction() {
   local path relative
   rollback_transaction_backup=
@@ -58,14 +59,19 @@ rollback_commit_marker_uncommitted() {
 }
 on_exit() {
   local status=$? recovery_status=0
-  if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
+  if [[ -n ${active_adapter_unit:-} ]] && ! stop_adapter_unit "$active_adapter_unit"; then
+    recovery_status=1
+    status=1
+    printf 'ERROR: adapter termination could not be verified; retain the journal before recovery\n' >&2
+  fi
+  if ((recovery_status == 0)) && [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
     if restore_state_directory "$state_root"; then
       if ! { rm -rf -- "$transaction_dir" && restore_transaction_backup; }; then recovery_status=1; fi
     else
       recovery_status=1
     fi
   fi
-  if [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
+  if ((recovery_status == 0)) && [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
     rm -rf -- "$transaction_dir"
     transaction_dir=
   elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
@@ -997,9 +1003,7 @@ recover_interrupted_transaction() {
     local pending_unit
     pending_unit=$(<"$candidate/adapter-unit")
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
-    if [[ $(systemctl is-active "$pending_unit" 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
-      block 'adapter service is still active; retain the journal until it stops'
-    fi
+    adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
   fi
   local candidate_marker=$candidate/application-rollback-committed
   if [[ -e "$candidate/commit" || -L "$candidate/commit" ]]; then
@@ -1279,6 +1283,20 @@ adapter_deadline() {
   printf '%s' "$seconds"
 }
 
+adapter_unit_inactive() {
+  local unit=$1 state
+  [[ $unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || return 1
+  state=$(timeout --signal=TERM --kill-after=5s 10s systemctl show "$unit" --property=ActiveState --value 2>/dev/null) || return 1
+  [[ $state == inactive || $state == failed ]]
+}
+
+stop_adapter_unit() {
+  local unit=$1
+  [[ $unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || return 1
+  timeout --signal=TERM --kill-after=5s 15s systemctl stop "$unit" >/dev/null 2>&1 || true
+  adapter_unit_inactive "$unit"
+}
+
 run_adapter() {
   local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds status unit
   local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root $policy"
@@ -1290,6 +1308,7 @@ run_adapter() {
   fi
   if [[ $testing != 1 || ${CI_FLEET_DEPLOYER_TEST_SANDBOX:-0} == 1 ]]; then
     unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
+    active_adapter_unit=$unit
     if [[ -n ${transaction_dir:-} ]]; then
       printf '%s\n' "$unit" >"$transaction_dir/adapter-unit"
       chmod 0600 "$transaction_dir/adapter-unit"
@@ -1303,6 +1322,7 @@ run_adapter() {
       --property='CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE'
       --property="ReadOnlyPaths=$readonly_paths"
       --property="ReadWritePaths=$writable_paths"
+      --property="BindReadOnlyPaths=/proc/$$/fd/7:$adapter_path"
       --property="RuntimeMaxSec=${seconds}s" --property=TimeoutStopSec=10s --property=KillMode=control-group)
     if [[ -n "$marker" ]]; then
       inhibitor=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback is active' --)
@@ -1310,16 +1330,14 @@ run_adapter() {
     seconds=$((seconds + 20))
   fi
   if timeout --signal=TERM --kill-after=10s "${seconds}s" "${inhibitor[@]}" "${sandbox[@]}" "${guard[@]}" env "${adapter_env[@]}" "$adapter_path" "$operation_name" 8>&- 9<&-; then
+    active_adapter_unit=
     return 0
   else
     status=$?
   fi
   if [[ -n ${unit:-} ]]; then
-    timeout --signal=TERM --kill-after=5s 15s systemctl stop "$unit" >/dev/null 2>&1 || true
-    if [[ $(systemctl is-active "$unit" 2>/dev/null || true) =~ ^(active|activating|deactivating|reloading)$ ]]; then
-      transaction_committed=1
-      block 'adapter service is still active; retain the journal until it stops'
-    fi
+    stop_adapter_unit "$unit" || block 'adapter termination could not be verified; retain the journal until it stops'
+    active_adapter_unit=
   fi
   return "$status"
 }
@@ -1329,7 +1347,10 @@ run_verified_adapter() {
   secure_file "$path" "$operation_name adapter" 700
   exec 7<"$path"
   [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "$digest" ]] || die "$operation_name adapter digest mismatch"
-  run_adapter "$policy" "/proc/$$/fd/7" "$operation_name" "$marker"
+  if [[ $testing == 1 && ${CI_FLEET_DEPLOYER_TEST_SANDBOX:-0} != 1 ]]; then
+    path=/proc/$$/fd/7
+  fi
+  run_adapter "$policy" "$path" "$operation_name" "$marker"
 }
 
 policy_adapter_operation() {
