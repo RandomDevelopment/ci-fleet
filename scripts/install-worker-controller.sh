@@ -2382,8 +2382,13 @@ fi
 # both flock this shared path for their whole mutating run.
 role_lock=$(root_path /run/ci-fleet-role-admission.lock)
 install -d -m 0755 "$(dirname "$role_lock")"
-exec 8>"$role_lock"
-flock -n 8 || die 'another ci-fleet role installation is already running'
+if [[ ${CI_FLEET_ROLE_ADMISSION_LOCK_FD:-} == 8 && -e /proc/$$/fd/8 && $(readlink -f /proc/$$/fd/8) == "$role_lock" ]]; then
+  flock -n 8 || die 'another ci-fleet role installation is already running'
+else
+  exec 8>"$role_lock"
+  flock -n 8 || die 'another ci-fleet role installation is already running'
+fi
+export CI_FLEET_ROLE_ADMISSION_LOCK_FD=8
 export CI_FLEET_INSTALLER_LOCK_FD=9
 if [[ "$mode" == policy-action ]]; then
   perform_policy_action
