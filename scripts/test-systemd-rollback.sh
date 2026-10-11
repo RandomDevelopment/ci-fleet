@@ -13,6 +13,8 @@ optional_unit_names=(ci-fleet-reconcile.service ci-fleet-reconcile.timer)
 staging_paths=()
 reconcile_unit=ci-fleet-reconcile.service
 calls=$tmp/systemctl.log
+lock_file=$tmp/installer.lock
+deferred_command=()
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
@@ -29,6 +31,26 @@ install() {
 mv() {
   [[ -z ${fail_move_unit:-} || ${*: -1} != "$systemd_dir/$fail_move_unit" ]] || return 42
   command mv "$@"
+}
+systemd-run() {
+  [[ " $* " == *' --property=After=ci-fleet-reconcile.service '* ]] || fail 'deferred restore is not ordered after reconciliation'
+  [[ ${fail_dispatch:-false} != true ]] || return 1
+  while [[ "$1" != /bin/bash ]]; do shift; done
+  deferred_command=("$@")
+}
+
+complete_deferred() {
+  [[ ${#deferred_command[@]} != 0 ]] || fail 'no deferred restoration was queued'
+  modeled_service_state=inactive model_running_service=false
+  if [[ -f "$checkpoint_dir/systemd/$reconcile_unit" ]]; then
+    cp "$checkpoint_dir/systemd/$reconcile_unit" "$expected_dir/$reconcile_unit"
+  else
+    rm -f "$expected_dir/$reconcile_unit"
+  fi
+  local environment=$tmp/deferred-env
+  declare -p tmp systemd_dir expected_dir calls unit_names optional_unit_names reconcile_unit modeled_service_state model_running_service fail_reload fail_show fail_timer >"$environment"
+  declare -f systemctl fail >>"$environment"
+  BASH_ENV="$environment" "${deferred_command[@]}"
 }
 
 systemctl() {
@@ -81,8 +103,9 @@ reset_fixture() {
   rm -rf "$systemd_dir" "$checkpoint_dir" "$expected_dir" "$tmp/enabled" "$tmp/active"
   mkdir -p "$systemd_dir" "$checkpoint_dir/systemd" "$expected_dir" "$tmp/enabled" "$tmp/active"
   : >"$calls"
-  fail_install_unit='' fail_move_unit='' fail_timer='' fail_reload=false fail_show=false
+  fail_install_unit='' fail_move_unit='' fail_timer='' fail_reload=false fail_show=false fail_dispatch=false
   staging_paths=()
+  deferred_command=()
   modeled_service_state=activating model_running_service=true
   local unit
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
@@ -91,6 +114,7 @@ reset_fixture() {
     cp "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit"
     printf '\n# candidate definition\n' >>"$systemd_dir/$unit"
   done
+  cp "$systemd_dir/$reconcile_unit" "$expected_dir/$reconcile_unit"
   printf '%s\n' ci-fleet-cleanup.timer ci-fleet-reconcile.timer >"$checkpoint_dir/enabled-timers"
   printf '%s\n' ci-fleet-drift.timer ci-fleet-reconcile.timer >"$checkpoint_dir/active-timers"
   : >"$tmp/enabled/ci-fleet-health.timer"
@@ -99,7 +123,8 @@ reset_fixture() {
 
 reset_fixture
 restore_systemd_snapshot || fail 'checkpoint restoration failed'
-[[ ${#staging_paths[@]} == 1 ]] || fail 'staged units were not registered for cleanup'
+[[ ${#staging_paths[@]} == 0 && -d ${deferred_command[2]} ]] || fail 'deferred restore did not retain its staged units'
+[[ ${deferred_command[-1]} == "$lock_file" ]] || fail 'deferred restore bypasses the installer lock'
 [[ $(grep -Fxc daemon-reload "$calls") == 1 ]] || fail 'rollback did not reload exactly once'
 for timer in "${timer_names[@]}" ci-fleet-reconcile.timer; do
   if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then
@@ -113,6 +138,13 @@ for timer in "${timer_names[@]}" ci-fleet-reconcile.timer; do
     [[ ! -f "$tmp/active/$timer" ]] || fail "timer remained active: $timer"
   fi
 done
+complete_deferred || fail 'checkpointed unit was not restored after execution'
+[[ ! -d ${deferred_command[2]} ]] || fail 'completed deferred restore retained its staged units'
+
+reset_fixture
+sed -i '/^TimeoutStartSec=/d; /^TimeoutStopSec=/d' "$checkpoint_dir/systemd/$reconcile_unit"
+restore_systemd_snapshot || fail 'older checkpoint dropped the live timeout budgets'
+complete_deferred || fail 'older unit was not restored after execution'
 
 for state in activating active reloading deactivating; do
   reset_fixture
@@ -120,6 +152,7 @@ for state in activating active reloading deactivating; do
   rm "$checkpoint_dir/systemd/$reconcile_unit"
   cp "$systemd_dir/$reconcile_unit" "$expected_dir/$reconcile_unit"
   restore_systemd_snapshot || fail "older checkpoint removed the executing unit: $state"
+  complete_deferred || fail "unit absent from the checkpoint was not removed after execution: $state"
 done
 
 for state in inactive failed; do
@@ -129,21 +162,33 @@ for state in inactive failed; do
   restore_systemd_snapshot || fail "absent stopped unit was not removed: $state"
 done
 
-for failure in install move show reload timer; do
+for failure in install move show reload timer dispatch; do
   reset_fixture
   case "$failure" in
     install) fail_install_unit=$reconcile_unit ;;
-    move) fail_move_unit=$reconcile_unit ;;
+    move) fail_move_unit=ci-fleet-health.service ;;
     show) fail_show=true; rm "$checkpoint_dir/systemd/$reconcile_unit" ;;
     reload) fail_reload=true ;;
     timer) fail_timer=ci-fleet-cleanup.timer ;;
+    dispatch) fail_dispatch=true ;;
   esac
   if restore_systemd_snapshot; then fail "restoration hid $failure failure"; fi
   [[ -f "$systemd_dir/$reconcile_unit" ]] || fail "$failure failure removed the executing unit"
   [[ -f "$checkpoint_dir/enabled-timers" ]] || fail "$failure failure removed recovery evidence"
-  if [[ "$failure" != reload && "$failure" != timer ]]; then
+  if [[ "$failure" != reload && "$failure" != timer && "$failure" != dispatch ]]; then
     ! grep -Fxq daemon-reload "$calls" || fail "$failure failure reloaded an incomplete unit set"
   fi
+done
+
+for failure in reload changed; do
+  reset_fixture
+  restore_systemd_snapshot || fail 'could not queue deferred failure fixture'
+  case "$failure" in
+    reload) fail_reload=true ;;
+    changed) printf '\n# later installer\n' >>"$systemd_dir/$reconcile_unit" ;;
+  esac
+  if complete_deferred; then fail "deferred restoration hid $failure failure"; fi
+  [[ -d ${deferred_command[2]} ]] || fail 'failed deferred restoration discarded its evidence'
 done
 
 reset_fixture

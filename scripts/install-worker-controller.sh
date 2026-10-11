@@ -1575,23 +1575,26 @@ PY
 }
 
 restore_systemd_snapshot() {
-  local unit timer staged_units reconcile_state failed=0
+  local unit timer staged_units reconcile_state restore_unit executing=false failed=0
   install -d -m 0755 "$systemd_dir" || return 1
   staged_units=$(mktemp -d "$systemd_dir/.ci-fleet-restore.XXXXXX") || return 1
   staging_paths+=("$staged_units")
+  if [[ -f "$systemd_dir/ci-fleet-reconcile.service" ]]; then
+    reconcile_state=$(systemctl show --property=ActiveState --value ci-fleet-reconcile.service) || return 1
+    case "$reconcile_state" in
+      active|activating|reloading|deactivating) executing=true ;;
+      inactive|failed) ;;
+      *) return 1 ;;
+    esac
+  fi
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$staged_units/$unit" || return 1
   done
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
-    if [[ -f "$staged_units/$unit" ]]; then
+    if [[ "$unit" == ci-fleet-reconcile.service && "$executing" == true ]]; then
+      continue
+    elif [[ -f "$staged_units/$unit" ]]; then
       mv -Tf "$staged_units/$unit" "$systemd_dir/$unit" || return 1
-    elif [[ "$unit" == ci-fleet-reconcile.service && -f "$systemd_dir/$unit" ]]; then
-      reconcile_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
-      case "$reconcile_state" in
-        active|activating|reloading|deactivating) continue ;;
-        inactive|failed) rm -f "$systemd_dir/$unit" || return 1 ;;
-        *) return 1 ;;
-      esac
     else
       rm -f "$systemd_dir/$unit" || return 1
     fi
@@ -1609,6 +1612,16 @@ restore_systemd_snapshot() {
       if grep -Fxq "$opt_name" "$checkpoint_dir/active-timers"; then systemctl start "$opt_name" || failed=1; else systemctl stop "$opt_name" >/dev/null 2>&1 || true; fi
     ;; esac
   done
+  if [[ "$executing" == true && "$failed" == 0 ]]; then
+    install -m 0644 "$systemd_dir/ci-fleet-reconcile.service" "$staged_units/current.service" || return 1
+    install -m 0700 "$repo_root/scripts/restore-reconcile-unit.sh" "$staged_units/restore-reconcile-unit.sh" || return 1
+    restore_unit=ci-fleet-reconcile-restore-${staged_units##*.}
+    systemd-run --quiet --no-block --collect --unit="$restore_unit" \
+      --property=After=ci-fleet-reconcile.service --property=Type=oneshot --property=TimeoutStartSec=15min \
+      /bin/bash "$staged_units/restore-reconcile-unit.sh" "$staged_units" "$systemd_dir" "$lock_file" || return 1
+    # The ordered transient service owns cleanup after the reconcile process exits.
+    unset 'staging_paths[-1]'
+  fi
   return "$failed"
 }
 
