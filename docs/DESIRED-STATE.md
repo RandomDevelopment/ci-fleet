@@ -262,6 +262,16 @@ Before mutation, the installer records the prior rendered environment, installat
 
 Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy. Rollback is a bounded convenience, not a guarantee that every catastrophic or major-version interruption leaves the controller operational. The installer repairs only canonical, digest-valid artifacts from their pinned revisions; otherwise it fails closed and reports that an operator must recover or reinstall from reviewed desired state rather than executing untrusted rollback material.
 
+While reconciliation is executing, rollback preserves its live service definition
+and timeout settings at every daemon reload. An ordered transient systemd service
+restores the checkpointed reconcile unit, or removes it if absent from the
+checkpoint, after reconciliation exits. Its ordering blocks the next reconciliation
+until finalization completes. It uses the installer lock and refuses
+to overwrite a unit changed by a later installer. Dispatch failure makes rollback
+fail. Deferred execution failure retains its staged files and reports an error
+in the transient service journal. This deferred step has a fifteen-minute budget;
+completion after process death or reboot is not guaranteed.
+
 Monitoring thresholds, heartbeat endpoints, and backup hooks are host-local operational facts, not fleet desired state. Keep them in the protected file documented by [Fleet health monitoring](HEALTH-MONITORING.md); the installer preserves that file across upgrades and rollback.
 
 This contract implements the engine portions of [issue #32](https://github.com/RandomDevelopment/ci-fleet/issues/32) and integrates the installer, documentation, phone-first bootstrap, and capacity work tracked by [#21](https://github.com/RandomDevelopment/ci-fleet/issues/21), [#24](https://github.com/RandomDevelopment/ci-fleet/issues/24), [#27](https://github.com/RandomDevelopment/ci-fleet/issues/27), and [#30](https://github.com/RandomDevelopment/ci-fleet/issues/30).

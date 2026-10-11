@@ -1471,6 +1471,7 @@ install_systemd_units() {
 }
 
 remove_systemd_units() {
+  rm -f "$systemd_dir/.ci-fleet-reconcile-unit-restore"
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
   local unit
   for unit in "${optional_unit_names[@]}"; do
@@ -1522,6 +1523,7 @@ PY
 
 activate_candidate() {
   local check_health=${1:-true} staged_state
+  rm -f "$systemd_dir/.ci-fleet-reconcile-unit-restore"
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
   install -m 0600 "$candidate_env" "$rendered_env"
@@ -1575,15 +1577,46 @@ PY
 }
 
 restore_systemd_snapshot() {
-  local unit timer failed=0
-  remove_systemd_units || failed=1
-  for unit in "${unit_names[@]}"; do
-    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  local unit timer staged_units reconcile_state restore_unit executing=false failed=0
+  install -d -m 0755 "$systemd_dir" || return 1
+  staged_units=$(mktemp -d "$systemd_dir/.ci-fleet-restore.XXXXXX") || return 1
+  staging_paths+=("$staged_units")
+  if [[ -f "$systemd_dir/ci-fleet-reconcile.service" ]]; then
+    reconcile_state=$(systemctl show --property=ActiveState --value ci-fleet-reconcile.service) || return 1
+    case "$reconcile_state" in
+      active|activating|reloading|deactivating) executing=true ;;
+      inactive|failed) ;;
+      *) return 1 ;;
+    esac
+  fi
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$staged_units/$unit" || return 1
   done
-  for unit in "${optional_unit_names[@]}"; do
-    [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$systemd_dir/$unit" || failed=1
+  if [[ "$executing" == true ]]; then
+    install -m 0644 "$systemd_dir/ci-fleet-reconcile.service" "$staged_units/current.service" || return 1
+    install -m 0700 "$repo_root/scripts/restore-reconcile-unit.sh" "$staged_units/restore-reconcile-unit.sh" || return 1
+    [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$staged_units/install-state.json" || return 1
+    if [[ -L "$manager_current" ]]; then readlink "$manager_current" >"$staged_units/manager-current" || return 1; fi
+    restore_unit=ci-fleet-reconcile-restore-${staged_units##*.}
+    systemd-run --quiet --no-block --collect --unit="$restore_unit" \
+      --property=Before=ci-fleet-reconcile.service --property=Type=oneshot --property=TimeoutStartSec=15min \
+      /bin/bash "$staged_units/restore-reconcile-unit.sh" "$staged_units" "$systemd_dir" "$state_file" "$manager_current" "$lock_file" || return 1
+    ln -s "$staged_units" "$staged_units/pending" || return 1
+    mv -Tf "$staged_units/pending" "$systemd_dir/.ci-fleet-reconcile-unit-restore" || return 1
+    # The ordered transient service owns cleanup after the reconcile process exits.
+    unset 'staging_paths[-1]'
+  fi
+  for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
+    if [[ "$unit" == ci-fleet-reconcile.service && "$executing" == true ]]; then
+      continue
+    elif [[ -f "$staged_units/$unit" ]]; then
+      mv -Tf "$staged_units/$unit" "$systemd_dir/$unit" || return 1
+    else
+      rm -f "$systemd_dir/$unit" || return 1
+    fi
   done
-  systemctl daemon-reload || failed=1
+  # Reload only the complete restored set, with the executing service still present.
+  systemctl daemon-reload || return 1
   for timer in "${timer_names[@]}"; do
     if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then systemctl enable "$timer" >/dev/null || failed=1; else systemctl disable "$timer" >/dev/null 2>&1 || true; fi
     if grep -Fxq "$timer" "$checkpoint_dir/active-timers"; then systemctl start "$timer" || failed=1; else systemctl stop "$timer" >/dev/null 2>&1 || true; fi
@@ -1800,6 +1833,7 @@ PY
   fi
   trap - ERR
   set +e
+  rm -f "$systemd_dir/.ci-fleet-reconcile-unit-restore" || failed=1
   if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
     install -m 0600 "$checkpoint_dir/ci-fleet.env" "$rendered_env" || failed=1
   else

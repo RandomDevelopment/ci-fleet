@@ -290,6 +290,13 @@ cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 [[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
+if [[ "${1:-}" == show && "${2:-}" == --property=ActiveState && "${3:-}" == --value ]]; then
+  printf '%s\n' "${FAKE_RECONCILE_ACTIVE_STATE:-inactive}"
+  exit 0
+fi
+if [[ "${1:-}" == daemon-reload && -n "${FAKE_RECONCILE_UNIT_EXPECTED:-}" ]]; then
+  cmp -s "$FAKE_RECONCILE_UNIT_EXPECTED" "${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-reconcile.service" || exit 96
+fi
 if [[ "${1:-}" == enable && "${2:-}" == --now && ! -f "${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/install-state.json" ]]; then
   exit 98
 fi
@@ -326,6 +333,13 @@ fi
 exec "$REAL_STAT" "$@"
 EOF
 chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
+
+cat >"$fake_bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+[[ " $* " == *' --property=Before=ci-fleet-reconcile.service '* ]] || exit 1
+exit 0
+EOF
+chmod 700 "$fake_bin/systemd-run"
 
 cat >"$fake_bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
@@ -758,12 +772,15 @@ unset FAKE_DOCKER_PROXY_UNAVAILABLE
 
 staging_failure_ref=$(write_config active 2 2)
 export FAKE_FAIL_UP_ONCE=$tmp/staging-failure-up
+export FAKE_RECONCILE_UNIT_EXPECTED=$repo_root/host/systemd/ci-fleet-reconcile.service
+export FAKE_RECONCILE_ACTIVE_STATE=activating
 : >"$FAKE_FAIL_UP_ONCE"
 staging_failure_output=$tmp/staging-failure.out
 if "$installer" --upgrade "${base_args[@]}" --ref "$staging_failure_ref" >"$staging_failure_output" 2>&1; then
   fail 'staging failure checkpoint fixture unexpectedly succeeded'
 fi
 unset FAKE_FAIL_UP_ONCE
+grep -Fq 'ROLLBACK_RESTORED' "$staging_failure_output" || fail 'activation failure did not verify rollback while its parent reconcile unit remained loaded'
 staging_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$staging_failure_output")
 [[ -n "$staging_failure_checkpoint" ]] || fail 'staging failure checkpoint was not created'
 active_release=$(readlink -f "$root/opt/ci-fleet/current")
@@ -785,6 +802,7 @@ unset FAKE_FAIL_TAR_EXTRACT_ONCE
 [[ -f "$active_release/preserve-on-staging-failure" && ! -f "$active_release/deploy/compose.yaml" ]] || fail 'failed archive extraction replaced the existing final release'
 
 expect_success "$installer" --rollback >/dev/null
+unset FAKE_RECONCILE_UNIT_EXPECTED FAKE_RECONCILE_ACTIVE_STATE
 [[ -f "$active_release/deploy/compose.yaml" && ! -e "$active_release/preserve-on-staging-failure" ]] || fail 'successful release staging did not replace the incomplete final release'
 rm -rf "$staging_failure_checkpoint"
 git -C "$config_repo" reset -q --hard "$ref_one"
