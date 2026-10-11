@@ -2,6 +2,18 @@
 set -Eeuo pipefail
 printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
+if [[ $1 == ps || ( $1 == volume || $1 == network ) && $2 == ls ]] && [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then
+  project=${*: -1}; project=${project#label=com.docker.compose.project=}
+  kind=$1; [[ $kind != ps ]] || kind=container
+  case $kind in
+    container) [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9 ;;
+    volume) [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9 ;;
+    network) [[ ${FAKE_TESTER_NETWORK_LS_FAIL:-0} != 1 ]] || exit 9 ;;
+  esac
+  resource_state=${FAKE_TESTER_RESOURCE_STATE:?}/$project
+  if [[ -f $resource_state && ( $(<"$resource_state") == all || $(<"$resource_state") == "$kind" ) ]]; then printf 'fixture-%s\n' "$kind"; fi
+  exit 0
+fi
 if [[ " $* " == *'|{{.Label "com.docker.compose.project"}}'* ]]; then
   [[ -z ${FAKE_TESTER_UNRELATED_RESOURCE:-} ]] || printf '%s\n' "$FAKE_TESTER_UNRELATED_RESOURCE"
   exit 0
@@ -126,6 +138,12 @@ case ${operation:-} in
       replicas) service_extra=',"deploy":{"replicas":2}' ;;
       scale) service_extra=',"scale":2' ;;
       lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
+      pre-start) service_extra=',"pre_start":[{"image":"registry.example/example/init:latest","privileged":true,"command":"true"}]' ;;
+      models) service_extra=',"models":["unapproved"]'; top_extra=',"models":{"unapproved":{"model":"example/model:latest"}}' ;;
+      service-models) service_extra=',"models":["unapproved"]' ;;
+      top-models) top_extra=',"models":{"unapproved":{"model":"example/model:latest"}}' ;;
+      anonymous-volume) volume='{"type":"volume","target":"/data"}' ;;
+      undeclared-volume) volume='{"type":"volume","source":"missing","target":"/data"}' ;;
       gpu) service_extra=',"gpus":"all"' ;;
       deploy-device) service_extra=',"deploy":{"resources":{"reservations":{"devices":[{"capabilities":["gpu"]}]}}}' ;;
       build) service_extra=',"build":{"context":"/"}' ;;
@@ -149,8 +167,19 @@ case ${operation:-} in
     printf '{"name":"%s","services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"%s"}]%s}%s},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
       "$project" "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$protocol" "$service_extra" "$extra_services" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
     ;;
-  up) [[ ${FAKE_TESTER_UP_FAIL:-0} != 1 ]] ;;
-  down) [[ ${FAKE_TESTER_DOWN_FAIL:-0} != 1 ]] ;;
+  up)
+    printf 'all\n' >"${FAKE_TESTER_RESOURCE_STATE:?}/$project"
+    case ${FAKE_TESTER_UP_SIGNAL:-} in
+      TERM) kill -TERM "$PPID"; exit 143 ;;
+      KILL) kill -KILL "$PPID"; exit 137 ;;
+    esac
+    [[ ${FAKE_TESTER_UP_FAIL:-0} != 1 ]]
+    ;;
+  down)
+    [[ ${FAKE_TESTER_DOWN_FAIL:-0} != 1 ]] || exit 1
+    if [[ -n ${FAKE_TESTER_DOWN_LEAVES:-} ]]; then printf '%s\n' "$FAKE_TESTER_DOWN_LEAVES" >"${FAKE_TESTER_RESOURCE_STATE:?}/$project";
+    else rm -f "${FAKE_TESTER_RESOURCE_STATE:?}/$project"; fi
+    ;;
   ps)
     printf '%s\n' "$model" >"${FAKE_TESTER_MODEL_PATH:?}"
     [[ ${FAKE_TESTER_UNHEALTHY:-0} == 1 ]] || {

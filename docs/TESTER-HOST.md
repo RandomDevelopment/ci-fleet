@@ -19,6 +19,10 @@ Compose source validation requires Debian's `python3-yaml` package. It decodes Y
 
 Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. They also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
 
+Compose init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units.
+
+The host's root administrators and Docker daemon are trusted. Health checks verify the isolation settings listed above; they do not attest process arguments, environment variables, or healthcheck definitions after an administrator recreates a container outside this runtime. Review image defaults and use the protected definitions for application changes. Restrict Docker administration to authorized operators.
+
 ## Prepare host-local configuration
 
 The installer supports only `/etc/ci-fleet-tester/tester.env`. Create it and all protected directories as root; never commit them:

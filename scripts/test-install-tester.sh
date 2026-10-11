@@ -29,6 +29,9 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
+if [[ $1 == show ]]; then
+  printf 'FragmentPath=%s/%s\nDropInPaths=%s\n' "${FAKE_TESTER_FRAGMENT_ROOT:-${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system}" "${*: -1}" "${FAKE_TESTER_UNIT_DROPINS:-}"
+fi
 if [[ -n ${FAKE_TESTER_SYSTEMCTL_WAIT_READY:-} && $1 == start && " $* " != *' --no-block '* ]]; then
   touch "$FAKE_TESTER_SYSTEMCTL_WAIT_READY"
   while [[ ! -e ${FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE:?} ]]; do sleep 0.05; done
@@ -58,6 +61,8 @@ export PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$root
 export FAKE_TESTER_MODEL_PATH=$tmp/model-path FAKE_TESTER_ROUTE_LOG=$tmp/route.log
 export FAKE_TESTER_DOCKER_ROOT=$root/var/lib/docker FAKE_TESTER_VOLUME_ROOT=$root/var/lib/fake-tester-volume FAKE_TESTER_DOCKER_LOG=$tmp/docker.log FAKE_TESTER_SYSTEMCTL_LOG=$tmp/systemctl.log
 export FAKE_TESTER_EVENT_LOG=$tmp/events.log
+export FAKE_TESTER_RESOURCE_STATE=$tmp/resources
+mkdir "$FAKE_TESTER_RESOURCE_STATE"
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do
   if grep -q '^ConditionPathExists=/etc/ci-fleet-tester/tester.env$' "$repo_root/host/systemd/$service"; then fail "$service silently skips missing configuration"; fi
 done
@@ -133,9 +138,11 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
   write_environment "bad-$policy" 18081
+  : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
+  if grep -Fq 'up -d' "$tmp/docker.log"; then fail "unsafe policy reached activation: $policy"; fi
 done
 for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority; do
   if FAKE_TESTER_LIVE_POLICY=$policy "$runtime" --health >/dev/null 2>&1; then fail "unsafe live policy passed health: $policy"; fi
@@ -218,6 +225,40 @@ if FAKE_TESTER_ROUTE_PORT=18084 FAKE_TESTER_UP_FAIL=1 "$runtime" --converge --en
 [[ -f $root/var/lib/ci-fleet-tester/environments/partial-up.state && -f $root/var/lib/ci-fleet-tester/environments/partial-up.compose.json ]] || fail 'partial activation was not tracked for cleanup'
 grep -q 'up -d --remove-orphans --wait --wait-timeout 60' "$tmp/docker.log" || fail 'Compose activation wait was not bounded'
 FAKE_TESTER_ROUTE_PORT=18084 "$runtime" --remove --environment partial-up >/dev/null
+for remaining_kind in container volume network; do
+  write_environment retained-removal 18084
+  FAKE_TESTER_ROUTE_PORT=18084 "$runtime" --converge --environment retained-removal >/dev/null
+  retained_state=$root/var/lib/ci-fleet-tester/environments/retained-removal.state
+  retained_compose=$root/var/lib/ci-fleet-tester/environments/retained-removal.compose.json
+  retained_hash=$(sha256sum "$retained_state" "$retained_compose")
+  if FAKE_TESTER_DOWN_LEAVES=$remaining_kind "$runtime" --remove --environment retained-removal >"$tmp/removal.log" 2>&1; then fail "removal ignored a remaining $remaining_kind"; fi
+  if grep -Fq REMOVED "$tmp/removal.log"; then fail 'incomplete removal reported success'; fi
+  [[ $(sha256sum "$retained_state" "$retained_compose") == "$retained_hash" ]] || fail 'incomplete removal lost recovery state'
+  timeout 10 "$runtime" --remove --environment retained-removal >/dev/null || fail 'retained removal state could not be retried'
+done
+# Cancellation and forced timeout termination must leave scoped cleanup possible.
+incumbent_hash=$(sha256sum "$state" "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
+for signal in TERM KILL; do
+  id="interrupted-${signal,,}"
+  write_environment "$id" 18084
+  set +e
+  FAKE_TESTER_ROUTE_PORT=18084 FAKE_TESTER_UP_SIGNAL=$signal "$runtime" --converge --environment "$id" >"$tmp/interrupted.log" 2>&1
+  interrupted_rc=$?
+  set -e
+  expected_rc=143; [[ $signal != KILL ]] || expected_rc=137
+  [[ $interrupted_rc == "$expected_rc" ]] || fail "$signal did not terminate activation"
+  interrupted_state=$root/var/lib/ci-fleet-tester/environments/$id.state
+  interrupted_compose=$root/var/lib/ci-fleet-tester/environments/$id.compose.json
+  [[ -f $interrupted_state && -f $interrupted_compose && $(stat -c %a "$interrupted_state") == 600 && $(stat -c %a "$interrupted_compose") == 600 ]] || fail "$signal lost protected cleanup state"
+  python3 -m json.tool "$interrupted_compose" >/dev/null || fail "$signal left an incomplete Compose snapshot"
+  sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$interrupted_state"
+  : >"$tmp/docker.log"
+  timeout 10 "$runtime" --cleanup >/dev/null || fail "$signal blocked subsequent expiration cleanup"
+  grep -Fq -- "-p ci-fleet-test-$id -f $interrupted_compose down --timeout 10 --volumes --remove-orphans" "$tmp/docker.log" || fail "$signal cleanup did not target the interrupted project"
+  [[ ! -e $interrupted_state && ! -e $interrupted_compose ]] || fail "$signal left expired state behind"
+  [[ $(sha256sum "$state" "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$incumbent_hash" ]] || fail "$signal cleanup changed the incumbent environment"
+  if grep -Fq -- '-p ci-fleet-test-preview-a' "$tmp/docker.log"; then fail "$signal cleanup touched the unexpired environment"; fi
+done
 write_environment immutable-remove 18085
 FAKE_TESTER_ROUTE_PORT=18085 "$runtime" --converge --environment immutable-remove >/dev/null
 rm "$root/etc/ci-fleet-tester/definitions/immutable-remove.yaml"
@@ -283,6 +324,12 @@ for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; d
 if grep -Eq '^(enable|disable|start|daemon-reload)' "$tmp/systemctl.log"; then fail 'unchanged install restarted tester maintenance'; fi
 check_output=$("$installer" --check --config /etc/ci-fleet-tester/tester.env)
 grep -Fq CHECK_OK <<<"$check_output" || fail 'installed check failed'
+if FAKE_TESTER_FRAGMENT_ROOT=$root/run/systemd/generator.early "$installer" --check >/dev/null 2>&1; then fail 'higher-priority systemd fragment passed check'; fi
+if FAKE_TESTER_UNIT_DROPINS=$root/etc/systemd/system.control/override.conf "$installer" --check >/dev/null 2>&1; then fail 'effective systemd control drop-in passed check'; fi
+: >"$tmp/systemctl.log"
+if FAKE_TESTER_FRAGMENT_ROOT=$root/run/systemd/generator.early "$installer" --install --ref "$ref" >/dev/null 2>&1; then fail 'activation accepted an effective unit override'; fi
+if grep -q '^start ' "$tmp/systemctl.log"; then fail 'activation started an unreviewed effective unit'; fi
+"$installer" --install --ref "$ref" >/dev/null || fail 'unit policy did not recover after effective override removal'
 stable_launcher=$root/opt/ci-fleet-tester/tester-runtime
 chmod 0777 "$stable_launcher"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'writable privileged launcher passed check'; fi

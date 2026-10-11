@@ -112,6 +112,18 @@ reject_unit_dropins() {
   done
 }
 
+effective_units_match() {
+  local unit properties key value fragment dropins
+  for unit in "${units[@]}"; do
+    properties=$(systemctl show --property=FragmentPath --property=DropInPaths "$unit") || return 1
+    fragment=; dropins=
+    while IFS='=' read -r key value; do
+      case $key in FragmentPath) fragment=$value ;; DropInPaths) dropins=$value ;; esac
+    done <<<"$properties"
+    [[ $fragment == "$systemd_dir/$unit" && -z $dropins ]] || return 1
+  done
+}
+
 pin_local_docker() {
   local socket_mode docker_context actual_root
   [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] || die 'Docker environment selectors are forbidden'
@@ -208,6 +220,7 @@ install_units() {
   install -m 0644 "$source/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf.new" || return 1
   mv -fT "$tmpfiles_dir/$tmpfiles_conf.new" "$tmpfiles_dir/$tmpfiles_conf" || return 1
   systemctl daemon-reload || return 1
+  effective_units_match
 }
 
 create_tmpfiles() {
@@ -290,6 +303,7 @@ installed_revision() {
 
 installation_matches() {
   local revision=$1 unit
+  effective_units_match || return 1
   release_complete "$release_dir/$revision" "$revision" || return 1
   protected_file "$stable_launcher" 555 && cmp -s "$release_dir/$revision/scripts/tester-launcher.sh" "$stable_launcher" || return 1
   for unit in "${units[@]}"; do
@@ -323,6 +337,7 @@ case $action in
     ;;
   --check)
     host_preflight
+    effective_units_match || die 'effective tester units differ from the installed policy'
     for directory in "$opt_dir" "$release_dir" "$systemd_dir"; do secure_dir "$directory" 755; done
     for directory in "$config_root" "$environment_dir" "$definition_dir" "$secret_root" "$state_root" "$runtime_state"; do secure_dir "$directory" 700; done
     secure_file "$(root_path "$config")" 600

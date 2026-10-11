@@ -165,12 +165,13 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if not all(isinstance(service.get(key),(int,float)) and not isinstance(service[key],bool) and math.isfinite(service[key]) and service[key] > 0 for key in ('cpus','mem_limit','pids_limit')): raise SystemExit(f'{name}: positive CPU, memory, and PID limits are required')
     if service.get('oom_kill_disable') or service.get('oom_score_adj',0) < 0: raise SystemExit(f'{name}: OOM priority overrides are forbidden')
+    if service.get('models'): raise SystemExit(f'{name}: external model runners are forbidden')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
@@ -178,10 +179,12 @@ for name,service in services.items():
     if service.get('security_opt') not in (['no-new-privileges:true'],['no-new-privileges=true']): raise SystemExit(f'{name}: no-new-privileges=true must be the only security option')
     for mount in service.get('volumes',[]):
         if isinstance(mount,str) or mount.get('type') not in ('volume','tmpfs'): raise SystemExit(f'{name}: host bind mounts are forbidden')
+        if mount['type']=='volume' and mount.get('source') not in value.get('volumes',{}): raise SystemExit(f'{name}: volume mounts must name a declared project volume')
     for port in service.get('ports',[]):
         if not isinstance(port,dict) or str(port.get('host_ip','')) != '127.0.0.1' or port.get('protocol','tcp') != 'tcp': raise SystemExit(f'{name}: published ports must use TCP on loopback')
         ports.append((name,int(port.get('published',0)),int(port.get('target',0))))
 if ports != [(route_service,route_port,ports[0][2] if ports else 0)] or not ports or ports[0][2] < 1: raise SystemExit('exactly one declared loopback route is required')
+if value.get('models'): raise SystemExit('external model runners are forbidden')
 if value.get('configs'): raise SystemExit('top-level configs are forbidden')
 for section in ('networks','volumes'):
     for name,item in value.get(section,{}).items():
@@ -309,11 +312,25 @@ remove_environment() {
     [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
     secure_file "$compose" 600
     docker compose -p "$(project_name "$id")" -f "$compose" down --timeout 10 --volumes --remove-orphans || return 1
+    project_resources_absent "$id" || return 1
     rm -f -- "$target" "$(deployed_compose_path "$id")"
   else
     reject_orphaned_projects
   fi
   report "REMOVED environment=$id"
+}
+
+project_resources_absent() {
+  local project inventory kind
+  project=$(project_name "$1")
+  for kind in container volume network; do
+    case $kind in
+      container) inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$project") || return 1 ;;
+      volume) inventory=$(docker volume ls -q --filter "label=com.docker.compose.project=$project") || return 1 ;;
+      network) inventory=$(docker network ls -q --filter "label=com.docker.compose.project=$project") || return 1 ;;
+    esac
+    [[ -z $inventory ]] || { printf 'ERROR: project %s resources remain after teardown; protected state retained\n' "$kind" >&2; return 1; }
+  done
 }
 
 reject_orphaned_projects() {
