@@ -2379,16 +2379,17 @@ else
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
 # Role admission is serialized across the controller and deployer installers:
-# both flock this shared path for their whole mutating run.
+# both flock this shared path for their whole mutating run. Descriptor 8 is
+# reserved for the network-policy checkpoint, and 7 carries transaction results.
 role_lock=$(root_path /run/ci-fleet-role-admission.lock)
 install -d -m 0755 "$(dirname "$role_lock")"
-if [[ ${CI_FLEET_ROLE_ADMISSION_LOCK_FD:-} == 8 && -e /proc/$$/fd/8 && $(readlink -f /proc/$$/fd/8) == "$role_lock" ]]; then
-  flock -n 8 || die 'another ci-fleet role installation is already running'
+if [[ ${CI_FLEET_ROLE_ADMISSION_LOCK_FD:-} == 6 && -e /proc/$$/fd/6 && $(readlink -f /proc/$$/fd/6) == "$role_lock" ]]; then
+  flock -n 6 || die 'another ci-fleet role installation is already running'
 else
-  exec 8>"$role_lock"
-  flock -n 8 || die 'another ci-fleet role installation is already running'
+  exec 6>"$role_lock"
+  flock -n 6 || die 'another ci-fleet role installation is already running'
 fi
-export CI_FLEET_ROLE_ADMISSION_LOCK_FD=8
+export CI_FLEET_ROLE_ADMISSION_LOCK_FD=6
 export CI_FLEET_INSTALLER_LOCK_FD=9
 if [[ "$mode" == policy-action ]]; then
   perform_policy_action
