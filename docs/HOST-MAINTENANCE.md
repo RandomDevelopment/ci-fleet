@@ -92,6 +92,14 @@ The proxy retains its shared lock until Docker completes a dispatched mutation,
 including when the caller disconnects. Nested raw socket bind requests are
 redirected to the proxy socket without project-specific changes.
 
+For `/build`, the proxy accepts contexts up to 1 GiB and spools at most two
+uploads concurrently, bounding temporary context storage to 2 GiB. Larger
+contexts receive HTTP 413; use `.dockerignore` to exclude unnecessary files.
+Additional uploads wait for a slot and can cancel while waiting. Spool files
+are unlinked before writing, so a proxy crash leaves no context files behind.
+The proxy closes each spool and releases its slot when the upload to Docker
+ends, while retaining the maintenance lock until the build response completes.
+
 Before removal, cleanup waits up to ten minutes for runnable noncontroller
 containers to finish. It releases the exclusive lock between checks so jobs can
 finish their Docker work. It requires two idle checks separated by one second.
@@ -105,7 +113,9 @@ network deletion. The service has a fifteen-minute start timeout.
 Proxy mutations and raw cleanup removals create empty, durable markers under
 `/run/lock/ci-fleet/inflight/<boot-id>/` and `removals/<boot-id>/` before dispatch.
 Markers contain no request bodies or credentials. A complete response clears
-the marker. A killed process or uncertain response preserves it. Cleanup defers
+the marker. A failed connection before any upstream connection is acquired also
+clears that request's marker, because Docker received no request. A killed
+process or uncertain response preserves it. Cleanup defers
 while a current-boot or unknown marker remains, and the proxy refuses new
 reference mutations while an unresolved cleanup-removal marker remains.
 Restarting the proxy or controller does not clear uncertainty. A host reboot

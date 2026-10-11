@@ -9,12 +9,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +27,8 @@ import (
 const dockerProxySocket = "/run/ci-fleet/locks/docker.sock"
 const dockerProxyHealthPath = "/_ci_fleet/docker-socket-proxy"
 const dockerProxyHealth = "ci-fleet-docker-socket-proxy-v1\n"
+const dockerBuildContextLimit = 1 << 30
+const dockerBuildUploadLimit = 2
 
 var dockerAPIVersion = regexp.MustCompile(`^/v[0-9]+\.[0-9]+/`)
 
@@ -239,11 +244,23 @@ func (t *dockerProxyTransport) RoundTrip(request *http.Request) (*http.Response,
 	}
 	// The daemon may finish registering a container after its caller disappears.
 	forwardContext, cancel := context.WithCancel(context.WithoutCancel(request.Context()))
+	var connected atomic.Bool
+	forwardContext = httptrace.WithClientTrace(forwardContext, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	})
 	request = request.Clone(forwardContext)
 	response, err := t.backend.RoundTrip(request)
 	if err != nil {
 		cancel()
-		lock.Close() // Keep the marker because daemon completion is uncertain.
+		// Any acquired connection, including before a retry, leaves dispatch uncertain.
+		if !connected.Load() {
+			if removeErr := os.Remove(marker); removeErr != nil {
+				err = errors.Join(err, removeErr)
+			} else {
+				err = errors.Join(err, syncProxyDirectory(filepath.Dir(marker)))
+			}
+		}
+		lock.Close()
 		return nil, err
 	}
 	response.Body = &dockerProxyBody{ReadCloser: response.Body, lock: lock, marker: marker, cancel: cancel}
@@ -285,6 +302,21 @@ func (body *dockerProxyBody) Close() error {
 	return errors.Join(err, body.lock.Close())
 }
 
+type dockerBuildSpool struct {
+	*os.File
+	closed sync.Once
+	slots  chan struct{}
+	err    error
+}
+
+func (spool *dockerBuildSpool) Close() error {
+	spool.closed.Do(func() {
+		spool.err = spool.File.Close()
+		<-spool.slots
+	})
+	return spool.err
+}
+
 func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *http.Transport) {
 	backend := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", upstream)
@@ -295,6 +327,7 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}
+	buildSlots := make(chan struct{}, dockerBuildUploadLimit)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Method == http.MethodGet && request.URL.Path == dockerProxyHealthPath {
 			if pending, err := proxyRemovalPending(lockPath, bootID); pending || err != nil {
@@ -319,29 +352,45 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 		}
 		if dockerReferenceMutation(request.Method, request.URL.Path) && request.Body != nil {
 			if dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/build" {
-				spool, err := os.CreateTemp("", "ci-fleet-docker-build-*")
+				if request.ContentLength > dockerBuildContextLimit {
+					http.Error(w, "build context exceeds 1 GiB", http.StatusRequestEntityTooLarge)
+					return
+				}
+				select {
+				case buildSlots <- struct{}{}:
+				case <-request.Context().Done():
+					http.Error(w, request.Context().Err().Error(), http.StatusRequestTimeout)
+					return
+				}
+				file, err := os.CreateTemp("", "ci-fleet-docker-build-*")
 				if err != nil {
+					<-buildSlots
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}
-				defer os.Remove(spool.Name())
+				spool := &dockerBuildSpool{File: file, slots: buildSlots}
 				defer spool.Close()
-				if _, err := io.Copy(spool, request.Body); err != nil {
+				// Unlink before writing so a killed proxy cannot leave spooled contexts behind.
+				if err := os.Remove(file.Name()); err != nil {
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
+				}
+				length, err := io.Copy(file, http.MaxBytesReader(w, request.Body, dockerBuildContextLimit))
+				if err != nil {
+					var tooLarge *http.MaxBytesError
+					if errors.As(err, &tooLarge) {
+						http.Error(w, "build context exceeds 1 GiB", http.StatusRequestEntityTooLarge)
+						return
+					}
 					http.Error(w, err.Error(), http.StatusBadRequest)
 					return
 				}
-				length, err := spool.Seek(0, io.SeekStart)
-				if err != nil {
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}
-				info, err := spool.Stat()
-				if err != nil || length != 0 {
-					http.Error(w, "cannot rewind build context", http.StatusServiceUnavailable)
-					return
-				}
 				request.Body = spool
-				request.ContentLength = info.Size()
+				request.ContentLength = length
 			} else {
 				body, err := io.ReadAll(request.Body)
 				if err == nil && dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/containers/create" {
