@@ -812,6 +812,20 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
+# Read-only checks must reject deployer-role drift on a converged controller.
+for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer; do
+  mkdir -p "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rmdir "$root$marker"
+  ln -s /missing "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+done
+printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v1 ]] || fail 'current controller did not retain its cleanup protocol label'
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
 proxy_health_result=0

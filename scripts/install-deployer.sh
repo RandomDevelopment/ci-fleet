@@ -1128,13 +1128,13 @@ run_adapter() {
     # deploy runtime, so a normal shutdown cannot strand a partially applied
     # rollback between core mutation and commit-marker publication.
     timeout --signal=TERM --kill-after=10s "${seconds}s" systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer \
-      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 9<&-
+      --why='transactional rollback is active' -- env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 8>&- 9<&-
     return
   fi
   if [[ -n "$marker" ]]; then
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 9<&-
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker" "$adapter_path" "$operation_name" 8>&- 9<&-
   else
-    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name" 9<&-
+    timeout --signal=TERM --kill-after=10s "${seconds}s" env CI_FLEET_DEPLOYER_CONFIG="$policy" "$adapter_path" "$operation_name" 8>&- 9<&-
   fi
 }
 

@@ -120,6 +120,7 @@ cat >"$adapter" <<'EOF'
 set -Eeuo pipefail
 printf '%s\n' "$1" >>"${FAKE_ADAPTER_LOG:?}"
 [[ ! -e /proc/$$/fd/9 ]] || { printf 'adapter inherited deployer operation lock\n' >&2; exit 46; }
+[[ $(readlink /proc/$$/fd/8 2>/dev/null || true) != "$CI_FLEET_DEPLOYER_ROOT/run/ci-fleet-role-admission.lock" ]] || { printf 'adapter inherited role admission lock\n' >&2; exit 47; }
 [[ -z ${FAKE_ADAPTER_RECORD_CONFIG:-} ]] || { printf '%s\n' "${CI_FLEET_DEPLOYER_CONFIG:-unset}" >"$FAKE_ADAPTER_RECORD_CONFIG"; : >"$FAKE_ADAPTER_RECORD_CONFIG.seen"; cp "${CI_FLEET_DEPLOYER_CONFIG:-/dev/null}" "$FAKE_ADAPTER_RECORD_CONFIG.content" 2>/dev/null || true; }
 if [[ -n ${FAKE_ADAPTER_FORBID_CONFIG_PATH:-} && ${CI_FLEET_DEPLOYER_CONFIG:-} == "$FAKE_ADAPTER_FORBID_CONFIG_PATH" ]]; then exit 43; fi
 if [[ "$1" == deploy && -n ${FAKE_ADAPTER_FORBID_REQUEST_PATH:-} && ${CI_FLEET_DEPLOYER_REQUEST:-} == "$FAKE_ADAPTER_FORBID_REQUEST_PATH" ]]; then exit 44; fi

@@ -2110,6 +2110,7 @@ trap on_term TERM
 
 perform_check() {
   local count
+  reject_deployer_host
   display_last_health
   drift_count
   count=$DRIFT_COUNT
@@ -2121,7 +2122,7 @@ perform_check() {
 }
 
 reject_deployer_host() {
-  # A deployer host is a separate role; never run controller mutations on it.
+  # A deployer host is a separate role; controller checks must reject it too.
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
