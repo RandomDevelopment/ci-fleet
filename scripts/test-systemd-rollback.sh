@@ -81,7 +81,8 @@ reset_fixture() {
   rm -rf "$systemd_dir" "$checkpoint_dir" "$expected_dir" "$tmp/enabled" "$tmp/active"
   mkdir -p "$systemd_dir" "$checkpoint_dir/systemd" "$expected_dir" "$tmp/enabled" "$tmp/active"
   : >"$calls"
-  fail_install_unit= fail_move_unit= fail_timer= fail_reload=false fail_show=false
+  fail_install_unit='' fail_move_unit='' fail_timer='' fail_reload=false fail_show=false
+  staging_paths=()
   modeled_service_state=activating model_running_service=true
   local unit
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
@@ -98,6 +99,7 @@ reset_fixture() {
 
 reset_fixture
 restore_systemd_snapshot || fail 'checkpoint restoration failed'
+[[ ${#staging_paths[@]} == 1 ]] || fail 'staged units were not registered for cleanup'
 [[ $(grep -Fxc daemon-reload "$calls") == 1 ]] || fail 'rollback did not reload exactly once'
 for timer in "${timer_names[@]}" ci-fleet-reconcile.timer; do
   if grep -Fxq "$timer" "$checkpoint_dir/enabled-timers"; then
