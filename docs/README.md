@@ -22,6 +22,7 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Make a project compliant | [Project CI standard](PROJECT-STANDARD.md) and [compliance checklist](COMPLIANCE-CHECKLIST.md) |
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
+| Install or operate a dedicated deployment host | [Deployer host installation](DEPLOYER-HOST.md) |
 | Monitor hosts and detect missed reports | [Fleet health monitoring](HEALTH-MONITORING.md) and [authenticated status reporting](STATUS-REPORTING.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
 | Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
@@ -43,6 +44,7 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Test shard | One bounded slice of a larger test suite, designed to run independently and usually finish within five minutes. |
 | Private delivery configuration | Repository allowlists, logical controllers, capacity budgets, environment policy, and required secret names kept in a private but secret-free repository. |
 | Desired state | A reviewed schema-v3 declaration of runner pools and logical controllers stored in a private, secret-free Git repository. |
+| Deployer host | A dedicated non-runner Linux host that applies exact-head approved immutable artifacts through application-owned deployment logic. |
 
 ## Design and boundaries
 
@@ -74,6 +76,7 @@ These pages are normative for compatible projects and hosts:
 - [Run the live pilot](LIVE-PILOT.md)
 - [Add a host](ADDING-A-HOST.md)
 - [Install, adopt, check, upgrade, roll back, or remove a controller](DESIRED-STATE.md)
+- [Install, check, repair, upgrade, drain, roll back, or remove a deployer](DEPLOYER-HOST.md)
 - [Add a project](ADDING-A-PROJECT.md)
 - [Deploy the current experimental prototype](DEPLOYMENT-PROTOTYPE.md)
 - [Maintain, drain, clean, update, and reboot hosts](HOST-MAINTENANCE.md)

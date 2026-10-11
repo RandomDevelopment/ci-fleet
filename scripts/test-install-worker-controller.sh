@@ -757,6 +757,18 @@ expect_failure 'host configuration must be owned by root' "$installer" --install
 unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
+# A controller must never install onto a deployer host.
+mkdir -p "$root/etc/systemd/system" "$root/var/lib/ci-fleet-deployer"
+printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+rmdir "$root/var/lib/ci-fleet-deployer"
+for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer; do
+  ln -s /missing "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+done
+
 # A rejected review must stop every direct candidate path before installation.
 export FAKE_REAL_OPENSSL FAKE_REAL_CURL
 FAKE_REAL_OPENSSL=$(command -v openssl)

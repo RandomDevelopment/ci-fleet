@@ -2120,9 +2120,17 @@ perform_check() {
   note "CHECK_OK controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
 }
 
+reject_deployer_host() {
+  # A deployer host is a separate role; never run controller mutations on it.
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
+    die 'deployer host state is present; controller and deployer roles are separate hosts'
+  fi
+}
+
 perform_converge() {
   local count existing_status candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 current_target current_ref manager_target manager_ref manager_source policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
   local desired_controller_id=$controller_id build_before_drain=false
+  reject_deployer_host
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -2296,6 +2304,7 @@ latest_checkpoint() {
 
 perform_rollback() {
   local checkpoint_env
+  reject_deployer_host
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
   if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -2369,6 +2378,12 @@ else
   exec 9>"$lock_file"
   flock -n 9 || die 'another ci-fleet installer or drift check is already running'
 fi
+# Role admission is serialized across the controller and deployer installers:
+# both flock this shared path for their whole mutating run.
+role_lock=$(root_path /run/ci-fleet-role-admission.lock)
+install -d -m 0755 "$(dirname "$role_lock")"
+exec 8>"$role_lock"
+flock -n 8 || die 'another ci-fleet role installation is already running'
 export CI_FLEET_INSTALLER_LOCK_FD=9
 if [[ "$mode" == policy-action ]]; then
   perform_policy_action
