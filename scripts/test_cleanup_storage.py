@@ -37,6 +37,43 @@ def usage():
 
 
 class StorageTests(unittest.TestCase):
+    def test_docker_usage_reads_detailed_lists_on_old_and_new_daemons(self):
+        for modern_daemon in (False, True):
+            with self.subTest(modern_daemon=modern_daemon):
+                connection = unittest.mock.MagicMock()
+                response = connection.getresponse.return_value
+                response.status = 200
+
+                def request(_method, path):
+                    accounting = usage()
+                    if modern_daemon:
+                        accounting = {"ImageUsage": {"Items": accounting["Images"]},
+                                      "ContainerUsage": {"Items": []},
+                                      "BuildCacheUsage": {"Items": accounting["BuildCache"]}}
+                        if path != "/system/df?verbose=true":
+                            accounting = {key: {"TotalCount": len(value["Items"])} for key, value in accounting.items()}
+                    response.read.return_value = json.dumps(accounting).encode()
+
+                connection.request.side_effect = request
+                with patch.object(cleanup.http.client, "HTTPConnection", return_value=connection), \
+                     patch.object(cleanup.socket, "socket"):
+                    accounting = cleanup.docker_usage()
+                    self.assertEqual({field: accounting[field] for field in usage()}, usage())
+                connection.request.assert_called_once_with("GET", "/system/df?verbose=true")
+                connection.close.assert_called_once()
+
+    def test_docker_usage_rejects_summary_only_or_malformed_resource_lists(self):
+        for resources in ({"ImageUsage": {}, "ContainerUsage": {}, "BuildCacheUsage": {}},
+                          {"ImageUsage": {"Items": {}}, "ContainerUsage": {"Items": []}, "BuildCacheUsage": {"Items": []}}):
+            with self.subTest(resources=resources):
+                connection = unittest.mock.MagicMock()
+                connection.getresponse.return_value.status = 200
+                connection.getresponse.return_value.read.return_value = json.dumps(resources).encode()
+                with patch.object(cleanup.http.client, "HTTPConnection", return_value=connection), \
+                     patch.object(cleanup.socket, "socket"), self.assertRaisesRegex(ValueError, "omitted resource lists"):
+                    cleanup.docker_usage()
+                connection.close.assert_called_once()
+
     def test_retention_decisions(self):
         for change, references, protected, expected in [
             ({}, set(), set(), "eligible"),
@@ -44,6 +81,7 @@ class StorageTests(unittest.TestCase):
             ({"Containers": -1}, set(), set(), "container-reference-or-unknown-use"),
             ({}, set(), {"example:old"}, "installed-or-checkpoint-release"),
             ({}, set(), {IMAGE}, "installed-or-checkpoint-release"),
+            ({"RepoTags": [], "RepoDigests": ["example@" + IMAGE]}, set(), {"example@" + IMAGE}, "installed-or-checkpoint-release"),
             ({"Labels": {cleanup.PREFIX + "retention": "keep"}}, set(), set(), "explicit-keep"),
             ({"Created": NOW - 30}, set(), set(), "recent-or-unknown-age"),
             ({"Created": None}, set(), set(), "recent-or-unknown-age"),
@@ -114,6 +152,17 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", tag))
         self.assertEqual(mutations[1].args[-1], "example:other")
         self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
+
+    def test_digest_only_images_remove_every_reference_and_continue_cleanup(self):
+        digests = ["example/one@" + IMAGE, "[2001:db8::1]:5000/two@" + IMAGE]
+        for tags in (None, [], ["<none>:<none>"]):
+            with self.subTest(tags=tags):
+                accounting = usage()
+                accounting["Images"] = [image(RepoTags=tags, RepoDigests=digests), image(identity=OTHER)]
+                _, mutations = self.run_storage(accounting=accounting)
+                self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", *digests))
+                self.assertEqual(mutations[1].args[-1], "example:old")
+                self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
 
     def test_service_deadline_stops_expired_resources_before_creating_uncertainty(self):
         labels = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}

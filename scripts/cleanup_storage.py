@@ -31,13 +31,16 @@ def docker_usage() -> dict:
     connection.sock.settimeout(30)
     try:
         connection.sock.connect(str(coordination.host_path("/var/run/docker.sock")))
-        connection.request("GET", "/system/df")
+        connection.request("GET", "/system/df?verbose=true")
         response = connection.getresponse()
         body = response.read(64 * 1024**2 + 1)
         if response.status != 200 or len(body) > 64 * 1024**2:
             raise ValueError("Docker storage accounting unavailable or too large")
         value = json.loads(body)
-        for field in ("Images", "Containers", "BuildCache"):
+        for field, modern in (("Images", "ImageUsage"), ("Containers", "ContainerUsage"), ("BuildCache", "BuildCacheUsage")):
+            # API 1.52+ puts detailed resource lists inside usage objects.
+            if field not in value and isinstance(value.get(modern), dict) and "Items" in value[modern]:
+                value[field] = value[modern]["Items"]
             if field not in value or (value[field] is not None and not isinstance(value[field], list)):
                 raise ValueError("Docker storage accounting omitted resource lists")
             value[field] = value[field] or []
@@ -275,6 +278,8 @@ def cleanup_storage(*, apply: bool) -> None:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
             raise ValueError("invalid Docker image identity")
         aliases = [tag for tag in (image.get("RepoTags") or []) if tag != "<none>:<none>"]
+        if not aliases:
+            aliases = image.get("RepoDigests") or []
         if any(not re.fullmatch(r"[A-Za-z0-9._/:@\[\]-]+", tag) or tag.startswith("-") for tag in aliases):
             raise ValueError("invalid Docker image reference")
         mutate("image", "rm", "--no-prune", "--", *(aliases or [identity]), timeout=max(0.1, deadline - time.monotonic()))
