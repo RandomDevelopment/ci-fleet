@@ -336,7 +336,7 @@ chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 
 cat >"$fake_bin/systemd-run" <<'EOF'
 #!/usr/bin/env bash
-[[ " $* " == *' --property=After=ci-fleet-reconcile.service '* ]] || exit 1
+[[ " $* " == *' --property=Before=ci-fleet-reconcile.service '* ]] || exit 1
 exit 0
 EOF
 chmod 700 "$fake_bin/systemd-run"

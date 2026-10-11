@@ -35,7 +35,7 @@ mv() {
   command mv "$@"
 }
 systemd-run() {
-  [[ " $* " == *' --property=After=ci-fleet-reconcile.service '* ]] || fail 'deferred restore is not ordered after reconciliation'
+  [[ " $* " == *' --property=Before=ci-fleet-reconcile.service '* ]] || fail 'deferred restore does not block a new reconciliation'
   [[ ${fail_dispatch:-false} != true ]] || return 1
   while [[ "$1" != /bin/bash ]]; do shift; done
   deferred_command=("$@")

@@ -265,7 +265,8 @@ Installer checkpoints and machine backups serve different failure classes. A che
 While reconciliation is executing, rollback preserves its live service definition
 and timeout settings at every daemon reload. An ordered transient systemd service
 restores the checkpointed reconcile unit, or removes it if absent from the
-checkpoint, after reconciliation exits. It uses the installer lock and refuses
+checkpoint, after reconciliation exits. Its ordering blocks the next reconciliation
+until finalization completes. It uses the installer lock and refuses
 to overwrite a unit changed by a later installer. Dispatch failure makes rollback
 fail. Deferred execution failure retains its staged files and reports an error
 in the transient service journal. This deferred step has a fifteen-minute budget;

@@ -1599,7 +1599,7 @@ restore_systemd_snapshot() {
     if [[ -L "$manager_current" ]]; then readlink "$manager_current" >"$staged_units/manager-current" || return 1; fi
     restore_unit=ci-fleet-reconcile-restore-${staged_units##*.}
     systemd-run --quiet --no-block --collect --unit="$restore_unit" \
-      --property=After=ci-fleet-reconcile.service --property=Type=oneshot --property=TimeoutStartSec=15min \
+      --property=Before=ci-fleet-reconcile.service --property=Type=oneshot --property=TimeoutStartSec=15min \
       /bin/bash "$staged_units/restore-reconcile-unit.sh" "$staged_units" "$systemd_dir" "$state_file" "$manager_current" "$lock_file" || return 1
     ln -s "$staged_units" "$staged_units/pending" || return 1
     mv -Tf "$staged_units/pending" "$systemd_dir/.ci-fleet-reconcile-unit-restore" || return 1
