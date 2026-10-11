@@ -1584,7 +1584,7 @@ restore_systemd_snapshot() {
   done
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
     if [[ -f "$staged_units/$unit" ]]; then
-      mv -f "$staged_units/$unit" "$systemd_dir/$unit" || return 1
+      mv -Tf "$staged_units/$unit" "$systemd_dir/$unit" || return 1
     elif [[ "$unit" == ci-fleet-reconcile.service && -f "$systemd_dir/$unit" ]]; then
       reconcile_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
       case "$reconcile_state" in
