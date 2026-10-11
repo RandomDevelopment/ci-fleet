@@ -27,7 +27,7 @@ backup_transaction() {
   local path relative
   rollback_transaction_backup=
   shopt -s nullglob
-  for path in "$transaction_dir"/* "$transaction_dir"/units/* "$transaction_dir"/state/*; do
+  for path in "$transaction_dir"/* "$transaction_dir"/units/* "$transaction_dir"/state/* "$transaction_dir"/deployed/* "$transaction_dir"/retained/*; do
     [[ -f "$path" && ! -L "$path" ]] || continue
     relative=${path#"$transaction_dir"/}
     rollback_transaction_backup+="$relative|$(base64 -w0 "$path")"$'\n'
@@ -36,10 +36,10 @@ backup_transaction() {
 }
 restore_transaction_backup() {
   local relative encoded destination
-  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" || return
+  install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" || return
   while IFS='|' read -r relative encoded; do
     [[ -n "$relative" ]] || continue
-    [[ "$relative" =~ ^(units|state)/[A-Za-z0-9._-]+$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$relative" =~ ^(units|state|deployed|retained)/[A-Za-z0-9._-]+$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
     destination=$transaction_dir/$relative
     printf '%s' "$encoded" | base64 -d >"$destination" || return
     chmod 0600 "$destination" || return
@@ -56,10 +56,11 @@ rollback_commit_marker_uncommitted() {
 on_exit() {
   local status=$? recovery_status=0
   if [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then
-    if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root"; fi
+    if [[ ! -e "$state_root" && ! -L "$state_root" ]]; then install -d -m 0700 "$state_root" || recovery_status=1; fi
     if [[ -d "$state_root" && ! -L "$state_root" && $(stat -c '%u:%a' "$state_root" 2>/dev/null) == "$expected_uid:700" ]]; then
-      rm -rf -- "$transaction_dir"
-      restore_transaction_backup
+      if ! { rm -rf -- "$transaction_dir" && restore_transaction_backup; }; then recovery_status=1; fi
+    else
+      recovery_status=1
     fi
   fi
   if [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
@@ -67,7 +68,9 @@ on_exit() {
     transaction_dir=
   elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
-    if rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
+    if ((recovery_status == 0)); then
+      if rollback_commit_marker_uncommitted "$transaction_dir/application-rollback-committed"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
+    fi
     set -e
     if ((recovery_status != 0)); then
       status=$recovery_status
@@ -716,6 +719,21 @@ begin_transaction() {
   elif [[ -e "$deployed_current" ]]; then block 'deployed snapshot pointer has an unsafe type'
   else printf 'absent\n' >"$transaction_dir/deployed-target"
   fi
+  install -d -m 0700 "$transaction_dir/deployed" "$transaction_dir/retained"
+  if [[ -n ${deployed_target:-} ]]; then
+    secure_directory "$deployed_root/$deployed_target" 700 0 || block 'deployed snapshot is missing'
+    for name in policy.conf state.json; do
+      secure_file "$deployed_root/$deployed_target/$name" 'deployed snapshot backup'
+      install -m 0600 "$deployed_root/$deployed_target/$name" "$transaction_dir/deployed/$name"
+    done
+  fi
+  for name in request.conf last-request.conf drained; do
+    path=$state_root/$name
+    if [[ -e "$path" || -L "$path" ]]; then
+      secure_file "$path" 'retained deployer state'
+      install -m 0600 "$path" "$transaction_dir/retained/$name"
+    fi
+  done
   transaction_name=${transaction_dir##*/}
   transaction_ready=$state_root/.transaction.${transaction_name#.transaction-preparing.}
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || block 'prepared recovery journal is not durable'
@@ -727,7 +745,7 @@ begin_transaction() {
 
 restore_transaction() {
   local name target_value backed_up systemd_restore_mode
-  [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 0
+  [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 1
   transaction_committed=1
   for name in units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
     [[ ! -e "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || [[ ! -L "$transaction_dir/$name" && -f "$transaction_dir/$name" ]] || block "transaction manifest $name has an unsafe type"
@@ -765,6 +783,20 @@ restore_transaction() {
       [[ -z $backed_up ]] || block "transaction $name manifest is missing but backups remain"
     fi
   done
+  # Older journals can lack these backups; new journals retain adapter-writable state.
+  for name in deployed retained; do
+    if [[ -e "$transaction_dir/$name" || -L "$transaction_dir/$name" ]]; then
+      secure_directory "$transaction_dir/$name" 700 0 || return 1
+      for backed_up in "$transaction_dir/$name"/*; do
+        [[ -e "$backed_up" || -L "$backed_up" ]] || continue
+        case "$name/${backed_up##*/}" in
+          deployed/policy.conf|deployed/state.json|retained/request.conf|retained/last-request.conf|retained/drained) ;;
+          *) block 'transaction retained state backup is unsafe' ;;
+        esac
+        secure_file "$backed_up" 'transaction retained state backup' || return
+      done
+    fi
+  done
   # Validate the deployed-state boundary before any pointer mutation follows it.
   if [[ -e "$deployed_root" || -L "$deployed_root" ]]; then
     [[ -d "$deployed_root" && ! -L "$deployed_root" && $(stat -c '%u:%a' "$deployed_root") == "$expected_uid:700" ]] || block 'deployed snapshot directory is unsafe'
@@ -800,6 +832,15 @@ restore_transaction() {
     if [[ "$target_value" == absent ]]; then
       rm -f -- "$deployed_current" || return
     else
+      if [[ -d "$transaction_dir/deployed" ]]; then
+        secure_directory "$deployed_root" 700 1 || return
+        secure_directory "$deployed_root/$target_value" 700 1 || return
+        for name in policy.conf state.json; do
+          secure_file "$transaction_dir/deployed/$name" 'transaction deployed snapshot backup' || return
+          [[ ! -L "$deployed_root/$target_value/$name" ]] || block 'deployed snapshot restore target is unsafe'
+          install -m 0600 "$transaction_dir/deployed/$name" "$deployed_root/$target_value/$name" || return
+        done
+      fi
       rm -f -- "$deployed_current" || return
       ln -s "$target_value" "$deployed_current" || return
     fi
@@ -810,6 +851,16 @@ restore_transaction() {
     if [[ ! -e $deployed_current && ! -L $deployed_current ]] || [[ $(readlink "$deployed_current" 2>/dev/null) != "$target_value" ]]; then
       [[ ! -d "$deployed_root/$target_value" || -L "$deployed_root/$target_value" ]] || rm -rf -- "${deployed_root:?}/$target_value"
     fi
+  fi
+  if [[ -d "$transaction_dir/retained" ]]; then
+    for name in request.conf last-request.conf drained; do
+      [[ ! -L "$state_root/$name" ]] || block 'retained state restore target is unsafe'
+      if [[ -f "$transaction_dir/retained/$name" ]]; then
+        install -m 0600 "$transaction_dir/retained/$name" "$state_root/$name" || return
+      else
+        rm -f -- "$state_root/$name" || return
+      fi
+    done
   fi
   systemctl daemon-reload >/dev/null 2>&1 || return
   if [[ -f "$transaction_dir/timers-enabled" ]]; then
@@ -1257,6 +1308,8 @@ PY
   reject_mixed_role
   mv -Tf "$active_policy.new" "$active_policy"
   mv -Tf "$state_root/.install-state.new" "$state_file"
+  # Keep recovery bytes outside the state directory writable by the health adapter.
+  backup_transaction
   policy_adapter_operation "$active_policy" health 'candidate policy' || die 'candidate health check failed after activation'
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
     publish_deployed_snapshot "$active_policy" "$state_file"

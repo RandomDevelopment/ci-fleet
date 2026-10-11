@@ -133,7 +133,10 @@ if [[ ${FAKE_ADAPTER_SLEEP_OPERATION:-} == "$1" ]]; then sleep 2; fi
 if [[ "$1" == validate && -n ${FAKE_ADAPTER_MUTATE_CONFIG_DURING_VALIDATE:-} ]]; then printf '# adapter mutation\n' >>"$CI_FLEET_DEPLOYER_CONFIG"; fi
 if [[ "$1" == health && -n ${FAKE_ADAPTER_FAIL_HEALTH_AFTER:-} ]]; then
   health_calls=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
-  ((health_calls <= FAKE_ADAPTER_FAIL_HEALTH_AFTER)) || exit 42
+  if ((health_calls > FAKE_ADAPTER_FAIL_HEALTH_AFTER)); then
+    [[ -z ${FAKE_ADAPTER_DELETE_STATE_ROOT:-} ]] || rm -rf -- "$FAKE_ADAPTER_DELETE_STATE_ROOT"
+    exit 42
+  fi
 fi
 if [[ -e "${FAKE_ADAPTER_FAIL:-/nonexistent}" ]]; then
   fail_operation=$(<"$FAKE_ADAPTER_FAIL")
@@ -848,6 +851,30 @@ expect_failure 'malformed completed deployment request line' "$installer" --roll
 install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/last-request.conf"
 completed_request=$root/var/lib/ci-fleet-deployer/last-request.conf
 cp "$completed_request" "$tmp/completed-request.saved"
+
+# Failed candidate health can remove the entire writable state and journal.
+printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
+installed_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+deployed_pointer_before=$(readlink "$root/var/lib/ci-fleet-deployer/deployed/current")
+deployed_files_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/deployed/$deployed_pointer_before/"{policy.conf,state.json})
+completed_request_before=$(sha256sum "$completed_request")
+install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/request.conf"
+pending_request_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/request.conf")
+install -m 0600 /dev/null "$root/var/lib/ci-fleet-deployer/drained"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before FAKE_ADAPTER_DELETE_STATE_ROOT=$root/var/lib/ci-fleet-deployer \
+  expect_failure 'candidate health check failed after activation' "$installer" --repair --config "$config" >/dev/null
+[[ "$installed_state_before" == "$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")" ]] || fail 'state-deleting candidate health did not restore installed state'
+[[ $(readlink "$root/var/lib/ci-fleet-deployer/deployed/current") == "$deployed_pointer_before" ]] || fail 'state-deleting candidate health did not restore the deployed pointer'
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/deployed/$deployed_pointer_before/"{policy.conf,state.json}) == "$deployed_files_before" ]] || fail 'state-deleting candidate health did not restore the deployed snapshot'
+[[ $(sha256sum "$completed_request") == "$completed_request_before" ]] || fail 'state-deleting candidate health removed the completed request'
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/request.conf") == "$pending_request_before" ]] || fail 'state-deleting candidate health removed the pending request'
+[[ $(stat -c '%a' "$root/var/lib/ci-fleet-deployer/drained") == 600 ]] || fail 'state-deleting candidate health removed protected drain state'
+compgen -G "$root/var/lib/ci-fleet-deployer/.transaction.*" >/dev/null && fail 'state-deleting candidate health left an unrecovered transaction'
+rm "$root/var/lib/ci-fleet-deployer/drained" "$root/var/lib/ci-fleet-deployer/request.conf"
+expect_success "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --check --config "$config" >/dev/null
+
 available_check=$(expect_success "$installer" --check --config "$config")
 grep -Fq 'rollback_available=yes' <<<"$available_check" || fail 'valid completed marker was not reported rollback_available=yes'
 chmod 0666 "$completed_request"
