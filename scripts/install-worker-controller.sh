@@ -1619,6 +1619,8 @@ restore_systemd_snapshot() {
     systemd-run --quiet --no-block --collect --unit="$restore_unit" \
       --property=After=ci-fleet-reconcile.service --property=Type=oneshot --property=TimeoutStartSec=15min \
       /bin/bash "$staged_units/restore-reconcile-unit.sh" "$staged_units" "$systemd_dir" "$lock_file" || return 1
+    ln -s "$staged_units" "$staged_units/pending" || return 1
+    mv -Tf "$staged_units/pending" "$systemd_dir/.ci-fleet-reconcile-unit-restore" || return 1
     # The ordered transient service owns cleanup after the reconcile process exits.
     unset 'staging_paths[-1]'
   fi

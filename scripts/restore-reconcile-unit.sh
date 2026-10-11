@@ -20,6 +20,12 @@ while true; do
   esac
 done
 flock -w 300 9 || die 'installer lock is busy'
+pending=$systemd_dir/.ci-fleet-reconcile-unit-restore
+if [[ $(readlink "$pending") != "$staged_units" ]]; then
+  rm -rf -- "$staged_units"
+  printf 'RECONCILE_UNIT_RESTORE_SUPERSEDED\n'
+  exit 0
+fi
 state=$(systemctl show --property=ActiveState --value "$unit") || die 'cannot determine service state'
 [[ "$state" == inactive || "$state" == failed ]] || die 'reconciliation is still executing'
 cmp -s "$staged_units/current.service" "$systemd_dir/$unit" || die 'a later installer changed the unit'
@@ -31,5 +37,6 @@ else
   rm -f "$systemd_dir/$unit"
 fi
 systemctl daemon-reload
+rm -f -- "$pending"
 rm -rf -- "$staged_units"
 printf 'RECONCILE_UNIT_RESTORED\n'
