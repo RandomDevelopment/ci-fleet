@@ -288,6 +288,19 @@ installed_revision() {
   basename "$target"
 }
 
+installation_matches() {
+  local revision=$1 unit
+  release_complete "$release_dir/$revision" "$revision" || return 1
+  protected_file "$stable_launcher" 555 && cmp -s "$release_dir/$revision/scripts/tester-launcher.sh" "$stable_launcher" || return 1
+  for unit in "${units[@]}"; do
+    protected_file "$systemd_dir/$unit" 644 && cmp -s "$release_dir/$revision/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+  done
+  protected_file "$tmpfiles_dir/$tmpfiles_conf" 644 && cmp -s "$release_dir/$revision/host/systemd/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf" || return 1
+  for unit in "${timers[@]}"; do
+    systemctl is-enabled --quiet "$unit" && systemctl is-active --quiet "$unit" || return 1
+  done
+}
+
 case $action in --install|--upgrade|--check|--reset|--rollback|--uninstall) acquire_lifecycle_lock ;; esac
 
 case $action in
@@ -300,6 +313,12 @@ case $action in
     current=$(installed_revision || true)
     [[ $action != --install || -z $current || $current == "$ref" ]] || die 'tester is already installed at another revision; use --upgrade'
     [[ $action != --upgrade || -n $current ]] || die 'tester is not installed; use --install'
+    if [[ $current == "$ref" ]] && installation_matches "$ref"; then
+      "$stable_launcher" --check
+      "$stable_launcher" --health
+      report "INSTALL_OK source_revision=$ref changed=false"
+      exit 0
+    fi
     stage_release "$ref"; activate_release "$ref"
     ;;
   --check)

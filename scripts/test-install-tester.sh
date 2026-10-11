@@ -278,7 +278,9 @@ rm -rf "$root/run/lock/ci-fleet-tester"
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'current release link is wrong'
 [[ -x $root/opt/ci-fleet-tester/tester-runtime ]] || fail 'stable tester launcher was not installed'
 for service in ci-fleet-tester-health.service ci-fleet-tester-cleanup.service; do grep -Fq 'ExecStart=/opt/ci-fleet-tester/tester-runtime' "$root/etc/systemd/system/$service" || fail "$service bypasses stable launcher"; done
-"$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null
+: >"$tmp/systemctl.log"
+"$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq 'changed=false' || fail 'unchanged install did not report no change'
+if grep -Eq '^(enable|disable|start|daemon-reload)' "$tmp/systemctl.log"; then fail 'unchanged install restarted tester maintenance'; fi
 check_output=$("$installer" --check --config /etc/ci-fleet-tester/tester.env)
 grep -Fq CHECK_OK <<<"$check_output" || fail 'installed check failed'
 stable_launcher=$root/opt/ci-fleet-tester/tester-runtime
