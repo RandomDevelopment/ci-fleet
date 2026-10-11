@@ -48,7 +48,7 @@ complete_deferred() {
     rm -f "$expected_dir/$reconcile_unit"
   fi
   local environment=$tmp/deferred-env
-  declare -p tmp systemd_dir expected_dir calls unit_names optional_unit_names reconcile_unit modeled_service_state model_running_service fail_reload fail_show fail_timer >"$environment"
+  declare -p tmp systemd_dir expected_dir calls unit_names optional_unit_names reconcile_unit modeled_service_state modeled_state_file model_running_service fail_reload fail_show fail_timer >"$environment"
   declare -f systemctl fail >>"$environment"
   BASH_ENV="$environment" "${deferred_command[@]}"
 }
@@ -60,7 +60,14 @@ systemctl() {
   case "$action" in
     show)
       [[ ${fail_show:-false} != true ]] || return 1
-      printf '%s\n' "$modeled_service_state"
+      if [[ -n ${modeled_state_file:-} ]]; then
+        local queried_state
+        queried_state=$(cat "$modeled_state_file")
+        printf '%s\n' "$queried_state"
+        if [[ "$queried_state" == activating ]]; then : >"$tmp/deferred-state-query"; fi
+      else
+        printf '%s\n' "$modeled_service_state"
+      fi
       ;;
     daemon-reload)
       # This is a timeout model, not a real systemd timing test. Recovery takes
@@ -100,6 +107,7 @@ systemctl() {
 }
 
 reset_fixture() {
+  rm -f "$tmp/deferred-env" "$tmp/deferred-state-query"
   rm -rf "$systemd_dir" "$checkpoint_dir" "$expected_dir" "$tmp/enabled" "$tmp/active"
   mkdir -p "$systemd_dir" "$checkpoint_dir/systemd" "$expected_dir" "$tmp/enabled" "$tmp/active"
   : >"$calls"
@@ -107,6 +115,7 @@ reset_fixture() {
   staging_paths=()
   deferred_command=()
   modeled_service_state=activating model_running_service=true
+  modeled_state_file=''
   local unit
   for unit in "${unit_names[@]}" "${optional_unit_names[@]}"; do
     cp "$repo_root/host/systemd/$unit" "$checkpoint_dir/systemd/$unit"
@@ -145,6 +154,22 @@ reset_fixture
 sed -i '/^TimeoutStartSec=/d; /^TimeoutStopSec=/d' "$checkpoint_dir/systemd/$reconcile_unit"
 restore_systemd_snapshot || fail 'older checkpoint dropped the live timeout budgets'
 complete_deferred || fail 'older unit was not restored after execution'
+
+reset_fixture
+restore_systemd_snapshot || fail 'could not queue execution-wait fixture'
+modeled_state_file=$tmp/service-state
+printf 'activating\n' >"$modeled_state_file"
+complete_deferred >"$tmp/deferred-wait.log" 2>&1 &
+deferred_pid=$!
+for ((attempt = 0; attempt < 200; attempt++)); do
+  [[ ! -f "$tmp/deferred-state-query" ]] || break
+  sleep 0.05
+done
+[[ -f "$tmp/deferred-state-query" ]] || fail 'deferred helper did not wait for the executing service'
+cmp -s "$systemd_dir/$reconcile_unit" "$expected_dir/$reconcile_unit" || fail 'deferred helper changed a running service'
+printf 'inactive\n' >"$modeled_state_file"
+wait "$deferred_pid" || fail 'deferred helper did not finish after the service exited'
+cmp -s "$systemd_dir/$reconcile_unit" "$checkpoint_dir/systemd/$reconcile_unit" || fail 'deferred helper did not restore the unit'
 
 for state in activating active reloading deactivating; do
   reset_fixture
