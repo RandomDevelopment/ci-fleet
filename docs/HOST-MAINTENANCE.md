@@ -109,12 +109,22 @@ image removal, and builder pruning participate in proxy protocol `v2` alongside
 builds and container reference mutations. Storage removal defers with older
 proxies. Image-load uploads use the same 1 GiB spool limit as build contexts.
 Image imports use that bounded spool too and share its two upload slots.
+Registry pulls and imports from remote URLs bypass upload slots while retaining
+the maintenance lock.
 Neither an installer nor a new job can enter while maintenance applies.
 An interrupted or uncertain removal blocks subsequent mutations until a host
 reboot changes its boot identity. Confirmed daemon rejections clear their marker
 and fail the service. A failure to launch the Docker client clears its marker
 because no request was dispatched. Cleanup never forces removal, stops active
 work, or prunes volumes globally.
+
+All raw removals share a fourteen-minute process budget, including preceding
+diagnostics and idle waits. Before creating a removal marker, cleanup checks
+that the command's full timeout fits that budget. Otherwise it defers remaining
+candidates without creating uncertainty. Network commands and other Docker
+inventory queries have a thirty-second timeout. This leaves a minute before
+the service's fifteen-minute termination limit; later timer passes can continue
+through a large expired-resource backlog.
 
 The service reports measured filesystem use after applying. If protected or
 recent resources prevent reaching 65%, it reports insufficient headroom and

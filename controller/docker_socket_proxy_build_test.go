@@ -88,6 +88,17 @@ func TestDockerSocketProxyBoundsConcurrentUploads(t *testing.T) {
 	if response.Code != http.StatusRequestTimeout || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("third upload bypassed the spool limit: status = %d", response.Code)
 	}
+	for _, query := range []string{"fromImage=example:latest", "fromSrc=https://example.invalid/rootfs.tar"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		request := httptest.NewRequest(http.MethodPost, "http://docker/v1.48/images/create?"+query, nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		cancel()
+		// The absent daemon must be reached even while both upload slots are occupied.
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("non-upload image creation waited for a spool slot: status = %d", response.Code)
+		}
+	}
 }
 
 func TestDockerSocketProxyReleasesSpoolBeforeBuildResponseCompletes(t *testing.T) {

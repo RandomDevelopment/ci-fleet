@@ -356,7 +356,8 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 		}
 		if dockerReferenceMutation(request.Method, request.URL.Path) && request.Body != nil {
 			path := dockerAPIVersion.ReplaceAllString(request.URL.Path, "/")
-			if path == "/build" || path == "/images/load" || path == "/images/create" {
+			if path == "/build" || path == "/images/load" ||
+				(path == "/images/create" && request.URL.Query().Get("fromSrc") == "-" && request.URL.Query().Get("fromImage") == "") {
 				if request.ContentLength > dockerBuildContextLimit {
 					http.Error(w, "build context exceeds 1 GiB", http.StatusRequestEntityTooLarge)
 					return

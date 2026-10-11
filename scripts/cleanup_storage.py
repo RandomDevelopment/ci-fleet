@@ -119,7 +119,7 @@ def cache_reason(record: dict, now: int) -> str:
 
 
 def mutate(*args: str, timeout: float) -> None:
-    marker = coordination.removal_marker()
+    marker = coordination.removal_marker(timeout=timeout)
     try:
         process = subprocess.Popen(["docker", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError:
@@ -275,7 +275,7 @@ def cleanup_storage(*, apply: bool) -> None:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
             raise ValueError("invalid Docker image identity")
         aliases = [tag for tag in (image.get("RepoTags") or []) if tag != "<none>:<none>"]
-        if any(not re.fullmatch(r"[A-Za-z0-9._/:@-]+", tag) or tag.startswith("-") for tag in aliases):
+        if any(not re.fullmatch(r"[A-Za-z0-9._/:@\[\]-]+", tag) or tag.startswith("-") for tag in aliases):
             raise ValueError("invalid Docker image reference")
         mutate("image", "rm", "--no-prune", "--", *(aliases or [identity]), timeout=max(0.1, deadline - time.monotonic()))
         print(f"REMOVE image {identity}", flush=True)
@@ -312,5 +312,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except coordination.MaintenanceDeferred as error:
+        print(f"DEFER {error}")
     except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError) as error:
         raise SystemExit(f"ERROR fleet cleanup failed: {error}") from error

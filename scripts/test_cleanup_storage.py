@@ -106,6 +106,52 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(mutations)
         self.assertIn("old-or-uncoordinated-proxy", output)
 
+    def test_ipv6_registry_tag_is_removed_without_blocking_later_candidates(self):
+        accounting = usage()
+        tag = "[2001:db8::1]:5000/team/image:old"
+        accounting["Images"] = [image(RepoTags=[tag]), image(identity=OTHER, RepoTags=["example:other"])]
+        _, mutations = self.run_storage(accounting=accounting)
+        self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", tag))
+        self.assertEqual(mutations[1].args[-1], "example:other")
+        self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
+
+    def test_service_deadline_stops_expired_resources_before_creating_uncertainty(self):
+        labels = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}
+        for resource in ("container", "volume"):
+            with self.subTest(resource=resource), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+                boot = Path(directory) / "proc/sys/kernel/random/boot_id"
+                boot.parent.mkdir(parents=True)
+                boot.write_text(BOOT_ID)
+                # An idle wait has already spent ten of the service's fifteen minutes.
+                clock = [600]
+                items = [{"Id": f"fixture-{index}", "State": "exited", "Labels": labels} for index in range(100)]
+                def docker(*args):
+                    if args[:2] == ("volume", "ls"):
+                        return "\n".join(item["Id"] for item in items) if resource == "volume" else ""
+                    if args[:2] == ("volume", "inspect"):
+                        return json.dumps([{"Labels": labels}])
+                    return ""
+                def completed(**_kwargs):
+                    clock[0] += 25
+                    return "", ""
+                with patch.object(cleanup.time, "monotonic", side_effect=lambda: clock[0]), \
+                     patch.object(cleanup.coordination, "SERVICE_DEADLINE", 840), \
+                     patch.object(cleanup.coordination, "docker", side_effect=docker), \
+                     patch.object(cleanup.subprocess, "Popen") as popen, redirect_stdout(io.StringIO()):
+                    popen.return_value.returncode = 0
+                    popen.return_value.communicate.side_effect = completed
+                    with self.assertRaises(cleanup.coordination.MaintenanceDeferred):
+                        cleanup.cleanup_expired(apply=True, instance="fixture", usage={"Containers": items if resource == "container" else []})
+                    self.assertEqual(popen.call_count, 9)
+                    self.assertFalse(cleanup.coordination.pending_requests("removals"))
+                    with self.assertRaises(cleanup.coordination.MaintenanceDeferred):
+                        cleanup.mutate("image", "rm", IMAGE, timeout=120)
+                    with self.assertRaises(cleanup.coordination.MaintenanceDeferred):
+                        cleanup.coordination.remove_network("fixture-network")
+                    self.assertEqual(popen.call_count, 9)
+                    self.assertFalse(cleanup.coordination.pending_requests("removals"))
+                self.assertLess(clock[0], 840)
+
     def test_checkpoint_ids_and_aliases_are_protected_and_symlinks_fail(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
             current = Path(directory) / "etc/ci-fleet/ci-fleet.env"
