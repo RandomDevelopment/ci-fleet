@@ -1,10 +1,10 @@
 [Unit]
-Description=Run scoped ci-fleet cleanup daily
+Description=Run scoped ci-fleet cleanup hourly
 
 [Timer]
 OnBootSec=15min
-OnCalendar=daily
-RandomizedDelaySec=30min
+OnCalendar=hourly
+RandomizedDelaySec=5min
 Persistent=true
 
 [Install]

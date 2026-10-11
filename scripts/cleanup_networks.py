@@ -142,7 +142,7 @@ def active_work() -> bool:
         mounts = item.get("Mounts") or []
         coordinated = (
             labels.get("com.docker.compose.project") == "ci-fleet"
-            and labels.get(PROXY_PROTOCOL_LABEL) == "v1"
+            and labels.get(PROXY_PROTOCOL_LABEL) in {"v1", "v2"}
             and any(mount.get("Type") == "bind" and mount.get("RW") is True
                     and mount.get("Source") == str(host_path("/run/lock/ci-fleet"))
                     and mount.get("Destination") == "/run/ci-fleet/locks" for mount in mounts)
@@ -288,9 +288,11 @@ def remove_networks(*, apply: bool, instance: str, pools: list[ipaddress.IPv4Net
             print(f"WOULD_REMOVE network {name} {reason}")
 
 
-def cleanup_networks(*, apply: bool, instance: str) -> None:
+def cleanup_networks(*, apply: bool, instance: str, maintenance=None) -> None:
     pools = configured_pools()
     if not apply:
+        if maintenance is not None:
+            maintenance(False)
         remove_networks(apply=False, instance=instance, pools=pools)
         return
     with ExitStack() as stack:
@@ -322,6 +324,8 @@ def cleanup_networks(*, apply: bool, instance: str) -> None:
                     else:
                         idle_checks += 1
                         if idle_checks == 2:
+                            if maintenance is not None:
+                                maintenance(True)
                             remove_networks(apply=True, instance=instance, pools=pools)
                             return
                 finally:

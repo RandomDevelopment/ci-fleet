@@ -33,11 +33,15 @@ const dockerBuildUploadLimit = 2
 var dockerAPIVersion = regexp.MustCompile(`^/v[0-9]+\.[0-9]+/`)
 
 func dockerReferenceMutation(method, path string) bool {
+	path = dockerAPIVersion.ReplaceAllString(path, "/")
+	if method == http.MethodDelete && strings.HasPrefix(path, "/images/") {
+		return true
+	}
 	if method != http.MethodPost {
 		return false
 	}
-	path = dockerAPIVersion.ReplaceAllString(path, "/")
-	if path == "/containers/create" || path == "/build" || path == "/swarm/init" || path == "/swarm/join" {
+	if path == "/containers/create" || path == "/build" || path == "/swarm/init" || path == "/swarm/join" ||
+		strings.HasPrefix(path, "/images/") || path == "/build/prune" || path == "/commit" {
 		return true
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -351,7 +355,8 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 			return
 		}
 		if dockerReferenceMutation(request.Method, request.URL.Path) && request.Body != nil {
-			if dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/build" {
+			path := dockerAPIVersion.ReplaceAllString(request.URL.Path, "/")
+			if path == "/build" || path == "/images/load" {
 				if request.ContentLength > dockerBuildContextLimit {
 					http.Error(w, "build context exceeds 1 GiB", http.StatusRequestEntityTooLarge)
 					return

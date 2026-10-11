@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Storage retention, rollback protection, and host cleanup regressions."""
+
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import cleanup_storage as cleanup
+from test_cleanup_networks import BOOT_ID
+
+
+NOW = 1800000000
+IMAGE = "sha256:" + "a" * 64
+OTHER = "sha256:" + "b" * 64
+OLD = NOW - cleanup.AGE_SECONDS - 1
+
+
+def image(identity=IMAGE, **changes):
+    return {"Id": identity, "RepoTags": ["example:old"], "RepoDigests": [], "Containers": 0,
+            "Labels": {}, "Created": OLD, **changes}
+
+
+def cache(**changes):
+    return {"ID": "cache-1", "InUse": False, "LastUsedAt": datetime.fromtimestamp(OLD, timezone.utc).isoformat(), **changes}
+
+
+def usage():
+    return {"Images": [image()], "Containers": [], "BuildCache": [cache()]}
+
+
+class StorageTests(unittest.TestCase):
+    def test_retention_decisions(self):
+        for change, references, protected, expected in [
+            ({}, set(), set(), "eligible"),
+            ({}, {IMAGE}, set(), "container-reference-or-unknown-use"),
+            ({"Containers": -1}, set(), set(), "container-reference-or-unknown-use"),
+            ({}, set(), {"example:old"}, "installed-or-checkpoint-release"),
+            ({}, set(), {IMAGE}, "installed-or-checkpoint-release"),
+            ({"Labels": {cleanup.PREFIX + "retention": "keep"}}, set(), set(), "explicit-keep"),
+            ({"Created": NOW - 30}, set(), set(), "recent-or-unknown-age"),
+            ({"Created": None}, set(), set(), "recent-or-unknown-age"),
+            ({"Created": NOW + 1}, set(), set(), "recent-or-unknown-age"),
+        ]:
+            with self.subTest(change=change, protected=protected):
+                self.assertEqual(cleanup.image_reason(image(**change), references, protected, NOW), expected)
+        for changes, expected in [({}, "eligible-subject-to-cache-reserve"),
+                                  ({"InUse": True}, "active-or-unknown-use"),
+                                  ({"InUse": None}, "active-or-unknown-use"),
+                                  ({"LastUsedAt": None}, "unknown-last-use"),
+                                  ({"LastUsedAt": "2020-01-01"}, "unknown-last-use"),
+                                  ({"LastUsedAt": datetime.fromtimestamp(NOW, timezone.utc).isoformat()}, "recent-last-use")]:
+            self.assertEqual(cleanup.cache_reason(cache(**changes), NOW), expected)
+
+    def run_storage(self, *, apply=True, admitted=True, accounting=None, disk=None):
+        output = io.StringIO()
+        env = {"CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION} if admitted else {}
+        with patch.dict(os.environ, env, clear=True), patch.object(cleanup, "docker_usage", return_value=accounting or usage()), \
+             patch.object(cleanup, "disk_percent", side_effect=disk or [81] * 10), \
+             patch.object(cleanup, "protected_images", return_value=set()), \
+             patch.object(cleanup, "mutate") as mutate, patch.object(cleanup.time, "time", return_value=NOW), redirect_stdout(output):
+            cleanup.cleanup_storage(apply=apply)
+        return output.getvalue(), mutate.call_args_list
+
+    def test_dry_run_no_admission_and_below_trigger_never_mutate(self):
+        for options in ({"apply": False}, {"admitted": False}, {"disk": [69]}):
+            output, mutations = self.run_storage(**options)
+            self.assertFalse(mutations)
+            self.assertIn("KEEP storage", output)
+        output, _ = self.run_storage(apply=False)
+        self.assertIn("ELIGIBLE image", output)
+        self.assertIn("ELIGIBLE build-cache", output)
+
+    def test_maintenance_reclaims_then_restores_upgrade_headroom(self):
+        output, mutations = self.run_storage(disk=[81, 81, 76, 64])
+        self.assertEqual(mutations[0].args, ("image", "rm", "--no-prune", "--", "example:old"))
+        self.assertEqual(mutations[1].args, ("builder", "prune", "--all", "--force", "--filter", "until=168h", "--keep-storage", str(cleanup.CACHE_KEEP_BYTES)))
+        self.assertIn("after=64%", output)
+        self.assertNotIn("headroom-insufficient", output)
+
+    def test_stops_at_headroom_target_and_reports_insufficient_capacity(self):
+        _, mutations = self.run_storage(disk=[70, 65, 65, 65])
+        self.assertFalse(mutations)
+        output, _ = self.run_storage()
+        self.assertIn("headroom-insufficient", output)
+
+    def test_image_count_bound_and_unknown_cache_preserved(self):
+        accounting = usage()
+        accounting["Images"] = [image(identity="sha256:" + f"{index:064x}", RepoTags=[]) for index in range(60)]
+        accounting["BuildCache"] = [cache(LastUsedAt="invalid")]
+        _, mutations = self.run_storage(accounting=accounting, disk=[81] * 100)
+        self.assertEqual(len(mutations), cleanup.MAX_IMAGES)
+        self.assertTrue(all(call.args[0] == "image" for call in mutations))
+
+    def test_old_proxy_defers_storage(self):
+        accounting = usage()
+        accounting["Containers"] = [{"ImageID": OTHER, "State": "running", "Labels": {cleanup.coordination.PROXY_PROTOCOL_LABEL: "v1"}}]
+        output, mutations = self.run_storage(accounting=accounting)
+        self.assertFalse(mutations)
+        self.assertIn("old-or-uncoordinated-proxy", output)
+
+    def test_checkpoint_ids_and_aliases_are_protected_and_symlinks_fail(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+            current = Path(directory) / "etc/ci-fleet/ci-fleet.env"
+            current.parent.mkdir(parents=True)
+            current.write_text("CI_FLEET_RUNNER_IMAGE=runner:current\nCI_FLEET_CONTROLLER_IMAGE=controller:current\n")
+            checkpoint = Path(directory) / "var/lib/ci-fleet/checkpoints/previous"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "ci-fleet.env").write_text("CI_FLEET_RUNNER_IMAGE=runner:previous\n")
+            ids = checkpoint / "image-ids.env"
+            ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={IMAGE}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
+            self.assertEqual(cleanup.protected_images(), {"runner:current", "controller:current", "runner:previous", IMAGE})
+            ids.unlink()
+            ids.symlink_to(current)
+            with self.assertRaises(ValueError):
+                cleanup.protected_images()
+
+    def test_uncertain_mutation_blocks_later_maintenance(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+            boot = Path(directory) / "proc/sys/kernel/random/boot_id"
+            boot.parent.mkdir(parents=True)
+            boot.write_text(BOOT_ID)
+            failure = subprocess.TimeoutExpired(["docker", "builder", "prune"], 1)
+            with patch.object(cleanup.subprocess, "run", side_effect=failure), self.assertRaisesRegex(ValueError, "uncertain"):
+                cleanup.mutate("builder", "prune", timeout=1)
+            self.assertTrue(cleanup.coordination.pending_requests("removals"))
+
+    def test_terminal_run_labels_only_report_and_unlabelled_compose_is_unknown(self):
+        accounting = usage()
+        accounting["Containers"] = [
+            {"Id": "terminal", "State": "running", "Labels": {"com.docker.compose.project": "fixture", cleanup.PREFIX + "run-id": "123"}},
+            {"Id": "legacy", "State": "running", "Labels": {"com.docker.compose.project": "fixture-123"}},
+        ]
+        with patch.object(cleanup.RunStatus, "get", side_effect=["terminal-run-leftover", "unknown-missing-run-identity"]), \
+             patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()) as output:
+            cleanup.report_workloads(accounting)
+        self.assertIn("terminal-run-leftover", output.getvalue())
+        self.assertIn("unknown-missing-run-identity", output.getvalue())
+        mutate.assert_not_called()
+
+    def test_run_status_uses_exact_attempt_and_keeps_credentials_out_of_report(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"id": 123, "run_attempt": 2, "status": "completed"}).encode()
+        opener = unittest.mock.Mock()
+        opener.open.return_value = response
+        with patch.object(cleanup.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="fixture-token")), \
+             patch.object(cleanup.urllib.request, "build_opener", return_value=opener):
+            runs = cleanup.RunStatus()
+            self.assertEqual(runs.get("example-org/example-app", "123", "2"), "terminal-run-leftover")
+            self.assertEqual(runs.get("example-org/example-app", "123", "2"), "terminal-run-leftover")
+        opener.open.assert_called_once()
+        request = opener.open.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/runs/123/attempts/2"))
+
+    def test_success_failure_cancellation_timeout_host_layer_without_trap(self):
+        for outcome in ("success", "failure", "cancellation", "timeout"):
+            with self.subTest(outcome=outcome):
+                accounting = usage()
+                accounting["Containers"] = [{"Id": outcome, "State": "exited", "Labels": {
+                    cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}}]
+                calls = []
+                with patch.object(cleanup.coordination, "docker", side_effect=lambda *args: calls.append(args) or ""), \
+                     patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
+                    cleanup.cleanup_expired(apply=True, instance="fixture", usage=accounting)
+                mutate.assert_called_once_with("rm", "-v", outcome, timeout=30)
+                accounting["Containers"][0]["State"] = "running"
+                with patch.object(cleanup.coordination, "docker", return_value=""), patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
+                    cleanup.cleanup_expired(apply=True, instance="fixture", usage=accounting)
+                mutate.assert_not_called()
+
+    def test_referenced_and_unowned_volumes_survive(self):
+        labels = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}
+        def docker(*args):
+            if args[:2] == ("volume", "ls"):
+                return "owned"
+            if args[:2] == ("volume", "inspect"):
+                return json.dumps([{"Labels": labels}])
+            return "stopped-container"
+        with patch.object(cleanup.coordination, "docker", side_effect=docker), patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
+            cleanup.cleanup_expired(apply=True, instance="fixture", usage={"Containers": []})
+        mutate.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

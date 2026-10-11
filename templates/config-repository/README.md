@@ -1,5 +1,10 @@
 # ci-fleet configuration template
 
+Optional controller policy `docker_storage_retention: {"exclusive_fleet_daemon": true}`
+admits image/default-builder cache reclamation on an isolated disposable-CI daemon.
+Leave it absent until a compatible engine is active and existing storage has been
+inventoried. See the [retention and activation contract](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/HOST-MAINTENANCE.md#docker-storage-retention).
+
 This is the public, secret-free starting point for an organization's private `ci-fleet` configuration repository. It records which trusted projects may use each CI pool, the reviewed desired state for controller machines, infrastructure capacity budgets, logical deployment environments, and the standardized commands every project must expose.
 
 It does **not** contain runner registration tokens, deploy credentials, private keys, host addresses, VM IDs, storage names, backup identifiers, or `.env` files.

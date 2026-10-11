@@ -89,73 +89,77 @@ func proxyMarkerCount(t *testing.T, fixture *socketProxyTest) int {
 	return len(markers)
 }
 
-func TestDockerSocketProxyCancelledCreateRetainsMaintenanceLock(t *testing.T) {
-	admitted, finish := make(chan struct{}), make(chan struct{})
-	var created atomic.Bool
-	fixture := newSocketProxyTest(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		io.Copy(io.Discard, request.Body)
-		close(admitted)
-		<-finish
-		created.Store(true)
-		io.WriteString(w, `{"Id":"created"}`)
-	}))
-	t.Cleanup(func() {
-		select {
-		case <-finish:
-		default:
+func TestDockerSocketProxyCancelledMutationRetainsMaintenanceLock(t *testing.T) {
+	for _, route := range []string{"/v1.48/containers/create", "/v1.48/images/create", "/v1.48/images/load", "/v1.48/images/example/tag", "/v1.48/build/prune"} {
+		t.Run(route, func(t *testing.T) {
+			admitted, finish := make(chan struct{}), make(chan struct{})
+			var created atomic.Bool
+			fixture := newSocketProxyTest(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				io.Copy(io.Discard, request.Body)
+				close(admitted)
+				<-finish
+				created.Store(true)
+				io.WriteString(w, `{"Id":"created"}`)
+			}))
+			t.Cleanup(func() {
+				select {
+				case <-finish:
+				default:
+					close(finish)
+				}
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker"+route, strings.NewReader(`{"Image":"example"}`))
+			responseDone := make(chan error, 1)
+			go func() {
+				response, err := fixture.client.Do(request)
+				if response != nil {
+					response.Body.Close()
+				}
+				responseDone <- err
+			}()
+			select {
+			case <-admitted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("create was not admitted")
+			}
+			if proxyMarkerCount(t, fixture) != 1 {
+				t.Fatal("mutation dispatched without a durable marker")
+			}
+			cancel()
+			select {
+			case err := <-responseDone:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("frontend cancellation did not complete: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("frontend cancellation blocked")
+			}
+			cleanupLock, err := openDockerMaintenanceLock(fixture.lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanupLock.Close()
+			if err := syscall.Flock(int(cleanupLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+				t.Fatalf("cancelled mutation released its shared lock early: %v", err)
+			}
 			close(finish)
-		}
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/v1.48/containers/create", strings.NewReader(`{"Image":"example"}`))
-	responseDone := make(chan error, 1)
-	go func() {
-		response, err := fixture.client.Do(request)
-		if response != nil {
-			response.Body.Close()
-		}
-		responseDone <- err
-	}()
-	select {
-	case <-admitted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("create was not admitted")
-	}
-	if proxyMarkerCount(t, fixture) != 1 {
-		t.Fatal("mutation dispatched without a durable marker")
-	}
-	cancel()
-	select {
-	case err := <-responseDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("frontend cancellation did not complete: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("frontend cancellation blocked")
-	}
-	cleanupLock, err := openDockerMaintenanceLock(fixture.lockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanupLock.Close()
-	if err := syscall.Flock(int(cleanupLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
-		t.Fatalf("cancelled create released its shared lock early: %v", err)
-	}
-	close(finish)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		err = syscall.Flock(int(cleanupLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) || time.Now().After(deadline) {
-			t.Fatalf("completed create retained its lock: %v", err)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	// Cleanup's final membership check can only run after daemon registration.
-	if !created.Load() || proxyMarkerCount(t, fixture) != 0 {
-		t.Fatal("cleanup could delete before the cancelled create registered its container")
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				err = syscall.Flock(int(cleanupLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, syscall.EWOULDBLOCK) || time.Now().After(deadline) {
+					t.Fatalf("completed mutation retained its lock: %v", err)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			// Cleanup's final membership check can only run after daemon registration.
+			if !created.Load() || proxyMarkerCount(t, fixture) != 0 {
+				t.Fatal("cleanup could delete before the cancelled mutation registered its container")
+			}
+		})
 	}
 }
 
@@ -445,7 +449,7 @@ func TestDockerSocketProxyRefusesUnresolvedRemoval(t *testing.T) {
 }
 
 func TestDockerReferenceMutationRoutes(t *testing.T) {
-	for _, path := range []string{"/containers/create", "/v1.48/containers/create", "/containers/runner/start", "/containers//runner/start", "/containers/runner/restart", "/containers/runner/unpause", "/networks/job/connect", "/v1.48/build", "/swarm/init", "/v1.48/swarm/join"} {
+	for _, path := range []string{"/containers/create", "/v1.48/containers/create", "/containers/runner/start", "/containers//runner/start", "/containers/runner/restart", "/containers/runner/unpause", "/networks/job/connect", "/v1.48/build", "/swarm/init", "/v1.48/swarm/join", "/images/create", "/images/load", "/images/image/tag", "/images/prune", "/build/prune", "/commit"} {
 		if !dockerReferenceMutation(http.MethodPost, path) {
 			t.Errorf("reference mutation was not guarded: %s", path)
 		}
@@ -457,6 +461,9 @@ func TestDockerReferenceMutationRoutes(t *testing.T) {
 	}
 	if dockerReferenceMutation(http.MethodGet, "/v1.48/events") {
 		t.Fatal("readonly stream was guarded")
+	}
+	if !dockerReferenceMutation(http.MethodDelete, "/v1.48/images/image") {
+		t.Fatal("image deletion was not guarded")
 	}
 }
 

@@ -48,6 +48,28 @@ def docker_network_policy() -> dict:
 
 
 class DesiredStateTests(unittest.TestCase):
+    def test_storage_retention_requires_exclusive_admission_and_engine_support(self):
+        value = config()
+        controller = value["controllers"]["example-ci-01"]
+        controller["docker_storage_retention"] = {"exclusive_fleet_daemon": True}
+        with self.assertRaisesRegex(DesiredStateError, "does not support Docker storage retention"):
+            self.render(value)
+        capabilities = load_engine_capabilities(ROOT / "engine-capabilities.json")
+        environment, _ = self.render(value, capabilities)
+        self.assertEqual(environment["CI_FLEET_DOCKER_STORAGE_RETENTION"], "exclusive-fleet-daemon-v1")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value))
+            load_and_validate_config(path)
+            for invalid in (None, False, {"exclusive_fleet_daemon": False}, {"exclusive_fleet_daemon": 1},
+                            {"exclusive_fleet_daemon": True, "allow_global_prune": True}):
+                controller["docker_storage_retention"] = invalid
+                path.write_text(json.dumps(value))
+                with self.assertRaises(DesiredStateError):
+                    load_and_validate_config(path)
+                with self.assertRaises(DesiredStateError):
+                    self.render(value, capabilities)
+
     def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
             value or config(),
