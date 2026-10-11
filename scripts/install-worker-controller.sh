@@ -267,7 +267,7 @@ verify_configuration_approval() {
   "$repo_root/scripts/github-app-token.sh" --env-file "$token_env" >"$approval_token" 2>"$temporary/approval-token.err" \
     || die 'configuration approval authentication unavailable'
   python3 "$repo_root/scripts/verify_config_approval.py" --policy "$config_review_policy" \
-    --repository "$config_identity" --commit "$config_ref" --tree "$config_tree" <"$approval_token" \
+    --repository "$config_identity" --commit "$config_ref" --tree "$config_tree" --installed-state "$state_file" <"$approval_token" \
     || die 'configuration approval rejected'
 }
 

@@ -43,6 +43,9 @@ adapter's resume action, the trusted verifier requires all of the following:
 
 1. The exact candidate SHA is the result of one merged PR targeting the trusted
    repository and branch. Direct pushes and ambiguous results are rejected.
+   On an existing installation, it must preserve the installed configuration
+   commit's ancestry. Force-pushing a previously approved older commit cannot
+   roll the host back or replace its accepted history.
 2. Its Git tree equals the current reviewed PR head's tree. This supports squash
    commits without treating approval of different source content as equivalent.
    Its first parent must be an ancestor of the reviewed head, and a two-parent

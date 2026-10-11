@@ -435,7 +435,7 @@ note "RESOLVED desired_ref=${desired_commit}"
 if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_review_required" || -L "$config_review_required" ]]; then
   desired_tree=$(git -C "$temp_dir/config-repo" rev-parse "$desired_commit^{tree}") || die 'configuration tree is unavailable'
   if ! printf '%s' "$token" | python3 "$script_dir/verify_config_approval.py" --policy "$config_review_policy" \
-    --repository "$installed_config_repo" --commit "$desired_commit" --tree "$desired_tree"; then
+    --repository "$installed_config_repo" --commit "$desired_commit" --tree "$desired_tree" --installed-state "$state_file"; then
     save_reconcile_state 'invalid' "$desired_commit" "$installed_config_ref" 'unknown' 'configuration approval rejected'
     exit 3
   fi

@@ -85,6 +85,28 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Rejected("GitHub API redirect rejected")
 
 
+def read_installed_commit(path: Path, repository: str, owner: int = 0) -> str | None:
+    for parent in path.parents:
+        try:
+            metadata = parent.lstat()
+        except FileNotFoundError:
+            continue
+        require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid in {0, owner} and not metadata.st_mode & 0o022,
+                "installed state parent is not trusted")
+    if not path.exists() and not path.is_symlink():
+        return None
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as handle:
+        metadata = os.fstat(handle.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and not metadata.st_mode & 0o022
+                and metadata.st_size <= 1024 * 1024, "installed state is not trusted")
+        installed = json.load(handle, object_pairs_hook=unique_object)
+    require(installed["config_repository"].lower() == repository.lower(), "installed repository identity differs")
+    previous = installed["config_ref"]
+    require(isinstance(previous, str) and bool(SHA.fullmatch(previous)), "installed configuration SHA is invalid")
+    return previous
+
+
 class GitHub:
     def __init__(self, token: str):
         require(bool(token) and "\n" not in token and "\r" not in token, "installation token is unavailable")
@@ -178,7 +200,8 @@ def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
     return max(evidence_timestamp(timestamp) for timestamp in timestamps), run["id"]
 
 
-def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str) -> None:
+def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str,
+           previous_commit: str | None = None) -> None:
     require(bool(REPOSITORY.fullmatch(repository)) and bool(SHA.fullmatch(commit)) and bool(SHA.fullmatch(tree)),
             "approval requires a repository, full commit SHA, and local tree SHA")
     prefix = f"/repos/{repository}"
@@ -188,6 +211,11 @@ def verify(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tr
     candidate = api.get(f"{prefix}/git/commits/{commit}")
     require(candidate.get("sha") == commit and candidate.get("tree", {}).get("sha") == tree,
             "local candidate does not match GitHub commit tree")
+    if previous_commit is not None and previous_commit != commit:
+        require(bool(SHA.fullmatch(previous_commit)), "installed configuration SHA is invalid")
+        lineage = api.get(f"{prefix}/compare/{previous_commit}...{commit}")
+        require(lineage.get("merge_base_commit", {}).get("sha") == previous_commit and lineage.get("status") == "ahead",
+                "candidate rewrites or replays older installed configuration history")
     associated = api.pages(f"{prefix}/commits/{commit}/pulls")
     matches = [pr for pr in associated if pr.get("merge_commit_sha") == commit and pr.get("merged_at")]
     require(len(matches) == 1 and positive_id(matches[0].get("number")), "candidate must be the unique merged PR result")
@@ -252,6 +280,7 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--tree", required=True)
+    parser.add_argument("--installed-state", type=Path, required=True)
     args = parser.parse_args()
 
     def deadline_expired(_signal: int, _frame: Any) -> None:
@@ -261,7 +290,8 @@ def main() -> int:
     signal.setitimer(signal.ITIMER_REAL, 120)
     try:
         policy = read_policy(args.policy)
-        verify(GitHub(sys.stdin.read(8192).strip()), policy, args.repository, args.commit, args.tree)
+        previous = read_installed_commit(args.installed_state, args.repository)
+        verify(GitHub(sys.stdin.read(8192).strip()), policy, args.repository, args.commit, args.tree, previous)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # API responses, policy contents, and authentication material are never logged.
         print("ERROR: configuration approval rejected or evidence unavailable", file=sys.stderr)

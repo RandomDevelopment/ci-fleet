@@ -17,7 +17,7 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
-from verify_config_approval import GitHub, NoRedirect, Rejected, read_policy, verify
+from verify_config_approval import GitHub, NoRedirect, Rejected, read_installed_commit, read_policy, verify
 import verify_config_approval
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +74,17 @@ class FixtureAPI(GitHub):
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_existing_hosts_reject_replay_or_divergence_from_the_installed_commit(self):
+        previous = "6" * 40
+        path = f"{PREFIX}/compare/{previous}...{COMMIT}"
+        data = evidence()
+        data[path] = {"merge_base_commit": {"sha": previous}, "status": "ahead"}
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE, previous)
+        verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE, COMMIT)
+        for status in ("behind", "diverged", "identical"):
+            data[path] = {"merge_base_commit": {"sha": PARENT}, "status": status}
+            with self.subTest(status=status), self.assertRaises(Rejected):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE, previous)
     def test_retargeting_requires_a_new_approval_in_the_main_branch_context(self):
         data = evidence()
         nodes = data["/graphql"]["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
@@ -233,6 +244,11 @@ class ApprovalTests(unittest.TestCase):
         data[run_path]["workflow_runs"].append(newer)
         with self.assertRaises(Rejected):
             verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        for conclusion in ("failure", "cancelled"):
+            newer.update(status="completed", conclusion=conclusion)
+            with self.subTest(newer_conclusion=conclusion), self.assertRaises(Rejected):
+                verify(FixtureAPI(data), POLICY, REPOSITORY, COMMIT, TREE)
+        newer.update(status="in_progress", conclusion=None)
         older_id_rerun = copy.deepcopy(newer)
         older_id_rerun.update(id=699, created_at="2025-12-31T00:00:00Z", run_started_at="2026-01-02T00:00:00Z",
                               updated_at="2026-01-02T00:00:01Z")
@@ -287,7 +303,8 @@ class ApprovalTests(unittest.TestCase):
             with self.subTest(path=path), patch.object(verify_config_approval, "read_policy", return_value=POLICY), \
                  patch.object(verify_config_approval, "GitHub", return_value=FixtureAPI(data)), \
                  patch("sys.stdin", io.StringIO("fixture-authentication")), patch("sys.stderr", io.StringIO()), \
-                 patch("sys.argv", ["verify", "--policy", "/unused", "--repository", REPOSITORY, "--commit", COMMIT, "--tree", TREE]):
+                 patch("sys.argv", ["verify", "--policy", "/unused", "--repository", REPOSITORY, "--commit", COMMIT, "--tree", TREE,
+                                    "--installed-state", "/nonexistent-approval-fixture-state"]):
                 self.assertEqual(verify_config_approval.main(), 2)
 
 
@@ -404,11 +421,31 @@ class PolicyTests(unittest.TestCase):
         self.path.write_text(json.dumps({"approval": "fixture-sensitive-marker"}))
         result = subprocess.run([
             "python3", str(ROOT / "scripts" / "verify_config_approval.py"), "--policy", str(self.path),
-            "--repository", REPOSITORY, "--commit", COMMIT, "--tree", TREE,
+            "--repository", REPOSITORY, "--commit", COMMIT, "--tree", TREE, "--installed-state", str(self.path.with_name("state.json")),
         ], input="fixture-authentication", text=True, capture_output=True)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn("fixture-authentication", result.stdout + result.stderr)
         self.assertNotIn("fixture-sensitive-marker", result.stdout + result.stderr)
+
+    def test_installed_baseline_identity_and_permissions_are_required(self):
+        path = self.path.with_name("state.json")
+        self.assertIsNone(read_installed_commit(path, REPOSITORY, os.getuid()))
+        original = {"config_repository": REPOSITORY, "config_ref": COMMIT}
+        path.write_text(json.dumps(original))
+        path.chmod(0o600)
+        self.assertEqual(read_installed_commit(path, REPOSITORY, os.getuid()), COMMIT)
+        for key, value in (("config_repository", "other/private-config"), ("config_ref", "invalid")):
+            path.write_text(json.dumps({**original, key: value}))
+            with self.subTest(key=key), self.assertRaises(Rejected):
+                read_installed_commit(path, REPOSITORY, os.getuid())
+        path.write_text(json.dumps(original))
+        path.chmod(0o666)
+        with self.assertRaises(Rejected):
+            read_installed_commit(path, REPOSITORY, os.getuid())
+        path.unlink()
+        path.symlink_to("missing")
+        with self.assertRaises(OSError):
+            read_installed_commit(path, REPOSITORY, os.getuid())
 
 
 if __name__ == "__main__":
