@@ -619,6 +619,9 @@ converged() {
 
 acquire_lock() {
   local path
+  if [[ $mode == drain && ( ! -d $state_root || ! -f $state_file || ! -L $current ) ]]; then
+    block 'drain requires an installed deployer'
+  fi
   secure_directory "$lock_root" 700 1
   if [[ -e "$state_root" || -L "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
   exec 9<"$lock_root"

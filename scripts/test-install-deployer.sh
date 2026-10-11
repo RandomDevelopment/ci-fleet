@@ -320,7 +320,10 @@ FAKE_DISK_AVAILABLE=1 expect_failure 'insufficient deployer disk capacity' "$ins
 FAKE_COMPOSE_EXIT=1 expect_failure 'Docker Compose v2 is required but unavailable' "$installer" --check --config "$config" >/dev/null
 expect_failure 'drain requires an installed deployer' "$installer" --drain --config "$config" >/dev/null
 [[ ! -e $root/var/lib/ci-fleet-deployer ]] || fail 'uninstalled drain created a deployer role marker'
-rmdir "$root/var/lock/ci-fleet-deployer"
+[[ ! -e $root/var/lock/ci-fleet-deployer ]] || fail 'uninstalled drain created a deployer lock marker'
+fresh_uninstall=$(expect_success "$installer" --uninstall --config "$config")
+grep -Fq 'result=NO_CHANGE' <<<"$fresh_uninstall" || fail 'rejected drain made fresh uninstall mutate the host'
+[[ ! -e $root/var/lib/ci-fleet-deployer ]] || fail 'fresh uninstall created retained deployer state'
 
 chmod 0755 "$root/etc/ci-fleet-deployer"
 expect_failure 'unsafe managed directory' "$installer" --check --config "$config" >/dev/null
