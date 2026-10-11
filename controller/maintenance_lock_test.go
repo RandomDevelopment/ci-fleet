@@ -133,4 +133,15 @@ func TestNewRunnerUsesProxyDirectoryAndAllowsNestedSharedLock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fixture runner watcher did not finish")
 	}
+	// Container removal precedes the watcher's final status write.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(scaler.config.StatusFile)
+		var status controllerStatus
+		if err == nil && json.Unmarshal(body, &status) == nil && status.Current == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("fixture runner watcher did not publish final status")
 }
