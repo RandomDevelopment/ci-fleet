@@ -101,6 +101,8 @@ func TestNewRunnerUsesProxyDirectoryAndAllowsNestedSharedLock(t *testing.T) {
 		case strings.HasSuffix(request.URL.Path, "/wait"):
 			<-release
 			_, _ = w.Write([]byte(`{"StatusCode":0}`))
+		case strings.HasSuffix(request.URL.Path, "/containers/runner-id/json"):
+			_, _ = w.Write([]byte(`{"Id":"runner-id","State":{"Status":"exited"}}`))
 		case strings.HasSuffix(request.URL.Path, "/logs"):
 			w.Header().Set("Content-Type", "application/octet-stream")
 		case request.Method == http.MethodDelete:

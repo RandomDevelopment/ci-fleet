@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -68,8 +70,16 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	return s.runners.count(), nil
 }
 
-func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) error {
+func (s *Scaler) HandleJobStarted(ctx context.Context, job *scaleset.JobStarted) error {
 	if !s.runners.markBusy(job.RunnerName) {
+		missing, err := s.missingPriorRunner(ctx, job.RunnerName)
+		if err != nil {
+			return err
+		}
+		if missing {
+			s.logger.Info("ignored late job start for removed runner", "runner", job.RunnerName, "jobID", job.JobID)
+			return nil
+		}
 		return fmt.Errorf("job started for unknown runner %q", job.RunnerName)
 	}
 	s.writeStatus()
@@ -80,12 +90,41 @@ func (s *Scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) e
 func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobCompleted) error {
 	id, cleanup, ok := s.runners.markDone(job.RunnerName)
 	if !ok {
+		missing, err := s.missingPriorRunner(ctx, job.RunnerName)
+		if err != nil {
+			return err
+		}
+		if missing {
+			s.logger.Info("ignored late job completion for removed runner", "runner", job.RunnerName, "jobID", job.JobID)
+			return nil
+		}
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
 	s.writeStatus()
 	s.logger.Info("job completed", "runner", job.RunnerName, "jobID", job.JobID)
-	if !cleanup { return nil }
-	return s.logAndRemove(ctx, job.RunnerName, id)
+	if !cleanup {
+		return nil
+	}
+	return s.logAndRemove(ctx, job.RunnerName, id, true)
+}
+
+// The selected scale-set session can report runners removed before this controller started.
+func (s *Scaler) missingPriorRunner(ctx context.Context, name string) (bool, error) {
+	suffix, owned := strings.CutPrefix(name, "ci-fleet-"+s.config.FleetInstance+"-")
+	if !owned || len(suffix) != 8 {
+		return false, nil
+	}
+	if _, err := hex.DecodeString(suffix); err != nil {
+		return false, nil
+	}
+	_, err := s.dockerClient.ContainerInspect(ctx, name)
+	if errdefs.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect untracked runner %q: %w", name, err)
+	}
+	return false, nil
 }
 
 func (s *Scaler) startRunner(ctx context.Context) (string, error) {
@@ -129,62 +168,110 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 }
 
 func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
-waitLoop:
 	for {
 		stopped, errors := s.dockerClient.ContainerWait(ctx, id, container.WaitConditionNotRunning)
 		select {
 		case err, ok := <-errors:
-			if !s.runners.contains(name, id) { return }
-			if ok && errdefs.IsNotFound(err) { break waitLoop }
-			if ok { s.logger.Warn("watch runner container", "runner", name, "error", err) }
-			time.Sleep(time.Minute)
+			if !s.runners.contains(name, id) {
+				return
+			}
+			if !ok || !errdefs.IsNotFound(err) {
+				if ok {
+					s.logger.Warn("watch runner container", "runner", name, "error", err)
+				}
+				time.Sleep(time.Minute)
+				continue
+			}
 		case response, ok := <-stopped:
-			if !ok {
-				if !s.runners.contains(name, id) { return }
+			if !s.runners.contains(name, id) {
+				return
+			}
+			if !ok || response.Error != nil {
+				if ok {
+					s.logger.Warn("watch runner container", "runner", name, "error", response.Error.Message)
+				}
 				time.Sleep(time.Minute)
 				continue
 			}
-			if response.Error != nil {
-				if !s.runners.contains(name, id) { return }
-				s.logger.Warn("watch runner container", "runner", name, "error", response.Error.Message)
-				time.Sleep(time.Minute)
-				continue
-			}
-			break waitLoop
 		}
-	}
-	if !s.runners.markExited(name, id) { return }
-	s.writeStatus()
-	s.logger.Warn("runner container exited before job completion", "runner", name)
-	for {
-		if err := s.logAndRemove(context.WithoutCancel(ctx), name, id); err == nil {
-			time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, id) })
-			return
-		} else {
+		// Docker can wake a not-running waiter while the container is restarting.
+		current, err := s.dockerClient.ContainerInspect(ctx, id)
+		if !errdefs.IsNotFound(err) {
+			if err != nil || current.State == nil {
+				s.logger.Warn("inspect exited runner", "runner", name, "error", err)
+				time.Sleep(time.Minute)
+				continue
+			}
+			if current.State.Running || current.State.Restarting || current.State.Paused {
+				continue
+			}
+		}
+		if err := s.logAndRemove(ctx, name, id, false); err != nil {
 			s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
+			time.Sleep(time.Minute)
+			continue
 		}
-		time.Sleep(time.Minute)
+		if !s.runners.markExited(name, id) {
+			return
+		}
+		s.writeStatus()
+		s.logger.Warn("runner container exited before job completion", "runner", name)
+		time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, id) })
+		return
 	}
 }
 
-func (s *Scaler) recoverStale(ctx context.Context) error {
+func (s *Scaler) recoverRunners(ctx context.Context) error {
 	f := filters.NewArgs(
 		filters.Arg("label", labelPrefix+"managed=true"),
 		filters.Arg("label", labelPrefix+"kind=runner"),
 		filters.Arg("label", labelPrefix+"instance="+s.config.FleetInstance),
+		filters.Arg("label", labelPrefix+"scale-set="+s.config.ScaleSetName),
 	)
 	containers, err := s.dockerClient.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
-	if err != nil { return fmt.Errorf("list stale runner containers: %w", err) }
+	if err != nil {
+		return fmt.Errorf("list prior runner containers: %w", err)
+	}
 	for _, c := range containers {
-		name := c.ID[:12]
-		if len(c.Names) > 0 { name = c.Names[0] }
+		current, err := s.dockerClient.ContainerInspect(ctx, c.ID)
+		if errdefs.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect prior runner: %w", err)
+		}
+		if current.Config == nil || current.State == nil {
+			return fmt.Errorf("prior runner %s has no configuration or state", c.ID)
+		}
+		labels := current.Config.Labels
+		if labels[labelPrefix+"managed"] != "true" || labels[labelPrefix+"kind"] != "runner" ||
+			labels[labelPrefix+"instance"] != s.config.FleetInstance || labels[labelPrefix+"scale-set"] != s.config.ScaleSetName {
+			continue
+		}
+		name := strings.TrimPrefix(current.Name, "/")
+		if current.State.Running || current.State.Restarting || current.State.Paused {
+			if name == "" {
+				return fmt.Errorf("active prior runner %s has no name", c.ID)
+			}
+			// A surviving runner may already have a job whose start event was acknowledged.
+			s.runners.addBusy(name, c.ID)
+			go s.watchRunner(context.WithoutCancel(ctx), name, c.ID)
+			s.logger.Info("recovered active runner", "runner", name, "containerID", c.ID)
+			continue
+		}
 		s.logger.Warn("removing stale runner from prior controller lifetime", "runner", name)
-		if err := s.logAndRemove(ctx, name, c.ID); err != nil { return err }
+		if err := s.logAndRemove(ctx, name, c.ID, false); err != nil {
+			return err
+		}
+		if name != "" {
+			s.runners.addExited(name, c.ID)
+			time.AfterFunc(10*time.Minute, func() { s.runners.forgetExited(name, c.ID) })
+		}
 	}
 	return nil
 }
 
-func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
+func (s *Scaler) logAndRemove(ctx context.Context, name, id string, force bool) error {
 	logs, err := s.dockerClient.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true, Timestamps: true, Tail: "2000"})
 	if err == nil {
 		_, _ = fmt.Fprintf(os.Stdout, "--- runner log: %s ---\n", name)
@@ -193,7 +280,7 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
 	} else {
 		s.logger.Warn("could not collect runner logs", "runner", name, "error", err)
 	}
-	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
+	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: force, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("remove runner %s: %w", name, err)
 	}
 	return nil
@@ -202,7 +289,7 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string) error {
 func (s *Scaler) shutdown(ctx context.Context) {
 	defer s.writeStatus()
 	for name, id := range s.runners.drain() {
-		if err := s.logAndRemove(ctx, name, id); err != nil {
+		if err := s.logAndRemove(ctx, name, id, true); err != nil {
 			s.logger.Error("runner shutdown failed", slog.String("runner", name), slog.String("error", err.Error()))
 		}
 	}
