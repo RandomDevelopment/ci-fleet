@@ -8,6 +8,7 @@
 # Usage:
 #   remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
 set -Eeuo pipefail
+set +x
 export PYTHONDONTWRITEBYTECODE=1
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -16,6 +17,10 @@ installer=$repo_root/scripts/install-worker-controller.sh
 state_file=${CI_FLEET_REMOTE_STATE_FILE:-/var/lib/ci-fleet/install-state.json}
 rendered_env=${CI_FLEET_RENDERED_ENV:-/etc/ci-fleet/ci-fleet.env}
 host_env=${CI_FLEET_HOST_ENV:-/etc/ci-fleet/host.env}
+config_review_root=${CI_FLEET_ROOT_PREFIX:-}
+[[ -z "$config_review_root" || ${CI_FLEET_TESTING:-0} == 1 ]] || { echo 'ERROR: root prefix is test-only' >&2; exit 2; }
+config_review_policy=$config_review_root/etc/ci-fleet/config-review-policy.json
+config_review_required=$config_review_root/etc/ci-fleet/config-review-required
 token_script=$script_dir/github-app-token.sh
 reconcile_state_dir=${CI_FLEET_RECONCILE_STATE_DIR:-/var/lib/ci-fleet/reconcile}
 reconcile_state_file=$reconcile_state_dir/state.json
@@ -426,6 +431,15 @@ while ((attempt < max_attempts)); do
 done
 
 note "RESOLVED desired_ref=${desired_commit}"
+
+if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_review_required" || -L "$config_review_required" ]]; then
+  desired_tree=$(git -C "$temp_dir/config-repo" rev-parse "$desired_commit^{tree}") || die 'configuration tree is unavailable'
+  if ! printf '%s' "$token" | python3 "$script_dir/verify_config_approval.py" --policy "$config_review_policy" \
+    --repository "$installed_config_repo" --commit "$desired_commit" --tree "$desired_tree"; then
+    save_reconcile_state 'invalid' "$desired_commit" "$installed_config_ref" 'unknown' 'configuration approval rejected'
+    exit 3
+  fi
+fi
 
 # Compare with installed
 if [[ "$desired_commit" == "$installed_config_ref" ]]; then

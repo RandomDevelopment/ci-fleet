@@ -9,6 +9,8 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/verify_config_approval.py \
+  scripts/test_config_approval.py \
   scripts/cleanup_networks.py \
   scripts/health.py \
   scripts/status_auth.py \
@@ -26,6 +28,7 @@ python3 -m py_compile \
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_config_approval.py
 python3 scripts/test_cleanup_networks.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py

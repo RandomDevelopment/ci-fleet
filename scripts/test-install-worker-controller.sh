@@ -426,6 +426,14 @@ chmod 700 "$fake_bin/df"
 
 cat >"$fake_bin/python3" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n ${FAKE_APPROVAL_LOG:-} && ${1:-} == */verify_config_approval.py ]]; then
+  printf '%s\n' "$@" >"$FAKE_APPROVAL_LOG"
+  exit 2
+fi
+if [[ ${1:-} == */health.py ]]; then
+  # The simulated controller must not inherit the shared test machine's load.
+  exec "$REAL_PYTHON3" -c 'import os,runpy,sys; os.getloadavg=lambda: (0.0,0.0,0.0); sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0],run_name="__main__")' "$@"
+fi
 if [[ -n "${FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE:-}" && -f "$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE" && "${1:-}" == - ]]; then
   script=$(</dev/stdin)
   if [[ "$script" == *'renameat2(-100'* && "$script" == *'os.fsync(parent)'* ]]; then
@@ -745,6 +753,38 @@ export FAKE_WRONG_HOST_CONFIG_OWNER=$host_config
 expect_failure 'host configuration must be owned by root' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
+
+# A rejected review must stop every direct candidate path before installation.
+export FAKE_REAL_OPENSSL FAKE_REAL_CURL
+FAKE_REAL_OPENSSL=$(command -v openssl)
+FAKE_REAL_CURL=$(command -v curl)
+cat >"$fake_bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${FAKE_APPROVAL_LOG:-} && ${1:-} == dgst ]]; then cat >/dev/null; printf 'fixture-signature'; exit 0; fi
+exec "$FAKE_REAL_OPENSSL" "$@"
+EOF
+cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n ${FAKE_APPROVAL_LOG:-} ]]; then printf '{"token":"fixture-authentication"}'; exit 0; fi
+exec "$FAKE_REAL_CURL" "$@"
+EOF
+chmod 0700 "$fake_bin/openssl" "$fake_bin/curl"
+printf '{}\n' >"$root/etc/ci-fleet/config-review-policy.json"
+printf '1\n' >"$root/etc/ci-fleet/config-review-required"
+chmod 0600 "$root/etc/ci-fleet/config-review-policy.json" "$root/etc/ci-fleet/config-review-required"
+export FAKE_APPROVAL_LOG=$tmp/approval-call
+for approval_mode in check install adopt upgrade; do
+  expect_failure 'configuration approval rejected' "$installer" "--$approval_mode" "${base_args[@]}" \
+    --config-identity example-org/private-config --ref "$ref_one"
+  grep -Fxq "$ref_one" "$FAKE_APPROVAL_LOG" || fail 'approval verifier did not receive the immutable config SHA'
+  grep -Fxq example-org/private-config "$FAKE_APPROVAL_LOG" || fail 'approval verifier did not receive the config identity'
+  [[ ! -e "$root/etc/ci-fleet/ci-fleet.env" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'rejected approval mutated installed state'
+done
+rm "$root/etc/ci-fleet/config-review-policy.json"
+expect_failure 'configuration approval rejected' "$installer" --upgrade "${base_args[@]}" --config-identity example-org/private-config --ref "$ref_one"
+rm "$root/etc/ci-fleet/config-review-required"
+unset FAKE_APPROVAL_LOG
+rm "$fake_bin/openssl" "$fake_bin/curl"
 
 export FAKE_WRONG_SOURCE_INSTALLER_OWNER=$installer
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")

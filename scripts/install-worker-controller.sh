@@ -136,6 +136,8 @@ manager_current=$manager_root/current
 etc_dir=$(root_path /etc/ci-fleet)
 rendered_env=$etc_dir/ci-fleet.env
 default_host_config=$etc_dir/host.env
+config_review_policy=$etc_dir/config-review-policy.json
+config_review_required=$etc_dir/config-review-required
 host_config=${host_config_arg:-$default_host_config}
 state_root=$(root_path /var/lib/ci-fleet)
 state_file=$state_root/install-state.json
@@ -248,6 +250,31 @@ validate_candidate_config_commit() {
     "${args[@]}" || die 'configuration commit validation failed'
   python3 "$repo_root/scripts/scan_committed_secrets.py" \
     --repository "$config_source_checkout" --commit "$config_ref" || die 'configuration commit secret scan failed'
+}
+
+configuration_approval_required() {
+  [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_review_required" || -L "$config_review_required" ]]
+}
+
+verify_configuration_approval() {
+  configuration_approval_required || return 0
+  local token_env=$default_host_config approval_token=$temporary/approval-token
+  [[ -f "$token_env" ]] || token_env=$rendered_env
+  effective_host_config=$token_env
+  verify_host_files
+  : >"$approval_token"
+  chmod 0600 "$approval_token"
+  "$repo_root/scripts/github-app-token.sh" --env-file "$token_env" >"$approval_token" 2>"$temporary/approval-token.err" \
+    || die 'configuration approval authentication unavailable'
+  python3 "$repo_root/scripts/verify_config_approval.py" --policy "$config_review_policy" \
+    --repository "$config_identity" --commit "$config_ref" --tree "$config_tree" <"$approval_token" \
+    || die 'configuration approval rejected'
+}
+
+require_configuration_approval_capability() {
+  configuration_approval_required || return 0
+  python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$1" \
+    --require-configuration-approval >/dev/null
 }
 
 prepare_host_config() {
@@ -384,6 +411,16 @@ PY
   [[ ${metadata_values[1]} == "$engine_ref" && ${metadata_values[2]} == "$engine_repository" ]] || die 'rendered engine metadata changed during validation'
   status_reporting_required=${metadata_values[3]}
   status_reporting_configured=${metadata_values[4]}
+  if configuration_approval_required; then
+    python3 - "$candidate_metadata" "$config_tree" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+value = json.loads(path.read_text())
+value.update(configuration_approval_required=True, config_tree=sys.argv[2])
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY
+  fi
 }
 
 compose() {
@@ -645,6 +682,10 @@ manager_release_complete() {
     [[ -f "$path/$required" ]] || return 1
   done
   [[ -x "$path/templates/config-repository/scripts/validate.sh" ]] || return 1
+  if [[ -f "$path/engine-capabilities.json" ]] && python3 "$repo_root/scripts/desired_state.py" \
+    validate-engine-capabilities --manifest "$path/engine-capabilities.json" --require-configuration-approval >/dev/null 2>&1; then
+    [[ -f "$path/scripts/verify_config_approval.py" && -x "$path/scripts/github-app-token.sh" ]] || return 1
+  fi
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
   marker=$(<"$path/.ci-fleet-engine-ref")
   [[ "$marker" == "$expected" ]]
@@ -1637,6 +1678,19 @@ restore_checkpoint() {
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
+  if configuration_approval_required; then
+    if [[ ! -f "$checkpoint_dir/manager-target" || -L "$checkpoint_dir/manager-target" \
+      || $(stat -c %u "$checkpoint_dir/manager-target") != "$expected_owner" \
+      || $(stat -c %a "$checkpoint_dir/manager-target") != 600 ]]; then
+      note 'ROLLBACK_FAILED reason=checkpoint lacks an approval-capable manager'
+      return 1
+    fi
+    target=$(<"$checkpoint_dir/manager-target")
+    if [[ "$target" != "$manager_releases/"* ]] || ! require_configuration_approval_capability "$target/engine-capabilities.json"; then
+      note 'ROLLBACK_FAILED reason=checkpoint manager would remove configuration approval enforcement'
+      return 1
+    fi
+  fi
   if [[ -e "$format_marker" || -L "$format_marker" ]]; then
     if [[ -L "$format_marker" || ! -f "$format_marker" || $(stat -c %u "$format_marker") != "$expected_owner" \
       || $(stat -c %a "$format_marker") != 600 || $(stat -c %s "$format_marker") != 2 ]]; then
@@ -1970,6 +2024,21 @@ perform_policy_action() {
       drain_current true "$rendered_env" "$release_dir"
       ;;
     resume)
+      if configuration_approval_required; then
+        local -a approval_context
+        mapfile -t approval_context < <(python3 - "$candidate_metadata" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for field in ("config_repository", "config_ref", "config_tree"):
+    print(value[field])
+PY
+        )
+        [[ ${#approval_context[@]} == 3 && ${approval_context[0]} == "$config_identity" ]] || die 'policy action approval context is invalid'
+        config_ref=${approval_context[1]}
+        config_tree=${approval_context[2]}
+        verify_configuration_approval
+        require_configuration_approval_capability "$release_dir/engine-capabilities.json" || die 'policy action engine would remove configuration approval enforcement'
+      fi
       run_candidate_preflight
       if [[ "$build_before_drain" != true ]]; then build_candidate; fi
       mode=${CI_FLEET_POLICY_MODE:-upgrade}
@@ -2046,6 +2115,10 @@ perform_converge() {
   fi
   if [[ "$mode" == install && -f "$rendered_env" && ! -f "$state_file" ]]; then
     die 'an unmanaged controller configuration exists; use --adopt'
+  fi
+  if configuration_approval_required && [[ -L "$manager_current" ]]; then
+    require_configuration_approval_capability "$manager_current/engine-capabilities.json" \
+      || die 'enable approval only after the installed manager supports it'
   fi
   if [[ -L "$current_link" ]]; then
     current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
@@ -2286,10 +2359,13 @@ case "$mode" in
     validate_common_arguments
     resolve_config
     validate_candidate_config_commit
+    config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'
+    verify_configuration_approval
     prepare_host_config
     verify_host_files
     select_engine
     prepare_engine_capabilities
+    require_configuration_approval_capability "$engine_capabilities" || die 'selected engine would remove configuration approval enforcement'
     render_candidate
     if [[ "$mode" == check ]]; then
       perform_check

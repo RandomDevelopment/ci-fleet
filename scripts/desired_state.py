@@ -570,6 +570,8 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
+    if args.require_configuration_approval and "configuration_approval_gate" not in capabilities:
+        raise DesiredStateError("selected engine does not support the configuration approval gate")
     if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not support Docker network policy configuration")
     if args.require_docker_default_bridge_cidr_config and DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY not in capabilities:
@@ -617,6 +619,7 @@ def parse_args() -> argparse.Namespace:
     capabilities.add_argument("--require-docker-default-bridge-cidr-config", action="store_true")
     capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
+    capabilities.add_argument("--require-configuration-approval", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)
     return parser.parse_args()
 

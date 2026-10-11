@@ -211,6 +211,14 @@ The host does not automatically follow or execute a moving branch. A new configu
 
 ## Remote reconciliation
 
+Hosts can opt into [independent configuration review verification](CONFIGURATION-APPROVAL.md).
+A root-owned policy outside the candidate repository pins the validation workflow,
+required jobs, and reviewer identities. The trusted engine checks the applied
+commit and reviewed tree before reconciliation or direct installer upgrades.
+An enabled gate rejects unavailable evidence and engine downgrades that remove
+verification. Without the separately provisioned policy/activation marker, the
+existing content validation does not establish GitHub review or hosted CI results.
+
 `ci-fleet-reconcile.timer` runs every five minutes to fetch the desired configuration from the private desired-state repository and apply it if a newer reviewed commit is available. Authentication uses the existing GitHub App identity — no PAT, no SSH, no inbound management port.
 
 How it works:
