@@ -150,6 +150,7 @@ case "${1:-}" in
         fi
         [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$image" >>"$FAKE_IMAGE_INSPECT_LOG"
         image_paths || exit 1
+        [[ ! -f "$image_state" ]] || cp "$image_state" "$image_state.provenance"
         if [[ "$*" == *'{{.Id}}'* ]]; then
           if [[ ! -f "$image_id_state" ]]; then
             [[ -z ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} ]] || : >"$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
@@ -166,6 +167,7 @@ case "${1:-}" in
         [[ -n "${FAKE_AVAILABLE_IMAGE_IDS:-}" && -f "$FAKE_AVAILABLE_IMAGE_IDS" ]] || exit 1
         grep -Fxq "$image_id" "$FAKE_AVAILABLE_IMAGE_IDS" || exit 1
         image_paths || exit 1
+        [[ -f "$image_state" || ! -f "$image_state.provenance" ]] || cp "$image_state.provenance" "$image_state"
         printf '%s\n' "$image_id" >"$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-tag|%s|%s\n' "$image_id" "$image" >>"$FAKE_COMPOSE_LOG"
         ;;
