@@ -92,7 +92,7 @@ restore_consumed_requests() {
   sync -f "$consumed_root" "$log_root" 2>/dev/null || return
   for entry in "${entries[@]}"; do
     id=${entry##*/}
-    [[ $id =~ ^[0-9a-f]{64}$ && -v "retained[$id]" ]] || { rm -f -- "$entry" || return; }
+    [[ $id =~ ^(approval-)?[0-9a-f]{64}$ && -v "retained[$id]" ]] || { rm -f -- "$entry" || return; }
   done
   sync -f "$consumed_root" "$log_root" 2>/dev/null
 }
@@ -262,7 +262,7 @@ reject_mixed_role() {
   for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'tester host state is present'
   done
-  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)"; do
+  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'status receiver state is present'
   done
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
@@ -346,16 +346,6 @@ shopt -u nullglob
 ((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
 secure_directory "$state_root" 'deployer state directory'
 
-if [[ "$operation" == drain ]]; then
-  [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'
-  temporary=$(mktemp "$state_root/.drained.XXXXXX")
-  chmod 0600 "$temporary"
-  mv -Tf "$temporary" "$drained"
-  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || die 'drain marker is not durable'
-  sync -f "$state_root" 2>/dev/null || die 'drain marker publication is not durable'
-  exit 0
-fi
-
 secure_file "$config" 'deployer configuration'
 if [[ $operation == health || $operation == cleanup ]]; then
   policy_snapshot=$(mktemp "${TMPDIR:-/tmp}/ci-fleet-deployer-policy.XXXXXX")
@@ -391,6 +381,16 @@ if [[ $own_realpath == */releases/* ]]; then
   fi
 fi
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
+if [[ "$operation" == drain ]]; then
+  reject_mixed_role
+  [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'
+  temporary=$(mktemp "$state_root/.drained.XXXXXX")
+  chmod 0600 "$temporary"
+  mv -Tf "$temporary" "$drained"
+  sync -f "$drained" 2>/dev/null || sync "$drained" 2>/dev/null || die 'drain marker is not durable'
+  sync -f "$state_root" 2>/dev/null || die 'drain marker publication is not durable'
+  exit 0
+fi
 [[ ${cfg[ADAPTER_SHA256]} =~ ^[0-9a-f]{64}$ ]] || die 'invalid adapter digest'
 inside "${cfg[ADAPTER_PATH]}" "$(root_path /etc/ci-fleet-deployer/adapters)" || die 'application adapter is outside the protected adapter directory'
 secure_file "${cfg[ADAPTER_PATH]}" 'application adapter' 700
@@ -442,11 +442,7 @@ case "$operation" in
     if [[ -e "$last_request" || -L "$last_request" ]]; then
       secure_file "$last_request" 'last completed deployment request'
       parse_file "$last_request" completed 'last completed deployment request' "$request_keys"
-      replay=1
-      for key in $request_keys; do
-        [[ -v "completed[$key]" && ${req[$key]} == "${completed[$key]}" ]] || replay=0
-      done
-      ((replay == 0)) || die 'deployment request was already completed'
+      [[ ${completed[APPROVAL_ID]:-} != "${req[APPROVAL_ID]}" ]] || die 'deployment request was already completed'
     fi
     inside "${cfg[CHECKPOINT_EVIDENCE_PATH]}" "$evidence_dir" || die 'checkpoint evidence is outside the protected evidence directory'
     secure_file "${cfg[CHECKPOINT_EVIDENCE_PATH]}" 'checkpoint evidence'
@@ -484,22 +480,23 @@ case "$operation" in
       die 'production deployment is not authorized by the current accepted scope'
     fi
     declare -a consumed_requests=()
-    # Keep the replay ledger outside application state cleanup. Import every
-    # legacy marker before accepting a request, and retain the full set in memory.
+    # Request hashes cannot recover stable approval IDs; legacy ledgers need
+    # operator reconciliation rather than silently accepting reused approvals.
     for directory in "$state_root/consumed-requests" "$consumed_root"; do
       [[ -e $directory || -L $directory ]] || continue
       secure_directory "$directory" 'consumed request directory'
       shopt -s nullglob
       for marker in "$directory"/*; do
         id=${marker##*/}
-        [[ $id =~ ^[0-9a-f]{64}$ ]] || die 'consumed request marker has an invalid identity'
+        [[ ! $id =~ ^[0-9a-f]{64}$ ]] || die 'legacy replay ledger requires operator reconciliation'
+        [[ $id =~ ^approval-[0-9a-f]{64}$ ]] || die 'consumed request marker has an invalid identity'
         secure_file "$marker" 'consumed request marker'
         consumed_requests+=("$id")
       done
       shopt -u nullglob
     done
     restore_consumed_requests || die 'consumed request ledger migration failed'
-    request_id=$(for key in $request_keys; do printf '%s=%s\0' "$key" "${req[$key]}"; done | sha256sum | cut -d' ' -f1)
+    request_id=approval-$(printf '%s' "${req[APPROVAL_ID]}" | sha256sum | cut -d' ' -f1)
     consumed_marker=$consumed_root/$request_id
     [[ ! -e "$consumed_marker" && ! -L "$consumed_marker" ]] || die 'deployment request was already consumed'
     consumed_requests+=("$request_id")

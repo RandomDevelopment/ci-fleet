@@ -805,6 +805,13 @@ rm "$root/etc/systemd/system/ci-fleet-drift.timer"
 printf 'receiver\n' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 expect_failure 'status receiver state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
+for receiver_path in "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
+  mkdir "$receiver_path"
+  for mode in --check --repair; do
+    expect_failure 'status receiver state is present' "$installer" "$mode" --config "$config" >/dev/null
+  done
+  rmdir "$receiver_path"
+done
 printf 'runner\n' >"$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
 expect_failure 'ordinary GitHub Actions runner service is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/actions.runner.example-org-example-repo.example-runner.service"
@@ -964,6 +971,17 @@ expect_failure 'malformed completed deployment request line' "$installer" --roll
 install -m 0600 "$approval" "$root/var/lib/ci-fleet-deployer/last-request.conf"
 completed_request=$root/var/lib/ci-fleet-deployer/last-request.conf
 cp "$completed_request" "$tmp/completed-request.saved"
+
+for mismatch in ENVIRONMENT TARGET_ID; do
+  sed -i "s/^$mismatch=.*/$mismatch=other-target/" "$completed_request"
+  pointer_before=$(readlink "$root/opt/ci-fleet-deployer/current")
+  expect_failure 'completed deployment request does not match the rollback target' "$installer" --rollback --config "$config" >/dev/null
+  [[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'rollback adapter ran for a different completed target'
+  [[ $(readlink "$root/opt/ci-fleet-deployer/current") == "$pointer_before" ]] || fail 'mismatched rollback changed core activation'
+  available_check=$(expect_success "$installer" --check --config "$config")
+  grep -Fq 'rollback_available=no' <<<"$available_check" || fail 'mismatched completed target reported rollback available'
+  install -m 0600 "$tmp/completed-request.saved" "$completed_request"
+done
 
 # Failed candidate health can remove the entire writable state and journal.
 printf '# force-transaction\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
@@ -1784,6 +1802,17 @@ install -m 0600 "$tmp/config.staging" "$config"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'usage: deployer-runtime.sh health|cleanup|deploy|drain' "$runtime" rollback >/dev/null
+for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/systemd/system/actions.runner.drain-test.service" "$root/etc/ci-fleet-tester" "$root/etc/systemd/system/ci-fleet-status-receiver.service" "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
+  mkdir "$role_path"
+  expect_failure 'is present' "$runtime" drain >/dev/null
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'mixed-role runtime drain published a maintenance marker'
+  if [[ $role_path == *ci-fleet-status* ]]; then
+    expect_failure 'status receiver state is present' "$runtime" health >/dev/null
+  fi
+  rmdir "$role_path"
+done
+FAKE_DOCKER_PS='foreign|controller|example-controller' expect_failure 'unrelated Docker workload is present' "$runtime" drain >/dev/null
+[[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker role drift published a drain marker'
 mv "$adapter" "$adapter.saved"
 expect_success "$runtime" drain >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'runtime drain required a healthy adapter'
@@ -1868,7 +1897,23 @@ import sys
 p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_PROVIDER=github-environmnt', 'APPROVAL_PROVIDER=external-exact-head').replace('APPROVAL_CAPABILITY_EVIDENCE_PATH='+str(p.parent/'evidence/github-capability.conf'), '').rstrip()+'\n')
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
+# A legacy request hash cannot prove which stable approval ID was consumed.
+install -d -m 0700 "$ledger"
+install -m 0600 /dev/null "$ledger/$(printf legacy-request | sha256sum | cut -d' ' -f1)"
+legacy_before=$(find "$ledger" -type f -printf '%f %m %s\n' | sort)
+expect_failure 'legacy replay ledger requires operator reconciliation' "$runtime" deploy >/dev/null
+[[ $(find "$ledger" -type f -printf '%f %m %s\n' | sort) == "$legacy_before" ]] || fail 'legacy replay rejection changed consumed markers'
+rm -rf "$ledger"
 expect_success "$runtime" deploy >/dev/null
+# Mutable approval fields must not let a completed identity run again.
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+sed -i 's/APPROVED_AT=2026-08-08T20:00:00Z/APPROVED_AT=2026-08-08T20:00:01Z/' "$approval"
+install -m 0600 "$approval" "$request"
+expect_failure 'deployment request was already completed' "$runtime" deploy >/dev/null
+mv "$root/var/lib/ci-fleet-deployer/last-request.conf" "$tmp/completed-replay.saved"
+expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'changed timestamp reused a consumed approval'
+mv "$tmp/completed-replay.saved" "$root/var/lib/ci-fleet-deployer/last-request.conf"
 write_evidence staging example-staging
 python3 - "$approval" <<'PY'
 from pathlib import Path
@@ -2084,7 +2129,7 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 cp "$approval" "$request"; chmod 0600 "$request"
 printf 'deploy\n' >"$tmp/fail-deploy-marker"; export FAKE_ADAPTER_FAIL=$tmp/fail-deploy-marker
-prior_marker=$(printf prior-request | sha256sum | cut -d' ' -f1)
+prior_marker=approval-$(printf prior-request | sha256sum | cut -d' ' -f1)
 install -d -m 0700 "$root/var/log/ci-fleet-deployer/consumed-requests"
 install -m 0600 /dev/null "$root/var/log/ci-fleet-deployer/consumed-requests/$prior_marker"
 export FAKE_ADAPTER_DELETE_CONSUMED_GLOB="$root/var/log/ci-fleet-deployer/consumed-requests/*"
@@ -2092,6 +2137,11 @@ expect_failure 'deployment adapter failed after approval consumption' "$runtime"
 unset FAKE_ADAPTER_FAIL FAKE_ADAPTER_DELETE_CONSUMED_GLOB; rm "$tmp/fail-deploy-marker"
 if ! compgen -G "$root/var/log/ci-fleet-deployer/consumed-requests/*" >/dev/null; then fail 'adapter-deleted consumption marker was not restored'; fi
 [[ -f $root/var/log/ci-fleet-deployer/consumed-requests/$prior_marker ]] || fail 'older consumed request marker was lost during recovery'
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+sed -i -e 's/APPROVED_AT=.*/APPROVED_AT=2026-08-08T20:05:46Z/' -e 's/APPROVAL_IDENTITY=.*/APPROVAL_IDENTITY=other-reviewer/' "$approval"
+install -m 0600 "$approval" "$request"
+expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
+[[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'changed fields reused a failed approval identity'
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'deployment request was already consumed' "$runtime" deploy >/dev/null
 rm -rf "$root/var/log/ci-fleet-deployer/consumed-requests"
