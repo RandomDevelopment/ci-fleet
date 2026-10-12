@@ -71,7 +71,7 @@ adapter rollback
 
 Every Docker resource must carry four labels from the active policy: `io.randomdevelopment.ci-fleet.role=deployer`, `io.randomdevelopment.ci-fleet.identity=<DEPLOYER_IDENTITY>`, `io.randomdevelopment.ci-fleet.environment=<ENVIRONMENT>` and `io.randomdevelopment.ci-fleet.target=<TARGET_ID>`. Names begin with `ci-fleet-deploy-<DEPLOYER_IDENTITY>-`. Host-role isolation rejects any unlabelled or differently labelled workload as unrelated, so unlabelled adapter resources break subsequent health, cleanup, deployment, and installer operations.
 
-Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
+Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes. Scheduled health allows four minutes for prerequisite checks, the two-minute adapter and verified teardown; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
 The Docker API permits only the approved digest-pinned artifact, scoped internal bridge networks, local named volumes without driver options, and containers with positive limits capped at 2 GiB memory, two CPUs and 256 PIDs, private cgroups/namespaces, `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`. Host ports must bind loopback above port 1023. Build, exec, archive access, global pruning, arbitrary binds and alternate network attachments are rejected. Adapters must use this contract rather than unrestricted Compose or host administration. Validation and health can only read; cleanup can only inspect and delete scoped resources.
 
@@ -200,7 +200,7 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudo chmod 0600 /etc/ci-fleet-deployer/deployer.conf
 ```
 
-For an external secret manager, use `CREDENTIAL_PROVIDER=external` and a non-secret reference shaped like `external:example-vault:staging/deployer`. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`. Production additionally requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/production-authorization.conf`.
+For an external secret manager, provision the protected credential file before invocation, keep `CREDENTIAL_PROVIDER=file`, and set `CREDENTIAL_REF` to its canonical path. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`. Production additionally requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/production-authorization.conf`.
 
 ## Install, check, repair, upgrade, drain, and rollback
 

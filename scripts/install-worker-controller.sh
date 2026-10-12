@@ -2188,7 +2188,7 @@ perform_check() {
 
 reject_deployer_host() {
   # A deployer host is a separate role; controller checks must reject it too.
-  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /opt/ci-fleet-deployer)" || -L "$(root_path /opt/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
 }

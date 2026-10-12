@@ -22,6 +22,9 @@ for unit in ci-fleet-deployer.service ci-fleet-deployer-health.service ci-fleet-
   grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$root/etc/systemd/system/$unit" || { printf 'unsafe adapter capabilities in %s\n' "$unit" >&2; exit 1; }
 done
 
+grep -Fxq 'TimeoutStartSec=4min' "$root/etc/systemd/system/ci-fleet-deployer-health.service" || { printf 'health unit omits adapter teardown headroom\n' >&2; exit 1; }
+grep -Fxq 'ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer -/run/docker.sock' "$root/etc/systemd/system/ci-fleet-deployer.service" || { printf 'deploy unit requires a host-root Docker socket\n' >&2; exit 1; }
+
 # Model /var/lock -> /run/lock after the volatile lock directory disappears.
 install -d -m 0755 "$root/var" "$root/run/lock"
 ln -s ../run/lock "$root/var/lock"

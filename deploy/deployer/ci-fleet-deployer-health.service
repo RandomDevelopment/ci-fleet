@@ -10,7 +10,7 @@ User=root
 ExecStartPre=+/usr/bin/mkdir -p -m 0700 /var/lock/ci-fleet-deployer
 ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh health
 Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
-TimeoutStartSec=2min
+TimeoutStartSec=4min
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

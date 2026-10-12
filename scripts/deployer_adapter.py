@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import grp
 import hashlib
 import http.client
@@ -107,6 +108,12 @@ class UnixConnection(http.client.HTTPConnection):
             require(0 not in groups, "Docker peer belongs to the root group")
             raw = Path("/run/docker.sock")
             if raw.exists() and str(raw.resolve()) != self.path:
+                try:
+                    os.getxattr(raw, "system.posix_acl_access")
+                except OSError as error:
+                    require(error.errno in (errno.ENODATA, errno.ENOTSUP), "host Docker socket ACL cannot be inspected")
+                else:
+                    raise ValueError("host Docker socket has an extended access ACL")
                 raw_info = raw.stat()
                 require(not raw_info.st_mode & 0o002
                         and not (raw_info.st_uid == uid and raw_info.st_mode & 0o200)
@@ -115,13 +122,19 @@ class UnixConnection(http.client.HTTPConnection):
         self.peer_uid, self.peer_gid = uid, gid
 
 
-def reject_rootful_workloads(backend_path: str) -> None:
+def reject_rootful_workloads(backend_path: str, deadline: float | None = None) -> None:
     socket_path = Path("/run/docker.sock")
     if not socket_path.exists() or str(socket_path.resolve()) == backend_path:
         return
-    connection = UnixConnection(str(socket_path), rootless=False)
+    connection = UnixConnection(str(socket_path), rootless=False, timeout=30)
     try:
+        deadline = deadline if deadline is not None else time.monotonic() + 30
         for path in ("/containers/json?all=1", "/networks", "/volumes"):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "host Docker inventory deadline elapsed")
+            connection.timeout = remaining
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
             connection.request("GET", path)
             response = connection.getresponse()
             body = response.read(MAX_REQUEST + 1)
@@ -145,7 +158,8 @@ class Backend:
         self.deadline = time.monotonic() + seconds + 10
         require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
         self.path = path
-        connection = UnixConnection(path)
+        startup_deadline = min(self.deadline, time.monotonic() + 30)
+        connection = UnixConnection(path, timeout=max(0.001, startup_deadline - time.monotonic()))
         try:
             connection.request("GET", "/info")
             response = connection.getresponse()
@@ -153,7 +167,7 @@ class Backend:
             require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
                     "a dedicated rootless Docker daemon is required")
             self.uid, self.gid = connection.peer_uid, connection.peer_gid
-            reject_rootful_workloads(path)
+            reject_rootful_workloads(path, startup_deadline)
         finally:
             connection.close()
 
@@ -173,7 +187,7 @@ class Backend:
             connection.close()
 
     def inspect(self, kind: str, name: str) -> dict:
-        suffix = "/json" if kind == "containers" else ""
+        suffix = "/json" if kind in ("containers", "images") else ""
         status, body = self.request("GET", f"/{kind}/{urllib.parse.quote(name, safe='')}{suffix}")
         require(status == 200, "owned Docker resource could not be inspected")
         return decode(body)
@@ -427,10 +441,15 @@ def handler(policy: Policy):
                     headers = {"Content-Type": "application/json"}
                     if path.startswith("/images/create") and self.headers.get("X-Registry-Auth"):
                         headers["X-Registry-Auth"] = self.headers["X-Registry-Auth"]
-                    if self.command == "POST" and path.startswith("/images/create?"):
-                        policy.record_artifact()
                     mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
+                    if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
+                        progress = [decode(line) for line in response.splitlines() if line.strip()]
+                        require(bool(progress), "image pull completion is unavailable")
+                        if not any(item.get("error") or item.get("errorDetail") for item in progress):
+                            image = policy.backend.inspect("images", policy.image)
+                            require(policy.image in (image.get("RepoDigests") or []), "pulled artifact digest is unverified")
+                            policy.record_artifact()
                     if self.command == "GET" and path.startswith("/images/json?") and status == 200:
                         inventory = json.loads(response, object_pairs_hook=unique_object)
                         require(isinstance(inventory, list), "invalid image inventory")
@@ -607,7 +626,7 @@ def execute_adapter(operation: str) -> int:
     commit = runtime / "rollback-commit"
     if os.environ.get("CI_FLEET_DEPLOYER_COMMIT_ALLOWED") == "1":
         environment["CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"] = str(commit)
-    status = subprocess.run([str(adapter), operation], env=environment, close_fds=True).returncode
+    status = subprocess.run([str(adapter), operation], env=environment, stdin=subprocess.DEVNULL, close_fds=True).returncode
     if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment and commit.exists():
         require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
         connection = UnixConnection(str(runtime / "docker.sock"), rootless=False)
@@ -699,7 +718,7 @@ def run_adapter(args) -> int:
             try:
                 command = sandbox_command(args.unit, args.seconds, proxy, args.policy, approved,
                                           credential, Path(__file__).resolve(), args.request, args.marker is not None, args.operation, backend.path, str(secret))
-                result = subprocess.run(command, close_fds=True).returncode
+                result = subprocess.run(command, stdin=subprocess.DEVNULL, close_fds=True).returncode
             finally:
                 server.shutdown()
                 thread.join(timeout=5)
