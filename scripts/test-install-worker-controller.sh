@@ -908,7 +908,9 @@ expect_command_failure "$installer" --rollback
 unset FAKE_FAIL_TAR_EXTRACT_ONCE
 [[ -f "$active_release/preserve-on-staging-failure" && ! -f "$active_release/deploy/compose.yaml" ]] || fail 'failed archive extraction replaced the existing final release'
 
+export FAKE_BUILDX_UNAVAILABLE=1
 expect_success "$installer" --rollback >/dev/null
+unset FAKE_BUILDX_UNAVAILABLE
 unset FAKE_RECONCILE_UNIT_EXPECTED FAKE_RECONCILE_ACTIVE_STATE
 [[ -f "$active_release/deploy/compose.yaml" && ! -e "$active_release/preserve-on-staging-failure" ]] || fail 'successful release staging did not replace the incomplete final release'
 rm -rf "$staging_failure_checkpoint"
@@ -2723,9 +2725,7 @@ export FAKE_BUILDX_UNAVAILABLE=1
 uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
 unset FAKE_BUILDX_UNAVAILABLE
-export FAKE_BUILDX_UNAVAILABLE=1
 expect_success "$installer" --rollback >/dev/null
-unset FAKE_BUILDX_UNAVAILABLE
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the reviewed runner image'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
