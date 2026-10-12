@@ -2806,7 +2806,7 @@ printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
 prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
 export FAKE_FAIL_TIMER_ENABLE=1
-if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$restartable_tag_build_output" 2>&1; then
+if "$installer" --upgrade "${base_args[@]}" --config-identity fixture-org/fleet-config --ref "$ref_two" >"$restartable_tag_build_output" 2>&1; then
   fail 'matching-image timer activation failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_TIMER_ENABLE
