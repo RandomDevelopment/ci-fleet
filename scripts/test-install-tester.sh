@@ -430,7 +430,9 @@ for marker in /opt/ci-fleet/current /opt/ci-fleet-deployer/current /opt/ci-fleet
   for kind in directory symlink; do
     if [[ $kind == directory ]]; then mkdir "$root$marker"; else ln -s /missing "$root$marker"; fi
     for mode in check install; do
-      if "$installer" "--$mode" --ref "$ref" >"$tmp/role-rejection.out" 2>&1; then fail "tester installer accepted another role: $marker $kind"; fi
+      ref_args=()
+      [[ $mode != install ]] || ref_args=(--ref "$ref")
+      if "$installer" "--$mode" "${ref_args[@]}" >"$tmp/role-rejection.out" 2>&1; then fail "tester installer accepted another role: $marker $kind"; fi
       grep -Fq 'another ci-fleet host role is present' "$tmp/role-rejection.out" || fail 'role marker failed outside admission check'
     done
     if "$runtime" --health >"$tmp/role-rejection.out" 2>&1; then fail "tester runtime accepted another role: $marker $kind"; fi
