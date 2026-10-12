@@ -146,7 +146,7 @@ case ${operation:-} in
       volumes-from) service_extra=',"volumes_from":["container:other:rw"]' ;;
       custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
       ipv4-disabled) network_extra=',"enable_ipv4":false,"enable_ipv6":true' ;;
-      service-tmpfs) service_extra=',"tmpfs":["/tmp"]' ;;
+      service-tmpfs) service_extra+=',"tmpfs":["/tmp"]' ;;
       ipam) network_extra=',"ipam":{"config":[{"subnet":"172.30.0.0/24"}]}' ;;
       replicas) service_extra=',"deploy":{"replicas":2}' ;;
       scale) service_extra=',"scale":2' ;;
