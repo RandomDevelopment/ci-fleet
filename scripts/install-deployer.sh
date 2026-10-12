@@ -1600,6 +1600,14 @@ perform_drain() {
   reject_other_role_state
   secure_directory "$state_root" 700 0 || block 'drain requires an installed deployer'
   secure_file "$state_file" 'deployer install state'
+  python3 - "$state_file" "$environment" "$target" <<'PY' || block 'installed environment and target do not match the drain configuration'
+import json, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(state, dict) and state.get('environment') == sys.argv[2] and state.get('target') == sys.argv[3] else 1)
+PY
   [[ -L $current && $(readlink "$current") =~ ^releases/[0-9a-f]{40}$ ]] || block 'drain requires an installed deployer'
   if active_deployment; then block 'active deployment prevents drain'; fi
   if [[ -e "$drained" || -L "$drained" ]]; then

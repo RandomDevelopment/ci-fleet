@@ -1595,9 +1595,30 @@ chmod 0600 "$active"
 CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents this operation' "$installer" --upgrade --config "$config" >/dev/null
 CI_FLEET_DEPLOYER_TEST_LIVE_PID=$$ expect_failure 'active deployment prevents drain' "$installer" --drain --config "$config" >/dev/null
 rm "$active"
+for identity in 'staging other-target' 'testing example-staging'; do
+  read -r drain_environment drain_target <<<"$identity"
+  write_config "$drain_environment" "$drain_target"
+  rejected_drain=$(expect_failure 'installed environment and target do not match the drain configuration' "$installer" --drain --config "$config")
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'wrong-target drain created a maintenance marker'
+  [[ $rejected_drain != *safe-to-maintain* ]] || fail 'wrong-target drain reported safe maintenance'
+done
+write_config
+install -m 0600 "$root/var/lib/ci-fleet-deployer/install-state.json" "$tmp/drain-state.saved"
+for invalid_state in 'invalid-json' '[]' '{}' '{"environment":"staging"}'; do
+  printf '%s\n' "$invalid_state" >"$root/var/lib/ci-fleet-deployer/install-state.json"
+  expect_failure 'installed environment and target do not match the drain configuration' "$installer" --drain --config "$config" >/dev/null
+  [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'invalid-state drain created a maintenance marker'
+done
+install -m 0600 "$tmp/drain-state.saved" "$root/var/lib/ci-fleet-deployer/install-state.json"
 drain=$(expect_success "$installer" --drain --config "$config")
 grep -Fq 'result=CHANGED' <<<"$drain" || fail 'drain marker was not created'
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'drain state is absent'
+drain_marker_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/drained")
+other_drain_config=$root/etc/ci-fleet-deployer/other-target.conf
+printf 'SCHEMA_VERSION=1\nENVIRONMENT=staging\nTARGET_ID=other-target\n' >"$other_drain_config"
+chmod 0600 "$other_drain_config"
+expect_failure 'installed environment and target do not match the drain configuration' "$installer" --drain --config "$other_drain_config" >/dev/null
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/drained") == "$drain_marker_before" ]] || fail 'wrong-target repeated drain changed the marker'
 mv "$fake_bin/docker" "$fake_bin/docker.unavailable"
 expect_success "$installer" --drain --config "$config" >/dev/null
 mv "$fake_bin/docker.unavailable" "$fake_bin/docker"
