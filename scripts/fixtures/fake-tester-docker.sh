@@ -201,8 +201,10 @@ case ${operation:-} in
       cgroup-default) cgroup_extra= ;;
       uts-host) service_extra=',"uts":"host"' ;;
       remote-logging) service_extra=',"logging":{"driver":"syslog","options":{"syslog-address":"tcp://example.invalid:514"}}' ;;
-      # shellcheck disable=SC2016 # Model literal dollars after source rendering.
-      literal-dollar) service_extra+=',"command":["sh","-c","echo $TOKEN ${MISSING:?}"]' ;;
+      literal-dollar)
+        # shellcheck disable=SC2016 # Model literal dollars after source rendering.
+        service_extra+=',"command":["sh","-c","echo $TOKEN ${MISSING:?}"]'
+        ;;
       interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
       profiles) service_extra=',"profiles":["extra"]' ;;
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
