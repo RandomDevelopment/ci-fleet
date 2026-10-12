@@ -27,3 +27,13 @@ Before committing configuration changes, run:
 - Keep ordinary task jobs at a five-minute hard ceiling and expected shard payload at four minutes or less.
 - Preserve deterministic task/shard isolation; Compose identity must include task and shard as well as run identity.
 - Update schema, initializer, validator, tests, examples, and documentation together.
+
+
+## Documentation impact
+
+- Always assess documentation impact when working on an issue, preparing a commit, or creating, updating, or reviewing a PR. Repeat the assessment if the scope changes.
+- Check whether the change affects documented behavior, usage, setup, configuration, APIs, architecture, deployment, or operations. Read the relevant documentation and compare it with the implementation.
+- When implementing a change, update affected documentation in the same commit or PR. Follow the repository's documentation and changelog conventions. Preserve historical release notes and immutable records.
+- When reviewing, report missing or inaccurate documentation as a finding.
+- Before declaring the work complete, check updated examples, commands, links, and configuration names. Run applicable documentation checks.
+- State the documentation impact in the PR description and completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.

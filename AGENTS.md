@@ -64,3 +64,13 @@ Runnable changes must eventually include:
 ## Change policy
 
 Keep changes small and reversible. Existing project CI must continue operating until the new fleet path has passed parallel validation, completed the compliance checklist, and has an explicit tested rollback or documented reinstall procedure appropriate to the host's failure boundary.
+
+
+## Documentation impact
+
+- Always assess documentation impact when working on an issue, preparing a commit, or creating, updating, or reviewing a PR. Repeat the assessment if the scope changes.
+- Check whether the change affects documented behavior, usage, setup, configuration, APIs, architecture, deployment, or operations. Read the relevant documentation and compare it with the implementation.
+- When implementing a change, update affected documentation in the same commit or PR. Follow the repository's documentation and changelog conventions. Preserve historical release notes and immutable records.
+- When reviewing, report missing or inaccurate documentation as a finding.
+- Before declaring the work complete, check updated examples, commands, links, and configuration names. Run applicable documentation checks.
+- State the documentation impact in the PR description and completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.
