@@ -2545,6 +2545,7 @@ cp -a "$root" "$build_failure_root"
 export FAKE_COMPOSE_LOG=$tmp/stopped-distinct-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
 printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$build_failure_output" 2>&1; then
   fail 'candidate build failure unexpectedly succeeded'
@@ -2560,6 +2561,7 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 same_controller_output=$tmp/same-controller-build.out
 export FAKE_COMPOSE_LOG=$tmp/same-controller-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$same_controller_output" 2>&1; then
   fail 'same-controller-tag build failure unexpectedly succeeded'
@@ -2578,6 +2580,7 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 empty_live_image_output=$tmp/empty-live-image-build.out
 export FAKE_COMPOSE_LOG=$tmp/empty-live-image-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$empty_live_image_output" 2>&1; then
   fail 'empty-live-image candidate build failure unexpectedly succeeded'
@@ -2599,6 +2602,7 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 live_drift_build_output=$tmp/live-drift-build.out
 export FAKE_COMPOSE_LOG=$tmp/live-drift-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$live_drift_build_output" 2>&1; then
   fail 'live-drift candidate build failure unexpectedly succeeded'
@@ -2614,6 +2618,7 @@ unset FAKE_COMPOSE_LOG
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$rendered_env" "$FAKE_CONTROLLER_IMAGE" "$prior_controller_image"
 postbuild_capacity_output=$tmp/postbuild-capacity.out
 export FAKE_DISK_USED_PERCENT_FILE=$tmp/docker-disk-used-percent
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_DISK_USED_PERCENT_AFTER_BUILD=80
 printf '79\n' >"$FAKE_DISK_USED_PERCENT_FILE"
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$postbuild_capacity_output" 2>&1; then
@@ -2788,6 +2793,7 @@ export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
 prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
+rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_PARTIAL_BUILD_FAIL=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$restartable_tag_build_output" 2>&1; then
   fail 'restartable-tag candidate build failure unexpectedly succeeded'
