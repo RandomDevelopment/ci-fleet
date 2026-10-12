@@ -570,15 +570,17 @@ def _memory(root: Path) -> tuple[int, int]:
     return available, swap_used
 
 
-def _cpu(root: Path) -> dict[str, float | int]:
+def _cpu(root: Path) -> dict[str, float | int | None]:
     try:
         fields = next(line for line in (root / "proc/stat").read_text().splitlines() if line.startswith("cpu ")).split()[1:]
         counters = [int(value) for value in fields]
         total = sum(counters[:8])
         idle = counters[3]
+        if any(value < 0 for value in counters) or total <= 0 or idle > total:
+            raise ValueError("invalid CPU counters")
         percent = round(100 * (total - idle) / max(total, 1), 1)
     except (OSError, ValueError, IndexError, StopIteration):
-        total, idle, percent = 0, 0, 0.0
+        total, idle, percent = None, None, 0.0
     return {"logical": max(os.cpu_count() or 1, 1), "used_percent": percent, "total_ticks": total, "idle_ticks": idle}
 
 

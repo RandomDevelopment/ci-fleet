@@ -543,6 +543,43 @@ class HealthTests(unittest.TestCase):
                 else:
                     os.environ["CI_FLEET_TESTING"] = previous_testing
 
+    def test_failed_cpu_probe_preserves_capacity_baseline_and_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proc").mkdir()
+            history = root / "capacity" / "samples.jsonl"
+            snapshot = healthy_snapshot()
+            snapshot["runners"] = {"current": 0}
+            previous_testing = os.environ.get("CI_FLEET_TESTING")
+            os.environ["CI_FLEET_TESTING"] = "1"
+            try:
+                (root / "proc/stat").write_text("cpu  100 0 50 800 50 0 0 0\n")
+                snapshot["cpu"] = health._cpu(root)
+                health.record_capacity(history, snapshot, now=1_000_000)
+                baseline = history.with_suffix(history.suffix + ".cpu")
+                original = baseline.read_bytes()
+                for contents in (None, "cpu bad\n", "cpu 0 0 0 0\n", "cpu -1 0 0 1\n"):
+                    if contents is None:
+                        (root / "proc/stat").unlink()
+                    else:
+                        (root / "proc/stat").write_text(contents)
+                    snapshot["cpu"] = health._cpu(root)
+                    snapshot["runners"]["current"] = 1
+                    with self.assertRaisesRegex(ValueError, "current CPU counters are invalid"):
+                        health.record_capacity(history, snapshot, now=1_000_030)
+                    self.assertEqual(baseline.read_bytes(), original)
+                    self.assertFalse(history.exists())
+                (root / "proc/stat").write_text("cpu  150 0 50 850 50 0 0 0\n")
+                cpu = health._cpu(root)
+                prior = health._update_cpu_baseline(history, 1_000_060, cpu)
+                self.assertEqual(prior["total_ticks"], 1000)
+                self.assertEqual(cpu["total_ticks"], 1100)
+            finally:
+                if previous_testing is None:
+                    os.environ.pop("CI_FLEET_TESTING", None)
+                else:
+                    os.environ["CI_FLEET_TESTING"] = previous_testing
+
     def test_capacity_prunes_inactive_history_and_ignores_incomplete_samples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             history = Path(directory) / "capacity" / "samples.jsonl"

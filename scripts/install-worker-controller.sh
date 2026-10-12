@@ -1548,6 +1548,19 @@ drain_current() {
   try_drain_current "$@" || die "$drain_error"
 }
 
+stop_capacity_units() {
+  local unit load_state
+  for unit in ci-fleet-capacity.timer ci-fleet-capacity.service; do
+    load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+    if [[ "$load_state" == not-found && ! -e "$systemd_dir/$unit" && ! -L "$systemd_dir/$unit" ]]; then continue; fi
+    [[ "$load_state" == loaded ]] || return 1
+    case "$unit" in
+      *.timer) systemctl disable --now "$unit" >/dev/null || return 1 ;;
+      *.service) systemctl stop "$unit" || return 1 ;;
+    esac
+  done
+}
+
 install_systemd_units() {
   local source=${1:-$repo_root}
   install -d -m 0755 "$systemd_dir"
@@ -1557,10 +1570,7 @@ install_systemd_units() {
     install -m 0644 "$source/host/systemd/ci-fleet-capacity.service" "$systemd_dir/"
     install -m 0644 "$source/host/systemd/ci-fleet-capacity.timer" "$systemd_dir/"
   else
-    systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
-    if [[ -f "$systemd_dir/ci-fleet-capacity.service" ]] && ! systemctl stop ci-fleet-capacity.service; then
-      return 1
-    fi
+    stop_capacity_units || return 1
     rm -f "$systemd_dir/ci-fleet-capacity.service" "$systemd_dir/ci-fleet-capacity.timer"
   fi
   install -m 0644 "$source/host/systemd/ci-fleet-cleanup.service" "$systemd_dir/"
@@ -1577,10 +1587,7 @@ install_systemd_units() {
 remove_systemd_units() {
   rm -f "$systemd_dir/.ci-fleet-reconcile-unit-restore"
   systemctl disable --now "${timer_names[@]}" >/dev/null 2>&1 || true
-  systemctl disable --now ci-fleet-capacity.timer >/dev/null 2>&1 || true
-  if [[ -f "$systemd_dir/ci-fleet-capacity.service" ]] && ! systemctl stop ci-fleet-capacity.service; then
-    return 1
-  fi
+  stop_capacity_units || return 1
   local unit
   for unit in "${optional_unit_names[@]}"; do
     case "$unit" in *.timer) systemctl disable --now "$unit" >/dev/null 2>&1 || true ;; esac

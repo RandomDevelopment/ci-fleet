@@ -296,6 +296,14 @@ if [[ -n "${FAKE_FAIL_CAPACITY_STOP_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_STOP_ONC
   exit 96
 fi
 [[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
+if [[ "${1:-}" == show && "${2:-}" == --property=LoadState && "${3:-}" == --value ]]; then
+  if [[ -e "${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${4:?}" ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
+  exit 0
+fi
+if [[ -n "${FAKE_FAIL_CAPACITY_TIMER_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_TIMER_ONCE" && "$*" == 'disable --now ci-fleet-capacity.timer' ]]; then
+  rm -f "$FAKE_FAIL_CAPACITY_TIMER_ONCE"
+  exit 95
+fi
 if [[ "${1:-}" == show && "${2:-}" == --property=ActiveState && "${3:-}" == --value ]]; then
   printf '%s\n' "${FAKE_RECONCILE_ACTIVE_STATE:-inactive}"
   exit 0
@@ -3179,6 +3187,11 @@ export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
 export FAKE_SYSTEMCTL_LOG=$tmp/legacy-systemctl.log
+export FAKE_FAIL_CAPACITY_TIMER_ONCE=$tmp/fail-capacity-timer-once
+: >"$FAKE_FAIL_CAPACITY_TIMER_ONCE"
+expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref"
+[[ -e "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'failed timer stop deleted telemetry units'
+unset FAKE_FAIL_CAPACITY_TIMER_ONCE
 export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/fail-capacity-stop-once
 : >"$FAKE_FAIL_CAPACITY_STOP_ONCE"
 expect_failure 'ROLLBACK_RESTORED' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref"
