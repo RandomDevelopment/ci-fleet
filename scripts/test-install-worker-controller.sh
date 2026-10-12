@@ -794,7 +794,7 @@ git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
 export FAKE_BUILDX_VERSION=v0.9.0
-expect_failure 'reviewed Docker Buildx v0.32.1 is required' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+expect_failure 'reviewed Docker Buildx v0.32.1 is required' "$repo_root/scripts/build-managed-images.sh" "$repo_root" "$tmp/unused-build.env"
 unset FAKE_BUILDX_VERSION
 
 expect_failure 'alternate Docker endpoints are not supported' env DOCKER_HOST=tcp://example.invalid:2376 "$installer" --check "${base_args[@]}" --ref "$ref_one"
@@ -2288,7 +2288,7 @@ mv "$host_config.missing" "$host_config"
 
 second=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'NO_CHANGE' <<<"$second" || fail 'idempotent rerun changed the host'
-check=$(expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
+check=$(FAKE_BUILDX_UNAVAILABLE=1 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one")
 grep -Fq 'HEALTH last=' <<<"$check" || fail 'check output omitted the last redacted health result'
 installed_installer=$root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
 expect_success env FAKE_FAIL_GIT_FETCH=1 "$installed_installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
@@ -2348,7 +2348,7 @@ expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/n
 if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
 export FAKE_TRANSACTION_LOG=$tmp/matching-image-maintenance.log
 : >"$FAKE_TRANSACTION_LOG"
-SOURCE_DATE_EPOCH=1 FAKE_DISABLED_TIMER=ci-fleet-health.timer FAKE_FAIL_BUILD=1 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+SOURCE_DATE_EPOCH=1 FAKE_DISABLED_TIMER=ci-fleet-health.timer FAKE_FAIL_BUILD=1 FAKE_BUILDX_UNAVAILABLE=1 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 if grep -Fq 'docker buildx build' "$FAKE_TRANSACTION_LOG"; then fail 'maintenance-only repair rebuilt matching reviewed images'; fi
 unset FAKE_TRANSACTION_LOG
 : >"$FAKE_IMAGE_INSPECT_LOG"

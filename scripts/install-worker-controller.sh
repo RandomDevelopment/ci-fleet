@@ -177,12 +177,6 @@ cleanup_temporary() {
 }
 trap cleanup_temporary EXIT
 
-require_buildx() {
-  local version
-  version=$(docker buildx version 2>/dev/null | awk '{print $2}') || die 'Docker Buildx is unavailable'
-  [[ "$version" == v0.32.1 ]] || die 'reviewed Docker Buildx v0.32.1 is required'
-}
-
 require_commands() {
   local command docker_root disk_used os_id os_release os_version socket
   local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp)
@@ -198,7 +192,6 @@ require_commands() {
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
-  if [[ "$mode" != uninstall && "$mode" != rollback ]]; then require_buildx; fi
   [[ "$mode" == rollback || "$mode" == uninstall ]] && return
 
   for command in curl jq df openssl; do command -v "$command" >/dev/null || die "$command is required"; done

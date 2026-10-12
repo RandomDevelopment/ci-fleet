@@ -65,7 +65,7 @@ docker image inspect --format '{{.Id}}' \
   "ci-fleet-runner:$CI_FLEET_VERSION"
 ```
 
-Managed builds require the reviewed Docker Buildx client v0.32.1. Uninstall and rollback that reuse retained images do not require that plugin. Rollback that must rebuild requires the reviewed client. Host tool installation or upgrade remains separately authorized.
+Managed builds require the reviewed Docker Buildx client v0.32.1. Read-only checks, manager staging, maintenance that reuses matching images, uninstall and retained-image rollback do not require that plugin. Rollback that must rebuild requires the reviewed client. Host tool installation or upgrade remains separately authorized.
 
 Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes the temporary builder afterward.
 
