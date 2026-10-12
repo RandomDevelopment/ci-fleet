@@ -1249,6 +1249,16 @@ FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
 export FAKE_PRIOR_RUNNER_IMAGE=$head_runner_image
 export FAKE_PRIOR_CONTROLLER_IMAGE=$head_controller_image
+export FAKE_PRIOR_IMAGE_STATES=$tmp/pre-adapter-current-tags
+mkdir -p "$FAKE_PRIOR_IMAGE_STATES"
+cp "$tmp/pre-adapter-runner-image-present" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$tmp/pre-adapter-runner-image-id" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$tmp/pre-adapter-controller-image-present" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$tmp/pre-adapter-controller-image-id-state" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
+cp "$tmp/pre-adapter-retained-tags/runner-state" "$tmp/pre-adapter-runner-image-present"
+cp "$tmp/pre-adapter-retained-tags/runner-id" "$tmp/pre-adapter-runner-image-id"
+cp "$tmp/pre-adapter-retained-tags/controller-state" "$tmp/pre-adapter-controller-image-present"
+cp "$tmp/pre-adapter-retained-tags/controller-id" "$tmp/pre-adapter-controller-image-id-state"
 pre_adapter_without_policy_ref=$(write_config active 1 1 "$pre_adapter_ref" false omit)
 : >"$FAKE_COMPOSE_LOG"
 pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_without_policy_ref")
@@ -1264,9 +1274,18 @@ FAKE_RUNNER_IMAGE=$head_runner_image
 FAKE_CONTROLLER_IMAGE=$head_controller_image
 FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
+FAKE_PRIOR_IMAGE_STATES=$tmp/pre-adapter-retained-tags
+cp "$tmp/pre-adapter-runner-image-present" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$tmp/pre-adapter-runner-image-id" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$tmp/pre-adapter-controller-image-present" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$tmp/pre-adapter-controller-image-id-state" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
+cp "$tmp/pre-adapter-current-tags/runner-state" "$tmp/pre-adapter-runner-image-present"
+cp "$tmp/pre-adapter-current-tags/runner-id" "$tmp/pre-adapter-runner-image-id"
+cp "$tmp/pre-adapter-current-tags/controller-state" "$tmp/pre-adapter-controller-image-present"
+cp "$tmp/pre-adapter-current-tags/controller-id" "$tmp/pre-adapter-controller-image-id-state"
 ref_one=$(write_config active 1 1)
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
-unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
 
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
 authority_active_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
