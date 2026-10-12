@@ -43,8 +43,12 @@ if [[ $1 == list-unit-files || $1 == list-units ]]; then
   exit 0
 fi
 if [[ $1 == show && " $* " == *' --property=LoadState '* ]]; then
-  if [[ -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
+  if [[ -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 || ${FAKE_TESTER_EFFECTIVE_SERVICES:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
   exit 0
+fi
+if [[ -n ${FAKE_TESTER_QUEUED_SERVICES:-} ]]; then
+  if [[ $* == 'stop ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' ]]; then rm -f "$FAKE_TESTER_QUEUED_SERVICES"; fi
+  if [[ $1 == daemon-reload && -e $FAKE_TESTER_QUEUED_SERVICES ]]; then printf 'maintenance services remain queued\n' >&2; exit 9; fi
 fi
 if [[ $1 == show ]]; then
   reload=no
@@ -139,6 +143,25 @@ if CI_FLEET_ROOT_PREFIX=$clean_root "$installer" --rollback >"$tmp/absent-rollba
 grep -Fq 'protected directory is unsafe' "$tmp/absent-rollback.out" || fail 'absent rollback failed outside existing-state validation'
 for marker in etc/ci-fleet-tester var/lib/ci-fleet-tester opt/ci-fleet-tester; do
   [[ ! -e $clean_root/$marker && ! -L $clean_root/$marker ]] || fail 'a no-op command created tester role state'
+done
+mkdir "$clean_root/etc"
+printf 'ID=debian\nVERSION_ID=13\n' >"$clean_root/etc/os-release"
+clean_ref=$(git -C "$repo_root" rev-parse HEAD)
+if CI_FLEET_ROOT_PREFIX=$clean_root FAKE_TESTER_DOCKER_ROOT=$clean_root/var/lib/docker "$installer" --install --ref "$clean_ref" >"$tmp/absent-config.out" 2>&1; then fail 'install accepted absent configuration'; fi
+grep -Fq 'protected directory is unsafe' "$tmp/absent-config.out" || fail 'absent configuration failed outside input validation'
+for marker in etc/ci-fleet-tester var/lib/ci-fleet-tester opt/ci-fleet-tester; do
+  [[ ! -e $clean_root/$marker ]] || fail 'missing configuration created tester role state'
+done
+install -d -m 0700 "$clean_root/etc/ci-fleet-tester"
+cp "$root/etc/ci-fleet-tester/tester.env" "$clean_root/etc/ci-fleet-tester/tester.env"
+chmod 0644 "$clean_root/etc/ci-fleet-tester/tester.env"
+if CI_FLEET_ROOT_PREFIX=$clean_root FAKE_TESTER_DOCKER_ROOT=$clean_root/var/lib/docker "$installer" --install --ref "$clean_ref" >"$tmp/unsafe-config.out" 2>&1; then fail 'install accepted unsafe configuration'; fi
+grep -Fq 'protected file is unsafe' "$tmp/unsafe-config.out" || fail 'unsafe configuration failed outside input validation'
+chmod 0600 "$clean_root/etc/ci-fleet-tester/tester.env"
+if CI_FLEET_ROOT_PREFIX=$clean_root FAKE_TESTER_DOCKER_ROOT=$clean_root/var/lib/docker "$installer" --upgrade --ref "$clean_ref" >"$tmp/absent-upgrade.out" 2>&1; then fail 'upgrade accepted an absent installation'; fi
+grep -Fq 'tester is not installed' "$tmp/absent-upgrade.out" || fail 'absent upgrade failed outside input validation'
+for marker in var/lib/ci-fleet-tester opt/ci-fleet-tester etc/ci-fleet-tester/environments etc/ci-fleet-tester/definitions etc/ci-fleet-tester/secrets; do
+  [[ ! -e $clean_root/$marker ]] || fail 'invalid install input created tester installation directories'
 done
 if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
@@ -533,6 +556,19 @@ installed_tmpfiles=$root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf
 rm "$installed_tmpfiles"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing installed tmpfiles rule passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-lock.conf" "$installed_tmpfiles"
+for override_dir in etc/tmpfiles.d run/tmpfiles.d usr/local/lib/tmpfiles.d; do
+  mkdir -p "$root/$override_dir"
+  override=$root/$override_dir/ci-fleet-tester-lock.conf
+  for override_kind in file symlink; do
+    if [[ $override_kind == file ]]; then printf 'd /run/lock/ci-fleet-tester 0700 root root -\n' >"$override"; else ln -s /dev/null "$override"; fi
+    for mode in --install --check; do
+      ref_args=(); [[ $mode != --install ]] || ref_args=(--ref "$ref")
+      if "$installer" "$mode" "${ref_args[@]}" >"$tmp/tmpfiles-override.out" 2>&1; then fail 'installer accepted a boot-effective tmpfiles override'; fi
+      grep -Fq 'unmanaged tester tmpfiles overrides are forbidden' "$tmp/tmpfiles-override.out" || fail 'tmpfiles override failed outside policy validation'
+    done
+    rm "$override"
+  done
+done
 unsafe_policy_accepted=0
 for policy_file in "$installed_unit" "$installed_tmpfiles"; do
   chmod 0666 "$policy_file"
@@ -675,7 +711,14 @@ if FAKE_TESTER_ORPHAN_VOLUME_PROJECT=ci-fleet-test-missing-state "$installer" --
 if FAKE_TESTER_ORPHAN_NETWORK_PROJECT=ci-fleet-test-missing-state "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored a managed Compose network with missing state'; fi
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall ignored systemd teardown failure'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed uninstall removed the active release'
+if FAKE_TESTER_SYSTEMCTL_FAIL=stop "$installer" --uninstall >/dev/null 2>&1; then fail 'uninstall ignored maintenance service stop failure'; fi
+[[ -L $root/opt/ci-fleet-tester/current && -f $root/etc/systemd/system/ci-fleet-tester-health.service ]] || fail 'failed service stop removed the active release or unit files'
+queued_services=$tmp/queued-services
+touch "$queued_services"
+export FAKE_TESTER_QUEUED_SERVICES=$queued_services
 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'uninstall failed'
+[[ ! -e $queued_services ]] || fail 'uninstall left maintenance services queued'
+unset FAKE_TESTER_QUEUED_SERVICES
 [[ -f $root/etc/ci-fleet-tester/tester.env && ! -L $root/opt/ci-fleet-tester/current ]] || fail 'uninstall did not preserve config/remove runtime'
 [[ ! -e $root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf ]] || fail 'uninstall left the tester tmpfiles rule installed'
 FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'repeated uninstall failed on absent units'
@@ -687,8 +730,10 @@ if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tes
 # than failing because a timer unit file is missing.
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'fresh install failed before partial-unit test'
 rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.timer"
+rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.service"
 : >"$tmp/systemctl.log"
-FAKE_TESTER_EFFECTIVE_TIMERS=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
+FAKE_TESTER_EFFECTIVE_TIMERS=1 FAKE_TESTER_EFFECTIVE_SERVICES=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
 grep -Fxq 'disable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'uninstall skipped an effective timer without a local fragment'
+grep -Fxq 'stop ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$tmp/systemctl.log" || fail 'uninstall skipped an effective service without a local fragment'
 [[ -L $root/opt/ci-fleet-tester/current ]] && fail 'partial uninstall left the active release link'
 printf 'TESTER_INSTALLER_TESTS_OK\n'

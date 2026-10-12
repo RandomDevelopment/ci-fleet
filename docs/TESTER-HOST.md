@@ -23,7 +23,7 @@ Compose provider executables, init containers, model-runner dependencies, and an
 
 Runtime commands use a fresh empty Docker client configuration, so inherited client proxies, credential helpers, and registry credentials are unavailable. Images must be pullable without those credentials or already available to the daemon. 
 
-Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units. Admission and health also reject foreign roles reported by systemd's loaded-unit and unit-file inventories.
+Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units. Admission and health also reject foreign roles reported by systemd's loaded-unit and unit-file inventories. Higher-priority files or symlinks named `ci-fleet-tester-lock.conf` in `/etc/tmpfiles.d`, `/run/tmpfiles.d`, or `/usr/local/lib/tmpfiles.d` are forbidden. Uninstall stops both maintenance services after disabling their timers and before removing the runtime.
 
 The host's root administrators and Docker daemon are trusted. Health checks verify the isolation settings listed above; they do not attest process arguments, environment variables, or healthcheck definitions after an administrator recreates a container outside this runtime. Review image defaults and use the protected definitions for application changes. Restrict Docker administration to authorized operators.
 

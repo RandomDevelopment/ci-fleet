@@ -126,6 +126,13 @@ reject_unit_dropins() {
   done
 }
 
+reject_tmpfiles_overrides() {
+  local directory
+  for directory in /etc/tmpfiles.d /run/tmpfiles.d /usr/local/lib/tmpfiles.d; do
+    [[ ! -e $(root_path "$directory")/$tmpfiles_conf && ! -L $(root_path "$directory")/$tmpfiles_conf ]] || die 'unmanaged tester tmpfiles overrides are forbidden'
+  done
+}
+
 effective_units_match() {
   local unit properties key value fragment dropins reload
   for unit in "${units[@]}"; do
@@ -175,6 +182,7 @@ host_preflight() {
   [[ ${ID:-} == debian && ${VERSION_ID:-} =~ ^[0-9]+$ && ${VERSION_ID%%.*} -ge 12 ]] || die 'tester hosts require Debian 12 or newer'
   reject_other_roles
   reject_unit_dropins
+  reject_tmpfiles_overrides
   python3 -c 'import yaml' 2>/dev/null || die 'python3-yaml is required for Compose source validation'
   pin_local_docker
   [[ $(docker info --format '{{len .DefaultAddressPools}}') =~ ^[1-9][0-9]*$ ]] || die 'explicit Docker default address pools are required'
@@ -259,7 +267,7 @@ start_maintenance() {
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  local unit load_state present_units=() present_timers=()
+  local unit load_state present_units=() present_timers=() present_services=()
   for unit in "${units[@]}"; do
     [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
@@ -274,6 +282,18 @@ remove_units() {
   done
   if (( ${#present_timers[@]} )); then
     systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
+  fi
+  for unit in "${services[@]}"; do
+    if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
+      present_services+=("$unit")
+    else
+      load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+      [[ -n $load_state ]] || return 1
+      [[ $load_state == not-found ]] || present_services+=("$unit")
+    fi
+  done
+  if (( ${#present_services[@]} )); then
+    systemctl stop "${present_services[@]}" >/dev/null 2>&1 || return 1
   fi
   for unit in "${present_units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
   rm -f -- "$tmpfiles_dir/$tmpfiles_conf" || return 1
@@ -290,6 +310,7 @@ activate_release() {
   local commit=$1 target=$release_dir/$1 previous=
   reject_other_roles
   reject_unit_dropins
+  reject_tmpfiles_overrides
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
@@ -340,7 +361,8 @@ case $action in --install|--upgrade|--check|--reset|--rollback|--uninstall) acqu
 
 case $action in
   --install|--upgrade)
-    host_preflight; ensure_directories
+    host_preflight
+    secure_dir "$config_root" 700
     secure_file "$(root_path "$config")" 600
     reject_git_replacements
     [[ $(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$ref" ]] || die 'reviewed checkout HEAD does not match --ref'
@@ -348,6 +370,7 @@ case $action in
     current=$(installed_revision || true)
     [[ $action != --install || -z $current || $current == "$ref" ]] || die 'tester is already installed at another revision; use --upgrade'
     [[ $action != --upgrade || -n $current ]] || die 'tester is not installed; use --install'
+    ensure_directories
     if [[ $current == "$ref" ]] && installation_matches "$ref"; then
       "$stable_launcher" --check
       "$stable_launcher" --health
