@@ -168,7 +168,7 @@ for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
     if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
-    if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
+    if service.get('build') or service.get('devices') or service.get('device_cgroup_rules') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if not all(isinstance(service.get(key),(int,float)) and not isinstance(service[key],bool) and math.isfinite(service[key]) and service[key] > 0 for key in ('cpus','mem_limit','pids_limit')): raise SystemExit(f'{name}: positive CPU, memory, and PID limits are required')
     swap_limit=service.get('memswap_limit',0)
@@ -191,8 +191,11 @@ if ports != [(route_service,route_port,ports[0][2] if ports else 0)] or not port
 if value.get('models'): raise SystemExit('external model runners are forbidden')
 if value.get('configs'): raise SystemExit('top-level configs are forbidden')
 for section in ('networks','volumes'):
+    resolved_names=set()
     for name,item in value.get(section,{}).items():
         resolved=item.get('name',f'{project}_{name}')
+        if resolved in resolved_names: raise SystemExit(f'{section}.{name}: duplicate resolved resource name')
+        resolved_names.add(resolved)
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
         if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
         if section == 'networks' and item.get('enable_ipv4') is False: raise SystemExit(f'{section}.{name}: IPv4 is required')
@@ -378,7 +381,7 @@ expected_mounts=sorted(expected_mounts)
 actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else mount.get('Name','') if mount.get('Type')=='volume' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
 networks={model['networks'][name]['name'] for name in service.get('networks',{'default':{}})}
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
-       not host.get('CapAdd') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
+       not host.get('CapAdd') and not host.get('Devices') and not host.get('DeviceRequests') and not host.get('DeviceCgroupRules') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
        host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and host['MemorySwap'] >= service['mem_limit'] and
        host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
@@ -434,7 +437,9 @@ inspect_environment() {
 }
 
 load_global
-for role_path in /etc/ci-fleet /var/lib/ci-fleet /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-status /var/lib/ci-fleet-status; do
+for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current \
+  /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /opt/ci-fleet-deployer \
+  /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
   [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
 done
 for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do

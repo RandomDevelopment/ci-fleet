@@ -49,7 +49,11 @@ if [[ $1 == inspect ]]; then
   elif [[ " $* " != *' --format '* ]]; then
     project=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$(<"${FAKE_TESTER_MODEL_PATH:?}")")
     privileged=false; nano_cpus=500000000; memory=134217728; memory_swap=268435456; pids_limit=128; oom_disable=false; oom_score=0; network_mode=${project}_default; networks=$(printf '{"%s":{}}' "$network_mode"); mounts=$(printf '[{"Type":"volume","Name":"%s_data","Destination":"/data","RW":true}]' "$project"); ports=$(printf '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}")
+    host_extra=
     case ${FAKE_TESTER_LIVE_POLICY:-valid} in
+      device-cgroup) host_extra=',"DeviceCgroupRules":["b 8:* rwm"]' ;;
+      devices) host_extra=',"Devices":[{"PathOnHost":"/dev/sda","PathInContainer":"/dev/sda","CgroupPermissions":"rwm"}]' ;;
+      device-requests) host_extra=',"DeviceRequests":[{"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]}]' ;;
       privileged) privileged=true ;;
       bind) mounts='[{"Type":"bind","Source":"/","Destination":"/host"}]' ;;
       broad-port) ports=$(printf '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}") ;;
@@ -68,7 +72,7 @@ if [[ $1 == inspect ]]; then
       mounts=${mounts%]}$(printf ',{"Type":"bind","Source":"%s","Destination":"%s","RW":false}]' "$FAKE_TESTER_SECRET_FILE" "$secret_target")
     fi
     if [[ ${*: -1} == fixture-worker-id ]]; then mounts='[]'; ports='{}'; fi
-    printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"MemorySwap":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$memory_swap" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$networks" "$mounts"
+    printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"MemorySwap":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"%s},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$memory_swap" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$host_extra" "$networks" "$mounts"
   else
     printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"
   fi
@@ -145,6 +149,9 @@ case ${operation:-} in
       custom-volume) volume_extra=',"driver":"local"' ;;
       volumes-from) service_extra=',"volumes_from":["container:other:rw"]' ;;
       custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
+      device-cgroup) service_extra+=',"device_cgroup_rules":["b 8:* rwm"]' ;;
+      duplicate-network) network_extra=$(printf '},"alias":{"name":"%s_default"' "$project") ;;
+      duplicate-volume) volume_extra=$(printf '},"alias":{"name":"%s_data"' "$project") ;;
       ipv4-disabled) network_extra=',"enable_ipv4":false,"enable_ipv6":true' ;;
       service-tmpfs) service_extra+=',"tmpfs":["/tmp"]' ;;
       ipam) network_extra=',"ipam":{"config":[{"subnet":"172.30.0.0/24"}]}' ;;

@@ -175,11 +175,13 @@ grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared rout
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
   if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
 done
-for policy in ipv4-disabled service-tmpfs; do
+for policy in ipv4-disabled service-tmpfs device-cgroup duplicate-network duplicate-volume; do
   write_environment "$policy" 18098
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "$policy" >"$tmp/model-rejection.out" 2>&1; then fail "unsupported model was accepted: $policy"; fi
   case $policy in
+    device-cgroup) grep -Fq 'build/device/capability/external mount/global identity is forbidden' "$tmp/model-rejection.out" || fail 'device rules failed outside model validation' ;;
+    duplicate-network|duplicate-volume) grep -Fq 'duplicate resolved resource name' "$tmp/model-rejection.out" || fail 'duplicate names failed outside model validation' ;;
     ipv4-disabled) grep -Fq 'IPv4 is required' "$tmp/model-rejection.out" || fail 'IPv4-disabled network failed outside model validation' ;;
     service-tmpfs) grep -Fq 'service-level tmpfs is unsupported' "$tmp/model-rejection.out" || fail 'service tmpfs failed outside model validation' ;;
   esac
@@ -233,7 +235,7 @@ FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtim
 FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null || fail 'health rejected a reachable route without a Docker healthcheck'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unreachable route without a Docker healthcheck'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
-for live_policy in privileged bind broad-port unbounded unlimited-swap; do
+for live_policy in privileged bind broad-port unbounded unlimited-swap device-cgroup devices device-requests; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
 done
 legacy_model=$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json
@@ -423,6 +425,20 @@ done
 ln -s /missing "$root/var/lib/ci-fleet-deployer"
 if "$installer" --check >/dev/null 2>&1; then fail 'tester accepted a dangling deployer role marker'; fi
 rm "$root/var/lib/ci-fleet-deployer"
+for marker in /opt/ci-fleet/current /opt/ci-fleet-deployer/current /opt/ci-fleet-status/current /var/lib/ci-fleet-status-installer; do
+  mkdir -p "$(dirname "$root$marker")"
+  for kind in directory symlink; do
+    if [[ $kind == directory ]]; then mkdir "$root$marker"; else ln -s /missing "$root$marker"; fi
+    for mode in check install; do
+      if "$installer" "--$mode" --ref "$ref" >"$tmp/role-rejection.out" 2>&1; then fail "tester installer accepted another role: $marker $kind"; fi
+      grep -Fq 'another ci-fleet host role is present' "$tmp/role-rejection.out" || fail 'role marker failed outside admission check'
+    done
+    if "$runtime" --health >"$tmp/role-rejection.out" 2>&1; then fail "tester runtime accepted another role: $marker $kind"; fi
+    grep -Fq 'another ci-fleet host role is present' "$tmp/role-rejection.out" || fail 'runtime marker failed outside admission check'
+    if [[ $kind == directory ]]; then rmdir "$root$marker"; else rm "$root$marker"; fi
+  done
+  [[ $marker != */current ]] || rmdir "$(dirname "$root$marker")"
+done
 printf '# drift\n' >>"$installed_unit"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"

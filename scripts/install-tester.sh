@@ -92,8 +92,9 @@ acquire_lifecycle_lock() {
 reject_other_roles() {
   local path
   for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" \
-    "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" \
+    "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /opt/ci-fleet-deployer)" \
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
+    "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)" \
     "$systemd_dir"/ci-fleet-deployer* "$systemd_dir"/ci-fleet-health* "$systemd_dir"/ci-fleet-cleanup* \
     "$systemd_dir"/ci-fleet-reconcile* "$systemd_dir"/ci-fleet-drift* "$systemd_dir"/ci-fleet-status-receiver* "$systemd_dir"/actions.runner*; do
     [[ ! -e $path && ! -L $path ]] || die 'another ci-fleet host role is present'
