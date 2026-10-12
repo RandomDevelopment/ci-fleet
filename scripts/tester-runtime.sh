@@ -157,9 +157,9 @@ PY
   if ! "${clean_environment[@]}" docker compose --env-file "$empty_env" -p "$compose_project" -f "$compose_file" config --format json >"$rendered"; then rm -f "$empty_env"; return 1; fi
   rm -f "$empty_env"
   chmod 600 "$rendered"
-  python3 - "$rendered" "$route_service" "$route_port" "$compose_project" "$secret_dir" "$expected_uid" <<'PY' || return 1
-import json,math,os,re,stat,sys
-value=json.load(open(sys.argv[1])); route_service=sys.argv[2]; route_port=int(sys.argv[3]); project=sys.argv[4]; secret_dir=sys.argv[5]; expected_uid=int(sys.argv[6])
+  python3 - "$rendered" "$route_service" "$route_port" "$compose_project" <<'PY' || return 1
+import json,math,re,sys
+value=json.load(open(sys.argv[1])); route_service=sys.argv[2]; route_port=int(sys.argv[3]); project=sys.argv[4]
 if value.get('name') != project: raise SystemExit('rendered Compose project identity differs from the environment')
 services=value.get('services')
 if not isinstance(services,dict) or route_service not in services: raise SystemExit('route service is missing')
@@ -167,7 +167,7 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('device_cgroup_rules') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
@@ -177,6 +177,7 @@ for name,service in services.items():
     if service.get('oom_kill_disable') or service.get('oom_score_adj',0) < 0: raise SystemExit(f'{name}: OOM priority overrides are forbidden')
     if service.get('models'): raise SystemExit(f'{name}: external model runners are forbidden')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
+    if service.get('cgroup') != 'private': raise SystemExit(f'{name}: a private cgroup namespace is required')
     if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
     if service.get('read_only') is not True or set(service.get('cap_drop',[])) != {'ALL'}: raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
@@ -203,7 +204,21 @@ for section in ('networks','volumes'):
         if section == 'networks' and item.get('enable_ipv6'): raise SystemExit(f'{section}.{name}: IPv6 is unsupported')
         if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
-secrets=value.get('secrets',{})
+PY
+  validate_secrets "$rendered" "$secret_dir" || return 1
+  image_digests=$(python3 - "$rendered" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+print(','.join(sorted({service['image'].rsplit('@',1)[1] for service in value['services'].values()})))
+PY
+)
+}
+
+validate_secrets() {
+  python3 - "$1" "$2" "$expected_uid" <<'PY'
+import json,os,stat,sys
+secret_dir=sys.argv[2]; expected_uid=int(sys.argv[3])
+secrets=json.load(open(sys.argv[1])).get('secrets',{})
 if secrets:
     try: metadata=os.lstat(secret_dir)
     except FileNotFoundError: raise SystemExit('environment secret directory is missing')
@@ -214,12 +229,6 @@ for name,item in secrets.items():
     metadata=os.lstat(path)
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600: raise SystemExit(f'secrets.{name}: secret must be a singly linked owner-controlled mode-0600 file')
 PY
-  image_digests=$(python3 - "$rendered" <<'PY'
-import json,sys
-value=json.load(open(sys.argv[1]))
-print(','.join(sorted({service['image'].rsplit('@',1)[1] for service in value['services'].values()})))
-PY
-)
 }
 
 validate_existing_resources() {
@@ -387,7 +396,7 @@ valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True an
        not host.get('CapAdd') and not host.get('Devices') and not host.get('DeviceRequests') and not host.get('DeviceCgroupRules') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
        host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and host['MemorySwap'] >= service['mem_limit'] and
-       host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
+       host.get('CgroupnsMode')=='private' and host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
        host.get('OomKillDisable') in (None,False) and host.get('OomScoreAdj',0)==service.get('oom_score_adj',0) and
        host.get('NetworkMode') in networks and set((actual.get('NetworkSettings') or {}).get('Networks') or {})==networks)
 raise SystemExit(0 if valid else 1)
@@ -409,6 +418,7 @@ inspect_environment() {
   secure_file "$compose" 600
   route_port=$(awk -F= '$1=="ROUTE_PORT"{print $2}' "$target")
   [[ $route_port =~ ^[0-9]+$ && $route_port -ge 1024 && $route_port -le 65535 ]] || die 'stored route port is invalid'
+  validate_secrets "$compose" "$secret_root/$id" || status=unhealthy
   validate_existing_resources "$compose" "$id" true || status=unhealthy
   expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
   while read -r service configured_image; do expected_images[$service]=$configured_image; done < <(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\n".join("%s %s" % (name,service["image"]) for name,service in value["services"].items()))' "$compose")

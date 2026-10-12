@@ -251,7 +251,7 @@ grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared rout
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
   if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
 done
-for policy in ipv4-disabled ipv6-enabled service-tmpfs device-cgroup duplicate-network duplicate-volume capdrop-extra; do
+for policy in ipv4-disabled ipv6-enabled cgroup-default cgroup-host service-tmpfs device-cgroup duplicate-network duplicate-volume capdrop-extra; do
   write_environment "$policy" 18098
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "$policy" >"$tmp/model-rejection.out" 2>&1; then fail "unsupported model was accepted: $policy"; fi
@@ -261,6 +261,7 @@ for policy in ipv4-disabled ipv6-enabled service-tmpfs device-cgroup duplicate-n
     duplicate-network|duplicate-volume) grep -Fq 'duplicate resolved resource name' "$tmp/model-rejection.out" || fail 'duplicate names failed outside model validation' ;;
     ipv4-disabled) grep -Fq 'IPv4 is required' "$tmp/model-rejection.out" || fail 'IPv4-disabled network failed outside model validation' ;;
     ipv6-enabled) grep -Fq 'IPv6 is unsupported' "$tmp/model-rejection.out" || fail 'IPv6-enabled network failed outside model validation' ;;
+    cgroup-default|cgroup-host) grep -Fq 'a private cgroup namespace is required' "$tmp/model-rejection.out" || fail 'cgroup namespace failed outside model validation' ;;
     service-tmpfs) grep -Fq 'service-level tmpfs is unsupported' "$tmp/model-rejection.out" || fail 'service tmpfs failed outside model validation' ;;
   esac
   [[ ! -e $root/var/lib/ci-fleet-tester/environments/$policy.state ]] || fail "unsupported model created tracked state: $policy"
@@ -327,7 +328,7 @@ FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtim
 FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null || fail 'health rejected a reachable route without a Docker healthcheck'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unreachable route without a Docker healthcheck'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
-for live_policy in privileged bind broad-port unbounded unlimited-swap device-cgroup devices device-requests; do
+for live_policy in privileged bind broad-port unbounded unlimited-swap device-cgroup devices device-requests cgroup-host cgroup-default; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
 done
 legacy_model=$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json
@@ -350,8 +351,21 @@ FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --remove
 write_environment secret-preview 18082
 secret_file=$root/etc/ci-fleet-tester/secrets/secret-preview/credential
 printf 'example-test-scope-value\n' >"$secret_file"; chmod 600 "$secret_file"
+expect_secret_health_failure() {
+  if FAKE_TESTER_SECRET_FILE=$secret_file FAKE_TESTER_SECRET_TARGET=$secret_target "$runtime" --health >"$tmp/secret-health.out" 2>&1; then fail 'health accepted secret boundary drift'; fi
+}
 for secret_target in credential /etc/app/token; do
   FAKE_TESTER_ROUTE_PORT=18082 FAKE_TESTER_POLICY=valid-secret FAKE_TESTER_SECRET_FILE=$secret_file FAKE_TESTER_SECRET_TARGET=$secret_target "$runtime" --converge --environment secret-preview >/dev/null || fail "valid secret target was rejected: $secret_target"
+  FAKE_TESTER_SECRET_FILE=$secret_file FAKE_TESTER_SECRET_TARGET=$secret_target "$runtime" --health >/dev/null || fail 'healthy secret environment failed scheduled health'
+  chmod 0755 "${secret_file%/*}"; expect_secret_health_failure; chmod 0700 "${secret_file%/*}"
+  chmod 0644 "$secret_file"; expect_secret_health_failure; chmod 0600 "$secret_file"
+  ln "$secret_file" "$tmp/secret-hardlink"; expect_secret_health_failure; rm "$tmp/secret-hardlink"
+  mv "$secret_file" "$tmp/retained-secret"; ln -s "$tmp/retained-secret" "$secret_file"
+  expect_secret_health_failure; rm "$secret_file"; mv "$tmp/retained-secret" "$secret_file"
+  mv "$secret_file" "$tmp/retained-secret"; expect_secret_health_failure; mv "$tmp/retained-secret" "$secret_file"
+  mv "${secret_file%/*}" "$tmp/retained-secret-dir"; ln -s "$tmp/retained-secret-dir" "${secret_file%/*}"
+  expect_secret_health_failure; rm "${secret_file%/*}"; mv "$tmp/retained-secret-dir" "${secret_file%/*}"
+  FAKE_TESTER_SECRET_FILE=$secret_file FAKE_TESTER_SECRET_TARGET=$secret_target "$runtime" --health >/dev/null || fail 'restored secret boundary failed scheduled health'
   FAKE_TESTER_ROUTE_PORT=18082 "$runtime" --remove --environment secret-preview >/dev/null
 done
 outside_secret=$root/etc/ci-fleet-tester/secrets/outside
@@ -361,6 +375,12 @@ if FAKE_TESTER_ROUTE_PORT=18083 FAKE_TESTER_POLICY=outside-secret FAKE_TESTER_SE
 write_environment hardlink-secret 18089
 ln "$outside_secret" "$root/etc/ci-fleet-tester/secrets/hardlink-secret/credential"
 if FAKE_TESTER_ROUTE_PORT=18089 FAKE_TESTER_POLICY=valid-secret FAKE_TESTER_SECRET_FILE=$root/etc/ci-fleet-tester/secrets/hardlink-secret/credential "$runtime" --converge --environment hardlink-secret >/dev/null 2>&1; then fail 'hard-linked host secret was accepted'; fi
+write_environment image-volume 18099
+if FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_LIVE_POLICY=image-volume "$runtime" --converge --environment image-volume >"$tmp/image-volume.out" 2>&1; then fail 'converge accepted an anonymous image-declared volume'; fi
+grep -Fq 'environment route is unhealthy; tracked state retained for cleanup' "$tmp/image-volume.out" || fail 'anonymous image volume failed outside the live mount guard'
+[[ -f $root/var/lib/ci-fleet-tester/environments/image-volume.state ]] || fail 'anonymous image volume lost cleanup state'
+"$runtime" --remove --environment image-volume >/dev/null || fail 'anonymous image volume could not be removed through scoped teardown'
+[[ ! -f $root/var/lib/ci-fleet-tester/environments/image-volume.state ]] || fail 'anonymous image volume retained state after complete teardown'
 write_environment partial-up 18084
 if FAKE_TESTER_ROUTE_PORT=18084 FAKE_TESTER_UP_FAIL=1 "$runtime" --converge --environment partial-up >/dev/null 2>&1; then fail 'partial activation succeeded'; fi
 [[ -f $root/var/lib/ci-fleet-tester/environments/partial-up.state && -f $root/var/lib/ci-fleet-tester/environments/partial-up.compose.json ]] || fail 'partial activation was not tracked for cleanup'
