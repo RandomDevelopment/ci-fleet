@@ -311,7 +311,10 @@ write_lkg() {
 }
 
 retire_activation() {
-  sync -f "$opt_dir" "$state_root" || return 1
+  local directory
+  for directory in "$opt_dir" "$state_root" "$systemd_dir" "$tmpfiles_dir"; do
+    [[ ! -d $directory ]] || sync -f "$directory" || return 1
+  done
   rm -f -- "$activation_pending" || return 1
   sync -f "$state_root"
 }
@@ -341,6 +344,16 @@ recover_activation() {
   report "ACTIVATION_RECOVERED previous_revision=$previous candidate_revision=$candidate"
 }
 
+write_activation_journal() {
+  [[ ! -e $activation_pending && ! -L $activation_pending ]] || die 'outstanding activation requires recovery'
+  [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
+  printf '%s %s %s\n' "${1:-none}" "$2" "$3" >"$activation_pending.new"
+  chmod 0600 "$activation_pending.new"
+  sync -f "$activation_pending.new" || die 'activation journal is not durable'
+  mv -Tf "$activation_pending.new" "$activation_pending"
+  sync -f "$state_root" || die 'activation journal publication is not durable'
+}
+
 activate_release() {
   local commit=$1 target=$release_dir/$1 previous='' record_previous=${2:-1}
   reject_other_roles
@@ -352,16 +365,10 @@ activate_release() {
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
-  [[ ! -e $activation_pending && ! -L $activation_pending ]] || die 'outstanding activation requires recovery'
-  [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
-  printf '%s %s %s\n' "${previous:-none}" "$commit" "$record_previous" >"$activation_pending.new"
-  chmod 0600 "$activation_pending.new"
-  sync -f "$activation_pending.new" || die 'activation journal is not durable'
-  mv -Tf "$activation_pending.new" "$activation_pending"
-  sync -f "$state_root" || die 'activation journal publication is not durable'
+  write_activation_journal "$previous" "$commit" "$record_previous"
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
   sync -f "$opt_dir" || die 'candidate pointer is not durable'
-  if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! "$stable_launcher" --check || ! "$stable_launcher" --health || ! start_maintenance || ! enable_timers; then
+  if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! CI_FLEET_TESTER_ACTIVATION_FD=9 "$stable_launcher" --check || ! CI_FLEET_TESTER_ACTIVATION_FD=9 "$stable_launcher" --health; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
       if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'candidate activation failed and incumbent unit restore failed; launcher and incumbent link retained for recovery'; fi
@@ -378,7 +385,16 @@ activate_release() {
     retire_activation || die 'incumbent restore succeeded but activation journal retirement failed'
     die 'last-known-good recording failed; previous release restored'
   fi
+  if ! enable_timers; then
+    recover_activation
+    die 'candidate timer activation failed; incumbent restored'
+  fi
   retire_activation || die 'completed activation journal retirement failed'
+  if ! start_maintenance; then
+    write_activation_journal "$previous" "$commit" "$record_previous"
+    recover_activation
+    die 'candidate maintenance probes failed; incumbent restored'
+  fi
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 

@@ -37,6 +37,7 @@ required_commands='awk basename chmod cmp date df dirname docker du env find flo
 case $action in --check|--health) required_commands+=' curl getent' ;; esac
 case $action in --remove|--cleanup) ;; *) required_commands+=' systemctl' ;; esac
 case $action in --converge|--reset|--inspect|--health) required_commands+=' timeout' ;; esac
+case $action in --converge|--reset) required_commands+=' sync' ;; esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
 secure_directory() {
@@ -311,6 +312,7 @@ apply_converge() {
   validate_existing_resources "$prepared_rendered" || die 'pre-existing Docker resource validation failed'
   [[ -f $(state_path "$environment") ]] || install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
+  sync -f "$(deployed_compose_path "$environment")" "$(state_path "$environment")" "$state_dir" || die 'cleanup state is not durable; environment was not started'
   if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait --wait-timeout 60; then
     rm -f "$prepared_rendered"
     die 'environment activation failed; tracked state retained for cleanup'
@@ -503,6 +505,11 @@ else
   secure_directory "$(dirname "$lock_file")" 755
   exec 9>"$lock_file"
   flock -x 9
+fi
+activation_pending=$(root_path /var/lib/ci-fleet-tester/activation-pending)
+if [[ -e $activation_pending || -L $activation_pending ]]; then
+  secure_file "$activation_pending" 600
+  [[ ( $action == --check || $action == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "${lock_file%/*}/lifecycle.lock" ]] && flock -n 9 || die 'interrupted tester activation requires installer recovery'
 fi
 if [[ $action != --remove && $action != --cleanup ]]; then
   for kind in container network volume; do

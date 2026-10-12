@@ -17,6 +17,11 @@ if [[ ${CI_FLEET_TESTER_LOCK_FD:-} != 8 || ! -e /proc/$$/fd/8 || $(readlink -f /
   exec 8>"$lock_file"
   flock -x 8
 fi
+activation_pending=$(root_path /var/lib/ci-fleet-tester/activation-pending)
+if [[ -e $activation_pending || -L $activation_pending ]]; then
+  [[ -f $activation_pending && ! -L $activation_pending && $(stat -c '%u:%a' "$activation_pending") == "$expected_uid:600" ]] || { printf 'ERROR: tester activation journal is unsafe\n' >&2; exit 1; }
+  [[ $# == 1 && ( $1 == --check || $1 == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "$lock_dir/lifecycle.lock" ]] && flock -n 9 || { printf 'ERROR: interrupted tester activation requires installer recovery\n' >&2; exit 1; }
+fi
 target=$(readlink -f "$current_link")
 revision=$(basename "$target")
 [[ $target == "$release_dir/$revision" && $revision =~ ^[0-9a-f]{40}$ && -x $target/scripts/tester-runtime.sh ]] || { printf 'ERROR: active tester release is invalid\n' >&2; exit 1; }

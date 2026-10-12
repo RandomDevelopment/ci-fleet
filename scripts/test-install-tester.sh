@@ -117,6 +117,16 @@ chmod 0666 "$root/var/run/docker.sock"
 if PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'uninstall accepted a world-writable Docker control socket'; fi
 chmod 0600 "$root/var/run/docker.sock"
 
+export FAKE_TESTER_REAL_SYNC
+FAKE_TESTER_REAL_SYNC=$(command -v sync)
+cat >"$fake_bin/sync" <<'EOF_SYNC'
+#!/usr/bin/env bash
+[[ -z ${FAKE_TESTER_SYNC_LOG:-} ]] || printf '%s\n' "$*" >>"$FAKE_TESTER_SYNC_LOG"
+for path in "$@"; do [[ -z ${FAKE_TESTER_SYNC_FAIL_PATH:-} || $path != "$FAKE_TESTER_SYNC_FAIL_PATH" ]] || exit 9; done
+exec "$FAKE_TESTER_REAL_SYNC" "$@"
+EOF_SYNC
+chmod 0755 "$fake_bin/sync"
+
 write_environment() {
   local id=$1 port=$2
   mkdir -p "$root/etc/ci-fleet-tester/secrets/$id"; chmod 700 "$root/etc/ci-fleet-tester/secrets/$id"
@@ -343,6 +353,12 @@ write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
 FAKE_TESTER_ROUTE_PORT=18090 "$runtime" --remove --environment interpolation >/dev/null
+write_environment nondurable 18090
+: >"$tmp/docker.log"
+if FAKE_TESTER_SYNC_FAIL_PATH=$root/var/lib/ci-fleet-tester/environments FAKE_TESTER_ROUTE_PORT=18090 "$runtime" --converge --environment nondurable >"$tmp/sync-failure.out" 2>&1; then fail 'environment started without durable cleanup state'; fi
+grep -Fq 'cleanup state is not durable' "$tmp/sync-failure.out" || fail 'durability failure occurred outside the cleanup-state commit'
+if grep -Fq 'up -d' "$tmp/docker.log"; then fail 'Compose started before cleanup state was durable'; fi
+FAKE_TESTER_ROUTE_PORT=18090 "$runtime" --remove --environment nondurable >/dev/null
 deployed_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=changed-model "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge replaced the incumbent Compose model without reset'; fi
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$deployed_hash" ]] || fail 'rejected model replacement changed incumbent state'
@@ -640,6 +656,11 @@ for signal in TERM KILL; do
   FAKE_TESTER_ACTIVATION_SIGNAL=$signal "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/killed-upgrade.out" 2>&1 || interrupted_rc=$?
   [[ $interrupted_rc == 137 || $interrupted_rc == 143 ]] || fail 'activation interruption did not terminate the installer'
   [[ -f $root/var/lib/ci-fleet-tester/activation-pending && ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'interrupted first upgrade lost its recovery record'
+  for operation in --converge --reset --remove; do
+    if "$root/opt/ci-fleet-tester/tester-runtime" "$operation" --environment preview-a >"$tmp/pending-runtime.out" 2>&1; then fail 'stable runtime bypassed pending activation'; fi
+    grep -Fq 'requires installer recovery' "$tmp/pending-runtime.out" || fail 'pending activation failed outside its guard'
+  done
+  if CI_FLEET_TESTER_ACTIVATION_FD=9 "$root/opt/ci-fleet-tester/tester-runtime" --health >"$tmp/pending-runtime.out" 2>&1; then fail 'activation flag without inherited lifecycle authority bypassed the guard'; fi
   if [[ $signal == TERM ]]; then
     if "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/retry-upgrade.out" 2>&1; then fail 'invalid interrupted candidate passed retry'; fi
   else
@@ -683,6 +704,7 @@ if FAKE_TESTER_SYSTEMCTL_FAIL_WAIT=1 "$upgrade_repo/scripts/install-tester.sh" -
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'asynchronous maintenance failure did not restore incumbent release'
 
 # A corrupt incumbent is never recorded as the rollback target.
+rm -f "$root/var/lib/ci-fleet-tester/last-known-good"
 chmod u+w "$release/scripts/tester-runtime.sh"; printf '# corrupt incumbent\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
 printf '# candidate\n' >>"$upgrade_repo/docs/TESTER-HOST.md"
 git -C "$upgrade_repo" add docs/TESTER-HOST.md
@@ -692,7 +714,8 @@ valid_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null 2>&1; then fail 'upgrade ignored timer quiescence failure'; fi
 grep -Fq 'enable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'quiescence failure did not restore incumbent timers'
 : >"$tmp/events.log"
-"$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null || fail 'valid upgrade failed'
+FAKE_TESTER_SYNC_LOG=$tmp/activation-sync.log "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null || fail 'valid upgrade failed'
+for directory in "$root/etc/systemd/system" "$root/usr/lib/tmpfiles.d"; do grep -Fxq -- "-f $directory" "$tmp/activation-sync.log" || fail 'installed policy filesystem was not flushed'; done
 [[ ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'corrupt incumbent was recorded as last-known-good'
 disable_line=$(grep -n '^systemctl disable --now ' "$tmp/events.log" | tail -1 | cut -d: -f1)
 check_line=$(grep -n '^docker info ' "$tmp/events.log" | tail -1 | cut -d: -f1)
