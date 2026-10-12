@@ -386,11 +386,12 @@ activate_release() {
   reject_tmpfiles_overrides
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   if [[ -e $current_link || -L $current_link ]]; then previous=$(installed_revision) || die 'installed tester revision is invalid'; fi
+  write_activation_journal "$previous" "$commit" "$record_previous"
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
+    retire_activation || die 'incumbent timers restored but activation journal retirement failed'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
-  write_activation_journal "$previous" "$commit" "$record_previous"
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
   sync -f "$opt_dir" || die 'candidate pointer is not durable'
   if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! CI_FLEET_TESTER_ACTIVATION_FD=9 "$stable_launcher" --check || ! CI_FLEET_TESTER_ACTIVATION_FD=9 "$stable_launcher" --health; then

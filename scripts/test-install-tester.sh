@@ -73,6 +73,10 @@ if [[ $1 == daemon-reload && -n ${FAKE_TESTER_ACTIVATION_SIGNAL:-} ]]; then
   kill -s "$FAKE_TESTER_ACTIVATION_SIGNAL" "$PPID"
   exit 137
 fi
+if [[ $1 == disable && -n ${FAKE_TESTER_QUIESCE_SIGNAL:-} ]]; then
+  kill -s "$FAKE_TESTER_QUIESCE_SIGNAL" "$PPID"
+  exit 137
+fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
@@ -671,6 +675,17 @@ git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.exampl
 bad_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 for signal in TERM KILL; do
   interrupted_rc=0
+  FAKE_TESTER_QUIESCE_SIGNAL=$signal "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/killed-quiesce.out" 2>&1 || interrupted_rc=$?
+  [[ $interrupted_rc == 137 || $interrupted_rc == 143 ]] || fail 'timer quiescence interruption did not terminate the installer'
+  [[ -f $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'timer quiescence lost its recovery record'
+  [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'timer quiescence switched the incumbent'
+  : >"$tmp/systemctl.log"
+  "$installer" --rollback >"$tmp/rollback-quiesce.out" 2>&1 || fail 'interrupted timer quiescence could not recover'
+  grep -Fq 'enable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'timer quiescence recovery did not re-enable incumbent timers'
+  [[ ! -e $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'timer quiescence recovery kept a pending record'
+done
+for signal in TERM KILL; do
+  interrupted_rc=0
   FAKE_TESTER_ACTIVATION_SIGNAL=$signal "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/killed-upgrade.out" 2>&1 || interrupted_rc=$?
   [[ $interrupted_rc == 137 || $interrupted_rc == 143 ]] || fail 'activation interruption did not terminate the installer'
   [[ -f $root/var/lib/ci-fleet-tester/activation-pending && ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'interrupted first upgrade lost its recovery record'
@@ -731,6 +746,7 @@ valid_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
 : >"$tmp/systemctl.log"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null 2>&1; then fail 'upgrade ignored timer quiescence failure'; fi
 grep -Fq 'enable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'quiescence failure did not restore incumbent timers'
+[[ ! -e $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'restored incumbent timers kept an activation journal'
 : >"$tmp/events.log"
 FAKE_TESTER_SYNC_LOG=$tmp/activation-sync.log "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null || fail 'valid upgrade failed'
 for directory in "$root/etc/systemd/system" "$root/usr/lib/tmpfiles.d"; do grep -Fxq -- "-f $directory" "$tmp/activation-sync.log" || fail 'installed policy filesystem was not flushed'; done
