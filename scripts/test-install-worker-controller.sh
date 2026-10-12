@@ -2711,7 +2711,7 @@ export FAKE_COMPOSE_LOG=$tmp/absent-controller-timer-rollback-compose.log
 export FAKE_STOPPED_CONTROLLER_STATE=$tmp/stopped-controller
 export FAKE_REJECT_RUNNING_IMAGE_RM=1
 : >"$FAKE_COMPOSE_LOG"
-prior_controller_image_id=sha256:4444444444444444444444444444444444444444444444444444444444444444
+prior_controller_image_id=sha256:3333333333333333333333333333333333333333333333333333333333333333
 printf '%s\n' "$prior_controller_image_id" >>"$FAKE_AVAILABLE_IMAGE_IDS"
 printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
 printf '%s\n' "$prior_controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
@@ -2795,6 +2795,9 @@ rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 |
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
+# The following maintenance-only case starts with both reviewed image IDs.
+printf '%s\n' "sha256:3333333333333333333333333333333333333333333333333333333333333333" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+printf '%s\n' "sha256:3333333333333333333333333333333333333333333333333333333333333333" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
 [[ ${CI_FLEET_TEST_STOP_AFTER_STOPPED_RUNNER_ROLLBACK:-0} != 1 ]] || { printf 'STOPPED_RUNNER_ROLLBACK_REGRESSION_OK\n'; exit 0; }
 restartable_tag_build_output=$tmp/restartable-tag-build.out
 export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
