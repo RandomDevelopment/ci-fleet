@@ -146,7 +146,8 @@ labels. It reads these labels for optional GitHub diagnostics:
 The host queries the exact run attempt with its short-lived App installation
 token. This requires existing App access to read Actions runs. No permission
 change is performed automatically. Lookup is bounded to 20 distinct attempts
-and 30 seconds. Missing labels, unavailable credentials, API errors, and exhausted
+and five seconds, including token acquisition, leaving time for health's Docker
+inventory checks. Missing labels, unavailable credentials, API errors, and exhausted
 lookup budgets produce an unknown status. The report contains container IDs and
 status, never credentials. Compose names and age do not infer repository/run
 ownership. A completed attempt produces `terminal-run-leftover`, including

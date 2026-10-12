@@ -198,7 +198,8 @@ class RunStatus:
     def __init__(self):
         self.results = {}
         self.token = None
-        self.deadline = time.monotonic() + 30
+        # Leave most of health's 30-second dry-run timeout for Docker inventory.
+        self.deadline = time.monotonic() + 5
 
     def get(self, repository: str, run: str, attempt: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not re.fullmatch(r"[1-9][0-9]*", run) or not re.fullmatch(r"[1-9][0-9]*", attempt):

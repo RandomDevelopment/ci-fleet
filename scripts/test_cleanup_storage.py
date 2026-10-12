@@ -419,6 +419,25 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
                 self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
+    def test_slow_run_diagnostics_reserve_time_for_health_inventory(self):
+        clock = [100.0]
+        def token(*_args, **_kwargs):
+            clock[0] += 3
+            return subprocess.CompletedProcess([], 0, stdout="fixture-token")
+        def unavailable(*_args, **kwargs):
+            clock[0] += kwargs["timeout"]
+            raise TimeoutError("slow GitHub response")
+        opener = unittest.mock.Mock()
+        opener.open.side_effect = unavailable
+        with patch.object(cleanup.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(cleanup.subprocess, "run", side_effect=token), \
+             patch.object(cleanup.urllib.request, "build_opener", return_value=opener):
+            runs = cleanup.RunStatus()
+            self.assertEqual(runs.get("example-org/example-app", "123", "2"), "unknown-api-unavailable")
+            self.assertEqual(runs.get("example-org/example-app", "124", "1"), "unknown-lookup-budget")
+        self.assertLessEqual(clock[0] - 100, 5)
+        opener.open.assert_called_once()
+
     def test_success_failure_cancellation_timeout_host_layer_without_trap(self):
         for outcome in ("success", "failure", "cancellation", "timeout"):
             with self.subTest(outcome=outcome):
