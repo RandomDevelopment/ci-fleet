@@ -96,7 +96,9 @@ def protected_images() -> set[str]:
 def image_reason(image: dict, references: set[str], protected: set[str], now: int) -> str:
     identity = image["Id"]
     aliases = set(image.get("RepoTags") or []) | set(image.get("RepoDigests") or []) | {identity}
-    if identity in references or image.get("Containers", -1) != 0:
+    # Before API v1.51, -1 means use the complete container inventory instead.
+    count = image.get("Containers")
+    if identity in references or type(count) is not int or count not in {-1, 0}:
         return "container-reference-or-unknown-use"
     if aliases & protected:
         return "installed-or-checkpoint-release"
@@ -169,7 +171,12 @@ def cleanup_expired(*, apply: bool, instance: str, usage: dict) -> None:
             print(f"{'REMOVE' if apply else 'WOULD_REMOVE'} container {identity} expired={expires}", flush=True)
             if apply:
                 mutate("rm", identity, timeout=30)
-    for name in coordination.docker("volume", "ls", "-q").splitlines():
+    filters = []
+    if apply:
+        filters = ["--filter", f"label={PREFIX}managed=true", "--filter", f"label={PREFIX}expires-at"]
+        if instance:
+            filters += ["--filter", f"label={PREFIX}instance={instance}"]
+    for name in coordination.docker("volume", "ls", "-q", *filters).splitlines():
         item = json.loads(coordination.docker("volume", "inspect", name))[0]
         labels = item.get("Labels") or {}
         expires = labels.get(f"{PREFIX}expires-at", "")

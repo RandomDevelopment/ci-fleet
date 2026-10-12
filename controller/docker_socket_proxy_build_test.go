@@ -15,6 +15,29 @@ import (
 
 type zeroBuildContext struct{}
 
+func TestDockerSocketProxyBoundsMetadataBodies(t *testing.T) {
+	for _, route := range []string{"/v1.48/images/create?fromImage=example:latest", "/images/create?fromSrc=https://example.invalid/rootfs.tar", "/commit", "/images/fixture/tag"} {
+		t.Run(route, func(t *testing.T) {
+			handler, transport := newDockerSocketProxy("/missing-daemon.sock", filepath.Join(t.TempDir(), "maintenance.lock"), proxyTestBoot)
+			defer transport.CloseIdleConnections()
+			for _, size := range []int64{1 << 20, 1<<20 + 1} {
+				request := httptest.NewRequest(http.MethodPost, "http://docker"+route, io.LimitReader(zeroBuildContext{}, size))
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				want := http.StatusServiceUnavailable
+				if size > 1<<20 {
+					want = http.StatusRequestEntityTooLarge
+				}
+				if response.Code != want {
+					t.Fatalf("metadata body size %d: status = %d, want %d", size, response.Code, want)
+				}
+			}
+		})
+	}
+}
+
 func (zeroBuildContext) Read(buffer []byte) (int, error) {
 	clear(buffer)
 	return len(buffer), nil

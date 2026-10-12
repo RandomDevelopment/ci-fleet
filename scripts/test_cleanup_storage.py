@@ -82,7 +82,11 @@ class StorageTests(unittest.TestCase):
         for change, references, protected, expected in [
             ({}, set(), set(), "eligible"),
             ({}, {IMAGE}, set(), "container-reference-or-unknown-use"),
-            ({"Containers": -1}, set(), set(), "container-reference-or-unknown-use"),
+            ({"Containers": -1}, set(), set(), "eligible"),
+            ({"Containers": -1}, {IMAGE}, set(), "container-reference-or-unknown-use"),
+            ({"Containers": 1}, set(), set(), "container-reference-or-unknown-use"),
+            ({"Containers": None}, set(), set(), "container-reference-or-unknown-use"),
+            ({"Containers": "0"}, set(), set(), "container-reference-or-unknown-use"),
             ({}, set(), {"example:old"}, "installed-or-checkpoint-release"),
             ({}, set(), {IMAGE}, "installed-or-checkpoint-release"),
             ({"RepoTags": [], "RepoDigests": ["example@" + IMAGE]}, set(), {"example@" + IMAGE}, "installed-or-checkpoint-release"),
@@ -147,6 +151,13 @@ class StorageTests(unittest.TestCase):
         output, mutations = self.run_storage(accounting=accounting)
         self.assertFalse(mutations)
         self.assertIn("old-or-uncoordinated-proxy", output)
+
+    def test_older_api_reclaims_unreferenced_images_and_preserves_stopped_references(self):
+        accounting = {"Images": [image(Containers=-1), image(identity=OTHER, Containers=-1)],
+                      "Containers": [{"ImageID": OTHER, "State": "exited"}], "BuildCache": []}
+        output, mutations = self.run_storage(accounting=accounting, disk=[81, 81, 64, 64])
+        self.assertEqual([call.args for call in mutations], [("image", "rm", "--no-prune", "--", "example:old")])
+        self.assertIn(f"KEEP image {OTHER} container-reference", output)
 
     def test_ipv6_registry_tag_is_removed_without_blocking_later_candidates(self):
         accounting = usage()
@@ -225,7 +236,17 @@ class StorageTests(unittest.TestCase):
              patch.object(cleanup.time, "time", return_value=NOW), redirect_stdout(io.StringIO()) as output:
             cleanup.cleanup_expired(apply=False, instance="fixture", usage=accounting)
         run = lambda args: subprocess.CompletedProcess(args, 0, output.getvalue(), "")
-        self.assertEqual(health._stale_resources(run, "fixture"), {"containers": 1, "networks": 0, "volumes": 2})
+        self.assertEqual(health._stale_resources(run, "fixture"), {"containers": 1, "networks": 0, "volumes": 2, "images": 0})
+
+    def test_applying_volume_inventory_filters_owned_expiry_candidates(self):
+        for instance in ("", "fixture"):
+            with self.subTest(instance=instance), patch.object(cleanup.coordination, "docker", return_value="") as docker:
+                cleanup.cleanup_expired(apply=True, instance=instance, usage={"Containers": []})
+                expected = ["volume", "ls", "-q", "--filter", f"label={cleanup.PREFIX}managed=true",
+                            "--filter", f"label={cleanup.PREFIX}expires-at"]
+                if instance:
+                    expected += ["--filter", f"label={cleanup.PREFIX}instance={instance}"]
+                docker.assert_called_once_with(*expected)
 
     def test_service_deadline_stops_expired_resources_before_creating_uncertainty(self):
         labels = {cleanup.PREFIX + "managed": "true", cleanup.PREFIX + "instance": "fixture", cleanup.PREFIX + "expires-at": "1"}

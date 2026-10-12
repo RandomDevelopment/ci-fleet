@@ -29,6 +29,7 @@ const dockerProxyHealthPath = "/_ci_fleet/docker-socket-proxy"
 const dockerProxyHealth = "ci-fleet-docker-socket-proxy-v1\n"
 const dockerBuildContextLimit = 1 << 30
 const dockerBuildUploadLimit = 2
+const dockerMetadataBodyLimit = 1 << 20
 
 var dockerAPIVersion = regexp.MustCompile(`^/v[0-9]+\.[0-9]+/`)
 
@@ -398,7 +399,12 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 				request.Body = spool
 				request.ContentLength = length
 			} else {
-				body, err := io.ReadAll(request.Body)
+				body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, dockerMetadataBodyLimit))
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, "Docker metadata body exceeds 1 MiB", http.StatusRequestEntityTooLarge)
+					return
+				}
 				if err == nil && dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/containers/create" {
 					body, err = rewriteDockerSocketBinds(body)
 				}

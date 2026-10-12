@@ -183,6 +183,8 @@ def configured_pools() -> list[ipaddress.IPv4Network]:
 
 
 def docker(*args: str) -> str:
+    if time.monotonic() + COMMAND_TIMEOUT_SECONDS >= SERVICE_DEADLINE:
+        raise MaintenanceDeferred("cleanup service-deadline; remaining candidates retained")
     return subprocess.run(["docker", *args], check=True, capture_output=True, text=True,
                           timeout=COMMAND_TIMEOUT_SECONDS).stdout
 

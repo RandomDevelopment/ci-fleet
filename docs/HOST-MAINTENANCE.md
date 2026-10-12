@@ -110,7 +110,8 @@ builds and container reference mutations. Storage removal defers with older
 proxies. Image-load uploads use the same 1 GiB spool limit as build contexts.
 Image imports use that bounded spool too and share its two upload slots.
 Registry pulls and imports from remote URLs bypass upload slots while retaining
-the maintenance lock.
+the maintenance lock. Other guarded request bodies have a 1 MiB metadata limit;
+oversized bodies receive HTTP 413 before reaching Docker.
 Neither an installer nor a new job can enter while maintenance applies.
 An interrupted or uncertain removal blocks subsequent mutations until a host
 reboot changes its boot identity. Confirmed daemon rejections clear their marker

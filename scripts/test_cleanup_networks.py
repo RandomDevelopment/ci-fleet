@@ -36,6 +36,14 @@ def network(name="job", subnet="198.51.100.0/29", *, labels=None, containers=Non
 
 
 class CleanupNetworksTests(unittest.TestCase):
+    def test_inventory_defers_before_dispatch_at_service_deadline(self):
+        with patch.object(cleanup, "SERVICE_DEADLINE", 840), \
+             patch.object(cleanup.time, "monotonic", return_value=810), \
+             patch.object(cleanup.subprocess, "run") as run:
+            with self.assertRaises(cleanup.MaintenanceDeferred):
+                cleanup.docker("volume", "inspect", "fixture")
+            run.assert_not_called()
+
     def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None, root=None, active_containers=None, attempt_create_on_remove=False, check_wait_unlock=False, swarm_state="inactive", maintenance=None):
         remaining = copy.deepcopy(inventory)
         calls = []
