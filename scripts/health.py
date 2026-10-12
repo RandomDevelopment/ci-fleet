@@ -295,10 +295,12 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args, 124 if isinstance(error, subprocess.TimeoutExpired) else 127, "", "")
 
 
-def _disk(path: str) -> dict[str, int]:
+def _disk(path: str, *, strict: bool = False) -> dict[str, int]:
     try:
         value = os.statvfs(path)
     except OSError:
+        if strict:
+            raise
         value = os.statvfs("/")
     used = value.f_blocks - value.f_bfree
     iused = value.f_files - value.f_ffree
@@ -813,7 +815,7 @@ def _runner_capacity(run: Runner, instance: str) -> list[dict[str, int | float]]
         raise ValueError("managed runner discovery failed")
     ids = [value for value in result.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", value)]
     if not ids:
-        raise ValueError("active managed runners have no stat targets")
+        return []
     result = run(["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}", *ids])
     if result.returncode != 0:
         raise ValueError("managed runner stat collection failed")
@@ -856,7 +858,7 @@ def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tupl
         for line in path.read_text().splitlines():
             try:
                 previous = json.loads(line)
-                if timestamp - CAPACITY_RETENTION_SECONDS <= previous["timestamp"] <= timestamp:
+                if _sample_values(previous, timestamp, retention_seconds=CAPACITY_RETENTION_SECONDS) is not None:
                     retained.append(previous)
                 else:
                     dirty = True
@@ -935,7 +937,12 @@ def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run,
         idle_delta = cpu["idle_ticks"] - previous_host["idle_ticks"]
         if total_delta > 0 and 0 <= idle_delta <= total_delta:
             host["cpu_percent"] = round(100 * (total_delta - idle_delta) / total_delta, 1)
-    sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": _runner_capacity(run, snapshot["controller_id"])}
+    runners = _runner_capacity(run, snapshot["controller_id"])
+    if not runners:
+        if dirty:
+            _write_capacity(path, retained[-CAPACITY_MAX_SAMPLES:])
+        return False
+    sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": runners}
     if dirty or len(retained) >= CAPACITY_COMPACT_SAMPLES:
         _write_capacity(path, (retained + [sample])[-CAPACITY_MAX_SAMPLES:])
     else:
@@ -950,10 +957,10 @@ def _percentiles(values: list[int | float]) -> dict[str, int | float] | None:
     return {name: ordered[max(0, math.ceil(len(ordered) * percentile) - 1)] for name, percentile in (("p50", 0.50), ("p95", 0.95))}
 
 
-def _sample_values(sample: Any, timestamp: int) -> tuple[str, dict[str, list[int | float]], int] | None:
+def _sample_values(sample: Any, timestamp: int, *, retention_seconds: int = 7 * 24 * 60 * 60) -> tuple[str, dict[str, list[int | float]], int] | None:
     if not isinstance(sample, dict) or set(sample) != {"timestamp", "pool", "host", "runners"}:
         return None
-    if type(sample["timestamp"]) is not int or not timestamp - 7 * 24 * 60 * 60 <= sample["timestamp"] <= timestamp:
+    if type(sample["timestamp"]) is not int or not timestamp - retention_seconds <= sample["timestamp"] <= timestamp:
         return None
     if not isinstance(sample["pool"], str) or not re.fullmatch(r"[A-Za-z0-9._-]+", sample["pool"]):
         return None
@@ -1034,7 +1041,7 @@ def collect_capacity_snapshot(values: dict[str, str], *, root: Path = Path("/"),
         "cpu": _cpu(root),
         "memory": memory,
         "swap": swap,
-        "disks": {"root": _disk(str(root)), "docker": _disk(str(root / docker_root.lstrip("/")))},
+        "disks": {"root": _disk(str(root), strict=True), "docker": _disk(str(root / docker_root.lstrip("/")), strict=True)},
         "runners": {"current": current},
     }
 

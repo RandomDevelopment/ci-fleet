@@ -606,6 +606,8 @@ class HealthTests(unittest.TestCase):
                 history.write_text(history.read_text() + json.dumps(incomplete) + "\n" + json.dumps(malformed_counters) + "\n")
                 report = health.capacity_report(history, now=1_000_000)
                 self.assertEqual(report["pools"]["example-ci-01"]["samples"], 1)
+                self.assertFalse(health.record_capacity(history, {"runners": {"current": 0}, "cpu": {"total_ticks": 30, "idle_ticks": 15}}, now=1_000_030))
+                self.assertEqual([json.loads(line) for line in history.read_text().splitlines()], [valid])
                 redirected = Path(directory) / "redirected"
                 redirected.mkdir(mode=0o700)
                 other = Path(directory) / "other"
@@ -625,6 +627,34 @@ class HealthTests(unittest.TestCase):
                     os.environ.pop("CI_FLEET_TESTING", None)
                 else:
                     os.environ["CI_FLEET_TESTING"] = previous_testing
+
+    def test_capacity_skips_successful_empty_runner_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_TESTING": "1"}):
+            history = Path(directory) / "capacity" / "samples.jsonl"
+            snapshot = healthy_snapshot()
+            snapshot.update(cpu={"total_ticks": 100, "idle_ticks": 40},
+                            memory={"total_bytes": 1000, "available_bytes": 600},
+                            swap={"used_bytes": 0}, runners={"current": 1})
+            for disk in snapshot["disks"].values():
+                disk.update(used_bytes=1, inode_used=1)
+            calls = []
+            def run(args):
+                calls.append(args)
+                return health.subprocess.CompletedProcess(args, 0, "", "")
+            self.assertFalse(health.record_capacity(history, snapshot, run=run, now=1_000_000))
+            self.assertFalse(history.exists())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][:3], ["docker", "ps", "-q"])
+            with self.assertRaisesRegex(ValueError, "discovery failed"):
+                health._runner_capacity(lambda args: health.subprocess.CompletedProcess(args, 1, "", ""), "example-ci-01")
+
+    def test_capacity_rejects_unavailable_docker_filesystem(self) -> None:
+        def run(args):
+            return health.subprocess.CompletedProcess(args, 0, "/missing-docker-root" if args[1] == "info" else "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(OSError):
+                health.collect_capacity_snapshot({"CI_FLEET_INSTANCE": "example-ci-01"}, root=Path(directory), run=run)
+            self.assertGreater(health._disk(str(Path(directory) / "missing"))["total_bytes"], 0)
 
     def test_capacity_surfaces_runner_stat_failures(self) -> None:
         snapshot = healthy_snapshot()
