@@ -145,7 +145,7 @@ while (($#)); do
     *) shift ;;
   esac
 done
-if [[ ${FAKE_TESTER_EXPECT_LITERAL_DOLLARS:-0} == 1 && ${operation:-} != config ]]; then
+if [[ ${FAKE_TESTER_EXPECT_LITERAL_DOLLARS:-0} == 1 && ${operation:-} != config && $project == ci-fleet-test-literal-dollar ]]; then
   [[ -z ${TOKEN:-} && -z ${CURL_HOME:-} ]] || { printf 'caller environment reached Compose replay\n' >&2; exit 9; }
   python3 - "$model" <<'PY_LITERAL' || exit 9
 import json,sys
