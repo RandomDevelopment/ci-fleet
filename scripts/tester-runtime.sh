@@ -377,7 +377,7 @@ networks={model['networks'][name]['name'] for name in service.get('networks',{'d
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
        not host.get('CapAdd') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
-       host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and
+       host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and host['MemorySwap'] >= service['mem_limit'] and
        host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
        host.get('OomKillDisable') in (None,False) and host.get('OomScoreAdj',0)==service.get('oom_score_adj',0) and
        host.get('NetworkMode') in networks and set((actual.get('NetworkSettings') or {}).get('Networks') or {})==networks)

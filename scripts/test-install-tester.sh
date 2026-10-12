@@ -215,6 +215,16 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/ex
 for live_policy in privileged bind broad-port unbounded unlimited-swap; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
 done
+legacy_model=$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json
+cp "$legacy_model" "$tmp/legacy-model.json"
+python3 - "$legacy_model" <<'PY_LEGACY'
+import json,sys
+path=sys.argv[1]; model=json.load(open(path)); model['services']['web']['memswap_limit']=-1
+with open(path,'w') as output: json.dump(model,output)
+PY_LEGACY
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=unlimited-swap "$runtime" --health >/dev/null 2>&1; then fail 'health accepted unlimited swap from an older protected model'; fi
+mv "$tmp/legacy-model.json" "$legacy_model"
+
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_GETENT_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed DNS probe'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CURL_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed HTTPS probe'; fi
