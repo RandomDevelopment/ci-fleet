@@ -3187,7 +3187,9 @@ legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
 legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
-legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit omit)
+# Exercise telemetry removal without changing the existing Docker network policy.
+legacy_engine_ref=8bd27a2e7451806a1e37f79a15eeb7c677a12c3e
+legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
@@ -3204,7 +3206,7 @@ unset FAKE_FAIL_CAPACITY_STOP_ONCE
 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$legacy_ref" >/dev/null
 grep -Fxq 'stop ci-fleet-capacity.service' "$FAKE_SYSTEMCTL_LOG" || fail 'legacy upgrade did not stop the in-flight capacity service'
 unset FAKE_SYSTEMCTL_LOG
-[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-health-contract engine'
+[[ $(readlink -f "$adopt_root/opt/ci-fleet/current") == "$adopt_root/opt/ci-fleet/releases/$legacy_engine_ref" ]] || fail 'upgrade could not restore a pre-telemetry engine'
 [[ $(readlink -f "$adopt_root/opt/ci-fleet/manager/current") == "$adopt_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'legacy downgrade replaced the forward-compatible manager'
 [[ ! -e "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'legacy runtime retained capacity units'
 retained_installer=$adopt_root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
