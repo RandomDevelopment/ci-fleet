@@ -174,7 +174,7 @@ class Containment(unittest.TestCase):
             snapshot = deployed / '.snapshot.fixture'
             snapshot.mkdir(parents=True, mode=0o700)
             adapter.durable_file(snapshot / 'state.json', b'{"fixture":"deployed"}')
-            adapter.durable_file(snapshot / 'policy.conf', b'FIXTURE=deployed\n')
+            adapter.durable_file(snapshot / 'policy.conf', ('ARTIFACT_IMAGE=' + self.values['ARTIFACT_IMAGE'] + '\n').encode())
             (deployed / 'current').symlink_to(snapshot.name)
             args = SimpleNamespace(policy=policy, adapter=source, store=store, runtime=runtime,
                                    credential_store=credential_store, unit='ci-fleet-deployer-adapter-1-2.service', seconds=120, request=None,
@@ -211,6 +211,61 @@ class Containment(unittest.TestCase):
             self.assertEqual(advertised[0], advertised[1])
             self.assertEqual(advertised[0].read_bytes(), b'fixture-only')
             self.assertFalse(list(runtime.iterdir()))
+
+    def test_retire_completed_journal_preserves_inflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            unit = 'ci-fleet-deployer-adapter-1-2.service'
+            journal = store / unit
+            journal.mkdir(mode=0o700)
+            status = journal / 'status.json'
+            with patch.object(adapter, 'trusted_directory'):
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'health', 'status': 'inflight'}).encode())
+                with self.assertRaises(ValueError):
+                    adapter.retire_journal(store, unit, os.getuid())
+                self.assertTrue(journal.exists())
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'health', 'status': 'completed', 'exit_code': 0}).encode())
+                adapter.retire_journal(store, unit, os.getuid())
+                self.assertFalse(journal.exists())
+
+    def test_artifact_cleanup_is_owned_unforced_and_protected(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}):
+            ledger = Path(directory) / 'artifacts.json'
+            old = self.policy.image.replace('a' * 64, 'b' * 64)
+            retained = self.policy.image.replace('a' * 64, 'c' * 64)
+            adapter.durable_file(ledger, json.dumps({old: self.policy.labels, retained: self.policy.labels}).encode())
+            policy = adapter.Policy(self.values, self.backend, operation='cleanup', artifact_store=ledger, protected_images={retained})
+            path, _ = policy.authorize('DELETE', '/images/' + old, b'')
+            self.assertEqual(path, '/images/' + old + '?force=false&noprune=true')
+            for image in (self.policy.image, retained, old.replace('b' * 64, 'd' * 64)):
+                with self.assertRaises(ValueError):
+                    policy.authorize('DELETE', '/images/' + image, b'')
+            with self.assertRaises(ValueError):
+                policy.authorize('DELETE', '/images/' + old + '?force=1', b'')
+
+    def test_artifact_inventory_hides_unrelated_images(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}):
+            ledger = Path(directory) / 'artifacts.json'
+            adapter.durable_file(ledger, json.dumps({self.policy.image: self.policy.labels}).encode())
+            policy = adapter.Policy(self.values, self.backend, artifact_store=ledger)
+            self.backend.request = lambda *_args: (200, json.dumps([
+                {'Id':'owned', 'RepoDigests':[self.policy.image], 'RepoTags':['unrelated-alias']},
+                {'Id':'foreign', 'RepoDigests':['registry.example.invalid/other@sha256:'+'b'*64]}]).encode())
+            path = str(Path(directory) / 'broker.sock')
+            with adapter.ProxyServer(path, adapter.handler(policy)) as server:
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                try:
+                    connection = adapter.UnixConnection(path, rootless=False)
+                    connection.request('GET', '/v1.47/images/json')
+                    response = connection.getresponse()
+                    inventory = json.loads(response.read())
+                    connection.close()
+                finally:
+                    server.shutdown()
+                    thread.join()
+            self.assertEqual([item['Id'] for item in inventory], ['owned'])
+            self.assertEqual(inventory[0]['RepoTags'], [])
 
     def test_guard_requires_completed_protected_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

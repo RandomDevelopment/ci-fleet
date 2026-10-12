@@ -17,7 +17,7 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer
-ReadWritePaths=/run/docker.sock
+ReadWritePaths=-/run/docker.sock
 CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE
 RestrictSUIDSGID=yes
 

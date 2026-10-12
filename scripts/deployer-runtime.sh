@@ -321,6 +321,7 @@ parse_file() {
 }
 
 validate_credential() {
+  [[ $testing == 1 || ${cfg[CREDENTIAL_PROVIDER]} == file ]] || die 'contained adapters require a materialized file credential'
   secure_directory "$deployer_etc" 'deployer configuration directory'
   secure_directory "$credential_dir" 'credential directory'
   [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
@@ -438,6 +439,7 @@ PYCODE
     python3 "$script_dir/deployer_adapter.py" journal-complete --store "$recovery" "$unit" || die 'adapter recovery requires operator reconciliation'
     rm -f "$guard"
     sync -f "$recovery" 2>/dev/null || die 'adapter guard retirement is not durable'
+    python3 "$script_dir/deployer_adapter.py" journal-retire --store "$recovery" "$unit" || die 'completed adapter journal retirement failed'
   fi
   return "$status"
 }
@@ -770,8 +772,10 @@ PY
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
     if [[ $testing != 1 ]]; then
       sync -f "$state_root" "$log_root" 2>/dev/null || die 'completed deployment is not durable'
+      completed_unit=$(<"$state_root/.adapter-recovery/pending-unit")
       rm -f "$state_root/.adapter-recovery/pending-unit"
       sync -f "$state_root/.adapter-recovery" 2>/dev/null || die 'deployment guard retirement is not durable'
+      python3 "$script_dir/deployer_adapter.py" journal-retire --store "$state_root/.adapter-recovery" "$completed_unit" || die 'completed deployment journal retirement failed'
     fi
     audit_pending=0
     ;;
