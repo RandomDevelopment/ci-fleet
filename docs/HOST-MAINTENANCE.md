@@ -1,6 +1,6 @@
 # Host maintenance standard
 
-Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean only fleet-owned expired resources.
+Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean expired fleet resources and empty job networks in their configured Docker address pools. Admitted hosts also reclaim disposable image and default-builder cache storage.
 
 ## Policy
 
@@ -8,7 +8,7 @@ Fleet hosts are generic Docker infrastructure. They must receive operating-syste
 - Do not automatically replace controller, runner, Docker major-version, kernel, or project images without repository validation.
 - Schedule reboots only after draining the controller.
 - Run health checks every five minutes.
-- Run scoped cleanup daily.
+- Run scoped cleanup hourly, with up to five minutes of jitter.
 - Compare installed state with its pinned Git configuration every fifteen minutes.
 - Never schedule `docker system prune`.
 - Alert before Docker storage reaches 80%; treat 90% as critical.
@@ -31,7 +31,7 @@ Review `/etc/apt/apt.conf.d/50unattended-upgrades` and confirm only the intended
 `scripts/install-worker-controller.sh` installs and enables all three timer pairs:
 
 - `ci-fleet-health.timer` runs the complete [fleet health contract](HEALTH-MONITORING.md);
-- `ci-fleet-cleanup.timer` removes only expired inactive fleet-owned resources;
+- `ci-fleet-cleanup.timer` removes expired inactive fleet-owned resources, empty networks in the configured Docker default address pools, and admitted disposable storage;
 - `ci-fleet-drift.timer` compares the installation with the exact pinned configuration commit without applying changes;
 - `ci-fleet-reconcile.timer` fetches the latest reviewed desired-state commit from the private repository over authenticated HTTPS and applies it automatically.
 
@@ -42,11 +42,229 @@ sudo systemctl start ci-fleet-health.service
 sudo systemctl start ci-fleet-drift.service
 sudo journalctl -u ci-fleet-health.service --since today
 sudo journalctl -u ci-fleet-drift.service --since today
-sudo /opt/ci-fleet/current/scripts/cleanup.sh
-sudo systemctl start ci-fleet-cleanup.service
+sudo systemd-run --wait --pipe --collect \
+  --property=User=root \
+  --property=EnvironmentFile=/etc/ci-fleet/ci-fleet.env \
+  --property=WorkingDirectory=/opt/ci-fleet/current \
+  /opt/ci-fleet/current/scripts/cleanup.sh
 ```
 
-The manual cleanup command is intentionally a dry-run. Enable the applying service only after its candidates are understood.
+This transient service runs a dry-run with the same root-owned rendered
+environment and working directory as the applying cleanup service. After
+reviewing its candidates, run `sudo systemctl start ci-fleet-cleanup.service`.
+
+## Docker storage retention
+
+Storage removal is disabled unless reviewed schema-v3 controller policy contains:
+
+```json
+"docker_storage_retention": {"exclusive_fleet_daemon": true}
+```
+
+First activate an engine advertising `docker_storage_retention`, then introduce
+this field in a separate reviewed configuration change. The renderer rejects
+unsupported engines and renders `CI_FLEET_DOCKER_STORAGE_RETENTION=exclusive-fleet-daemon-v1`.
+Do not edit the rendered environment to enable cleanup. The example configuration
+leaves this admission absent.
+
+Admission asserts that the entire daemon's project images and default-builder
+cache belong to disposable ordinary CI. It requires an isolated fleet daemon,
+the current credential-free socket proxy, and no independent Docker writers.
+Inventory existing storage before admitting a host. Unknown or persistent images
+must be removed from this daemon or explicitly marked
+`io.randomdevelopment.ci-fleet.retention=keep`. A project/name prefix or Docker's
+reclaimable estimate does not establish this admission. Shared application
+daemons, persistent workload images, remote builders, and asynchronous
+orchestrators do not qualify. Custom Buildx builder volumes remain outside this
+policy.
+
+The hourly service checks actual Docker filesystem use. It starts storage
+reclamation at 70% and targets 65%, leaving headroom below the unchanged 80%
+installer gate. A pass removes at most 50 unreferenced images, oldest first,
+and spends at most two minutes on storage removal. Images must be at least seven
+days old. This is creation age, not a claim about their last use. Referenced images,
+including references from stopped or created containers, remain protected.
+Installed controller/runner tags and every retained checkpoint's image tags and
+immutable IDs remain protected, including a checkpoint's live controller image.
+Untrusted or unreadable protection files stop cleanup. Multiple tags on one
+eligible image are removed together without force or parent-image pruning.
+
+Default-builder cache removal uses Engine's unused-cache selection with
+`until=168h` and a 10 GiB cache reserve. It preserves in-use cache and recently
+used records. Unknown cache use or last-use information defers cache removal.
+Shared image layers remain referenced by retained images. The cache reserve is
+a retention floor for Engine garbage collection, not a hard maximum. Do not sum
+Docker's image and cache estimates because their layers can overlap.
+
+The documented dry-run reports each image/cache record and its retention reason,
+expired resource candidates, uncertain volume ownership, and disk thresholds.
+`ELIGIBLE` means a resource qualifies if applying maintenance reaches it before
+the headroom or pass limit. It does not promise Engine will reclaim that record
+or its reported size. A dry-run changes no resources or coordination markers.
+
+Applying cleanup shares the installer lock, idle checks, exclusive proxy gate,
+and boot-scoped uncertainty markers used for network reclamation. Container and
+volume cleanup now run inside that gate too. Pulls, image loads, tagging, commits,
+image removal, and builder pruning participate in proxy protocol `v2` alongside
+builds and container reference mutations. Storage removal defers with older
+proxies. Image-load uploads use the same 1 GiB spool limit as build contexts.
+Image imports use that bounded spool too and share its two upload slots.
+Registry pulls and imports from remote URLs bypass upload slots while retaining
+the maintenance lock. Other guarded request bodies have a 1 MiB metadata limit;
+oversized bodies receive HTTP 413 before reaching Docker.
+Neither an installer nor a new job can enter while maintenance applies.
+An interrupted or uncertain removal blocks subsequent mutations until a host
+reboot changes its boot identity. Confirmed daemon rejections clear their marker
+and fail the service. A failure to launch the Docker client clears its marker
+because no request was dispatched. Cleanup never forces removal, stops active
+work, or prunes volumes globally.
+
+All raw removals share a fourteen-minute process budget, including preceding
+diagnostics and idle waits. Before creating a removal marker, cleanup checks
+that the command's full timeout fits that budget. Otherwise it defers remaining
+candidates without creating uncertainty. Network commands and other Docker
+inventory queries have a thirty-second timeout. This leaves a minute before
+the service's fifteen-minute termination limit; later timer passes can continue
+through a large expired-resource backlog.
+
+The service reports measured filesystem use after applying. If protected or
+recent resources prevent reaching 65%, it reports insufficient headroom and
+retains them. The next timer can continue a count-limited pass. This policy
+cannot guarantee headroom when protected storage or seven days of workload
+growth exceed disk capacity. Measure growth and increase capacity or reduce
+the admitted workload rather than bypassing the upgrade gate.
+
+## Workload leftovers and activation proof
+
+Cleanup reports Compose workload containers even when they lack fleet expiry
+labels. It reads these labels for optional GitHub diagnostics:
+
+- `io.randomdevelopment.ci-fleet.repository`, the full repository identity;
+- `io.randomdevelopment.ci-fleet.run-id`;
+- `io.randomdevelopment.ci-fleet.run-attempt`.
+
+The host queries the exact run attempt with its short-lived App installation
+token. This requires existing App access to read Actions runs. No permission
+change is performed automatically. Lookup is bounded to 20 distinct attempts
+and five seconds, including token acquisition, leaving time for health's Docker
+inventory checks. Missing labels, unavailable credentials, API errors, and exhausted
+lookup budgets produce an unknown status. The report contains container IDs and
+status, never credentials. Compose names and age do not infer repository/run
+ownership. A completed attempt produces `terminal-run-leftover`, including
+successful, failed, cancelled, and timed-out attempts.
+
+This diagnostic does not authorize removal of those workloads. Existing inactive
+fleet-owned resources still require their explicit managed/instance/expiry
+contract. Unlabelled volumes remain intact. Running leftovers continue to defer
+maintenance. Any later host teardown that stops workloads must independently
+verify repository, run attempt, task, shard, and resource ownership through a
+concurrency-safe lifecycle contract. A forged label or terminal run alone is
+insufficient.
+
+Inert validation includes real Docker fixtures after success, failure, client
+cancellation, and client termination with no project teardown. Host cleanup must
+remove only those expired inactive fixtures and leave no container, network, or
+volume residue. Unit coverage separately checks age, rollback protection, pass
+limits, uncertain requests, and reported terminal attempts.
+
+Before treating an admitted host as verified, retain a sanitized dry-run and
+an applying service journal, measure actual headroom afterward, wait for the next
+scheduled pass, and verify that later reconciliation passes the existing disk
+gate. Prove running and unknown-owned leftovers survive. If the host is already
+above 80%, its installed engine cannot bootstrap this feature through an upgrade
+that fails admission. Any initial scoped recovery requires separate operator
+authorization. Repository validation does not apply policy or delete live
+resources.
+
+## Network reclamation
+
+The cleanup service reads the default address pools from its rendered
+`/etc/ci-fleet/ci-fleet.env`. The documented dry-run loads that file through
+systemd, exactly as the applying service does. Without rendered pool values,
+cleanup uses only the existing fleet-label expiry rule. Pool reclamation removes
+a network with zero attached containers once it is at least ten minutes old
+and every allocated subnet lies inside those pools, including project Compose
+networks without fleet ownership or expiry labels. It does not infer ownership
+from a project name or require a changed desired-state commit.
+
+The fixed ten-minute grace is twice the ordinary job timeout and protects the
+gap between network creation and container attachment. Cleanup preserves fresh
+networks and networks whose `Created` timestamp is missing, invalid, lacks a
+timezone, or lies in the future. Explicit fleet-label expiry cleanup keeps its
+existing age policy.
+
+Cleanup always preserves `ci-fleet_default`, networks with the controller's
+`com.docker.compose.project=ci-fleet` identity, and the daemon's default bridge.
+It preserves networks with any attached container, including stopped containers.
+It reports unlabeled networks outside the configured pools without deleting them.
+Mixed allocations and networks without allocation information do not qualify for
+pool reclamation. Existing instance-scoped expiry cleanup still applies to other
+fleet-labeled networks.
+
+Cleanup checks network endpoints and all container references with
+`docker ps -aq` with filters for both the exact network ID and name, including
+stopped and created containers. It repeats those checks before each individual
+`docker network rm`. Docker's endpoint check alone cannot protect a container
+created between inspection and removal, so ordinary fleet Docker requests use
+an independent `docker-socket-proxy` Compose service. The controller starts only
+after that service is healthy. The proxy has no GitHub credentials. It gates
+container creation, network connection, and other operations that can introduce
+container references through `/run/lock/ci-fleet/docker-maintenance.lock`.
+Cleanup holds that same lock exclusively while it inspects and removes networks.
+The proxy retains its shared lock until Docker completes a dispatched mutation,
+including when the caller disconnects. Nested raw socket bind requests are
+redirected to the proxy socket without project-specific changes.
+
+For `/build`, the proxy accepts contexts up to 1 GiB and spools at most two
+uploads concurrently, bounding temporary context storage to 2 GiB. Larger
+contexts receive HTTP 413; use `.dockerignore` to exclude unnecessary files.
+Additional uploads wait for a slot and can cancel while waiting. Spool files
+are unlinked before writing, so a proxy crash leaves no context files behind.
+The proxy closes each spool and releases its slot when the upload to Docker
+ends, while retaining the maintenance lock until the build response completes.
+
+Before removal, cleanup waits up to ten minutes for runnable noncontroller
+containers to finish. It releases the exclusive lock between checks so jobs can
+finish their Docker work. It requires two idle checks separated by one second.
+It never pauses or removes active work. It exempts only current-protocol
+controller and proxy containers with the expected shared-directory mount and
+Docker endpoint. Older controllers and unknown active workloads defer cleanup.
+The applying service also takes the installer lock nonblockingly. An active
+installer, including uninstall's inherited lock, produces `DEFER` without
+network deletion. The service has a fifteen-minute start timeout.
+
+Proxy mutations and raw cleanup removals create empty, durable markers under
+`/run/lock/ci-fleet/inflight/<boot-id>/` and `removals/<boot-id>/` before dispatch.
+Markers contain no request bodies or credentials. A complete response clears
+the marker. A failed connection before any upstream connection is acquired also
+clears that request's marker, because Docker received no request. A killed
+process or uncertain response preserves it. Cleanup defers
+while a current-boot or unknown marker remains, and the proxy refuses new
+reference mutations while an unresolved cleanup-removal marker remains.
+Restarting the proxy or controller does not clear uncertainty. A host reboot
+changes the kernel boot ID; cleanup may then clear older boot directories and
+recover capacity automatically. Never delete current-boot markers to bypass
+this guard.
+
+This coordination applies to an isolated ordinary Docker/Compose fleet. It
+does not make direct host-root Docker requests outside the proxy atomic.
+Cleanup defers on an active or unknown Swarm state because Swarm can create
+tasks asynchronously after an API response. Do not use this reclamation policy
+on a daemon with independent API writers or other asynchronous orchestrators.
+The direct runner uses the shared directory and `DOCKER_HOST` so it can reconnect
+after the proxy rebinds its socket. `/var/run/docker.sock` remains available for
+explicit-path clients. Such clients and nested socket-file mounts can retain an
+old inode across a proxy restart, which can interrupt their job. Controller-only
+restarts leave the independent proxy running.
+
+Cleanup rechecks the network after a confirmed removal failure and retries a
+clean network once.
+Repeated transient endpoint conflicts defer that network and let later cleanup
+candidates proceed. Other persistent Docker errors fail the cleanup service;
+uncertain transport failures also preserve the removal marker.
+Cleanup never invokes `docker network prune` or `docker system prune`. The controller's
+low-water gate remains a backstop while the hourly timer restores leaked
+subnet capacity.
 
 ## Reboot procedure
 
@@ -60,5 +278,9 @@ The manual cleanup command is intentionally a dry-run. Enable the applying servi
 ## Dependency maintenance
 
 Dependabot proposes updates for GitHub Actions, Go modules, and both Dockerfiles. Those pull requests must pass inert validation and be reviewed before merge. This preserves unattended host security patching without silently changing the runner control plane.
+
+The `Update GitHub Actions runner release` workflow checks the official `actions/runner` releases each Monday. It ignores drafts and prereleases, validates the stable tag and exact Linux x64 and arm64 assets, downloads both archives, and calculates their SHA-256 checksums. When an update exists, it updates the three pins in `runner/Dockerfile` and the `CI_FLEET_RUNNER_VERSION` default in `deploy/compose.yaml` on the machine-managed `automation/update-actions-runner` branch. It creates or refreshes one pull request for normal review and validation. If all four pins are current, it makes no branch or pull-request change.
+
+Run the same check on demand from **Actions → Update GitHub Actions runner release → Run workflow**. The workflow only proposes a repository change. It does not build or deploy a host update.
 
 Controller and runner engine updates are also pinned. A merged private configuration change is applied with `install-worker-controller.sh --upgrade`; the host never follows a moving engine or configuration branch automatically. See [Git-authored controller desired state](DESIRED-STATE.md).

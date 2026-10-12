@@ -44,12 +44,24 @@ elif "/installation/repositories" in url:
     response = {"total_count": 1, "repositories": [{"id": 201, "full_name": "example-org/config", "private": True, "archived": False}]}
 elif endpoint.endswith("/actions/runner-groups") and method == "POST":
     kind = "runner-group-create"
+    payload = json.loads(Path(values["data-binary"][0].removeprefix("@")).read_text())
+    assert payload["selected_repository_ids"] == [], "new group must start without repository access"
     state.write_text("created\n")
     response = {"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False, "restricted_to_workflows": False}
 elif endpoint.endswith("/actions/runner-groups"):
     kind = "runner-groups"
     groups = [{"id": 789, "name": "example-ci-experimental", "visibility": "selected", "default": False, "allows_public_repositories": False, "restricted_to_workflows": False}] if state.exists() else []
-    response = {"total_count": len(groups), "runner_groups": groups}
+    if os.environ.get("FAKE_BOOTSTRAP_SECOND_DISCOVERY_PAGE") == "1":
+        page = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("page", ["1"])[0])
+        all_groups = [{"id": 1000 + index, "name": f"other-group-{index}"} for index in range(100)] + groups
+        groups = all_groups[(page - 1) * 100:page * 100]
+        response = {"total_count": len(all_groups), "runner_groups": groups}
+    else:
+        response = {"total_count": len(groups), "runner_groups": groups}
+elif endpoint.endswith("/actions/runner-groups/789/repositories") and method == "PUT":
+    kind = "runner-group-authorize"
+    state.write_text("authorized\n")
+    response = {}
 elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
     page = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("page", ["1"])[0])
@@ -57,7 +69,8 @@ elif endpoint.endswith("/actions/runner-groups/789/repositories"):
         repositories = [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}] if page == 1 else [{"id": 102, "full_name": "example-org/second-repo", "private": True, "archived": False}] if page == 2 else []
         response = {"total_count": 2, "repositories": repositories}
     else:
-        response = {"total_count": 1, "repositories": [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}]}
+        repositories = [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}] if state.read_text().strip() == "authorized" else []
+        response = {"total_count": len(repositories), "repositories": repositories}
 elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
     kind = "runner-group-delete"
     state.unlink(missing_ok=True)
@@ -91,5 +104,11 @@ if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_TRANSIENT_INSTALLA
 with Path(os.environ["FAKE_BOOTSTRAP_LOG"]).open("a") as log:
     log.write(f"{method} {kind}\n")
 output.write_text(json.dumps(response))
+if kind == "runner-group-create":
+    if os.environ.get("FAKE_BOOTSTRAP_CREATE_TIMEOUT") == "1":
+        output.unlink()
+        raise SystemExit(28)
+    if os.environ.get("FAKE_BOOTSTRAP_CREATE_TRUNCATED") == "1":
+        output.write_text('{"id":')
 if kind == "manifest-conversion" and os.environ.get("FAKE_BOOTSTRAP_CONVERSION_NONZERO") == "1":
     raise SystemExit(22)

@@ -107,6 +107,14 @@ Project cleanup is the first layer, not the only layer. Ephemeral runner destruc
 
 Cancellation, host failure, or Docker daemon failure may bypass a shell trap. Therefore, every resource MUST remain identifiable by run and age so fleet cleanup can safely remove abandoned state later.
 
+For host diagnostics, workload containers SHOULD also carry
+`io.randomdevelopment.ci-fleet.repository`, `io.randomdevelopment.ci-fleet.run-id`,
+and `io.randomdevelopment.ci-fleet.run-attempt` labels. These let the host report
+leftovers from an exact completed GitHub run attempt. Labels and age alone never
+authorize stopping a running workload. Future host teardown needs independently
+verified task/shard ownership and concurrent lifecycle coordination. See
+[host maintenance](HOST-MAINTENANCE.md#workload-leftovers-and-activation-proof).
+
 ## Workflow permissions
 
 Ordinary CI:

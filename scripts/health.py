@@ -149,6 +149,8 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
                 reserve=network.get("reserve", 0),
             )
             add("docker_network_legacy", "warning" if network.get("legacy", 0) else "ok", count=network.get("legacy", 0))
+            if "default_bridge" in network:
+                add("docker_default_bridge", "ok" if network["default_bridge"] == "matched" else "critical")
 
     desired = snapshot["desired_state"]
     controller_state = snapshot["controller"]["state"]
@@ -156,6 +158,9 @@ def evaluate(snapshot: dict[str, Any], thresholds: Thresholds) -> dict[str, Any]
     add("controller", "ok" if controller_ok else "critical", state=controller_state, desired_state=desired)
     status_expected = desired == "active" and controller_state == "running"
     add("controller_status", "warning" if status_expected and not snapshot.get("controller_status_valid", True) else "ok")
+    proxy = snapshot.get("docker_socket_proxy", "not_required")
+    if status_expected and proxy != "not_required":
+        add("docker_socket_proxy", "ok" if proxy == "healthy" else "critical")
     restarts = snapshot["controller"]["restart_count"]
     add("restarts", "warning" if restarts >= thresholds.restart_warn_count else "ok", count=restarts)
 
@@ -312,12 +317,14 @@ def _count(run: Runner, args: list[str]) -> int:
 
 def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
     result = run([str(Path(__file__).with_name("cleanup.sh")), "--instance", instance])
-    stale = {"containers": 0, "networks": 0, "volumes": 0}
+    stale = {"containers": 0, "networks": 0, "volumes": 0, "images": 0}
     if result.returncode == 0:
         for line in result.stdout.splitlines():
             match = re.match(r"(?:WOULD_REMOVE|KEEP) (container|network|volume) ", line)
             if match:
                 stale[f"{match.group(1)}s"] += 1
+            elif line.startswith("ELIGIBLE image "):
+                stale["images"] += 1
     return stale
 
 
@@ -355,6 +362,13 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         pools.append(pool)
     if not pools or configured_max < 0 or networks_per_runner < 1 or reserve < 1:
         return unavailable
+    bridge_value = values.get("CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR")
+    try:
+        expected_bridge = ipaddress.ip_interface(bridge_value) if bridge_value else None
+    except ValueError:
+        return unavailable
+    if expected_bridge is not None and expected_bridge.version != 4:
+        return unavailable
     configured = sum(1 << (size - pool.prefixlen) for pool, size in pools)
     unavailable = {"configured": configured, "reserve": reserve, "state": "unavailable"}
     if not docker_ok:
@@ -364,6 +378,7 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         return unavailable
     occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
     bridge_occupied: list[list[tuple[int, int]]] = [[] for _ in pools]
+    default_bridge_matches = expected_bridge is None
     legacy_networks = 0
     for name in [line.strip() for line in listed.stdout.splitlines() if line.strip()]:
         inspected = run(["docker", "network", "inspect", name])
@@ -384,16 +399,24 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         saw_ipv6 = False
         for entry in payload:
             configs = entry.get("IPAM", {}).get("Config", []) if isinstance(entry, dict) else []
+            if configs is None and name in {"host", "none"}:
+                configs = []
             if not isinstance(configs, list):
                 return unavailable
             for config in configs:
                 subnet = config.get("Subnet") if isinstance(config, dict) else None
+                gateway = config.get("Gateway") if isinstance(config, dict) else None
                 if not isinstance(subnet, str):
                     return unavailable
                 try:
                     network = ipaddress.ip_network(subnet, strict=False)
+                    gateway_address = ipaddress.ip_address(gateway) if isinstance(gateway, str) else None
                 except ValueError:
                     return unavailable
+                if name == "bridge" and expected_bridge is not None:
+                    default_bridge_matches = default_bridge_matches or (
+                        network == expected_bridge.network and gateway_address == expected_bridge.ip
+                    )
                 if network.version == 6:
                     saw_ipv6 = True
                     continue
@@ -445,13 +468,13 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
     free = max(configured - used, 0)
     policy_max = 0 if values.get("CI_FLEET_CONTROLLER_STATE") == "disabled" else configured_max
     required = policy_max * networks_per_runner + reserve + 1
-    if free == 0:
+    if not default_bridge_matches or free == 0:
         state = "critical"
     elif legacy_networks > 0 or configured - bridge_used < required or free <= reserve:
         state = "warning"
     else:
         state = "healthy"
-    return {
+    result = {
         "configured": configured,
         "used": used,
         "free": free,
@@ -459,6 +482,9 @@ def _docker_network_headroom(run: Runner, values: dict[str, str], *, docker_ok: 
         "legacy": legacy_networks,
         "state": state,
     }
+    if expected_bridge is not None:
+        result["default_bridge"] = "matched" if default_bridge_matches else "mismatch"
+    return result
 
 
 def _timespan_seconds(value: str) -> float | None:
@@ -633,6 +659,16 @@ def _reconcile_state(path: Path) -> dict[str, Any]:
     return {"status": status, "desired_commit": commits[0], "applied_commit": commits[1], "health": reported_health, "last_success_at": last_success}
 
 
+def _docker_socket_proxy(run: Runner, controller_name: str) -> str:
+    protocol = run(["docker", "inspect", "--format", '{{index .Config.Labels "io.randomdevelopment.ci-fleet.network-cleanup-lock"}}', controller_name])
+    if protocol.returncode != 0:
+        return "unavailable"
+    if protocol.stdout.strip() in {"", "<no value>"}:
+        return "not_required"
+    checked = run(["docker", "exec", controller_name, "/usr/local/bin/ci-fleet-controller", "--check-docker-socket-proxy"])
+    return "healthy" if checked.returncode == 0 else "unavailable"
+
+
 def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Runner = _run) -> dict[str, Any]:
     docker_root = values.get("CI_FLEET_DOCKER_ROOT", "/var/lib/docker")
     available, swap = _memory(root)
@@ -643,6 +679,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     instance = values.get("CI_FLEET_INSTANCE", "unknown")
     configured = {"min": int(values.get("CI_FLEET_MIN_RUNNERS", 0)), "max": int(values.get("CI_FLEET_MAX_RUNNERS", 0))}
     controller, effective = _container(run, controller_name) if docker_ok else ({"state": "missing", "restart_count": 0, "oom_killed": False}, {"min": 0, "max": 0})
+    docker_socket_proxy = _docker_socket_proxy(run, controller_name) if docker_ok and controller["state"] == "running" and values.get("CI_FLEET_CONTROLLER_STATE", "active") == "active" else "not_required"
     runners, software_version, controller_status_valid = _controller_status(run, controller_name, instance, configured["max"]) if docker_ok else ({"current": 0, "busy": 0, "maximum": configured["max"]}, "unknown", False)
     managed = {"running": 0, "inactive": 0, "unhealthy": 0, "restarting": 0}
     if docker_ok:
@@ -657,7 +694,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["unhealthy"] += int("unhealthy" in status)
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
-    timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    timer_ages = {"health": 900, "cleanup": 7200, "drift": 3600}
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
     if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
@@ -680,8 +717,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         # ponytail: activation validates unit installation separately; scheduled runs verify maintenance state after commit.
         timers = {name: "ok" for name in timers}
         services = {name: "ok" for name in services}
-    stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0}
-    stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"]) if docker_ok else 0
+    stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0, "images": 0}
+    if docker_ok and not values.get("CI_FLEET_DOCKER_STORAGE_RETENTION"):
+        stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"])
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
     docker_network_headroom = _docker_network_headroom(run, values, docker_ok=docker_ok)
     return {
@@ -702,6 +740,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,
         "recent_oom": oom.returncode == 0 and bool(oom.stdout.strip()),
         "docker_available": docker_ok,
+        "docker_socket_proxy": docker_socket_proxy,
         "controller": controller,
         "configured_capacity": configured,
         "effective_capacity": effective,

@@ -48,6 +48,28 @@ def docker_network_policy() -> dict:
 
 
 class DesiredStateTests(unittest.TestCase):
+    def test_storage_retention_requires_exclusive_admission_and_engine_support(self):
+        value = config()
+        controller = value["controllers"]["example-ci-01"]
+        controller["docker_storage_retention"] = {"exclusive_fleet_daemon": True}
+        with self.assertRaisesRegex(DesiredStateError, "does not support Docker storage retention"):
+            self.render(value)
+        capabilities = load_engine_capabilities(ROOT / "engine-capabilities.json")
+        environment, _ = self.render(value, capabilities)
+        self.assertEqual(environment["CI_FLEET_DOCKER_STORAGE_RETENTION"], "exclusive-fleet-daemon-v1")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fleet.json"
+            path.write_text(json.dumps(value))
+            load_and_validate_config(path)
+            for invalid in (None, False, {"exclusive_fleet_daemon": False}, {"exclusive_fleet_daemon": 1},
+                            {"exclusive_fleet_daemon": True, "allow_global_prune": True}):
+                controller["docker_storage_retention"] = invalid
+                path.write_text(json.dumps(value))
+                with self.assertRaises(DesiredStateError):
+                    load_and_validate_config(path)
+                with self.assertRaises(DesiredStateError):
+                    self.render(value, capabilities)
+
     def render(self, value: dict | None = None, capabilities: set[str] | None = None):
         return build_rendered_env(
             value or config(),
@@ -56,7 +78,14 @@ class DesiredStateTests(unittest.TestCase):
             config_repository="example-org/example-fleet-config",
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
-            engine_capabilities={"status_reporting_config", "docker_network_policy_config"} if capabilities is None else capabilities,
+            engine_capabilities={
+                "status_reporting_config",
+                "docker_network_policy_config",
+                "docker_network_policy_adapter",
+                "docker_default_bridge_cidr_config",
+            }
+            if capabilities is None
+            else capabilities,
         )
 
     def test_active_controller_renders_configured_capacity(self) -> None:
@@ -75,7 +104,12 @@ class DesiredStateTests(unittest.TestCase):
         }
         environment, _ = self.render(
             value,
-            {"status_reporting_config", "required_status_reporting", "docker_network_policy_config"},
+            {
+                "status_reporting_config",
+                "required_status_reporting",
+                "docker_network_policy_config",
+                "docker_network_policy_adapter",
+            },
         )
         self.assertEqual(environment["CI_FLEET_STATUS_REPORTING_REQUIRED"], "1")
         value["controllers"]["example-ci-01"]["status_reporting"]["config_file"] = "https://example.invalid/v1/status"
@@ -98,7 +132,7 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not advertise"):
-            self.render(value, {"docker_network_policy_config"})
+            self.render(value, {"docker_network_policy_config", "docker_network_policy_adapter"})
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "engine-capabilities.json"
             manifest.write_text("not json", encoding="utf-8")
@@ -114,7 +148,10 @@ class DesiredStateTests(unittest.TestCase):
     def test_omitted_status_reporting_accepts_older_engine(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"].pop("status_reporting", None)
-        environment, metadata = self.render(value, {"docker_network_policy_config"})
+        environment, metadata = self.render(
+            value,
+            {"docker_network_policy_config", "docker_network_policy_adapter"},
+        )
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertFalse(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
@@ -126,8 +163,11 @@ class DesiredStateTests(unittest.TestCase):
             "config_file": "/etc/ci-fleet/monitoring.env",
         }
         with self.assertRaisesRegex(DesiredStateError, "does not support status reporting configuration"):
-            self.render(value, {"docker_network_policy_config"})
-        environment, metadata = self.render(value, {"status_reporting_config", "docker_network_policy_config"})
+            self.render(value, {"docker_network_policy_config", "docker_network_policy_adapter"})
+        environment, metadata = self.render(
+            value,
+            {"status_reporting_config", "docker_network_policy_config", "docker_network_policy_adapter"},
+        )
         self.assertNotIn("CI_FLEET_STATUS_REPORTING_REQUIRED", environment)
         self.assertTrue(metadata["status_reporting_configured"])
         self.assertFalse(metadata["status_reporting_required"])
@@ -148,6 +188,37 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(metadata["docker_networks_per_runner"], 2)
         self.assertEqual(metadata["docker_network_reserve_subnets"], 1)
 
+    def test_default_bridge_cidr_renders_bip_and_requires_capability(self) -> None:
+        value = config()
+        value["controllers"]["example-ci-01"]["docker_network_policy"]["default_bridge_cidr"] = "192.0.2.1/28"
+        environment, metadata = self.render(value)
+        self.assertEqual(environment["CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR"], "192.0.2.1/28")
+        self.assertTrue(metadata["docker_default_bridge_cidr_configured"])
+        with self.assertRaisesRegex(DesiredStateError, "default bridge CIDR"):
+            self.render(value, {"status_reporting_config", "docker_network_policy_config", "docker_network_policy_adapter"})
+
+    def test_default_bridge_cidr_validation(self) -> None:
+        policy = docker_network_policy()
+        policy["default_bridge_cidr"] = "192.0.2.1/28"
+        validate_docker_network_policy(policy, path="policy", max_runners=1)
+        invalid = (
+            (42, "IPv4 interface"),
+            ("bad", "malformed"),
+            ("2001:db8::1/64", "IPv4 interface"),
+            ("192.0.2.0/28", "usable host"),
+            ("192.0.2.15/28", "usable host"),
+            ("192.0.2.1/30", "at least six usable"),
+            ("198.51.100.1/28", "must not overlap"),
+        )
+        for cidr, message in invalid:
+            with self.subTest(cidr=cidr):
+                policy["default_bridge_cidr"] = cidr
+                with self.assertRaisesRegex(DesiredStateError, message):
+                    validate_docker_network_policy(policy, path="policy", max_runners=1)
+        policy["default_bridge_cidr"] = "192.0.2.1/29"
+        with self.assertRaisesRegex(DesiredStateError, "max_runners.*reserve_subnets"):
+            validate_docker_network_policy(policy, path="policy", max_runners=5)
+
     def test_docker_network_policy_can_be_staged_after_engine_upgrade(self) -> None:
         value = config()
         value["controllers"]["example-ci-01"].pop("docker_network_policy", None)
@@ -158,6 +229,10 @@ class DesiredStateTests(unittest.TestCase):
     def test_docker_network_policy_requires_engine_capability(self) -> None:
         with self.assertRaisesRegex(DesiredStateError, "network policy configuration"):
             self.render(config(), {"status_reporting_config"})
+
+    def test_docker_network_policy_requires_engine_adapter(self) -> None:
+        with self.assertRaisesRegex(DesiredStateError, "network policy adapter"):
+            self.render(config(), {"status_reporting_config", "docker_network_policy_config"})
 
     def test_render_rejects_present_null_docker_network_policy(self) -> None:
         value = config()
@@ -231,6 +306,20 @@ class DesiredStateTests(unittest.TestCase):
             max_runners=2,
         )
         self.assertEqual((configured, reserve, networks_per_runner), (6, 1, 2))
+
+    def test_docker_network_policy_rejects_more_than_64_pools_before_overlap_checks(self) -> None:
+        policy = {
+            "networks_per_runner": 1,
+            "reserve_subnets": 1,
+            "default_address_pools": [{"base": "198.51.100.0/24", "size": 29}] * 65,
+        }
+
+        with self.assertRaisesRegex(DesiredStateError, "must not exceed 64"):
+            validate_docker_network_policy(
+                policy,
+                path="$.controllers.example-ci-01.docker_network_policy",
+                max_runners=1,
+            )
 
     def test_disabled_docker_network_policy_keeps_reserve_and_controller_capacity(self) -> None:
         configured, _, _, _ = validate_docker_network_policy(

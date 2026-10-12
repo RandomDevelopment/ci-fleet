@@ -62,6 +62,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 temporary=$(mktemp -d)
 callback_pid=
 created_group=false
+group_creation_pending=false
 installation_token=
 group_id=
 callback_is_running() {
@@ -83,6 +84,10 @@ cleanup() {
   reap_callback_if_exited
   if $created_group && declare -F rollback_new_group >/dev/null; then
     rollback_new_group || printf 'ERROR: automatic rollback of the unverified runner group failed\n' >&2
+  elif $group_creation_pending; then
+    local observed_group
+    observed_group=$(discover_group) || observed_group=unknown
+    printf 'ERROR: runner-group creation outcome is uncertain; observed group ID=%s. Owner reconciliation is required before removing %s\n' "${observed_group:-not-observed}" "$group_pending" >&2
   fi
   rm -rf "$temporary"
   exit "$status"
@@ -128,6 +133,7 @@ host_env=$etc_dir/host.env
 bootstrap_state=$etc_dir/bootstrap-app.env
 bootstrap_recovery=$etc_dir/bootstrap-recovery.json
 bootstrap_pending=$etc_dir/bootstrap-recovery.pending
+group_pending=$etc_dir/bootstrap-group.pending
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 
@@ -161,6 +167,7 @@ rollback_new_group() {
   local deleted=$temporary/group-delete.json
   write_auth_config "$installation_token" DELETE "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id" "$deleted" || return 1
   rm -f "$deleted"
+  rm -f "$group_pending"
   created_group=false
 }
 
@@ -182,8 +189,19 @@ load_metadata() {
     [[ ${CI_FLEET_BOOTSTRAP_ORGANIZATION:-} == "$organization" && ${CI_FLEET_BOOTSTRAP_INSTANCE:-} == "$instance" ]] || die 'existing bootstrap state belongs to another identity'
     if [[ -e $host_env || -L $host_env ]]; then
       [[ -f $host_env && ! -L $host_env && $(stat -c %a "$host_env") == 600 && $(stat -c %u "$host_env") == "$expected_uid" ]] || die 'existing host configuration is invalid'
-      # shellcheck disable=SC1090
-      . "$host_env"
+      mapfile -t host_data < <(python3 - "$script_dir" "$host_env" "$CI_FLEET_GITHUB_APP_CLIENT_ID" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from desired_state import parse_env, validate_host_values
+values = validate_host_values(parse_env(Path(sys.argv[2]), allow_unknown=False))
+if values['CI_FLEET_GITHUB_APP_CLIENT_ID'] != sys.argv[3] or values['CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE'] != '/etc/ci-fleet/secrets/github-app.pem': raise SystemExit(1)
+print(values['CI_FLEET_GITHUB_APP_INSTALLATION_ID']); print(values['CI_FLEET_RUNNER_TTL'])
+PY
+)
+      ((${#host_data[@]} == 2)) || die 'existing host configuration differs from bootstrap identity or is invalid'
+      CI_FLEET_GITHUB_APP_INSTALLATION_ID=${host_data[0]}
+      runner_ttl=${host_data[1]}
     fi
   else
     return 1
@@ -208,6 +226,20 @@ if slug != f'ci-fleet-{organization}-{instance}' or not re.fullmatch(r'[a-z0-9-]
 pem.write_text(value['pem']); os.chmod(pem,0o600)
 state.write_text(f'CI_FLEET_BOOTSTRAP_ORGANIZATION={organization}\nCI_FLEET_BOOTSTRAP_INSTANCE={instance}\nCI_FLEET_GITHUB_APP_ID={value["id"]}\nCI_FLEET_GITHUB_APP_CLIENT_ID={value["client_id"]}\nCI_FLEET_GITHUB_APP_SLUG={slug}\n'); os.chmod(state,0o600)
 PY
+  openssl pkey -in "$staged_pem" -check -noout >/dev/null 2>&1 || die 'bootstrap recovery PEM is invalid'
+  local target staged
+  for target in "$pem" "$bootstrap_state"; do
+    if [[ -e $target || -L $target ]]; then
+      staged=$staged_pem
+      [[ $target != "$bootstrap_state" ]] || staged=$staged_state
+      [[ -f $target && ! -L $target && $(stat -c %a "$target") == 600 && $(stat -c %u "$target") == "$expected_uid" ]] || die 'active credential destination is unsafe'
+      cmp -s "$staged" "$target" || die 'recovery record conflicts with active credentials; owner reconciliation is required'
+    fi
+  done
+  if [[ -e $host_env || -L $host_env ]]; then
+    [[ -f $pem && -f $bootstrap_state ]] || die 'recovery record beside host configuration lacks matching active credentials'
+    load_metadata
+  fi
   install -m 0600 "$staged_pem" "$pem"
   install -m 0600 "$staged_state" "$bootstrap_state"
   load_metadata
@@ -233,6 +265,7 @@ if [[ ! -e $bootstrap_lock && ! -L $bootstrap_lock ]]; then (set -o noclobber; :
 [[ -f $bootstrap_lock && ! -L $bootstrap_lock && $(stat -c %a "$bootstrap_lock") == 600 && $(stat -c %u "$bootstrap_lock") == "$expected_uid" ]] || die 'bootstrap lock file is unsafe'
 exec {bootstrap_lock_fd}<>"$bootstrap_lock"
 flock -n "$bootstrap_lock_fd" || die 'another bootstrap transaction is active'
+[[ ! -e $group_pending && ! -L $group_pending ]] || die "uncertain runner-group creation remains at $group_pending; owner reconciliation is required"
 if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
   if python3 - "$bootstrap_pending" <<'PY'
 import json,sys
@@ -406,17 +439,40 @@ if len(repositories)!=1 or len(actual)!=1: raise SystemExit(1)
 PY
 rm -f "$visible"
 
-groups=$temporary/groups.json
-write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups?per_page=100" "$groups"
-group_id=$(python3 - "$groups" "$runner_group" <<'PY'
+discover_group() {
+  local page=1 total=-1 seen=0 groups stats page_total page_count
+  local pages=()
+  while :; do
+    groups=$temporary/groups-$page.json
+    write_auth_config "$installation_token" GET "https://api.github.com/orgs/$organization/actions/runner-groups?per_page=100&page=$page" "$groups" || return 1
+    pages+=("$groups")
+    stats=$(python3 - "$groups" <<'PY'
 import json,sys
-response=json.load(open(sys.argv[1])); groups=response.get('runner_groups',[])
-if response.get('total_count') != len(groups): raise SystemExit(1)
-for value in groups:
-    if value.get('name')==sys.argv[2]: print(value['id']); break
+response=json.load(open(sys.argv[1])); groups=response.get('runner_groups'); total=response.get('total_count')
+if type(total) is not int or not 0 <= total <= 10000 or not isinstance(groups,list) or len(groups)>100: raise SystemExit(1)
+print(total,len(groups))
 PY
-)
-rm -f "$groups"
+    ) || return 1
+    read -r page_total page_count <<<"$stats"
+    if ((total < 0)); then total=$page_total; else ((page_total == total)) || return 1; fi
+    seen=$((seen + page_count))
+    ((seen <= total)) || return 1
+    ((seen < total)) || break
+    ((page_count > 0 && page < 100)) || return 1
+    page=$((page + 1))
+  done
+  python3 - "$runner_group" "${pages[@]}" <<'PY'
+import json,sys
+responses=[json.load(open(path)) for path in sys.argv[2:]]
+groups=[value for response in responses for value in response['runner_groups']]
+ids=[value['id'] for value in groups]
+if any(type(value) is not int or value < 1 for value in ids) or len(set(ids)) != len(ids): raise SystemExit(1)
+matches=[value for value in groups if value.get('name')==sys.argv[1]]
+if len(matches)>1: raise SystemExit(1)
+if matches: print(matches[0]['id'])
+PY
+}
+group_id=$(discover_group) || die 'runner group discovery is incomplete or malformed'
 created_group=false
 if [[ -z $group_id ]]; then
   [[ $mode != check ]] || die 'runner group is missing'
@@ -424,18 +480,29 @@ if [[ -z $group_id ]]; then
   python3 - "$payload" "$runner_group" "$repository_ids" <<'PY'
 import json,sys
 from pathlib import Path
-ids=[int(v) for v in Path(sys.argv[3]).read_text().splitlines()]
-Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'restricted_to_workflows':False,'selected_repository_ids':ids}))
+Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'restricted_to_workflows':False,'selected_repository_ids':[]}))
 PY
   response=$temporary/group.json
+  printf '%s\n' "organization=$organization" "runner_group=$runner_group" >"$group_pending"
+  group_creation_pending=true
   write_auth_config "$installation_token" POST "https://api.github.com/orgs/$organization/actions/runner-groups" "$response" "$payload"
-  group_id=$(python3 - "$response" <<'PY'
+  group_id=$(python3 - "$response" "$runner_group" <<'PY'
 import json,sys
-print(json.load(open(sys.argv[1]))['id'])
+value=json.load(open(sys.argv[1]))
+if type(value.get('id')) is not int or value['id']<1 or value.get('name')!=sys.argv[2]: raise SystemExit(1)
+print(value['id'])
 PY
 )
   created_group=true
+  group_creation_pending=false
+  rm -f "$group_pending"
   if [[ ${CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then kill -TERM "$$"; fi
+  python3 - "$payload" "$repository_ids" <<'PY'
+import json,sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({'selected_repository_ids':[int(v) for v in Path(sys.argv[2]).read_text().splitlines()]}))
+PY
+  write_auth_config "$installation_token" PUT "https://api.github.com/orgs/$organization/actions/runner-groups/$group_id/repositories" "$response" "$payload"
   rm -f "$payload" "$response"
 fi
 [[ $group_id =~ ^[0-9]+$ ]] || die 'runner group ID is invalid'
@@ -501,9 +568,15 @@ rm -f "${selected_pages[@]}"
 created_group=false
 
 staged=$temporary/host.env
-printf '%s\n' "CI_FLEET_GITHUB_APP_CLIENT_ID=$CI_FLEET_GITHUB_APP_CLIENT_ID" "CI_FLEET_GITHUB_APP_INSTALLATION_ID=$installation_id" "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/secrets/github-app.pem" 'CI_FLEET_RUNNER_TTL=6h' >"$staged"
+printf '%s\n' "CI_FLEET_GITHUB_APP_CLIENT_ID=$CI_FLEET_GITHUB_APP_CLIENT_ID" "CI_FLEET_GITHUB_APP_INSTALLATION_ID=$installation_id" "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/secrets/github-app.pem" "CI_FLEET_RUNNER_TTL=${runner_ttl:-6h}" >"$staged"
 if [[ $mode == check ]]; then
-  cmp -s "$staged" "$host_env" || die 'host configuration differs from verified GitHub state'
+  python3 - "$script_dir" "$staged" "$host_env" <<'PY' || die 'host configuration differs from verified GitHub state'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from desired_state import parse_env, validate_host_values
+if validate_host_values(parse_env(Path(sys.argv[2]), allow_unknown=False)) != validate_host_values(parse_env(Path(sys.argv[3]), allow_unknown=False)): raise SystemExit(1)
+PY
 else
   install -m 0600 "$staged" "$host_env"
 fi

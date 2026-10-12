@@ -73,6 +73,14 @@ mkdir "$config_checkout"
 cp -a "$repo_root/templates/config-repository/." "$config_checkout/"
 fixture_engine_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["controllers"]["example-ci-01"]["engine_ref"])' "$config_checkout/fleet.json")
 python3 "$repo_root/templates/config-repository/scripts/init.py" --organization acme-org --project example-repo --repository acme-org/example-repo --runner-group example-ci-experimental --controller example-ci-01 --location example-site --engine-ref "$fixture_engine_ref" --output "$config_checkout/fleet.json" --force
+if python3 "$config_checkout/scripts/validate.py" --config "$config_checkout/fleet.json" --strict >/dev/null 2>&1; then fail 'unreviewed initializer network placeholder passed strict validation'; fi
+python3 - "$config_checkout/fleet.json" <<'PY'
+import json,sys
+from pathlib import Path
+path=Path(sys.argv[1]); value=json.loads(path.read_text())
+value['controllers']['example-ci-01']['docker_network_policy']['default_address_pools'][0]['base']='10.64.0.0/24'
+path.write_text(json.dumps(value,indent=2)+'\n')
+PY
 git init -q "$config_checkout"
 git -C "$config_checkout" add -A
 git -C "$config_checkout" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
@@ -156,6 +164,7 @@ PY
   "http://127.0.0.1:$live_port/callback" -o "$tmp/live-callback.html"
 if wait "$live_pid"; then fail 'injected post-conversion failure succeeded'; fi
 [[ -f $live_root/etc/ci-fleet/bootstrap-recovery.json && ! -e $live_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'converted credentials were not left recoverable'
+cp "$live_root/etc/ci-fleet/bootstrap-recovery.json" "$tmp/matching-recovery.json"
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_TRANSIENT_INSTALLATIONS=1 "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$live_port" --timeout 30 >"$tmp/live.out" 2>"$tmp/live.err"
 grep -Fq 'BOOTSTRAP_OK organization=example-org instance=example-ci-01 app=ci-fleet-example-org-example-ci-01 app_id=123 installation_id=456 runner_group=example-ci-experimental runner_group_id=789 repositories=1' "$tmp/live.out" || fail 'live bootstrap did not complete'
@@ -184,7 +193,20 @@ cancel_delete_count=$(grep -c '^DELETE runner-group-delete$' "$tmp/api.log")
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'injected cancellation after group creation succeeded'; fi
 [[ $(grep -c '^DELETE runner-group-delete$' "$tmp/api.log") == "$((cancel_delete_count + 1))" && ! -e $FAKE_BOOTSTRAP_STATE ]] || fail 'cancellation did not roll back the new runner group'
-printf 'created\n' >"$FAKE_BOOTSTRAP_STATE"
+for failure in CREATE_TIMEOUT CREATE_TRUNCATED; do
+  if env PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX="$live_root" "FAKE_BOOTSTRAP_$failure=1" "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=999 >"$tmp/uncertain.out" 2>"$tmp/uncertain.err"; then fail 'uncertain group creation succeeded'; fi
+  [[ $(<"$FAKE_BOOTSTRAP_STATE") == created ]] || fail 'uncertain creation granted repository access'
+  group_pending=$live_root/etc/ci-fleet/bootstrap-group.pending
+  [[ -f $group_pending && $(stat -c %a "$group_pending") == 600 ]] || fail 'uncertain creation did not leave protected recovery state'
+  grep -Fq 'observed group ID=789' "$tmp/uncertain.err" || fail 'uncertain creation was not reconciled read-only'
+  api_before=$(wc -l <"$tmp/api.log")
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'uncertain group was silently adopted by rerun'; fi
+  [[ $(wc -l <"$tmp/api.log") == "$api_before" ]] || fail 'uncertain rerun reached GitHub before owner reconciliation'
+  rm -f "$group_pending" "$FAKE_BOOTSTRAP_STATE"
+done
+printf 'authorized\n' >"$FAKE_BOOTSTRAP_STATE"
 post_rollback_create_count=$(grep -c '^POST runner-group-create$' "$tmp/api.log")
 
 before=$(sha256sum "$host_env" "$pem")
@@ -193,8 +215,54 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$boot
 [[ $(sha256sum "$host_env" "$pem") == "$before" ]] || fail 'check mode changed credentials'
 grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not verify persisted credentials'
 [[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$post_rollback_create_count" ]] || fail 'check mode mutated the runner group'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_DISCOVERY_PAGE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'target runner group on second discovery page was rejected'
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_GROUP_PAGE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --allow-repository example-org/second-repo=102 >/dev/null 2>&1 || fail 'valid second runner-group repository page was rejected'
+
+for host_present in yes no; do
+  mixed_root=$tmp/mixed-$host_present
+  cp -a "$live_root" "$mixed_root"
+  [[ $host_present == yes ]] || rm "$mixed_root/etc/ci-fleet/host.env"
+  recovery=$mixed_root/etc/ci-fleet/bootstrap-recovery.json
+  cp "$tmp/matching-recovery.json" "$recovery"
+  python3 - "$recovery" <<'PY'
+import json,sys
+from pathlib import Path
+path=Path(sys.argv[1]); value=json.loads(path.read_text()); value['id']=999
+path.write_text(json.dumps(value))
+PY
+  mixed_before=$(find "$mixed_root" -type f -exec sha256sum {} + | sort)
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$mixed_root "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'recovery beside a different active App was accepted'; fi
+  [[ $(find "$mixed_root" -type f -exec sha256sum {} + | sort) == "$mixed_before" ]] || fail 'conflicting recovery changed active credentials or recovery bytes'
+done
+cp "$tmp/matching-recovery.json" "$live_root/etc/ci-fleet/bootstrap-recovery.json"
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'matching interrupted recovery was rejected'
+[[ ! -e $live_root/etc/ci-fleet/bootstrap-recovery.json ]] || fail 'matching recovery was not finalized'
+
+cp "$host_env" "$tmp/original-host.env"
+for ttl in 12h omitted 3599s; do
+  sed '/^CI_FLEET_RUNNER_TTL=/d' "$tmp/original-host.env" >"$host_env"
+  [[ $ttl == omitted ]] || printf 'CI_FLEET_RUNNER_TTL=%s\n' "$ttl" >>"$host_env"
+  ttl_before=$(sha256sum "$host_env")
+  if [[ $ttl == 3599s ]]; then
+    if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+      --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'invalid host-local TTL was accepted'; fi
+    [[ $(sha256sum "$host_env") == "$ttl_before" ]] || fail 'invalid TTL rejection changed host configuration'
+  else
+    PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance example-ci-01 \
+      --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'supported host-local TTL failed check'
+    [[ $(sha256sum "$host_env") == "$ttl_before" ]] || fail 'TTL check rewrote host configuration'
+    PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+      --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >"$tmp/ttl-live.out" 2>"$tmp/ttl-live.err" || fail "supported TTL failed live rerun: $(<"$tmp/ttl-live.err")"
+    expected_ttl=$ttl
+    [[ $ttl != omitted ]] || expected_ttl=6h
+    grep -Fxq "CI_FLEET_RUNNER_TTL=$expected_ttl" "$host_env" || fail 'live rerun changed effective host-local TTL'
+  fi
+done
+cp "$tmp/original-host.env" "$host_env"
 
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --check --organization example-org --instance other-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'persisted App was rebound to another instance'; fi

@@ -59,15 +59,17 @@ The bootstrap:
   client/installation IDs to `/etc/ci-fleet/host.env`, root-owned mode `0600`;
 - rejects public, archived, wrong-organization, broader App installation, and
   default/broad runner-group access;
-- creates a missing selected-repository runner group, but never changes an
-  existing group whose identity or access differs. A group created by the
-  current invocation is automatically deleted if inspection, routing
-  verification, or cancellation occurs before verification completes;
+- creates a missing selected-repository runner group with no repository access.
+  Only an acknowledged creation receives the requested access. An acknowledged
+  group created by this invocation is automatically deleted if inspection,
+  routing verification, or cancellation fails before verification completes.
+  Existing groups whose identity or access differs remain unchanged;
 - destroys the conversion code, JWTs, installation token, callback state, and
   temporary curl configurations on exit. After a successful conversion, a
   protected mode-`0600` `bootstrap-recovery.json` (or atomic-publication
   `bootstrap-recovery.pending`) is deliberately retained until the PEM and
   identity record are installed. Rerun the identical live command to recover.
+  Recovery never overwrites a different active PEM or App identity.
   If bootstrap is abandoned, an organization owner must first revoke/delete the
   exact newly created App, then explicitly remove those recovery files; ordinary
   cleanup never discards potentially unique credentials.
@@ -85,6 +87,8 @@ sudo ./scripts/bootstrap-github.sh --dry-run \
 After success, rerun the same command with `--check` to verify App ownership,
 permissions, exact selected private repositories, exact runner-group access,
 and host-local credential modes without changing the App or runner group.
+Bootstrap preserves an existing valid `CI_FLEET_RUNNER_TTL` and uses the host
+contract default of `6h` when the optional setting is absent.
 
 Pass `--install --config-repo /PATH/TO/PINNED/CHECKOUT --config-ref REVIEWED_COMMIT`
 on the initial live command for direct handoff to the idempotent host installer.
@@ -96,11 +100,111 @@ credential before App creation. Without `--install`, the redacted final report
 prints the installer shape. Externally provisioned credentials remain supported;
 the generic installer never requires this bootstrap on every run.
 
+## Manual provisioning
+
+Use this path for externally provisioned credentials.
+
+## 1. Create the app
+
+Organization Settings → Developer settings → GitHub Apps → New GitHub App.
+
+| Field | Value |
+| --- | --- |
+| Name | one per controller, e.g. `ci-fleet-<controller-id>` |
+| Homepage URL | your organization or fleet repository URL |
+| Webhook | disabled — the controller polls; nothing calls it |
+
+## 2. Grant minimum permissions
+
+Repository permissions:
+
+| Permission | Access | Why |
+| --- | --- | --- |
+| Contents | Read-only | fetch desired-state configuration over HTTPS |
+
+Organization permissions:
+
+| Permission | Access | Why |
+| --- | --- | --- |
+| Self-hosted runners | Read & write | mint runner registration tokens |
+
+The ordinary controller needs no other repository permissions. The optional
+[configuration approval gate](CONFIGURATION-APPROVAL.md) additionally requires
+read-only Pull requests and Actions on the configuration repository to verify
+reviews and exact-commit workflow/job results. It never needs contents write,
+approval write, or administration. Granting those read permissions and enabling
+the gate remain separately authorized operator actions.
+
+## 3. Generate and transfer the private key
+
+On the app page: Private keys → Generate a private key. GitHub downloads one
+PEM. The normal manual workflow in this guide stores it on the controller's
+local filesystem at `/etc/ci-fleet/secrets/github-app.pem`, owned by root with
+mode `0600`.
+
+GitHub's browser download is necessarily present briefly on a controlled
+management workstation. Choose a fresh temporary directory outside synchronized,
+indexed, and backed-up locations, restrict the downloaded file to the operator
+immediately, and transfer it at once. This is transient handling, not approved
+long-term credential storage; never claim that the key was absent from the
+workstation.
+
+Before any key bytes arrive, create the controller directory as root-owned mode
+`0700` and pre-create the destination as a root-owned regular file with mode
+`0600`. Initial setup uses only the active path:
+
+```bash
+sudo install -d -o root -g root -m 0700 /etc/ci-fleet/secrets
+sudo install -o root -g root -m 0600 /dev/null \
+  /etc/ci-fleet/secrets/github-app.pem
+```
+
+Verify the directory and destination ownership, type, and mode without reading
+the content. Then use an authenticated encrypted channel to stream into that
+already secured file; the transfer must not replace it with a default-mode node.
+Keep key bytes out of tracing, logs, stdout, process arguments, Git, issues, and
+PRs. Compare a SHA-256 digest at both ends without printing file content, then
+verify the destination again.
+
+Delete the workstation copy immediately after authenticated transfer and those
+transfer checks succeed, before token, reconciliation, health, or convergence
+checks. Stop if transfer verification or local deletion fails. The PEM must
+never be committed or printed; see [SECRETS.md](SECRETS.md).
+
+This manual workflow permits exactly two host-local files: the active path above
+and `/etc/ci-fleet/secrets/github-app.next.pem` while rotating. It does not cover
+other custom paths, symlinks, or an external secret manager's import, rotation,
+or deletion lifecycle. Those cases require provider-specific tested automation.
+Do not improvise them from these Markdown examples;
+[issue #27](https://github.com/RandomDevelopment/ci-fleet/issues/27) tracks that
+automation.
+
+## 4. Install the app
+
+App page → Install App → choose the organization → **Only select
+repositories**: pick only the private desired-state configuration repository.
+Installing on all repositories defeats the permission scoping.
+
+Record from the installation page URL and app page:
+
+- **Client ID** (app page, `Iv1...` / `Iv23...`)
+- **Installation ID** (the number at the end of the installation URL)
+
+## 5. Wire the host
+
+`/etc/ci-fleet/host.env` (root-owned `0600`, never committed):
+
+```bash
+CI_FLEET_GITHUB_APP_CLIENT_ID=<client id>
+CI_FLEET_GITHUB_APP_INSTALLATION_ID=<installation id>
+CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ci-fleet/secrets/github-app.pem
+```
+
 The controller exchanges a short-lived JWT signed with the PEM for an
 installation token at runtime (`scripts/github-app-token.sh`). No token is
 stored.
 
-## Verify
+## 6. Verify
 
 The token helper writes a token to stdout. Every verification invocation must
 redirect stdout to `/dev/null`; exit status alone is the result.
@@ -141,8 +245,19 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 
 ## Accidental creation rollback
 
+If the runner-group creation response is lost or malformed, bootstrap performs
+read-only discovery and retains root-owned mode-`0600`
+`/etc/ci-fleet/bootstrap-group.pending`. The new group has no repository access.
+Every later live/check invocation stops before making a GitHub request until an
+organization owner reconciles the recorded organization/group with GitHub.
+An absent group immediately after a timeout does not prove creation failed.
+Confirm the eventual outcome and ownership, remove only an accidentally created
+empty group with separate authorization, then remove the exact pending file.
+Do not delete an observed group based on its name alone.
+
 The bootstrap never replaces or broadens an existing App or runner group. A new
-runner group is automatically deleted only when the same invocation cannot
+runner group with an acknowledged creation ID is automatically deleted only
+when the same invocation cannot
 verify its identity/access or is cancelled before verification; it never deletes
 a pre-existing group. If another new object was approved accidentally, stop
 before running the installer. An
@@ -158,18 +273,16 @@ therefore require separate authorization; this command does not automate them.
 Use this ordered safety checklist for the normal host-local root-owned PEM
 workflow. It is a set of gates, not a copy-and-paste shell program.
 
-1. Before any key bytes arrive, use a controlled management workstation and
-   pre-create the one approved replacement path,
+1. Generate a new GitHub key and transfer, verify, and install it as described
+   above at the one approved replacement path,
    `/etc/ci-fleet/secrets/github-app.next.pem`. Pre-create it as root-owned
-   `0600` inside the root-owned `0700` directory. Generate a new GitHub key,
-   transfer and verify it there, and keep the old key and
-   `/etc/ci-fleet/secrets/github-app.pem` active for rollback. Delete the
-   workstation copy immediately after verified transfer and before token,
-   reconciliation, health, or convergence checks.
+   `0600` inside the root-owned `0700` directory before transfer. Keep the old
+   key and `/etc/ci-fleet/secrets/github-app.pem` active for rollback, and delete
+   the workstation copy before continuing.
 2. Update the protected controller identity configuration to select the new PEM.
-3. Require new-key activation, reconciliation, health, or convergence checks
-   all to succeed with the new key, including the installed manager's token
-   verification and installed-state convergence check.
+3. Activate the new key and require the installed manager's token verification,
+   reconciliation, health check, and installed-state convergence check all to
+   succeed with the new key.
 4. Confirm the controller remains healthy and converged after a fresh check.
 5. Only then revoke the old key in GitHub. Remove its exact old controller PEM
    only after revocation is confirmed. Retain the now-active replacement PEM;

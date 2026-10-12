@@ -1,15 +1,34 @@
 # ci-fleet configuration template
 
+Optional controller policy `docker_storage_retention: {"exclusive_fleet_daemon": true}`
+admits image/default-builder cache reclamation on an isolated disposable-CI daemon.
+Leave it absent until a compatible engine is active and existing storage has been
+inventoried. See the [retention and activation contract](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/HOST-MAINTENANCE.md#docker-storage-retention).
+
+The initializer, `fleet.json`, and `examples/multi-host/fleet.json` deliberately
+omit this admission. First activate an engine advertising
+`docker_storage_retention` and inventory each daemon. Then add the following
+controller property in a separate reviewed change, only for controllers whose
+entire daemon holds disposable ordinary-CI images and default-builder cache:
+
+```json
+"docker_storage_retention": {"exclusive_fleet_daemon": true}
+```
+
+For the multi-host example, assess each controller separately. A shared daemon
+must leave this property absent; `false` is not a valid admission. Run
+`./scripts/validate.sh --strict` after editing the private configuration.
+
 This is the public, secret-free starting point for an organization's private `ci-fleet` configuration repository. It records which trusted projects may use each CI pool, the reviewed desired state for controller machines, infrastructure capacity budgets, logical deployment environments, and the standardized commands every project must expose.
 
 It does **not** contain runner registration tokens, deploy credentials, private keys, host addresses, VM IDs, storage names, backup identifiers, or `.env` files.
 
 One explicit exception permits reviewed operational Docker
-`default_address_pools[].base` CIDRs in this private Git-authored policy. The
-controller must render and inspect those exact capacity ranges. They are not host
-addresses, credentials, host identity, or routable service endpoints. All VM,
-storage, backup, SSH, rendered runtime, and unrelated infrastructure details stay
-outside Git.
+`default_address_pools[].base` CIDRs and the optional `default_bridge_cidr`
+gateway/interface CIDR in this private Git-authored policy. The controller must
+render and inspect those exact Docker network ranges. They are not credentials,
+host identity, or routable service endpoints. All VM, storage, backup, SSH,
+rendered runtime, and unrelated infrastructure details stay outside Git.
 
 ```mermaid
 flowchart LR
@@ -44,11 +63,12 @@ flowchart LR
      --capacity-budget 1 \
      --max-runners 1 \
      --networks-per-runner 1 \
+     --default-bridge-cidr 192.0.2.1/24 \
      --engine-ref <reviewed-ci-fleet-commit>
    ```
 
 3. Edit `fleet.json` to add the organization's real logical mappings and replace
-   the generated RFC 5737 Docker pool with a reviewed operational Docker pool.
+   the generated RFC 5737 Docker network values with reviewed operational values.
 4. Run the strict policy check:
 
    ```bash
@@ -57,7 +77,7 @@ flowchart LR
 
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
-The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation pool is intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, resource, and output options.
+The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation network values are intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, bridge, resource, and output options.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -88,17 +108,23 @@ can upgrade itself. Endpoint and key values remain host-local and never enter
 Git.
 
 The same per-controller evidence record may declare
-`docker_network_policy_config`. A controller may omit this boolean only while it
-omits `docker_network_policy`. A retained policy requires current evidence for
-the selected engine with this boolean set to `true`. A complete record has this
-shape after an operator has verified the named engine is active:
+`docker_network_policy_config` and `docker_default_bridge_cidr_config`. A
+controller may omit the first boolean only while it omits `docker_network_policy`.
+It may omit the second while it omits `default_bridge_cidr`. Retained fields
+require current evidence for the selected engine, and the selected engine
+manifest must advertise the matching capabilities plus
+`docker_network_policy_adapter`. Remove unsupported fields while retaining the
+current engine, reconcile that release, and select an older engine only in a
+later commit. A complete record has this shape after an operator has verified
+the named engine is active:
 
 ```json
 {
   "engine_ref": "1111111111111111111111111111111111111111",
   "status_reporting_config": false,
   "required_status_reporting": false,
-  "docker_network_policy_config": true
+  "docker_network_policy_config": true,
+  "docker_default_bridge_cidr_config": true
 }
 ```
 
@@ -112,11 +138,21 @@ The validator totals the maximum capacity of every active or drained controller 
 
 For `docker_network_policy`, each pool has an IPv4 CIDR `base` and Docker
 subnet prefix `size`. The size must be no longer than `/29` and cannot be
-broader than its base. Pools must not overlap, and active or drained controllers
-must provide at least `max_runners * networks_per_runner + reserve_subnets + 1`
-subnets. The final
-subnet is reserved for the persistent controller Compose network. Real pool
-values belong in the private configuration; this template uses RFC 5737
+broader than its base. A policy may declare at most 64 pools. Pools must not
+overlap, and active or drained controllers must provide at least
+`max_runners * networks_per_runner + reserve_subnets + 1`
+subnets. The final subnet is reserved for the persistent controller Compose
+network. The optional `default_bridge_cidr` is an IPv4 interface address and
+prefix such as `192.0.2.1/28`, not a canonical network base. Its address must be
+a usable gateway, its prefix must leave room for containers, and its subnet must
+not overlap the default-address pools. After excluding the network, broadcast,
+and bridge gateway addresses, it must provide at least
+`max_runners + reserve_subnets` container addresses. Size this bridge for
+containers that use Docker's default network. Size the pools separately for job and controller
+networks. The pool-capacity arithmetic above does not change when the bridge
+field is present.
+
+Real values belong in the private configuration; this template uses RFC 5737
 documentation ranges only. Non-strict validation accepts those public examples.
 Strict validation rejects them until the private configuration uses a reviewed
 operational Docker pool CIDR. This is the narrow capacity-policy exception
@@ -131,14 +167,24 @@ engine rejects the new key, so skipped commits must not satisfy the gate.
 Transition validation requires the activation evidence to exist in the previous
 integrated state when introducing the policy. It also requires matching current
 evidence whenever a controller retains the policy, including across engine
-changes or rollbacks.
+changes or rollbacks. Adding `default_bridge_cidr` later repeats the prior-state
+gate with `docker_default_bridge_cidr_config: true`.
 
-The public engine renders these values only for read-only health inspection.
-This phase detects low water, exhaustion, failed inspection, and legacy
-networks; it does not configure or restart Docker, create/delete networks,
-clean resources, drain runners, or change controller scale. Circuit breaking,
-frequent orphan reconciliation, daemon mutation, transactional recovery, and
-consumer-label changes are later issue #81 slices.
+After the three-commit engine activation gate above, the pinned public engine
+can apply or remove a validated policy with at most 64 pools. The executable
+stage holds the installer lock, drains the controller and managed runners, and
+changes Docker's `default-address-pools` key plus `bip` only when
+`default_bridge_cidr` is configured. It preserves each prior key value, restarts
+Docker, verifies the effective bridge subnet and gateway, probes capacity,
+resumes the intended controller state, and checks health. Incompatible daemon
+settings such as `fixed-cidr` fail before the drain. The transaction uses prior
+key provenance and the prior rendered environment to roll back a failed or
+interrupted operation, and retains recovery data if rollback cannot be verified.
+A merged or configured policy does not authorize host mutation; rollout still
+requires separate operator approval, exact-head CI, and proof for
+the reviewed engine and desired-state commits. This stage does not create or
+delete networks, prune resources, change controller scale or consumer labels,
+or authorize application deployment.
 
 Application repositories do not encode the number of available workers. They submit all independent tasks and shards. Do not use GitHub Actions `strategy.max-parallel` to model fleet size; controllers and the private configuration decide how many jobs run simultaneously. An application may limit concurrency only for a separately documented external-system constraint, not worker availability.
 
