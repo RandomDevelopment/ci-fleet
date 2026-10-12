@@ -159,7 +159,7 @@ else:
 	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fakeDocker), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command("bash", "../scripts/cleanup.sh", "--apply")
+	command := exec.Command("python3", "../scripts/cleanup_networks.py", "--apply")
 	for _, value := range os.Environ() {
 		if !strings.HasPrefix(value, "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_") && !strings.HasPrefix(value, "PATH=") {
 			command.Env = append(command.Env, value)

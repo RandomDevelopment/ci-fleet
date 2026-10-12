@@ -81,6 +81,12 @@
         "min_runners": {"const": 0},
         "max_runners": {"type": "integer", "minimum": 1},
         "runner_resources": {"$ref": "#/$defs/runner_resources"},
+        "docker_storage_retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["exclusive_fleet_daemon"],
+          "properties": {"exclusive_fleet_daemon": {"const": true}}
+        },
         "docker_network_policy": {
           "type": "object",
           "additionalProperties": false,

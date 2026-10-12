@@ -1,5 +1,5 @@
 [Unit]
-Description=Remove expired ci-fleet resources and empty Docker pool networks
+Description=Remove expired ci-fleet resources and reclaim admitted Docker storage
 After=docker.service
 Wants=docker.service
 
