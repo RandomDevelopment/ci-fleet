@@ -570,9 +570,9 @@ PY
       lkg_release=$(root_path /opt/ci-fleet-deployer)/releases/${lkg_policy[CORE_REF]}
       [[ -d "$lkg_release" && ! -L "$lkg_release" && $(stat -c '%u:%a' "$lkg_release") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'
       for dir in "$lkg_release/scripts" "$lkg_release/deploy" "$lkg_release/deploy/deployer"; do [[ -d "$dir" && ! -L "$dir" && $(stat -c '%u:%a' "$dir") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'; done
-      for entry in "$lkg_release/scripts/install-deployer.sh" "$lkg_release/scripts/deployer-runtime.sh"; do [[ ! -L "$entry" && -f "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'; done
+      for entry in "$lkg_release/scripts/install-deployer.sh" "$lkg_release/scripts/deployer-runtime.sh" "$lkg_release/scripts/deployer_adapter.py"; do [[ ! -L "$entry" && -f "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || die 'last-known-good release is incomplete'; done
       [[ -f "$lkg_release/.ci-fleet-tree-sha256" ]] || die 'last-known-good release is incomplete'
-      [[ $(<"$lkg_release/.ci-fleet-tree-sha256") == "$(cd "$lkg_release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)" ]] || die 'last-known-good release tree digest mismatch'
+      [[ $(<"$lkg_release/.ci-fleet-tree-sha256") == "$(cd "$lkg_release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer/* | sha256sum | cut -d' ' -f1)" ]] || die 'last-known-good release tree digest mismatch'
       for entry in "$lkg_release"/deploy/deployer/*; do [[ -f "$entry" && ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:644" ]] || die 'last-known-good release is incomplete'; done
       # Cross-validate the retained pair exactly as the rollback path does:
       # state must match policy, and the retained adapter must match its pin.

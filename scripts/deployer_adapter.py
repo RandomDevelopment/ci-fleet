@@ -113,6 +113,31 @@ class UnixConnection(http.client.HTTPConnection):
         self.peer_uid = uid
 
 
+def reject_rootful_workloads(backend_path: str) -> None:
+    socket_path = Path("/run/docker.sock")
+    if not socket_path.exists() or str(socket_path.resolve()) == backend_path:
+        return
+    connection = UnixConnection(str(socket_path), rootless=False)
+    try:
+        for path in ("/containers/json?all=1", "/networks", "/volumes"):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            body = response.read(MAX_REQUEST + 1)
+            require(response.status == 200 and len(body) <= MAX_REQUEST, "host Docker inventory is unavailable")
+            value = json.loads(body, object_pairs_hook=unique_object)
+            if path == "/volumes":
+                require(isinstance(value, dict), "invalid host volume inventory")
+                value = value.get("Volumes") or []
+            require(isinstance(value, list), "invalid host Docker inventory")
+            if path == "/networks":
+                require(all(isinstance(item, dict) and item.get("Name") in ("bridge", "host", "none") for item in value),
+                        "unrelated host Docker network is present")
+            else:
+                require(not value, "unrelated host Docker workload is present")
+    finally:
+        connection.close()
+
+
 class Backend:
     def __init__(self, path: str):
         require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
@@ -125,6 +150,7 @@ class Backend:
             require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
                     "a dedicated rootless Docker daemon is required")
             self.uid = connection.peer_uid
+            reject_rootful_workloads(path)
         finally:
             connection.close()
 

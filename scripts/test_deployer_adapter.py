@@ -199,6 +199,19 @@ class Containment(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.decode(b'{"Privileged":false,"Privileged":true}')
 
+    def test_rootful_workload_is_not_hidden_by_rootless_backend(self):
+        from unittest.mock import MagicMock
+        connection = MagicMock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b'[{"Id":"unrelated"}]'
+        with patch.object(adapter.Path, 'exists', return_value=True), \
+             patch.object(adapter.Path, 'resolve', return_value=Path('/run/docker.sock')), \
+             patch.object(adapter, 'UnixConnection', return_value=connection):
+            with self.assertRaises(ValueError):
+                adapter.reject_rootful_workloads('/run/rootless/docker.sock')
+        connection.close.assert_called_once()
+
     def test_rootful_socket_peer_rejected(self):
         if os.getuid() != 0:
             self.skipTest('root peer fixture requires root test user')
