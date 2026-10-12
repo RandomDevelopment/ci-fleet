@@ -2,7 +2,7 @@
 FROM golang:1.27.1-bookworm@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66 AS build
 ARG SOURCE_DATE_EPOCH=1786752000
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
-    && printf 'deb http://snapshot.debian.org/archive/debian/20260815T000000Z bookworm main\n' >/etc/apt/sources.list \
+    && printf 'deb http://snapshot.debian.org/archive/debian/20261012T000000Z bookworm main\n' >/etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${CI_FLEET_
 
 FROM debian:13.7-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 ARG SOURCE_DATE_EPOCH=1786752000
-ARG DEBIAN_SNAPSHOT=20260815T000000Z
+ARG DEBIAN_SNAPSHOT=20261012T000000Z
 ARG CI_FLEET_COMMIT=unknown
 LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
       io.randomdevelopment.ci-fleet.managed="true" \

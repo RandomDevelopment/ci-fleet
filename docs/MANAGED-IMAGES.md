@@ -15,7 +15,7 @@ Base-image and runner selections updated on 2026-10-12 from official upstream en
 | --- | --- | --- |
 | Debian 13.7 slim, both managed images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim` |
 | Go 1.27.1 Bookworm build image | `sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66` | Docker Hub registry manifest for `library/golang:1.27.1-bookworm` |
-| Debian packages | signed snapshot `20260815T000000Z` | `snapshot.debian.org/archive/debian/20260815T000000Z/dists/trixie/InRelease` |
+| Debian packages | signed snapshot `20261012T000000Z` | `snapshot.debian.org/archive/debian/20261012T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
 | Compose plugin 5.4.0 amd64 / arm64 | exact package version and SHA-256 `75391b38459edf75a975504903673fdb87a5a4016d689d9b198e2db1ae2796e0` / `81261f286d48c1c9e586065bc52065bbbe3b023705ebdb72377ec465c216dcaf` | official Docker Debian `trixie` package index |
