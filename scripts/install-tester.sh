@@ -274,7 +274,7 @@ create_tmpfiles() {
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
 quiesce_timers() {
-  local unit load_state present_timers=()
+  local unit directory load_state present_timers=()
   for unit in "${timers[@]}"; do
     if [[ -e $systemd_dir/$unit ]]; then
       present_timers+=("$unit")
@@ -282,6 +282,9 @@ quiesce_timers() {
       load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
       [[ -n $load_state ]] || return 1
       if [[ $load_state != not-found ]]; then systemctl stop "$unit" >/dev/null || return 1; fi
+      for directory in timers.target.wants multi-user.target.wants; do
+        [[ ! -L $systemd_dir/$directory/$unit ]] || rm -f -- "$systemd_dir/$directory/$unit" || return 1
+      done
     fi
   done
   if (( ${#present_timers[@]} )); then systemctl disable --now "${present_timers[@]}" >/dev/null || return 1; fi

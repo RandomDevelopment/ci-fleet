@@ -911,11 +911,18 @@ if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tes
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'fresh install failed before partial-unit test'
 rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.timer"
 rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.service"
+for directory in timers.target.wants multi-user.target.wants; do
+  mkdir -p "$root/etc/systemd/system/$directory"
+  ln -s ../ci-fleet-tester-cleanup.timer "$root/etc/systemd/system/$directory/ci-fleet-tester-cleanup.timer"
+done
 : >"$tmp/systemctl.log"
 FAKE_TESTER_EFFECTIVE_TIMERS=1 FAKE_TESTER_EFFECTIVE_SERVICES=1 FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
 grep -Fxq 'disable --now ci-fleet-tester-health.timer' "$tmp/systemctl.log" || fail 'uninstall did not disable the present timer'
 grep -Fxq 'stop ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'uninstall skipped a cached timer without a local fragment'
 if grep '^disable ' "$tmp/systemctl.log" | grep -Fq ci-fleet-tester-cleanup.timer; then fail 'uninstall tried to disable a missing timer file'; fi
+for directory in timers.target.wants multi-user.target.wants; do
+  [[ ! -L $root/etc/systemd/system/$directory/ci-fleet-tester-cleanup.timer ]] || fail 'uninstall retained a fileless timer enablement link'
+done
 grep -Fxq 'stop ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$tmp/systemctl.log" || fail 'uninstall skipped an effective service without a local fragment'
 [[ -L $root/opt/ci-fleet-tester/current ]] && fail 'partial uninstall left the active release link'
 printf 'TESTER_INSTALLER_TESTS_OK\n'
