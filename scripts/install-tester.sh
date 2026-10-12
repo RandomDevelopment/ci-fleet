@@ -32,10 +32,10 @@ expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 if [[ ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run installer as root'; fi
 case $action in
-  --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat systemctl tar wc' ;;
+  --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat sync systemctl tar wc' ;;
   --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir python3 readlink sha256sum stat systemctl' ;;
   --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
-  --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat systemctl' ;;
+  --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat sync systemctl' ;;
   --uninstall) required_commands='bash chmod dirname docker env find flock grep install mkdir rm stat systemctl' ;;
 esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
@@ -55,6 +55,7 @@ environment_dir=$config_root/environments
 definition_dir=$config_root/definitions
 secret_root=$config_root/secrets
 runtime_state=$state_root/environments
+activation_pending=$state_root/activation-pending
 docker_root=$(root_path /var/lib/docker)
 docker_socket=$(root_path /var/run/docker.sock)
 runtime_lock=$(root_path /run/lock/ci-fleet-tester/runtime.lock)
@@ -304,7 +305,39 @@ remove_units() {
 write_lkg() {
   printf '%s\n' "$1" >"$lkg_file.new"
   chmod 0600 "$lkg_file.new"
-  mv -fT "$lkg_file.new" "$lkg_file"
+  sync -f "$lkg_file.new" || return 1
+  mv -fT "$lkg_file.new" "$lkg_file" || return 1
+  sync -f "$state_root"
+}
+
+retire_activation() {
+  sync -f "$opt_dir" "$state_root" || return 1
+  rm -f -- "$activation_pending" || return 1
+  sync -f "$state_root"
+}
+
+recover_activation() {
+  local previous candidate extra
+  for command in basename ln mv sha256sum sync; do command -v "$command" >/dev/null || die "activation recovery requires $command"; done
+  secure_dir "$state_root" 700
+  secure_dir "$opt_dir" 755
+  secure_dir "$release_dir" 755
+  secure_file "$activation_pending" 600
+  read -r previous candidate extra <"$activation_pending"
+  [[ ( $previous == none || $previous =~ ^[0-9a-f]{40}$ ) && $candidate =~ ^[0-9a-f]{40}$ && -z $extra ]] || die 'activation journal is invalid'
+  reject_other_roles
+  reject_unit_dropins
+  reject_tmpfiles_overrides
+  if [[ $previous != none ]]; then
+    release_complete "$release_dir/$previous" "$previous" || die 'interrupted activation incumbent is incomplete; operator recovery is required'
+    ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
+    if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'interrupted activation incumbent restore failed; journal retained'; fi
+  else
+    remove_units || die 'interrupted fresh installation teardown failed; journal retained'
+    rm -f -- "$current_link" "$stable_launcher"
+  fi
+  retire_activation || die 'activation recovery retirement failed'
+  report "ACTIVATION_RECOVERED previous_revision=$previous candidate_revision=$candidate"
 }
 
 activate_release() {
@@ -318,7 +351,15 @@ activate_release() {
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
   fi
+  [[ ! -e $activation_pending && ! -L $activation_pending ]] || die 'outstanding activation requires recovery'
+  [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
+  printf '%s %s\n' "${previous:-none}" "$commit" >"$activation_pending.new"
+  chmod 0600 "$activation_pending.new"
+  sync -f "$activation_pending.new" || die 'activation journal is not durable'
+  mv -Tf "$activation_pending.new" "$activation_pending"
+  sync -f "$state_root" || die 'activation journal publication is not durable'
   ln -sfn "$target" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
+  sync -f "$opt_dir" || die 'candidate pointer is not durable'
   if ! install_launcher "$target" || ! install_units "$target" || ! create_tmpfiles || ! "$stable_launcher" --check || ! "$stable_launcher" --health || ! start_maintenance || ! enable_timers; then
     if [[ $previous =~ ^[0-9a-f]{40}$ ]] && release_complete "$release_dir/$previous" "$previous"; then
       ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
@@ -327,13 +368,16 @@ activate_release() {
       remove_units || die 'candidate activation failed and fresh-install unit teardown also failed; candidate retained for recovery'
       rm -f -- "$current_link" "$stable_launcher"
     fi
+    retire_activation || die 'candidate restore succeeded but activation journal retirement failed'
     die 'candidate tester activation failed; previous release restored when available'
   fi
   if [[ $record_previous == 1 && $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous" && ! write_lkg "$previous"; then
     ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
     if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! enable_timers; then die 'last-known-good recording failed and incumbent restore failed; incumbent link retained for recovery'; fi
+    retire_activation || die 'incumbent restore succeeded but activation journal retirement failed'
     die 'last-known-good recording failed; previous release restored'
   fi
+  retire_activation || die 'completed activation journal retirement failed'
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 
@@ -359,6 +403,14 @@ installation_matches() {
 }
 
 case $action in --install|--upgrade|--check|--reset|--rollback|--uninstall) acquire_lifecycle_lock ;; esac
+
+if [[ -e $activation_pending || -L $activation_pending ]]; then
+  case $action in
+    --install|--upgrade|--rollback|--uninstall) recover_activation ;;
+    *) die 'interrupted tester activation requires installer retry or rollback' ;;
+  esac
+  if [[ $action == --rollback ]]; then report "ROLLBACK_OK source_revision=$(installed_revision || printf none) recovered_pending=true"; exit 0; fi
+fi
 
 case $action in
   --install|--upgrade)

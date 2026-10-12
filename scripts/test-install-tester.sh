@@ -60,10 +60,14 @@ if [[ -n ${FAKE_TESTER_SYSTEMCTL_WAIT_READY:-} && $1 == start && " $* " != *' --
   touch "$FAKE_TESTER_SYSTEMCTL_WAIT_READY"
   while [[ ! -e ${FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE:?} ]]; do sleep 0.05; done
 fi
+if [[ $1 == daemon-reload && -n ${FAKE_TESTER_ACTIVATION_SIGNAL:-} ]]; then
+  kill -s "$FAKE_TESTER_ACTIVATION_SIGNAL" "$PPID"
+  exit 137
+fi
 [[ -z ${FAKE_TESTER_SYSTEMCTL_FAIL:-} || " $* " != *" $FAKE_TESTER_SYSTEMCTL_FAIL "* ]]
 EOF
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
-printf '%s\n' '#!/usr/bin/env bash' 'set -e' '[[ ${FAKE_TESTER_CURL_FAIL:-0} != 1 ]]' '[[ " $* " == *" --noproxy * "* ]]' >"$fake_bin/curl"
+printf '%s\n' '#!/usr/bin/env bash' 'set -e' '[[ ${1:-} == --disable ]]' '[[ ${FAKE_TESTER_CURL_FAIL:-0} != 1 ]]' '[[ " $* " == *" --noproxy * "* ]]' >"$fake_bin/curl"
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
 printf '%s\n' '#!/usr/bin/env bash' '[[ ${FAKE_TESTER_GETENT_FAIL:-0} != 1 ]]' >"$fake_bin/getent"
 # shellcheck disable=SC2016 # Write the expansion for the fake to evaluate.
@@ -339,6 +343,11 @@ write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
 FAKE_TESTER_ROUTE_PORT=18090 "$runtime" --remove --environment interpolation >/dev/null
+write_environment literal-dollar 18090
+TOKEN=caller-value CURL_HOME=/fictional/root-curl FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --converge --environment literal-dollar >/dev/null || fail 'literal Compose dollars changed during activation'
+TOKEN=caller-value FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --health >/dev/null || fail 'literal Compose dollars changed during health'
+FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --remove --environment literal-dollar >/dev/null || fail 'literal Compose dollars prevented cleanup'
+[[ ! -e $root/var/lib/ci-fleet-tester/environments/literal-dollar.state ]] || fail 'literal-dollar environment was not removed'
 deployed_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=changed-model "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge replaced the incumbent Compose model without reset'; fi
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$deployed_hash" ]] || fail 'rejected model replacement changed incumbent state'
@@ -436,7 +445,7 @@ for signal in TERM KILL; do
   sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$interrupted_state"
   : >"$tmp/docker.log"
   timeout 10 "$runtime" --cleanup >/dev/null || fail "$signal blocked subsequent expiration cleanup"
-  grep -Fq -- "-p ci-fleet-test-$id -f $interrupted_compose down --timeout 10 --volumes --remove-orphans" "$tmp/docker.log" || fail "$signal cleanup did not target the interrupted project"
+  grep -Eq -- "-p ci-fleet-test-$id -f [^ ]+ down --timeout 10 --volumes --remove-orphans" "$tmp/docker.log" || fail "$signal cleanup did not target the interrupted project"
   [[ ! -e $interrupted_state && ! -e $interrupted_compose ]] || fail "$signal left expired state behind"
   [[ $(sha256sum "$state" "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$incumbent_hash" ]] || fail "$signal cleanup changed the incumbent environment"
   if grep -Fq -- '-p ci-fleet-test-preview-a' "$tmp/docker.log"; then fail "$signal cleanup touched the unexpired environment"; fi
@@ -631,6 +640,19 @@ printf '#!/usr/bin/env bash\nexit 1\n' >"$upgrade_repo/scripts/tester-runtime.sh
 git -C "$upgrade_repo" add scripts/tester-runtime.sh
 git -C "$upgrade_repo" -c user.name=Example -c user.email=example@invalid.example commit --quiet -m 'fixture: fail tester activation'
 bad_ref=$(git -C "$upgrade_repo" rev-parse HEAD)
+for signal in TERM KILL; do
+  interrupted_rc=0
+  FAKE_TESTER_ACTIVATION_SIGNAL=$signal "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/killed-upgrade.out" 2>&1 || interrupted_rc=$?
+  [[ $interrupted_rc == 137 || $interrupted_rc == 143 ]] || fail 'activation interruption did not terminate the installer'
+  [[ -f $root/var/lib/ci-fleet-tester/activation-pending && ! -e $root/var/lib/ci-fleet-tester/last-known-good ]] || fail 'interrupted first upgrade lost its recovery record'
+  if [[ $signal == TERM ]]; then
+    if "$upgrade_repo/scripts/install-tester.sh" --upgrade --ref "$bad_ref" >"$tmp/retry-upgrade.out" 2>&1; then fail 'invalid interrupted candidate passed retry'; fi
+  else
+    "$installer" --rollback >"$tmp/rollback-interrupted.out" 2>&1 || fail 'first interrupted upgrade could not roll back without LKG'
+  fi
+  [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'interrupted upgrade recovery selected the candidate as incumbent'
+  [[ ! -e $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'recovered activation kept a pending record'
+done
 if "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'failed candidate activation succeeded'; fi
 [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$ref" ]] || fail 'failed upgrade did not restore incumbent release'
 

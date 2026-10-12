@@ -145,6 +145,14 @@ while (($#)); do
     *) shift ;;
   esac
 done
+if [[ ${FAKE_TESTER_EXPECT_LITERAL_DOLLARS:-0} == 1 && ${operation:-} != config ]]; then
+  [[ -z ${TOKEN:-} && -z ${CURL_HOME:-} ]] || { printf 'caller environment reached Compose replay\n' >&2; exit 9; }
+  python3 - "$model" <<'PY_LITERAL' || exit 9
+import json,sys
+command=json.load(open(sys.argv[1]))['services']['web']['command']
+assert command == ['sh','-c','echo $$TOKEN $${MISSING:?}'], command
+PY_LITERAL
+fi
 case ${operation:-} in
   config)
     digest=$(printf 'a%.0s' {1..64})
@@ -193,6 +201,8 @@ case ${operation:-} in
       cgroup-default) cgroup_extra= ;;
       uts-host) service_extra=',"uts":"host"' ;;
       remote-logging) service_extra=',"logging":{"driver":"syslog","options":{"syslog-address":"tcp://example.invalid:514"}}' ;;
+      # shellcheck disable=SC2016 # Model literal dollars after source rendering.
+      literal-dollar) service_extra+=',"command":["sh","-c","echo $TOKEN ${MISSING:?}"]' ;;
       interpolation) [[ -z ${TOKEN:-} ]] || service_extra=$(printf ',"command":["app","--token=%s"]' "$TOKEN") ;;
       profiles) service_extra=',"profiles":["extra"]' ;;
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
