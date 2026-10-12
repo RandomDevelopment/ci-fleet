@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+from contextlib import contextmanager
 import math
 import http.client
 import ipaddress
@@ -550,14 +552,20 @@ def _container(run: Runner, name: str) -> tuple[dict[str, Any], dict[str, int]]:
     }, capacity
 
 
-def _memory_details(root: Path) -> tuple[dict[str, int], dict[str, int]]:
+def _memory_details(root: Path, *, strict: bool = False) -> tuple[dict[str, int], dict[str, int]]:
     values: dict[str, int] = {}
     try:
         for line in (root / "proc/meminfo").read_text().splitlines():
             key, value = line.split(":", 1)
             values[key] = int(value.split()[0]) * 1024
-    except (OSError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError) as error:
+        if strict:
+            raise ValueError("memory counters are unavailable") from error
         return {"total_bytes": 0, "available_bytes": 0}, {"total_bytes": 0, "used_bytes": 0}
+    if strict and (not {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"} <= values.keys()
+                   or values["MemTotal"] <= 0 or any(value < 0 for value in values.values())
+                   or values["MemAvailable"] > values["MemTotal"] or values["SwapFree"] > values["SwapTotal"]):
+        raise ValueError("memory counters are invalid")
     swap_total = values.get("SwapTotal", 0)
     return (
         {"total_bytes": values.get("MemTotal", 0), "available_bytes": values.get("MemAvailable", 0)},
@@ -716,6 +724,12 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
     if remote_config:
         service_units["reconcile"] = "ci-fleet-reconcile.service"
     services = {name: _unit_state(run, unit) for name, unit in service_units.items()}
+    capacity_history = root / "var/lib/ci-fleet/capacity/samples.jsonl"
+    capacity_failure = None
+    if capacity_installed and _capacity_directory(capacity_history):
+        capacity_failure = _capacity_json(capacity_history.parent / "failure.json")
+        if capacity_failure is not None:
+            services["capacity"] = "failed"
     debian = (root / "etc/debian_version").exists()
     if debian:
         timers["updates"] = _unit_state(run, "apt-daily-upgrade.timer", timer=True, max_age_seconds=172800)
@@ -743,6 +757,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         "software_version": software_version if software_version != "unknown" else values.get("CI_FLEET_ENGINE_REF", "unknown"),
         "runners": runners,
         "controller_status_valid": controller_status_valid,
+        "capacity_failure": capacity_failure,
         "memory_available_percent": available,
         "load_per_cpu": loads[2] / max(os.cpu_count() or 1, 1),
         "swap_used_percent": swap if (pressure := _memory_pressure(root)) is None or pressure >= 0.1 else 0,
@@ -835,17 +850,58 @@ def _runner_capacity(run: Runner, instance: str) -> list[dict[str, int | float]]
     return metrics
 
 
-def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tuple[list[dict[str, Any]], bool]:
+def _capacity_directory(path: Path, *, create: bool = False) -> bool:
     expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    for ancestor in reversed(path.absolute().parent.parents):
+        if ancestor.is_symlink():
+            raise ValueError("capacity history ancestor must not be a symlink")
     try:
         parent = path.parent.lstat()
     except FileNotFoundError:
         if not create:
-            return [], False
+            return False
         path.parent.mkdir(parents=True, mode=0o700)
         parent = path.parent.lstat()
     if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != expected_owner or stat.S_IMODE(parent.st_mode) != 0o700:
         raise ValueError("capacity history directory must be root-owned mode 0700")
+    return True
+
+
+def _capacity_json(path: Path) -> Any:
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("capacity metadata must be root-owned mode 0600")
+    return json.loads(path.read_text())
+
+
+def _write_capacity_json(path: Path, value: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+@contextmanager
+def _capacity_lock(path: Path):
+    _capacity_directory(path, create=True)
+    descriptor = os.open(path.parent / "lock", os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, "r+") as lock:
+        info = os.fstat(lock.fileno())
+        expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity lock must be root-owned mode 0600")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tuple[list[dict[str, Any]], bool]:
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    if not _capacity_directory(path, create=create):
+        return [], False
     retained = []
     dirty = False
     try:
@@ -858,7 +914,8 @@ def _capacity_state(path: Path, timestamp: int, *, create: bool = False) -> tupl
         for line in path.read_text().splitlines():
             try:
                 previous = json.loads(line)
-                if _sample_values(previous, timestamp, retention_seconds=CAPACITY_RETENTION_SECONDS) is not None:
+                observed_at = max(timestamp, previous["timestamp"]) if isinstance(previous, dict) and type(previous.get("timestamp")) is int else timestamp
+                if _sample_values(previous, observed_at, retention_seconds=CAPACITY_RETENTION_SECONDS) is not None:
                     retained.append(previous)
                 else:
                     dirty = True
@@ -913,14 +970,35 @@ def _update_cpu_baseline(path: Path, timestamp: int, cpu: dict[str, Any]) -> dic
     return None
 
 
-def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None) -> bool:
+def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run, now: int | None = None, cached: bool = False) -> bool:
     timestamp = int(time.time() if now is None else now)
-    retained, dirty = _capacity_state(path, timestamp, create=True)
+    _capacity_directory(path, create=True)
+    index_path = path.with_suffix(path.suffix + ".index")
+    index = _capacity_json(index_path) if cached else None
+    size = path.lstat().st_size if path.exists() else 0
+    expected_owner = os.getuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_owner or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("capacity history must be root-owned mode 0600")
+    if (isinstance(index, dict) and set(index) == {"checked_at", "count", "size", "expires_at"}
+            and all(type(value) is int and value >= 0 for value in index.values())
+            and 0 <= timestamp - index["checked_at"] < 3600 and timestamp < index["expires_at"]
+            and index["size"] == size and index["count"] < CAPACITY_COMPACT_SAMPLES):
+        retained, dirty = [], False
+    else:
+        retained, dirty = _capacity_state(path, timestamp, create=True)
+        index = {"checked_at": timestamp, "count": len(retained), "size": size,
+                 "expires_at": min((sample["timestamp"] + CAPACITY_RETENTION_SECONDS + 1 for sample in retained), default=timestamp + 3600)}
     cpu = snapshot["cpu"]
     previous_host = _update_cpu_baseline(path, timestamp, cpu)
     if snapshot.get("runners", {}).get("current", 0) < 1:
         if dirty:
             _write_capacity(path, retained[-CAPACITY_MAX_SAMPLES:])
+            index["count"] = min(len(retained), CAPACITY_MAX_SAMPLES)
+        if cached:
+            index["size"] = path.stat().st_size if path.exists() else 0
+            _write_capacity_json(index_path, index)
         return False
     pool_id = snapshot.get("pool_id", snapshot["controller_id"])
     memory = snapshot["memory"]
@@ -941,12 +1019,23 @@ def record_capacity(path: Path, snapshot: dict[str, Any], *, run: Runner = _run,
     if not runners:
         if dirty:
             _write_capacity(path, retained[-CAPACITY_MAX_SAMPLES:])
+            index["count"] = min(len(retained), CAPACITY_MAX_SAMPLES)
+        if cached:
+            index["size"] = path.stat().st_size if path.exists() else 0
+            _write_capacity_json(index_path, index)
         return False
     sample = {"timestamp": timestamp, "pool": pool_id, "host": host, "runners": runners}
+    if _sample_values(sample, timestamp) is None:
+        raise ValueError("capacity sample is invalid")
     if dirty or len(retained) >= CAPACITY_COMPACT_SAMPLES:
         _write_capacity(path, (retained + [sample])[-CAPACITY_MAX_SAMPLES:])
+        index["count"] = min(len(retained) + 1, CAPACITY_MAX_SAMPLES)
     else:
         _append_capacity(path, sample)
+        index["count"] += 1
+    if cached:
+        index["size"] = path.stat().st_size
+        _write_capacity_json(index_path, index)
     return True
 
 
@@ -1034,7 +1123,7 @@ def collect_capacity_snapshot(values: dict[str, str], *, root: Path = Path("/"),
     if runners.returncode != 0:
         raise ValueError("managed runner discovery failed")
     current = len([value for value in runners.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{12,64}", value)])
-    memory, swap = _memory_details(root)
+    memory, swap = _memory_details(root, strict=True)
     return {
         "controller_id": instance,
         "pool_id": values.get("CI_FLEET_POOL", instance),
@@ -1167,6 +1256,14 @@ def _local(args: argparse.Namespace) -> int:
         if delivery > report["exit_code"]:
             report["status"], report["exit_code"] = ("unhealthy", 2) if delivery == 2 else ("warning", 1)
     _write_report(args.output, report)
+    if snapshot.get("capacity_failure") is not None and delivery == 0 and values.get("CI_FLEET_HEALTH_BOOTSTRAP") != "1":
+        history = Path("/var/lib/ci-fleet/capacity/samples.jsonl")
+        if os.environ.get("CI_FLEET_TESTING") == "1":
+            history = Path(os.environ.get("CI_FLEET_ROOT_PREFIX", "/")) / "var/lib/ci-fleet/capacity/samples.jsonl"
+        with _capacity_lock(history):
+            failure = history.parent / "failure.json"
+            if _capacity_json(failure) == snapshot["capacity_failure"]:
+                failure.unlink()
     print(json.dumps(report, sort_keys=True) if args.json else render_human(report))
     return int(report["exit_code"])
 
@@ -1189,8 +1286,16 @@ def _capacity(args: argparse.Namespace) -> int:
 
 
 def _capacity_sample(args: argparse.Namespace) -> int:
-    snapshot = collect_capacity_snapshot(dict(os.environ), root=args.root)
-    recorded = record_capacity(args.history, snapshot)
+    with _capacity_lock(args.history):
+        try:
+            clock = _run(["timedatectl", "show", "--property=NTPSynchronized", "--value"])
+            if clock.returncode != 0 or clock.stdout.strip() != "yes":
+                raise ValueError("capacity sampling requires a synchronized clock")
+            snapshot = collect_capacity_snapshot(dict(os.environ), root=args.root)
+            recorded = record_capacity(args.history, snapshot, cached=True)
+        except (OSError, ValueError, KeyError):
+            _write_capacity_json(args.history.parent / "failure.json", {"timestamp": int(time.time()), "event": secrets.token_hex(16)})
+            raise
     print(f"CAPACITY_SAMPLE recorded={str(recorded).lower()}")
     return 0
 
