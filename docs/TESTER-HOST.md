@@ -115,4 +115,4 @@ Uninstall fails while any managed environment exists. It removes only tester uni
 
 ## External acceptance gate
 
-Before this draft can merge, an authorized operator must use a prepared isolated Debian Docker host with test-only identity/network/storage/domain boundaries and provide evidence for: fresh install, unchanged second install, immutable application converge, health, scoped reset, expiration cleanup, upgrade, failed-upgrade restoration, rollback, and removal. No production credentials, database, network authority, ordinary CI runner, or live production system may participate.
+Before this PR can merge, an authorized operator must use a prepared isolated Debian Docker host with test-only identity/network/storage/domain boundaries and provide evidence for: fresh install, unchanged second install, immutable application converge, health, scoped reset, expiration cleanup, upgrade, failed-upgrade restoration, rollback, and removal. No production credentials, database, network authority, ordinary CI runner, or live production system may participate.
