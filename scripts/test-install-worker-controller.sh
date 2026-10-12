@@ -1161,7 +1161,10 @@ unset FAKE_RESTART_AFTER_UP
 [[ $(grep -Fc 'ROLLBACK_RESTORED' "$pre_adapter_upgrade_output" || true) == 1 ]] || fail "pre-adapter upgrade did not emit exactly one restored marker: $(<"$pre_adapter_upgrade_output")"
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager_current" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
-cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
+grep -v -E '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=' "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" >"$tmp/pre-adapter-restored.env"
+cmp -s "$pre_adapter_rendered" "$tmp/pre-adapter-restored.env" || fail 'pre-adapter rollback changed the prior rendered state'
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$(printf '3%.0s' {1..64})" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy rollback did not retain its captured controller ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$(printf '4%.0s' {1..64})" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy rollback did not retain its captured runner ID' 
 pre_adapter_converged=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_converged" || fail 'post-rollback upgrade did not converge to the current engine'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
