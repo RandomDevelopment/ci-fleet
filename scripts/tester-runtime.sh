@@ -509,9 +509,18 @@ fi
 activation_pending=$(root_path /var/lib/ci-fleet-tester/activation-pending)
 if [[ -e $activation_pending || -L $activation_pending ]]; then
   secure_file "$activation_pending" 600
-  if ! [[ ( $action == --check || $action == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "${lock_file%/*}/lifecycle.lock" ]] || ! flock -n 9; then
-    die 'interrupted tester activation requires installer recovery'
+  activation_allowed=false
+  if [[ ( $action == --check || $action == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "${lock_file%/*}/lifecycle.lock" ]] && flock -n 9; then activation_allowed=true; fi
+  read -r _ _ _ phase installer_pid installer_start installer_boot extra <"$activation_pending"
+  if [[ $activation_allowed == false && $phase == probes && $installer_pid =~ ^[1-9][0-9]*$ && -z $extra && ${INVOCATION_ID:-} =~ ^[a-f0-9]{32}$ ]]; then
+    unit=
+    case $action in --health) unit=ci-fleet-tester-health.service ;; --cleanup) unit=ci-fleet-tester-cleanup.service ;; esac
+    if [[ -n $unit && -e /proc/$installer_pid/fd/9 && $(readlink -f /proc/"$installer_pid"/fd/9) == "${lock_file%/*}/lifecycle.lock" && $(awk '{print $22}' /proc/"$installer_pid"/stat 2>/dev/null) == "$installer_start" && $(</proc/sys/kernel/random/boot_id) == "$installer_boot" ]]; then
+      properties=$(systemctl show "$unit" --property=MainPID --property=InvocationID --property=FragmentPath) || properties=
+      if grep -Fxq "MainPID=$$" <<<"$properties" && grep -Fxq "InvocationID=$INVOCATION_ID" <<<"$properties" && grep -Fxq "FragmentPath=$(root_path /etc/systemd/system)/$unit" <<<"$properties"; then activation_allowed=true; fi
+    fi
   fi
+  [[ $activation_allowed == true ]] || { printf 'ERROR: interrupted tester activation requires installer recovery\n' >&2; exit 1; }
 fi
 if [[ $action != --remove && $action != --cleanup ]]; then
   for kind in container network volume; do

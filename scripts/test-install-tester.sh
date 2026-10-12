@@ -30,6 +30,15 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
+if [[ $1 == disable && ${FAKE_TESTER_DISABLE_DANGLING_FAILURE:-0} == 1 ]]; then
+  for unit in "$@"; do
+    [[ ! -L ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/$unit || -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/$unit ]] || exit 77
+  done
+fi
+if [[ $1 == show && " $* " == *' --property=MainPID '* ]]; then
+  printf 'MainPID=%s\nInvocationID=%s\nFragmentPath=%s/etc/systemd/system/%s\n' "${FAKE_TESTER_PROBE_PID:-$PPID}" "${INVOCATION_ID:-}" "${CI_FLEET_ROOT_PREFIX:?}" "$2"
+  exit 0
+fi
 if [[ $1 == list-unit-files || $1 == list-units ]]; then
   if [[ ${FAKE_TESTER_UNIT_INVENTORY_FAIL:-0} == 1 ]]; then printf 'inventory inspection failed\n' >&2; exit "${FAKE_TESTER_UNIT_INVENTORY_FAILURE_CODE:-7}"; fi
   if [[ ${FAKE_TESTER_EMPTY_UNIT_INVENTORY:-0} == 1 ]]; then
@@ -106,7 +115,7 @@ ln -s "$fake_bin/docker" "$uninstall_bin/docker"
 ln -s "$fake_bin/systemctl" "$uninstall_bin/systemctl"
 ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.service"
 ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.timer"
-PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
+FAKE_TESTER_DISABLE_DANGLING_FAILURE=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
 [[ ! -L $root/etc/systemd/system/ci-fleet-tester-health.service && ! -L $root/etc/systemd/system/ci-fleet-tester-health.timer ]] || fail 'uninstall left dangling tester unit symlinks'
 mv "$root/var/run/docker.sock" "$root/var/run/docker.real"
 ln -s docker.real "$root/var/run/docker.sock"
@@ -730,6 +739,10 @@ printf '# fixture drift\n' >>"$root/etc/systemd/system/ci-fleet-tester-health.se
 FAKE_TESTER_SYSTEMCTL_WAIT_READY=$probe_ready FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE=$probe_release \
   "$upgrade_repo/scripts/install-tester.sh" --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$valid_ref" >/dev/null & probe_pid=$!
 while [[ ! -e $probe_ready ]]; do kill -0 "$probe_pid" 2>/dev/null || fail 'maintenance probe fixture exited early'; done
+[[ -f $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'maintenance probes lost the activation journal'
+if "$root/opt/ci-fleet-tester/tester-runtime" --reset --environment preview-a >"$tmp/probe-reset.out" 2>&1; then fail 'direct reset bypassed an active probe journal'; fi
+INVOCATION_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$root/opt/ci-fleet-tester/tester-runtime" --health >/dev/null || fail 'authenticated maintenance probe was blocked'
+if INVOCATION_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa FAKE_TESTER_PROBE_PID=1 "$root/opt/ci-fleet-tester/tester-runtime" --health >"$tmp/probe-spoof.out" 2>&1; then fail 'unrelated PID impersonated a maintenance unit'; fi
 set +e
 timeout 2 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1
 probe_lock_rc=$?

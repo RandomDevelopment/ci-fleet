@@ -20,10 +20,18 @@ fi
 activation_pending=$(root_path /var/lib/ci-fleet-tester/activation-pending)
 if [[ -e $activation_pending || -L $activation_pending ]]; then
   [[ -f $activation_pending && ! -L $activation_pending && $(stat -c '%u:%a' "$activation_pending") == "$expected_uid:600" ]] || { printf 'ERROR: tester activation journal is unsafe\n' >&2; exit 1; }
-  if ! [[ $# == 1 && ( $1 == --check || $1 == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "$lock_dir/lifecycle.lock" ]] || ! flock -n 9; then
-    printf 'ERROR: interrupted tester activation requires installer recovery\n' >&2
-    exit 1
+  activation_allowed=false
+  if [[ $# == 1 && ( $1 == --check || $1 == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "$lock_dir/lifecycle.lock" ]] && flock -n 9; then activation_allowed=true; fi
+  read -r _ _ _ phase installer_pid installer_start installer_boot extra <"$activation_pending"
+  if [[ $activation_allowed == false && $phase == probes && $installer_pid =~ ^[1-9][0-9]*$ && -z $extra && ${INVOCATION_ID:-} =~ ^[a-f0-9]{32}$ ]]; then
+    unit=
+    case $1 in --health) unit=ci-fleet-tester-health.service ;; --cleanup) unit=ci-fleet-tester-cleanup.service ;; esac
+    if [[ -n $unit && -e /proc/$installer_pid/fd/9 && $(readlink -f /proc/"$installer_pid"/fd/9) == "$lock_dir/lifecycle.lock" && $(awk '{print $22}' /proc/"$installer_pid"/stat 2>/dev/null) == "$installer_start" && $(</proc/sys/kernel/random/boot_id) == "$installer_boot" ]]; then
+      properties=$(systemctl show "$unit" --property=MainPID --property=InvocationID --property=FragmentPath) || properties=
+      if grep -Fxq "MainPID=$$" <<<"$properties" && grep -Fxq "InvocationID=$INVOCATION_ID" <<<"$properties" && grep -Fxq "FragmentPath=$(root_path /etc/systemd/system)/$unit" <<<"$properties"; then activation_allowed=true; fi
+    fi
   fi
+  [[ $activation_allowed == true ]] || { printf 'ERROR: interrupted tester activation requires installer recovery\n' >&2; exit 1; }
 fi
 target=$(readlink -f "$current_link")
 revision=$(basename "$target")

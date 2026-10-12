@@ -35,7 +35,7 @@ case $action in
   --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat sync systemctl tar wc' ;;
   --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir python3 readlink sha256sum stat systemctl' ;;
   --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
-  --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat sync systemctl' ;;
+  --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat sync systemctl awk' ;;
   --uninstall) required_commands='bash chmod dirname docker env find flock grep install mkdir rm stat systemctl' ;;
 esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
@@ -269,8 +269,17 @@ start_maintenance() {
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  local unit load_state present_units=() present_timers=() present_services=()
+  local unit directory load_state present_units=() present_timers=() present_services=()
   for unit in "${units[@]}"; do
+    if [[ -L $systemd_dir/$unit && ! -e $systemd_dir/$unit ]]; then
+      load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+      [[ $load_state == not-found || $load_state == loaded ]] || return 1
+      if [[ $load_state == loaded ]]; then systemctl stop "$unit" >/dev/null 2>&1 || return 1; fi
+      rm -f -- "$systemd_dir/$unit" || return 1
+      for directory in timers.target.wants multi-user.target.wants; do
+        [[ ! -L $systemd_dir/$directory/$unit ]] || rm -f -- "$systemd_dir/$directory/$unit" || return 1
+      done
+    fi
     [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
   for unit in "${timers[@]}"; do
@@ -320,14 +329,14 @@ retire_activation() {
 }
 
 recover_activation() {
-  local previous candidate record_previous extra
+  local previous candidate record_previous phase pid started boot extra
   for command in basename ln mv sha256sum sync; do command -v "$command" >/dev/null || die "activation recovery requires $command"; done
   secure_dir "$state_root" 700
   secure_dir "$opt_dir" 755
   secure_dir "$release_dir" 755
   secure_file "$activation_pending" 600
-  read -r previous candidate record_previous extra <"$activation_pending"
-  [[ ( $previous == none || $previous =~ ^[0-9a-f]{40}$ ) && $candidate =~ ^[0-9a-f]{40}$ && $record_previous =~ ^[01]$ && -z $extra ]] || die 'activation journal is invalid'
+  read -r previous candidate record_previous phase pid started boot extra <"$activation_pending"
+  [[ ( $previous == none || $previous =~ ^[0-9a-f]{40}$ ) && $candidate =~ ^[0-9a-f]{40}$ && $record_previous =~ ^[01]$ && $phase =~ ^(validate|probes)$ && $pid =~ ^[1-9][0-9]*$ && $started =~ ^[0-9]+$ && $boot =~ ^[a-f0-9-]{36}$ && -z $extra ]] || die 'activation journal is invalid'
   reject_other_roles
   reject_unit_dropins
   reject_tmpfiles_overrides
@@ -345,9 +354,14 @@ recover_activation() {
 }
 
 write_activation_journal() {
-  [[ ! -e $activation_pending && ! -L $activation_pending ]] || die 'outstanding activation requires recovery'
+  local previous candidate record_previous phase pid started boot extra
+  if [[ -e $activation_pending || -L $activation_pending ]]; then
+    secure_file "$activation_pending" 600
+    read -r previous candidate record_previous phase pid started boot extra <"$activation_pending"
+    [[ ${4:-validate} == probes && $phase == validate && $previous == "${1:-none}" && $candidate == "$2" && $record_previous == "$3" && $pid == "$$" && -z $extra ]] || die 'outstanding activation requires recovery'
+  fi
   [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
-  printf '%s %s %s\n' "${1:-none}" "$2" "$3" >"$activation_pending.new"
+  printf '%s %s %s %s %s %s %s\n' "${1:-none}" "$2" "$3" "${4:-validate}" "$$" "$(awk '{print $22}' /proc/$$/stat)" "$(</proc/sys/kernel/random/boot_id)" >"$activation_pending.new"
   chmod 0600 "$activation_pending.new"
   sync -f "$activation_pending.new" || die 'activation journal is not durable'
   mv -Tf "$activation_pending.new" "$activation_pending"
@@ -389,12 +403,12 @@ activate_release() {
     recover_activation
     die 'candidate timer activation failed; incumbent restored'
   fi
-  retire_activation || die 'completed activation journal retirement failed'
+  write_activation_journal "$previous" "$commit" "$record_previous" probes
   if ! start_maintenance; then
-    write_activation_journal "$previous" "$commit" "$record_previous"
     recover_activation
     die 'candidate maintenance probes failed; incumbent restored'
   fi
+  retire_activation || die 'completed activation journal retirement failed'
   report "INSTALL_OK source_revision=$commit previous_revision=${previous:-none} config=$config"
 }
 
