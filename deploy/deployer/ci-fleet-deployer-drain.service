@@ -4,6 +4,8 @@ Description=Drain the ci-fleet deployer before maintenance
 [Service]
 Type=oneshot
 User=root
+# Recreate the boot-volatile lock outside the read-only service namespace.
+ExecStartPre=+/usr/bin/mkdir -p -m 0700 /var/lock/ci-fleet-deployer
 ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh drain
 Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
 TimeoutStartSec=2min
