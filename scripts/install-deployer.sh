@@ -42,7 +42,7 @@ restore_transaction_backup() {
   install -d -m 0700 "$transaction_dir" "$transaction_dir/units" "$transaction_dir/state" "$transaction_dir/deployed" "$transaction_dir/retained" "$transaction_dir/log" "$transaction_dir/log/consumed-requests" "$transaction_dir/commit" || return
   while IFS='|' read -r relative encoded; do
     [[ -n "$relative" ]] || continue
-    [[ "$relative" =~ ^(units|state|deployed|retained|log)/[A-Za-z0-9._-]+$ || "$relative" =~ ^log/consumed-requests/[0-9a-f]{64}$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$relative" =~ ^(units|state|deployed|retained|log)/[A-Za-z0-9._-]+$ || "$relative" =~ ^log/consumed-requests/(approval-)?[0-9a-f]{64}$ || "$relative" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
     destination=$transaction_dir/$relative
     printf '%s' "$encoded" | base64 -d >"$destination" || return
     chmod 0600 "$destination" || return
@@ -156,15 +156,16 @@ PY
   else
     printf no; return
   fi
-  local rollback_scope rollback_environment rollback_release
+  local rollback_scope rollback_environment rollback_target rollback_release
   rollback_scope=$(awk '$0 ~ /^CREDENTIAL_SCOPE=/ {sub(/^CREDENTIAL_SCOPE=/, ""); print}' "$previous_policy")
   rollback_environment=$(awk '$0 ~ /^ENVIRONMENT=/ {sub(/^ENVIRONMENT=/, ""); print}' "$previous_policy")
+  rollback_target=$(awk '$0 ~ /^TARGET_ID=/ {sub(/^TARGET_ID=/, ""); print}' "$previous_policy")
   [[ $rollback_scope == "$rollback_environment" ]] || { printf no; return; }
   rollback_release=$(awk '$0 ~ /^CORE_REF=/ {sub(/^CORE_REF=/, ""); print}' "$previous_policy")
   [[ $rollback_release =~ ^[0-9a-f]{40}$ ]] || { printf no; return; }
   release_complete "$releases/$rollback_release" 2>/dev/null || { printf no; return; }
   # Rollback requires a completed deployment; mirror the perform_rollback gate.
-  (validating_rollback_marker=1; validate_completed_request "$state_root/last-request.conf") >/dev/null 2>&1 || { printf no; return; }
+  (validating_rollback_marker=1; validate_completed_request "$state_root/last-request.conf" "$rollback_environment" "$rollback_target") >/dev/null 2>&1 || { printf no; return; }
   printf yes
 }
 die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
@@ -286,13 +287,14 @@ parse_file() {
 }
 
 validate_completed_request() {
-  local path=$1 key
+  local path=$1 expected_environment=$2 expected_target=$3 key
   local -A completed=()
   secure_file "$path" 'completed deployment request'
   parse_file "$path" completed 'completed deployment request' "$request_keys"
   for key in $request_keys; do [[ -v "completed[$key]" ]] || block "completed deployment request is missing $key"; done
   [[ ${completed[SCHEMA_VERSION]} == 1 ]] || block 'completed deployment request has an unsupported schema version'
   [[ ${completed[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${completed[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'completed deployment request has an invalid target identity'
+  [[ ${completed[ENVIRONMENT]} == "$expected_environment" && ${completed[TARGET_ID]} == "$expected_target" ]] || block 'completed deployment request does not match the rollback target'
   [[ ${completed[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ && ${completed[ARTIFACT_IMAGE]} =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || block 'completed deployment request is not immutable and qualified'
   for key in APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID; do [[ ${completed[$key]} =~ ^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$ ]] || block "completed deployment request has an unsafe $key"; done
   valid_utc "${completed[APPROVED_AT]}" || block 'completed deployment request has an invalid approval time'
@@ -480,7 +482,7 @@ reject_other_role_state() {
   for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'tester host state is present'
   done
-  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)"; do
+  for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'status receiver state is present'
   done
   for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
@@ -765,7 +767,7 @@ begin_transaction() {
     secure_directory "$log_root/consumed-requests" 700 0 || block 'consumed request ledger is unsafe'
     for path in "$log_root/consumed-requests"/*; do
       [[ -e "$path" || -L "$path" ]] || continue
-      [[ ${path##*/} =~ ^[0-9a-f]{64}$ ]] || block 'consumed request identity is unsafe'
+      [[ ${path##*/} =~ ^(approval-)?[0-9a-f]{64}$ ]] || block 'consumed request identity is unsafe'
       secure_file "$path" 'consumed request marker'
       [[ ! -s "$path" ]] || block 'consumed request marker must be empty'
       install -m 0600 "$path" "$transaction_dir/log/consumed-requests/${path##*/}"
@@ -918,7 +920,7 @@ restore_transaction() {
     if [[ -e "$transaction_dir/log/audit.log" || -L "$transaction_dir/log/audit.log" ]]; then secure_file "$transaction_dir/log/audit.log" 'transaction audit backup' || return; fi
     for backed_up in "$transaction_dir/log/consumed-requests"/*; do
       [[ -e "$backed_up" || -L "$backed_up" ]] || continue
-      [[ ${backed_up##*/} =~ ^[0-9a-f]{64}$ ]] || block 'transaction consumed request identity is unsafe'
+      [[ ${backed_up##*/} =~ ^(approval-)?[0-9a-f]{64}$ ]] || block 'transaction consumed request identity is unsafe'
       secure_file "$backed_up" 'transaction consumed request backup' || return
       [[ ! -s "$backed_up" ]] || block 'transaction consumed request backup must be empty'
     done
@@ -1543,7 +1545,7 @@ PY
   # was never deployed; rollback is meaningful only after a deployment has
   # completed (the runtime records last-request.conf on success).
   [[ -e "$state_root/last-request.conf" || -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
-  validate_completed_request "$state_root/last-request.conf"
+  validate_completed_request "$state_root/last-request.conf" "$environment" "$target"
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role

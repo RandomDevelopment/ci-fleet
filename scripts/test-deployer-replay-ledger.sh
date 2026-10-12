@@ -12,8 +12,8 @@ source "$tmp/functions.sh"
 expected_uid=$(id -u)
 log_root=$tmp/log
 consumed_root=$log_root/consumed-requests
-prior_id=$(printf prior | sha256sum | cut -d' ' -f1)
-missing_id=$(printf missing | sha256sum | cut -d' ' -f1)
+prior_id=approval-$(printf prior | sha256sum | cut -d' ' -f1)
+missing_id=approval-$(printf missing | sha256sum | cut -d' ' -f1)
 extra_id=$(printf injected | sha256sum | cut -d' ' -f1)
 # The sourced runtime function reads this array.
 # shellcheck disable=SC2034
