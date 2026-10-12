@@ -113,3 +113,38 @@ Status: open acceptance finding for issue #22 and draft PR #69. No host activati
 The existing deployer model uses reviewed root adapters on an isolated Docker host. A read-only systemd mount namespace blocks direct adapter writes to core files and journals, but the daemon remains root-equivalent and can bind-mount those paths for the adapter. Capability removal does not constrain that daemon-mediated access. The current implementation therefore does not prove recovery-state containment against an adapter using the Docker API. Deployment adapters additionally inherit direct write access to the deploy service's state/log roots. Their recovery copies live in process memory, so SIGKILL and host power loss can lose adapter-mutated records before EXIT restoration.
 
 Risks include deletion or falsification of recovery journals, activation state, replay protection, and audit history through direct deployment-adapter writes or daemon-mounted host paths. Keep PR #69 draft and retain both findings until a reviewed read-only deployment-adapter boundary with durable recovery and a constrained daemon/API boundary or daemon-inaccessible recovery store pass adversarial prepared-host verification, or an explicit acceptance decision establishes the trusted-root-adapter model, both failure limits, and the checkpoint recovery procedure. Any accepted exception must record its risks and removal criteria. Production remains separately gated.
+
+## Authenticate the bootstrap callback through SSH
+
+The GitHub bootstrap portal uses an operator-owned Unix socket and an
+authenticated SSH local forward. A plain loopback listener would let other
+target-host users read its nonce and consume its one-shot callback. The nonce
+now remains in a root-private file and the socket permits only the explicitly
+trusted operator UID. Registration URLs and printed socket paths contain no
+authentication value. Temporary portal directories disappear when bootstrap
+exits. No target-host TCP listener or firewall rule is needed.
+
+The management device and its SSH account remain trusted. A forward on a shared
+device exposes the portal to that device's other users. This choice requires an
+SSH client with Unix-socket forwarding and one extra terminal session, including
+when the management device is a phone. Root-console users must select the
+trusted SSH account's UID. Live phone acceptance remains tracked in issue #27.
+Replace this transport only after an equally authenticated portal has proved
+nonce confidentiality, one-shot behavior, and cleanup without credential
+transport through chat or process arguments.
+
+## Confirm App visibility in GitHub's owner UI
+
+GitHub's documented [`GET /app` response](https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app)
+has no App visibility field. Bootstrap requests `public: false` in the manifest
+and requires the owner to confirm **Only on this account** before creation or
+installation. It verifies the API-supported ownership, permission, and selected
+repository fields and rejects an explicitly public response if GitHub reports
+one. Missing visibility is never described as machine-verified private status.
+
+An owner can broaden App distribution in GitHub outside this workflow. That
+could permit installations in additional accounts and expand the effect of a
+leaked private key. Live setup and periodic owner checks must retain private
+distribution. Issue #27 includes live acceptance of this requirement. Replace
+this manual check when GitHub exposes a supported, authoritative visibility
+field that bootstrap can verify without browser credentials.
