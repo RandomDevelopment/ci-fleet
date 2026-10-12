@@ -35,6 +35,34 @@ printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" \
   "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence"
 
+# Exercise the actual EXIT handler with a failed final sync and pending statuses.
+cleanup_script=$tmp/cleanup-exit.sh
+{
+  printf 'set -Eeuo pipefail\n'
+  sed -n '/^deploy_exit() {/,/^}/p' "$runtime"
+  cat <<'EOF'
+state_root=$1/exit-state
+log_root=$1/exit-log
+active=$state_root/active-operation
+expected_uid=$(id -u)
+mkdir -p -m 0700 "$state_root"
+restore_rollback_pair() { return 0; }
+sync_failure=$3
+sync() { [[ $sync_failure == 0 ]]; }
+trap deploy_exit EXIT
+exit "$2"
+EOF
+} >"$cleanup_script"
+for pending_status in 0 42; do
+  for sync_failure in 0 1; do
+    cleanup_status=0
+    bash "$cleanup_script" "$tmp" "$pending_status" "$sync_failure" || cleanup_status=$?
+    expected_status=$pending_status
+    if [[ $sync_failure == 1 ]]; then expected_status=1; fi
+    [[ $cleanup_status == "$expected_status" ]] || fail 'deployment EXIT handler lost its computed status'
+  done
+done
+
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
@@ -934,6 +962,34 @@ p=Path(sys.argv[1]); p.write_text(p.read_text().replace('APPROVAL_ID=approval-20
 PY
 expect_success "$installer" --upgrade --config "$config" >/dev/null
 grep -Fq 'sha256:aaaaaaaa' "$root/var/lib/ci-fleet-deployer/last-known-good.json" || fail 'second undeployed upgrade replaced the deployed rollback point'
+
+# A retained snapshot may name an older core, but that core must remain usable.
+retained_core=$(printf retained-core-fixture | sha1sum | cut -d' ' -f1)
+retained_release=$root/opt/ci-fleet-deployer/releases/$retained_core
+cp -a "$root/opt/ci-fleet-deployer/releases/$core_ref" "$retained_release"
+install -m 0600 "$deployed_current/policy.conf" "$tmp/retained-policy.saved"
+install -m 0600 "$deployed_current/state.json" "$tmp/retained-state.saved"
+python3 - "$deployed_current/policy.conf" "$deployed_current/state.json" "$retained_core" <<'PY'
+import json, pathlib, re, sys
+policy, state = map(pathlib.Path, sys.argv[1:3])
+policy.write_text(re.sub(r'^CORE_REF=.*$', 'CORE_REF=' + sys.argv[3], policy.read_text(), flags=re.M))
+value = json.loads(state.read_text()); value['core_ref'] = sys.argv[3]
+state.write_text(json.dumps(value) + '\n')
+PY
+expect_success "$installer" --check --config "$config" >/dev/null
+retained_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json")
+retained_pointer_before=$(readlink "$root/opt/ci-fleet-deployer/current")
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+mv "$retained_release" "$tmp/retained-release.saved"
+expect_failure 'deployed rollback core release is incomplete' "$installer" --upgrade --config "$config" >/dev/null
+mv "$tmp/retained-release.saved" "$retained_release"
+printf '# corrupted retained core\n' >>"$retained_release/scripts/deployer-runtime.sh"
+expect_failure 'deployed rollback core release is incomplete' "$installer" --upgrade --config "$config" >/dev/null
+[[ $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$retained_state_before" && $(readlink "$root/opt/ci-fleet-deployer/current") == "$retained_pointer_before" ]] || fail 'unusable retained core changed installed state'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'unusable retained core reached the adapter'
+install -m 0600 "$tmp/retained-policy.saved" "$deployed_current/policy.conf"
+install -m 0600 "$tmp/retained-state.saved" "$deployed_current/state.json"
+rm -rf "$retained_release"
 
 # Failed active-policy health checks must not accumulate policy-check snapshots.
 compgen -G "$root/var/lib/ci-fleet-deployer/.policy-check.*" >/dev/null && fail 'policy-check snapshot leaked before drifted-health regression'
@@ -2009,6 +2065,30 @@ expect_failure 'deployed snapshot pointer target is not canonical' "$runtime" de
 [[ ! -e "$active" ]] || fail 'rejected deployment left the active operation marker'
 rm "$deployed_current"
 ln -s "$deployed_target" "$deployed_current"
+install -m 0600 "$deployed_current/state.json" "$tmp/runtime-deployed-state.saved"
+install -m 0600 "$deployed_current/policy.conf" "$tmp/runtime-deployed-policy.saved"
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+consumption_before=$(find "$ledger" -type f -printf '%f\n' | sort)
+for invalid_state in 'invalid-json' '[]' 'target-mismatch' 'foreign-target'; do
+  install -m 0600 "$tmp/runtime-deployed-state.saved" "$deployed_current/state.json"
+  install -m 0600 "$tmp/runtime-deployed-policy.saved" "$deployed_current/policy.conf"
+  python3 - "$deployed_current/state.json" "$deployed_current/policy.conf" "$invalid_state" <<'PY'
+import json, pathlib, sys
+state, policy = map(pathlib.Path, sys.argv[1:3])
+if sys.argv[3] in ('invalid-json', '[]'):
+    state.write_text(sys.argv[3] + '\n')
+else:
+    value = json.loads(state.read_text()); value['target'] = 'other-target'
+    state.write_text(json.dumps(value) + '\n')
+    if sys.argv[3] == 'foreign-target':
+        policy.write_text(policy.read_text().replace('TARGET_ID=example-staging', 'TARGET_ID=other-target'))
+PY
+  expect_failure 'deployed rollback snapshot state and policy do not cross-validate' "$runtime" deploy >/dev/null
+  [[ $(find "$ledger" -type f -printf '%f\n' | sort) == "$consumption_before" ]] || fail 'invalid rollback snapshot consumed an approval'
+  [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && ! -e $active ]] || fail 'invalid rollback snapshot reached the adapter'
+done
+install -m 0600 "$tmp/runtime-deployed-state.saved" "$deployed_current/state.json"
+install -m 0600 "$tmp/runtime-deployed-policy.saved" "$deployed_current/policy.conf"
 chmod 0644 "$credential"
 deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null

@@ -236,7 +236,8 @@ deploy_exit() {
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
   fi
   if [[ -n ${snapshot_pointer:-} && $snapshot_pointer != "$deployed_current" ]]; then rm -f "$snapshot_pointer"; fi
-  return "$status"
+  trap - EXIT
+  exit "$status"
 }
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)
@@ -580,7 +581,26 @@ PY
     # fully usable first, or the change proceeds with no way back.
     declare -A deployed_policy=()
     parse_file "$deployed_snapshot/policy.conf" deployed_policy 'deployed rollback policy' "$config_keys"
-    for key in ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT TARGET_ID; do [[ -v "deployed_policy[$key]" ]] || die "deployed rollback policy is missing $key"; done
+    for key in SCHEMA_VERSION CORE_REF SOURCE_COMMIT ARTIFACT_IMAGE DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT TARGET_ID; do [[ -v "deployed_policy[$key]" ]] || die "deployed rollback policy is missing $key"; done
+    python3 - "$deployed_snapshot/state.json" "${deployed_policy[SCHEMA_VERSION]}" \
+      "${deployed_policy[CORE_REF]}" "${deployed_policy[ENVIRONMENT]}" "${deployed_policy[TARGET_ID]}" \
+      "${deployed_policy[DEPLOYER_IDENTITY]}" "${deployed_policy[SOURCE_COMMIT]}" "${deployed_policy[ARTIFACT_IMAGE]}" \
+      "${cfg[ENVIRONMENT]}" "${cfg[TARGET_ID]}" "${cfg[DEPLOYER_IDENTITY]}" <<'PY' >/dev/null 2>&1 || die 'deployed rollback snapshot state and policy do not cross-validate'
+import json, re, sys
+try:
+    state = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    raise SystemExit(1)
+keys = ('core_ref', 'environment', 'target', 'deployer_identity', 'source_commit', 'artifact')
+policy = dict(zip(keys, sys.argv[3:9]))
+ok = (sys.argv[2] == '1' and isinstance(state, dict)
+      and all(state.get(key) == value for key, value in policy.items())
+      and [policy[key] for key in ('environment', 'target', 'deployer_identity')] == sys.argv[9:12]
+      and bool(re.fullmatch(r'[0-9a-f]{40}', policy['core_ref']))
+      and bool(re.fullmatch(r'[0-9a-f]{40}', policy['source_commit']))
+      and bool(re.fullmatch(r'[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}', policy['artifact'])))
+raise SystemExit(0 if ok else 1)
+PY
     inside "${deployed_policy[ADAPTER_PATH]}" "$deployer_etc/adapters" || die 'deployed rollback adapter is outside the protected adapter directory'
     [[ ! -L "${deployed_policy[ADAPTER_PATH]}" && -f "${deployed_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${deployed_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'deployed rollback adapter is missing or unsafe'
     [[ $(sha256sum "${deployed_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${deployed_policy[ADAPTER_SHA256]}" ]] || die 'deployed rollback adapter digest does not match its snapshot policy'
