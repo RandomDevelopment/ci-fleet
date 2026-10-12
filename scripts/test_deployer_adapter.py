@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -148,6 +149,51 @@ class Containment(unittest.TestCase):
                 adapter.protected_file(link, os.getuid())
             with self.assertRaises(ValueError):
                 adapter.trusted_directory(Path(directory), os.getuid(), 0o700)
+
+    def test_recovery_survives_dispatch_failure(self):
+        # The production directory check is separate; this fixture has a /tmp parent.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / '.adapter-recovery'
+            runtime = root / 'runtime'
+            store.mkdir(mode=0o700)
+            runtime.mkdir(mode=0o711)
+            source = root / 'adapter'
+            source.write_bytes(b'#!/bin/sh\nexit 0\n')
+            source.chmod(0o700)
+            credential = root / 'application'
+            adapter.durable_file(credential, b'fixture-only')
+            values = dict(self.values, CREDENTIAL_PROVIDER='file', CREDENTIAL_REF=str(credential),
+                          ADAPTER_SHA256=adapter.hashlib.sha256(source.read_bytes()).hexdigest(), DOCKER_SOCKET='/run/rootless/docker.sock')
+            policy = root / 'policy'
+            adapter.durable_file(policy, ''.join(f'{k}={v}\n' for k, v in values.items()).encode())
+            adapter.durable_file(root / 'install-state.json', b'{"fixture":"incumbent"}')
+            deployed = root / 'deployed'
+            snapshot = deployed / '.snapshot.fixture'
+            snapshot.mkdir(parents=True, mode=0o700)
+            adapter.durable_file(snapshot / 'state.json', b'{"fixture":"deployed"}')
+            adapter.durable_file(snapshot / 'policy.conf', b'FIXTURE=deployed\n')
+            (deployed / 'current').symlink_to(snapshot.name)
+            args = SimpleNamespace(policy=policy, adapter=source, store=store, runtime=runtime,
+                                   unit='ci-fleet-deployer-adapter-1-2.service', seconds=120, request=None,
+                                   marker=None, operation='deploy')
+            backend = SimpleNamespace(uid=os.getuid(), path='/run/rootless/docker.sock')
+            with patch.object(adapter, 'Backend', return_value=backend), patch.object(adapter, 'trusted_directory'), \
+                 patch.object(adapter.subprocess, 'run', side_effect=OSError('interrupted dispatcher')):
+                with self.assertRaises(OSError):
+                    adapter.run_adapter(args)
+            journal = store / args.unit
+            self.assertEqual(json.loads((journal / 'status.json').read_text())['status'], 'inflight')
+            self.assertEqual((journal / 'install-state.json').read_bytes(), b'{"fixture":"incumbent"}')
+            self.assertEqual((journal / 'deployed/state.json').read_bytes(), b'{"fixture":"deployed"}')
+            self.assertFalse(any('credential-' in path.name for path in runtime.iterdir()))
+            self.assertFalse(any(path.name == 'application' for path in journal.rglob('*')))
+
+    def test_unsafe_systemd_path_is_rejected(self):
+        with self.assertRaises(ValueError):
+            adapter.sandbox_command('ci-fleet-deployer-adapter-1-2.service', 120, Path('/run/proxy'),
+                                    Path('/policy%h'), Path('/adapter'), Path('/credential'), Path('/helper'),
+                                    None, False, 'health', '/run/rootless/socket', '/credential-copy')
 
     def test_duplicate_json(self):
         with self.assertRaises(ValueError):

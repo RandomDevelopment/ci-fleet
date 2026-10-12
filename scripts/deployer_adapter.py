@@ -243,6 +243,9 @@ class Policy:
                 and host.get("CgroupnsMode") == "private", "shared host namespaces are forbidden")
         require(all(type(host.get(k)) is int and 0 < host[k] <= limit for k, limit in CONTAINER_LIMITS.items()),
                 "memory, CPU and PID limits must fit the reviewed containment ceilings")
+        swap = host.get("MemorySwap", 0)
+        require(type(swap) is int and (swap == 0 or host["Memory"] <= swap <= 2 * host["Memory"]), "unbounded swap is forbidden")
+        require(not host.get("Tmpfs"), "unbounded tmpfs is forbidden; use scoped volumes")
         network = self.owned("networks", host.get("NetworkMode", ""))
         require(network.get("Driver") == "bridge" and network.get("Internal") is True,
                 "a scoped internal bridge is required")
