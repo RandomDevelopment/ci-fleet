@@ -52,6 +52,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
     "CI_FLEET_LABELS",
     "CI_FLEET_MAX_RUNNERS",
     "CI_FLEET_MIN_RUNNERS",
+    "CI_FLEET_POOL",
     "CI_FLEET_RUNNER_CPUS",
     "CI_FLEET_RUNNER_GROUP",
     "CI_FLEET_RUNNER_IMAGE",
@@ -63,6 +64,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
 }
 REQUIRED_STATUS_CAPABILITY = "required_status_reporting"
 STATUS_REPORTING_CONFIG_CAPABILITY = "status_reporting_config"
+CAPACITY_TELEMETRY_CAPABILITY = "capacity_telemetry"
 DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY = "docker_network_policy_config"
 DOCKER_NETWORK_POLICY_ADAPTER_CAPABILITY = "docker_network_policy_adapter"
 DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY = "docker_default_bridge_cidr_config"
@@ -484,6 +486,9 @@ def build_rendered_env(
     if images is not None:
         rendered["CI_FLEET_CONTROLLER_IMAGE_DIGEST"] = images["controller"]
         rendered["CI_FLEET_RUNNER_IMAGE_DIGEST"] = images["runner"]
+
+    if CAPACITY_TELEMETRY_CAPABILITY in (engine_capabilities or set()):
+        rendered["CI_FLEET_POOL"] = controller["pool"]
     if network_policy_configured:
         rendered["CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT"] = str(len(parsed_pools))
         rendered["CI_FLEET_DOCKER_NETWORKS_PER_RUNNER"] = str(networks_per_runner)
@@ -610,6 +615,8 @@ def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
         raise DesiredStateError("selected engine does not support status reporting configuration")
     if args.require_status_reporting and REQUIRED_STATUS_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not advertise required status reporting")
+    if args.require_capacity_telemetry and CAPACITY_TELEMETRY_CAPABILITY not in capabilities:
+        raise DesiredStateError("selected engine does not advertise capacity telemetry")
     print("ENGINE_CAPABILITIES_OK")
 
 
@@ -649,6 +656,7 @@ def parse_args() -> argparse.Namespace:
     capabilities.add_argument("--require-docker-default-bridge-cidr-config", action="store_true")
     capabilities.add_argument("--require-status-reporting-config", action="store_true")
     capabilities.add_argument("--require-status-reporting", action="store_true")
+    capabilities.add_argument("--require-capacity-telemetry", action="store_true")
     capabilities.add_argument("--require-configuration-approval", action="store_true")
     capabilities.set_defaults(function=command_validate_engine_capabilities)
     return parser.parse_args()
