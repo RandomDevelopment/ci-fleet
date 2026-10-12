@@ -33,6 +33,23 @@ state=${FAKE_DOCKER_STATE:?}
 status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
 stopped_state=${FAKE_STOPPED_CONTROLLER_STATE:-}
+image_paths() {
+  if [[ $image == "${FAKE_RUNNER_IMAGE:-}" || $image == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
+    image_kind=runner
+    image_state=${FAKE_RUNNER_IMAGE_STATE:-}
+    image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
+  elif [[ $image == "${FAKE_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
+    image_kind=controller
+    image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
+    image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
+  else
+    return 1
+  fi
+  if [[ -n ${FAKE_PRIOR_IMAGE_STATES:-} && $image != "${FAKE_RUNNER_IMAGE:-}" && $image != "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
+    image_state=$FAKE_PRIOR_IMAGE_STATES/$image_kind-state
+    image_id_state=$FAKE_PRIOR_IMAGE_STATES/$image_kind-id
+  fi
+}
 if [[ -n ${FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT:-} ]]; then
   expected_socket=${CI_FLEET_ROOT_PREFIX:-}/var/run/docker.sock
   [[ ${DOCKER_HOST:-} == "unix://$expected_socket" ]] || {
@@ -54,8 +71,14 @@ case "${1:-}" in
       create|rm) ;;
       build)
         [[ "$*" == *'--build-arg SOURCE_DATE_EPOCH=1786752000'* ]] || exit 94
+        [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'build|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"
         [[ -z "${FAKE_FAIL_BUILD:-}" ]] || exit 46
         if [[ "$*" == *ci-fleet-runner:* ]]; then
+          if [[ -n "${FAKE_PARTIAL_BUILD_FAIL:-}" ]]; then
+            printf '%s\n' "${FAKE_PARTIAL_RUNNER_IMAGE_ID:?}" >>"${FAKE_AVAILABLE_IMAGE_IDS:?}"
+            printf '%s\n' "$FAKE_PARTIAL_RUNNER_IMAGE_ID" >"${FAKE_RUNNER_IMAGE_ID_STATE:?}"
+            exit 46
+          fi
           printf '%s\n' "$CI_FLEET_ENGINE_REF" >"${FAKE_RUNNER_IMAGE_STATE:?}"
           printf '%s\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST" >"${FAKE_RUNNER_IMAGE_ID_STATE:?}"
           [[ -z "${FAKE_AVAILABLE_IMAGE_IDS:-}" ]] || printf '%s\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST" >>"$FAKE_AVAILABLE_IMAGE_IDS"
@@ -66,6 +89,7 @@ case "${1:-}" in
         else
           exit 1
         fi
+        [[ -z "${FAKE_DISK_USED_PERCENT_AFTER_BUILD:-}" || -z "${FAKE_DISK_USED_PERCENT_FILE:-}" ]] || printf '%s\n' "$FAKE_DISK_USED_PERCENT_AFTER_BUILD" >"$FAKE_DISK_USED_PERCENT_FILE"
         ;;
       *) exit 1 ;;
     esac
@@ -116,15 +140,7 @@ case "${1:-}" in
       inspect)
         image=${!#}
         [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$image" >>"$FAKE_IMAGE_INSPECT_LOG"
-        if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
-          image_state=${FAKE_RUNNER_IMAGE_STATE:-}
-          image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
-        elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
-          image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
-          image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
-        else
-          exit 1
-        fi
+        image_paths || exit 1
         if [[ "$*" == *'{{.Id}}'* ]]; then
           if [[ ! -f "$image_id_state" ]]; then
             [[ -z ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} ]] || : >"$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
@@ -140,13 +156,7 @@ case "${1:-}" in
         image=${4:-}
         [[ -n "${FAKE_AVAILABLE_IMAGE_IDS:-}" && -f "$FAKE_AVAILABLE_IMAGE_IDS" ]] || exit 1
         grep -Fxq "$image_id" "$FAKE_AVAILABLE_IMAGE_IDS" || exit 1
-        if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
-          image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
-        elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
-          image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
-        else
-          exit 1
-        fi
+        image_paths || exit 1
         printf '%s\n' "$image_id" >"$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-tag|%s|%s\n' "$image_id" "$image" >>"$FAKE_COMPOSE_LOG"
         ;;
@@ -156,17 +166,7 @@ case "${1:-}" in
         for argument in "${@:3}"; do
           [[ "$argument" != -f && "$argument" != --force ]] || force=true
         done
-        if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
-          image_kind=runner
-          image_state=${FAKE_RUNNER_IMAGE_STATE:-}
-          image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
-        elif [[ "$image" == "${FAKE_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || "$image" == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
-          image_kind=controller
-          image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
-          image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
-        else
-          exit 1
-        fi
+        image_paths || exit 1
         if [[ "$image_kind" == runner && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
           [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
           exit 48
@@ -2541,11 +2541,17 @@ unset FAKE_COMPOSE_LOG FAKE_SYSTEMCTL_LOG FAKE_MV_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_PREBUILD_CURRENT_VALIDATION:-0} != 1 ]] || { printf 'PREBUILD_CURRENT_VALIDATION_REGRESSION_OK\n'; exit 0; }
 build_failure_output=$tmp/build-failure.out
 build_failure_root=$tmp/build-failure-root
+export FAKE_PRIOR_IMAGE_STATES=$tmp/prior-image-states
+mkdir "$FAKE_PRIOR_IMAGE_STATES"
+cp "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
+rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE"
 cp -a "$root" "$build_failure_root"
 export FAKE_COMPOSE_LOG=$tmp/stopped-distinct-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
 printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$build_failure_output" 2>&1; then
   fail 'candidate build failure unexpectedly succeeded'
@@ -2561,7 +2567,6 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 same_controller_output=$tmp/same-controller-build.out
 export FAKE_COMPOSE_LOG=$tmp/same-controller-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$same_controller_output" 2>&1; then
   fail 'same-controller-tag build failure unexpectedly succeeded'
@@ -2580,7 +2585,6 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 empty_live_image_output=$tmp/empty-live-image-build.out
 export FAKE_COMPOSE_LOG=$tmp/empty-live-image-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$empty_live_image_output" 2>&1; then
   fail 'empty-live-image candidate build failure unexpectedly succeeded'
@@ -2602,7 +2606,6 @@ python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path
 live_drift_build_output=$tmp/live-drift-build.out
 export FAKE_COMPOSE_LOG=$tmp/live-drift-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_FAIL_BUILD=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$live_drift_build_output" 2>&1; then
   fail 'live-drift candidate build failure unexpectedly succeeded'
@@ -2618,7 +2621,6 @@ unset FAKE_COMPOSE_LOG
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$rendered_env" "$FAKE_CONTROLLER_IMAGE" "$prior_controller_image"
 postbuild_capacity_output=$tmp/postbuild-capacity.out
 export FAKE_DISK_USED_PERCENT_FILE=$tmp/docker-disk-used-percent
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_DISK_USED_PERCENT_AFTER_BUILD=80
 printf '79\n' >"$FAKE_DISK_USED_PERCENT_FILE"
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$postbuild_capacity_output" 2>&1; then
@@ -2793,23 +2795,22 @@ export FAKE_COMPOSE_LOG=$tmp/restartable-tag-build-compose.log
 printf 'exited\n' >"$FAKE_CONTROLLER_STATUS_FILE"
 prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
 prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
-rm -f "$FAKE_CONTROLLER_IMAGE_ID_STATE"
-export FAKE_PARTIAL_BUILD_FAIL=1
+export FAKE_FAIL_TIMER_ENABLE=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$restartable_tag_build_output" 2>&1; then
-  fail 'restartable-tag candidate build failure unexpectedly succeeded'
+  fail 'matching-image timer activation failure unexpectedly succeeded'
 fi
-unset FAKE_PARTIAL_BUILD_FAIL
+unset FAKE_FAIL_TIMER_ENABLE
 stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'restartable controller runner tag was built before stop'
-grep -Fq 'DRAIN_OK managed_runners=0' "$restartable_tag_build_output" || fail 'restartable controller runner tag build did not wait for drain'
-grep -Fq 'ROLLBACK_RESTORED' "$restartable_tag_build_output" || fail 'restartable controller runner tag build failure did not restore the checkpoint'
-[[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'restartable controller runner tag build failure did not restore the installed controller'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'restartable controller runner tag build failure changed installed environment'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$FAKE_CONTROLLER_ENV_FILE" || fail 'restartable controller runner tag build failure did not restore the installed controller environment'
-grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'restartable controller runner tag build failure changed installed state'
-[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'restartable controller runner tag build failure changed the installed manager'
-[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "$prior_runner_image_id" ]] || fail 'rollback reported restored but left the runner tag on the partial build image'
+[[ -n "$stop_line" ]] || fail 'restartable controller did not stop before activation'
+if grep -q '^build|' "$FAKE_COMPOSE_LOG"; then fail 'restartable controller rebuilt matching reviewed images'; fi
+grep -Fq 'DRAIN_OK managed_runners=0' "$restartable_tag_build_output" || fail 'restartable controller activation did not wait for drain'
+grep -Fq 'ROLLBACK_RESTORED' "$restartable_tag_build_output" || fail 'matching-image timer activation failure did not restore the checkpoint'
+[[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'matching-image timer activation failure did not restore the installed controller'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'matching-image timer activation failure changed installed environment'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$FAKE_CONTROLLER_ENV_FILE" || fail 'matching-image timer activation failure did not restore the installed controller environment'
+grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'matching-image timer activation failure changed installed state'
+[[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'matching-image timer activation failure changed the installed manager'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "$prior_runner_image_id" ]] || fail 'timer rollback changed the reviewed runner image ID'
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'rollback did not restore the prior controller tag image ID'
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$restartable_tag_build_output")
 image_ids_file=$checkpoint_path/image-ids.env
