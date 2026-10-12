@@ -80,6 +80,7 @@ class DesiredStateTests(unittest.TestCase):
             docker_gid=998,
             engine_capabilities={
                 "status_reporting_config",
+                "capacity_telemetry",
                 "docker_network_policy_config",
                 "docker_network_policy_adapter",
                 "docker_default_bridge_cidr_config",
@@ -93,8 +94,13 @@ class DesiredStateTests(unittest.TestCase):
         self.assertEqual(environment["CI_FLEET_MAX_RUNNERS"], "1")
         self.assertEqual(environment["CI_FLEET_CONFIGURED_MAX_RUNNERS"], "1")
         self.assertEqual(environment["CI_FLEET_LABELS"], "docker-ci")
+        self.assertEqual(environment["CI_FLEET_POOL"], "trusted-ci")
         self.assertEqual(environment["CI_FLEET_COMMIT"], environment["CI_FLEET_ENGINE_REF"])
         self.assertEqual(metadata["controller_state"], "active")
+
+    def test_legacy_engine_does_not_receive_capacity_pool_variable(self) -> None:
+        environment, _ = self.render(capabilities={"status_reporting_config", "docker_network_policy_config", "docker_network_policy_adapter", "docker_default_bridge_cidr_config"})
+        self.assertNotIn("CI_FLEET_POOL", environment)
 
     def test_status_reporting_requires_fixed_host_local_configuration(self) -> None:
         value = config()
