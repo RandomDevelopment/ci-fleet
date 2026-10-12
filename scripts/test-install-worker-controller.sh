@@ -2721,6 +2721,13 @@ export FAKE_COMPOSE_LOG=$tmp/missing-tag-build-compose.log
 prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
 prior_controller_image_id=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
 rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE"
+# Model a lost object, not just an absent tag whose ID remains locally recoverable.
+python3 - "$FAKE_AVAILABLE_IMAGE_IDS" "$prior_runner_image_id" <<'PYTHON'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+path.write_text("".join(line + "\n" for line in path.read_text().splitlines() if line != sys.argv[2]))
+PYTHON
 export FAKE_PARTIAL_BUILD_FAIL=1
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$missing_tag_output" 2>&1; then
   fail 'missing-tag candidate build failure unexpectedly succeeded'
@@ -2731,7 +2738,7 @@ grep -Fq 'ROLLBACK_FAILED' "$missing_tag_output" || fail 'missing-tag rollback i
 if grep -Fq 'ROLLBACK_RESTORED' "$missing_tag_output"; then fail 'failed reviewed-image rebuild reported restored rollback'; fi
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$missing_tag_output")
 grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'checkpoint did not record the missing runner tag'
-[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" ]] || fail 'failed reviewed-image rebuild retained a verified runner image'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "$FAKE_PARTIAL_RUNNER_IMAGE_ID" && "$FAKE_PARTIAL_RUNNER_IMAGE_ID" != "$prior_runner_image_id" ]] || fail 'failed preflight did not preserve the unverified partial image without activating it'
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'missing-tag rollback did not restore the prior controller image ID'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'missing-tag rollback changed the installed environment'
 grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
@@ -2739,7 +2746,7 @@ grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rol
 runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
-[[ -n "$runner_rm_line" && -n "$controller_tag_line" && -z "$rollback_up_line" ]] || fail 'failed reviewed-image rebuild restarted the controller'
+[[ -z "$runner_rm_line" && -z "$controller_tag_line" && -z "$rollback_up_line" ]] || fail 'failed reconstruction preflight mutated rollback tags or restarted the controller'
 recovered_missing_tag=$(expect_success "$installer" --rollback)
 grep -Fq 'ROLLBACK_RESTORED' <<<"$recovered_missing_tag" || fail 'explicit rollback did not rebuild the missing reviewed runner image'
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 ]] || fail 'explicit rollback accepted an unreviewed runner image'

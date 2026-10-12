@@ -1829,9 +1829,26 @@ raise SystemExit(0 if supported else 1)
 PYTHON
 }
 
+restore_reviewed_image_tags() {
+  local environment=$1 image identifier mapping
+  local -a mappings=()
+  mapfile -t mappings < <(awk -F= '
+    $1 == "CI_FLEET_CONTROLLER_IMAGE" {controller=$2}
+    $1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {controller_digest=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE" {runner=$2}
+    $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {runner_digest=$2}
+    END {if (controller && controller_digest && runner && runner_digest) {print controller " " controller_digest; print runner " " runner_digest}}
+  ' "$environment")
+  [[ ${#mappings[@]} == 2 ]] || return 1
+  for mapping in "${mappings[@]}"; do
+    read -r image identifier <<<"$mapping"
+    docker image tag "$identifier" "$image" || return 1
+  done
+}
+
 preflight_checkpoint_images() {
-  local release=$1 environment=$2 identifier error
-  checkpoint_images_reproducible "$release" && return 0
+  local release=$1 environment=$2 identifier error reproducible=false rebuilt=false
+  checkpoint_images_reproducible "$release" && reproducible=true
   local -a identifiers=()
   mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" || $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
   [[ ${#identifiers[@]} == 2 ]] || return 1
@@ -1842,10 +1859,18 @@ preflight_checkpoint_images() {
     if error=$(docker image inspect --format '{{.Id}}' "$identifier" 2>&1); then
       [[ "$error" == "$identifier" ]] || return 1
     else
-      note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy images require retained objects or verified offline import'
-      return 1
+      [[ "$error" == *"No such image: $identifier"* ]] && docker info >/dev/null 2>&1 || return 1
+      if [[ "$reproducible" != true || "$rebuilt" == true ]]; then
+        note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=checkpoint image object requires verified offline import or reinstall'
+        return 1
+      fi
+      rebuild_checkpoint_images "$release" "$environment" || return 1
+      rebuilt=true
+      [[ $(docker image inspect --format '{{.Id}}' "$identifier" 2>/dev/null) == "$identifier" ]] || return 1
     fi
   done
+  restore_reviewed_image_tags "$environment" || return 1
+  managed_images_match "$environment"
 }
 
 rebuild_checkpoint_images() {
@@ -1872,7 +1897,7 @@ retag_checkpoint_image() {
 
 restore_checkpoint() {
   local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
-  local restore_controller_tag_after_start=false missing_checkpoint_image=false image_status=0
+  local restore_controller_tag_after_start=false
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -2127,25 +2152,13 @@ PY
   if $restore_images; then
     for index in 0 1; do
       if [[ "$index" == 1 && ${#checkpoint_images[@]} == 5 ]]; then
-        image_status=0
-        retag_checkpoint_image "${checkpoint_images[4]}" "${checkpoint_images[index]}" || image_status=$?
-        case $image_status in 0) ;; 2) missing_checkpoint_image=true ;; *) failed=1 ;; esac
+        retag_checkpoint_image "${checkpoint_images[4]}" "${checkpoint_images[index]}" || failed=1
         restore_controller_tag_after_start=true
       elif [[ ${checkpoint_images[index + 2]} == absent ]]; then
-        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
-          docker image rm "${checkpoint_images[index]}" >/dev/null || failed=1
-        else
-          docker info >/dev/null 2>&1 || failed=1
-        fi
-        if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
-          failed=1
-        else
-          docker info >/dev/null 2>&1 || failed=1
-        fi
+        # Keep preflight's verified image tag available through controller restoration.
+        :
       else
-        image_status=0
-        retag_checkpoint_image "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || image_status=$?
-        case $image_status in 0) ;; 2) missing_checkpoint_image=true ;; *) failed=1 ;; esac
+        retag_checkpoint_image "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || failed=1
       fi
     done
   fi
@@ -2154,9 +2167,8 @@ PY
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
-      if $missing_checkpoint_image || ! managed_images_match "$rendered_env"; then
-        rebuild_checkpoint_images "$release_dir" "$rendered_env" || failed=1
-      fi
+      restore_reviewed_image_tags "$rendered_env" || failed=1
+      if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
       failed=1
