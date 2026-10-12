@@ -10,7 +10,7 @@ Usage: bootstrap-github.sh [--dry-run|--check] --organization ORG --instance ID
   --allow-repository ORG/PROJECT=NUMERIC_ID [--allow-repository ORG/PROJECT=NUMERIC_ID ...]
   [--bind ADDRESS --callback-host HOST --port PORT --timeout SECONDS]
   [--operator-uid UID]
-  [--install --config-repo LOCAL_CHECKOUT --config-ref COMMIT]
+  [--config-repo LOCAL_CHECKOUT --config-ref COMMIT] [--install]
 EOF
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -67,7 +67,9 @@ operator_uid=${operator_uid:-${SUDO_UID:-$(id -u)}}
 [[ $operator_uid =~ ^[0-9]+$ && $operator_uid -le 4294967294 ]] || die 'invalid operator UID'
 if $run_installer; then
   [[ $mode == live ]] || die '--install is available only in live mode'
-  [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
+fi
+if [[ $mode == live || -n $config_repo || -n $config_ref ]]; then
+  [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die 'live bootstrap requires --config-repo and a 40-character --config-ref'
 fi
 for command in bash curl flock openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -110,9 +112,9 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if $run_installer; then
+if [[ -n $config_repo ]]; then
   command -v git >/dev/null || die 'required command is unavailable: git'
-  git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die '--install requires a local configuration checkout; remote handoff has no pre-mutation credential proof'
+  git -C "$config_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 'bootstrap requires a local configuration checkout; remote handoff has no pre-mutation credential proof'
   [[ $(git -C "$config_repo" rev-parse "$config_ref^{commit}" 2>/dev/null || true) == "$config_ref" ]] || die 'local configuration repository does not contain --config-ref'
   candidate_config=$temporary/fleet.json
   tree_paths=$temporary/config-tree-paths
@@ -506,7 +508,7 @@ if sys.argv[3] and (actual[0].get('id')!=int(sys.argv[3]) or actual[0].get('defa
 PY
 rm -f "$visible"
 
-if $run_installer && $approval_gate; then
+if [[ $mode == live ]] && $approval_gate; then
   config_tree=$(git -C "$config_repo" rev-parse "$config_ref^{tree}") || die 'cannot inspect the pinned configuration tree'
   python3 "$script_dir/verify_config_approval.py" --policy "$approval_policy" \
     --repository "$config_repository" --commit "$config_ref" --tree "$config_tree" \
@@ -571,8 +573,10 @@ PY
 )
   created_group=true
   group_creation_pending=false
-  rm -f "$group_pending"
+  printf '%s\n' "organization=$organization" "runner_group=$runner_group" "runner_group_id=$group_id" >"$temporary/group-pending"
+  publish_private "$temporary/group-pending" "$group_pending"
   if [[ ${CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then kill -TERM "$$"; fi
+  if [[ ${CI_FLEET_TEST_KILL_AFTER_GROUP_CREATE:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then kill -KILL "$$"; fi
   python3 - "$payload" "$repository_ids" <<'PY'
 import json,sys
 from pathlib import Path
@@ -641,6 +645,7 @@ then
   die 'existing runner group repository access differs; no change made'
 fi
 rm -f "${selected_pages[@]}"
+if $created_group; then rm -f "$group_pending"; fi
 created_group=false
 
 staged=$temporary/host.env

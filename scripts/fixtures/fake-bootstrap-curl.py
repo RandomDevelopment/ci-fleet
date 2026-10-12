@@ -24,25 +24,25 @@ response = None
 kind = "unknown"
 if "/app-manifests/" in url:
     kind = "manifest-conversion"
-    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-example-org-example-ci-01", "pem": pem,
+    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-acme-org-example-ci-01", "pem": pem,
                 "client_secret": "fixture-client-secret", "webhook_secret": "fixture-webhook-secret"}
 elif endpoint.endswith("/app"):
     kind = "app"
-    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-example-org-example-ci-01", "public": False, "events": [], "owner": {"login": "example-org", "type": "Organization"},
+    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-acme-org-example-ci-01", "public": False, "events": [], "owner": {"login": "acme-org", "type": "Organization"},
                 "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
 elif endpoint.endswith("/app/installations"):
     kind = "installations"
-    response = [{"id": 456, "repository_selection": "selected", "account": {"login": "example-org", "type": "Organization"}}]
+    response = [{"id": 456, "repository_selection": "selected", "account": {"login": "acme-org", "type": "Organization"}}]
 elif endpoint.endswith("/access_tokens"):
     kind = "installation-token"
     response = {"token": "fixture-installation-token-value", "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
-elif "/repos/example-org/example-repo" in url:
+elif "/repos/acme-org/example-repo" in url:
     kind = "repository"
-    response = {"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False,
-                "owner": {"login": "example-org"}}
+    response = {"id": 101, "full_name": "acme-org/example-repo", "private": True, "archived": False,
+                "owner": {"login": "acme-org"}}
 elif "/installation/repositories" in url:
     kind = "installation-repositories"
-    response = {"total_count": 1, "repositories": [{"id": 201, "full_name": "example-org/config", "private": True, "archived": False, "default_branch": "main"}]}
+    response = {"total_count": 1, "repositories": [{"id": 201, "full_name": "acme-org/config", "private": True, "archived": False, "default_branch": "main"}]}
 elif endpoint.endswith("/actions/runner-groups") and method == "POST":
     kind = "runner-group-create"
     payload = json.loads(Path(values["data-binary"][0].removeprefix("@")).read_text())
@@ -67,14 +67,15 @@ elif endpoint.endswith("/actions/runner-groups/789/repositories"):
     kind = "runner-group-repositories"
     page = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("page", ["1"])[0])
     if os.environ.get("FAKE_BOOTSTRAP_SECOND_GROUP_PAGE") == "1":
-        repositories = [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}] if page == 1 else [{"id": 102, "full_name": "example-org/second-repo", "private": True, "archived": False}] if page == 2 else []
+        repositories = [{"id": 101, "full_name": "acme-org/example-repo", "private": True, "archived": False}] if page == 1 else [{"id": 102, "full_name": "acme-org/second-repo", "private": True, "archived": False}] if page == 2 else []
         response = {"total_count": 2, "repositories": repositories}
     else:
-        repositories = [{"id": 101, "full_name": "example-org/example-repo", "private": True, "archived": False}] if state.read_text().strip() == "authorized" else []
+        repositories = [{"id": 101, "full_name": "acme-org/example-repo", "private": True, "archived": False}] if state.read_text().strip() == "authorized" else []
         response = {"total_count": len(repositories), "repositories": repositories}
 elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
     kind = "runner-group-delete"
-    state.unlink(missing_ok=True)
+    if not os.environ.get("FAKE_BOOTSTRAP_DELETE_TIMEOUT"):
+        state.unlink(missing_ok=True)
     response = {}
 elif endpoint.endswith("/actions/runner-groups/789"):
     kind = "runner-group"
@@ -128,7 +129,9 @@ with Path(os.environ["FAKE_BOOTSTRAP_LOG"]).open("a") as log:
     log.write(f"{method} {kind}\n")
 if kind == "manifest-conversion" and os.environ.get("FAKE_BOOTSTRAP_CONVERSION_NO_RESPONSE") == "1":
     raise SystemExit(28)
-output.write_text(json.dumps(response).replace("example-org", os.environ.get("FAKE_BOOTSTRAP_ORGANIZATION", "example-org")))
+if kind == "runner-group-delete" and os.environ.get("FAKE_BOOTSTRAP_DELETE_TIMEOUT") == "1":
+    raise SystemExit(28)
+output.write_text(json.dumps(response).replace("acme-org", os.environ.get("FAKE_BOOTSTRAP_ORGANIZATION", "acme-org")))
 if kind == "runner-group-create":
     if os.environ.get("FAKE_BOOTSTRAP_CREATE_TIMEOUT") == "1":
         output.unlink()

@@ -29,7 +29,9 @@ sudo ./scripts/bootstrap-github.sh \
   --instance example-ci-01 \
   --config-repository example-org/config \
   --runner-group example-ci-experimental \
-  --allow-repository example-org/example-repo=123456
+  --allow-repository example-org/example-repo=123456 \
+  --config-repo /PATH/TO/PINNED/CHECKOUT \
+  --config-ref REVIEWED_COMMIT
 ```
 
 All names above are fictional. The script prints a non-secret `CALLBACK_SOCKET`,
@@ -74,6 +76,9 @@ The bootstrap:
   group created by this invocation is automatically deleted if inspection,
   routing verification, or cancellation fails before verification completes.
   Existing groups whose identity or access differs remain unchanged;
+- retains the protected creation marker and acknowledged group ID until routing
+  verification or confirmed deletion completes. SIGKILL, host failure, or an
+  uncertain rollback leaves owner reconciliation required before any retry;
 - destroys the conversion code, JWTs, installation token, callback state, and
   temporary curl configurations on exit. After a successful conversion, a
   protected mode-`0600` `bootstrap-recovery.json` or
@@ -108,9 +113,9 @@ against the protected numeric repository ID and default branch.
 Bootstrap preserves an existing valid `CI_FLEET_RUNNER_TTL` and uses the host
 contract default of `6h` when the optional setting is absent.
 
-Pass `--install --config-repo /PATH/TO/PINNED/CHECKOUT --config-ref REVIEWED_COMMIT`
-on the initial live command for direct handoff to the idempotent host installer.
-Bootstrap requires the commit in that local checkout and verifies that its
+Every live command requires `--config-repo /PATH/TO/PINNED/CHECKOUT` and
+`--config-ref REVIEWED_COMMIT`. Add `--install` for direct handoff to the
+idempotent host installer. Bootstrap requires the commit in that local checkout and verifies that its
 selected controller pool exactly matches the requested organization, runner
 group, and project allowlist before any GitHub mutation.
 When the protected approval gate is enabled, bootstrap also verifies the pinned
@@ -269,6 +274,9 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 If the runner-group creation response is lost or malformed, bootstrap performs
 read-only discovery and retains root-owned mode-`0600`
 `/etc/ci-fleet/bootstrap-group.pending`. The new group has no repository access.
+The marker also survives SIGKILL or a failed rollback after acknowledged
+creation, and records the acknowledged group ID until verification or confirmed
+deletion completes. Reconcile that exact ID when present.
 Every later live/check invocation stops before making a GitHub request until an
 organization owner reconciles the recorded organization/group with GitHub.
 An absent group immediately after a timeout does not prove creation failed.
