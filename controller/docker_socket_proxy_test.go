@@ -486,8 +486,16 @@ func TestDockerSocketProxyUploadIsCompleteBeforeDispatch(t *testing.T) {
 			}
 			io.Copy(io.Discard, response.Body)
 			response.Body.Close()
-			if !bytes.Equal(<-received, contextBody) || proxyMarkerCount(t, fixture) != 0 {
-				t.Fatal("build context was truncated or its completed mutation retained a marker")
+			if !bytes.Equal(<-received, contextBody) {
+				t.Fatal("build context was truncated")
+			}
+			// The client can receive EOF before ReverseProxy closes its upstream body.
+			deadline := time.Now().Add(2 * time.Second)
+			for proxyMarkerCount(t, fixture) != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("completed mutation retained a marker")
+				}
+				time.Sleep(time.Millisecond)
 			}
 		})
 	}
