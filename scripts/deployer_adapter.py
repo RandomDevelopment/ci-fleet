@@ -115,7 +115,7 @@ class UnixConnection(http.client.HTTPConnection):
 
 class Backend:
     def __init__(self, path: str):
-        require(os.path.isabs(path) and os.path.realpath(path) == path, "Docker socket must be canonical")
+        require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
         self.path = path
         connection = UnixConnection(path)
         try:
@@ -468,6 +468,8 @@ def execute_adapter(operation: str) -> int:
 
 def sandbox_command(unit: str, seconds: int, proxy: Path, policy: Path, adapter: Path,
                     credential: Path, helper: Path, request: Path | None, commit: bool, operation: str, backend_socket: str, container_credential: str) -> list[str]:
+    for path in (proxy, policy, adapter, credential, helper, request, backend_socket, container_credential):
+        require(path is None or bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", str(path))), "unsafe systemd path")
     directory = unit.removesuffix(".service")
     command = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec", "--unit=" + unit,
                "--property=DynamicUser=yes", "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=",

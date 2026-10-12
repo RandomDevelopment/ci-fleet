@@ -528,7 +528,7 @@ validate_checkout() {
   checkout_snapshot=$(mktemp -d)
   chmod 0700 "$checkout_snapshot"
   install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
-  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
+  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$repo_root/scripts/deployer_adapter.py" "$checkout_snapshot/scripts/"
   local entry
   for entry in "$repo_root"/deploy/deployer/*; do
     [[ -f "$entry" && ! -L "$entry" ]] || block 'deployer unit source contains an unsafe or untracked entry'
@@ -1358,7 +1358,8 @@ run_adapter() {
       chmod 0600 "$transaction_dir/adapter-unit"
       sync -f "$transaction_dir" 2>/dev/null || die 'adapter unit guard is not durable'
     fi
-    local recovery=$state_root/.adapter-recovery runtime=$(root_path /run/ci-fleet-deployer-adapters)
+    local recovery=$state_root/.adapter-recovery runtime
+    runtime=$(root_path /run/ci-fleet-deployer-adapters)
     [[ ! -L $recovery && ! -L $runtime ]] || block 'adapter directories must not be symlinks'
     install -d -m 0700 "$recovery"
     install -d -m 0711 "$runtime"
