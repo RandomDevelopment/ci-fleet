@@ -104,7 +104,7 @@ Rerun preflight. Capture only the pass/fail summary, not environment contents.
 ## 6. Start at zero and observe
 
 ```bash
-docker compose -f deploy/compose.yaml up -d --no-deps controller
+docker compose -f deploy/compose.yaml up -d controller
 docker compose -f deploy/compose.yaml logs --tail=100 controller
 docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true
 ```

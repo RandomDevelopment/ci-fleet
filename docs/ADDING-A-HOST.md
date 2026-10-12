@@ -102,7 +102,7 @@ sudo ./scripts/install-worker-controller.sh \
   --controller example-ci-01
 ```
 
-Use `--adopt` when converting an existing manual controller. The installer validates the complete configuration, renders host-local runtime state, installs the pinned engine, creates a controller checkpoint, builds images, installs maintenance timers, and verifies health.
+Use `--adopt` when converting an existing manual controller. The installer validates the complete configuration, renders host-local runtime state, installs the pinned engine, and validates the candidate Compose configuration. It may build images with a distinct inert runner tag before creating a checkpoint and draining. A build that would retag the runner image used by the active controller waits until after checkpoint and drain. Managed preflight still runs after drain, before activation. A failed pre-transaction build may leave candidate image or layer artifacts, but it does not change installed state or stop the active controller.
 
 The configuration repository credential, when required, must be read-only and host-side. Credentials are never accepted in command arguments.
 

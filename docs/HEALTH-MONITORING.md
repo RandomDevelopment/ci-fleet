@@ -17,6 +17,7 @@ The check covers:
 - root and Docker filesystem space and inodes;
 - available memory, swap use, per-CPU load, and OOM evidence from the last 24 hours;
 - Docker availability, controller state/restarts, and configured versus effective capacity;
+- configured/used/free Docker subnet headroom and legacy networks, without exposing addresses;
 - inactive, unhealthy, restarting, and stale fleet-labelled resources, including week-old build cache;
 - cleanup, drift, health, and update services/timers;
 - failed package state, pending reboot, and clock synchronization;
@@ -24,6 +25,27 @@ The check covers:
 - optional authenticated outbound status delivery.
 
 It reports but never prunes, restarts, or repairs resources. Project source, logs, environment values, tokens, and private keys are never included.
+
+Docker network inspection is read-only. Healthy headroom is reported when free
+subnets remain above the reviewed reserve, low water and legacy/nonconforming
+networks are warnings, and exhaustion is critical. A malformed policy or failed
+Docker network listing/inspection is critical rather than falsely healthy.
+When policy parsing succeeds during an inspection outage, the local snapshot
+retains the configured subnet count and reserve without inventing usage counts.
+Status reports include aggregate configured, used, free, and legacy counts only
+after a successful measurement; otherwise they omit the optional network field.
+
+Before each scale-up, a controller with rendered network policy values reads the
+effective Docker default pools and current network allocations. It starts no more
+runners than the remaining subnet slots can support after reserving the reviewed
+low-water count and every current runner's declared network budget. This may
+conservatively count a current runner's allocated network twice, but cannot admit
+work based on a subnet that runner still needs. Failed or malformed Docker
+inspection blocks new runners without stopping in-flight jobs. The gate does not
+remove networks, cancel jobs, or change capacity in desired state.
+
+Frequent orphan reconciliation and consumer-label migrations remain later issue
+#81 work. Cleanup stays label-scoped and never uses blind Docker prune.
 
 ## Threshold overrides and hooks
 
