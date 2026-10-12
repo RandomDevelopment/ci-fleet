@@ -66,6 +66,7 @@ restore_rollback_pair() {
 restore_consumed_requests() {
   local id entry
   local -a entries=()
+  local -A retained=()
   [[ -d $log_root && ! -L $log_root && $(realpath -e -- "$log_root") == "$log_root" && $(stat -c '%u:%a' "$log_root") == "$expected_uid:700" ]] || return 1
   if [[ -e $consumed_root || -L $consumed_root ]]; then
     [[ -d $consumed_root && ! -L $consumed_root ]] || return 1
@@ -80,12 +81,18 @@ restore_consumed_requests() {
   for entry in "${entries[@]}"; do
     [[ -f $entry && ! -L $entry ]] || return 1
   done
-  for entry in "${entries[@]}"; do rm -f -- "$entry" || return; done
   for id in "${consumed_requests[@]}"; do
+    retained[$id]=1
     [[ ! -L $consumed_root/$id && ( ! -e $consumed_root/$id || -f $consumed_root/$id ) ]] || return 1
     [[ ! -f $consumed_root/$id || $(stat -c '%u:%a:%s' "$consumed_root/$id") != "$expected_uid:600:0" ]] || continue
     install -m 0600 /dev/null "$consumed_root/$id" || return
     sync -f "$consumed_root/$id" 2>/dev/null || return
+  done
+  # Make every captured approval durable before pruning adapter-added entries.
+  sync -f "$consumed_root" "$log_root" 2>/dev/null || return
+  for entry in "${entries[@]}"; do
+    id=${entry##*/}
+    [[ $id =~ ^[0-9a-f]{64}$ && -v "retained[$id]" ]] || { rm -f -- "$entry" || return; }
   done
   sync -f "$consumed_root" "$log_root" 2>/dev/null
 }
