@@ -651,8 +651,22 @@ for marker in /var/lib/ci-fleet-deployer-container-credentials /opt/ci-fleet/cur
   done
   [[ $marker != */current ]] || rmdir "$(dirname "$root$marker")"
 done
+for unit in ci-fleet-capacity.service ci-fleet-capacity.timer; do
+  for kind in file symlink; do
+    role_unit=$root/etc/systemd/system/$unit
+    if [[ $kind == file ]]; then : >"$role_unit"; else ln -s /missing "$role_unit"; fi
+    for mode in check install; do
+      ref_args=(); [[ $mode != install ]] || ref_args=(--ref "$ref")
+      if "$installer" "--$mode" "${ref_args[@]}" >"$tmp/capacity-role.out" 2>&1; then fail 'installer accepted controller capacity unit state'; fi
+      grep -Fq 'another ci-fleet host role is present' "$tmp/capacity-role.out" || fail 'capacity unit failed outside admission'
+    done
+    if "$runtime" --health >"$tmp/capacity-role.out" 2>&1; then fail 'runtime accepted controller capacity unit state'; fi
+    grep -Fq 'another ci-fleet host role is present' "$tmp/capacity-role.out" || fail 'runtime capacity unit failed outside admission'
+    rm "$role_unit"
+  done
+done
 for inventory_kind in list-unit-files list-units; do
-  for unit in ci-fleet-deployer.service ci-fleet-status-receiver.service ci-fleet-health.timer actions.runner.example.service; do
+  for unit in ci-fleet-deployer.service ci-fleet-status-receiver.service ci-fleet-health.timer ci-fleet-capacity.service ci-fleet-capacity.timer actions.runner.example.service; do
     for mode in check install; do
       ref_args=(); [[ $mode != install ]] || ref_args=(--ref "$ref")
       if FAKE_TESTER_FOREIGN_UNIT=$unit FAKE_TESTER_FOREIGN_UNIT_KIND=$inventory_kind "$installer" "--$mode" "${ref_args[@]}" >"$tmp/unit-rejection.out" 2>&1; then fail "installer accepted effective foreign unit: $unit"; fi

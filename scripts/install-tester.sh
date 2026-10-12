@@ -97,7 +97,7 @@ reject_other_roles() {
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
     "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)" \
     "$systemd_dir"/ci-fleet-deployer* "$systemd_dir"/ci-fleet-health* "$systemd_dir"/ci-fleet-cleanup* \
-    "$systemd_dir"/ci-fleet-reconcile* "$systemd_dir"/ci-fleet-drift* "$systemd_dir"/ci-fleet-status-receiver* "$systemd_dir"/actions.runner*; do
+    "$systemd_dir"/ci-fleet-reconcile* "$systemd_dir"/ci-fleet-drift* "$systemd_dir"/ci-fleet-capacity* "$systemd_dir"/ci-fleet-status-receiver* "$systemd_dir"/actions.runner*; do
     [[ ! -e $path && ! -L $path ]] || die 'another ci-fleet host role is present'
   done
   for inventory_kind in list-unit-files list-units; do
@@ -109,7 +109,7 @@ reject_other_roles() {
     fi
     while read -r unit _; do
       case $unit in
-        ci-fleet-deployer*|ci-fleet-health*|ci-fleet-cleanup*|ci-fleet-reconcile*|ci-fleet-drift*|ci-fleet-status-receiver*|actions.runner*) die 'another ci-fleet host role is present' ;;
+        ci-fleet-deployer*|ci-fleet-health*|ci-fleet-cleanup*|ci-fleet-reconcile*|ci-fleet-drift*|ci-fleet-capacity*|ci-fleet-status-receiver*|actions.runner*) die 'another ci-fleet host role is present' ;;
       esac
     done <<<"$inventory"
   done

@@ -461,7 +461,7 @@ if [[ $action != --remove && $action != --cleanup ]]; then
     /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
     [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
   done
-  for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do
+  for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-capacity* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do
     [[ ! -e $role_unit && ! -L $role_unit ]] || die 'another ci-fleet host role is present'
   done
   for inventory_kind in list-unit-files list-units; do
@@ -473,7 +473,7 @@ if [[ $action != --remove && $action != --cleanup ]]; then
     fi
     while read -r unit _; do
       case $unit in
-        ci-fleet-deployer*|ci-fleet-health*|ci-fleet-cleanup*|ci-fleet-reconcile*|ci-fleet-drift*|ci-fleet-status-receiver*|actions.runner*) die 'another ci-fleet host role is present' ;;
+        ci-fleet-deployer*|ci-fleet-health*|ci-fleet-cleanup*|ci-fleet-reconcile*|ci-fleet-drift*|ci-fleet-capacity*|ci-fleet-status-receiver*|actions.runner*) die 'another ci-fleet host role is present' ;;
       esac
     done <<<"$inventory"
   done
