@@ -388,6 +388,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         for architecture, identifiers in images.items():
             architecture_path = f"{path}.{architecture}"
             if validation.exact_keys(identifiers, architecture_path, {"controller", "runner"}):
+                validation.require(identifiers["controller"] != identifiers["runner"], architecture_path, "controller and runner image IDs must differ")
                 for name in ("controller", "runner"):
                     digest = identifiers.get(name)
                     validation.require(isinstance(digest, str) and bool(IMAGE_DIGEST.fullmatch(digest)) and digest != "sha256:" + "0" * 64, f"{architecture_path}.{name}", "must be a nonzero sha256 image digest")

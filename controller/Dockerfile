@@ -31,7 +31,7 @@ RUN --mount=type=bind,from=build,source=/out,target=/out \
     && apt-get install -y --no-install-recommends ca-certificates \
     && install -m 0755 /out/ci-fleet-controller /usr/local/bin/ci-fleet-controller \
     && install -d -o 65532 -g 65532 /run/ci-fleet \
-    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
+    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ci-fleet-controller"]

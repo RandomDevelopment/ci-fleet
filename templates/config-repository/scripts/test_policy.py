@@ -342,6 +342,13 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, {}, validation)
         self.assertEqual(validation.errors, [])
 
+    def test_managed_image_ids_reject_identical_controller_and_runner(self) -> None:
+        config = reference_config()
+        for architecture in ("amd64", "arm64"):
+            images = next(iter(config["managed_images"].values()))
+            images[architecture] = {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "3" * 64}
+            self.assert_rejected(config, "image IDs must differ", strict=True)
+
     def test_managed_image_ids_require_an_architecture_key(self) -> None:
         config = copy.deepcopy(reference_config())
         engine_ref = first_controller(config)["engine_ref"]

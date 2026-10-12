@@ -67,7 +67,7 @@ case "${1:-}" in
     ;;
   buildx)
     case "${2:-}" in
-      version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx v0.32.1\n' ;;
+      version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-v0.32.1}" ;;
       inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: v0.32.2\n' ;;
       create|rm) ;;
       build)
@@ -2720,7 +2720,9 @@ export FAKE_BUILDX_UNAVAILABLE=1
 uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
 unset FAKE_BUILDX_UNAVAILABLE
+export FAKE_BUILDX_UNAVAILABLE=1
 expect_success "$installer" --rollback >/dev/null
+unset FAKE_BUILDX_UNAVAILABLE
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the reviewed runner image'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
