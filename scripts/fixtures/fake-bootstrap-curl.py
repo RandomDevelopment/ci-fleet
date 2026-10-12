@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import urllib.parse
 
+assert sys.argv[1] == "-q", "sensitive API request must disable default curl configuration first"
 config = Path(sys.argv[sys.argv.index("--config") + 1]).read_text().splitlines()
 values = {}
 for line in config:
@@ -88,6 +89,11 @@ if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID") == "1":
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_CONTENTS") == "1":
     assert isinstance(response, dict)
     response["permissions"].pop("contents")
+if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_RUNNER_PERMISSION"):
+    if os.environ["FAKE_BOOTSTRAP_RUNNER_PERMISSION"] == "none":
+        response["permissions"].pop("organization_self_hosted_runners")
+    else:
+        response["permissions"]["organization_self_hosted_runners"] = os.environ["FAKE_BOOTSTRAP_RUNNER_PERMISSION"]
 if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_PUBLIC_GROUP") == "1":
     (response["runner_groups"][0] if kind == "runner-groups" else response)["allows_public_repositories"] = True
 if kind in {"runner-group", "runner-groups"} and os.environ.get("FAKE_BOOTSTRAP_RESTRICTED_GROUP") == "1":
@@ -103,6 +109,8 @@ if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_TRANSIENT_INSTALLA
     raise SystemExit(22)
 with Path(os.environ["FAKE_BOOTSTRAP_LOG"]).open("a") as log:
     log.write(f"{method} {kind}\n")
+if kind == "manifest-conversion" and os.environ.get("FAKE_BOOTSTRAP_CONVERSION_NO_RESPONSE") == "1":
+    raise SystemExit(28)
 output.write_text(json.dumps(response))
 if kind == "runner-group-create":
     if os.environ.get("FAKE_BOOTSTRAP_CREATE_TIMEOUT") == "1":

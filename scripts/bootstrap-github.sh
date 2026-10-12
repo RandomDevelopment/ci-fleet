@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -Eeuo pipefail
 umask 077
 
@@ -157,9 +158,23 @@ Path(target).write_text('\n'.join(lines) + '\n')
 PY
   chmod 600 "$config"
   local status=0
-  curl --config "$config" || status=$?
+  curl -q --config "$config" || status=$?
   rm -f "$config"
   return "$status"
+}
+
+publish_private() {
+  python3 - "$script_dir" "$1" "$2" <<'PY'
+from pathlib import Path
+import os,sys
+sys.path.insert(0,sys.argv[1])
+from desired_state import write_private
+source,target=map(Path,sys.argv[2:])
+write_private(target,source.read_text())
+descriptor=os.open(target.parent,os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(descriptor)
+finally: os.close(descriptor)
+PY
 }
 
 rollback_new_group() {
@@ -240,8 +255,9 @@ PY
     [[ -f $pem && -f $bootstrap_state ]] || die 'recovery record beside host configuration lacks matching active credentials'
     load_metadata
   fi
-  install -m 0600 "$staged_pem" "$pem"
-  install -m 0600 "$staged_state" "$bootstrap_state"
+  publish_private "$staged_pem" "$pem"
+  if [[ ${CI_FLEET_TEST_FAIL_AFTER_PEM_PUBLISH:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected interruption after atomic PEM publication'; fi
+  publish_private "$staged_state" "$bootstrap_state"
   load_metadata
   rm -f "$bootstrap_recovery"
 }
@@ -327,8 +343,10 @@ config.write_text('\n'.join(['silent','show-error','fail-with-body','connect-tim
  'header = "Accept: application/vnd.github+json"','header = "X-GitHub-Api-Version: 2022-11-28"']) + '\n')
 PY
   chmod 600 "$conversion_config"
+  printf '{}\n' >"$temporary/conversion-pending"
+  publish_private "$temporary/conversion-pending" "$bootstrap_pending"
   conversion_status=0
-  curl --config "$conversion_config" || conversion_status=$?
+  curl -q --config "$conversion_config" || conversion_status=$?
   chmod 600 "$bootstrap_pending"
   rm -f "$code_file" "$conversion_config"
   if python3 - "$bootstrap_pending" <<'PY'
@@ -419,7 +437,8 @@ python3 - "$installation_response" "$installation_token" <<'PY'
 import json,os,sys
 from pathlib import Path
 value=json.load(open(sys.argv[1])); token=value.get('token')
-if not isinstance(token,str) or len(token)<20 or value.get('permissions',{}).get('contents') != 'read': raise SystemExit(1)
+permissions=value.get('permissions',{})
+if not isinstance(token,str) or len(token)<20 or permissions.get('contents') != 'read' or permissions.get('organization_self_hosted_runners') != 'write': raise SystemExit(1)
 Path(sys.argv[2]).write_text(token); os.chmod(sys.argv[2],0o600)
 PY
 rm -f "$installation_response"
@@ -483,7 +502,8 @@ from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps({'name':sys.argv[2],'visibility':'selected','allows_public_repositories':False,'restricted_to_workflows':False,'selected_repository_ids':[]}))
 PY
   response=$temporary/group.json
-  printf '%s\n' "organization=$organization" "runner_group=$runner_group" >"$group_pending"
+  printf '%s\n' "organization=$organization" "runner_group=$runner_group" >"$temporary/group-pending"
+  publish_private "$temporary/group-pending" "$group_pending"
   group_creation_pending=true
   write_auth_config "$installation_token" POST "https://api.github.com/orgs/$organization/actions/runner-groups" "$response" "$payload"
   group_id=$(python3 - "$response" "$runner_group" <<'PY'
@@ -578,7 +598,7 @@ from desired_state import parse_env, validate_host_values
 if validate_host_values(parse_env(Path(sys.argv[2]), allow_unknown=False)) != validate_host_values(parse_env(Path(sys.argv[3]), allow_unknown=False)): raise SystemExit(1)
 PY
 else
-  install -m 0600 "$staged" "$host_env"
+  publish_private "$staged" "$host_env"
 fi
 note "BOOTSTRAP_OK organization=$organization instance=$instance app=$CI_FLEET_GITHUB_APP_SLUG app_id=$verified_app_id installation_id=$installation_id runner_group=$runner_group runner_group_id=$group_id repositories=${#repositories[@]}"
 if [[ $mode == check ]]; then note "CREDENTIALS_VERIFIED pem=$pem host_config=$host_env"; else note "CREDENTIALS_WRITTEN pem=$pem host_config=$host_env"; fi

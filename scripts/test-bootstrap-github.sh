@@ -165,6 +165,10 @@ PY
 if wait "$live_pid"; then fail 'injected post-conversion failure succeeded'; fi
 [[ -f $live_root/etc/ci-fleet/bootstrap-recovery.json && ! -e $live_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'converted credentials were not left recoverable'
 cp "$live_root/etc/ci-fleet/bootstrap-recovery.json" "$tmp/matching-recovery.json"
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_FAIL_AFTER_PEM_PUBLISH=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'injected interruption between credential publications succeeded'; fi
+cmp -s "$FAKE_BOOTSTRAP_PEM_FILE" "$live_root/etc/ci-fleet/secrets/github-app.pem" || fail 'interrupted publication left a partial PEM'
+[[ -f $live_root/etc/ci-fleet/bootstrap-recovery.json && ! -e $live_root/etc/ci-fleet/bootstrap-app.env ]] || fail 'interrupted atomic publication lost recovery state'
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_TRANSIENT_INSTALLATIONS=1 "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$live_port" --timeout 30 >"$tmp/live.out" 2>"$tmp/live.err"
 grep -Fq 'BOOTSTRAP_OK organization=example-org instance=example-ci-01 app=ci-fleet-example-org-example-ci-01 app_id=123 installation_id=456 runner_group=example-ci-experimental runner_group_id=789 repositories=1' "$tmp/live.out" || fail 'live bootstrap did not complete'
@@ -215,6 +219,9 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root "$boot
 [[ $(sha256sum "$host_env" "$pem") == "$before" ]] || fail 'check mode changed credentials'
 grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not verify persisted credentials'
 [[ $(grep -c '^POST runner-group-create$' "$tmp/api.log") == "$post_rollback_create_count" ]] || fail 'check mode mutated the runner group'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root bash -x "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >"$tmp/traced.out" 2>"$tmp/traced.err"
+if grep -Fq -e fixture-installation-token-value -e eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9 "$tmp/traced.out" "$tmp/traced.err"; then fail 'inherited shell tracing exposed credentials'; fi
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_DISCOVERY_PAGE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'target runner group on second discovery page was rejected'
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_GROUP_PAGE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
@@ -278,9 +285,39 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'mismatched App client ID was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_NO_CONTENTS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'installation token without contents permission was accepted'; fi
+for permission in read none; do
+  permission_before=$(sha256sum "$host_env" "$pem")
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_RUNNER_PERMISSION=$permission "$bootstrap" --check --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'effective token without runner-write permission was accepted'; fi
+  [[ $(sha256sum "$host_env" "$pem") == "$permission_before" ]] || fail 'permission rejection changed active credentials'
+done
 for kind in installation-repositories runner-groups runner-group-repositories; do
   if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_TRUNCATE_KIND=$kind "$bootstrap" --check --organization example-org --instance example-ci-01 \
     --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail "truncated $kind page was accepted"; fi
 done
+
+# A conversion consumed by GitHub with zero response bytes must block registration retries.
+uncertain_root=$tmp/uncertain-conversion-root
+uncertain_port=$(port)
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$uncertain_root FAKE_BOOTSTRAP_CONVERSION_NO_RESPONSE=1 "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$uncertain_port" --timeout 30 >"$tmp/zero.out" 2>"$tmp/zero.err" &
+uncertain_pid=$!
+processes+=("$uncertain_pid")
+wait_http "http://127.0.0.1:$uncertain_port/" "$tmp/zero.html"
+zero_state=$(python3 - "$tmp/zero.html" <<'PY'
+import html,re,sys,urllib.parse
+print(urllib.parse.unquote(re.search(r"settings/apps/new\?state=([^'&]+)",html.unescape(open(sys.argv[1]).read())).group(1)))
+PY
+)
+"$real_curl" -fsS --get --data-urlencode code=fixture-zero-response --data-urlencode "state=$zero_state" \
+  "http://127.0.0.1:$uncertain_port/callback" -o "$tmp/zero-callback.html"
+if wait "$uncertain_pid"; then fail 'zero-response conversion succeeded'; fi
+zero_pending=$uncertain_root/etc/ci-fleet/bootstrap-recovery.pending
+[[ -f $zero_pending && $(stat -c %a "$zero_pending") == 600 && ! -e $uncertain_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'zero-response conversion lost its protected uncertainty marker'
+api_before=$(wc -l <"$tmp/api.log")
+pending_before=$(sha256sum "$zero_pending")
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$uncertain_root "$bootstrap" --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'uncertain conversion rerun succeeded'; fi
+[[ $(wc -l <"$tmp/api.log") == "$api_before" && $(sha256sum "$zero_pending") == "$pending_before" ]] || fail 'uncertain conversion rerun registered another App or discarded recovery bytes'
 
 printf 'BOOTSTRAP_TESTS_OK\n'

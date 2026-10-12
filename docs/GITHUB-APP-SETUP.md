@@ -55,8 +55,9 @@ The bootstrap:
   runner write permission;
 - creates a private, independently revocable App identity for the host;
 - verifies callback state and expires the callback after 30–1800 seconds;
-- writes the PEM directly to `/etc/ci-fleet/secrets/github-app.pem` and the
-  client/installation IDs to `/etc/ci-fleet/host.env`, root-owned mode `0600`;
+- publishes the PEM at `/etc/ci-fleet/secrets/github-app.pem` and the
+  client/installation IDs at `/etc/ci-fleet/host.env` through atomic file
+  replacement, root-owned mode `0600`;
 - rejects public, archived, wrong-organization, broader App installation, and
   default/broad runner-group access;
 - creates a missing selected-repository runner group with no repository access.
@@ -66,10 +67,13 @@ The bootstrap:
   Existing groups whose identity or access differs remain unchanged;
 - destroys the conversion code, JWTs, installation token, callback state, and
   temporary curl configurations on exit. After a successful conversion, a
-  protected mode-`0600` `bootstrap-recovery.json` (or atomic-publication
-  `bootstrap-recovery.pending`) is deliberately retained until the PEM and
+  protected mode-`0600` `bootstrap-recovery.json` or
+  `bootstrap-recovery.pending` is deliberately retained until the PEM and
   identity record are installed. Rerun the identical live command to recover.
-  Recovery never overwrites a different active PEM or App identity.
+  A durable pending marker exists before conversion starts. A lost response,
+  including zero response bytes, blocks registration retries until owner
+  recovery or abandonment. Recovery never overwrites a different active PEM
+  or App identity.
   If bootstrap is abandoned, an organization owner must first revoke/delete the
   exact newly created App, then explicitly remove those recovery files; ordinary
   cleanup never discards potentially unique credentials.
@@ -85,7 +89,8 @@ sudo ./scripts/bootstrap-github.sh --dry-run \
 ```
 
 After success, rerun the same command with `--check` to verify App ownership,
-permissions, exact selected private repositories, exact runner-group access,
+App permissions, effective installation `contents: read` and organization
+runner-write permission, exact selected private repositories, runner-group access,
 and host-local credential modes without changing the App or runner group.
 Bootstrap preserves an existing valid `CI_FLEET_RUNNER_TTL` and uses the host
 contract default of `6h` when the optional setting is absent.
