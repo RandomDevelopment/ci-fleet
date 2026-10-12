@@ -28,7 +28,11 @@ cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
-if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
+if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && ( $1 == disable || $1 == enable ) ]]; then
+  for unit in "$@"; do
+    [[ $unit != ci-fleet-tester-*.timer || -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/$unit ]] || exit 5
+  done
+fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
 if [[ $1 == disable && ${FAKE_TESTER_DISABLE_DANGLING_FAILURE:-0} == 1 ]]; then
   for unit in "$@"; do
@@ -397,7 +401,7 @@ FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtim
 FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null || fail 'health rejected a reachable route without a Docker healthcheck'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unreachable route without a Docker healthcheck'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
-for live_policy in privileged bind broad-port unbounded unlimited-swap device-cgroup devices device-requests cgroup-host cgroup-default; do
+for live_policy in privileged bind broad-port unbounded unlimited-swap device-cgroup devices device-requests cgroup-host cgroup-default pid-host pid-container ipc-host ipc-container ipc-shareable uts-host userns-host; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
 done
 legacy_model=$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json
@@ -587,6 +591,17 @@ chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper\n' >>"$release/
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'tampered installed release passed check'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'repaired release failed check'
+for timer in ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer; do
+  for loaded in 0 1; do
+    rm "$root/etc/systemd/system/$timer"
+    : >"$tmp/systemctl.log"
+    FAKE_TESTER_EFFECTIVE_TIMERS=$loaded FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 "$installer" --install --ref "$ref" >/dev/null || fail 'missing timer required a second repair invocation'
+    if grep '^disable ' "$tmp/systemctl.log" | grep -Fq "$timer"; then fail 'repair tried to disable a missing timer file'; fi
+    if [[ $loaded == 1 ]]; then grep -Fxq "stop $timer" "$tmp/systemctl.log" || fail 'repair did not stop a cached missing timer'; fi
+    "$installer" --check >/dev/null || fail 'missing timer repair failed check'
+    [[ ! -e $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'missing timer repair left its activation journal'
+  done
+done
 for point in displaced published; do
   for signal in TERM KILL; do
     chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper before interrupted repair\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"

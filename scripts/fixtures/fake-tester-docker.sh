@@ -55,12 +55,19 @@ if [[ $1 == inspect ]]; then
   elif [[ " $* " != *' --format '* ]]; then
     read -r project route_port < <(python3 -c 'import json,sys; model=json.load(open(sys.argv[1])); print(model["name"], model["services"]["web"]["ports"][0]["published"])' "$(<"${FAKE_TESTER_MODEL_PATH:?}")")
     privileged=false; nano_cpus=500000000; memory=134217728; memory_swap=268435456; pids_limit=128; oom_disable=false; oom_score=0; network_mode=${project}_default; networks=$(printf '{"%s":{}}' "$network_mode"); mounts=$(printf '[{"Type":"volume","Name":"%s_data","Destination":"/data","RW":true}]' "$project"); ports=$(printf '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"%s"}]}' "$route_port")
-    host_extra=; cgroup_mode=private
+    host_extra=; cgroup_mode=private; pid_mode=; ipc_mode=private; uts_mode=; userns_mode=
     case ${FAKE_TESTER_LIVE_POLICY:-valid} in
       runtime) host_extra=',"Runtime":"alternative"' ;;
       logging) host_extra=',"LogConfig":{"Type":"json-file","Config":{}}' ;;
       cgroup-host) cgroup_mode=host ;;
       cgroup-default) cgroup_mode= ;;
+      pid-host) pid_mode=host ;;
+      pid-container) pid_mode=container:other ;;
+      ipc-host) ipc_mode=host ;;
+      ipc-container) ipc_mode=container:other ;;
+      ipc-shareable) ipc_mode=shareable ;;
+      uts-host) uts_mode=host ;;
+      userns-host) userns_mode=host ;;
       image-volume) mounts=${mounts%]}',{"Type":"volume","Name":"anonymous-image-volume","Destination":"/image-data","RW":true}]' ;;
       device-cgroup) host_extra=',"DeviceCgroupRules":["b 8:* rwm"]' ;;
       devices) host_extra=',"Devices":[{"PathOnHost":"/dev/sda","PathInContainer":"/dev/sda","CgroupPermissions":"rwm"}]' ;;
@@ -83,7 +90,7 @@ if [[ $1 == inspect ]]; then
       mounts=${mounts%]}$(printf ',{"Type":"bind","Source":"%s","Destination":"%s","RW":false}]' "$FAKE_TESTER_SECRET_FILE" "$secret_target")
     fi
     if [[ ${*: -1} == fixture-worker-id ]]; then mounts='[]'; ports='{}'; fi
-    printf '[{"HostConfig":{"Runtime":"runc","LogConfig":{"Type":"local","Config":{"max-size":"10m","max-file":"3","compress":"true"}},"Privileged":%s,"CgroupnsMode":"%s","ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"MemorySwap":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"%s},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$cgroup_mode" "$nano_cpus" "$memory" "$memory_swap" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$host_extra" "$networks" "$mounts"
+    printf '[{"HostConfig":{"Runtime":"runc","LogConfig":{"Type":"local","Config":{"max-size":"10m","max-file":"3","compress":"true"}},"Privileged":%s,"CgroupnsMode":"%s","PidMode":"%s","IpcMode":"%s","UTSMode":"%s","UsernsMode":"%s","ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"MemorySwap":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"%s},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$cgroup_mode" "$pid_mode" "$ipc_mode" "$uts_mode" "$userns_mode" "$nano_cpus" "$memory" "$memory_swap" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$host_extra" "$networks" "$mounts"
   else
     printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"
   fi

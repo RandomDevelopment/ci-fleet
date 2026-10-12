@@ -273,6 +273,20 @@ create_tmpfiles() {
 }
 
 enable_timers() { systemctl enable --now "${timers[@]}" >/dev/null; }
+quiesce_timers() {
+  local unit load_state present_timers=()
+  for unit in "${timers[@]}"; do
+    if [[ -e $systemd_dir/$unit ]]; then
+      present_timers+=("$unit")
+    else
+      load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+      [[ -n $load_state ]] || return 1
+      if [[ $load_state != not-found ]]; then systemctl stop "$unit" >/dev/null || return 1; fi
+    fi
+  done
+  if (( ${#present_timers[@]} )); then systemctl disable --now "${present_timers[@]}" >/dev/null || return 1; fi
+  return 0
+}
 start_maintenance() {
   local status=0
   systemctl start --no-block "${services[@]}" >/dev/null || return 1
@@ -401,7 +415,7 @@ activate_release() {
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
   if [[ -e $current_link || -L $current_link ]]; then previous=$(installed_revision) || die 'installed tester revision is invalid'; fi
   write_activation_journal "$previous" "$commit" "$record_previous"
-  if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
+  if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! quiesce_timers; then
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     retire_activation || die 'incumbent timers restored but activation journal retirement failed'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'

@@ -395,6 +395,7 @@ expected_mounts=sorted(expected_mounts)
 actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else mount.get('Name','') if mount.get('Type')=='volume' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
 networks={model['networks'][name]['name'] for name in service.get('networks',{'default':{}})}
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
+       host.get('PidMode')=='' and host.get('IpcMode')=='private' and host.get('UTSMode')=='' and host.get('UsernsMode')=='' and
        not host.get('CapAdd') and not host.get('Devices') and not host.get('DeviceRequests') and not host.get('DeviceCgroupRules') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
        host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and host['MemorySwap'] >= service['mem_limit'] and
