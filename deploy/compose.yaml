@@ -3,6 +3,8 @@ name: ci-fleet
 services:
   runner-image:
     image: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}
     build:
       context: ../runner
       args:
@@ -15,6 +17,8 @@ services:
 
   docker-socket-proxy:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     command: ["--docker-socket-proxy"]
     user: "0:0"
     restart: unless-stopped
@@ -41,6 +45,8 @@ services:
 
   controller:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     build:
       context: ..
       dockerfile: controller/Dockerfile

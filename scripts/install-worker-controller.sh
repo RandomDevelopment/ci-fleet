@@ -464,8 +464,8 @@ compose() {
 
 build_managed_images() {
   local release=$1 environment=$2
-  require_buildx
   (
+    require_buildx
     set -a
     # shellcheck disable=SC1090
     . "$environment"
@@ -1836,9 +1836,21 @@ restore_systemd_snapshot() {
   return "$failed"
 }
 
+retag_checkpoint_image() {
+  local identifier=$1 tag=$2 error
+  if docker image tag "$identifier" "$tag"; then
+    [[ $(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null) == "$identifier" ]]
+    return
+  fi
+  error=$(docker image inspect --format '{{.Id}}' "$identifier" 2>&1) && return 1
+  [[ "$error" == *"No such image: $identifier"* ]] || return 1
+  docker info >/dev/null 2>&1 || return 1
+  return 2
+}
+
 restore_checkpoint() {
   local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
-  local restore_controller_tag_after_start=false
+  local restore_controller_tag_after_start=false missing_checkpoint_image=false image_status=0
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -2092,9 +2104,9 @@ PY
   if $restore_images; then
     for index in 0 1; do
       if [[ "$index" == 1 && ${#checkpoint_images[@]} == 5 ]]; then
-        docker image tag "${checkpoint_images[4]}" "${checkpoint_images[index]}" || failed=1
-        actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
-        [[ "$actual" == "${checkpoint_images[4]}" ]] || failed=1
+        image_status=0
+        retag_checkpoint_image "${checkpoint_images[4]}" "${checkpoint_images[index]}" || image_status=$?
+        case $image_status in 0) ;; 2) missing_checkpoint_image=true ;; *) failed=1 ;; esac
         restore_controller_tag_after_start=true
       elif [[ ${checkpoint_images[index + 2]} == absent ]]; then
         if docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" >/dev/null 2>&1; then
@@ -2108,9 +2120,9 @@ PY
           docker info >/dev/null 2>&1 || failed=1
         fi
       else
-        docker image tag "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || failed=1
-        actual=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[index]}" 2>/dev/null) || failed=1
-        [[ "$actual" == "${checkpoint_images[index + 2]}" ]] || failed=1
+        image_status=0
+        retag_checkpoint_image "${checkpoint_images[index + 2]}" "${checkpoint_images[index]}" || image_status=$?
+        case $image_status in 0) ;; 2) missing_checkpoint_image=true ;; *) failed=1 ;; esac
       fi
     done
   fi
@@ -2119,7 +2131,7 @@ PY
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
-      if ! managed_images_match "$rendered_env"; then
+      if $missing_checkpoint_image || ! managed_images_match "$rendered_env"; then
         build_managed_images "$release_dir" "$rendered_env" || failed=1
         if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
       fi
@@ -2266,6 +2278,33 @@ on_policy_term() {
 trap on_error ERR
 trap on_term TERM
 
+mandatory_timers_active() {
+  local timer
+  for timer in "${timer_names[@]}"; do
+    systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || return 1
+  done
+}
+
+stage_manager_only() {
+  local manager_ref=$1 installed_engine
+  [[ "$mode" == upgrade && -f "$state_file" && -f "$rendered_env" ]] \
+    || die 'managed_images may be omitted only for an existing managed engine upgrade'
+  ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
+    || die 'managed_images cannot be removed after image enforcement'
+  installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
+  [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "${manager_ref:-}" != "$engine_ref" ]] \
+    || die 'manager-only staging requires a new engine revision'
+  staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
+  install_release
+  install_manager "$engine_ref" "$release_dir"
+  install_systemd_units "$(current_runtime_release)"
+  systemctl enable --now "${timer_names[@]}" >/dev/null
+  [[ ! -f "$systemd_dir/ci-fleet-capacity.timer" ]] || systemctl enable --now ci-fleet-capacity.timer >/dev/null
+  staged_runtime_matches || die 'manager-only staging changed the installed runtime'
+  mandatory_timers_active || die 'manager-only staging has inactive mandatory maintenance timers'
+  note "MANAGER_STAGED engine_ref=$engine_ref runtime_ref=$installed_engine"
+}
+
 staged_runtime_matches() {
   local installed_ref installed_state installed_release
   local candidate_env=$rendered_env engine_ref controller_id=$controller_id controller_container=$controller_container
@@ -2288,10 +2327,7 @@ perform_check() {
     [[ -L "$manager_current" && $(readlink -f "$manager_current") == "$manager_releases/$engine_ref" ]] \
       || die 'manager-only staging is incomplete'
     staged_runtime_matches || die 'manager-only staging changed the installed runtime'
-    local timer
-    for timer in "${timer_names[@]}"; do
-      systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || die 'manager-only staging has inactive mandatory maintenance timers'
-    done
+    mandatory_timers_active || die 'manager-only staging has inactive mandatory maintenance timers'
     note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
     return
   fi
@@ -2362,21 +2398,7 @@ perform_converge() {
     die 'manager current pointer is invalid'
   fi
   if ! managed_image_ids_configured; then
-    [[ "$mode" == upgrade && -f "$state_file" && -f "$rendered_env" ]] \
-      || die 'managed_images may be omitted only for an existing managed engine upgrade'
-    ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
-      || die 'managed_images cannot be removed after image enforcement'
-    installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
-    [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "$manager_ref" != "$engine_ref" ]] \
-      || die 'manager-only staging requires a new engine revision'
-    staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
-    install_release
-    install_manager "$engine_ref" "$release_dir"
-    install_systemd_units "$(current_runtime_release)"
-    systemctl enable --now "${timer_names[@]}" >/dev/null
-    [[ ! -f "$systemd_dir/ci-fleet-capacity.timer" ]] || systemctl enable --now ci-fleet-capacity.timer >/dev/null
-    staged_runtime_matches || die 'manager-only staging changed the installed runtime'
-    note "MANAGER_STAGED engine_ref=$engine_ref runtime_ref=$installed_engine"
+    stage_manager_only "${manager_ref:-}"
     return
   fi
   drift_count

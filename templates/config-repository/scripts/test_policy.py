@@ -89,6 +89,45 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_explicit_null_image_policy_is_rejected(self) -> None:
+        config = reference_config()
+        config["managed_images"] = None
+        self.assert_rejected(config, "null is not", strict=True)
+
+    def test_staging_retains_live_feature_evidence(self) -> None:
+        previous = reference_config()
+        previous.pop("managed_images")
+        controller = first_controller(previous)
+        controller["status_reporting"] = {"enabled": True, "config_file": "/etc/ci-fleet/monitoring.env"}
+        name = next(iter(previous["controllers"]))
+        evidence = {name: {"engine_ref": controller["engine_ref"], "status_reporting_config": True,
+                           "required_status_reporting": True, "docker_network_policy_config": True,
+                           "docker_default_bridge_cidr_config": True}}
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation, evidence)
+        self.assertEqual(validation.errors, [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "previous.json"
+            new = root / "current.json"
+            proof = root / "evidence.json"
+            old.write_text(json.dumps(previous))
+            new.write_text(json.dumps(current))
+            proof.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": evidence}))
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
+                                     "--previous-config", str(old), "--rollout-evidence", str(proof),
+                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # Reverting the staged manager keeps the same runtime and evidence.
+            old.write_text(json.dumps(current))
+            new.write_text(json.dumps(previous))
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
+                                     "--previous-config", str(old), "--rollout-evidence", str(proof),
+                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_managed_images_may_be_omitted_for_staged_engine_upgrade(self) -> None:
         config = copy.deepcopy(reference_config())
         config.pop("managed_images")

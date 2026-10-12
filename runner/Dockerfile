@@ -39,7 +39,6 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 RUN useradd --create-home --no-log-init --uid 1001 --shell /bin/bash runner \
     && chage -d "$((SOURCE_DATE_EPOCH / 86400))" runner \
     && rm -f /etc/shadow- \
-    && rm -f /etc/shadow- \
     && install -d -o runner -g runner /home/runner/_work \
     && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 

@@ -92,9 +92,6 @@ jobs:
             --architecture amd64 \
             --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
             --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --output "${temporary_directory}/invalid.json"; then
             echo 'initializer accepted an invalid registry' >&2
             exit 1
@@ -104,9 +101,6 @@ jobs:
             --organization test-company \
             --project test-app \
             --engine-ref "${engine_ref}" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --architecture amd64 \
             --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
             --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \

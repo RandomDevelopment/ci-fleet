@@ -28,9 +28,9 @@ The Dockerfiles fail closed if an upstream artifact no longer matches. Updating 
 
 Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
 
-1. Separately authorize the bootstrap on each host. Before publishing the staging revision, stop its reconciliation timer so the incumbent manager cannot race the bootstrap. Check out the reviewed candidate engine and invoke that checkout's `scripts/install-worker-controller.sh --upgrade` with the approved staging configuration ref. The incumbent installer cannot stage the new manager. Its attempt to load the new Compose release fails closed when reviewed image IDs are missing.
-2. Merge and apply a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged.
-3. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime.
+1. Separately authorize the bootstrap on each host and stop its reconciliation timer before publishing the staging revision. The incumbent installer cannot stage the new manager. Its attempt to load the new Compose release fails closed when reviewed image IDs are missing.
+2. Merge a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged. Apply it with the reviewed candidate checkout's `scripts/install-worker-controller.sh --upgrade` and the approved staging configuration ref. Preserve the incumbent runtime capability evidence and all controller settings during this revision.
+3. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime. Preserve the incumbent capability evidence for this activation commit, then update it to the verified new runtime in a follow-up revision. Restart reconciliation using the staged manager. A staging rollback may select the retained runtime engine through the same candidate installer.
 
 Fresh installation, field removal after enforcement, unrelated staging changes, and runtime activation without reviewed IDs all fail closed.
 
