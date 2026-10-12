@@ -8,24 +8,55 @@ services:
       args:
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
         SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-1786752000}
-        RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.335.1}
+        RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.337.0}
     command: ["/bin/true"]
     deploy:
       replicas: 0
 
+  docker-socket-proxy:
+    image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    command: ["--docker-socket-proxy"]
+    user: "0:0"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CI_FLEET_ROOT_PREFIX:-}/run/lock/ci-fleet:/run/ci-fleet/locks
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ci-fleet-controller", "--check-docker-socket-proxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
   controller:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
     build:
-      context: ../controller
+      context: ..
+      dockerfile: controller/Dockerfile
       args:
         CI_FLEET_VERSION: ${CI_FLEET_VERSION:-dev}
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
         SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-1786752000}
     restart: unless-stopped
+    depends_on:
+      docker-socket-proxy:
+        condition: service_healthy
     user: "0:0"
     group_add:
       - ${CI_FLEET_DOCKER_GID:?set CI_FLEET_DOCKER_GID to the numeric group owning the Docker socket}
     environment:
+      DOCKER_HOST: unix:///run/ci-fleet/locks/docker.sock
       CI_FLEET_GITHUB_URL: ${CI_FLEET_GITHUB_URL:?set the organization or repository URL}
       CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-}
       CI_FLEET_LABELS: ${CI_FLEET_LABELS:-docker-ci-experimental}
@@ -41,10 +72,13 @@ services:
       CI_FLEET_RUNNER_MEMORY_MIB: ${CI_FLEET_RUNNER_MEMORY_MIB:-8192}
       CI_FLEET_RUNNER_TTL: ${CI_FLEET_RUNNER_TTL:-6h}
       CI_FLEET_DOCKER_GID: ${CI_FLEET_DOCKER_GID}
+      CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR: ${CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR:-}
+      CI_FLEET_DOCKER_NETWORKS_PER_RUNNER: ${CI_FLEET_DOCKER_NETWORKS_PER_RUNNER:-0}
+      CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS: ${CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS:-0}
     secrets:
       - github_app_private_key
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CI_FLEET_ROOT_PREFIX:-}/run/lock/ci-fleet:/run/ci-fleet/locks
     security_opt:
       - no-new-privileges:true
     deploy:

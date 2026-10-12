@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "configuration_repository_id": 101,
+  "branch": "main",
+  "workflow_id": 501,
+  "required_jobs": ["validate"],
+  "reviewer_ids": [202]
+}

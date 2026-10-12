@@ -9,17 +9,17 @@ Convergence rejects an image whose revision label is correct but whose image ID 
 
 ## Reviewed upstream inputs
 
-Reviewed on 2026-08-16 from official upstream endpoints:
+Base-image and runner selections updated on 2026-10-12 from official upstream endpoints. Snapshot and Docker package pins retain their 2026-08-16 review:
 
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
-| Debian 13.6 slim, both managed images | `sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258` | Docker Hub registry manifest for `library/debian:13.6-slim` |
-| Go 1.26.5 Bookworm build image | `sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd` | Docker Hub registry manifest for `library/golang:1.26.5-bookworm` |
+| Debian 13.7 slim, both managed images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim` |
+| Go 1.27.1 Bookworm build image | `sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66` | Docker Hub registry manifest for `library/golang:1.27.1-bookworm` |
 | Debian packages | signed snapshot `20260815T000000Z` | `snapshot.debian.org/archive/debian/20260815T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
 | Compose plugin 5.4.0 amd64 / arm64 | exact package version and SHA-256 `75391b38459edf75a975504903673fdb87a5a4016d689d9b198e2db1ae2796e0` / `81261f286d48c1c9e586065bc52065bbbe3b023705ebdb72377ec465c216dcaf` | official Docker Debian `trixie` package index |
-| Actions Runner 2.335.1 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
+| Actions Runner 2.337.0 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
 | Controller modules | versions plus checksums in `controller/go.mod` and `controller/go.sum` | Go checksum-verified module inputs |
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.
@@ -58,7 +58,7 @@ docker buildx build --builder "$BUILDER" --no-cache --load \
   --provenance=false --sbom=false \
   --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION \
   --build-arg SOURCE_DATE_EPOCH \
-  --tag "ci-fleet-controller:$CI_FLEET_VERSION" controller
+  --tag "ci-fleet-controller:$CI_FLEET_VERSION" --file controller/Dockerfile .
 docker image inspect --format '{{.Id}}' \
   "ci-fleet-controller:$CI_FLEET_VERSION" \
   "ci-fleet-runner:$CI_FLEET_VERSION"

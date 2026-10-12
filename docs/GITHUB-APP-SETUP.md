@@ -16,6 +16,140 @@ organization, app name, and configuration repository.
   identity, not a personal account.
 - Revoking access is removing an installation, not rotating a user's keys.
 
+## Bootstrap on the target host
+
+Run the reviewed checkout on the target Linux Docker host. The callback listens
+on a private Unix socket accessible only to the operator UID. Reach it through
+an authenticated SSH local forward bound to loopback on the management device.
+The callback nonce stays in a private file and never enters process arguments.
+
+```bash
+sudo ./scripts/bootstrap-github.sh \
+  --organization example-org \
+  --instance example-ci-01 \
+  --config-repository example-org/config \
+  --runner-group example-ci-experimental \
+  --allow-repository example-org/example-repo=123456 \
+  --config-repo /PATH/TO/PINNED/CHECKOUT \
+  --config-ref REVIEWED_COMMIT
+```
+
+All names above are fictional. The script prints a non-secret `CALLBACK_SOCKET`,
+an SSH `TUNNEL` command shape, and a local `REGISTRATION_URL`. Establish the
+forward, open the URL, press the single registration button, install the
+new App for **only** the private configuration repository, and return to the
+terminal. The target host receives and exchanges the temporary code itself.
+Before creating or installing the App, the owner must confirm GitHub's
+**Only on this account** installation setting. The manifest requests a private
+App, but GitHub's documented App API does not report visibility. Bootstrap
+verifies ownership, permissions, and installation scope; it cannot replace this
+owner visibility check.
+Neither the code nor any credential is copied through a phone, clipboard, chat,
+email, issue, or second computer.
+
+Use a second terminal on the same management device to establish the printed
+SSH local forward after bootstrap starts. Substitute the target host and use
+the same remote account that invoked `sudo`. Keep the SSH session open and open
+`http://127.0.0.1:8765/` on that device. Close the session after bootstrap. The
+Unix socket is mode `0600` inside an operator-owned mode-`0700` directory. The
+operator UID defaults to `SUDO_UID`, or the invoking UID without sudo. A root
+console operator can explicitly authorize the trusted SSH account with
+`--operator-uid UID`. Other target-host users cannot fetch the nonce or submit
+a callback. Do not expose the forward on a shared management device. No TCP
+listener or firewall change is created on the target host.
+
+Each project argument includes its numeric repository ID, obtained and reviewed
+by the organization owner. The App itself receives access only to the separate
+configuration repository; the project name/ID pairs scope runner-group routing
+without granting the controller App project source access.
+
+GitHub App names are globally unique. If the default
+`ci-fleet-ORGANIZATION-INSTANCE` is unavailable, add `--app-name UNIQUE_NAME`
+with a reviewed lowercase name of at most 34 characters. Bootstrap binds the
+returned slug to that name and persists it. Reruns reuse the persisted slug;
+an explicitly different name is rejected.
+
+The bootstrap:
+
+- requests `contents: read`, metadata read, and organization self-hosted
+  runner write permission. With a valid protected configuration-approval policy
+  and activation marker, it also requests and verifies `actions: read` and
+  `pull_requests: read`. It rejects unrelated or broader permissions;
+- creates a private, independently revocable App identity for the host;
+- verifies callback state and expires the callback after 30–1800 seconds;
+- publishes the PEM at `/etc/ci-fleet/secrets/github-app.pem` and the
+  client/installation IDs at `/etc/ci-fleet/host.env` through atomic file
+  replacement, root-owned mode `0600`;
+- rejects public, archived, wrong-organization, broader App installation, and
+  default, enterprise-inherited, or broad runner-group access;
+- creates a missing selected-repository runner group with no repository access.
+  Only an acknowledged creation receives the requested access. An acknowledged
+  group created by this invocation is automatically deleted if inspection,
+  routing verification, or cancellation fails before verification completes.
+  Existing groups whose identity or access differs remain unchanged;
+- retains the protected creation marker and acknowledged group ID until routing
+  verification or confirmed deletion completes. SIGKILL, host failure, or an
+  uncertain rollback leaves owner reconciliation required before any retry;
+- records registration uncertainty in root-owned mode-`0600`
+  `bootstrap-registration.pending` before exposing the portal. A callback
+  atomically publishes its code as protected `bootstrap-registration-code`.
+  A rerun with the same identity resumes a captured code without registering
+  another App. Without a captured code, retries stop for owner reconciliation,
+  including after cancellation, timeout, or a dropped tunnel;
+- destroys JWTs, installation tokens, callback nonces, and temporary curl
+  configurations on exit. The captured code remains protected until conversion
+  is attempted. After a successful conversion, a
+  protected mode-`0600` `bootstrap-recovery.json` or
+  `bootstrap-recovery.pending` is deliberately retained until the PEM and
+  identity record are installed. Bootstrap syncs the completed response to disk
+  and syncs its recovery pathname before installing credentials. Rerun the
+  identical live command to recover.
+  A durable pending marker exists before conversion starts. A lost response,
+  including zero response bytes, blocks registration retries until owner
+  recovery or abandonment. Recovery never overwrites a different active PEM
+  or App identity.
+  If bootstrap is abandoned, an organization owner must first revoke/delete the
+  exact newly created App, then explicitly remove those recovery files; ordinary
+  cleanup never discards potentially unique credentials.
+
+Inspect the argument format without local writes or GitHub calls. Dry-run does
+not validate a configuration checkout; live mode validates the pinned commit
+before mutation.
+
+```bash
+sudo ./scripts/bootstrap-github.sh --dry-run \
+  --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config \
+  --runner-group example-ci-experimental \
+  --allow-repository example-org/example-repo=123456
+```
+
+After success, rerun the same command with `--check` to verify App ownership,
+App permissions, effective installation `contents: read` and organization
+runner-write permission, exact selected private repositories, runner-group access,
+and host-local credential modes without changing the App or runner group.
+An enabled approval gate also verifies the selected configuration repository
+against the protected numeric repository ID and default branch.
+Bootstrap preserves an existing valid `CI_FLEET_RUNNER_TTL` and uses the host
+contract default of `6h` when the optional setting is absent.
+
+Every live command requires `--config-repo /PATH/TO/PINNED/CHECKOUT` and
+`--config-ref REVIEWED_COMMIT`. Add `--install` for direct handoff to the
+idempotent host installer. Bootstrap requires the commit in that local checkout and verifies that its
+selected controller pool exactly matches the requested organization, runner
+group, and project allowlist before any GitHub mutation.
+When the protected approval gate is enabled, bootstrap also verifies the pinned
+configuration commit's review and CI evidence against the installed trusted
+baseline before discovering or provisioning a runner group.
+Remote `OWNER/REPO` handoff is rejected because a fresh host has no independently
+verified Git credential before App creation. Without `--install`, the redacted
+final report prints the installer shape. Externally provisioned credentials remain supported;
+the generic installer never requires this bootstrap on every run.
+
+## Manual provisioning
+
+Use this path for externally provisioned credentials.
+
 ## 1. Create the app
 
 Organization Settings → Developer settings → GitHub Apps → New GitHub App.
@@ -25,6 +159,7 @@ Organization Settings → Developer settings → GitHub Apps → New GitHub App.
 | Name | one per controller, e.g. `ci-fleet-<controller-id>` |
 | Homepage URL | your organization or fleet repository URL |
 | Webhook | disabled — the controller polls; nothing calls it |
+| Installation availability | Only on this account |
 
 ## 2. Grant minimum permissions
 
@@ -40,9 +175,12 @@ Organization permissions:
 | --- | --- | --- |
 | Self-hosted runners | Read & write | mint runner registration tokens |
 
-Nothing else. No `write` on contents, no actions, no administration. If the
-controller ever needs more, that is a reviewed design change, not a settings
-tweak.
+The ordinary controller needs no other repository permissions. The optional
+[configuration approval gate](CONFIGURATION-APPROVAL.md) additionally requires
+read-only Pull requests and Actions on the configuration repository to verify
+reviews and exact-commit workflow/job results. It never needs contents write,
+approval write, or administration. Granting those read permissions and enabling
+the gate remain separately authorized operator actions.
 
 ## 3. Generate and transfer the private key
 
@@ -151,6 +289,44 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
   and approve it.
 - 401 on token exchange: `host.env` has the wrong client ID, installation ID,
   or PEM path.
+
+## Accidental creation rollback
+
+An unresolved `bootstrap-registration.pending` means GitHub may have created
+the App before a callback reached the host. An owner must reconcile the exact
+organization and App name in that protected marker. Resume a durably captured
+code with the identical live command while GitHub still accepts it. Otherwise,
+confirm no App was created or revoke/delete only the exact newly registered App
+before approving removal of the marker and any retained code. An unrelated App
+that already holds the same name must remain untouched.
+
+If the runner-group creation response is lost or malformed, bootstrap performs
+read-only discovery and retains root-owned mode-`0600`
+`/etc/ci-fleet/bootstrap-group.pending`. The new group has no repository access.
+The marker also survives SIGKILL or a failed rollback after acknowledged
+creation, and records the acknowledged group ID until verification or confirmed
+deletion completes. Reconcile that exact ID when present.
+Automatic deletion must return HTTP 204. A redirect, unexpected status, or
+transport failure retains the marker for owner reconciliation.
+Every later live/check invocation stops before making a GitHub request until an
+organization owner reconciles the recorded organization/group with GitHub.
+An absent group immediately after a timeout does not prove creation failed.
+Confirm the eventual outcome and ownership, remove only an accidentally created
+empty group with separate authorization, then remove the exact pending file.
+Do not delete an observed group based on its name alone.
+
+The bootstrap never replaces or broadens an existing App or runner group. A new
+runner group with an acknowledged creation ID is automatically deleted only
+when the same invocation cannot
+verify its identity/access or is cancelled before verification; it never deletes
+a pre-existing group. If another new object was approved accidentally, stop
+before running the installer. An
+organization owner must compare the App slug/ID and group name in the redacted
+bootstrap report with GitHub's settings, verify the new group has no runners,
+then remove only those exact newly created objects. Preserve and investigate any
+pre-existing or mismatched object. App deletion and deletion of any group outside
+the bounded automatic rollback above are live GitHub-setting mutations and
+therefore require separate authorization; this command does not automate them.
 
 ## Rotation
 
