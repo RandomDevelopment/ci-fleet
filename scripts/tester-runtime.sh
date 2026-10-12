@@ -165,7 +165,8 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('external_links') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('logging') != {'driver':'local','options':{'max-size':'10m','max-file':'3','compress':'true'}}: raise SystemExit(f'{name}: bounded local logging is required')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('device_cgroup_rules') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
@@ -377,6 +378,7 @@ live_container_matches() {
 import json,sys
 model=json.load(open(sys.argv[1])); service=model['services'][sys.argv[2]]
 value=json.load(open(sys.argv[3])); actual=value[0] if len(value)==1 else {}; host=actual.get('HostConfig') or {}
+if host.get('Runtime') != 'runc' or host.get('LogConfig') != {'Type':'local','Config':{'max-size':'10m','max-file':'3','compress':'true'}}: raise SystemExit('live runtime or logging policy differs')
 security=lambda values: sorted(str(value).replace('=true',':true') for value in values or [])
 expected_ports={}
 for port in service.get('ports',[]):
@@ -452,7 +454,7 @@ secure_directory "$state_dir" 700
 if [[ $action != --remove && $action != --cleanup ]]; then
   load_global
   for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current /opt/ci-fleet/manager/current \
-    /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /opt/ci-fleet-deployer \
+    /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials /opt/ci-fleet-deployer \
     /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
     [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
   done
@@ -518,7 +520,8 @@ fi
 case $action in
   --check)
     docker info --format '{{.DockerRootDir}}' >/dev/null
-    docker compose version >/dev/null
+    [[ $(docker info --format '{{.DefaultRuntime}}') == runc ]] || die 'Docker default runtime must be runc'
+  docker compose version >/dev/null
     check_network_probes
     check_disk_threshold
     report "CHECK_OK max_environments=$max_environments disk_used_percent=$used"

@@ -122,3 +122,5 @@ Uninstall fails while any managed environment exists. It removes only tester uni
 ## External acceptance gate
 
 Before this PR can merge, an authorized operator must use a prepared isolated Debian Docker host with test-only identity/network/storage/domain boundaries and provide evidence for: fresh install, unchanged second install, immutable application converge, health, scoped reset, expiration cleanup, upgrade, failed-upgrade restoration, rollback, and removal. No production credentials, database, network authority, ordinary CI runner, or live production system may participate.
+
+Every service must declare the local Docker logging driver with `max-size: "10m"`, `max-file: "3"`, and `compress: "true"`. Add this policy before upgrading existing definitions. The daemon default runtime must be `runc`; preflight and live inspection reject another runtime. Health verifies the effective logging limits and runtime.

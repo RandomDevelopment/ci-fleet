@@ -92,7 +92,7 @@ acquire_lifecycle_lock() {
 reject_other_roles() {
   local path inventory_kind inventory_status inventory unit
   for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" "$(root_path /opt/ci-fleet/manager/current)" \
-    "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /opt/ci-fleet-deployer)" \
+    "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" "$(root_path /opt/ci-fleet-deployer)" \
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
     "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)" \
     "$systemd_dir"/ci-fleet-deployer* "$systemd_dir"/ci-fleet-health* "$systemd_dir"/ci-fleet-cleanup* \
@@ -186,6 +186,7 @@ host_preflight() {
   python3 -c 'import yaml' 2>/dev/null || die 'python3-yaml is required for Compose source validation'
   pin_local_docker
   [[ $(docker info --format '{{len .DefaultAddressPools}}') =~ ^[1-9][0-9]*$ ]] || die 'explicit Docker default address pools are required'
+  [[ $(docker info --format '{{.DefaultRuntime}}') == runc ]] || die 'Docker default runtime must be runc'
   docker compose version >/dev/null
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
   docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
@@ -295,8 +296,8 @@ remove_units() {
   if (( ${#present_services[@]} )); then
     systemctl stop "${present_services[@]}" >/dev/null 2>&1 || return 1
   fi
-  for unit in "${present_units[@]}"; do rm -f -- "$systemd_dir/$unit" || return 1; done
-  rm -f -- "$tmpfiles_dir/$tmpfiles_conf" || return 1
+  for unit in "${units[@]}"; do rm -f -- "$systemd_dir/$unit" "$systemd_dir/$unit.new" || return 1; done
+  rm -f -- "$tmpfiles_dir/$tmpfiles_conf" "$tmpfiles_dir/$tmpfiles_conf.new" "$stable_launcher.new" || return 1
   systemctl daemon-reload
 }
 
@@ -307,7 +308,7 @@ write_lkg() {
 }
 
 activate_release() {
-  local commit=$1 target=$release_dir/$1 previous= record_previous=${2:-1}
+  local commit=$1 target=$release_dir/$1 previous='' record_previous=${2:-1}
   reject_other_roles
   reject_unit_dropins
   reject_tmpfiles_overrides

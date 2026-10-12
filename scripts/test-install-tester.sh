@@ -263,9 +263,10 @@ for policy in mutable privileged bind broad-port udp-route external-network envi
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
   if grep -Fq 'up -d' "$tmp/docker.log"; then fail "unsafe policy reached activation: $policy"; fi
 done
-for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority ipv6-enabled ipv6-allocation; do
+for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority ipv6-enabled ipv6-allocation runtime logging; do
   if FAKE_TESTER_LIVE_POLICY=$policy "$runtime" --health >/dev/null 2>&1; then fail "unsafe live policy passed health: $policy"; fi
 done
+if FAKE_TESTER_DEFAULT_RUNTIME=alternative "$runtime" --check >/dev/null 2>&1; then fail 'alternative default runtime was accepted'; fi
 if FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'unreachable loopback route passed health'; fi
 grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared route port'
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
@@ -557,7 +558,7 @@ done
 ln -s /missing "$root/var/lib/ci-fleet-deployer"
 if "$installer" --check >/dev/null 2>&1; then fail 'tester accepted a dangling deployer role marker'; fi
 rm "$root/var/lib/ci-fleet-deployer"
-for marker in /opt/ci-fleet/current /opt/ci-fleet/manager/current /opt/ci-fleet-deployer/current /opt/ci-fleet-status/current /var/lib/ci-fleet-status-installer; do
+for marker in /var/lib/ci-fleet-deployer-container-credentials /opt/ci-fleet/current /opt/ci-fleet/manager/current /opt/ci-fleet-deployer/current /opt/ci-fleet-status/current /var/lib/ci-fleet-status-installer; do
   mkdir -p "$(dirname "$root$marker")"
   for kind in directory symlink; do
     if [[ $kind == directory ]]; then mkdir "$root$marker"; else ln -s /missing "$root$marker"; fi
@@ -767,7 +768,12 @@ export FAKE_TESTER_QUEUED_SERVICES=$queued_services
 unset FAKE_TESTER_QUEUED_SERVICES
 [[ -f $root/etc/ci-fleet-tester/tester.env && ! -L $root/opt/ci-fleet-tester/current ]] || fail 'uninstall did not preserve config/remove runtime'
 [[ ! -e $root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf ]] || fail 'uninstall left the tester tmpfiles rule installed'
+for unit in ci-fleet-tester-health.service ci-fleet-tester-cleanup.timer; do
+  : >"$root/etc/systemd/system/$unit.new"
+done
+: >"$root/etc/tmpfiles.d/ci-fleet-tester-lock.conf.new"
 FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'repeated uninstall failed on absent units'
+if compgen -G "$root/etc/systemd/system/ci-fleet-tester*.new" >/dev/null || [[ -e $root/etc/tmpfiles.d/ci-fleet-tester-lock.conf.new ]]; then fail 'uninstall retained staged tester units'; fi
 git -C "$upgrade_repo" checkout --quiet "$bad_ref"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'invalid fresh install succeeded'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed fresh-install teardown removed the recovery link'
