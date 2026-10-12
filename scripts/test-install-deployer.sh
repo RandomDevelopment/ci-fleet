@@ -365,6 +365,7 @@ CORE_REF=$core_ref
 ENVIRONMENT=$environment
 TARGET_ID=$target
 DEPLOYER_IDENTITY=${environment}-deployer-01
+DOCKER_SOCKET=$root/run/docker.sock
 ADAPTER_PATH=$adapter
 ADAPTER_SHA256=$(sha256sum "$adapter" | cut -d' ' -f1)
 CREDENTIAL_PROVIDER=file

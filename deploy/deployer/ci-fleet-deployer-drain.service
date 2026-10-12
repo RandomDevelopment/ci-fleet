@@ -17,3 +17,8 @@ ProtectSystem=strict
 ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer
 ReadWritePaths=/var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer
 RestrictSUIDSGID=yes
+
+RuntimeDirectory=ci-fleet-deployer-adapters
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery

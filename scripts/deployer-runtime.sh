@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 set +x
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 operation=${1:-}
 case "$operation" in health|cleanup|deploy|drain) ;; *) printf 'ERROR: usage: deployer-runtime.sh health|cleanup|deploy|drain\n' >&2; exit 2 ;; esac
@@ -349,18 +350,27 @@ transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
 shopt -u nullglob
 ((${#transactions[@]} == 0)) || die 'interrupted installer transaction requires recovery'
 secure_directory "$state_root" 'deployer state directory'
+[[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || die 'interrupted runtime adapter requires operator recovery'
 
 secure_file "$config" 'deployer configuration'
 if [[ $operation == health || $operation == cleanup ]]; then
-  policy_snapshot=$(mktemp "${TMPDIR:-/tmp}/ci-fleet-deployer-policy.XXXXXX")
+  if [[ $testing == 1 ]]; then
+    policy_snapshot=$(mktemp "${TMPDIR:-/tmp}/ci-fleet-deployer-policy.XXXXXX")
+  else
+    secure_directory "$state_root/.adapter-recovery" 'adapter recovery directory'
+    policy_snapshot=$(mktemp "$state_root/.adapter-recovery/.policy.XXXXXX")
+  fi
 else
   policy_snapshot=$(mktemp "$state_root/.active-policy.XXXXXX")
 fi
 install -m 0600 "$config" "$policy_snapshot"
 config=$policy_snapshot
 trap 'rm -f "${policy_snapshot:-}"' EXIT
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 parse_file "$config" cfg configuration "$config_keys"
+[[ $testing == 1 || -v 'cfg[DOCKER_SOCKET]' ]] || die 'configuration requires a dedicated rootless Docker socket'
+DOCKER_HOST=unix://${cfg[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
+export DOCKER_HOST
 for key in ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE; do [[ -v "cfg[$key]" ]] || die "configuration is missing $key"; done
 [[ ${cfg[SCHEMA_VERSION]:-} == 1 ]] || die 'configuration has an unsupported or missing schema version'
 [[ ${cfg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || die 'configuration is missing a valid core revision'
@@ -403,13 +413,40 @@ exec 7<"${cfg[ADAPTER_PATH]}"
 adapter_path=/proc/$$/fd/7
 validate_credential
 
+run_application_adapter() {
+  local action=$1 unit guard=$state_root/.adapter-recovery/pending-unit status=0 recovery=$state_root/.adapter-recovery
+  if [[ $testing == 1 ]]; then
+    env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="${request_snapshot:-}" "$adapter_path" "$action" 9<&-
+    return
+  fi
+  [[ ! -e "$guard" && ! -L "$guard" ]] || die 'outstanding adapter guard requires operator recovery'
+  secure_directory "$recovery" 'adapter recovery directory'
+  unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
+  (umask 077; printf '%s\n' "$unit" >"$guard")
+  sync -f "$guard" "$recovery" 2>/dev/null || die 'adapter guard is not durable'
+  local -a command=(python3 "$script_dir/deployer_adapter.py" run --policy "$config" --adapter "$adapter_path" --store "$recovery" --runtime "$(root_path /run/ci-fleet-deployer-adapters)" --unit "$unit" --seconds 2400)
+  [[ -z ${request_snapshot:-} ]] || command+=(--request "$request_snapshot")
+  "${command[@]}" "$action" 8>&- 9<&- || status=$?
+  python3 - "$script_dir" "$unit" <<'PYCODE' || die 'adapter termination could not be verified'
+import sys
+sys.path.insert(0, sys.argv[1])
+from deployer_adapter import unit_inactive
+raise SystemExit(0 if unit_inactive(sys.argv[2]) else 1)
+PYCODE
+  if [[ $action != deploy ]]; then
+    rm -f "$guard"
+    sync -f "$recovery" 2>/dev/null || die 'adapter guard retirement is not durable'
+  fi
+  return "$status"
+}
+
 secure_directory "$log_root" 'deployer log directory'
 
 case "$operation" in
   health)
     reject_mixed_role
     validate_credential
-    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" "$operation" 9<&-
+    run_application_adapter "$operation"
     ;;
   cleanup)
     not_drained
@@ -418,7 +455,7 @@ case "$operation" in
     # Scheduled cleanup mutates application-owned resources; production paths
     # remain separately gated like deploy.
     [[ ${cfg[ENVIRONMENT]} != production ]] || die 'production cleanup is not authorized by the current accepted scope'
-    env CI_FLEET_DEPLOYER_CONFIG="$config" "$adapter_path" cleanup 9<&-
+    run_application_adapter cleanup
     ;;
   deploy)
     not_drained
@@ -669,7 +706,7 @@ PY
     incumbent_policy_backup=$(base64 -w0 "$deployed_current/policy.conf")
     incumbent_state_backup=$(base64 -w0 "$deployed_current/state.json")
     set +e
-    env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="$request_snapshot" "$adapter_path" deploy 9<&-
+    run_application_adapter deploy
     adapter_status=$?
     set -e
     if ((adapter_status == 0)); then
@@ -729,6 +766,11 @@ PY
     lkg_captured=0
     if [[ -n "$retired_snapshot" && -d "$deployed_root/$retired_snapshot" && ! -L "$deployed_root/$retired_snapshot" ]]; then rm -rf -- "${deployed_root:?}/$retired_snapshot"; fi
     sync -f "$deployed_root" 2>/dev/null || sync "$deployed_root" 2>/dev/null || die 'retired deployed snapshot is not durable'
+    if [[ $testing != 1 ]]; then
+      sync -f "$state_root" "$log_root" 2>/dev/null || die 'completed deployment is not durable'
+      rm -f "$state_root/.adapter-recovery/pending-unit"
+      sync -f "$state_root/.adapter-recovery" 2>/dev/null || die 'deployment guard retirement is not durable'
+    fi
     audit_pending=0
     ;;
 esac

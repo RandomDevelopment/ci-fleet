@@ -52,6 +52,7 @@ scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh
 scripts/test-install-deployer.sh
+python3 scripts/test_deployer_adapter.py
 scripts/test-deployer-units.sh
 scripts/test-install-status-receiver.sh
 
