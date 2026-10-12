@@ -140,6 +140,21 @@ exec "$FAKE_TESTER_REAL_SYNC" "$@"
 EOF_SYNC
 chmod 0755 "$fake_bin/sync"
 
+export FAKE_TESTER_REAL_MV
+FAKE_TESTER_REAL_MV=$(command -v mv)
+cat >"$fake_bin/mv" <<'EOF_MV'
+#!/usr/bin/env bash
+"$FAKE_TESTER_REAL_MV" "$@" || exit $?
+if [[ ${1:-} == -T && -n ${FAKE_TESTER_REPAIR_SIGNAL:-} ]]; then
+  if [[ ( ${FAKE_TESTER_REPAIR_POINT:-} == displaced && $3 == */.replaced-* ) || ( ${FAKE_TESTER_REPAIR_POINT:-} == published && $2 == */.staging-* ) ]]; then
+    kill -s "$FAKE_TESTER_REPAIR_SIGNAL" "$PPID"
+    exit 137
+  fi
+fi
+exit 0
+EOF_MV
+chmod 0755 "$fake_bin/mv"
+
 write_environment() {
   local id=$1 port=$2
   mkdir -p "$root/etc/ci-fleet-tester/secrets/$id"; chmod 700 "$root/etc/ci-fleet-tester/secrets/$id"
@@ -572,6 +587,20 @@ chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper\n' >>"$release/
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'tampered installed release passed check'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'repaired release failed check'
+for point in displaced published; do
+  for signal in TERM KILL; do
+    chmod u+w "$release/scripts/tester-runtime.sh"; printf '# tamper before interrupted repair\n' >>"$release/scripts/tester-runtime.sh"; chmod 0555 "$release/scripts/tester-runtime.sh"
+    interrupted_rc=0
+    FAKE_TESTER_REPAIR_POINT=$point FAKE_TESTER_REPAIR_SIGNAL=$signal "$installer" --install --ref "$ref" >"$tmp/killed-repair.out" 2>&1 || interrupted_rc=$?
+    [[ $interrupted_rc == 137 || $interrupted_rc == 143 ]] || fail 'release repair interruption did not terminate the installer'
+    [[ -f $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'release repair lost its recovery journal'
+    if "$stable_launcher" --health >"$tmp/pending-repair.out" 2>&1; then fail 'interrupted repair allowed runtime use'; fi
+    grep -Fq 'requires installer recovery' "$tmp/pending-repair.out" || fail 'interrupted repair failed outside its runtime guard'
+    "$installer" --install --ref "$ref" >/dev/null || fail 'interrupted release repair could not resume'
+    "$installer" --check >/dev/null || fail 'resumed release repair failed check'
+    [[ ! -e $root/var/lib/ci-fleet-tester/activation-pending && ! -e $root/opt/ci-fleet-tester/releases/.staging-$ref && ! -e $root/opt/ci-fleet-tester/releases/.replaced-$ref ]] || fail 'resumed release repair left recovery residue'
+  done
+done
 installed_unit=$root/etc/systemd/system/ci-fleet-tester-health.service
 export FAKE_TESTER_LOADED_POLICY_DRIFT=$tmp/loaded-policy-drift
 touch "$FAKE_TESTER_LOADED_POLICY_DRIFT"

@@ -223,6 +223,15 @@ release_complete() {
   (cd "$path" && sha256sum --status -c .ci-fleet-release.sha256) || return 1
 }
 
+publish_staged_release() {
+  local commit=$1 target=$release_dir/$1 staging=$release_dir/.staging-$1 replaced=$release_dir/.replaced-$1
+  release_complete "$staging" "$commit" || die 'staged tester release is incomplete'
+  if [[ -e $target || -L $target ]]; then remove_release_tree "$replaced"; mv -T "$target" "$replaced"; fi
+  if ! mv -T "$staging" "$target"; then [[ ! -e $replaced ]] || mv -T "$replaced" "$target"; die 'could not replace tester release'; fi
+  sync -f "$release_dir" || die 'tester release publication is not durable'
+  remove_release_tree "$replaced"
+}
+
 stage_release() {
   local commit=$1 target=$release_dir/$1 staging=$release_dir/.staging-$1 replaced=$release_dir/.replaced-$1
   if [[ -e $target ]] && release_complete "$target" "$commit"; then return; fi
@@ -239,9 +248,9 @@ stage_release() {
   (cd "$staging" && sha256sum scripts/tester-runtime.sh scripts/tester-launcher.sh .ci-fleet-source-revision host/systemd/* >.ci-fleet-release.sha256)
   chmod 0444 "$staging/.ci-fleet-source-revision" "$staging/.ci-fleet-release.sha256" "$staging"/host/systemd/*
   chmod 0555 "$staging" "$staging/scripts" "$staging/host" "$staging/host/systemd" "$staging/scripts/tester-runtime.sh" "$staging/scripts/tester-launcher.sh"
-  [[ ! -e $target ]] || mv -T "$target" "$replaced"
-  if ! mv -T "$staging" "$target"; then [[ ! -e $replaced ]] || mv -T "$replaced" "$target"; die 'could not replace tester release'; fi
-  remove_release_tree "$replaced"
+  sync -f "$staging" || die 'staged tester release is not durable'
+  if [[ -L $current_link && $(readlink -f "$current_link") == "$target" ]]; then write_activation_journal "$commit" "$commit" 1; fi
+  publish_staged_release "$commit"
 }
 
 install_units() {
@@ -352,6 +361,11 @@ recover_activation() {
   reject_unit_dropins
   reject_tmpfiles_overrides
   if [[ $previous != none ]]; then
+    if [[ $previous == "$candidate" ]]; then
+      if ! release_complete "$release_dir/$previous" "$previous"; then publish_staged_release "$previous"; fi
+      remove_release_tree "$release_dir/.staging-$previous"
+      remove_release_tree "$release_dir/.replaced-$previous"
+    fi
     release_complete "$release_dir/$previous" "$previous" || die 'interrupted activation incumbent is incomplete; operator recovery is required'
     ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
     if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'interrupted activation incumbent unit restore failed; journal retained'; fi
@@ -369,7 +383,7 @@ write_activation_journal() {
   if [[ -e $activation_pending || -L $activation_pending ]]; then
     secure_file "$activation_pending" 600
     read -r previous candidate record_previous phase pid started boot extra <"$activation_pending"
-    [[ ${4:-validate} == probes && $phase == validate && $previous == "${1:-none}" && $candidate == "$2" && $record_previous == "$3" && $pid == "$$" && -z $extra ]] || die 'outstanding activation requires recovery'
+    [[ ${4:-validate} =~ ^(validate|probes)$ && $phase == validate && $previous == "${1:-none}" && $candidate == "$2" && $record_previous == "$3" && $pid == "$$" && -z $extra ]] || die 'outstanding activation requires recovery'
   fi
   [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
   printf '%s %s %s %s %s %s %s\n' "${1:-none}" "$2" "$3" "${4:-validate}" "$$" "$(awk '{print $22}' /proc/$$/stat)" "$(</proc/sys/kernel/random/boot_id)" >"$activation_pending.new"
