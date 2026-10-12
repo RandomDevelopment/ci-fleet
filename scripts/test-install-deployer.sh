@@ -2589,7 +2589,7 @@ for scheduled in health cleanup; do
   scheduled_unit=$repo_root/deploy/deployer/ci-fleet-deployer-$scheduled.service
   grep -Fq 'ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer' "$scheduled_unit" || fail 'scheduled adapter state is writable'
   grep -Fxq 'ReadWritePaths=-/run/docker.sock' "$scheduled_unit" || fail 'scheduled adapter has unexpected writable paths'
-  [[ $(grep '^ReadWritePaths=' "$scheduled_unit" | wc -l) == 2 ]] || fail 'scheduled adapter has additional writable paths'
+  [[ $(grep -c '^ReadWritePaths=' "$scheduled_unit") == 2 ]] || fail 'scheduled adapter has additional writable paths'
   grep -Fxq 'ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery /var/lib/ci-fleet-deployer-container-credentials' "$scheduled_unit" || fail 'scheduled adapter recovery paths differ'
   grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$scheduled_unit" || fail 'scheduled adapter can bypass its mount namespace'
 done
