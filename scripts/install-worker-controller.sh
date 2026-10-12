@@ -475,7 +475,7 @@ build_managed_images() {
     cleanup_builder
     docker buildx create --name "$managed_builder" --driver docker-container \
       --driver-opt "image=$managed_buildkit" --bootstrap >/dev/null
-    [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit" && $2 == "version:" {print $3; exit}') == v0.32.2 ]] \
+    [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit:" {print $2; exit}') == v0.32.2 ]] \
       || die 'reviewed BuildKit backend v0.32.2 is unavailable'
     docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
       --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH=1786752000 \
@@ -2324,7 +2324,7 @@ perform_check() {
   local count
   display_last_health
   if ! managed_image_ids_configured; then
-    [[ -L "$manager_current" && $(readlink -f "$manager_current") == "$manager_releases/$engine_ref" ]] \
+    [[ $(manager_release_from_raw_pointer || true) == "$manager_releases/$engine_ref" ]] \
       || die 'manager-only staging is incomplete'
     staged_runtime_matches || die 'manager-only staging changed the installed runtime'
     mandatory_timers_active || die 'manager-only staging has inactive mandatory maintenance timers'

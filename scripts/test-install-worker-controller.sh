@@ -68,7 +68,7 @@ case "${1:-}" in
   buildx)
     case "${2:-}" in
       version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-v0.32.1}" ;;
-      inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: v0.32.2\n' ;;
+      inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit: v0.32.2\n' ;;
       create|rm) ;;
       build)
         [[ "$*" == *'--build-arg SOURCE_DATE_EPOCH=1786752000'* ]] || exit 94
