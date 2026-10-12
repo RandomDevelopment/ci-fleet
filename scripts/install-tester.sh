@@ -163,6 +163,7 @@ host_preflight() {
   reject_unit_dropins
   python3 -c 'import yaml' 2>/dev/null || die 'python3-yaml is required for Compose source validation'
   pin_local_docker
+  [[ $(docker info --format '{{len .DefaultAddressPools}}') =~ ^[1-9][0-9]*$ ]] || die 'explicit Docker default address pools are required'
   docker compose version >/dev/null
   printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
   docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
@@ -244,12 +245,18 @@ start_maintenance() {
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  local unit present_units=() present_timers=()
+  local unit load_state present_units=() present_timers=()
   for unit in "${units[@]}"; do
     [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
   for unit in "${timers[@]}"; do
-    [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_timers+=("$unit")
+    if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
+      present_timers+=("$unit")
+    else
+      load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+      [[ -n $load_state ]] || return 1
+      [[ $load_state == not-found ]] || present_timers+=("$unit")
+    fi
   done
   if (( ${#present_timers[@]} )); then
     systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1

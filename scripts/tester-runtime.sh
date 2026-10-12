@@ -165,7 +165,7 @@ image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}
 ports=[]
 for name,service in services.items():
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
-    if service.get('privileged') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
+    if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('cgroup') or service.get('external_links') or service.get('logging') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     deploy=service.get('deploy') or {}; reservations=(deploy.get('resources') or {}).get('reservations') or {}
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
@@ -367,7 +367,8 @@ for port in service.get('ports',[]):
 expected_mounts=[(mount['type'],model['volumes'][mount['source']]['name'] if mount['type']=='volume' else '',mount['target'],not mount.get('read_only',False)) for mount in service.get('volumes',[])]
 for secret in service.get('secrets',[]):
     item={'source':secret,'target':secret} if isinstance(secret,str) else secret
-    expected_mounts.append(('bind',model['secrets'][item['source']]['file'],f"/run/secrets/{item.get('target',item['source'])}",False))
+    target=item.get('target',item['source'])
+    expected_mounts.append(('bind',model['secrets'][item['source']]['file'],target if target.startswith('/') else f'/run/secrets/{target}',False))
 expected_mounts=sorted(expected_mounts)
 actual_mounts=sorted((mount.get('Type'),mount.get('Source','') if mount.get('Type')=='bind' else mount.get('Name','') if mount.get('Type')=='volume' else '',mount.get('Destination'),bool(mount.get('RW'))) for mount in actual.get('Mounts') or [])
 networks={model['networks'][name]['name'] for name in service.get('networks',{'default':{}})}
@@ -384,7 +385,7 @@ PY
 }
 
 inspect_environment() {
-  local target=$1 id compose route_service route_port status=running resource value bytes=0 mount expected running_state service configured_image
+  local target=$1 id compose route_port status=running resource value bytes=0 mount expected running_state service configured_image
   local -a containers=()
   local -A expected_images=() observed_services=()
   id=$(basename "$target" .state); secure_file "$target" 600
@@ -394,7 +395,6 @@ inspect_environment() {
   compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
   [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
   secure_file "$compose" 600
-  route_service=$(awk -F= '$1=="ROUTE_SERVICE"{print $2}' "$target")
   route_port=$(awk -F= '$1=="ROUTE_PORT"{print $2}' "$target")
   [[ $route_port =~ ^[0-9]+$ && $route_port -ge 1024 && $route_port -le 65535 ]] || die 'stored route port is invalid'
   validate_existing_resources "$compose" "$id" true || status=unhealthy
@@ -409,11 +409,7 @@ inspect_environment() {
     [[ -n ${expected_images[$service]:-} && $configured_image == "${expected_images[$service]}" ]] || status=unhealthy
     live_container_matches "$compose" "$service" "$resource" || status=unhealthy
     observed_services[$service]=$((${observed_services[$service]:-0} + 1))
-    if [[ $service == "$route_service" ]]; then
-      [[ $running_state == 'running healthy' ]] || status=unhealthy
-    else
-      [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
-    fi
+    [[ $running_state == 'running healthy' || $running_state == 'running none' ]] || status=unhealthy
   done
   for service in "${!expected_images[@]}"; do [[ ${observed_services[$service]:-0} == 1 ]] || status=unhealthy; done
   inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$(project_name "$id")") || die 'container inventory failed'
@@ -450,6 +446,11 @@ socket_mode=$(stat -c %a "$docker_socket")
 unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$docker_socket"
 [[ $(docker info --format '{{.DockerRootDir}}') == "$(root_path /var/lib/docker)" ]] || die 'Docker daemon root is not the expected local path'
+case $action in
+  --check|--health|--converge|--reset)
+    [[ $(docker info --format '{{len .DefaultAddressPools}}') =~ ^[1-9][0-9]*$ ]] || die 'explicit Docker default address pools are required'
+    ;;
+esac
 if [[ ${CI_FLEET_TESTER_LOCK_FD:-} == 8 && -e /proc/$$/fd/8 && $(readlink -f /proc/$$/fd/8) == "$lock_file" ]] && flock -n 8; then
   unset CI_FLEET_TESTER_LOCK_FD
 else

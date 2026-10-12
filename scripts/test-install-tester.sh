@@ -29,6 +29,10 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
+if [[ $1 == show && " $* " == *' --property=LoadState '* ]]; then
+  if [[ -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
+  exit 0
+fi
 if [[ $1 == show ]]; then
   printf 'FragmentPath=%s/%s\nDropInPaths=%s\n' "${FAKE_TESTER_FRAGMENT_ROOT:-${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system}" "${*: -1}" "${FAKE_TESTER_UNIT_DROPINS:-}"
 fi
@@ -99,6 +103,7 @@ write_environment() {
   chmod 600 "$root/etc/ci-fleet-tester/environments/$id.env"
 }
 
+if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
 if FAKE_TESTER_UNRELATED_RESOURCE='other-container|ordinary-ci' "$runtime" --check >/dev/null 2>&1; then fail 'tester admitted unrelated Docker state'; fi
 ln -s /missing "$root/var/lib/ci-fleet-deployer"
@@ -114,6 +119,10 @@ if "$runtime" --check >/dev/null 2>&1; then fail 'symlinked lifecycle lock direc
 rm "$root/run/lock/ci-fleet-tester"
 if FAKE_TESTER_DOCKER_ROOT=/remote/docker "$runtime" --check >/dev/null 2>&1; then fail 'remote Docker daemon was accepted'; fi
 write_environment secretless 18079
+: >"$tmp/docker.log"
+if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 FAKE_TESTER_ROUTE_PORT=18079 "$runtime" --converge --environment secretless >/dev/null 2>&1; then fail 'converge accepted absent explicit Docker address pools'; fi
+[[ ! -e $root/var/lib/ci-fleet-tester/environments/secretless.state ]] || fail 'missing address pools reached tracked state creation'
+if grep -Fq 'up -d' "$tmp/docker.log"; then fail 'missing address pools reached activation'; fi
 rmdir "$root/etc/ci-fleet-tester/secrets/secretless"
 FAKE_TESTER_ROUTE_PORT=18079 "$runtime" --converge --environment secretless >/dev/null || fail 'secretless environment required an empty secret directory'
 FAKE_TESTER_ROUTE_PORT=18079 "$runtime" --remove --environment secretless >/dev/null
@@ -138,7 +147,7 @@ FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
   write_environment "bad-$policy" 18081
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
@@ -195,8 +204,9 @@ if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=changed-model "$runtime" --co
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=mutable "$runtime" --reset --environment preview-a >/dev/null 2>&1; then fail 'reset accepted invalid replacement'; fi
 [[ -f $state ]] || fail 'reset deleted the incumbent before validation'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='exited unhealthy' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a stopped managed service'; fi
-if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge accepted a route without health evidence'; fi
-if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a route without health evidence'; fi
+FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --converge --environment preview-a >/dev/null || fail 'converge rejected a reachable route without a Docker healthcheck'
+FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null || fail 'health rejected a reachable route without a Docker healthcheck'
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unreachable route without a Docker healthcheck'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
 for live_policy in privileged bind broad-port unbounded; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
@@ -211,8 +221,10 @@ FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=two-services "$runtime" --remove
 write_environment secret-preview 18082
 secret_file=$root/etc/ci-fleet-tester/secrets/secret-preview/credential
 printf 'example-test-scope-value\n' >"$secret_file"; chmod 600 "$secret_file"
-FAKE_TESTER_ROUTE_PORT=18082 FAKE_TESTER_POLICY=valid-secret FAKE_TESTER_SECRET_FILE=$secret_file "$runtime" --converge --environment secret-preview >/dev/null
-FAKE_TESTER_ROUTE_PORT=18082 "$runtime" --remove --environment secret-preview >/dev/null
+for secret_target in credential /etc/app/token; do
+  FAKE_TESTER_ROUTE_PORT=18082 FAKE_TESTER_POLICY=valid-secret FAKE_TESTER_SECRET_FILE=$secret_file FAKE_TESTER_SECRET_TARGET=$secret_target "$runtime" --converge --environment secret-preview >/dev/null || fail "valid secret target was rejected: $secret_target"
+  FAKE_TESTER_ROUTE_PORT=18082 "$runtime" --remove --environment secret-preview >/dev/null
+done
 outside_secret=$root/etc/ci-fleet-tester/secrets/outside
 printf 'example-test-scope-value\n' >"$outside_secret"; chmod 600 "$outside_secret"
 write_environment outside-secret 18083
@@ -312,6 +324,7 @@ symlink_ref=$(git -C "$symlink_repo" rev-parse HEAD)
 if "$symlink_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$symlink_ref" >/dev/null 2>&1; then fail 'install accepted a release archive with a symlinked member'; fi
 [[ $(stat -c %a "$host_target") == 640 ]] || fail 'release validation dereferenced an archive symlink'
 if DOCKER_HOST=tcp://example.invalid:2375 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installer accepted a remote Docker selector'; fi
+if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null 2>&1; then fail 'install accepted absent explicit Docker address pools'; fi
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" | grep -Fq INSTALL_OK || fail 'activation failed'
 grep -Fq 'start --no-block ci-fleet-tester-health.service ci-fleet-tester-cleanup.service' "$tmp/systemctl.log" || fail 'activation did not queue lock-blocked maintenance services'
 rm -rf "$root/run/lock/ci-fleet-tester"
@@ -529,6 +542,8 @@ if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tes
 # than failing because a timer unit file is missing.
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'fresh install failed before partial-unit test'
 rm -f "$root/etc/systemd/system/ci-fleet-tester-cleanup.timer"
-PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
+: >"$tmp/systemctl.log"
+FAKE_TESTER_EFFECTIVE_TIMERS=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'standalone uninstall required installation-only tools or a Git checkout'
+grep -Fxq 'disable --now ci-fleet-tester-health.timer ci-fleet-tester-cleanup.timer' "$tmp/systemctl.log" || fail 'uninstall skipped an effective timer without a local fragment'
 [[ -L $root/opt/ci-fleet-tester/current ]] && fail 'partial uninstall left the active release link'
 printf 'TESTER_INSTALLER_TESTS_OK\n'

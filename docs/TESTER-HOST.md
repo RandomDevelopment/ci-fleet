@@ -17,9 +17,9 @@ It rejects mutable images, public port binds, host bind mounts, external/unscope
 
 Compose source validation requires Debian's `python3-yaml` package. It decodes YAML keys before Compose runs and rejects external file loaders, including `include`, `extends`, `label_file`, and `env_file`. Escaped, tagged, anchored, and aliased keys follow the same rule. Duplicate and complex mapping keys are unsupported.
 
-Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. They also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
+Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. A running service without a Docker healthcheck is allowed; an unhealthy Docker healthcheck still fails validation. Health checks also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
 
-Compose init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units.
+Compose provider executables, init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units.
 
 The host's root administrators and Docker daemon are trusted. Health checks verify the isolation settings listed above; they do not attest process arguments, environment variables, or healthcheck definitions after an administrator recreates a container outside this runtime. Review image defaults and use the protected definitions for application changes. Restrict Docker administration to authorized operators.
 
@@ -75,7 +75,7 @@ sudo ./scripts/install-tester.sh --install \
   --ref "$ref"
 ```
 
-The command fails before mutation unless it sees Debian 12 or newer with `python3-yaml`, root, the local default Docker context/socket/root, Compose v2, required generic tools, protected paths, and Docker storage below 80%. It stages an immutable source release, validates it, switches the `current` symlink, installs health and expiration timers, and verifies both configuration and active environments. Repeating the same command is idempotent.
+The command fails before mutation unless it sees Debian 12 or newer with `python3-yaml`, root, the local default Docker context/socket/root, Compose v2, required generic tools, protected paths, and Docker storage below 80%, and explicit Docker default address pools. Configure those pools during host preparation; an empty custom-pool setting fails before application activation. It stages an immutable source release, validates it, switches the `current` symlink, installs health and expiration timers, and verifies both configuration and active environments. Repeating the same command is idempotent.
 
 ## Environment lifecycle
 

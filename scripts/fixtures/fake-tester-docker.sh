@@ -20,7 +20,9 @@ if [[ " $* " == *'|{{.Label "com.docker.compose.project"}}'* ]]; then
 fi
 if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
 if [[ $1 == info ]]; then
-  if [[ " $* " == *'DefaultAddressPools'* ]]; then printf '[{"Base":"198.51.100.0/24","Size":28}]\n';
+  if [[ " $* " == *'len .DefaultAddressPools'* ]]; then
+    [[ ${FAKE_TESTER_EMPTY_ADDRESS_POOLS:-0} == 1 ]] && printf '0\n' || printf '1\n'
+  elif [[ " $* " == *'DefaultAddressPools'* ]]; then printf '[{"Base":"198.51.100.0/24","Size":28}]\n';
   else printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; fi
   exit 0
 fi
@@ -56,6 +58,11 @@ if [[ $1 == inspect ]]; then
       oom-disabled) oom_disable=true ;;
       oom-priority) oom_score=-1000 ;;
     esac
+    if [[ -n ${FAKE_TESTER_SECRET_FILE:-} ]]; then
+      secret_target=${FAKE_TESTER_SECRET_TARGET:-/run/secrets/credential}
+      [[ $secret_target != credential ]] || secret_target=/run/secrets/credential
+      mounts=${mounts%]}$(printf ',{"Type":"bind","Source":"%s","Destination":"%s","RW":false}]' "$FAKE_TESTER_SECRET_FILE" "$secret_target")
+    fi
     if [[ ${*: -1} == fixture-worker-id ]]; then mounts='[]'; ports='{}'; fi
     printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$networks" "$mounts"
   else
@@ -138,6 +145,7 @@ case ${operation:-} in
       replicas) service_extra=',"deploy":{"replicas":2}' ;;
       scale) service_extra=',"scale":2' ;;
       lifecycle-hook) service_extra=',"post_start":[{"command":"true","privileged":true}]' ;;
+      provider) service_extra+=',"provider":{"type":"unapproved-host-executable"}' ;;
       pre-start) service_extra=',"pre_start":[{"image":"registry.example/example/init:latest","privileged":true,"command":"true"}]' ;;
       models) service_extra=',"models":["unapproved"]'; top_extra=',"models":{"unapproved":{"model":"example/model:latest"}}' ;;
       service-models) service_extra=',"models":["unapproved"]' ;;
@@ -161,7 +169,10 @@ case ${operation:-} in
       unbounded) service_extra=',"cpus":0,"mem_limit":0,"pids_limit":-1' ;;
       oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;
       two-services) extra_services=$(printf ',"worker":{"image":"%s","privileged":false,"read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"volumes":[],"cpus":0.5,"mem_limit":134217728,"pids_limit":128}' "$image") ;;
-      valid-secret|outside-secret) secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}") ;;
+      valid-secret|outside-secret)
+        secrets=$(printf '{"credential":{"file":"%s"}}' "${FAKE_TESTER_SECRET_FILE:?}")
+        service_extra+=$(printf ',"secrets":[{"source":"credential","target":"%s"}]' "${FAKE_TESTER_SECRET_TARGET:-credential}")
+        ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
     printf '{"name":"%s","services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"%s"}]%s}%s},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
