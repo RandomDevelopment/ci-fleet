@@ -333,6 +333,9 @@ class Policy:
             require(not body and set(query) <= {"fromImage", "tag"} and image == self.image,
                     "only the approved artifact may be pulled")
             return path + "?" + urllib.parse.urlencode(query, doseq=True), body
+        if method == "GET" and path == "/images/json":
+            require(not body and set(query) <= {"all", "filters", "digests"}, "unsupported image inventory query")
+            return "/images/json?all=1", body
         if method == "DELETE" and path.startswith("/images/"):
             image = path[len("/images/"):]
             require(self.operation == "cleanup" and self.artifact_owned(image) and image not in self.protected_images
@@ -428,6 +431,18 @@ def handler(policy: Policy):
                         policy.record_artifact()
                     mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
+                    if self.command == "GET" and path.startswith("/images/json?") and status == 200:
+                        inventory = json.loads(response, object_pairs_hook=unique_object)
+                        require(isinstance(inventory, list), "invalid image inventory")
+                        owned = {image for image, labels in policy.artifacts().items() if labels == policy.labels}
+                        scoped = []
+                        for item in inventory:
+                            require(isinstance(item, dict), "invalid image inventory entry")
+                            digests = [digest for digest in item.get("RepoDigests") or [] if digest in owned]
+                            if digests:
+                                item["RepoDigests"], item["RepoTags"] = digests, []
+                                scoped.append(item)
+                        response = json.dumps(scoped).encode()
                     if self.command == "DELETE" and path.startswith("/images/") and 200 <= status < 300 and policy.artifact_store is not None:
                         records = policy.artifacts()
                         records.pop(path.split("?", 1)[0][len("/images/"):], None)
