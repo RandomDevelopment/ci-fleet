@@ -2351,7 +2351,7 @@ perform_converge() {
   if ! $build_before_drain; then build_candidate; fi
   activate_candidate
   transaction_active=false
-  if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then rm -rf -- "$state_root/capacity"; fi
+  if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
 }
 
@@ -2373,8 +2373,21 @@ perform_rollback() {
   candidate_env=$checkpoint_env
   docker_network_policy_matches || die 'rollback requires Docker network-policy reconciliation through --upgrade'
   restore_checkpoint || die 'checkpoint restoration failed'
-  if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then rm -rf -- "$state_root/capacity"; fi
+  if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
+}
+
+remove_capacity_history() {
+  python3 - "$state_root/capacity" <<'PYTHON'
+from pathlib import Path
+import shutil
+import sys
+path = Path(sys.argv[1])
+if any(entry.is_symlink() for entry in (path, *path.parents)):
+    raise SystemExit("capacity history ancestry must not contain symlinks")
+if path.exists():
+    shutil.rmtree(path)
+PYTHON
 }
 
 perform_uninstall() {
@@ -2419,7 +2432,7 @@ perform_uninstall() {
   rm -rf -- "$state_root/health"
   rm -f "$manager_current"
   transaction_active=false
-  rm -rf -- "$state_root/capacity"
+  remove_capacity_history
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"
 }
 

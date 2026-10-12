@@ -33,6 +33,7 @@ printf 'CAPACITY_UNIT_STOP_TESTS_OK\n'
 
 {
   printf 'set -Eeuo pipefail\n'
+  sed -n '/^remove_capacity_history() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^perform_uninstall() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   cat <<'TEST'
 state_root=$1/state
@@ -72,3 +73,19 @@ sed -i 's/fail_manager_removal=true/fail_manager_removal=false/' "$temporary/uni
 bash "$temporary/uninstall.sh" "$temporary"
 [[ ! -e $temporary/state/capacity ]] || { printf 'FAIL: committed uninstall retained capacity history\n' >&2; exit 1; }
 printf 'CAPACITY_UNINSTALL_TRANSACTION_TESTS_OK\n'
+
+mkdir -p "$temporary/outside/capacity"
+printf 'keep\n' >"$temporary/outside/capacity/samples.jsonl"
+ln -s "$temporary/outside" "$temporary/redirected"
+{
+  printf 'set -Eeuo pipefail\n'
+  sed -n '/^remove_capacity_history() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
+  # shellcheck disable=SC2016
+  printf 'state_root=$1\nremove_capacity_history\n'
+} >"$temporary/remove.sh"
+if bash "$temporary/remove.sh" "$temporary/redirected"; then
+  printf 'FAIL: capacity removal followed a redirected state root\n' >&2
+  exit 1
+fi
+[[ -f $temporary/outside/capacity/samples.jsonl ]] || { printf 'FAIL: redirected capacity history was deleted\n' >&2; exit 1; }
+printf 'CAPACITY_ANCESTRY_REMOVAL_TESTS_OK\n'
