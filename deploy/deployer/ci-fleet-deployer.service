@@ -30,4 +30,4 @@ LockPersonality=yes
 RuntimeDirectory=ci-fleet-deployer-adapters
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
-ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery
+ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery /var/lib/ci-fleet-deployer-container-credentials

@@ -57,7 +57,7 @@ class Containment(unittest.TestCase):
         for key, value in {'Privileged': True, 'CapAdd': ['SYS_ADMIN'], 'PidMode': 'host', 'IpcMode': 'host',
                            'UsernsMode': 'host', 'CgroupnsMode': 'host', 'Devices': [{'PathOnHost': '/dev/sda'}],
                            'SecurityOpt': ['seccomp=unconfined'], 'NetworkMode': 'host', 'CgroupParent': '/system.slice',
-                           'Runtime': 'unreviewed', 'ReadonlyRootfs': False, 'PidsLimit': 0}.items():
+                           'Runtime': 'unreviewed', 'ReadonlyRootfs': False, 'PidsLimit': 0, 'GroupAdd': ['1']}.items():
             with self.subTest(key=key), self.assertRaises((ValueError, KeyError)):
                 body = copy.deepcopy(self.body)
                 body['HostConfig'][key] = value
@@ -158,6 +158,8 @@ class Containment(unittest.TestCase):
             runtime = root / 'runtime'
             store.mkdir(mode=0o700)
             runtime.mkdir(mode=0o711)
+            credential_store = root / 'container-credentials'
+            credential_store.mkdir(mode=0o711)
             source = root / 'adapter'
             source.write_bytes(b'#!/bin/sh\nexit 0\n')
             source.chmod(0o700)
@@ -175,9 +177,9 @@ class Containment(unittest.TestCase):
             adapter.durable_file(snapshot / 'policy.conf', b'FIXTURE=deployed\n')
             (deployed / 'current').symlink_to(snapshot.name)
             args = SimpleNamespace(policy=policy, adapter=source, store=store, runtime=runtime,
-                                   unit='ci-fleet-deployer-adapter-1-2.service', seconds=120, request=None,
+                                   credential_store=credential_store, unit='ci-fleet-deployer-adapter-1-2.service', seconds=120, request=None,
                                    marker=None, operation='deploy')
-            backend = SimpleNamespace(uid=os.getuid(), path='/run/rootless/docker.sock')
+            backend = SimpleNamespace(uid=os.getuid(), gid=os.getgid(), path='/run/rootless/docker.sock')
             with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}), \
                  patch.object(adapter, 'Backend', return_value=backend), patch.object(adapter, 'trusted_directory'), \
                  patch.object(adapter.subprocess, 'run', side_effect=OSError('interrupted dispatcher')):
@@ -189,6 +191,45 @@ class Containment(unittest.TestCase):
             self.assertEqual((journal / 'deployed/state.json').read_bytes(), b'{"fixture":"deployed"}')
             self.assertFalse(any('credential-' in path.name for path in runtime.iterdir()))
             self.assertFalse(any(path.name == 'application' for path in journal.rglob('*')))
+            advertised = []
+            def successful_dispatch(command, **kwargs):
+                if command[0] == 'systemd-run':
+                    source = next(item.split('=', 2)[2] for item in command if item.startswith('--setenv=CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL='))
+                    advertised.append(Path(source))
+                    self.assertEqual(Path(source).read_bytes(), b'fixture-only')
+                return subprocess.CompletedProcess(command, 0, 'LoadState=loaded\nActiveState=inactive\n')
+            with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}), \
+                 patch.object(adapter, 'Backend', return_value=backend), patch.object(adapter, 'trusted_directory'), \
+                 patch.object(adapter.subprocess, 'run', side_effect=successful_dispatch):
+                args.unit = 'ci-fleet-deployer-adapter-1-3.service'
+                self.assertEqual(adapter.run_adapter(args), 0)
+                self.assertEqual(advertised[-1].read_bytes(), b'fixture-only')
+                adapter.shutil.rmtree(runtime)
+                runtime.mkdir(mode=0o711)
+                args.unit = 'ci-fleet-deployer-adapter-1-4.service'
+                self.assertEqual(adapter.run_adapter(args), 0)
+            self.assertEqual(advertised[0], advertised[1])
+            self.assertEqual(advertised[0].read_bytes(), b'fixture-only')
+            self.assertFalse(list(runtime.iterdir()))
+
+    def test_persistent_credential_survives_runtime_removal_and_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / 'credential-store'
+            store.mkdir(mode=0o711)
+            first = adapter.materialize_credential(store, self.values, b'fixture-one', os.getuid(), os.getuid(), os.getgid())
+            second = adapter.materialize_credential(store, self.values, b'fixture-one', os.getuid(), os.getuid(), os.getgid())
+            self.assertEqual(first, second)
+            self.assertEqual(first.read_bytes(), b'fixture-one')
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o440)
+            self.assertEqual(first.stat().st_uid, os.getuid())
+            self.assertEqual(first.stat().st_gid, os.getgid())
+            rotated = adapter.materialize_credential(store, self.values, b'fixture-two', os.getuid(), os.getuid(), os.getgid())
+            self.assertNotEqual(first, rotated)
+            self.assertEqual(first.read_bytes(), b'fixture-one')
+            self.assertEqual(rotated.read_bytes(), b'fixture-two')
+            first.chmod(0o600)
+            with self.assertRaises(ValueError):
+                adapter.materialize_credential(store, self.values, b'fixture-one', os.getuid(), os.getuid(), os.getgid())
 
     def test_unsafe_systemd_path_is_rejected(self):
         with self.assertRaises(ValueError):

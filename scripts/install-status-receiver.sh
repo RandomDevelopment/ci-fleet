@@ -58,7 +58,7 @@ reject_deployer_role() {
   if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then
     echo "deployer host state is present" >&2; exit 1
   fi
-  for path in "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer"; do
+  for path in "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer-container-credentials"; do
     [[ ! -e "$path" && ! -L "$path" ]] || { echo "deployer host state is present" >&2; exit 1; }
   done
 }

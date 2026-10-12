@@ -769,7 +769,7 @@ printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 rm "$root/etc/systemd/system/ci-fleet-deployer.service"
 rmdir "$root/var/lib/ci-fleet-deployer"
-for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer; do
+for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
   ln -s /missing "$root$marker"
   expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
   rm "$root$marker"
@@ -819,7 +819,7 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
 # Read-only checks must reject deployer-role drift on a converged controller.
-for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer; do
+for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
   mkdir -p "$root$marker"
   expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
   rmdir "$root$marker"

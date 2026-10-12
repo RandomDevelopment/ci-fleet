@@ -80,7 +80,7 @@ def parse_policy(body: bytes) -> dict[str, str]:
 class UnixConnection(http.client.HTTPConnection):
     def __init__(self, path: str, *, rootless: bool = True):
         super().__init__("localhost", timeout=120)
-        self.path, self.rootless, self.peer_uid = path, rootless, None
+        self.path, self.rootless, self.peer_uid, self.peer_gid = path, rootless, None, None
 
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -96,7 +96,8 @@ class UnixConnection(http.client.HTTPConnection):
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
                 key, _, value = line.partition(":")
                 process[key] = value.split()
-            require(all(int(value) == uid for value in process["Uid"]), "Docker peer retains another user identity")
+            require(all(int(value) == uid for value in process["Uid"])
+                    and all(int(value) == gid for value in process["Gid"]), "Docker peer retains another user or group identity")
             groups = {int(value) for value in process["Groups"]} | {gid}
             for name in ("sudo", "wheel", "docker"):
                 try:
@@ -110,7 +111,7 @@ class UnixConnection(http.client.HTTPConnection):
                 require(raw_info.st_uid != 0 or (not raw_info.st_mode & 0o002
                         and (not raw_info.st_mode & 0o020 or raw_info.st_gid not in groups)),
                         "Docker peer can access the host-root daemon")
-        self.peer_uid = uid
+        self.peer_uid, self.peer_gid = uid, gid
 
 
 def reject_rootful_workloads(backend_path: str) -> None:
@@ -149,7 +150,7 @@ class Backend:
             value = decode(response.read(MAX_REQUEST + 1))
             require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
                     "a dedicated rootless Docker daemon is required")
-            self.uid = connection.peer_uid
+            self.uid, self.gid = connection.peer_uid, connection.peer_gid
             reject_rootful_workloads(path)
         finally:
             connection.close()
@@ -158,7 +159,7 @@ class Backend:
         connection = UnixConnection(self.path)
         try:
             connection.connect()
-            require(connection.peer_uid == self.uid, "Docker daemon identity changed")
+            require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
             connection.request(method, path, body, headers or {})
             response = connection.getresponse()
             result = response.read(MAX_RESPONSE + 1)
@@ -243,7 +244,7 @@ class Policy:
         host_keys = {"Mounts", "Binds", "VolumesFrom", "Privileged", "CapAdd", "CapDrop", "ReadonlyRootfs",
                      "SecurityOpt", "NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode",
                      "CgroupnsMode", "Memory", "MemorySwap", "NanoCpus", "PidsLimit", "PortBindings",
-                     "RestartPolicy", "AutoRemove", "Init", "Tmpfs"}
+                     "RestartPolicy", "AutoRemove", "Init", "Tmpfs", "GroupAdd"}
         require(isinstance(host, dict), "invalid host configuration")
         host = dict(host)
         neutral = {"ContainerIDFile": "", "Links": None, "ConsoleSize": [0, 0], "OomKillDisable": None,
@@ -261,6 +262,7 @@ class Policy:
             if key in host and host[key] == default:
                 host.pop(key)
         require(set(host) <= host_keys, "unsupported container host configuration")
+        require(host.get("GroupAdd") in (None, [], ["0"]), "only the rootless credential group may be added")
         require(host.get("Privileged", False) is False and not host.get("CapAdd")
                 and host.get("CapDrop") == ["ALL"] and host.get("ReadonlyRootfs") is True
                 and host.get("SecurityOpt") in (["no-new-privileges"], ["no-new-privileges:true"]),
@@ -462,6 +464,44 @@ def unit_inactive(unit: str) -> bool:
             and (result.returncode == 0 or result.returncode == 1 and state == {"LoadState": "not-found", "ActiveState": "inactive"}))
 
 
+def materialize_credential(store: Path, values: dict, body: bytes, owner: int, daemon_uid: int, daemon_gid: int) -> Path:
+    identity = json.dumps([values[key] for key in ("DEPLOYER_IDENTITY", "ENVIRONMENT", "TARGET_ID")]
+                          + [daemon_uid, daemon_gid], separators=(",", ":")).encode()
+    key = hashlib.sha256(identity + b"\0" + body).hexdigest()
+    directory = store / key
+    if not directory.exists() and not directory.is_symlink():
+        directory.mkdir(mode=0o700)
+        os.chown(directory, owner, daemon_gid)
+        directory.chmod(0o710)
+    metadata = directory.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == daemon_gid
+            and stat.S_IMODE(metadata.st_mode) == 0o710, "credential directory is unsafe")
+    secret = directory / "application"
+    try:
+        descriptor = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        descriptor = os.open(secret, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == daemon_gid
+                    and metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == 0o440
+                    and stream.read(MAX_REQUEST + 1) == body, "retained credential changed")
+    else:
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchown(stream.fileno(), owner, daemon_gid)
+            os.fchmod(stream.fileno(), 0o440)
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+    for parent in (directory, store):
+        descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return secret
+
+
 def execute_adapter(operation: str) -> int:
     credentials = Path(os.environ["CREDENTIALS_DIRECTORY"])
     runtime = Path(os.environ["RUNTIME_DIRECTORY"])
@@ -552,31 +592,26 @@ def run_adapter(args) -> int:
     durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
                                                    "status": "inflight", "started_at": int(time.time())}).encode())
     trusted_directory(args.runtime, uid, 0o711)
+    trusted_directory(args.credential_store, uid, 0o711)
+    secret = materialize_credential(args.credential_store, values, credential_bytes, uid, backend.uid, backend.gid)
     with tempfile.TemporaryDirectory(prefix="adapter-", dir=args.runtime) as stage:
         stage = Path(stage)
         approved = stage / "adapter"
         approved.write_bytes(adapter_bytes)
         approved.chmod(0o600)
-        with tempfile.TemporaryDirectory(prefix="credential-", dir=args.runtime) as secret_stage:
-            secret_stage = Path(secret_stage)
-            os.chown(secret_stage, backend.uid, -1)
-            secret = secret_stage / "application"
-            secret.write_bytes(credential_bytes)
-            secret.chmod(0o400)
-            os.chown(secret, backend.uid, -1)
-            policy = Policy(values, backend, str(secret), args.marker, args.operation)
-            proxy = stage / "docker.sock"
-            with ProxyServer(str(proxy), handler(policy)) as server:
-                proxy.chmod(0o666)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
-                try:
-                    command = sandbox_command(args.unit, args.seconds, proxy, args.policy, approved,
-                                              credential, Path(__file__).resolve(), args.request, args.marker is not None, args.operation, backend.path, str(secret))
-                    result = subprocess.run(command, close_fds=True).returncode
-                finally:
-                    server.shutdown()
-                    thread.join(timeout=5)
+        policy = Policy(values, backend, str(secret), args.marker, args.operation)
+        proxy = stage / "docker.sock"
+        with ProxyServer(str(proxy), handler(policy)) as server:
+            proxy.chmod(0o666)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                command = sandbox_command(args.unit, args.seconds, proxy, args.policy, approved,
+                                          credential, Path(__file__).resolve(), args.request, args.marker is not None, args.operation, backend.path, str(secret))
+                result = subprocess.run(command, close_fds=True).returncode
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
     require(unit_inactive(args.unit), "adapter termination is unverified")
     durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
                                                    "status": "completed", "exit_code": result}).encode())
@@ -595,6 +630,7 @@ def main() -> int:
     run.add_argument("--adapter", type=Path, required=True)
     run.add_argument("--store", type=Path, required=True)
     run.add_argument("--runtime", type=Path, required=True)
+    run.add_argument("--credential-store", type=Path, required=True)
     run.add_argument("--unit", required=True)
     run.add_argument("--seconds", type=int, required=True)
     run.add_argument("--request", type=Path)

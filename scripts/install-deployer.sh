@@ -1271,6 +1271,7 @@ publish_deployed_snapshot() {
 install_units() {
   [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
   install -d -m 0700 "$state_root/.adapter-recovery"
+  install -d -m 0711 "$(root_path /var/lib/ci-fleet-deployer-container-credentials)"
   local unit systemd_mode
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_mode=$(stat -c %a "$systemd_root")
@@ -1363,7 +1364,11 @@ run_adapter() {
     [[ ! -L $recovery && ! -L $runtime ]] || block 'adapter directories must not be symlinks'
     install -d -m 0700 "$recovery"
     install -d -m 0711 "$runtime"
-    local -a confined=(python3 "$repo_root/scripts/deployer_adapter.py" run --policy "$policy" --adapter "/proc/$$/fd/7" --store "$recovery" --runtime "$runtime" --unit "$unit" --seconds "$seconds")
+    local credential_store
+    credential_store=$(root_path /var/lib/ci-fleet-deployer-container-credentials)
+    [[ ! -L $credential_store ]] || block 'container credential store is unsafe'
+    install -d -m 0711 "$credential_store"
+    local -a confined=(python3 "$repo_root/scripts/deployer_adapter.py" run --policy "$policy" --adapter "/proc/$$/fd/7" --store "$recovery" --runtime "$runtime" --credential-store "$credential_store" --unit "$unit" --seconds "$seconds")
     [[ -z "$marker" ]] || confined+=(--marker "$marker")
     status=0
     timeout --signal=TERM --kill-after=10s "$((seconds + 30))s" "${confined[@]}" "$operation_name" 8>&- 9<&- || status=$?

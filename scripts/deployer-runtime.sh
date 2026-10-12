@@ -424,7 +424,7 @@ run_application_adapter() {
   unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
   (umask 077; printf '%s\n' "$unit" >"$guard")
   sync -f "$guard" "$recovery" 2>/dev/null || die 'adapter guard is not durable'
-  local -a command=(python3 "$script_dir/deployer_adapter.py" run --policy "$config" --adapter "$adapter_path" --store "$recovery" --runtime "$(root_path /run/ci-fleet-deployer-adapters)" --unit "$unit" --seconds 2400)
+  local -a command=(python3 "$script_dir/deployer_adapter.py" run --policy "$config" --adapter "$adapter_path" --store "$recovery" --runtime "$(root_path /run/ci-fleet-deployer-adapters)" --credential-store "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" --unit "$unit" --seconds 2400)
   [[ -z ${request_snapshot:-} ]] || command+=(--request "$request_snapshot")
   "${command[@]}" "$action" 8>&- 9<&- || status=$?
   python3 - "$script_dir" "$unit" <<'PYCODE' || die 'adapter termination could not be verified'
