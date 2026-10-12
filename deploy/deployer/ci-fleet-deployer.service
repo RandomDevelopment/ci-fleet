@@ -7,6 +7,8 @@ Wants=docker.service network-online.target
 Type=oneshot
 User=root
 Group=root
+# Recreate the boot-volatile lock outside the read-only service namespace.
+ExecStartPre=+/usr/bin/mkdir -p -m 0700 /var/lock/ci-fleet-deployer
 ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh deploy
 Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
 Environment=CI_FLEET_DEPLOYER_REQUEST=/var/lib/ci-fleet-deployer/request.conf
