@@ -414,17 +414,18 @@ adapter_path=/proc/$$/fd/7
 validate_credential
 
 run_application_adapter() {
-  local action=$1 unit guard=$state_root/.adapter-recovery/pending-unit status=0 recovery=$state_root/.adapter-recovery
+  local action=$1 unit guard=$state_root/.adapter-recovery/pending-unit status=0 seconds=2400 recovery=$state_root/.adapter-recovery
   if [[ $testing == 1 ]]; then
     env CI_FLEET_DEPLOYER_CONFIG="$config" CI_FLEET_DEPLOYER_REQUEST="${request_snapshot:-}" "$adapter_path" "$action" 9<&-
     return
   fi
   [[ ! -e "$guard" && ! -L "$guard" ]] || die 'outstanding adapter guard requires operator recovery'
   secure_directory "$recovery" 'adapter recovery directory'
+  case "$action" in health) seconds=120 ;; cleanup) seconds=600 ;; esac
   unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
   (umask 077; printf '%s\n' "$unit" >"$guard")
   sync -f "$guard" "$recovery" 2>/dev/null || die 'adapter guard is not durable'
-  local -a command=(python3 "$script_dir/deployer_adapter.py" run --policy "$config" --adapter "$adapter_path" --store "$recovery" --runtime "$(root_path /run/ci-fleet-deployer-adapters)" --credential-store "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" --unit "$unit" --seconds 2400)
+  local -a command=(python3 "$script_dir/deployer_adapter.py" run --policy "$config" --adapter "$adapter_path" --store "$recovery" --runtime "$(root_path /run/ci-fleet-deployer-adapters)" --credential-store "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" --unit "$unit" --seconds "$seconds")
   [[ -z ${request_snapshot:-} ]] || command+=(--request "$request_snapshot")
   "${command[@]}" "$action" 8>&- 9<&- || status=$?
   python3 - "$script_dir" "$unit" <<'PYCODE' || die 'adapter termination could not be verified'
@@ -434,6 +435,7 @@ from deployer_adapter import unit_inactive
 raise SystemExit(0 if unit_inactive(sys.argv[2]) else 1)
 PYCODE
   if [[ $action != deploy ]]; then
+    python3 "$script_dir/deployer_adapter.py" journal-complete --store "$recovery" "$unit" || die 'adapter recovery requires operator reconciliation'
     rm -f "$guard"
     sync -f "$recovery" 2>/dev/null || die 'adapter guard retirement is not durable'
   fi

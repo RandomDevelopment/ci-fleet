@@ -106,10 +106,11 @@ class UnixConnection(http.client.HTTPConnection):
                     pass
             require(0 not in groups, "Docker peer belongs to the root group")
             raw = Path("/run/docker.sock")
-            if raw.exists():
+            if raw.exists() and str(raw.resolve()) != self.path:
                 raw_info = raw.stat()
-                require(raw_info.st_uid != 0 or (not raw_info.st_mode & 0o002
-                        and (not raw_info.st_mode & 0o020 or raw_info.st_gid not in groups)),
+                require(not raw_info.st_mode & 0o002
+                        and not (raw_info.st_uid == uid and raw_info.st_mode & 0o200)
+                        and (not raw_info.st_mode & 0o020 or raw_info.st_gid not in groups),
                         "Docker peer can access the host-root daemon")
         self.peer_uid, self.peer_gid = uid, gid
 
@@ -176,9 +177,9 @@ class Backend:
 
 
 class Policy:
-    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy"):
+    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
-        self.operation = operation
+        self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
         self.image = values["ARTIFACT_IMAGE"]
         require(bool(IMAGE.fullmatch(self.image)), "approved artifact is not immutable")
         self.labels = {LABEL + "role": "deployer", LABEL + "identity": values["DEPLOYER_IDENTITY"],
@@ -382,6 +383,7 @@ def handler(policy: Policy):
             pass
 
         def dispatch(self):
+            mutation = False
             try:
                 require(not self.headers.get("Transfer-Encoding"), "chunked requests are forbidden")
                 length = int(self.headers.get("Content-Length", "0"))
@@ -396,8 +398,17 @@ def handler(policy: Policy):
                     headers = {"Content-Type": "application/json"}
                     if path.startswith("/images/create") and self.headers.get("X-Registry-Auth"):
                         headers["X-Registry-Auth"] = self.headers["X-Registry-Auth"]
+                    mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
+                    if mutation and status >= 500:
+                        policy.uncertain = True
+                        if policy.uncertain_marker is not None:
+                            durable_file(policy.uncertain_marker, b"uncertain\n")
             except (ValueError, KeyError, TypeError, AttributeError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                if mutation:
+                    policy.uncertain = True
+                    if policy.uncertain_marker is not None:
+                        durable_file(policy.uncertain_marker, b"uncertain\n")
                 status, response = 403, b'{"message":"deployment Docker policy rejected the request"}'
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -464,6 +475,22 @@ def unit_inactive(unit: str) -> bool:
             and (result.returncode == 0 or result.returncode == 1 and state == {"LoadState": "not-found", "ActiveState": "inactive"}))
 
 
+def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
+    try:
+        require(bool(UNIT.fullmatch(unit)), "invalid adapter unit")
+        journal = store / unit
+        trusted_directory(journal, uid, 0o700)
+        value = decode(protected_file(journal / "status.json", uid))
+        uncertain = journal / "docker-uncertain"
+        return (value.get("unit") == unit and value.get("status") == "completed"
+                and type(value.get("exit_code")) is int
+                and value.get("operation") in ("validate", "health", "cleanup", "deploy", "rollback")
+                and (value["exit_code"] == 0 or value["operation"] in ("validate", "health"))
+                and not uncertain.exists() and not uncertain.is_symlink())
+    except (ValueError, KeyError, OSError):
+        return False
+
+
 def materialize_credential(store: Path, values: dict, body: bytes, owner: int, daemon_uid: int, daemon_gid: int) -> Path:
     identity = json.dumps([values[key] for key in ("DEPLOYER_IDENTITY", "ENVIRONMENT", "TARGET_ID")]
                           + [daemon_uid, daemon_gid], separators=(",", ":")).encode()
@@ -493,7 +520,7 @@ def materialize_credential(store: Path, values: dict, body: bytes, owner: int, d
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
-    for parent in (directory, store):
+    for parent in (directory, store, store.parent):
         descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(descriptor)
@@ -599,7 +626,7 @@ def run_adapter(args) -> int:
         approved = stage / "adapter"
         approved.write_bytes(adapter_bytes)
         approved.chmod(0o600)
-        policy = Policy(values, backend, str(secret), args.marker, args.operation)
+        policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain")
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
@@ -612,6 +639,7 @@ def run_adapter(args) -> int:
             finally:
                 server.shutdown()
                 thread.join(timeout=5)
+    require(not policy.uncertain, "Docker mutation completion is unverified")
     require(unit_inactive(args.unit), "adapter termination is unverified")
     durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
                                                    "status": "completed", "exit_code": result}).encode())
@@ -625,6 +653,9 @@ def main() -> int:
     execute.add_argument("operation")
     check = sub.add_parser("check")
     check.add_argument("socket")
+    complete = sub.add_parser("journal-complete")
+    complete.add_argument("--store", type=Path, required=True)
+    complete.add_argument("unit")
     run = sub.add_parser("run")
     run.add_argument("--policy", type=Path, required=True)
     run.add_argument("--adapter", type=Path, required=True)
@@ -638,6 +669,9 @@ def main() -> int:
     run.add_argument("operation")
     args = parser.parse_args()
     try:
+        if args.command == "journal-complete":
+            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+            return 0 if journal_complete(args.store, args.unit, uid) else 1
         if args.command == "execute":
             return execute_adapter(args.operation)
         if args.command == "check":

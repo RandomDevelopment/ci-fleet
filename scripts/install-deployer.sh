@@ -1317,6 +1317,9 @@ adapter_unit_inactive() {
 
 retire_adapter_guard() {
   local unit=$1 guard
+  if [[ $testing != 1 ]]; then
+    python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$unit" || return 1
+  fi
   local -a guards=("$adapter_guard")
   [[ -z ${transaction_dir:-} ]] || guards+=("$transaction_dir/adapter-unit")
   for guard in "${guards[@]}"; do

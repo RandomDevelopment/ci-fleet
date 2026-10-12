@@ -212,6 +212,48 @@ class Containment(unittest.TestCase):
             self.assertEqual(advertised[0].read_bytes(), b'fixture-only')
             self.assertFalse(list(runtime.iterdir()))
 
+    def test_guard_requires_completed_protected_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            unit = 'ci-fleet-deployer-adapter-1-2.service'
+            journal = store / unit
+            journal.mkdir(mode=0o700)
+            status = journal / 'status.json'
+            with patch.object(adapter, 'trusted_directory'):
+                for operation, state, code, expected in [('rollback', 'inflight', 0, False),
+                                                        ('rollback', 'completed', 1, False),
+                                                        ('rollback', 'completed', 0, True),
+                                                        ('health', 'completed', 1, True),
+                                                        ('cleanup', 'completed', 1, False)]:
+                    adapter.durable_file(status, json.dumps({'unit': unit, 'operation': operation,
+                                                            'status': state, 'exit_code': code}).encode())
+                    self.assertEqual(adapter.journal_complete(store, unit, os.getuid()), expected)
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'deploy', 'status': 'completed', 'exit_code': 0}).encode())
+                adapter.durable_file(journal / 'docker-uncertain', b'uncertain')
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+
+    def test_failed_forwarded_mutation_keeps_durable_uncertainty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'docker-uncertain'
+            policy = adapter.Policy(self.values, self.backend, uncertain_marker=marker)
+            self.backend.request = lambda *_args: (_ for _ in ()).throw(OSError('daemon disconnected'))
+            path = str(Path(directory) / 'broker.sock')
+            with adapter.ProxyServer(path, adapter.handler(policy)) as server:
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                try:
+                    connection = adapter.UnixConnection(path, rootless=False)
+                    connection.request('POST', '/networks/create', json.dumps({'Name': self.network, 'Internal': True, 'Labels': policy.labels}).encode())
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 403)
+                    response.read()
+                    connection.close()
+                finally:
+                    server.shutdown()
+                    thread.join()
+            self.assertTrue(policy.uncertain)
+            self.assertEqual(marker.read_bytes(), b'uncertain\n')
+
     def test_persistent_credential_survives_runtime_removal_and_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory) / 'credential-store'
