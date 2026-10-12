@@ -470,11 +470,11 @@ build_managed_images() {
     [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit" && $2 == "version:" {print $3; exit}') == v0.32.2 ]] \
       || die 'reviewed BuildKit backend v0.32.2 is unavailable'
     docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
-      --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH \
+      --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH=1786752000 \
       --tag "$CI_FLEET_RUNNER_IMAGE" "$release/runner"
     docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
-      --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION --build-arg SOURCE_DATE_EPOCH \
-      --tag "$CI_FLEET_CONTROLLER_IMAGE" "$release/controller"
+      --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION --build-arg SOURCE_DATE_EPOCH=1786752000 \
+      --tag "$CI_FLEET_CONTROLLER_IMAGE" --file "$release/controller/Dockerfile" "$release"
   )
 }
 
@@ -1150,7 +1150,7 @@ run_candidate_preflight() {
 build_candidate() {
   run_candidate_preflight
   compose "$release_dir" "$candidate_env" config --quiet
-  build_managed_images "$release_dir" "$candidate_env"
+  if ! managed_images_match "$candidate_env"; then build_managed_images "$release_dir" "$candidate_env"; fi
   managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
 }
 
