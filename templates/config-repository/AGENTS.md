@@ -36,4 +36,4 @@ Before committing configuration changes, run:
 - When implementing a change, update affected documentation in the same commit or PR. Follow the repository's documentation and changelog conventions. Preserve historical release notes and immutable records.
 - When reviewing, report missing or inaccurate documentation as a finding.
 - Before declaring the work complete, check updated examples, commands, links, and configuration names. Run applicable documentation checks.
-- State the documentation impact in the PR description and completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.
+- When creating or updating a PR, state the documentation impact in its description. In all cases, include the assessment in the completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.
