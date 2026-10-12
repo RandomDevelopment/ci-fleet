@@ -29,6 +29,11 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
+if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  [[ ${FAKE_TESTER_UNIT_INVENTORY_FAIL:-0} != 1 ]] || exit 7
+  if [[ -n ${FAKE_TESTER_FOREIGN_UNIT:-} && ${FAKE_TESTER_FOREIGN_UNIT_KIND:-$1} == "$1" ]]; then printf '%s enabled\n' "$FAKE_TESTER_FOREIGN_UNIT"; fi
+  exit 0
+fi
 if [[ $1 == show && " $* " == *' --property=LoadState '* ]]; then
   if [[ -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
   exit 0
@@ -106,6 +111,14 @@ write_environment() {
   chmod 600 "$root/etc/ci-fleet-tester/environments/$id.env"
 }
 
+clean_root=$tmp/clean-root
+mkdir -p "$clean_root/var/run" "$clean_root/var/lib/docker" "$clean_root/run/lock"
+chmod 1777 "$clean_root/run/lock"
+: >"$clean_root/var/run/docker.sock"; chmod 0600 "$clean_root/var/run/docker.sock"
+CI_FLEET_ROOT_PREFIX=$clean_root FAKE_TESTER_DOCKER_ROOT=$clean_root/var/lib/docker "$installer" --uninstall >/dev/null || fail 'uninstall failed on a host without tester state'
+for marker in etc/ci-fleet-tester var/lib/ci-fleet-tester opt/ci-fleet-tester; do
+  [[ ! -e $clean_root/$marker && ! -L $clean_root/$marker ]] || fail 'no-op uninstall created tester role state'
+done
 if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
 cp "$root/etc/ci-fleet-tester/tester.env" "$tmp/tester.env.valid"
@@ -156,6 +169,24 @@ mv "$tmp/spec" "$root/etc/ci-fleet-tester/environments/preview-a.env"; chmod 600
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev/null
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
 FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_MIXED_ADDRESS_POOLS=1 "$runtime" --converge --environment preview-a >/dev/null || fail 'IPv6 pool prevented matching the approved IPv4 network'
+for teardown in remove cleanup; do
+  id=role-drift-$teardown
+  write_environment "$id" 18097
+  FAKE_TESTER_ROUTE_PORT=18097 "$runtime" --converge --environment "$id" >/dev/null
+  mkdir -p "$root/opt/ci-fleet-status"
+  ln -s /missing "$root/opt/ci-fleet-status/current"
+  : >"$tmp/docker.log"
+  if [[ $teardown == remove ]]; then
+    FAKE_TESTER_FOREIGN_UNIT=ci-fleet-deployer.service FAKE_TESTER_UNRELATED_RESOURCE='other-container|ordinary-ci' "$runtime" --remove --environment "$id" >/dev/null || fail 'role drift blocked scoped removal'
+  else
+    sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$root/var/lib/ci-fleet-tester/environments/$id.state"
+    FAKE_TESTER_FOREIGN_UNIT=ci-fleet-deployer.service FAKE_TESTER_UNRELATED_RESOURCE='other-container|ordinary-ci' "$runtime" --cleanup >/dev/null || fail 'role drift blocked expiration cleanup'
+  fi
+  [[ ! -e $root/var/lib/ci-fleet-tester/environments/$id.state && -L $root/opt/ci-fleet-status/current ]] || fail 'teardown removed foreign role state or retained tester state'
+  grep -Fq "ci-fleet-test-$id" "$tmp/docker.log" || fail 'teardown did not address its Compose project'
+  if grep -Eq '(^| )prune( |$)|other-container' "$tmp/docker.log"; then fail 'teardown addressed unrelated Docker resources'; fi
+  rm "$root/opt/ci-fleet-status/current"; rmdir "$root/opt/ci-fleet-status"
+done
 write_environment finite-swap 18099
 FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_POLICY=finite-swap "$runtime" --converge --environment finite-swap >/dev/null || fail 'finite memory-plus-swap limit was rejected'
 FAKE_TESTER_ROUTE_PORT=18099 "$runtime" --remove --environment finite-swap >/dev/null
@@ -175,11 +206,12 @@ grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared rout
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
   if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
 done
-for policy in ipv4-disabled service-tmpfs device-cgroup duplicate-network duplicate-volume; do
+for policy in ipv4-disabled service-tmpfs device-cgroup duplicate-network duplicate-volume capdrop-extra; do
   write_environment "$policy" 18098
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "$policy" >"$tmp/model-rejection.out" 2>&1; then fail "unsupported model was accepted: $policy"; fi
   case $policy in
+    capdrop-extra) grep -Fq 'read_only and cap_drop ALL are required' "$tmp/model-rejection.out" || fail 'extra capability drops failed outside model validation' ;;
     device-cgroup) grep -Fq 'build/device/capability/external mount/global identity is forbidden' "$tmp/model-rejection.out" || fail 'device rules failed outside model validation' ;;
     duplicate-network|duplicate-volume) grep -Fq 'duplicate resolved resource name' "$tmp/model-rejection.out" || fail 'duplicate names failed outside model validation' ;;
     ipv4-disabled) grep -Fq 'IPv4 is required' "$tmp/model-rejection.out" || fail 'IPv4-disabled network failed outside model validation' ;;
@@ -441,6 +473,19 @@ for marker in /opt/ci-fleet/current /opt/ci-fleet-deployer/current /opt/ci-fleet
   done
   [[ $marker != */current ]] || rmdir "$(dirname "$root$marker")"
 done
+for inventory_kind in list-unit-files list-units; do
+  for unit in ci-fleet-deployer.service ci-fleet-status-receiver.service ci-fleet-health.timer actions.runner.example.service; do
+    for mode in check install; do
+      ref_args=(); [[ $mode != install ]] || ref_args=(--ref "$ref")
+      if FAKE_TESTER_FOREIGN_UNIT=$unit FAKE_TESTER_FOREIGN_UNIT_KIND=$inventory_kind "$installer" "--$mode" "${ref_args[@]}" >"$tmp/unit-rejection.out" 2>&1; then fail "installer accepted effective foreign unit: $unit"; fi
+      grep -Fq 'another ci-fleet host role is present' "$tmp/unit-rejection.out" || fail 'foreign unit failed outside admission check'
+    done
+    if FAKE_TESTER_FOREIGN_UNIT=$unit FAKE_TESTER_FOREIGN_UNIT_KIND=$inventory_kind "$runtime" --health >"$tmp/unit-rejection.out" 2>&1; then fail "runtime accepted effective foreign unit: $unit"; fi
+    grep -Fq 'another ci-fleet host role is present' "$tmp/unit-rejection.out" || fail 'runtime unit failed outside admission check'
+  done
+done
+if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 "$installer" --check >/dev/null 2>&1; then fail 'installer accepted unavailable foreign unit inventory'; fi
+if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'runtime accepted unavailable foreign unit inventory'; fi
 printf '# drift\n' >>"$installed_unit"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"

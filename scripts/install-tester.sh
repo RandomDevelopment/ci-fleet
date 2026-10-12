@@ -90,7 +90,7 @@ acquire_lifecycle_lock() {
 }
 
 reject_other_roles() {
-  local path
+  local path inventory_kind inventory
   for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" \
     "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /opt/ci-fleet-deployer)" \
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
@@ -98,6 +98,12 @@ reject_other_roles() {
     "$systemd_dir"/ci-fleet-deployer* "$systemd_dir"/ci-fleet-health* "$systemd_dir"/ci-fleet-cleanup* \
     "$systemd_dir"/ci-fleet-reconcile* "$systemd_dir"/ci-fleet-drift* "$systemd_dir"/ci-fleet-status-receiver* "$systemd_dir"/actions.runner*; do
     [[ ! -e $path && ! -L $path ]] || die 'another ci-fleet host role is present'
+  done
+  for inventory_kind in list-unit-files list-units; do
+    inventory=$(systemctl "$inventory_kind" --all --plain --no-legend --no-pager \
+      'ci-fleet-deployer*' 'ci-fleet-health*' 'ci-fleet-cleanup*' 'ci-fleet-reconcile*' \
+      'ci-fleet-drift*' 'ci-fleet-status-receiver*' 'actions.runner*') || die 'foreign systemd unit inventory could not be inspected'
+    [[ -z $inventory ]] || die 'another ci-fleet host role is present'
   done
 }
 
@@ -377,16 +383,23 @@ case $action in
     report "ROLLBACK_OK source_revision=$target"
     ;;
   --uninstall)
-    ensure_directories
-    if find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
+    for directory in "$opt_dir" "$release_dir"; do
+      [[ ! -e $directory && ! -L $directory ]] || secure_dir "$directory" 755
+    done
+    for directory in "$config_root" "$environment_dir" "$definition_dir" "$secret_root" "$state_root" "$runtime_state"; do
+      [[ ! -e $directory && ! -L $directory ]] || secure_dir "$directory" 700
+    done
+    if [[ -d $runtime_state ]] && find "$runtime_state" -maxdepth 1 -type f -name '*.state' | grep -q .; then die 'remove every test environment before uninstalling the tester service'; fi
     pin_local_docker
     reject_managed_compose_resources container
     reject_managed_compose_resources volume
     reject_managed_compose_resources network
     remove_units || die 'could not stop and disable tester maintenance units'
     rm -f -- "$current_link" "$stable_launcher" "$lkg_file"
-    [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
-    rm -rf -- "$release_dir"; install -d -m 0755 "$release_dir"
+    if [[ -d $release_dir ]]; then
+      [[ ${CI_FLEET_TESTING:-0} != 1 ]] || chmod -R u+w "$release_dir"
+      rm -rf -- "$release_dir"
+    fi
     report 'UNINSTALL_OK preserved_config=true preserved_definitions=true preserved_secrets=true'
     ;;
 esac

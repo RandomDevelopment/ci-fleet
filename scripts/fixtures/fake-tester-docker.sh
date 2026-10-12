@@ -133,7 +133,7 @@ done
 case ${operation:-} in
   config)
     digest=$(printf 'a%.0s' {1..64})
-    privileged=false; read_only=true; host_ip=127.0.0.1; protocol=tcp; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128'; extra_services=; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'
+    privileged=false; read_only=true; host_ip=127.0.0.1; protocol=tcp; image="registry.example/example/app@sha256:$digest"; network_name="${project}_default"; secrets='{}'; service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128'; extra_services=; top_extra=; volume_extra=; network_extra=; security='no-new-privileges:true'; cap_drop='"ALL"'
     case ${FAKE_TESTER_POLICY:-valid} in
       mutable) image=registry.example/example/app:latest ;;
       privileged) privileged=true ;;
@@ -149,6 +149,7 @@ case ${operation:-} in
       custom-volume) volume_extra=',"driver":"local"' ;;
       volumes-from) service_extra=',"volumes_from":["container:other:rw"]' ;;
       custom-network) network_extra=',"driver":"macvlan","driver_opts":{"parent":"eth0"}' ;;
+      capdrop-extra) cap_drop='"ALL","NET_RAW"' ;;
       device-cgroup) service_extra+=',"device_cgroup_rules":["b 8:* rwm"]' ;;
       duplicate-network) network_extra=$(printf '},"alias":{"name":"%s_default"' "$project") ;;
       duplicate-volume) volume_extra=$(printf '},"alias":{"name":"%s_data"' "$project") ;;
@@ -190,8 +191,8 @@ case ${operation:-} in
         ;;
     esac
     volume=${volume:-'{"type":"volume","source":"data","target":"/data"}'}
-    printf '{"name":"%s","services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":["ALL"],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"%s"}]%s}%s},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
-      "$project" "$image" "$privileged" "$read_only" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$protocol" "$service_extra" "$extra_services" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
+    printf '{"name":"%s","services":{"web":{"image":"%s","privileged":%s,"read_only":%s,"cap_drop":[%s],"security_opt":["%s"],"volumes":[%s],"ports":[{"host_ip":"%s","published":%s,"target":8080,"protocol":"%s"}]%s}%s},"networks":{"default":{"name":"%s"%s}},"volumes":{"data":{"name":"%s_data"%s}},"secrets":%s%s}\n' \
+      "$project" "$image" "$privileged" "$read_only" "$cap_drop" "$security" "$volume" "$host_ip" "${FAKE_TESTER_ROUTE_PORT:-18080}" "$protocol" "$service_extra" "$extra_services" "$network_name" "$network_extra" "$project" "$volume_extra" "$secrets" "$top_extra"
     ;;
   up)
     printf 'all\n' >"${FAKE_TESTER_RESOURCE_STATE:?}/$project"

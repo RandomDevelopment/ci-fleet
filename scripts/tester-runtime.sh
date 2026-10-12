@@ -35,6 +35,7 @@ done
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
 required_commands='awk basename chmod cmp date df dirname docker du env find flock grep install mkdir mktemp mv python3 readlink rm stat wc'
 case $action in --check|--health) required_commands+=' curl getent' ;; esac
+case $action in --remove|--cleanup) ;; *) required_commands+=' systemctl' ;; esac
 case $action in --converge|--reset|--inspect|--health) required_commands+=' timeout' ;; esac
 for command in $required_commands; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 
@@ -178,7 +179,7 @@ for name,service in services.items():
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
     if service.get('profiles'): raise SystemExit(f'{name}: Compose profiles are forbidden')
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
-    if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
+    if service.get('read_only') is not True or set(service.get('cap_drop',[])) != {'ALL'}: raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
     if service.get('security_opt') not in (['no-new-privileges:true'],['no-new-privileges=true']): raise SystemExit(f'{name}: no-new-privileges=true must be the only security option')
     if service.get('tmpfs'): raise SystemExit(f'{name}: service-level tmpfs is unsupported; use volumes with type tmpfs')
     for mount in service.get('volumes',[]):
@@ -437,14 +438,22 @@ inspect_environment() {
 }
 
 load_global
-for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current \
-  /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /opt/ci-fleet-deployer \
-  /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
-  [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
-done
-for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do
-  [[ ! -e $role_unit && ! -L $role_unit ]] || die 'another ci-fleet host role is present'
-done
+if [[ $action != --remove && $action != --cleanup ]]; then
+  for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current \
+    /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /opt/ci-fleet-deployer \
+    /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
+    [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
+  done
+  for role_unit in "$(root_path /etc/systemd/system)"/ci-fleet-deployer* "$(root_path /etc/systemd/system)"/ci-fleet-health* "$(root_path /etc/systemd/system)"/ci-fleet-cleanup* "$(root_path /etc/systemd/system)"/ci-fleet-reconcile* "$(root_path /etc/systemd/system)"/ci-fleet-drift* "$(root_path /etc/systemd/system)"/ci-fleet-status-receiver* "$(root_path /etc/systemd/system)"/actions.runner*; do
+    [[ ! -e $role_unit && ! -L $role_unit ]] || die 'another ci-fleet host role is present'
+  done
+  for inventory_kind in list-unit-files list-units; do
+    inventory=$(systemctl "$inventory_kind" --all --plain --no-legend --no-pager \
+      'ci-fleet-deployer*' 'ci-fleet-health*' 'ci-fleet-cleanup*' 'ci-fleet-reconcile*' \
+      'ci-fleet-drift*' 'ci-fleet-status-receiver*' 'actions.runner*') || die 'foreign systemd unit inventory could not be inspected'
+    [[ -z $inventory ]] || die 'another ci-fleet host role is present'
+  done
+fi
 docker_socket=$(root_path /var/run/docker.sock)
 if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
   [[ -f $docker_socket ]] || die 'local Docker socket is unavailable'
@@ -470,17 +479,19 @@ else
   exec 9>"$lock_file"
   flock -x 9
 fi
-for kind in container network volume; do
-  case $kind in
-    container) inventory=$(docker ps -a --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
-    network) inventory=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
-    volume) inventory=$(docker volume ls --format '{{.Name}}|{{.Label "com.docker.compose.project"}}') ;;
-  esac
-  while IFS='|' read -r resource resource_project; do
-    [[ -n $resource ]] || continue
-    [[ $resource_project =~ ^ci-fleet-test-([a-z0-9][a-z0-9-]{0,62})$ && -f $(state_path "${BASH_REMATCH[1]}") ]] || die 'unrelated or untracked Docker workload is present'
-  done <<<"$inventory"
-done
+if [[ $action != --remove && $action != --cleanup ]]; then
+  for kind in container network volume; do
+    case $kind in
+      container) inventory=$(docker ps -a --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
+      network) inventory=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "com.docker.compose.project"}}') ;;
+      volume) inventory=$(docker volume ls --format '{{.Name}}|{{.Label "com.docker.compose.project"}}') ;;
+    esac
+    while IFS='|' read -r resource resource_project; do
+      [[ -n $resource ]] || continue
+      [[ $resource_project =~ ^ci-fleet-test-([a-z0-9][a-z0-9-]{0,62})$ && -f $(state_path "${BASH_REMATCH[1]}") ]] || die 'unrelated or untracked Docker workload is present'
+    done <<<"$inventory"
+  done
+fi
 case $action in
   --check)
     docker info --format '{{.DockerRootDir}}' >/dev/null
