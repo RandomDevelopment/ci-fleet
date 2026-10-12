@@ -2122,6 +2122,7 @@ perform_check() {
 }
 
 reject_isolated_host() {
+  local inventory_kind inventory_status inventory unit
   # Isolated application hosts must not run controller checks or mutations.
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-tester*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-tester)" || -L "$(root_path /var/lib/ci-fleet-tester)" || -e "$(root_path /etc/ci-fleet-tester)" || -L "$(root_path /etc/ci-fleet-tester)" ||
        -e "$(root_path /opt/ci-fleet-tester/current)" || -L "$(root_path /opt/ci-fleet-tester/current)" ||
@@ -2131,6 +2132,20 @@ reject_isolated_host() {
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
+  for inventory_kind in list-unit-files list-units; do
+    inventory_status=0
+    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+    # list-unit-files returns status 1 for an empty inventory without diagnostics.
+    if ((inventory_status != 0)); then
+      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || die 'isolated-role systemd unit inventory could not be inspected'
+    fi
+    while read -r unit _; do
+      case $unit in
+        ci-fleet-tester*) die 'tester host state is present' ;;
+        ci-fleet-deployer*) die 'deployer host state is present' ;;
+      esac
+    done <<<"$inventory"
+  done
 }
 
 perform_converge() {

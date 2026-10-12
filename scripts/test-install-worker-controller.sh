@@ -292,6 +292,13 @@ cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 [[ -z "${FAKE_TRANSACTION_LOG:-}" ]] || printf 'systemctl %s\n' "$*" >>"$FAKE_TRANSACTION_LOG"
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
+if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  if [[ -n ${FAKE_ISOLATED_INVENTORY_ERROR:-} ]]; then printf 'inventory inspection failed\n' >&2; exit "$FAKE_ISOLATED_INVENTORY_ERROR"; fi
+  if [[ ${FAKE_ISOLATED_INVENTORY_EMPTY:-0} == 1 ]]; then [[ $1 != list-unit-files ]] || exit 1; exit 0; fi
+  printf 'ci-fleet-health.service static\nci-fleet-status-receiver.service static\n'
+  if [[ -n ${FAKE_ISOLATED_UNIT:-} && ${FAKE_ISOLATED_UNIT_KIND:-$1} == "$1" ]]; then printf '%s static\n' "$FAKE_ISOLATED_UNIT"; fi
+  exit 0
+fi
 if [[ "${1:-}" == show && "${2:-}" == --property=ActiveState && "${3:-}" == --value ]]; then
   printf '%s\n' "${FAKE_RECONCILE_ACTIVE_STATE:-inactive}"
   exit 0
@@ -783,6 +790,11 @@ for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/
   rm "$root$marker"
 done
 
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    expect_failure "$role host state is present" env FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  done
+done
 # A rejected review must stop every direct candidate path before installation.
 export FAKE_REAL_OPENSSL FAKE_REAL_CURL
 FAKE_REAL_OPENSSL=$(command -v openssl)
@@ -826,6 +838,15 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
+expect_success env FAKE_ISOLATED_INVENTORY_EMPTY=1 "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    expect_failure "$role host state is present" env FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  done
+done
+for inventory_error in 1 7; do
+  expect_failure 'isolated-role systemd unit inventory could not be inspected' env FAKE_ISOLATED_INVENTORY_ERROR=$inventory_error "$installer" --check "${base_args[@]}" --ref "$ref_one"
+done
 # Read-only checks must reject isolated-role drift on a converged controller.
 for role in deployer tester; do
   for marker in /var/lib/ci-fleet-$role /etc/ci-fleet-$role; do

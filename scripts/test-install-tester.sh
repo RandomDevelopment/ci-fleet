@@ -135,8 +135,10 @@ mkdir -p "$clean_root/var/run" "$clean_root/var/lib/docker" "$clean_root/run/loc
 chmod 1777 "$clean_root/run/lock"
 : >"$clean_root/var/run/docker.sock"; chmod 0600 "$clean_root/var/run/docker.sock"
 CI_FLEET_ROOT_PREFIX=$clean_root FAKE_TESTER_DOCKER_ROOT=$clean_root/var/lib/docker "$installer" --uninstall >/dev/null || fail 'uninstall failed on a host without tester state'
+if CI_FLEET_ROOT_PREFIX=$clean_root "$installer" --rollback >"$tmp/absent-rollback.out" 2>&1; then fail 'rollback succeeded without an installation'; fi
+grep -Fq 'protected directory is unsafe' "$tmp/absent-rollback.out" || fail 'absent rollback failed outside existing-state validation'
 for marker in etc/ci-fleet-tester var/lib/ci-fleet-tester opt/ci-fleet-tester; do
-  [[ ! -e $clean_root/$marker && ! -L $clean_root/$marker ]] || fail 'no-op uninstall created tester role state'
+  [[ ! -e $clean_root/$marker && ! -L $clean_root/$marker ]] || fail 'a no-op command created tester role state'
 done
 if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'

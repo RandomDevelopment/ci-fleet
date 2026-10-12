@@ -384,8 +384,14 @@ case $action in
     "$current_link/scripts/tester-runtime.sh" --reset --environment "$environment"
     ;;
   --rollback)
-    ensure_directories; secure_file "$lkg_file" 600
+    secure_dir "$state_root" 700
+    secure_dir "$opt_dir" 755
+    secure_dir "$release_dir" 755
+    secure_file "$lkg_file" 600
     target=$(<"$lkg_file"); [[ $target =~ ^[0-9a-f]{40}$ ]] || die 'last-known-good revision is invalid'
+    release_complete "$release_dir/$target" "$target" || die 'last-known-good release is incomplete'
+    reject_other_roles
+    ensure_directories
     activate_release "$target"
     report "ROLLBACK_OK source_revision=$target"
     ;;

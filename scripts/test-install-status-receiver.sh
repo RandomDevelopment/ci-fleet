@@ -9,6 +9,22 @@ test -f "$unit"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+fake_bin=$tmp/bin
+mkdir "$fake_bin"
+cat >"$fake_bin/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  if [[ -n ${FAKE_ISOLATED_INVENTORY_ERROR:-} ]]; then printf 'inventory inspection failed\n' >&2; exit "$FAKE_ISOLATED_INVENTORY_ERROR"; fi
+  if [[ ${FAKE_ISOLATED_INVENTORY_EMPTY:-0} == 1 ]]; then [[ $1 != list-unit-files ]] || exit 1; exit 0; fi
+  printf 'ci-fleet-health.service static\nci-fleet-status-receiver.service static\n'
+  if [[ -n ${FAKE_ISOLATED_UNIT:-} && ${FAKE_ISOLATED_UNIT_KIND:-$1} == "$1" ]]; then printf '%s static\n' "$FAKE_ISOLATED_UNIT"; fi
+  exit 0
+fi
+printf 'unexpected systemctl operation: %s\n' "$*" >&2
+exit 42
+EOF_SYSTEMCTL
+chmod 0755 "$fake_bin/systemctl"
+export PATH="$fake_bin:$PATH"
 source_tree="$tmp/source"
 root="$tmp/root"
 mkdir -p "$source_tree/scripts" "$source_tree/deploy/status-receiver"
@@ -84,6 +100,23 @@ for marker in /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; 
   done
   rm "$root$marker"
 done
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    for mode in install check; do
+      ref_args=(); [[ $mode != install ]] || ref_args=(--ref "$first")
+      if FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind run "--$mode" "${ref_args[@]}" >"$tmp/inventory-rejection.out" 2>&1; then
+        echo 'status receiver accepted an effective isolated-role unit' >&2; exit 1
+      fi
+      grep -Fq "$role host state is present" "$tmp/inventory-rejection.out"
+    done
+  done
+done
+for inventory_error in 1 7; do
+  if FAKE_ISOLATED_INVENTORY_ERROR=$inventory_error run --install --ref "$first" >"$tmp/inventory-rejection.out" 2>&1; then
+    echo 'status receiver accepted an inventory inspection failure' >&2; exit 1
+  fi
+  grep -Fq 'isolated-role systemd unit inventory could not be inspected' "$tmp/inventory-rejection.out"
+done
 role_lock="$root/run/ci-fleet-role-admission.lock"
 exec 8>"$role_lock"
 flock -n 8
@@ -99,7 +132,7 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   exit 1
 fi
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
-test "$(run --install --ref "$first")" = NO_CHANGE
+test "$(FAKE_ISOLATED_INVENTORY_EMPTY=1 run --install --ref "$first")" = NO_CHANGE
 assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"
