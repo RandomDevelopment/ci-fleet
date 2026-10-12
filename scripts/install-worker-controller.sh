@@ -799,7 +799,7 @@ systemd_matches() {
   local current_manager
   current_manager=$(manager_release_from_raw_pointer || true)
   [[ -n "$current_manager" ]] || return 1
-  if ! engine_has_capacity_telemetry "$release_dir" && engine_has_capacity_telemetry "$current_manager"; then
+  if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]] && engine_has_capacity_telemetry "$current_manager"; then
     expected_manager=$current_manager
   fi
   [[ -f "$expected_manager/.ci-fleet-engine-ref" ]] || return 1
@@ -1097,7 +1097,7 @@ install_manager() {
   current_manager=$(manager_release_from_raw_pointer || true)
   current_manager_commit=
   [[ -z "$current_manager" || ! -f "$current_manager/.ci-fleet-engine-ref" ]] || current_manager_commit=$(<"$current_manager/.ci-fleet-engine-ref")
-  if (($# == 0)) && ! engine_has_capacity_telemetry "$release_dir" && [[ -n "$current_manager_commit" ]] \
+  if (($# == 0)) && [[ ! -x "$release_dir/scripts/capacity-sample.sh" && -n "$current_manager_commit" ]] \
     && engine_has_capacity_telemetry "$current_manager" \
     && manager_release_complete "$current_manager" "$current_manager_commit" "$require_status" "$require_schema" \
     && release_tree_permissions_trusted "$current_manager"; then
