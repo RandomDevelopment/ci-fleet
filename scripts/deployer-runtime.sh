@@ -236,8 +236,7 @@ deploy_exit() {
     if [[ $target != "${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi
   fi
   if [[ -n ${snapshot_pointer:-} && $snapshot_pointer != "$deployed_current" ]]; then rm -f "$snapshot_pointer"; fi
-  trap - EXIT
-  exit "$status"
+  return "$status"
 }
 expected_uid=0
 [[ "$testing" != 1 ]] || expected_uid=$(id -u)

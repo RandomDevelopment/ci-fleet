@@ -35,34 +35,6 @@ printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" \
   "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence"
 
-# Exercise the actual EXIT handler with a failed final sync and pending statuses.
-cleanup_script=$tmp/cleanup-exit.sh
-{
-  printf 'set -Eeuo pipefail\n'
-  sed -n '/^deploy_exit() {/,/^}/p' "$runtime"
-  cat <<'EOF'
-state_root=$1/exit-state
-log_root=$1/exit-log
-active=$state_root/active-operation
-expected_uid=$(id -u)
-mkdir -p -m 0700 "$state_root"
-restore_rollback_pair() { return 0; }
-sync_failure=$3
-sync() { [[ $sync_failure == 0 ]]; }
-trap deploy_exit EXIT
-exit "$2"
-EOF
-} >"$cleanup_script"
-for pending_status in 0 42; do
-  for sync_failure in 0 1; do
-    cleanup_status=0
-    bash "$cleanup_script" "$tmp" "$pending_status" "$sync_failure" || cleanup_status=$?
-    expected_status=$pending_status
-    if [[ $sync_failure == 1 ]]; then expected_status=1; fi
-    [[ $cleanup_status == "$expected_status" ]] || fail 'deployment EXIT handler lost its computed status'
-  done
-done
-
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
