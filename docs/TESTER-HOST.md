@@ -115,7 +115,7 @@ Remove every environment explicitly, verify no state remains, then uninstall:
 sudo ./scripts/install-tester.sh --uninstall --config /etc/ci-fleet-tester/tester.env
 ```
 
-Scoped environment removal and expiration cleanup remain available during foreign-role drift. They verify protected state and operate only on the recorded Compose projects.
+Scoped environment removal and expiration cleanup remain available during foreign-role drift, missing or malformed global configuration, and missing definitions or secrets directories. They verify protected state and operate only on the recorded Compose projects.
 
 Uninstall fails while any managed environment exists. It removes only tester units and immutable service releases. Host configuration, definitions, and secrets remain for explicit operator disposition; the script never guesses which credential may be deleted.
 

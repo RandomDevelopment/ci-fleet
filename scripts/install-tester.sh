@@ -91,7 +91,7 @@ acquire_lifecycle_lock() {
 
 reject_other_roles() {
   local path inventory_kind inventory_status inventory unit
-  for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" \
+  for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" "$(root_path /opt/ci-fleet/manager/current)" \
     "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /opt/ci-fleet-deployer)" \
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
     "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)" \

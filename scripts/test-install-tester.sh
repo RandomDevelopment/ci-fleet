@@ -232,6 +232,26 @@ for teardown in remove cleanup; do
   if grep -Eq '(^| )prune( |$)|other-container' "$tmp/docker.log"; then fail 'teardown addressed unrelated Docker resources'; fi
   rm "$root/opt/ci-fleet-status/current"; rmdir "$root/opt/ci-fleet-status"
 done
+for teardown in remove cleanup; do
+  for damage in missing-config malformed-config definitions secrets; do
+    id=config-drift-$teardown-$damage
+    write_environment "$id" 18097
+    FAKE_TESTER_ROUTE_PORT=18097 "$runtime" --converge --environment "$id" >/dev/null
+    damaged_path=$root/etc/ci-fleet-tester/tester.env
+    case $damage in definitions|secrets) damaged_path=$root/etc/ci-fleet-tester/$damage ;; esac
+    mv "$damaged_path" "$tmp/saved-config"
+    [[ $damage != malformed-config ]] || printf 'INVALID\n' >"$damaged_path"
+    if [[ $teardown == remove ]]; then
+      "$runtime" --remove --environment "$id" >/dev/null || fail "$damage blocked scoped removal"
+    else
+      sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$root/var/lib/ci-fleet-tester/environments/$id.state"
+      "$runtime" --cleanup >/dev/null || fail "$damage blocked expiration cleanup"
+    fi
+    [[ ! -e $root/var/lib/ci-fleet-tester/environments/$id.state ]] || fail "$damage teardown retained state"
+    [[ $damage != malformed-config ]] || rm "$damaged_path"
+    mv "$tmp/saved-config" "$damaged_path"
+  done
+done
 write_environment finite-swap 18099
 FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_POLICY=finite-swap "$runtime" --converge --environment finite-swap >/dev/null || fail 'finite memory-plus-swap limit was rejected'
 FAKE_TESTER_ROUTE_PORT=18099 "$runtime" --remove --environment finite-swap >/dev/null
@@ -537,7 +557,7 @@ done
 ln -s /missing "$root/var/lib/ci-fleet-deployer"
 if "$installer" --check >/dev/null 2>&1; then fail 'tester accepted a dangling deployer role marker'; fi
 rm "$root/var/lib/ci-fleet-deployer"
-for marker in /opt/ci-fleet/current /opt/ci-fleet-deployer/current /opt/ci-fleet-status/current /var/lib/ci-fleet-status-installer; do
+for marker in /opt/ci-fleet/current /opt/ci-fleet/manager/current /opt/ci-fleet-deployer/current /opt/ci-fleet-status/current /var/lib/ci-fleet-status-installer; do
   mkdir -p "$(dirname "$root$marker")"
   for kind in directory symlink; do
     if [[ $kind == directory ]]; then mkdir "$root$marker"; else ln -s /missing "$root$marker"; fi

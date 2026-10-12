@@ -66,8 +66,6 @@ load_global() {
   secure_directory "$environment_dir" 700
   secure_directory "$definition_dir" 700
   secure_directory "$secret_root" 700
-  secure_directory "$(dirname "$state_dir")" 700
-  secure_directory "$state_dir" 700
   secure_file "$config_file" 600
   load_exact_env "$config_file" 'CI_FLEET_TESTER_DEFAULT_TTL_SECONDS CI_FLEET_TESTER_MAX_ENVIRONMENTS CI_FLEET_TESTER_DISK_WARN_PERCENT CI_FLEET_TESTER_NETWORK_PROBE_HOST CI_FLEET_TESTER_HTTPS_PROBE_URL CI_FLEET_TESTER_ISOLATION_ACK'
   default_ttl=${ENV_VALUES[CI_FLEET_TESTER_DEFAULT_TTL_SECONDS]:-86400}
@@ -449,9 +447,11 @@ inspect_environment() {
   printf 'STATUS=%s DISK_BYTES=%s\n' "$status" "$bytes"
 }
 
-load_global
+secure_directory "$(dirname "$state_dir")" 700
+secure_directory "$state_dir" 700
 if [[ $action != --remove && $action != --cleanup ]]; then
-  for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current \
+  load_global
+  for role_path in /etc/ci-fleet /var/lib/ci-fleet /opt/ci-fleet/current /opt/ci-fleet/manager/current \
     /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer /opt/ci-fleet-deployer \
     /etc/ci-fleet-status /var/lib/ci-fleet-status /opt/ci-fleet-status /var/lib/ci-fleet-status-installer; do
     [[ ! -e $(root_path "$role_path") && ! -L $(root_path "$role_path") ]] || die 'another ci-fleet host role is present'
