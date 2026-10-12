@@ -1712,6 +1712,7 @@ restore_systemd_snapshot() {
   for unit in "${unit_names[@]}" "${capacity_unit_names[@]}" "${optional_unit_names[@]}"; do
     [[ ! -f "$checkpoint_dir/systemd/$unit" ]] || install -m 0644 "$checkpoint_dir/systemd/$unit" "$staged_units/$unit" || return 1
   done
+  stop_capacity_units || return 1
   if [[ "$executing" == true ]]; then
     install -m 0644 "$systemd_dir/ci-fleet-reconcile.service" "$staged_units/current.service" || return 1
     install -m 0700 "$repo_root/scripts/restore-reconcile-unit.sh" "$staged_units/restore-reconcile-unit.sh" || return 1
