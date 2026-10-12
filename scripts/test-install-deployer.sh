@@ -56,6 +56,11 @@ log=${FAKE_SYSTEMCTL_LOG:-/dev/null}
 printf '%s\n' "$*" >>"$log"
 [[ -z ${FAKE_SYSTEMCTL_FAIL_COMMAND:-} || ${1:-} != "$FAKE_SYSTEMCTL_FAIL_COMMAND" ]] || exit 1
 case "${1:-}" in
+  list-unit-files|list-units)
+    [[ -z ${FAKE_DEPLOYER_TESTER_INVENTORY_ERROR:-} ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_DEPLOYER_TESTER_INVENTORY_ERROR"; }
+    [[ -z ${FAKE_DEPLOYER_TESTER_UNIT:-} || ${FAKE_DEPLOYER_TESTER_UNIT_KIND:-$1} != "$1" ]] || printf '%s enabled\n' "$FAKE_DEPLOYER_TESTER_UNIT"
+    exit 0
+    ;;
   is-system-running)
     [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1
     printf '%s\n' "${FAKE_SYSTEMD_STATE:-running}"
@@ -801,6 +806,11 @@ rm "$unit_path"; mv "$unit_path.real" "$unit_path"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-health.service"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-health.service"
+for inventory_kind in list-unit-files list-units; do
+  FAKE_DEPLOYER_TESTER_UNIT=ci-fleet-tester-health.service FAKE_DEPLOYER_TESTER_UNIT_KIND=$inventory_kind expect_failure 'tester host state is present' "$installer" --check --config "$config" >/dev/null
+  FAKE_DEPLOYER_TESTER_UNIT=ci-fleet-tester-health.service FAKE_DEPLOYER_TESTER_UNIT_KIND=$inventory_kind expect_failure 'tester host state is present' "$runtime" health >/dev/null
+done
+FAKE_DEPLOYER_TESTER_INVENTORY_ERROR=7 expect_failure 'tester systemd inventory could not be inspected' "$installer" --check --config "$config" >/dev/null
 for form in directory symlink; do
   if [[ $form == directory ]]; then mkdir "$root/opt/ci-fleet-tester"; else ln -s /missing "$root/opt/ci-fleet-tester"; fi
   expect_failure 'tester host state is present' "$installer" --check --config "$config" >/dev/null

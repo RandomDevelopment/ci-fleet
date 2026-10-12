@@ -52,7 +52,7 @@ if [[ $1 == list-unit-files || $1 == list-units ]]; then
   exit 0
 fi
 if [[ $1 == show && " $* " == *' --property=LoadState '* ]]; then
-  if [[ -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 || ${FAKE_TESTER_EFFECTIVE_SERVICES:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
+  if [[ ( ${FAKE_TESTER_CACHED_DANGLING:-0} == 1 && ${*: -1} == ci-fleet-tester-health.* ) || -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/${*: -1} || ${FAKE_TESTER_EFFECTIVE_TIMERS:-0} == 1 || ${FAKE_TESTER_EFFECTIVE_SERVICES:-0} == 1 ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
   exit 0
 fi
 if [[ -n ${FAKE_TESTER_QUEUED_SERVICES:-} ]]; then
@@ -115,7 +115,7 @@ ln -s "$fake_bin/docker" "$uninstall_bin/docker"
 ln -s "$fake_bin/systemctl" "$uninstall_bin/systemctl"
 ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.service"
 ln -s /missing "$root/etc/systemd/system/ci-fleet-tester-health.timer"
-FAKE_TESTER_DISABLE_DANGLING_FAILURE=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
+FAKE_TESTER_CACHED_DANGLING=1 FAKE_TESTER_DISABLE_DANGLING_FAILURE=1 PATH=$uninstall_bin "$standalone_installer" --uninstall --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'standalone uninstall required installation-only tools or a Git checkout'
 [[ ! -L $root/etc/systemd/system/ci-fleet-tester-health.service && ! -L $root/etc/systemd/system/ci-fleet-tester-health.timer ]] || fail 'uninstall left dangling tester unit symlinks'
 mv "$root/var/run/docker.sock" "$root/var/run/docker.real"
 ln -s docker.real "$root/var/run/docker.sock"
@@ -651,6 +651,15 @@ rmdir "$runtime_state"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'missing runtime state directory passed check'; fi
 [[ ! -e $runtime_state ]] || fail 'check recreated the missing runtime state directory'
 install -d -m 0700 "$runtime_state"
+
+current_before_invalid=$(readlink "$root/opt/ci-fleet-tester/current")
+ln -sfn "$root/opt/ci-fleet-tester/releases/malformed" "$root/opt/ci-fleet-tester/current"
+if "$installer" --upgrade --ref "$ref" >"$tmp/malformed-current.out" 2>&1; then fail 'malformed installed revision was accepted'; fi
+grep -Fq 'installed tester revision is invalid' "$tmp/malformed-current.out" || fail 'malformed revision failed outside pointer validation'
+[[ ! -e $root/var/lib/ci-fleet-tester/activation-pending ]] || fail 'malformed revision entered a recovery journal'
+ln -sfn "$current_before_invalid" "$root/opt/ci-fleet-tester/current"
+if DOCKER_CONFIG=$tmp/private-compose FAKE_TESTER_PRIVATE_PLUGIN_CONFIG=$tmp/private-compose "$installer" --install --ref "$ref" >"$tmp/private-plugin.out" 2>&1; then fail 'root-private Compose plugin passed host preflight'; fi
+grep -Fq 'system-wide Compose plugin is required' "$tmp/private-plugin.out" || fail 'private Compose plugin failed after activation'
 
 # A syntactically valid candidate that fails its post-switch check restores the incumbent.
 upgrade_repo=$tmp/upgrade-repo

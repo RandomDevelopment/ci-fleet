@@ -33,7 +33,7 @@ expected_uid=0
 if [[ ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run installer as root'; fi
 case $action in
   --install|--upgrade) required_commands='awk bash chmod cmp curl date df dirname docker du find flock getent git grep install ln mktemp mv python3 readlink rm sha256sum shellcheck stat sync systemctl tar wc' ;;
-  --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir python3 readlink sha256sum stat systemctl' ;;
+  --check) required_commands='awk bash basename cmp df dirname docker env flock grep mkdir mktemp python3 readlink rm sha256sum stat systemctl' ;;
   --reset) required_commands='bash basename dirname env flock mkdir readlink stat' ;;
   --rollback) required_commands='bash basename chmod dirname env flock install ln mkdir mv readlink rm sha256sum stat sync systemctl awk' ;;
   --uninstall) required_commands='bash chmod dirname docker env find flock grep install mkdir rm stat systemctl' ;;
@@ -174,6 +174,15 @@ reject_managed_compose_resources() {
   done <<<"$inventory"
 }
 
+compose_preflight() (
+  client_config=$(mktemp -d)
+  trap 'rm -rf -- "$client_config"' EXIT
+  export DOCKER_CONFIG=$client_config
+  docker compose version >/dev/null || die 'system-wide Compose plugin is required'
+  printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
+  docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
+)
+
 host_preflight() {
   local os_release used
   os_release=$(root_path /etc/os-release)
@@ -188,9 +197,7 @@ host_preflight() {
   pin_local_docker
   [[ $(docker info --format '{{len .DefaultAddressPools}}') =~ ^[1-9][0-9]*$ ]] || die 'explicit Docker default address pools are required'
   [[ $(docker info --format '{{.DefaultRuntime}}') == runc ]] || die 'Docker default runtime must be runc'
-  docker compose version >/dev/null
-  printf 'services: {}\n' | docker compose -f - config --format json >/dev/null || die 'Compose JSON rendering is unavailable'
-  docker compose up --help | grep -q -- '--wait-timeout' || die 'Compose wait-timeout support is unavailable'
+  compose_preflight
   used=$(df -P "$docker_root" | awk 'NR==2{gsub(/%/,"",$5);print $5}')
   [[ $used =~ ^[0-9]+$ && $used -lt 80 ]] || die 'Docker storage is at or above 80%'
 }
@@ -270,12 +277,14 @@ install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_la
 
 remove_units() {
   local unit directory load_state present_units=() present_timers=() present_services=()
+  local -A handled_units=()
   for unit in "${units[@]}"; do
     if [[ -L $systemd_dir/$unit && ! -e $systemd_dir/$unit ]]; then
       load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
       [[ $load_state == not-found || $load_state == loaded ]] || return 1
       if [[ $load_state == loaded ]]; then systemctl stop "$unit" >/dev/null 2>&1 || return 1; fi
       rm -f -- "$systemd_dir/$unit" || return 1
+      handled_units[$unit]=1
       for directory in timers.target.wants multi-user.target.wants; do
         [[ ! -L $systemd_dir/$directory/$unit ]] || rm -f -- "$systemd_dir/$directory/$unit" || return 1
       done
@@ -283,6 +292,7 @@ remove_units() {
     [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
   for unit in "${timers[@]}"; do
+    [[ ${handled_units[$unit]:-0} != 1 ]] || continue
     if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
       present_timers+=("$unit")
     else
@@ -295,6 +305,7 @@ remove_units() {
     systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
   fi
   for unit in "${services[@]}"; do
+    [[ ${handled_units[$unit]:-0} != 1 ]] || continue
     if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
       present_services+=("$unit")
     else
@@ -374,7 +385,7 @@ activate_release() {
   reject_unit_dropins
   reject_tmpfiles_overrides
   release_complete "$target" "$commit" || die 'candidate tester release is incomplete'
-  [[ ! -L $current_link ]] || previous=$(basename "$(readlink -f "$current_link")")
+  if [[ -e $current_link || -L $current_link ]]; then previous=$(installed_revision) || die 'installed tester revision is invalid'; fi
   if [[ $previous =~ ^[0-9a-f]{40}$ ]] && ! systemctl disable --now "${timers[@]}" >/dev/null; then
     enable_timers || die 'could not quiesce or restore tester maintenance timers'
     die 'could not quiesce tester maintenance timers; incumbent timers restored'
@@ -414,9 +425,10 @@ activate_release() {
 
 installed_revision() {
   [[ -L $current_link ]] || return 1
-  local target; target=$(readlink -f "$current_link")
-  [[ $target == "$release_dir"/* ]] || return 1
-  basename "$target"
+  local target revision; target=$(readlink -f "$current_link")
+  revision=$(basename "$target")
+  [[ $target == "$release_dir/$revision" && $revision =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$revision"
 }
 
 installation_matches() {
@@ -451,7 +463,8 @@ case $action in
     reject_git_replacements
     [[ $(GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_root" rev-parse 'HEAD^{commit}') == "$ref" ]] || die 'reviewed checkout HEAD does not match --ref'
     if ! git -C "$repo_root" diff --quiet || ! git -C "$repo_root" diff --cached --quiet; then die 'reviewed checkout has tracked changes'; fi
-    current=$(installed_revision || true)
+    current=
+    if [[ -e $current_link || -L $current_link ]]; then current=$(installed_revision) || die 'installed tester revision is invalid'; fi
     [[ $action != --install || -z $current || $current == "$ref" ]] || die 'tester is already installed at another revision; use --upgrade'
     [[ $action != --upgrade || -n $current ]] || die 'tester is not installed; use --install'
     ensure_directories

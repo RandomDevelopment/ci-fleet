@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
+if [[ $1 == compose && -n ${FAKE_TESTER_PRIVATE_PLUGIN_CONFIG:-} && ${DOCKER_CONFIG:-} != "$FAKE_TESTER_PRIVATE_PLUGIN_CONFIG" ]]; then exit 9; fi
 if [[ $1 == compose && ${FAKE_TESTER_EXPECT_EMPTY_CLIENT_CONFIG:-0} == 1 ]]; then
   [[ -n ${DOCKER_CONFIG:-} && -d $DOCKER_CONFIG && $DOCKER_CONFIG != "${FAKE_TESTER_INHERITED_CLIENT_CONFIG:?}" && ! -e $DOCKER_CONFIG/config.json ]] || { printf 'unsafe Docker client configuration\n' >&2; exit 9; }
   printf '%s\n' "$DOCKER_CONFIG" >>"${FAKE_TESTER_CLIENT_CONFIG_LOG:?}"

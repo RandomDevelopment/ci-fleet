@@ -259,7 +259,17 @@ secure_directory() {
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
 }
 reject_other_role_state() {
-  local unit runner_unit path
+  local unit runner_unit path inventory_kind inventory inventory_status
+  for inventory_kind in list-unit-files list-units; do
+    inventory_status=0
+    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+    if ((inventory_status != 0)); then
+      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || die 'tester systemd inventory could not be inspected'
+    fi
+    while read -r unit _; do
+      case $unit in ci-fleet-tester*) die 'tester host state is present' ;; esac
+    done <<<"$inventory"
+  done
   for path in "$(root_path /opt/ci-fleet-tester)" "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'tester host state is present'
   done
