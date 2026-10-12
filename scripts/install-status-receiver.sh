@@ -58,7 +58,7 @@ reject_isolated_role() {
   if compgen -G "$root/etc/systemd/system/ci-fleet-tester*" >/dev/null; then
     echo "tester host state is present" >&2; exit 1
   fi
-  for path in "$root/etc/ci-fleet-tester" "$root/var/lib/ci-fleet-tester" \
+  for path in "$root/opt/ci-fleet-tester" "$root/etc/ci-fleet-tester" "$root/var/lib/ci-fleet-tester" \
     "$root/opt/ci-fleet-tester/current" "$root/opt/ci-fleet-tester/tester-runtime"; do
     [[ ! -e "$path" && ! -L "$path" ]] || { echo "tester host state is present" >&2; exit 1; }
   done

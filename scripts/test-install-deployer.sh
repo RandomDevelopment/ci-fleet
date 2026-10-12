@@ -801,6 +801,11 @@ rm "$unit_path"; mv "$unit_path.real" "$unit_path"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-health.service"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-health.service"
+for form in directory symlink; do
+  if [[ $form == directory ]]; then mkdir "$root/opt/ci-fleet-tester"; else ln -s /missing "$root/opt/ci-fleet-tester"; fi
+  expect_failure 'tester host state is present' "$installer" --check --config "$config" >/dev/null
+  if [[ $form == directory ]]; then rmdir "$root/opt/ci-fleet-tester"; else rm "$root/opt/ci-fleet-tester"; fi
+done
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-drift.timer"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-drift.timer"

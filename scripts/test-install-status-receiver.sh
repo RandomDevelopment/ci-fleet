@@ -81,7 +81,7 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   echo "partial deployer unit set was accepted by the status receiver" >&2; exit 1
 fi
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
-for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
+for marker in /opt/ci-fleet-tester /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
   /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
   mkdir -p "$(dirname "$root$marker")"
   ln -s /missing "$root$marker"
@@ -89,8 +89,10 @@ for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/
     echo "tester role marker was accepted by the status receiver" >&2; exit 1
   fi
   rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
 done
-for marker in /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+for marker in /opt/ci-fleet-tester /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
   : >"$root$marker"
   for mode in install check; do
     if run "--$mode" --ref "$first" >"$tmp/tester-role.out" 2>&1; then
@@ -99,6 +101,7 @@ for marker in /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; 
     grep -Fq 'tester host state is present' "$tmp/tester-role.out"
   done
   rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
 done
 for inventory_kind in list-unit-files list-units; do
   for role in tester deployer; do

@@ -482,7 +482,7 @@ require_maintenance_host() {
 
 reject_other_role_state() {
   local unit path runner_unit
-  for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
+  for path in "$(root_path /opt/ci-fleet-tester)" "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'tester host state is present'
   done
   for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
