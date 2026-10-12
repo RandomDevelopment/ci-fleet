@@ -76,6 +76,8 @@ TEST
 bash "$temporary/recovery.sh"
 {
   printf 'set -Eeuo pipefail\n'
+  sed -n '/^checkpoint_images_reproducible() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
+  sed -n '/^preflight_checkpoint_images() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^rebuild_checkpoint_images() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   cat <<'TEST'
 repo_root=$1
@@ -92,6 +94,16 @@ for legacy_manifest in missing disabled; do
   [[ ! -e "$root/rebuild.log" ]]
   grep -Fq ROLLBACK_IMAGE_REINSTALL_REQUIRED "$root/rebuild-notes.log"
 done
+identifier=sha256:3333333333333333333333333333333333333333333333333333333333333333
+printf 'CI_FLEET_CONTROLLER_IMAGE_DIGEST=%s\nCI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$identifier" "$identifier" >"$root/checkpoint.env"
+checkpoint_images=(controller runner "$identifier" absent)
+docker() { [[ ${image_present:-false} == true ]] || return 1; printf '%s\n' "$identifier"; }
+if preflight_checkpoint_images "$root/legacy" "$root/checkpoint.env"; then exit 1; fi
+[[ ! -e "$root/rebuild.log" ]]
+image_present=true
+preflight_checkpoint_images "$root/legacy" "$root/checkpoint.env"
+image_present=false
+preflight_checkpoint_images "$root/reviewed" "$root/checkpoint.env"
 rebuild_checkpoint_images "$root/reviewed" fixture-env
 [[ $(<"$root/rebuild.log") == build ]]
 match_images=false
@@ -99,4 +111,15 @@ if rebuild_checkpoint_images "$root/reviewed" fixture-env; then exit 1; fi
 TEST
 } >"$temporary/rebuild.sh"
 bash "$temporary/rebuild.sh" "$repo_root" "$temporary"
+{
+  printf 'set -Eeuo pipefail\n'
+  sed -n '/^build_managed_images() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
+  cat <<'TEST'
+root=$1
+mkdir -p "$root/older-release/scripts"
+printf 'printf "older-release-contract %%s %%s\\n" "$1" "$2"\n' >"$root/older-release/scripts/build-managed-images.sh"
+[[ $(build_managed_images "$root/older-release" old-env) == "older-release-contract $root/older-release old-env" ]]
+TEST
+} >"$temporary/release-build.sh"
+bash "$temporary/release-build.sh" "$temporary"
 printf 'MANAGER_STAGING_AND_IMAGE_RECOVERY_TESTS_OK\n'

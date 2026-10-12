@@ -140,6 +140,14 @@ case "${1:-}" in
     case "${2:-}" in
       inspect)
         image=${!#}
+        if [[ $image =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          if [[ -f ${FAKE_AVAILABLE_IMAGE_IDS:-} ]] && grep -Fxq "$image" "$FAKE_AVAILABLE_IMAGE_IDS"; then
+            printf '%s\n' "$image"
+            exit 0
+          fi
+          printf 'Error: No such image: %s\n' "$image" >&2
+          exit 1
+        fi
         [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$image" >>"$FAKE_IMAGE_INSPECT_LOG"
         image_paths || exit 1
         if [[ "$*" == *'{{.Id}}'* ]]; then
@@ -1171,6 +1179,12 @@ FAKE_RUNNER_IMAGE=$head_runner_image
 FAKE_CONTROLLER_IMAGE=$head_controller_image
 export FAKE_PRIOR_RUNNER_IMAGE=$pre_adapter_runner_image
 export FAKE_PRIOR_CONTROLLER_IMAGE=$pre_adapter_controller_image
+export FAKE_PRIOR_IMAGE_STATES=$tmp/pre-adapter-retained-tags
+mkdir -p "$FAKE_PRIOR_IMAGE_STATES"
+cp "$tmp/pre-adapter-runner-image-present" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$tmp/pre-adapter-runner-image-id" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$tmp/pre-adapter-controller-image-present" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$tmp/pre-adapter-controller-image-id-state" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
 pre_adapter_upgrade_ref=$(write_config active 1 1 "$engine_ref")
 export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
@@ -1221,7 +1235,7 @@ rm -rf "$pre_adapter_snapshot"
 FAKE_ENGINE_REF=$engine_ref
 FAKE_RUNNER_IMAGE=$head_runner_image
 FAKE_CONTROLLER_IMAGE=$head_controller_image
-unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
 pre_adapter_current_without_policy_ref=$(write_config active 1 1 "$engine_ref" false omit)
 : >"$FAKE_TRANSACTION_LOG"
 pre_adapter_policy_removal=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_current_without_policy_ref")

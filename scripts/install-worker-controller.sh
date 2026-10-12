@@ -166,8 +166,6 @@ capacity_unit_names=(ci-fleet-capacity.service ci-fleet-capacity.timer)
 optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
-managed_builder=ci-fleet-managed
-managed_buildkit='moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
 
 temporary=$(mktemp -d)
 cleanup_temporary() {
@@ -464,26 +462,7 @@ compose() {
 
 build_managed_images() {
   local release=$1 environment=$2
-  (
-    require_buildx
-    set -a
-    # shellcheck disable=SC1090
-    . "$environment"
-    set +a
-    cleanup_builder() { docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true; }
-    trap cleanup_builder EXIT
-    cleanup_builder
-    docker buildx create --name "$managed_builder" --driver docker-container \
-      --driver-opt "image=$managed_buildkit" --bootstrap >/dev/null
-    [[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit:" {print $2; exit}') == v0.32.2 ]] \
-      || die 'reviewed BuildKit backend v0.32.2 is unavailable'
-    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
-      --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH=1786752000 \
-      --tag "$CI_FLEET_RUNNER_IMAGE" "$release/runner"
-    docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
-      --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION --build-arg SOURCE_DATE_EPOCH=1786752000 \
-      --tag "$CI_FLEET_CONTROLLER_IMAGE" --file "$release/controller/Dockerfile" "$release"
-  )
+  bash "$release/scripts/build-managed-images.sh" "$release" "$environment"
 }
 
 controller_status() {
@@ -694,7 +673,7 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
-    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh; do
+    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh; do
       policy_script=${required#*:}
       if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
 import json, sys
@@ -1836,16 +1815,42 @@ restore_systemd_snapshot() {
   return "$failed"
 }
 
-rebuild_checkpoint_images() {
-  local release=$1 environment=$2
-  if ! python3 - "$repo_root/scripts" "$release/engine-capabilities.json" <<'PYTHON'
+checkpoint_images_reproducible() {
+  python3 - "$repo_root/scripts" "$1/engine-capabilities.json" <<'PYTHON'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from desired_state import load_engine_capabilities
-raise SystemExit(0 if "reproducible_managed_images" in load_engine_capabilities(Path(sys.argv[2])) else 1)
+from desired_state import DesiredStateError, load_engine_capabilities
+try:
+    supported = "reproducible_managed_images" in load_engine_capabilities(Path(sys.argv[2]))
+except DesiredStateError:
+    supported = False
+raise SystemExit(0 if supported else 1)
 PYTHON
-  then
+}
+
+preflight_checkpoint_images() {
+  local release=$1 environment=$2 identifier error
+  checkpoint_images_reproducible "$release" && return 0
+  local -a identifiers=()
+  mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" || $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  [[ ${#identifiers[@]} == 2 ]] || return 1
+  identifiers+=("${checkpoint_images[@]:2}")
+  for identifier in "${identifiers[@]}"; do
+    [[ "$identifier" != absent ]] || continue
+    [[ "$identifier" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    if error=$(docker image inspect --format '{{.Id}}' "$identifier" 2>&1); then
+      [[ "$error" == "$identifier" ]] || return 1
+    else
+      note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy images require retained objects or verified offline import'
+      return 1
+    fi
+  done
+}
+
+rebuild_checkpoint_images() {
+  local release=$1 environment=$2
+  if ! checkpoint_images_reproducible "$release"; then
     note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy images require retained objects or verified offline import'
     return 1
   fi
@@ -2053,6 +2058,7 @@ PY
       note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
       return 1
     fi
+    preflight_checkpoint_images "$checkpoint_release" "$checkpoint_dir/ci-fleet.env" || return 1
     restore_images=true
   elif $new_format && [[ -e "$image_ids" || -L "$image_ids" ]]; then
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
