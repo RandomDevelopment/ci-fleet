@@ -89,6 +89,18 @@ func proxyMarkerCount(t *testing.T, fixture *socketProxyTest) int {
 	return len(markers)
 }
 
+func waitForProxyMarkerCleanup(t *testing.T, fixture *socketProxyTest) {
+	t.Helper()
+	// The client can receive EOF before ReverseProxy closes its upstream body.
+	deadline := time.Now().Add(2 * time.Second)
+	for proxyMarkerCount(t, fixture) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("completed mutation retained a marker")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestDockerSocketProxyCancelledMutationRetainsMaintenanceLock(t *testing.T) {
 	for _, route := range []string{"/v1.48/containers/create", "/v1.48/images/create", "/v1.48/images/load", "/v1.48/images/example/tag", "/v1.48/build/prune"} {
 		t.Run(route, func(t *testing.T) {
@@ -489,14 +501,7 @@ func TestDockerSocketProxyUploadIsCompleteBeforeDispatch(t *testing.T) {
 			if !bytes.Equal(<-received, contextBody) {
 				t.Fatal("build context was truncated")
 			}
-			// The client can receive EOF before ReverseProxy closes its upstream body.
-			deadline := time.Now().Add(2 * time.Second)
-			for proxyMarkerCount(t, fixture) != 0 {
-				if time.Now().After(deadline) {
-					t.Fatal("completed mutation retained a marker")
-				}
-				time.Sleep(time.Millisecond)
-			}
+			waitForProxyMarkerCleanup(t, fixture)
 		})
 	}
 }
