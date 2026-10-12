@@ -1594,6 +1594,8 @@ PY
   # completed (the runtime records last-request.conf on success).
   [[ -e "$state_root/last-request.conf" || -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
   validate_completed_request "$state_root/last-request.conf" "$environment" "$target"
+  cfg[ENVIRONMENT]=$environment
+  cfg[TARGET_ID]=$target
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
   [[ $testing == 1 || -v 'rollback_policy[DOCKER_SOCKET]' ]] || block 'last-known-good policy requires its dedicated Docker socket'
   DOCKER_HOST=unix://${rollback_policy[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
