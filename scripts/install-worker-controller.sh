@@ -2195,20 +2195,18 @@ trap on_error ERR
 trap on_term TERM
 
 staged_runtime_matches() {
-  (
-    local installed_ref installed_state installed_release
-    load_installed_controller_identity
-    installed_ref=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
-    installed_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env")
-    [[ "$installed_ref" =~ ^[0-9a-f]{40}$ && "$installed_state" =~ ^(active|drained|disabled)$ ]] || return 1
-    installed_release=$releases_dir/$installed_ref
-    [[ $(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true) == "$installed_release" ]] || return 1
-    runtime_release_complete "$installed_release" "$installed_ref" || return 1
-    release_tree_permissions_trusted "$installed_release" || return 1
-    candidate_env=$rendered_env
-    engine_ref=$installed_ref
-    runtime_matches "$installed_state"
-  )
+  local installed_ref installed_state installed_release
+  local candidate_env=$rendered_env engine_ref controller_id=$controller_id controller_container=$controller_container
+  load_installed_controller_identity
+  installed_ref=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
+  installed_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env")
+  [[ "$installed_ref" =~ ^[0-9a-f]{40}$ && "$installed_state" =~ ^(active|drained|disabled)$ ]] || return 1
+  installed_release=$releases_dir/$installed_ref
+  [[ $(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true) == "$installed_release" ]] || return 1
+  runtime_release_complete "$installed_release" "$installed_ref" || return 1
+  release_tree_permissions_trusted "$installed_release" || return 1
+  engine_ref=$installed_ref
+  runtime_matches "$installed_state"
 }
 
 perform_check() {

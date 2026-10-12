@@ -2282,6 +2282,11 @@ expect_failure 'DRIFT managed_images' "$installer" --check "${base_args[@]}" --r
 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "sha256:$controller_image_digest" ]] || fail 'candidate build did not restore reviewed managed image digests'
 if docker image inspect unrelated:image >/dev/null 2>&1; then fail 'unrelated image fixture unexpectedly exists'; fi
+export FAKE_TRANSACTION_LOG=$tmp/matching-image-maintenance.log
+: >"$FAKE_TRANSACTION_LOG"
+SOURCE_DATE_EPOCH=1 FAKE_DISABLED_TIMER=ci-fleet-health.timer FAKE_FAIL_BUILD=1 expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+if grep -Fq 'docker buildx build' "$FAKE_TRANSACTION_LOG"; then fail 'maintenance-only repair rebuilt matching reviewed images'; fi
+unset FAKE_TRANSACTION_LOG
 : >"$FAKE_IMAGE_INSPECT_LOG"
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 grep -Fxq "$FAKE_RUNNER_IMAGE" "$FAKE_IMAGE_INSPECT_LOG" || fail 'runner image was not inspected'

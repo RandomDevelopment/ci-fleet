@@ -114,7 +114,7 @@ class DesiredStateTests(unittest.TestCase):
             config_ref=CONFIG_COMMIT,
             docker_gid=998,
             machine="aarch64",
-            engine_capabilities={"status_reporting_config"},
+            engine_capabilities={"status_reporting_config", "docker_network_policy_config", "docker_network_policy_adapter", "docker_default_bridge_cidr_config"},
         )
         self.assertEqual(environment["CI_FLEET_CONTROLLER_IMAGE_DIGEST"], "sha256:" + "3" * 64)
         self.assertEqual(environment["CI_FLEET_RUNNER_IMAGE_DIGEST"], "sha256:" + "4" * 64)

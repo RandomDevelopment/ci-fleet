@@ -20,7 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def reference_config() -> dict:
-    return json.loads((ROOT / "fleet.json").read_text(encoding="utf-8"))
+    value = json.loads((ROOT / "fleet.json").read_text(encoding="utf-8"))
+    for architectures in value.get("managed_images", {}).values():
+        for images in architectures.values():
+            images["controller"] = "sha256:" + "3" * 64
+            images["runner"] = "sha256:" + "4" * 64
+    return value
 
 
 def contract_schema() -> dict:
@@ -93,6 +98,8 @@ class PolicyTests(unittest.TestCase):
     def test_manager_only_staging_transition_is_engine_ref_only(self) -> None:
         previous = copy.deepcopy(reference_config())
         previous.pop("managed_images")
+        for controller in previous["controllers"].values():
+            controller.pop("docker_network_policy", None)
         current = copy.deepcopy(previous)
         first_controller(current)["engine_ref"] = "3" * 40
         validation = Validation()
@@ -110,7 +117,7 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(any("cannot be removed" in error for error in validation.errors), validation.errors)
 
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
-        config = copy.deepcopy(reference_config())
+        config = json.loads((ROOT / "fleet.json").read_text())
         self.assert_rejected(config, "replace the fixture image digest", strict=True)
     def test_storage_retention_schema_requires_explicit_exclusive_admission(self) -> None:
         controller = contract_schema()["$defs"]["controller"]
@@ -146,6 +153,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts/init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--output", str(output),
             ], check=True, text=True, capture_output=True)
             config = json.loads(output.read_text())
@@ -296,6 +306,23 @@ class PolicyTests(unittest.TestCase):
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
 
+    def test_manager_staging_requires_every_controller_to_advance(self) -> None:
+        previous = reference_config()
+        previous.pop("managed_images")
+        for controller in previous["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        original = next(iter(previous["controllers"].values()))
+        previous["controllers"]["second-controller"] = copy.deepcopy(original)
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("second-controller.engine_ref" in error for error in validation.errors), validation.errors)
+        current["controllers"]["second-controller"]["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+
     def test_managed_image_ids_require_an_architecture_key(self) -> None:
         config = copy.deepcopy(reference_config())
         engine_ref = first_controller(config)["engine_ref"]
@@ -310,6 +337,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40,
                 "--default-bridge-cidr", "192.0.2.1/24",
                 "--output", str(output),
@@ -323,6 +353,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "16",
                 "--capacity-budget", "16", "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
@@ -337,6 +370,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "2",
                 "--capacity-budget", "2", "--networks-per-runner", "2",
                 "--output", str(output),
@@ -352,6 +388,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "30",
                 "--capacity-budget", "30", "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
@@ -363,6 +402,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "31",
                 "--capacity-budget", "31", "--output", str(Path(directory) / "fleet.json"),
             ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -374,6 +416,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "256",
                 "--capacity-budget", "256", "--output", str(Path(directory) / "fleet.json"),
             ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
