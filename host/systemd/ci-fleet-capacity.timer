@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample active ci-fleet capacity every 30 seconds
+
+[Timer]
+OnActiveSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=ci-fleet-capacity.service
+
+[Install]
+WantedBy=timers.target

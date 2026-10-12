@@ -22,7 +22,7 @@ fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
 # Exercise the production functions without running the installer's CLI.
 source_functions=$tmp/functions.sh
-sed -n '/^remove_systemd_units() {$/,/^}$/p; /^restore_systemd_snapshot() {$/,/^}$/p' "$repo_root/scripts/install-worker-controller.sh" >"$source_functions"
+sed -n '/^stop_capacity_units() {$/,/^}$/p; /^remove_systemd_units() {$/,/^}$/p; /^restore_systemd_snapshot() {$/,/^}$/p' "$repo_root/scripts/install-worker-controller.sh" >"$source_functions"
 # shellcheck disable=SC1090
 source "$source_functions"
 
@@ -62,6 +62,13 @@ systemctl() {
   case "$action" in
     show)
       [[ ${fail_show:-false} != true ]] || return 1
+      if [[ ${*: -1} == ci-fleet-capacity.timer || ${*: -1} == ci-fleet-capacity.service ]]; then
+        case ${1:-} in
+          --property=LoadState) printf 'not-found\n'; return ;;
+          --property=ActiveState) printf 'inactive\n'; return ;;
+          *) fail 'unexpected capacity unit query' ;;
+        esac
+      fi
       if [[ -n ${modeled_state_file:-} ]]; then
         local queried_state
         queried_state=$(cat "$modeled_state_file")
