@@ -37,10 +37,13 @@ wait_http "http://127.0.0.1:$callback_port/" "$tmp/callback.html"
 status=$("$real_curl" -sS -o "$tmp/wrong.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=wrong")
 [[ $status == 403 && ! -e $code_file ]] || fail 'callback accepted the wrong state'
 "$real_curl" -fsS "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=fixture-state" -o "$tmp/correct.html"
+[[ $(<"$code_file") == fixture-code && $(stat -c %a "$code_file") == 600 ]] || fail 'callback did not protect the conversion code'
+rm "$code_file"
+status=$("$real_curl" -sS -o "$tmp/replayed.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-replay&state=fixture-state")
+[[ $status == 409 && ! -e $code_file ]] || fail 'callback state was reusable after code cleanup'
 printf 'https://github.com/apps/example-fixture/installations/new\n' >"$handoff_file"
 "$real_curl" -fsS "http://127.0.0.1:$callback_port/next" -o "$tmp/next.html"
 wait "${processes[-1]}"
-[[ $(<"$code_file") == fixture-code && $(stat -c %a "$code_file") == 600 ]] || fail 'callback did not protect the conversion code'
 [[ ! -s $tmp/callback.out && ! -s $tmp/callback.err ]] || fail 'callback logged request material'
 grep -Fq 'https://github.com/apps/example-fixture/installations/new' "$tmp/next.html" || fail 'callback did not provide the installation approval link'
 orphan_port=$(port)

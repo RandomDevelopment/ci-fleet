@@ -17,6 +17,7 @@ class Server(http.server.HTTPServer):
     output: str
     handoff: str
     done: bool
+    consumed: bool
 
 
 class Callback(http.server.BaseHTTPRequestHandler):
@@ -82,6 +83,9 @@ class Callback(http.server.BaseHTTPRequestHandler):
         if not secrets.compare_digest(values["state"][0], self.app_server.state):
             self.reply(403, "Invalid callback state")
             return
+        if self.app_server.consumed:
+            self.reply(409, "Callback already consumed")
+            return
         code = values["code"][0]
         if not code or len(code) > 512 or any(character.isspace() for character in code):
             self.reply(400, "Invalid callback")
@@ -93,6 +97,7 @@ class Callback(http.server.BaseHTTPRequestHandler):
             return
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(code)
+        self.app_server.consumed = True
         self.reply(200, "<meta http-equiv=refresh content='1;url=/next'><h1>Registration received</h1><p>Preparing installation approval. No value needs to be copied.</p>")
 
 
@@ -123,6 +128,7 @@ def main() -> int:
     server.output = args.output
     server.handoff = args.handoff
     server.done = False
+    server.consumed = False
     server.timeout = 1
     deadline = __import__("time").monotonic() + args.timeout
     while __import__("time").monotonic() < deadline and not server.done:
