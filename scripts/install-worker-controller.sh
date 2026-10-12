@@ -1163,7 +1163,7 @@ run_candidate_preflight() {
 }
 
 build_candidate() {
-  run_candidate_preflight
+  # Quiescence is enforced after drain, not while preparing validated image inputs.
   compose "$release_dir" "$candidate_env" config --quiet
   if ! managed_images_match "$candidate_env"; then build_managed_images "$release_dir" "$candidate_env"; fi
   managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
