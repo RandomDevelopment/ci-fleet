@@ -820,7 +820,15 @@ rm "$root/etc/systemd/system/actions.runner.example-org-example-repo.example-run
 export FAKE_DOCKER_PS='unrelated workload'
 expect_failure 'unrelated Docker workload is present' "$installer" --check --config "$config" >/dev/null
 unset FAKE_DOCKER_PS
-export FAKE_DOCKER_PS='owned|deployer|staging-deployer-01'
+for inventory in PS NETWORKS VOLUMES; do
+  case $inventory in PS) message='unrelated Docker workload is present' ;; NETWORKS) message='incompatible custom Docker network is present' ;; VOLUMES) message='incompatible Docker volume is present' ;; esac
+  for scope in '' '|production|example-staging' '|staging|other-target'; do
+    export "FAKE_DOCKER_$inventory=owned|deployer|staging-deployer-01$scope"
+    expect_failure "$message" "$installer" --check --config "$config" >/dev/null
+    unset "FAKE_DOCKER_$inventory"
+  done
+done
+export FAKE_DOCKER_PS='owned|deployer|staging-deployer-01|staging|example-staging'
 expect_success "$installer" --check --config "$config" >/dev/null
 export FAKE_DOCKER_PS='wrong|deployer|other-identity'
 expect_failure 'unrelated Docker workload is present' "$installer" --check --config "$config" >/dev/null
@@ -2580,7 +2588,9 @@ policy_line=$(grep -n "secure_file \"\$config\" 'deployer configuration'" "$runt
 for scheduled in health cleanup; do
   scheduled_unit=$repo_root/deploy/deployer/ci-fleet-deployer-$scheduled.service
   grep -Fq 'ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer' "$scheduled_unit" || fail 'scheduled adapter state is writable'
-  grep -Fxq 'ReadWritePaths=/run/docker.sock' "$scheduled_unit" || fail 'scheduled adapter has unexpected writable paths'
+  grep -Fxq 'ReadWritePaths=-/run/docker.sock' "$scheduled_unit" || fail 'scheduled adapter has unexpected writable paths'
+  [[ $(grep -c '^ReadWritePaths=' "$scheduled_unit") == 2 ]] || fail 'scheduled adapter has additional writable paths'
+  grep -Fxq 'ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery /var/lib/ci-fleet-deployer-container-credentials' "$scheduled_unit" || fail 'scheduled adapter recovery paths differ'
   grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$scheduled_unit" || fail 'scheduled adapter can bypass its mount namespace'
 done
 

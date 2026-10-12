@@ -123,6 +123,14 @@ if run --check >/dev/null 2>&1; then
 fi
 rmdir "$root/var/lib/ci-fleet-deployer-container-credentials"
 
+for form in directory symlink; do
+  if [[ $form == directory ]]; then mkdir "$root/opt/ci-fleet-deployer"; else ln -s /missing "$root/opt/ci-fleet-deployer"; fi
+  if run --check >/dev/null 2>&1; then
+    echo "retained deployer install root was accepted by the status receiver" >&2; exit 1
+  fi
+  if [[ $form == directory ]]; then rmdir "$root/opt/ci-fleet-deployer"; else rm "$root/opt/ci-fleet-deployer"; fi
+done
+
 role_lock="$root/run/ci-fleet-role-admission.lock"
 exec 8>"$role_lock"
 flock -n 8

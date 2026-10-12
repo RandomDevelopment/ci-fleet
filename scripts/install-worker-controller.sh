@@ -2194,7 +2194,7 @@ reject_isolated_host() {
        -e "$(root_path /opt/ci-fleet-tester/tester-runtime)" || -L "$(root_path /opt/ci-fleet-tester/tester-runtime)" ]]; then
     die 'tester host state is present; controller and tester roles are separate hosts'
   fi
-  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /opt/ci-fleet-deployer)" || -L "$(root_path /opt/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
   for inventory_kind in list-unit-files list-units; do

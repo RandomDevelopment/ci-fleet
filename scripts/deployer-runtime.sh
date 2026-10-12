@@ -280,13 +280,13 @@ reject_other_role_state() {
   done
 }
 reject_mixed_role() {
-  local line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  local line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}|${cfg[ENVIRONMENT]}|${cfg[TARGET_ID]}"
   reject_other_role_state
-  output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker workload inventory failed'
+  output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}|{{.Label "io.randomdevelopment.ci-fleet.environment"}}|{{.Label "io.randomdevelopment.ci-fleet.target"}}') || die 'Docker workload inventory failed'
   while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'unrelated Docker workload is present'; done <<<"$output"
-  output=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker network inventory failed'
+  output=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}|{{.Label "io.randomdevelopment.ci-fleet.environment"}}|{{.Label "io.randomdevelopment.ci-fleet.target"}}') || die 'Docker network inventory failed'
   while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'incompatible custom Docker network is present'; done <<<"$output"
-  output=$(docker volume ls --format '{{.Name}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker volume inventory failed'
+  output=$(docker volume ls --format '{{.Name}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}|{{.Label "io.randomdevelopment.ci-fleet.environment"}}|{{.Label "io.randomdevelopment.ci-fleet.target"}}') || die 'Docker volume inventory failed'
   while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'incompatible Docker volume is present'; done <<<"$output"
 }
 inside() {

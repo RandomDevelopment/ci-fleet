@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Adversarial checks for the deployment Docker and recovery boundary."""
 import copy
+import errno
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import deployer_adapter as adapter
 
@@ -114,6 +115,68 @@ class Containment(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.policy.authorize('POST', '/images/create?fromImage=unreviewed:latest', b'')
 
+    def test_rootful_socket_acl_fails_closed(self):
+        peer = MagicMock()
+        peer.getsockopt.return_value = adapter.struct.pack('3i', 123, 45678, 45678)
+        status = 'Uid: 45678 45678 45678 45678\nGid: 45678 45678 45678 45678\nGroups: 45678\n'
+        for acl, rejected in [(OSError(errno.ENODATA, 'absent'), False),
+                              (OSError(errno.ENOTSUP, 'unsupported'), False),
+                              (b'named-user-acl', True), (OSError(errno.EACCES, 'denied'), True)]:
+            with self.subTest(acl=acl), patch.object(adapter.socket, 'socket', return_value=peer), \
+                 patch.object(adapter.os, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=45678)), \
+                 patch.object(adapter.Path, 'read_text', return_value=status), \
+                 patch.object(adapter.grp, 'getgrnam', side_effect=KeyError), \
+                 patch.object(adapter.Path, 'exists', return_value=True), \
+                 patch.object(adapter.Path, 'resolve', return_value=Path('/run/docker.sock')), \
+                 patch.object(adapter.Path, 'stat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFSOCK | 0o660)), \
+                 patch.object(adapter.os, 'getxattr', **({'side_effect': acl} if isinstance(acl, OSError) else {'return_value': acl})):
+                connection = adapter.UnixConnection('/run/rootless/docker.sock')
+                if rejected:
+                    with self.assertRaises(ValueError):
+                        connection.connect()
+                else:
+                    connection.connect()
+
+    def test_pull_ownership_requires_success_and_confirmed_digest(self):
+        for status, response, recorded in [(404, b'{"message":"absent"}', False),
+                                           (200, b'{"errorDetail":{"message":"denied"},"error":"denied"}\n', False),
+                                           (200, b'{"status":"Pull complete"}\n', True),
+                                           (200, b'not-json', False), (200, b'', False)]:
+            with self.subTest(status=status, response=response), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}):
+                ledger = Path(directory) / 'artifacts.json'
+                policy = adapter.Policy(self.values, self.backend, artifact_store=ledger)
+                self.backend.request = lambda *_args: (status, response)
+                self.backend.resources['images', policy.image] = {'RepoDigests': [policy.image]}
+                path = str(Path(directory) / 'broker.sock')
+                with adapter.ProxyServer(path, adapter.handler(policy)) as server:
+                    thread = threading.Thread(target=server.serve_forever)
+                    thread.start()
+                    try:
+                        connection = adapter.UnixConnection(path, rootless=False)
+                        query = adapter.urllib.parse.urlencode({'fromImage': policy.image})
+                        connection.request('POST', '/images/create?' + query)
+                        result = connection.getresponse()
+                        result.read()
+                        connection.close()
+                    finally:
+                        server.shutdown()
+                        thread.join()
+                self.assertEqual(policy.artifact_owned(policy.image), recorded)
+
+    def test_adapter_has_no_caller_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials, runtime = root / 'credentials', root / 'runtime'
+            credentials.mkdir(); runtime.mkdir()
+            (credentials / 'policy').write_text('CREDENTIAL_PROVIDER=file\n')
+            (credentials / 'adapter').write_text('#!/bin/sh\nread value && exit 1\nexit 0\n')
+            with patch.dict(os.environ, {'CREDENTIALS_DIRECTORY':str(credentials), 'RUNTIME_DIRECTORY':str(runtime),
+                                        'CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL':'/approved/application'}):
+                result = subprocess.run([adapter.sys.executable, adapter.__file__, 'execute', 'health'],
+                                        input=b'caller-input\n', capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_sandbox_properties(self):
         command = adapter.sandbox_command('ci-fleet-deployer-adapter-1-2.service', 120, Path('/run/broker.sock'),
                                          Path('/policy'), Path('/adapter'), Path('/credential'), Path('/helper'),
@@ -195,6 +258,7 @@ class Containment(unittest.TestCase):
             def successful_dispatch(command, **kwargs):
                 if command[0] == 'systemd-run':
                     source = next(item.split('=', 2)[2] for item in command if item.startswith('--setenv=CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL='))
+                    self.assertEqual(kwargs.get('stdin'), subprocess.DEVNULL)
                     advertised.append(Path(source))
                     self.assertEqual(Path(source).read_bytes(), b'fixture-only')
                 return subprocess.CompletedProcess(command, 0, 'LoadState=loaded\nActiveState=inactive\n')
@@ -350,6 +414,24 @@ class Containment(unittest.TestCase):
             with self.assertRaises(ValueError):
                 adapter.reject_rootful_workloads('/run/rootless/docker.sock')
         connection.close.assert_called_once()
+
+    def test_rootful_inventory_has_one_startup_deadline(self):
+        connection = MagicMock()
+        with patch.object(adapter.Path, 'exists', return_value=True), \
+             patch.object(adapter.Path, 'resolve', return_value=Path('/run/docker.sock')), \
+             patch.object(adapter, 'UnixConnection', return_value=connection), \
+             patch.object(adapter.time, 'monotonic', return_value=31):
+            with self.assertRaises(ValueError):
+                adapter.reject_rootful_workloads('/run/rootless/docker.sock', deadline=30)
+        connection.request.assert_not_called()
+        connection.close.assert_called_once()
+
+    def test_confirmed_image_uses_docker_inspect_endpoint(self):
+        backend = adapter.Backend.__new__(adapter.Backend)
+        backend.request = MagicMock(return_value=(200, json.dumps({'RepoDigests':[self.policy.image]}).encode()))
+        self.assertEqual(backend.inspect('images', self.policy.image)['RepoDigests'], [self.policy.image])
+        path = '/images/' + adapter.urllib.parse.quote(self.policy.image, safe='') + '/json'
+        backend.request.assert_called_once_with('GET', path)
 
     def test_rootful_socket_peer_rejected(self):
         if os.getuid() != 0:
