@@ -391,7 +391,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
     for name, controller in controllers.items():
         path = f"$.controllers.{name}"
         validation.require(isinstance(name, str) and bool(SLUG.fullmatch(name)), path, "controller ID must be a unique lowercase slug")
-        if not validation.exact_keys(controller, path, controller_keys - {"docker_network_policy"}, {"status_reporting", "docker_network_policy"}):
+        if not validation.exact_keys(controller, path, controller_keys - {"docker_network_policy"}, {"status_reporting", "docker_network_policy", "docker_storage_retention"}):
             continue
         pool_name = controller.get("pool")
         location = controller.get("location")
@@ -420,6 +420,10 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             validation.require(minimum <= maximum, f"{path}.min_runners", "must not exceed max_runners")
         validation.require(minimum == 0, f"{path}.min_runners", "must be zero because managed prewarmed runners are not supported")
         status_reporting = controller.get("status_reporting")
+        if "docker_storage_retention" in controller:
+            retention = controller["docker_storage_retention"]
+            if validation.exact_keys(retention, f"{path}.docker_storage_retention", {"exclusive_fleet_daemon"}):
+                validation.require(retention.get("exclusive_fleet_daemon") is True, f"{path}.docker_storage_retention.exclusive_fleet_daemon", "must be true; shared daemons are not admitted")
         if "status_reporting" in controller and validation.exact_keys(status_reporting, f"{path}.status_reporting", {"enabled", "config_file"}):
             validation.require(type(status_reporting.get("enabled")) is bool, f"{path}.status_reporting.enabled", "must be a boolean")
             validation.require(status_reporting.get("config_file") == "/etc/ci-fleet/monitoring.env", f"{path}.status_reporting.config_file", "must use the fixed host-local monitoring configuration")

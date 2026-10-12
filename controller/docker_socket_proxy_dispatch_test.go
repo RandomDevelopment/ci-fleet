@@ -71,9 +71,7 @@ func TestDockerSocketProxyDefiniteDialFailureDoesNotLeaveMarker(t *testing.T) {
 			if got := post(); got != http.StatusOK {
 				t.Fatalf("recovered daemon status = %d", got)
 			}
-			if count := proxyMarkerCount(t, fixture); count != 0 {
-				t.Errorf("daemon recovery retained %d markers from requests it never received", count)
-			}
+			waitForProxyMarkerCleanup(t, fixture)
 		})
 	}
 }

@@ -12,6 +12,8 @@ python3 -m py_compile \
   scripts/verify_config_approval.py \
   scripts/test_config_approval.py \
   scripts/cleanup_networks.py \
+  scripts/cleanup_storage.py \
+  scripts/test_cleanup_storage.py \
   scripts/health.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
@@ -30,6 +32,7 @@ python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
 python3 scripts/test_config_approval.py
 python3 scripts/test_cleanup_networks.py
+python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py
 python3 scripts/test_health.py
@@ -66,6 +69,7 @@ docker compose -f deploy/compose.yaml config --quiet
 
 docker compose -f deploy/compose.yaml build runner-image controller
 docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+bash scripts/test-cleanup-e2e.sh
 CI_FLEET_INSTANCE=validation scripts/cleanup.sh
 
 python3 scripts/scan_committed_secrets.py

@@ -29,15 +29,20 @@ const dockerProxyHealthPath = "/_ci_fleet/docker-socket-proxy"
 const dockerProxyHealth = "ci-fleet-docker-socket-proxy-v1\n"
 const dockerBuildContextLimit = 1 << 30
 const dockerBuildUploadLimit = 2
+const dockerMetadataBodyLimit = 1 << 20
 
 var dockerAPIVersion = regexp.MustCompile(`^/v[0-9]+\.[0-9]+/`)
 
 func dockerReferenceMutation(method, path string) bool {
+	path = dockerAPIVersion.ReplaceAllString(path, "/")
+	if method == http.MethodDelete && strings.HasPrefix(path, "/images/") {
+		return true
+	}
 	if method != http.MethodPost {
 		return false
 	}
-	path = dockerAPIVersion.ReplaceAllString(path, "/")
-	if path == "/containers/create" || path == "/build" || path == "/swarm/init" || path == "/swarm/join" {
+	if path == "/containers/create" || path == "/build" || path == "/swarm/init" || path == "/swarm/join" ||
+		strings.HasPrefix(path, "/images/") || path == "/build/prune" || path == "/commit" {
 		return true
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -351,7 +356,9 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 			return
 		}
 		if dockerReferenceMutation(request.Method, request.URL.Path) && request.Body != nil {
-			if dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/build" {
+			path := dockerAPIVersion.ReplaceAllString(request.URL.Path, "/")
+			if path == "/build" || path == "/images/load" ||
+				(path == "/images/create" && request.URL.Query().Get("fromSrc") == "-" && request.URL.Query().Get("fromImage") == "") {
 				if request.ContentLength > dockerBuildContextLimit {
 					http.Error(w, "build context exceeds 1 GiB", http.StatusRequestEntityTooLarge)
 					return
@@ -392,7 +399,12 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 				request.Body = spool
 				request.ContentLength = length
 			} else {
-				body, err := io.ReadAll(request.Body)
+				body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, dockerMetadataBodyLimit))
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, "Docker metadata body exceeds 1 MiB", http.StatusRequestEntityTooLarge)
+					return
+				}
 				if err == nil && dockerAPIVersion.ReplaceAllString(request.URL.Path, "/") == "/containers/create" {
 					body, err = rewriteDockerSocketBinds(body)
 				}

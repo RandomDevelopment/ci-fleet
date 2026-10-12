@@ -21,6 +21,7 @@ expect_failure() {
 
 [[ -x "$installer" && -x "$runtime" ]] || fail 'deployer installer/runtime is missing'
 expect_failure 'an explicit operating mode is required' "$installer"
+bash "$repo_root/scripts/test-deployer-replay-ledger.sh"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("health", ROOT / "scripts" / "health.py")
@@ -516,6 +517,23 @@ class HealthTests(unittest.TestCase):
         wrong = health.evaluate_heartbeats({"fresh": controllers["fresh"]}, {"fresh": {"controller": "other", "timestamp": 980, "status": "healthy"}}, now=1000, grace_seconds=60)
         self.assertEqual((wrong["status"], wrong["hosts"][0]["status"]), ("unhealthy", "missing"))
 
+    def test_collector_detects_missed_hourly_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proc").mkdir()
+            (root / "proc/meminfo").write_text("MemTotal: 100 kB\nMemAvailable: 75 kB\n")
+
+            def run(args):
+                output = "1s\n" if "--property=LastTriggerUSecMonotonic" in args else "success\n"
+                return health.subprocess.CompletedProcess(args, 1 if args[0] == "docker" else 0, output, "")
+
+            for age, expected in ((3900, "ok"), (7200, "ok"), (7201, "stale")):
+                with self.subTest(age=age), patch.object(health.time, "clock_gettime", return_value=age + 1):
+                    snapshot = health.collect_snapshot({"CI_FLEET_CONTROLLER_STATE": "disabled"}, root=root, run=run)
+                    self.assertEqual(snapshot["timers"]["cleanup"], expected)
+                    report = health.evaluate({**healthy_snapshot(), "timers": {"cleanup": snapshot["timers"]["cleanup"]}}, health.Thresholds())
+                    self.assertEqual(report["exit_code"], 1 if expected == "stale" else 0)
+
     def test_collector_uses_sustained_metrics_and_all_service_units(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -866,7 +884,7 @@ class HealthTests(unittest.TestCase):
     def test_expired_active_resources_and_stopped_capacity_are_observable(self) -> None:
         cleanup = "KEEP container runner state=running expired=1 (routine cleanup never removes active containers)\nWOULD_REMOVE volume old expired=1\n"
         run = lambda args: health.subprocess.CompletedProcess(args, 0, cleanup, "")
-        self.assertEqual(health._stale_resources(run, "example"), {"containers": 1, "networks": 0, "volumes": 1})
+        self.assertEqual(health._stale_resources(run, "example"), {"containers": 1, "networks": 0, "volumes": 1, "images": 0})
 
         def stopped(args):
             outputs = {
@@ -880,6 +898,34 @@ class HealthTests(unittest.TestCase):
         controller, capacity = health._container(stopped, "controller")
         self.assertEqual((controller["state"], capacity), ("exited", {"min": 0, "max": 0}))
 
+    def test_retention_eligible_tagged_images_warn_below_disk_warning_threshold(self) -> None:
+        for eligible in (False, True):
+            with self.subTest(eligible=eligible):
+                output = "KEEP image protected installed-or-checkpoint-release\nKEEP image recent recent-or-unknown-age\n"
+                if eligible:
+                    output += "ELIGIBLE image old-tagged eligible\n"
+                run = lambda args: health.subprocess.CompletedProcess(args, 0, output, "")
+                snapshot = healthy_snapshot()
+                snapshot["disks"]["docker"]["used_percent"] = 75
+                snapshot["stale"] = health._stale_resources(run, "example")
+                self.assertEqual(snapshot["stale"]["images"], int(eligible))
+                report = health.evaluate(snapshot, health.Thresholds())
+                self.assertEqual(report["status"], "warning" if eligible else "healthy")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proc").mkdir()
+            (root / "proc/meminfo").write_text("MemTotal: 100 kB\nMemAvailable: 75 kB\n")
+            def run(args):
+                output = "ELIGIBLE image tagged eligible\n" if args[0].endswith("cleanup.sh") else ""
+                if args[:3] == ["docker", "images", "-q"]:
+                    output = "dangling-one\ndangling-two\n"
+                return health.subprocess.CompletedProcess(args, 0, output, "")
+            for admitted, expected in ((False, 2), (True, 1)):
+                values = {"CI_FLEET_CONTROLLER_STATE": "disabled"}
+                if admitted:
+                    values["CI_FLEET_DOCKER_STORAGE_RETENTION"] = "exclusive-fleet-daemon-v1"
+                self.assertEqual(health.collect_snapshot(values, root=root, run=run)["stale"]["images"], expected)
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,24 +15,51 @@ import (
 
 type zeroBuildContext struct{}
 
+func TestDockerSocketProxyBoundsMetadataBodies(t *testing.T) {
+	for _, route := range []string{"/v1.48/images/create?fromImage=example:latest", "/images/create?fromSrc=https://example.invalid/rootfs.tar", "/commit", "/images/fixture/tag"} {
+		t.Run(route, func(t *testing.T) {
+			handler, transport := newDockerSocketProxy("/missing-daemon.sock", filepath.Join(t.TempDir(), "maintenance.lock"), proxyTestBoot)
+			defer transport.CloseIdleConnections()
+			for _, size := range []int64{1 << 20, 1<<20 + 1} {
+				request := httptest.NewRequest(http.MethodPost, "http://docker"+route, io.LimitReader(zeroBuildContext{}, size))
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				want := http.StatusServiceUnavailable
+				if size > 1<<20 {
+					want = http.StatusRequestEntityTooLarge
+				}
+				if response.Code != want {
+					t.Fatalf("metadata body size %d: status = %d, want %d", size, response.Code, want)
+				}
+			}
+		})
+	}
+}
+
 func (zeroBuildContext) Read(buffer []byte) (int, error) {
 	clear(buffer)
 	return len(buffer), nil
 }
 
-func TestDockerSocketProxyRejectsOversizedBuildContext(t *testing.T) {
-	for _, knownLength := range []bool{true, false} {
-		t.Run(map[bool]string{true: "known length", false: "streamed"}[knownLength], func(t *testing.T) {
-			handler, transport := newDockerSocketProxy("/missing-daemon.sock", filepath.Join(t.TempDir(), "maintenance.lock"), proxyTestBoot)
-			defer transport.CloseIdleConnections()
-			request := httptest.NewRequest(http.MethodPost, "http://docker/v1.48/build", io.LimitReader(zeroBuildContext{}, 1<<30+1))
-			if knownLength {
-				request.ContentLength = 1<<30 + 1
-			}
-			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, request)
-			if response.Code != http.StatusRequestEntityTooLarge {
-				t.Fatalf("oversized context status = %d, want 413", response.Code)
+func TestDockerSocketProxyRejectsOversizedUploads(t *testing.T) {
+	for _, route := range []string{"/v1.48/build", "/v1.48/images/load", "/v1.48/images/create?fromSrc=-&repo=fixture"} {
+		t.Run(route, func(t *testing.T) {
+			for _, knownLength := range []bool{true, false} {
+				t.Run(map[bool]string{true: "known length", false: "streamed"}[knownLength], func(t *testing.T) {
+					handler, transport := newDockerSocketProxy("/missing-daemon.sock", filepath.Join(t.TempDir(), "maintenance.lock"), proxyTestBoot)
+					defer transport.CloseIdleConnections()
+					request := httptest.NewRequest(http.MethodPost, "http://docker"+route, io.LimitReader(zeroBuildContext{}, 1<<30+1))
+					if knownLength {
+						request.ContentLength = 1<<30 + 1
+					}
+					response := httptest.NewRecorder()
+					handler.ServeHTTP(response, request)
+					if response.Code != http.StatusRequestEntityTooLarge {
+						t.Fatalf("oversized context status = %d, want 413", response.Code)
+					}
+				})
 			}
 		})
 	}
@@ -49,7 +76,7 @@ func (body *blockedBuildContext) Read([]byte) (int, error) {
 	return 0, io.ErrUnexpectedEOF
 }
 
-func TestDockerSocketProxyBoundsConcurrentBuildUploads(t *testing.T) {
+func TestDockerSocketProxyBoundsConcurrentUploads(t *testing.T) {
 	handler, transport := newDockerSocketProxy("/missing-daemon.sock", filepath.Join(t.TempDir(), "maintenance.lock"), proxyTestBoot)
 	defer transport.CloseIdleConnections()
 	finished := make(chan struct{}, 2)
@@ -64,10 +91,10 @@ func TestDockerSocketProxyBoundsConcurrentBuildUploads(t *testing.T) {
 			}
 		}
 	}()
-	for range 2 {
+	for _, route := range []string{"/build", "/images/load"} {
 		body := &blockedBuildContext{started: make(chan struct{}), finish: finish}
 		go func() {
-			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "http://docker/build", body))
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "http://docker"+route, body))
 			finished <- struct{}{}
 		}()
 		select {
@@ -78,11 +105,22 @@ func TestDockerSocketProxyBoundsConcurrentBuildUploads(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "http://docker/build", strings.NewReader("context")).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, "http://docker/images/create?fromSrc=-&repo=fixture", strings.NewReader("context")).WithContext(ctx)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusRequestTimeout || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("third upload bypassed the spool limit: status = %d", response.Code)
+	}
+	for _, query := range []string{"fromImage=example:latest", "fromSrc=https://example.invalid/rootfs.tar"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		request := httptest.NewRequest(http.MethodPost, "http://docker/v1.48/images/create?"+query, nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		cancel()
+		// The absent daemon must be reached even while both upload slots are occupied.
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("non-upload image creation waited for a spool slot: status = %d", response.Code)
+		}
 	}
 }
 
