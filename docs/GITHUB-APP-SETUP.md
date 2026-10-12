@@ -18,9 +18,10 @@ organization, app name, and configuration repository.
 
 ## Bootstrap on the target host
 
-Run the reviewed checkout on the target Linux Docker host. The plaintext callback
-is loopback-only; non-loopback callbacks are rejected because the one-time
-manifest conversion code requires transport confidentiality.
+Run the reviewed checkout on the target Linux Docker host. The callback listens
+on a private Unix socket accessible only to the operator UID. Reach it through
+an authenticated SSH local forward bound to loopback on the management device.
+The callback nonce stays in a private file and never enters process arguments.
 
 ```bash
 sudo ./scripts/bootstrap-github.sh \
@@ -31,18 +32,24 @@ sudo ./scripts/bootstrap-github.sh \
   --allow-repository example-org/example-repo=123456
 ```
 
-All names above are fictional. The script prints one non-secret local
-`REGISTRATION_URL`. Open it, press the single registration button, install the
+All names above are fictional. The script prints a non-secret `CALLBACK_SOCKET`,
+an SSH `TUNNEL` command shape, and a local `REGISTRATION_URL`. Establish the
+forward, open the URL, press the single registration button, install the
 new App for **only** the private configuration repository, and return to the
 terminal. The target host receives and exchanges the temporary code itself.
 Neither the code nor any credential is copied through a phone, clipboard, chat,
 email, issue, or second computer.
 
-For a headless remote host, establish an authenticated SSH local forward from
-the management workstation first: `ssh -L 8765:127.0.0.1:8765 HOST`. Keep that
-session open, run bootstrap on `HOST`, and open `http://127.0.0.1:8765/` on the
-workstation. Close the SSH session immediately after bootstrap. Do not expose
-the callback listener or forward on a shared workstation.
+Use a second terminal on the same management device to establish the printed
+SSH local forward after bootstrap starts. Substitute the target host and use
+the same remote account that invoked `sudo`. Keep the SSH session open and open
+`http://127.0.0.1:8765/` on that device. Close the session after bootstrap. The
+Unix socket is mode `0600` inside an operator-owned mode-`0700` directory. The
+operator UID defaults to `SUDO_UID`, or the invoking UID without sudo. A root
+console operator can explicitly authorize the trusted SSH account with
+`--operator-uid UID`. Other target-host users cannot fetch the nonce or submit
+a callback. Do not expose the forward on a shared management device. No TCP
+listener or firewall change is created on the target host.
 
 Each project argument includes its numeric repository ID, obtained and reviewed
 by the organization owner. The App itself receives access only to the separate
@@ -96,6 +103,8 @@ After success, rerun the same command with `--check` to verify App ownership,
 App permissions, effective installation `contents: read` and organization
 runner-write permission, exact selected private repositories, runner-group access,
 and host-local credential modes without changing the App or runner group.
+An enabled approval gate also verifies the selected configuration repository
+against the protected numeric repository ID and default branch.
 Bootstrap preserves an existing valid `CI_FLEET_RUNNER_TTL` and uses the host
 contract default of `6h` when the optional setting is absent.
 

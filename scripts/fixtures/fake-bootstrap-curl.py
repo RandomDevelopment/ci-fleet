@@ -42,7 +42,7 @@ elif "/repos/example-org/example-repo" in url:
                 "owner": {"login": "example-org"}}
 elif "/installation/repositories" in url:
     kind = "installation-repositories"
-    response = {"total_count": 1, "repositories": [{"id": 201, "full_name": "example-org/config", "private": True, "archived": False}]}
+    response = {"total_count": 1, "repositories": [{"id": 201, "full_name": "example-org/config", "private": True, "archived": False, "default_branch": "main"}]}
 elif endpoint.endswith("/actions/runner-groups") and method == "POST":
     kind = "runner-group-create"
     payload = json.loads(Path(values["data-binary"][0].removeprefix("@")).read_text())
@@ -95,6 +95,12 @@ if kind in {"app", "installation-token"} and os.environ.get("FAKE_BOOTSTRAP_APPR
         response["permissions"]["actions"] = "write"
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_APPROVAL_READ"):
     response["permissions"].pop(os.environ["FAKE_BOOTSTRAP_NO_APPROVAL_READ"])
+if kind == "installation-repositories" and os.environ.get("FAKE_BOOTSTRAP_POLICY_MISMATCH"):
+    repository = response["repositories"][0]
+    if os.environ["FAKE_BOOTSTRAP_POLICY_MISMATCH"] == "id":
+        repository["id"] = 999
+    else:
+        repository["default_branch"] = "other-branch"
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_RUNNER_PERMISSION"):
     if os.environ["FAKE_BOOTSTRAP_RUNNER_PERMISSION"] == "none":
         response["permissions"].pop("organization_self_hosted_runners")

@@ -16,11 +16,14 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+callback_socket=
+callback_curl() { "$real_curl" --unix-socket "$callback_socket" "$@"; }
 port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 wait_http() {
-  local url=$1 output=$2
+  local url=$1 output=$2 transcript=${3:-}
   for _ in {1..100}; do
-    if "$real_curl" -fsS "$url" -o "$output" 2>/dev/null; then return; fi
+    if [[ -n $transcript ]]; then callback_socket=$(awk '$1 == "CALLBACK_SOCKET" {print $2; exit}' "$transcript"); fi
+    if [[ -n $callback_socket ]] && callback_curl -fsS "$url" -o "$output" 2>/dev/null; then return; fi
     sleep 0.05
   done
   fail "callback did not become ready: $url"
@@ -28,27 +31,36 @@ wait_http() {
 
 # The callback rejects mismatched state, never logs, and writes the code once with mode 0600.
 callback_port=$(port)
+callback_socket=$tmp/callback.sock
+state_file=$tmp/callback-state
+printf fixture-state >"$state_file"
+chmod 600 "$state_file"
 code_file=$tmp/callback-code
 handoff_file=$tmp/callback-handoff
-python3 "$callback" --parent-pid "$$" --bind 127.0.0.1 --port "$callback_port" --organization example-org --state fixture-state \
+python3 "$callback" --parent-pid "$$" --socket "$callback_socket" --operator-uid "$(id -u)" --port "$callback_port" --organization example-org --state-file "$state_file" \
   --manifest '{"name":"fixture"}' --output "$code_file" --handoff "$handoff_file" --timeout 30 >"$tmp/callback.out" 2>"$tmp/callback.err" &
 processes+=("$!")
 wait_http "http://127.0.0.1:$callback_port/" "$tmp/callback.html"
-status=$("$real_curl" -sS -o "$tmp/wrong.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=wrong")
+[[ $(stat -c %a "$callback_socket") == 600 && $(stat -c %u "$callback_socket") == "$(id -u)" ]] || fail 'callback socket is not operator-private'
+if tr '\0' '\n' <"/proc/${processes[-1]}/cmdline" | grep -Fxq fixture-state; then fail 'callback nonce appeared in process arguments'; fi
+if [[ $(id -u) == 0 ]] && command -v runuser >/dev/null; then
+  if runuser -u nobody -- "$real_curl" --unix-socket "$callback_socket" -fsS "http://127.0.0.1:$callback_port/" -o /dev/null 2>/dev/null; then fail 'another local user could access the callback'; fi
+fi
+status=$(callback_curl -sS -o "$tmp/wrong.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=wrong")
 [[ $status == 403 && ! -e $code_file ]] || fail 'callback accepted the wrong state'
-"$real_curl" -fsS "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=fixture-state" -o "$tmp/correct.html"
+callback_curl -fsS "http://127.0.0.1:$callback_port/callback?code=fixture-code&state=fixture-state" -o "$tmp/correct.html"
 [[ $(<"$code_file") == fixture-code && $(stat -c %a "$code_file") == 600 ]] || fail 'callback did not protect the conversion code'
 rm "$code_file"
-status=$("$real_curl" -sS -o "$tmp/replayed.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-replay&state=fixture-state")
+status=$(callback_curl -sS -o "$tmp/replayed.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/callback?code=fixture-replay&state=fixture-state")
 [[ $status == 409 && ! -e $code_file ]] || fail 'callback state was reusable after code cleanup'
 printf 'https://github.com/apps/example-fixture/installations/new\n' >"$handoff_file"
-"$real_curl" -fsS "http://127.0.0.1:$callback_port/next" -o "$tmp/next.html"
+callback_curl -fsS "http://127.0.0.1:$callback_port/next" -o "$tmp/next.html"
 wait "${processes[-1]}"
 [[ ! -s $tmp/callback.out && ! -s $tmp/callback.err ]] || fail 'callback logged request material'
 grep -Fq 'https://github.com/apps/example-fixture/installations/new' "$tmp/next.html" || fail 'callback did not provide the installation approval link'
 orphan_port=$(port)
-if python3 "$callback" --parent-pid 1 --bind 127.0.0.1 --port "$orphan_port" --organization example-org --state fixture-state --manifest '{"name":"fixture"}' --output "$tmp/orphan-code" --handoff "$tmp/orphan-handoff" --timeout 30 >/dev/null 2>&1; then fail 'callback accepted a mismatched bootstrap parent'; fi
-if "$real_curl" -fsS "http://127.0.0.1:$orphan_port/" -o /dev/null 2>/dev/null; then fail 'orphaned callback opened a listener'; fi
+if python3 "$callback" --parent-pid 1 --socket "$tmp/orphan.sock" --operator-uid "$(id -u)" --port "$orphan_port" --organization example-org --state-file "$state_file" --manifest '{"name":"fixture"}' --output "$tmp/orphan-code" --handoff "$tmp/orphan-handoff" --timeout 30 >/dev/null 2>&1; then fail 'callback accepted a mismatched bootstrap parent'; fi
+[[ ! -e $tmp/orphan.sock ]] || fail 'orphaned callback opened a listener'
 
 # Dry-run validates a complete fictional request and performs no write or API call.
 dry_root=$tmp/dry-root
@@ -60,6 +72,12 @@ conflicting_root=$tmp/conflicting-mode-root
 if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$conflicting_root "$bootstrap" --dry-run --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'conflicting dry-run/check modes were accepted'; fi
 [[ ! -e $conflicting_root ]] || fail 'conflicting mode rejection wrote local state'
+duplicate_root=$tmp/duplicate-root
+for second in example-org/second-repo=101 example-org/example-repo=102; do
+  if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$duplicate_root "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --allow-repository "$second" >/dev/null 2>&1; then fail 'non-bijective repository mapping was accepted'; fi
+  [[ ! -e $duplicate_root ]] || fail 'duplicate repository mapping wrote host state'
+done
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group Default --allow-repository example-org/example-repo >/dev/null 2>&1; then
   fail 'default runner group was accepted'
 fi
@@ -95,20 +113,27 @@ if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_mismatch_root "$bootstrap" -
 [[ ! -e $routing_mismatch_root ]] || fail 'desired-state routing mismatch wrote local state before rejection'
 routing_root=$tmp/routing-root
 routing_port=$(port)
-CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$routing_port" --timeout 30 >"$tmp/routing.out" 2>"$tmp/routing.err" &
+operator_flags=()
+if [[ $(id -u) == 0 ]] && command -v runuser >/dev/null; then operator_flags=(--operator-uid "$(id -u nobody)"); fi
+CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$routing_port" --timeout 30 "${operator_flags[@]}" >"$tmp/routing.out" 2>"$tmp/routing.err" &
 routing_pid=$!
 processes+=("$routing_pid")
-wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html"
+wait_http "http://127.0.0.1:$routing_port/" "$tmp/routing.html" "$tmp/routing.out"
+if ((${#operator_flags[@]})); then
+  [[ $(stat -c %u "$callback_socket") == "$(id -u nobody)" && $(stat -c %a "${callback_socket%/*}") == 700 ]] || fail 'explicit operator socket ownership is incorrect'
+  runuser -u nobody -- "$real_curl" --unix-socket "$callback_socket" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null || fail 'authorized operator could not access the callback'
+  if runuser -u daemon -- "$real_curl" --unix-socket "$callback_socket" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then fail 'unrelated local user could access the operator callback'; fi
+fi
 second_routing_port=$(port)
-if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$second_routing_port" --timeout 30 >/dev/null 2>&1; then fail 'concurrent first-time bootstrap was accepted'; fi
-if "$real_curl" -fsS "http://127.0.0.1:$second_routing_port/" -o /dev/null 2>/dev/null; then fail 'concurrent bootstrap reached callback registration'; fi
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --install --config-repo "$config_checkout" --config-ref "$config_ref" --port "$second_routing_port" --timeout 30 >"$tmp/second-routing.out" 2>&1; then fail 'concurrent first-time bootstrap was accepted'; fi
+if grep -Fq CALLBACK_SOCKET "$tmp/second-routing.out"; then fail 'concurrent bootstrap reached callback registration'; fi
 kill -TERM "$routing_pid"
 if wait "$routing_pid"; then fail 'cancelled matching desired-state bootstrap succeeded'; fi
 for _ in {1..100}; do
-  if ! "$real_curl" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then break; fi
+  if ! callback_curl -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then break; fi
   sleep 0.05
 done
-if "$real_curl" -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then fail 'callback outlived its bootstrap parent'; fi
+if callback_curl -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then fail 'callback outlived its bootstrap parent'; fi
 if "$bootstrap" --dry-run --organization example-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository example-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
   fail 'plaintext non-loopback callback was accepted'
@@ -156,7 +181,7 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_FAIL_AFTER_CONVERSION=1 
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$live_port" --timeout 30 >"$tmp/fault.out" 2>"$tmp/fault.err" &
 live_pid=$!
 processes+=("$live_pid")
-wait_http "http://127.0.0.1:$live_port/" "$tmp/live.html"
+wait_http "http://127.0.0.1:$live_port/" "$tmp/live.html" "$tmp/fault.out"
 state=$(python3 - "$tmp/live.html" <<'PY'
 import html,re,sys,urllib.parse
 body=html.unescape(open(sys.argv[1]).read())
@@ -165,7 +190,7 @@ if not match: raise SystemExit(1)
 print(urllib.parse.unquote(match.group(1)))
 PY
 )
-"$real_curl" -fsS --get --data-urlencode code=fixture-conversion-code --data-urlencode "state=$state" \
+callback_curl -fsS --get --data-urlencode code=fixture-conversion-code --data-urlencode "state=$state" \
   "http://127.0.0.1:$live_port/callback" -o "$tmp/live-callback.html"
 if wait "$live_pid"; then fail 'injected post-conversion failure succeeded'; fi
 [[ -f $live_root/etc/ci-fleet/bootstrap-recovery.json && ! -e $live_root/etc/ci-fleet/secrets/github-app.pem ]] || fail 'converted credentials were not left recoverable'
@@ -305,11 +330,22 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'extra approval reads were accepted without the protected gate'; fi
 approval_root=$(mktemp -d "$repo_root/scripts/.bootstrap-approval.XXXXXX")
 cp -a "$live_root/." "$approval_root/"
-cp "$repo_root/host/config-review-policy.json.example" "$approval_root/etc/ci-fleet/config-review-policy.json"
+python3 - "$repo_root/host/config-review-policy.json.example" "$approval_root/etc/ci-fleet/config-review-policy.json" <<'PY'
+import json,sys
+from pathlib import Path
+value=json.load(open(sys.argv[1])); value['configuration_repository_id']=201
+Path(sys.argv[2]).write_text(json.dumps(value))
+PY
 printf '1\n' >"$approval_root/etc/ci-fleet/config-review-required"
 chmod 600 "$approval_root/etc/ci-fleet/config-review-policy.json" "$approval_root/etc/ci-fleet/config-review-required"
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'protected approval-gate reads were rejected'
+for mismatch in id branch; do
+  gate_before=$(sha256sum "$approval_root/etc/ci-fleet/host.env")
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_POLICY_MISMATCH=$mismatch "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'approval repository identity mismatch was accepted'; fi
+  [[ $(sha256sum "$approval_root/etc/ci-fleet/host.env") == "$gate_before" ]] || fail 'approval identity rejection changed host configuration'
+done
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_APPROVAL_WRITE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'approval write permission was accepted'; fi
 for permission in actions pull_requests; do
@@ -327,7 +363,7 @@ PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$uncertain_root F
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$uncertain_port" --timeout 30 >"$tmp/zero.out" 2>"$tmp/zero.err" &
 uncertain_pid=$!
 processes+=("$uncertain_pid")
-wait_http "http://127.0.0.1:$uncertain_port/" "$tmp/zero.html"
+wait_http "http://127.0.0.1:$uncertain_port/" "$tmp/zero.html" "$tmp/zero.out"
 python3 - "$tmp/zero.html" <<'PY'
 from html.parser import HTMLParser
 import json,sys
@@ -344,7 +380,7 @@ import html,re,sys,urllib.parse
 print(urllib.parse.unquote(re.search(r"settings/apps/new\?state=([^'&]+)",html.unescape(open(sys.argv[1]).read())).group(1)))
 PY
 )
-"$real_curl" -fsS --get --data-urlencode code=fixture-zero-response --data-urlencode "state=$zero_state" \
+callback_curl -fsS --get --data-urlencode code=fixture-zero-response --data-urlencode "state=$zero_state" \
   "http://127.0.0.1:$uncertain_port/callback" -o "$tmp/zero-callback.html"
 if wait "$uncertain_pid"; then fail 'zero-response conversion succeeded'; fi
 zero_pending=$uncertain_root/etc/ci-fleet/bootstrap-recovery.pending

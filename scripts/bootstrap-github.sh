@@ -9,6 +9,7 @@ Usage: bootstrap-github.sh [--dry-run|--check] --organization ORG --instance ID
   --config-repository ORG/PRIVATE_CONFIG_REPO --runner-group GROUP
   --allow-repository ORG/PROJECT=NUMERIC_ID [--allow-repository ORG/PROJECT=NUMERIC_ID ...]
   [--bind ADDRESS --callback-host HOST --port PORT --timeout SECONDS]
+  [--operator-uid UID]
   [--install --config-repo LOCAL_CHECKOUT --config-ref COMMIT]
 EOF
 }
@@ -16,7 +17,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
 mode=live; mode_selected=false; organization=; instance=; runner_group=; config_repository=; bind=127.0.0.1; callback_host=127.0.0.1
-port=8765; timeout=600; run_installer=false; config_repo=; config_ref=
+port=8765; timeout=600; run_installer=false; config_repo=; config_ref=; operator_uid=
 repositories=()
 while (($#)); do
   case $1 in
@@ -31,6 +32,7 @@ while (($#)); do
     --callback-host) (($# >= 2)) || die '--callback-host requires a value'; callback_host=$2; shift 2 ;;
     --port) (($# >= 2)) || die '--port requires a value'; port=$2; shift 2 ;;
     --timeout) (($# >= 2)) || die '--timeout requires a value'; timeout=$2; shift 2 ;;
+    --operator-uid) (($# >= 2)) || die '--operator-uid requires a value'; operator_uid=$2; shift 2 ;;
     --install) run_installer=true; shift ;;
     --config-repo) (($# >= 2)) || die '--config-repo requires a value'; config_repo=$2; shift 2 ;;
     --config-ref) (($# >= 2)) || die '--config-ref requires a value'; config_ref=$2; shift 2 ;;
@@ -53,7 +55,16 @@ done
 mapfile -t repositories < <(printf '%s\n' "${repositories[@]}" | LC_ALL=C sort -u)
 ((${#repositories[@]} > 0)) || die 'repository allowlist is empty'
 repository_names=(); repository_id_values=()
-for repository in "${repositories[@]}"; do repository_names+=("${repository%=*}"); repository_id_values+=("${repository##*=}"); done
+declare -A names_seen=() ids_seen=()
+for repository in "${repositories[@]}"; do
+  repository_name=${repository%=*}; repository_id=${repository##*=}
+  normalized_name=${repository_name,,}
+  [[ ! -v names_seen[$normalized_name] && ! -v ids_seen[$repository_id] ]] || die 'repository names and IDs must have a one-to-one mapping'
+  names_seen[$normalized_name]=1; ids_seen[$repository_id]=1
+  repository_names+=("$repository_name"); repository_id_values+=("$repository_id")
+done
+operator_uid=${operator_uid:-${SUDO_UID:-$(id -u)}}
+[[ $operator_uid =~ ^[0-9]+$ && $operator_uid -le 4294967294 ]] || die 'invalid operator UID'
 if $run_installer; then
   [[ $mode == live ]] || die '--install is available only in live mode'
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die '--install requires --config-repo and a 40-character --config-ref'
@@ -62,6 +73,7 @@ for command in bash curl flock openssl python3 install mktemp stat; do command -
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 temporary=$(mktemp -d)
 callback_pid=
+portal_directory=
 created_group=false
 group_creation_pending=false
 installation_token=
@@ -91,6 +103,7 @@ cleanup() {
     printf 'ERROR: runner-group creation outcome is uncertain; observed group ID=%s. Owner reconciliation is required before removing %s\n' "${observed_group:-not-observed}" "$group_pending" >&2
   fi
   rm -rf "$temporary"
+  [[ -z $portal_directory ]] || rm -rf "$portal_directory"
   exit "$status"
 }
 trap cleanup EXIT
@@ -300,16 +313,20 @@ exec {bootstrap_lock_fd}<>"$bootstrap_lock"
 flock -n "$bootstrap_lock_fd" || die 'another bootstrap transaction is active'
 [[ ! -e $group_pending && ! -L $group_pending ]] || die "uncertain runner-group creation remains at $group_pending; owner reconciliation is required"
 approval_gate=false
+approval_repository_id=; approval_branch=
 approval_policy=$etc_dir/config-review-policy.json
 approval_marker=$etc_dir/config-review-required
 if [[ -e $approval_policy || -L $approval_policy || -e $approval_marker || -L $approval_marker ]]; then
-  python3 - "$script_dir" "$approval_policy" "$expected_uid" <<'PY' || die 'configuration approval policy is invalid'
+  approval_identity=$(python3 - "$script_dir" "$approval_policy" "$expected_uid" <<'PY'
 from pathlib import Path
 import sys
 sys.path.insert(0,sys.argv[1])
 from verify_config_approval import read_policy
-read_policy(Path(sys.argv[2]),int(sys.argv[3]))
+policy=read_policy(Path(sys.argv[2]),int(sys.argv[3]))
+print(policy['configuration_repository_id'],policy['branch'])
 PY
+  ) || die 'configuration approval policy is invalid'
+  read -r approval_repository_id approval_branch <<<"$approval_identity"
   approval_gate=true
 fi
 if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
@@ -329,6 +346,8 @@ if ! load_metadata; then
   [[ $mode != check ]] || die 'bootstrap state is missing; run live bootstrap first'
   [[ ! -e $pem && ! -L $pem && ! -e $host_env && ! -L $host_env ]] || die 'existing credentials lack matching bootstrap identity; no replacement made'
   state=$(openssl rand -hex 32)
+  state_file=$temporary/manifest-state
+  printf '%s' "$state" >"$state_file"
   callback_url="http://$callback_host:$port/callback"
   manifest=$(python3 - "$organization" "$instance" "$callback_url" "$approval_gate" <<'PY'
 import json, sys
@@ -345,8 +364,18 @@ PY
 )
   code_file=$temporary/manifest-code
   handoff_file=$temporary/installation-url
-  python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --bind "$bind" --port "$port" --organization "$organization" --state "$state" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
+  if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
+    # Keep test sockets below Linux's Unix-socket pathname limit.
+    portal_directory=$(mktemp -d /tmp/ci-fleet-bootstrap.XXXXXX)
+  else
+    portal_directory=$(mktemp -d /run/ci-fleet-bootstrap.XXXXXX)
+  fi
+  install -d -m 0700 -o "$operator_uid" "$portal_directory"
+  callback_socket=$portal_directory/callback.sock
+  python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --socket "$callback_socket" --operator-uid "$operator_uid" --port "$port" --organization "$organization" --state-file "$state_file" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
   callback_pid=$!
+  note "CALLBACK_SOCKET $callback_socket"
+  note "TUNNEL ssh -N -L 127.0.0.1:$port:$callback_socket HOST"
   note "REGISTRATION_URL http://$callback_host:$port/"
   note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
   deadline=$((SECONDS + timeout))
@@ -467,12 +496,13 @@ printf '%s\n' "${repository_id_values[@]}" | sort -n -u >"$repository_ids"
 
 visible=$temporary/visible.json
 write_auth_config "$installation_token" GET 'https://api.github.com/installation/repositories?per_page=100' "$visible"
-python3 - "$visible" "$config_repository" <<'PY' || die 'App installation must select only the private configuration repository'
+python3 - "$visible" "$config_repository" "$approval_repository_id" "$approval_branch" <<'PY' || die 'App installation must select only the private configuration repository matching the approval policy'
 import json,sys
 value=json.load(open(sys.argv[1])); repositories=value.get('repositories',[])
 if value.get('total_count') != len(repositories): raise SystemExit(1)
 actual=[v for v in repositories if v.get('full_name','').lower()==sys.argv[2].lower() and v.get('private') and not v.get('archived')]
 if len(repositories)!=1 or len(actual)!=1: raise SystemExit(1)
+if sys.argv[3] and (actual[0].get('id')!=int(sys.argv[3]) or actual[0].get('default_branch')!=sys.argv[4]): raise SystemExit(1)
 PY
 rm -f "$visible"
 

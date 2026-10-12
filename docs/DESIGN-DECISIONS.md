@@ -105,3 +105,22 @@ permission change, host activation, or production approval is granted here.
 The evaluated alternatives were `delivery-fleet`, `build-test-deploy-fleet`, and `software-delivery-fleet`. All three were available in the `RandomDevelopment` GitHub namespace on 2026-08-16. GitHub name search found no exact `build-test-deploy-fleet` or `software-delivery-fleet` repository; `delivery-fleet` is used by unrelated logistics projects and is ambiguous. The current name remains shorter, searchable, integration-neutral, and accurate for the repository's implemented production boundary.
 
 Reconsider only after tester and deployer roles are implemented, independently proven, and operators demonstrably need one public umbrella identity. If that happens, write a new ADR first and stage the migration: reserve the name; inventory every public and private consumer; preserve GitHub redirects and compatibility aliases; update docs, badges, action references, module/package paths, images, labels, Compose projects, environment variables, configuration templates, Apps, runner groups, scale sets, installed hosts, scripts, and prompts; canary new references while old references remain valid; then deprecate in a documented release window. Roll back by restoring the old canonical name and aliases before removing any compatibility path. No repository, image, App, runner group, host, or external consumer is renamed by this decision.
+
+## Authenticate the bootstrap callback through SSH
+
+The GitHub bootstrap portal uses an operator-owned Unix socket and an
+authenticated SSH local forward. A plain loopback listener would let other
+target-host users read its nonce and consume its one-shot callback. The nonce
+now remains in a root-private file and the socket permits only the explicitly
+trusted operator UID. Registration URLs and printed socket paths contain no
+authentication value. Temporary portal directories disappear when bootstrap
+exits. No target-host TCP listener or firewall rule is needed.
+
+The management device and its SSH account remain trusted. A forward on a shared
+device exposes the portal to that device's other users. This choice requires an
+SSH client with Unix-socket forwarding and one extra terminal session, including
+when the management device is a phone. Root-console users must select the
+trusted SSH account's UID. Live phone acceptance remains tracked in issue #27.
+Replace this transport only after an equally authenticated portal has proved
+nonce confidentiality, one-shot behavior, and cleanup without credential
+transport through chat or process arguments.

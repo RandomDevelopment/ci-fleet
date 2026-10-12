@@ -6,11 +6,15 @@ import http.server
 import os
 import secrets
 import signal
+import socket
+import socketserver
+import stat
 import urllib.parse
 from typing import cast
 
 
 class Server(http.server.HTTPServer):
+    address_family = socket.AF_UNIX
     organization: str
     state: str
     manifest: str
@@ -18,6 +22,11 @@ class Server(http.server.HTTPServer):
     handoff: str
     done: bool
     consumed: bool
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
 
 
 class Callback(http.server.BaseHTTPRequestHandler):
@@ -103,11 +112,12 @@ class Callback(http.server.BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bind", required=True)
+    parser.add_argument("--socket", required=True)
+    parser.add_argument("--operator-uid", required=True, type=int)
     parser.add_argument("--parent-pid", required=True, type=int)
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--organization", required=True)
-    parser.add_argument("--state", required=True)
+    parser.add_argument("--state-file", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--handoff", required=True)
@@ -121,9 +131,21 @@ def main() -> int:
         raise OSError(ctypes.get_errno(), "cannot bind callback lifetime to bootstrap")
     if os.getppid() != args.parent_pid:
         return 2
-    server = Server((args.bind, args.port), Callback)
+    os.umask(0o077)
+    descriptor = os.open(args.state_file, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as handle:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            return 2
+        state = handle.read()
+    if not state or len(state) > 256:
+        return 2
+    server = Server(args.socket, Callback)
+    os.chmod(args.socket, 0o600)
+    if args.operator_uid != os.geteuid():
+        os.chown(args.socket, args.operator_uid, -1)
     server.organization = args.organization
-    server.state = args.state
+    server.state = state
     server.manifest = args.manifest
     server.output = args.output
     server.handoff = args.handoff
