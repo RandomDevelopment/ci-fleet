@@ -114,7 +114,7 @@ rollback_available() {
   [[ $(stat -c '%u:%a' "$previous_state" 2>/dev/null) == "$expected_uid:600" && $(stat -c '%u:%a' "$previous_policy" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
   python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || { printf no; return; }
 import json, sys
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError):
@@ -220,7 +220,7 @@ unit_names=(
   ci-fleet-deployer-drain.service
 )
 timer_names=(ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer)
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
 request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
 
 expected_uid=0
@@ -339,7 +339,7 @@ validate_config() {
   secure_directory "$etc_root/adapters" 700 0 || block 'adapter directory is missing'
   secure_directory "$etc_root/credentials" 700 0 || block 'credential directory is missing'
   secure_directory "$etc_root/evidence" 700 0 || block 'evidence directory is missing'
-  for key in SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE; do
+  for key in SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE; do
     [[ -v "cfg[$key]" ]] || block "configuration is missing required key: $key"
   done
   [[ ${cfg[DEPLOYER_IDENTITY]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid deployer identity'
@@ -429,12 +429,13 @@ require_host() {
   local command os_id os_version available required systemd_state disk_path canonical
   # Docker checks must target the host's local daemon, not an operator shell's
   # remote DOCKER_HOST or selected context.
-  DOCKER_HOST=unix://$(root_path /run/docker.sock)
+  DOCKER_HOST=unix://${cfg[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
   export DOCKER_HOST
   unset DOCKER_CONTEXT
   for command in bash awk base64 cut sort stat sha256sum readlink realpath install cmp mv cp rm mkdir mktemp chmod chown ln flock kill timeout env git python3 docker systemctl systemd-run systemd-analyze systemd-inhibit timedatectl curl df date; do
     command -v "$command" >/dev/null || block "$command is required"
   done
+  [[ "$testing" == 1 ]] || python3 "$repo_root/scripts/deployer_adapter.py" check "${cfg[DOCKER_SOCKET]}" || block 'a dedicated rootless Docker daemon is required'
   local os_release
   os_release=$(root_path /etc/os-release)
   if [[ -L "$os_release" ]]; then
@@ -467,7 +468,7 @@ require_host() {
 require_maintenance_host() {
   # Docker checks must target the host's local daemon, not an operator shell's
   # remote DOCKER_HOST or selected context.
-  DOCKER_HOST=unix://$(root_path /run/docker.sock)
+  DOCKER_HOST=unix://${cfg[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
   export DOCKER_HOST
   unset DOCKER_CONTEXT
   local command
@@ -516,7 +517,7 @@ validate_checkout() {
   head=$(git_checkout --no-replace-objects rev-parse 'HEAD^{commit}') || block 'installer checkout is not Git-authored'
   [[ "$head" == "$core_ref" ]] || block 'CORE_REF must equal the exact reviewed checkout HEAD'
   if [[ "$testing" != 1 ]]; then
-    git_checkout diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
+    git_checkout diff --quiet HEAD -- scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer || block 'reviewed deployer inputs differ from HEAD'
   fi
   # Pin the reviewed inputs before any privileged copy: copy the worktree
   # bytes once into a root-controlled snapshot outside managed state, then
@@ -527,13 +528,13 @@ validate_checkout() {
   checkout_snapshot=$(mktemp -d)
   chmod 0700 "$checkout_snapshot"
   install -d -m 0700 "$checkout_snapshot/scripts" "$checkout_snapshot/deploy/deployer"
-  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$checkout_snapshot/scripts/"
+  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$repo_root/scripts/deployer_adapter.py" "$checkout_snapshot/scripts/"
   local entry
   for entry in "$repo_root"/deploy/deployer/*; do
     [[ -f "$entry" && ! -L "$entry" ]] || block 'deployer unit source contains an unsafe or untracked entry'
     install -m 0644 "$entry" "$checkout_snapshot/deploy/deployer/"
   done
-  tree_listing=$(git_checkout --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer) || block 'reviewed commit tree is unreadable'
+  tree_listing=$(git_checkout --no-replace-objects ls-tree -r "$head" -- scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer) || block 'reviewed commit tree is unreadable'
   [[ -n $tree_listing ]] || block 'reviewed commit tree is unreadable'
   while read -r _ _ blob path; do
     [[ $blob == "$(git hash-object "$checkout_snapshot/$path")" ]] || block "checkout input $path differs from the reviewed commit"
@@ -578,10 +579,10 @@ release_complete() {
   local release=$1 stored actual unit entry dir
   [[ -d "$release" && ! -L "$release" && $(stat -c '%u:%a' "$release") == "$expected_uid:755" && -x "$release/scripts/install-deployer.sh" && -x "$release/scripts/deployer-runtime.sh" ]] || return 1
   for dir in "$release/scripts" "$release/deploy" "$release/deploy/deployer"; do [[ -d "$dir" && ! -L "$dir" && $(stat -c '%u:%a' "$dir") == "$expected_uid:755" ]] || return 1; done
-  for entry in "$release/scripts/install-deployer.sh" "$release/scripts/deployer-runtime.sh"; do [[ ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || return 1; done
+  for entry in "$release/scripts/install-deployer.sh" "$release/scripts/deployer-runtime.sh" "$release/scripts/deployer_adapter.py"; do [[ ! -L "$entry" && $(stat -c '%u:%a' "$entry") == "$expected_uid:755" ]] || return 1; done
   [[ -f "$release/.ci-fleet-tree-sha256" ]] || return 1
   stored=$(<"$release/.ci-fleet-tree-sha256")
-  actual=$(cd "$release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1)
+  actual=$(cd "$release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer/* | sha256sum | cut -d' ' -f1)
   [[ "$stored" == "$actual" ]] || return 1
   for unit in "${unit_names[@]}"; do [[ -f "$release/deploy/deployer/$unit" && ! -L "$release/deploy/deployer/$unit" && $(stat -c '%u:%a' "$release/deploy/deployer/$unit") == "$expected_uid:644" ]] || return 1; done
 }
@@ -647,6 +648,7 @@ acquire_lock() {
   exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
   flock -n 8 || block 'another ci-fleet role installation is already running'
   recover_adapter_guard
+  [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
   if [[ -e "$active_operation" ]] && ! active_deployment; then
@@ -685,6 +687,7 @@ acquire_check_lock() {
   exec 9<"$lock_root"
   flock -n 9 || block 'another deployer operation is running'
   [[ ! -e $adapter_guard && ! -L $adapter_guard ]] || block 'interrupted installer adapter requires mutating recovery'
+  [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
 }
 
 begin_transaction() {
@@ -1050,7 +1053,7 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 policy = {}
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
 try:
     for line in open(sys.argv[2], encoding='utf-8'):
         line = line.rstrip('\n')
@@ -1149,9 +1152,9 @@ install_release() {
   chmod 0755 "$staging"
   staging_path=$staging
   install -d -m 0755 "$staging/scripts" "$staging/deploy/deployer"
-  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$staging/scripts/"
+  install -m 0755 "$repo_root/scripts/install-deployer.sh" "$repo_root/scripts/deployer-runtime.sh" "$repo_root/scripts/deployer_adapter.py" "$staging/scripts/"
   install -m 0644 "$unit_source"/* "$staging/deploy/deployer/"
-  (cd "$staging" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh deploy/deployer/* | sha256sum | cut -d' ' -f1) >"$staging/.ci-fleet-tree-sha256"
+  (cd "$staging" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer/* | sha256sum | cut -d' ' -f1) >"$staging/.ci-fleet-tree-sha256"
   chmod 0644 "$staging/.ci-fleet-tree-sha256"
   release_complete "$staging" || die 'staged deployer release is incomplete'
   atomic_replace_directory "$staging" "$release"
@@ -1203,7 +1206,7 @@ try:
 except (OSError, ValueError):
     raise SystemExit(1)
 policy = {}
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
 try:
     for line in open(sys.argv[2], encoding='utf-8'):
         line = line.rstrip('\n')
@@ -1266,6 +1269,8 @@ publish_deployed_snapshot() {
 }
 
 install_units() {
+  [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
+  install -d -m 0700 "$state_root/.adapter-recovery"
   local unit systemd_mode
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_mode=$(stat -c %a "$systemd_root")
@@ -1342,6 +1347,30 @@ run_adapter() {
   local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root -$lock_root $policy"
   local -a adapter_env=(CI_FLEET_DEPLOYER_CONFIG="$policy") sandbox=() inhibitor=() guard=()
   seconds=$(adapter_deadline "$operation_name")
+  if [[ $testing != 1 ]]; then
+    unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
+    active_adapter_unit=$unit
+    [[ ! -e $adapter_guard && ! -L $adapter_guard ]] || block 'outstanding adapter guard prevents dispatch'
+    (umask 077; printf '%s\n' "$unit" >"$adapter_guard")
+    sync -f "$lock_root" 2>/dev/null || die 'adapter unit guard is not durable'
+    if [[ -n ${transaction_dir:-} ]]; then
+      printf '%s\n' "$unit" >"$transaction_dir/adapter-unit"
+      chmod 0600 "$transaction_dir/adapter-unit"
+      sync -f "$transaction_dir" 2>/dev/null || die 'adapter unit guard is not durable'
+    fi
+    local recovery=$state_root/.adapter-recovery runtime
+    runtime=$(root_path /run/ci-fleet-deployer-adapters)
+    [[ ! -L $recovery && ! -L $runtime ]] || block 'adapter directories must not be symlinks'
+    install -d -m 0700 "$recovery"
+    install -d -m 0711 "$runtime"
+    local -a confined=(python3 "$repo_root/scripts/deployer_adapter.py" run --policy "$policy" --adapter "/proc/$$/fd/7" --store "$recovery" --runtime "$runtime" --unit "$unit" --seconds "$seconds")
+    [[ -z "$marker" ]] || confined+=(--marker "$marker")
+    status=0
+    timeout --signal=TERM --kill-after=10s "$((seconds + 30))s" "${confined[@]}" "$operation_name" 8>&- 9<&- || status=$?
+    { stop_adapter_unit "$unit" && retire_adapter_guard "$unit"; } || block 'adapter termination could not be verified; retain its guard until it stops'
+    active_adapter_unit=
+    return "$status"
+  fi
   if [[ -n "$marker" ]]; then
     adapter_env+=(CI_FLEET_DEPLOYER_ROLLBACK_COMMIT="$marker")
     writable_paths+=" ${marker%/*}"
