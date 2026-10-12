@@ -9,6 +9,8 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/bootstrap-github-callback.py \
+  scripts/fixtures/fake-bootstrap-curl.py \
   scripts/verify_config_approval.py \
   scripts/test_config_approval.py \
   scripts/cleanup_networks.py \
@@ -38,6 +40,7 @@ python3 scripts/test_remote_reconcile.py
 python3 scripts/test_health.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
+scripts/test-bootstrap-github.sh
 python3 scripts/test_validate_commits.py
 python3 scripts/test_workflow_tag_validation.py
 python3 -m json.tool schemas/status-report-v1.json >/dev/null
