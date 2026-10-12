@@ -771,9 +771,9 @@ unset FAKE_TESTER_QUEUED_SERVICES
 for unit in ci-fleet-tester-health.service ci-fleet-tester-cleanup.timer; do
   : >"$root/etc/systemd/system/$unit.new"
 done
-: >"$root/etc/tmpfiles.d/ci-fleet-tester-lock.conf.new"
+: >"$root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf.new"
 FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING=1 "$installer" --uninstall --config /etc/ci-fleet-tester/tester.env | grep -Fq UNINSTALL_OK || fail 'repeated uninstall failed on absent units'
-if compgen -G "$root/etc/systemd/system/ci-fleet-tester*.new" >/dev/null || [[ -e $root/etc/tmpfiles.d/ci-fleet-tester-lock.conf.new ]]; then fail 'uninstall retained staged tester units'; fi
+if compgen -G "$root/etc/systemd/system/ci-fleet-tester*.new" >/dev/null || [[ -e $root/usr/lib/tmpfiles.d/ci-fleet-tester-lock.conf.new ]]; then fail 'uninstall retained staged tester units'; fi
 git -C "$upgrade_repo" checkout --quiet "$bad_ref"
 if FAKE_TESTER_SYSTEMCTL_FAIL='disable --now' "$upgrade_repo/scripts/install-tester.sh" --install --config /etc/ci-fleet-tester/tester.env --ref "$bad_ref" >/dev/null 2>&1; then fail 'invalid fresh install succeeded'; fi
 [[ -L $root/opt/ci-fleet-tester/current ]] || fail 'failed fresh-install teardown removed the recovery link'
