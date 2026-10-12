@@ -847,14 +847,13 @@ done
 for inventory_error in 1 7; do
   expect_failure 'isolated-role systemd unit inventory could not be inspected' env FAKE_ISOLATED_INVENTORY_ERROR=$inventory_error "$installer" --check "${base_args[@]}" --ref "$ref_one"
 done
-for marker in /var/lib/ci-fleet-deployer-container-credentials; do
-  mkdir -p "$root$marker"
-  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-  rmdir "$root$marker"
-  ln -s /missing "$root$marker"
-  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-  rm "$root$marker"
-done
+marker=/var/lib/ci-fleet-deployer-container-credentials
+mkdir -p "$root$marker"
+expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+rmdir "$root$marker"
+ln -s /missing "$root$marker"
+expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+rm "$root$marker"
 # Read-only checks must reject isolated-role drift on a converged controller.
 for role in deployer tester; do
   for marker in /var/lib/ci-fleet-$role /etc/ci-fleet-$role; do
