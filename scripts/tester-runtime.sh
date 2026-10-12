@@ -509,7 +509,9 @@ fi
 activation_pending=$(root_path /var/lib/ci-fleet-tester/activation-pending)
 if [[ -e $activation_pending || -L $activation_pending ]]; then
   secure_file "$activation_pending" 600
-  [[ ( $action == --check || $action == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "${lock_file%/*}/lifecycle.lock" ]] && flock -n 9 || die 'interrupted tester activation requires installer recovery'
+  if ! [[ ( $action == --check || $action == --health ) && ${CI_FLEET_TESTER_ACTIVATION_FD:-} == 9 && -e /proc/$$/fd/9 && $(readlink -f /proc/$$/fd/9) == "${lock_file%/*}/lifecycle.lock" ]] || ! flock -n 9; then
+    die 'interrupted tester activation requires installer recovery'
+  fi
 fi
 if [[ $action != --remove && $action != --cleanup ]]; then
   for kind in container network volume; do
