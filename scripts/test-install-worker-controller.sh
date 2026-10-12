@@ -783,6 +783,9 @@ secret_ref=$(git -C "$config_repo" rev-parse HEAD)
 git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
+export FAKE_BUILDX_VERSION=v0.9.0
+expect_failure 'reviewed Docker Buildx v0.32.1 is required' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+unset FAKE_BUILDX_VERSION
 
 expect_failure 'alternate Docker endpoints are not supported' env DOCKER_HOST=tcp://example.invalid:2376 "$installer" --check "${base_args[@]}" --ref "$ref_one"
 expect_failure 'alternate Docker contexts are not supported' env DOCKER_CONTEXT=remote "$installer" --check "${base_args[@]}" --ref "$ref_one"
