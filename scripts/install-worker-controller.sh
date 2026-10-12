@@ -1839,8 +1839,8 @@ restore_systemd_snapshot() {
 retag_checkpoint_image() {
   local identifier=$1 tag=$2 error
   if docker image tag "$identifier" "$tag"; then
-    [[ $(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null) == "$identifier" ]]
-    return
+    [[ $(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null) == "$identifier" ]] || return 1
+    return 0
   fi
   error=$(docker image inspect --format '{{.Id}}' "$identifier" 2>&1) && return 1
   [[ "$error" == *"No such image: $identifier"* ]] || return 1

@@ -887,7 +887,7 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$staging_failure_ref" >"$stag
   fail 'staging failure checkpoint fixture unexpectedly succeeded'
 fi
 unset FAKE_FAIL_UP_ONCE
-grep -Fq 'ROLLBACK_RESTORED' "$staging_failure_output" || fail 'activation failure did not verify rollback while its parent reconcile unit remained loaded'
+grep -Fq 'ROLLBACK_RESTORED' "$staging_failure_output" || fail "activation failure did not verify rollback while its parent reconcile unit remained loaded: $(<"$staging_failure_output")"
 staging_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$staging_failure_output")
 [[ -n "$staging_failure_checkpoint" ]] || fail 'staging failure checkpoint was not created'
 active_release=$(readlink -f "$root/opt/ci-fleet/current")

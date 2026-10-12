@@ -60,6 +60,9 @@ for test_case in retained absent daemon_failed tag_failed; do
   case $test_case in retained) expected=0 ;; absent) expected=2 ;; *) expected=1 ;; esac
   [[ $result == "$expected" ]] || { printf 'FAIL: %s returned %s\n' "$test_case" "$result" >&2; exit 1; }
 done
+test_case=retained
+trap 'status=0; retag_checkpoint_image "$identifier" fixture-tag || status=$?; [[ $status == 0 ]] || exit 99; exit 0' ERR
+(exit 42)
 TEST
 } >"$temporary/recovery.sh"
 bash "$temporary/recovery.sh"
