@@ -1191,9 +1191,10 @@ pre_adapter_without_policy_ref=$(write_config active 1 1 "$pre_adapter_ref" fals
 pre_adapter_install=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_without_policy_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_install" || fail 'adapterless engine with omitted policy did not converge'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_runtime" ]] || fail 'adapterless no-policy upgrade did not activate its runtime'
-[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager" ]] || fail 'adapterless no-policy upgrade did not activate its manager'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'adapterless no-policy upgrade did not retain its forward-capable manager'
 [[ ! -e "$pre_adapter_policy_marker" && ! -L "$pre_adapter_policy_marker" ]] || fail 'adapterless no-policy upgrade retained the managed policy marker'
 [[ ! -e "$pre_adapter_runtime/scripts/docker-network-policy-adapter.sh" && ! -e "$pre_adapter_manager/scripts/docker-network-policy-adapter.sh" ]] || fail 'installed pre-adapter release gained an adapter'
+[[ -x "$pre_adapter_root/opt/ci-fleet/manager/current/scripts/capacity-sample.sh" ]] || fail 'retained manager lost telemetry lifecycle support'
 
 FAKE_ENGINE_REF=$engine_ref
 FAKE_RUNNER_IMAGE=$head_runner_image
