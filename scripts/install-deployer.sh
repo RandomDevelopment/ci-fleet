@@ -1173,7 +1173,7 @@ with open(sys.argv[1],"w",encoding="utf-8") as f: json.dump(dict(zip(keys,values
 }
 
 load_deployed_snapshot() {
-  local snapshot deployed_adapter_path deployed_adapter_sha
+  local snapshot deployed_adapter_path deployed_adapter_sha deployed_core_ref
   local deployed_credential_provider deployed_credential_ref deployed_credential_scope deployed_environment
   secure_directory "$deployed_root" 700 0 || block 'deployed snapshot directory is missing'
   [[ -L "$deployed_current" ]] || block 'deployed snapshot pointer is absent or unsafe'
@@ -1232,6 +1232,10 @@ else:
     ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
 PY
+  deployed_core_ref=$(awk '$0 ~ /^CORE_REF=/ {sub(/^CORE_REF=/, ""); print}' "$deployed_snapshot_policy")
+  release_complete "$releases/$deployed_core_ref" || {
+    [[ ${1:-} == repair && $deployed_core_ref == "$core_ref" ]] || block 'deployed rollback core release is incomplete'
+  }
 }
 
 publish_deployed_snapshot() {
@@ -1452,7 +1456,8 @@ PY
 )
     [[ -z "$old_deployer_identity" || "$old_deployer_identity" == "${cfg[DEPLOYER_IDENTITY]}" ]] || block 'installed deployer ownership identity cannot change in place'
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || block 'deployed rollback snapshot is missing; restore it before convergence'
-    load_deployed_snapshot
+    # Repair can rebuild this candidate's core; retained older cores must exist.
+    load_deployed_snapshot "$mode"
     if [[ "$mode" == install && -L "$current" ]] && ! state_matches; then block 'install cannot select a new candidate; use --upgrade or --repair'; fi
   elif [[ "$mode" == upgrade ]]; then
     block '--upgrade requires an existing installation'
