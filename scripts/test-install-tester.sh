@@ -729,6 +729,12 @@ write_environment rollback-env 18086
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --converge --environment rollback-env >/dev/null
 rollback_state_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state")
 pre_rollback_release=$(readlink -f "$root/opt/ci-fleet-tester/current")
+interrupted_rc=0
+FAKE_TESTER_ROUTE_PORT=18086 FAKE_TESTER_ACTIVATION_SIGNAL=KILL "$installer" --rollback >"$tmp/killed-rollback.out" 2>&1 || interrupted_rc=$?
+[[ $interrupted_rc == 137 ]] || fail 'rollback interruption did not terminate activation'
+FAKE_TESTER_ROUTE_PORT=18086 "$installer" --rollback >/dev/null || fail 'interrupted rollback could not resume its LKG target'
+[[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$old" ]] || fail 'rollback retry returned to the faulty incumbent'
+[[ $(<"$root/var/lib/ci-fleet-tester/last-known-good") == "$old" ]] || fail 'rollback retry changed LKG'
 for rollback_attempt in 1 2; do
   FAKE_TESTER_ROUTE_PORT=18086 "$installer" --rollback --config /etc/ci-fleet-tester/tester.env >/dev/null
   [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$old" ]] || fail "rollback $rollback_attempt returned to the bad revision"

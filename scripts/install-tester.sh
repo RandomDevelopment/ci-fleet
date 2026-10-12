@@ -317,14 +317,14 @@ retire_activation() {
 }
 
 recover_activation() {
-  local previous candidate extra
+  local previous candidate record_previous extra
   for command in basename ln mv sha256sum sync; do command -v "$command" >/dev/null || die "activation recovery requires $command"; done
   secure_dir "$state_root" 700
   secure_dir "$opt_dir" 755
   secure_dir "$release_dir" 755
   secure_file "$activation_pending" 600
-  read -r previous candidate extra <"$activation_pending"
-  [[ ( $previous == none || $previous =~ ^[0-9a-f]{40}$ ) && $candidate =~ ^[0-9a-f]{40}$ && -z $extra ]] || die 'activation journal is invalid'
+  read -r previous candidate record_previous extra <"$activation_pending"
+  [[ ( $previous == none || $previous =~ ^[0-9a-f]{40}$ ) && $candidate =~ ^[0-9a-f]{40}$ && $record_previous =~ ^[01]$ && -z $extra ]] || die 'activation journal is invalid'
   reject_other_roles
   reject_unit_dropins
   reject_tmpfiles_overrides
@@ -337,6 +337,7 @@ recover_activation() {
     rm -f -- "$current_link" "$stable_launcher"
   fi
   retire_activation || die 'activation recovery retirement failed'
+  recovered_rollback=$((1 - record_previous))
   report "ACTIVATION_RECOVERED previous_revision=$previous candidate_revision=$candidate"
 }
 
@@ -353,7 +354,7 @@ activate_release() {
   fi
   [[ ! -e $activation_pending && ! -L $activation_pending ]] || die 'outstanding activation requires recovery'
   [[ ! -e $activation_pending.new && ! -L $activation_pending.new ]] || secure_file "$activation_pending.new" 600
-  printf '%s %s\n' "${previous:-none}" "$commit" >"$activation_pending.new"
+  printf '%s %s %s\n' "${previous:-none}" "$commit" "$record_previous" >"$activation_pending.new"
   chmod 0600 "$activation_pending.new"
   sync -f "$activation_pending.new" || die 'activation journal is not durable'
   mv -Tf "$activation_pending.new" "$activation_pending"
@@ -409,7 +410,7 @@ if [[ -e $activation_pending || -L $activation_pending ]]; then
     --install|--upgrade|--rollback|--uninstall) recover_activation ;;
     *) die 'interrupted tester activation requires installer retry or rollback' ;;
   esac
-  if [[ $action == --rollback ]]; then report "ROLLBACK_OK source_revision=$(installed_revision || printf none) recovered_pending=true"; exit 0; fi
+  if [[ $action == --rollback && $recovered_rollback == 0 ]]; then report "ROLLBACK_OK source_revision=$(installed_revision || printf none) recovered_pending=true"; exit 0; fi
 fi
 
 case $action in
