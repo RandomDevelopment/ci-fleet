@@ -113,14 +113,14 @@ reject_unit_dropins() {
 }
 
 effective_units_match() {
-  local unit properties key value fragment dropins
+  local unit properties key value fragment dropins reload
   for unit in "${units[@]}"; do
-    properties=$(systemctl show --property=FragmentPath --property=DropInPaths "$unit") || return 1
-    fragment=; dropins=
+    properties=$(systemctl show --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload "$unit") || return 1
+    fragment=; dropins=; reload=
     while IFS='=' read -r key value; do
-      case $key in FragmentPath) fragment=$value ;; DropInPaths) dropins=$value ;; esac
+      case $key in FragmentPath) fragment=$value ;; DropInPaths) dropins=$value ;; NeedDaemonReload) reload=$value ;; esac
     done <<<"$properties"
-    [[ $fragment == "$systemd_dir/$unit" && -z $dropins ]] || return 1
+    [[ $fragment == "$systemd_dir/$unit" && -z $dropins && $reload == no ]] || return 1
   done
 }
 

@@ -77,7 +77,8 @@ load_global() {
   [[ $default_ttl =~ ^[0-9]+$ && $default_ttl -ge 300 && $default_ttl -le 604800 ]] || die 'default TTL must be 300-604800 seconds'
   [[ $max_environments =~ ^[0-9]+$ && $max_environments -ge 1 && $max_environments -le 100 ]] || die 'max environments must be 1-100'
   [[ $disk_warn =~ ^[0-9]+$ && $disk_warn -ge 50 && $disk_warn -le 95 ]] || die 'disk warning threshold must be 50-95'
-  [[ $probe_host =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ && $probe_url =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]+)?/[^[:space:]]*$ ]] || die 'DNS and HTTPS probe targets are required'
+  [[ $probe_host =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ && $probe_url =~ ^https://([A-Za-z0-9][A-Za-z0-9.-]{0,252})(:[0-9]+)?/[^[:space:]]*$ ]] || die 'DNS and HTTPS probe targets are required'
+  [[ ${BASH_REMATCH[1],,} == "${probe_host,,}" ]] || die 'DNS and HTTPS probes must use the same host'
   [[ ${ENV_VALUES[CI_FLEET_TESTER_ISOLATION_ACK]:-} == test-only-no-production-authority ]] || die 'explicit test-only isolation acknowledgement is required'
 }
 

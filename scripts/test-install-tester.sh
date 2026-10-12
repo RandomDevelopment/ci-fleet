@@ -34,8 +34,11 @@ if [[ $1 == show && " $* " == *' --property=LoadState '* ]]; then
   exit 0
 fi
 if [[ $1 == show ]]; then
-  printf 'FragmentPath=%s/%s\nDropInPaths=%s\n' "${FAKE_TESTER_FRAGMENT_ROOT:-${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system}" "${*: -1}" "${FAKE_TESTER_UNIT_DROPINS:-}"
+  reload=no
+  [[ -z ${FAKE_TESTER_LOADED_POLICY_DRIFT:-} || ! -e $FAKE_TESTER_LOADED_POLICY_DRIFT ]] || reload=yes
+  printf 'FragmentPath=%s/%s\nDropInPaths=%s\nNeedDaemonReload=%s\n' "${FAKE_TESTER_FRAGMENT_ROOT:-${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system}" "${*: -1}" "${FAKE_TESTER_UNIT_DROPINS:-}" "$reload"
 fi
+[[ $1 != daemon-reload || -z ${FAKE_TESTER_LOADED_POLICY_DRIFT:-} ]] || rm -f "$FAKE_TESTER_LOADED_POLICY_DRIFT"
 if [[ -n ${FAKE_TESTER_SYSTEMCTL_WAIT_READY:-} && $1 == start && " $* " != *' --no-block '* ]]; then
   touch "$FAKE_TESTER_SYSTEMCTL_WAIT_READY"
   while [[ ! -e ${FAKE_TESTER_SYSTEMCTL_WAIT_RELEASE:?} ]]; do sleep 0.05; done
@@ -105,6 +108,13 @@ write_environment() {
 
 if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
+cp "$root/etc/ci-fleet-tester/tester.env" "$tmp/tester.env.valid"
+sed 's@https://tester-probe.invalid/health@https://elsewhere.invalid/health@' "$tmp/tester.env.valid" >"$root/etc/ci-fleet-tester/tester.env"
+if "$runtime" --check >/dev/null 2>&1; then fail 'check accepted different DNS and HTTPS probe hosts'; fi
+if "$runtime" --health >/dev/null 2>&1; then fail 'health accepted different DNS and HTTPS probe hosts'; fi
+sed 's@https://tester-probe.invalid/health@https://TESTER-PROBE.INVALID:8443/health@' "$tmp/tester.env.valid" >"$root/etc/ci-fleet-tester/tester.env"
+"$runtime" --check >/dev/null || fail 'matching probe hostname with different case and an explicit port was rejected'
+cp "$tmp/tester.env.valid" "$root/etc/ci-fleet-tester/tester.env"
 if FAKE_TESTER_UNRELATED_RESOURCE='other-container|ordinary-ci' "$runtime" --check >/dev/null 2>&1; then fail 'tester admitted unrelated Docker state'; fi
 ln -s /missing "$root/var/lib/ci-fleet-deployer"
 if "$runtime" --check >/dev/null 2>&1; then fail 'tester runtime admitted a dangling deployer marker'; fi
@@ -384,6 +394,13 @@ if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1
 "$installer" --install --config /etc/ci-fleet-tester/tester.env --ref "$ref" >/dev/null || fail 'same-ref install did not repair an incomplete release'
 "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null || fail 'repaired release failed check'
 installed_unit=$root/etc/systemd/system/ci-fleet-tester-health.service
+export FAKE_TESTER_LOADED_POLICY_DRIFT=$tmp/loaded-policy-drift
+touch "$FAKE_TESTER_LOADED_POLICY_DRIFT"
+if "$installer" --check >/dev/null 2>&1; then fail 'stale loaded systemd policy passed check'; fi
+repair_output=$("$installer" --install --ref "$ref") || fail 'unchanged install did not repair stale loaded systemd policy'
+[[ $repair_output == *INSTALL_OK* && $repair_output != *changed=false* && ! -e $FAKE_TESTER_LOADED_POLICY_DRIFT ]] || fail 'stale loaded systemd policy was accepted without a reload'
+unset FAKE_TESTER_LOADED_POLICY_DRIFT
+"$installer" --check >/dev/null || fail 'reloaded tester policy failed check'
 for directory in etc/systemd/system run/systemd/system usr/lib/systemd/system lib/systemd/system; do
   dropin=$root/$directory/ci-fleet-tester-health.service.d
   mkdir -p "$dropin"
