@@ -299,7 +299,7 @@ start_maintenance() {
 install_launcher() { install -m 0555 "$1/scripts/tester-launcher.sh" "$stable_launcher.new" && mv -fT "$stable_launcher.new" "$stable_launcher"; }
 
 remove_units() {
-  local unit directory load_state present_units=() present_timers=() present_services=()
+  local unit directory load_state present_services=()
   local -A handled_units=()
   for unit in "${units[@]}"; do
     if [[ -L $systemd_dir/$unit && ! -e $systemd_dir/$unit ]]; then
@@ -312,21 +312,8 @@ remove_units() {
         [[ ! -L $systemd_dir/$directory/$unit ]] || rm -f -- "$systemd_dir/$directory/$unit" || return 1
       done
     fi
-    [[ ! -e $systemd_dir/$unit && ! -L $systemd_dir/$unit ]] || present_units+=("$unit")
   done
-  for unit in "${timers[@]}"; do
-    [[ ${handled_units[$unit]:-0} != 1 ]] || continue
-    if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
-      present_timers+=("$unit")
-    else
-      load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
-      [[ -n $load_state ]] || return 1
-      [[ $load_state == not-found ]] || present_timers+=("$unit")
-    fi
-  done
-  if (( ${#present_timers[@]} )); then
-    systemctl disable --now "${present_timers[@]}" >/dev/null 2>&1 || return 1
-  fi
+  quiesce_timers || return 1
   for unit in "${services[@]}"; do
     [[ ${handled_units[$unit]:-0} != 1 ]] || continue
     if [[ -e $systemd_dir/$unit || -L $systemd_dir/$unit ]]; then
