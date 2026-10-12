@@ -684,16 +684,18 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present} images=${7:-present}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" "$images" <<'PY'
 import json
 import sys
-source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy, images = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
 value["projects"]["example-app"]["repository"] = "fixture-org/example-app"
 value["managed_images"] = {engine_ref: {"amd64": {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "4" * 64}}}
+if images == "omit":
+    value.pop("managed_images", None)
 controller = value["controllers"]["example-ci-01"]
 controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
 controller["engine_ref"] = engine_ref
@@ -1125,7 +1127,7 @@ head_runner_image=$FAKE_RUNNER_IMAGE
 head_controller_image=$FAKE_CONTROLLER_IMAGE
 pre_adapter_runner_image=ci-fleet-runner:${pre_adapter_ref:0:12}
 pre_adapter_controller_image=ci-fleet-controller:${pre_adapter_ref:0:12}
-pre_adapter_config_ref=$(write_config active 1 1 "$pre_adapter_ref" omit omit)
+pre_adapter_config_ref=$(write_config active 1 1 "$pre_adapter_ref" omit omit omit)
 FAKE_ENGINE_REF=$pre_adapter_ref
 FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
 FAKE_CONTROLLER_IMAGE=$pre_adapter_controller_image
