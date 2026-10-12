@@ -50,6 +50,7 @@ python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.jso
 scripts/test-capacity-preflight.sh
 bash scripts/test-capacity-unit-stop.sh
 bash scripts/test-manager-staging.sh
+bash scripts/test-managed-image-build.sh
 scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh

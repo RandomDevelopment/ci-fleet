@@ -2368,7 +2368,7 @@ perform_check() {
 }
 
 perform_converge() {
-  local count existing_status installed_engine candidate_runner_image candidate_controller_image installed_runner_image installed_controller_image live_runner_image expected_owner=0 current_target current_ref manager_target manager_ref manager_source policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
+  local count existing_status installed_engine candidate_runner_image candidate_controller_image current_target current_ref manager_target manager_ref manager_source policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
   local desired_controller_id=$controller_id build_before_drain=false
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
@@ -2439,23 +2439,7 @@ perform_converge() {
   compose "$release_dir" "$candidate_env" config --quiet
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
   candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
-  [[ "$testing" != 1 ]] || expected_owner=$(id -u)
-  case "$existing_status" in
-    '')
-      [[ "$mode" == install && ! -f "$rendered_env" && ! -f "$state_file" ]] && build_before_drain=true
-      ;;
-    running|exited|created|dead)
-      if [[ -f "$rendered_env" && $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] \
-        && installed_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
-        && installed_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$rendered_env") \
-        && live_runner_image=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$controller_container" 2>/dev/null | awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}') \
-        && [[ -n "$installed_runner_image" && -n "$installed_controller_image" && -n "$live_runner_image" ]]; then
-        if [[ "$candidate_runner_image" != "$installed_runner_image" && "$candidate_runner_image" != "$live_runner_image" \
-          && "$candidate_controller_image" != "$installed_controller_image" ]]; then build_before_drain=true; fi
-      fi
-      ;;
-  esac
-  if $build_before_drain; then build_candidate; require_commands; fi
+  [[ -n "$candidate_runner_image" && -n "$candidate_controller_image" ]] || die 'rendered candidate image name is missing'
   pending_checkpoint_status=0
   pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
   case "$pending_checkpoint_status" in
@@ -2466,6 +2450,9 @@ perform_converge() {
     1) make_checkpoint "$release_dir" ;;
     *) die 'pending network-policy controller checkpoint is invalid' ;;
   esac
+  build_candidate
+  build_before_drain=true
+  require_commands
   transaction_active=true
   if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
     policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")

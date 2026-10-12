@@ -35,18 +35,24 @@ status_file=${FAKE_CONTROLLER_STATUS_FILE:-}
 paused_state=${FAKE_PAUSED_STATE:-}
 stopped_state=${FAKE_STOPPED_CONTROLLER_STATE:-}
 image_paths() {
-  if [[ $image == "${FAKE_RUNNER_IMAGE:-}" || $image == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
+  if [[ $image == "${FAKE_RUNNER_IMAGE:-}"-staged-* || $image == "${FAKE_RUNNER_IMAGE:-}" || $image == "${FAKE_PRIOR_RUNNER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_RUNNER_IMAGE:-}" ]]; then
     image_kind=runner
     image_state=${FAKE_RUNNER_IMAGE_STATE:-}
     image_id_state=${FAKE_RUNNER_IMAGE_ID_STATE:-}
-  elif [[ $image == "${FAKE_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
+  elif [[ $image == "${FAKE_CONTROLLER_IMAGE:-}"-staged-* || $image == "${FAKE_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PRIOR_CONTROLLER_IMAGE:-}" || $image == "${FAKE_PREVIOUS_CONTROLLER_IMAGE:-}" ]]; then
     image_kind=controller
     image_state=${FAKE_CONTROLLER_IMAGE_STATE:-}
     image_id_state=${FAKE_CONTROLLER_IMAGE_ID_STATE:-}
   else
     return 1
   fi
-  if [[ -n ${FAKE_PRIOR_IMAGE_STATES:-} && $image != "${FAKE_RUNNER_IMAGE:-}" && $image != "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
+  staged_image=false
+  if [[ $image == "${FAKE_RUNNER_IMAGE:-}"-staged-* || $image == "${FAKE_CONTROLLER_IMAGE:-}"-staged-* ]]; then
+    staged_image=true
+    image_state=$image_state.stage
+    image_id_state=$image_id_state.stage
+  fi
+  if [[ "$staged_image" != true && -n ${FAKE_PRIOR_IMAGE_STATES:-} && $image != "${FAKE_RUNNER_IMAGE:-}" && $image != "${FAKE_CONTROLLER_IMAGE:-}" ]]; then
     image_state=$FAKE_PRIOR_IMAGE_STATES/$image_kind-state
     image_id_state=$FAKE_PRIOR_IMAGE_STATES/$image_kind-id
   fi
@@ -74,19 +80,26 @@ case "${1:-}" in
         [[ "$*" == *'--build-arg SOURCE_DATE_EPOCH=1786752000'* ]] || exit 94
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'build|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"
         [[ -z "${FAKE_FAIL_BUILD:-}" ]] || exit 46
-        if [[ "$*" == *ci-fleet-runner:* ]]; then
+        image=''
+        previous=''
+        for argument in "$@"; do
+          [[ "$previous" != --tag ]] || image=$argument
+          previous=$argument
+        done
+        image_paths || exit 1
+        if [[ "$image_kind" == runner ]]; then
           if [[ -n "${FAKE_PARTIAL_BUILD_FAIL:-}" ]]; then
             printf '%s\n' "${FAKE_PARTIAL_RUNNER_IMAGE_ID:?}" >>"${FAKE_AVAILABLE_IMAGE_IDS:?}"
-            printf '%s\n' "$FAKE_PARTIAL_RUNNER_IMAGE_ID" >"${FAKE_RUNNER_IMAGE_ID_STATE:?}"
+            printf '%s\n' "$FAKE_PARTIAL_RUNNER_IMAGE_ID" >"$image_id_state"
             exit 46
           fi
-          printf '%s\n' "$CI_FLEET_ENGINE_REF" >"${FAKE_RUNNER_IMAGE_STATE:?}"
-          printf '%s\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST" >"${FAKE_RUNNER_IMAGE_ID_STATE:?}"
-          [[ -z "${FAKE_AVAILABLE_IMAGE_IDS:-}" ]] || printf '%s\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST" >>"$FAKE_AVAILABLE_IMAGE_IDS"
-        elif [[ "$*" == *ci-fleet-controller:* ]]; then
-          printf '%s\n' "$CI_FLEET_ENGINE_REF" >"${FAKE_CONTROLLER_IMAGE_STATE:?}"
-          printf '%s\n' "$CI_FLEET_CONTROLLER_IMAGE_DIGEST" >"${FAKE_CONTROLLER_IMAGE_ID_STATE:?}"
-          [[ -z "${FAKE_AVAILABLE_IMAGE_IDS:-}" ]] || printf '%s\n' "$CI_FLEET_CONTROLLER_IMAGE_DIGEST" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+          printf '%s\n' "$CI_FLEET_ENGINE_REF" >"$image_state"
+          printf '%s\n' "${FAKE_BUILT_RUNNER_IMAGE_ID:-$CI_FLEET_RUNNER_IMAGE_DIGEST}" >"$image_id_state"
+          [[ -z "${FAKE_AVAILABLE_IMAGE_IDS:-}" ]] || printf '%s\n' "${FAKE_BUILT_RUNNER_IMAGE_ID:-$CI_FLEET_RUNNER_IMAGE_DIGEST}" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+        elif [[ "$image_kind" == controller ]]; then
+          printf '%s\n' "$CI_FLEET_ENGINE_REF" >"$image_state"
+          printf '%s\n' "${FAKE_BUILT_CONTROLLER_IMAGE_ID:-$CI_FLEET_CONTROLLER_IMAGE_DIGEST}" >"$image_id_state"
+          [[ -z "${FAKE_AVAILABLE_IMAGE_IDS:-}" ]] || printf '%s\n' "${FAKE_BUILT_CONTROLLER_IMAGE_ID:-$CI_FLEET_CONTROLLER_IMAGE_DIGEST}" >>"$FAKE_AVAILABLE_IMAGE_IDS"
         else
           exit 1
         fi
@@ -167,6 +180,9 @@ case "${1:-}" in
         [[ -n "${FAKE_AVAILABLE_IMAGE_IDS:-}" && -f "$FAKE_AVAILABLE_IMAGE_IDS" ]] || exit 1
         grep -Fxq "$image_id" "$FAKE_AVAILABLE_IMAGE_IDS" || exit 1
         image_paths || exit 1
+        if [[ -f "$image_id_state.stage" && $(<"$image_id_state.stage") == "$image_id" ]]; then
+          cp "$image_state.stage" "$image_state"
+        fi
         [[ -f "$image_state" || ! -f "$image_state.provenance" ]] || cp "$image_state.provenance" "$image_state"
         printf '%s\n' "$image_id" >"$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-tag|%s|%s\n' "$image_id" "$image" >>"$FAKE_COMPOSE_LOG"
@@ -178,16 +194,16 @@ case "${1:-}" in
           [[ "$argument" != -f && "$argument" != --force ]] || force=true
         done
         image_paths || exit 1
-        if [[ "$image_kind" == runner && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
+        if [[ "$staged_image" != true && "$image_kind" == runner && -n "${FAKE_ALL_RUNNER_STATE:-}" && -f "$FAKE_ALL_RUNNER_STATE" ]]; then
           [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
           exit 48
         fi
-        if [[ -n "$stopped_state" && -f "$stopped_state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
+        if [[ "$staged_image" != true && -n "$stopped_state" && -f "$stopped_state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
           && cmp -s "$FAKE_CONTROLLER_IMAGE_ID_FILE" "$image_id_state"; then
           [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
           exit 48
         fi
-        if [[ -n "${FAKE_REJECT_RUNNING_IMAGE_RM:-}" && "$image_kind" == controller && "$force" != true && -f "$state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
+        if [[ "$staged_image" != true && -n "${FAKE_REJECT_RUNNING_IMAGE_RM:-}" && "$image_kind" == controller && "$force" != true && -f "$state" && -n "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" && -f "$FAKE_CONTROLLER_IMAGE_ID_FILE" && -f "$image_id_state" ]] \
           && cmp -s "$FAKE_CONTROLLER_IMAGE_ID_FILE" "$image_id_state"; then
           [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-rm-blocked|%s\n' "$image" >>"$FAKE_COMPOSE_LOG"
           exit 48
@@ -2616,10 +2632,14 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$build_failure_ou
   fail 'candidate build failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_BUILD
-if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure entered the transaction'; fi
+grep -Fq 'CHECKPOINT_CREATED' "$build_failure_output" || fail 'candidate preparation did not capture the incumbent checkpoint'
+if grep -Eq 'DRAIN_READY|DRAIN_OK|ROLLBACK_' "$build_failure_output"; then fail 'candidate build failure mutated the runtime'; fi
 grep -q '^build|' "$FAKE_COMPOSE_LOG" || fail 'stopped controller with distinct trusted tags did not prebuild'
 if grep -q '^stop|' "$FAKE_COMPOSE_LOG"; then fail 'stopped controller with distinct trusted tags was stopped before prebuild'; fi
-diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state'
+prepared_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); print $2; exit}' "$build_failure_output")
+[[ -d "$prepared_checkpoint" && ! -e "$build_failure_root/var/lib/ci-fleet/checkpoints/${prepared_checkpoint##*/}" ]] || fail 'candidate preparation changed an existing checkpoint'
+cp -a "$prepared_checkpoint" "$build_failure_root/var/lib/ci-fleet/checkpoints/"
+diff -r "$build_failure_root" "$root" >/dev/null || fail 'candidate build failure changed host state outside its new checkpoint'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate build failure stopped the installed controller'
 unset FAKE_COMPOSE_LOG
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$rendered_env" "$prior_controller_image" "$FAKE_CONTROLLER_IMAGE"
@@ -2633,9 +2653,9 @@ fi
 unset FAKE_FAIL_BUILD
 stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'installed controller tag was rebuilt before checkpoint and stop'
+[[ -z "$stop_line" && -n "$build_line" ]] || fail 'same-tag build failure stopped the incumbent controller'
 grep -Fq 'CHECKPOINT_CREATED' "$same_controller_output" || fail 'same controller tag was rebuilt without a checkpoint'
-grep -Fq 'ROLLBACK_RESTORED' "$same_controller_output" || fail 'same-controller-tag build failure did not restore the checkpoint'
+if grep -Eq 'DRAIN_OK|ROLLBACK_' "$same_controller_output"; then fail 'same-tag preparation failure entered runtime recovery'; fi
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$prior_runner_image" "$rendered_env" || fail 'same-controller-tag build failure changed installed runner state'
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE" "$rendered_env" || fail 'same-controller-tag build failure changed installed controller state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'same-controller-tag build failure changed the installed manager'
@@ -2651,14 +2671,19 @@ fi
 unset FAKE_FAIL_BUILD
 stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'empty live runner image was accepted before drain'
-grep -Fq 'DRAIN_OK managed_runners=0' "$empty_live_image_output" || fail 'empty live runner image build did not wait for drain'
-grep -Fq 'ROLLBACK_RESTORED' "$empty_live_image_output" || fail 'empty live runner image build failure did not restore the checkpoint'
+[[ -z "$stop_line" && -n "$build_line" ]] || fail 'empty-live-image preparation failure stopped the incumbent controller'
+if grep -Eq 'DRAIN_OK|ROLLBACK_' "$empty_live_image_output"; then fail 'empty-live-image preparation failure entered runtime recovery'; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'empty live runner image build failure stopped the installed controller'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$prior_runner_image" "$rendered_env" || fail 'empty live runner image build failure changed installed environment'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE=$prior_runner_image" "$FAKE_CONTROLLER_ENV_FILE" || fail 'empty live runner image build failure did not restore the installed controller'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=" "$FAKE_CONTROLLER_ENV_FILE" || fail 'preparation failure changed the incumbent runtime environment'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'empty live runner image build failure changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'empty live runner image build failure changed the installed manager'
+python3 - "$FAKE_CONTROLLER_ENV_FILE" "$prior_runner_image" <<'PYTHON'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace("CI_FLEET_RUNNER_IMAGE=\n", "CI_FLEET_RUNNER_IMAGE=" + sys.argv[2] + "\n"))
+PYTHON
 unset FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_EMPTY_LIVE_IMAGE_BUILD:-0} != 1 ]] || { printf 'EMPTY_LIVE_IMAGE_BUILD_REGRESSION_OK\n'; exit 0; }
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$FAKE_CONTROLLER_ENV_FILE" "$prior_runner_image" "$FAKE_RUNNER_IMAGE"
@@ -2672,9 +2697,8 @@ fi
 unset FAKE_FAIL_BUILD
 stop_line=$(grep -n -m1 '^stop|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 build_line=$(grep -n -m1 '^build|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-[[ -n "$stop_line" && -n "$build_line" && "$stop_line" -lt "$build_line" ]] || fail 'live drift runner tag was built before drain'
-grep -Fq 'DRAIN_OK managed_runners=0' "$live_drift_build_output" || fail 'live drift runner tag build did not wait for drain'
-grep -Fq 'ROLLBACK_RESTORED' "$live_drift_build_output" || fail 'live drift runner tag build failure did not restore the checkpoint'
+[[ -z "$stop_line" && -n "$build_line" ]] || fail 'live-drift preparation failure stopped the incumbent controller'
+if grep -Eq 'DRAIN_OK|ROLLBACK_' "$live_drift_build_output"; then fail 'live-drift preparation failure entered runtime recovery'; fi
 unset FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_LIVE_DRIFT_BUILD:-0} != 1 ]] || { printf 'LIVE_DRIFT_BUILD_REGRESSION_OK\n'; exit 0; }
 python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$rendered_env" "$FAKE_CONTROLLER_IMAGE" "$prior_controller_image"
@@ -2687,7 +2711,8 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$postbuild_capaci
 fi
 unset FAKE_DISK_USED_PERCENT_AFTER_BUILD FAKE_DISK_USED_PERCENT_FILE
 grep -Fq 'Docker filesystem' "$postbuild_capacity_output" || fail 'post-build Docker capacity failure was not reported'
-if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$postbuild_capacity_output"; then fail 'post-build Docker capacity failure entered the transaction'; fi
+grep -Fq 'CHECKPOINT_CREATED' "$postbuild_capacity_output" || fail 'post-build capacity fixture lacks an incumbent checkpoint'
+if grep -Eq 'DRAIN_READY|DRAIN_OK|ROLLBACK_' "$postbuild_capacity_output"; then fail 'post-build capacity failure mutated the runtime'; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'post-build Docker capacity failure stopped the installed controller'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'post-build Docker capacity failure changed installed state'
 [[ ${CI_FLEET_TEST_STOP_AFTER_POSTBUILD_CAPACITY:-0} != 1 ]] || { printf 'POSTBUILD_CAPACITY_REGRESSION_OK\n'; exit 0; }
@@ -2735,12 +2760,11 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$missing_tag_outp
   fail 'missing-tag candidate build failure unexpectedly succeeded'
 fi
 unset FAKE_PARTIAL_BUILD_FAIL
-grep -Fq 'DRAIN_OK managed_runners=0' "$missing_tag_output" || fail "missing managed tag did not reach the deferred build failure: $(<"$missing_tag_output")"
-grep -Fq 'ROLLBACK_FAILED' "$missing_tag_output" || fail 'missing-tag rollback ignored the failed reviewed-image rebuild'
-if grep -Fq 'ROLLBACK_RESTORED' "$missing_tag_output"; then fail 'failed reviewed-image rebuild reported restored rollback'; fi
+if grep -Eq 'DRAIN_OK|ROLLBACK_' "$missing_tag_output"; then fail 'lost-image preparation failure drained or recovered the incumbent'; fi
+[[ -f "$FAKE_DOCKER_STATE" ]] || fail 'lost-image preparation failure stopped the controller'
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$missing_tag_output")
 grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'checkpoint did not record the missing runner tag'
-[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "$FAKE_PARTIAL_RUNNER_IMAGE_ID" && "$FAKE_PARTIAL_RUNNER_IMAGE_ID" != "$prior_runner_image_id" ]] || fail 'failed preflight did not preserve the unverified partial image without activating it'
+[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" ]] || fail 'partial staged build replaced the incumbent runner tag'
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'missing-tag rollback did not restore the prior controller image ID'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'missing-tag rollback changed the installed environment'
 grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
