@@ -90,7 +90,7 @@ acquire_lifecycle_lock() {
 }
 
 reject_other_roles() {
-  local path inventory_kind inventory
+  local path inventory_kind inventory_status inventory unit
   for path in "$(root_path /etc/ci-fleet)" "$(root_path /var/lib/ci-fleet)" "$(root_path /opt/ci-fleet/current)" \
     "$(root_path /etc/ci-fleet-deployer)" "$(root_path /var/lib/ci-fleet-deployer)" "$(root_path /opt/ci-fleet-deployer)" \
     "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" \
@@ -100,10 +100,17 @@ reject_other_roles() {
     [[ ! -e $path && ! -L $path ]] || die 'another ci-fleet host role is present'
   done
   for inventory_kind in list-unit-files list-units; do
-    inventory=$(systemctl "$inventory_kind" --all --plain --no-legend --no-pager \
-      'ci-fleet-deployer*' 'ci-fleet-health*' 'ci-fleet-cleanup*' 'ci-fleet-reconcile*' \
-      'ci-fleet-drift*' 'ci-fleet-status-receiver*' 'actions.runner*') || die 'foreign systemd unit inventory could not be inspected'
-    [[ -z $inventory ]] || die 'another ci-fleet host role is present'
+    inventory_status=0
+    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+    # list-unit-files returns status 1 for an empty inventory without diagnostics.
+    if ((inventory_status != 0)); then
+      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || die 'foreign systemd unit inventory could not be inspected'
+    fi
+    while read -r unit _; do
+      case $unit in
+        ci-fleet-deployer*|ci-fleet-health*|ci-fleet-cleanup*|ci-fleet-reconcile*|ci-fleet-drift*|ci-fleet-status-receiver*|actions.runner*) die 'another ci-fleet host role is present' ;;
+      esac
+    done <<<"$inventory"
   done
 }
 

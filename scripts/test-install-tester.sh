@@ -9,6 +9,7 @@ trap cleanup EXIT
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 root=$tmp/root
 fake_bin=$tmp/bin
+real_systemctl=$(command -v systemctl || true)
 mkdir -p "$fake_bin" "$root/etc/ci-fleet-tester/environments" "$root/etc/ci-fleet-tester/definitions" "$root/etc/ci-fleet-tester/secrets" "$root/var/lib/ci-fleet-tester/environments" "$root/var/lib/docker" "$root/var/lib/fake-tester-volume" "$root/var/run" "$root/etc/systemd/system"
 mkdir -p "$root/run/lock"; chmod 1777 "$root/run/lock"
 chmod 700 "$root/etc/ci-fleet-tester" "$root/etc/ci-fleet-tester/environments" "$root/etc/ci-fleet-tester/definitions" "$root/etc/ci-fleet-tester/secrets" "$root/var/lib/ci-fleet-tester" "$root/var/lib/ci-fleet-tester/environments"
@@ -30,7 +31,14 @@ printf '%s\n' "$*" >>"${FAKE_TESTER_SYSTEMCTL_LOG:?}"
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_IF_UNITS_MISSING:-0} == 1 && $1 == disable && ! -e ${CI_FLEET_ROOT_PREFIX:?}/etc/systemd/system/ci-fleet-tester-health.timer ]]; then exit 5; fi
 if [[ ${FAKE_TESTER_SYSTEMCTL_FAIL_WAIT:-0} == 1 && $1 == start && " $* " == *' ci-fleet-tester-health.service '* && " $* " != *' --no-block '* ]]; then exit 7; fi
 if [[ $1 == list-unit-files || $1 == list-units ]]; then
-  [[ ${FAKE_TESTER_UNIT_INVENTORY_FAIL:-0} != 1 ]] || exit 7
+  if [[ ${FAKE_TESTER_UNIT_INVENTORY_FAIL:-0} == 1 ]]; then printf 'inventory inspection failed\n' >&2; exit "${FAKE_TESTER_UNIT_INVENTORY_FAILURE_CODE:-7}"; fi
+  if [[ ${FAKE_TESTER_EMPTY_UNIT_INVENTORY:-0} == 1 ]]; then
+    [[ $1 != list-unit-files ]] || exit 1
+    exit 0
+  fi
+  if [[ $1 == list-unit-files && " $* " == *'ci-fleet-'* && -z ${FAKE_TESTER_FOREIGN_UNIT:-} ]]; then exit 1; fi
+  printf 'unrelated.service enabled\n'
+  printf 'ci-fleet-tester-health.service enabled\n'
   if [[ -n ${FAKE_TESTER_FOREIGN_UNIT:-} && ${FAKE_TESTER_FOREIGN_UNIT_KIND:-$1} == "$1" ]]; then printf '%s enabled\n' "$FAKE_TESTER_FOREIGN_UNIT"; fi
   exit 0
 fi
@@ -111,6 +119,17 @@ write_environment() {
   chmod 600 "$root/etc/ci-fleet-tester/environments/$id.env"
 }
 
+if [[ -n $real_systemctl ]]; then
+  offline_root=$tmp/offline-systemd
+  mkdir -p "$offline_root/etc/systemd/system"
+  offline_status=0
+  SYSTEMD_COLORS=0 "$real_systemctl" --root="$offline_root" list-unit-files --all --full --plain --no-legend --no-pager >"$tmp/offline-units.out" 2>&1 || offline_status=$?
+  [[ $offline_status == 0 || $offline_status == 1 && ! -s $tmp/offline-units.out ]] || fail 'empty systemd inventory returned an inspection error'
+  [[ ! -s $tmp/offline-units.out ]] || fail 'offline root unexpectedly listed unit files'
+  printf '[Unit]\nDescription=Example foreign unit\n[Service]\nExecStart=/bin/true\n' >"$offline_root/etc/systemd/system/ci-fleet-deployer.service"
+  SYSTEMD_COLORS=0 "$real_systemctl" --root="$offline_root" list-unit-files --all --full --plain --no-legend --no-pager >"$tmp/offline-units.out"
+  grep -q '^ci-fleet-deployer.service ' "$tmp/offline-units.out" || fail 'unfiltered systemd inventory omitted a foreign unit'
+fi
 clean_root=$tmp/clean-root
 mkdir -p "$clean_root/var/run" "$clean_root/var/lib/docker" "$clean_root/run/lock"
 chmod 1777 "$clean_root/run/lock"
@@ -121,6 +140,7 @@ for marker in etc/ci-fleet-tester var/lib/ci-fleet-tester opt/ci-fleet-tester; d
 done
 if FAKE_TESTER_EMPTY_ADDRESS_POOLS=1 "$runtime" --check >/dev/null 2>&1; then fail 'runtime accepted absent explicit Docker address pools'; fi
 "$runtime" --check | grep -Fq CHECK_OK || fail 'runtime preflight failed'
+FAKE_TESTER_EMPTY_UNIT_INVENTORY=1 "$runtime" --check >/dev/null || fail 'empty foreign unit inventory blocked runtime preflight'
 cp "$root/etc/ci-fleet-tester/tester.env" "$tmp/tester.env.valid"
 sed 's@https://tester-probe.invalid/health@https://elsewhere.invalid/health@' "$tmp/tester.env.valid" >"$root/etc/ci-fleet-tester/tester.env"
 if "$runtime" --check >/dev/null 2>&1; then fail 'check accepted different DNS and HTTPS probe hosts'; fi
@@ -484,8 +504,11 @@ for inventory_kind in list-unit-files list-units; do
     grep -Fq 'another ci-fleet host role is present' "$tmp/unit-rejection.out" || fail 'runtime unit failed outside admission check'
   done
 done
-if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 "$installer" --check >/dev/null 2>&1; then fail 'installer accepted unavailable foreign unit inventory'; fi
-if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'runtime accepted unavailable foreign unit inventory'; fi
+FAKE_TESTER_EMPTY_UNIT_INVENTORY=1 "$installer" --check >/dev/null || fail 'empty foreign unit inventory blocked installer check'
+for inventory_error in 1 7; do
+  if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 FAKE_TESTER_UNIT_INVENTORY_FAILURE_CODE=$inventory_error "$installer" --check >/dev/null 2>&1; then fail 'installer accepted unavailable foreign unit inventory'; fi
+  if FAKE_TESTER_UNIT_INVENTORY_FAIL=1 FAKE_TESTER_UNIT_INVENTORY_FAILURE_CODE=$inventory_error "$runtime" --health >/dev/null 2>&1; then fail 'runtime accepted unavailable foreign unit inventory'; fi
+done
 printf '# drift\n' >>"$installed_unit"
 if "$installer" --check --config /etc/ci-fleet-tester/tester.env >/dev/null 2>&1; then fail 'installed unit drift passed check'; fi
 cp "$release/host/systemd/ci-fleet-tester-health.service" "$installed_unit"
