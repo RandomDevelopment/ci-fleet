@@ -117,6 +117,12 @@ for inventory_error in 1 7; do
   fi
   grep -Fq 'isolated-role systemd unit inventory could not be inspected' "$tmp/inventory-rejection.out"
 done
+mkdir -p "$root/var/lib/ci-fleet-deployer-container-credentials"
+if run --check >/dev/null 2>&1; then
+  echo "retained deployer credentials were accepted by the status receiver" >&2; exit 1
+fi
+rmdir "$root/var/lib/ci-fleet-deployer-container-credentials"
+
 role_lock="$root/run/ci-fleet-role-admission.lock"
 exec 8>"$role_lock"
 flock -n 8
