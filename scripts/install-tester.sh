@@ -331,7 +331,7 @@ recover_activation() {
   if [[ $previous != none ]]; then
     release_complete "$release_dir/$previous" "$previous" || die 'interrupted activation incumbent is incomplete; operator recovery is required'
     ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
-    if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'interrupted activation incumbent restore failed; journal retained'; fi
+    if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! create_tmpfiles || ! enable_timers; then die 'interrupted activation incumbent unit restore failed; journal retained'; fi
   else
     remove_units || die 'interrupted fresh installation teardown failed; journal retained'
     rm -f -- "$current_link" "$stable_launcher"
