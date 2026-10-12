@@ -1549,10 +1549,14 @@ drain_current() {
 }
 
 stop_capacity_units() {
-  local unit load_state
+  local unit load_state active_state
   for unit in ci-fleet-capacity.timer ci-fleet-capacity.service; do
     load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
-    if [[ "$load_state" == not-found && ! -e "$systemd_dir/$unit" && ! -L "$systemd_dir/$unit" ]]; then continue; fi
+    if [[ "$load_state" == not-found && ! -e "$systemd_dir/$unit" && ! -L "$systemd_dir/$unit" ]]; then
+      active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+      [[ "$active_state" == inactive ]] || return 1
+      continue
+    fi
     [[ "$load_state" == loaded ]] || return 1
     case "$unit" in
       *.timer) systemctl disable --now "$unit" >/dev/null || return 1 ;;

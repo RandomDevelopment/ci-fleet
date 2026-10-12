@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+bash "$repo_root/scripts/test-capacity-unit-stop.sh"
 health_timer=$repo_root/host/systemd/ci-fleet-health.timer
 grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lacks activation-relative initial trigger\n' >&2; exit 1; }
 ! grep -Fq 'OnBootSec=' "$health_timer" || { printf 'FAIL: health timer initial trigger is boot-relative\n' >&2; exit 1; }
@@ -305,7 +306,10 @@ if [[ -n "${FAKE_FAIL_CAPACITY_TIMER_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_TIMER_O
   exit 95
 fi
 if [[ "${1:-}" == show && "${2:-}" == --property=ActiveState && "${3:-}" == --value ]]; then
-  printf '%s\n' "${FAKE_RECONCILE_ACTIVE_STATE:-inactive}"
+  case ${4:-} in
+    ci-fleet-capacity.timer|ci-fleet-capacity.service) printf '%s\n' "${FAKE_CAPACITY_ACTIVE_STATE:-inactive}" ;;
+    *) printf '%s\n' "${FAKE_RECONCILE_ACTIVE_STATE:-inactive}" ;;
+  esac
   exit 0
 fi
 if [[ "${1:-}" == daemon-reload && -n "${FAKE_RECONCILE_UNIT_EXPECTED:-}" ]]; then
