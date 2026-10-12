@@ -2706,11 +2706,15 @@ postbuild_capacity_output=$tmp/postbuild-capacity.out
 export FAKE_DISK_USED_PERCENT_FILE=$tmp/docker-disk-used-percent
 export FAKE_DISK_USED_PERCENT_AFTER_BUILD=80
 printf '79\n' >"$FAKE_DISK_USED_PERCENT_FILE"
+precapacity_runner_tag=$(cat "$FAKE_RUNNER_IMAGE_ID_STATE" 2>/dev/null || printf absent)
+precapacity_controller_tag=$(cat "$FAKE_CONTROLLER_IMAGE_ID_STATE" 2>/dev/null || printf absent)
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$postbuild_capacity_output" 2>&1; then
   fail 'post-build Docker capacity failure unexpectedly succeeded'
 fi
 unset FAKE_DISK_USED_PERCENT_AFTER_BUILD FAKE_DISK_USED_PERCENT_FILE
 grep -Fq 'Docker filesystem' "$postbuild_capacity_output" || fail 'post-build Docker capacity failure was not reported'
+[[ $(cat "$FAKE_RUNNER_IMAGE_ID_STATE" 2>/dev/null || printf absent) == "$precapacity_runner_tag" ]] || fail 'post-build host-check failure changed the canonical runner tag'
+[[ $(cat "$FAKE_CONTROLLER_IMAGE_ID_STATE" 2>/dev/null || printf absent) == "$precapacity_controller_tag" ]] || fail 'post-build host-check failure changed the canonical controller tag'
 grep -Fq 'CHECKPOINT_CREATED' "$postbuild_capacity_output" || fail 'post-build capacity fixture lacks an incumbent checkpoint'
 if grep -Eq 'DRAIN_READY|DRAIN_OK|ROLLBACK_' "$postbuild_capacity_output"; then fail 'post-build capacity failure mutated the runtime'; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'post-build Docker capacity failure stopped the installed controller'

@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory() as temporary:
                            FAKE_CONTROLLER_IMAGE_ID_STATE=str(root / 'controller-id'),
                            FAKE_AVAILABLE_IMAGE_IDS=str(root / 'available'),
                            FAKE_PARTIAL_RUNNER_IMAGE_ID=wrong_id)
-    for case in ('partial', 'runner_mismatch', 'controller_mismatch', 'success'):
+    for case in ('partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
         (root / 'running').touch()
         (root / 'runner-state').write_text(old_revision + '\n')
         (root / 'controller-state').write_text(old_revision + '\n')
@@ -45,12 +45,17 @@ with tempfile.TemporaryDirectory() as temporary:
         if case == 'partial': injected['FAKE_PARTIAL_BUILD_FAIL'] = '1'
         if case == 'runner_mismatch': injected['FAKE_BUILT_RUNNER_IMAGE_ID'] = wrong_id
         if case == 'controller_mismatch': injected['FAKE_BUILT_CONTROLLER_IMAGE_ID'] = wrong_id
-        result = subprocess.run(['bash', str(repo / 'scripts/build-managed-images.sh'), str(repo), str(environment)],
+        command = ['bash', str(repo / 'scripts/build-managed-images.sh'), str(repo), str(environment)]
+        if case == 'prepare': command.append(str(root / 'manifest'))
+        result = subprocess.run(command,
                                 env=injected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        assert (result.returncode == 0) == (case == 'success'), (case, result.stdout)
+        assert (result.returncode == 0) == (case in ('prepare', 'success')), (case, result.stdout)
         expected = (runner_id, controller_id) if case == 'success' else (old_runner, old_controller)
         assert tuple((root / name).read_text().strip() for name in ('runner-id', 'controller-id')) == expected, case
         assert (root / 'running').exists(), case
+        if case == 'prepare':
+            tags = (root / 'manifest').read_text().splitlines()
+            assert len(tags) == 2 and all('-staged-' in tag for tag in tags), tags
         if case != 'success':
             assert (root / 'runner-state').read_text().strip() == old_revision, case
             assert (root / 'controller-state').read_text().strip() == old_revision, case

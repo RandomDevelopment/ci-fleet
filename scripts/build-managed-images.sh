@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 release=$1
 environment=$2
+manifest=${3:-}
 version=$(docker buildx version 2>/dev/null | awk '{print $2}')
 [[ "$version" == v0.32.1 ]] || { printf 'reviewed Docker Buildx v0.32.1 is required\n' >&2; exit 1; }
 set -a
@@ -10,11 +11,14 @@ set -a
 set +a
 managed_builder=ci-fleet-managed
 managed_buildkit='moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
+keep_staged=false
 staged_runner=$CI_FLEET_RUNNER_IMAGE-staged-$$
 staged_controller=$CI_FLEET_CONTROLLER_IMAGE-staged-$$
 cleanup_build() {
   local image
-  for image in "$staged_runner" "$staged_controller"; do docker image rm "$image" >/dev/null 2>&1 || true; done
+  if [[ "$keep_staged" != true ]]; then
+    for image in "$staged_runner" "$staged_controller"; do docker image rm "$image" >/dev/null 2>&1 || true; done
+  fi
   docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true
 }
 trap cleanup_build EXIT
@@ -36,5 +40,10 @@ for mapping in "$staged_runner $CI_FLEET_RUNNER_IMAGE_DIGEST" "$staged_controlle
   [[ $(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image") == "$CI_FLEET_ENGINE_REF" ]] \
     || { printf 'managed image revision does not match reviewed desired state\n' >&2; exit 1; }
 done
-docker image tag "$CI_FLEET_RUNNER_IMAGE_DIGEST" "$CI_FLEET_RUNNER_IMAGE"
-docker image tag "$CI_FLEET_CONTROLLER_IMAGE_DIGEST" "$CI_FLEET_CONTROLLER_IMAGE"
+if [[ -n "$manifest" ]]; then
+  (umask 0077; printf '%s\n' "$staged_runner" "$staged_controller" >"$manifest")
+  keep_staged=true
+else
+  docker image tag "$CI_FLEET_RUNNER_IMAGE_DIGEST" "$CI_FLEET_RUNNER_IMAGE"
+  docker image tag "$CI_FLEET_CONTROLLER_IMAGE_DIGEST" "$CI_FLEET_CONTROLLER_IMAGE"
+fi

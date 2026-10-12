@@ -167,9 +167,11 @@ optional_unit_names=(
   ci-fleet-reconcile.service ci-fleet-reconcile.timer
 )
 
+prepared_image_tags=()
 temporary=$(mktemp -d)
 cleanup_temporary() {
-  local path
+  local path image
+  for image in "${prepared_image_tags[@]}"; do docker image rm "$image" >/dev/null 2>&1 || true; done
   rm -rf "$temporary"
   for path in "${staging_paths[@]}"; do
     [[ -z "$path" ]] || rm -rf -- "$path"
@@ -454,8 +456,20 @@ compose() {
 }
 
 build_managed_images() {
-  local release=$1 environment=$2
-  bash "$release/scripts/build-managed-images.sh" "$release" "$environment"
+  local release=$1 environment=$2 prepare_only=${3:-false} manifest runner controller
+  local -a tags=()
+  if [[ "$prepare_only" != true ]]; then
+    bash "$release/scripts/build-managed-images.sh" "$release" "$environment" || return 1
+    return 0
+  fi
+  manifest=$(mktemp "$temporary/prepared-image-tags.XXXXXX")
+  bash "$release/scripts/build-managed-images.sh" "$release" "$environment" "$manifest" || return 1
+  mapfile -t tags <"$manifest"
+  runner=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {print $2}' "$environment")
+  controller=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print $2}' "$environment")
+  [[ ${#tags[@]} == 2 && ${tags[0]} == "$runner"-staged-* && ${tags[1]} == "$controller"-staged-* ]] || return 1
+  prepared_image_tags+=("${tags[@]}")
+  return 0
 }
 
 controller_status() {
@@ -1165,8 +1179,7 @@ run_candidate_preflight() {
 build_candidate() {
   # Quiescence is enforced after drain, not while preparing validated image inputs.
   compose "$release_dir" "$candidate_env" config --quiet
-  if ! managed_images_match "$candidate_env"; then build_managed_images "$release_dir" "$candidate_env"; fi
-  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
+  if ! managed_images_match "$candidate_env"; then build_managed_images "$release_dir" "$candidate_env" true; fi
 }
 
 capture_legacy_image_ids() {
@@ -2453,6 +2466,8 @@ perform_converge() {
   build_candidate
   build_before_drain=true
   require_commands
+  restore_reviewed_image_tags "$candidate_env" || die 'verified candidate image publication failed'
+  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
   transaction_active=true
   if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
     policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")
