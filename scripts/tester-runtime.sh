@@ -123,7 +123,7 @@ load_spec() {
 
 validate_compose() {
   local rendered=$1 empty_env variable
-  local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST")
+  local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST" "DOCKER_CONFIG=$DOCKER_CONFIG")
   if ! python3 - "$compose_file" <<'PY'
 import sys
 try:
@@ -200,6 +200,7 @@ for section in ('networks','volumes'):
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
         if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
         if section == 'networks' and item.get('enable_ipv4') is False: raise SystemExit(f'{section}.{name}: IPv4 is required')
+        if section == 'networks' and item.get('enable_ipv6'): raise SystemExit(f'{section}.{name}: IPv6 is unsupported')
         if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
 secrets=value.get('secrets',{})
@@ -249,7 +250,7 @@ for kind in ('volume','network'):
             if actual.get('Driver') != 'local' or actual.get('Options') not in (None,{}): raise SystemExit(f'volume configuration is invalid: {name}')
             continue
         if actual.get('Driver') != 'bridge' or actual.get('Options') not in (None,{}) or actual.get('Ingress'): raise SystemExit(f'network configuration is invalid: {name}')
-        if bool(actual.get('Internal')) != bool(item.get('internal')) or bool(actual.get('Attachable')) != bool(item.get('attachable')) or bool(actual.get('EnableIPv6')) != bool(item.get('enable_ipv6')): raise SystemExit(f'network configuration differs from the approved model: {name}')
+        if bool(actual.get('Internal')) != bool(item.get('internal')) or bool(actual.get('Attachable')) != bool(item.get('attachable')) or actual.get('EnableIPv6') or item.get('enable_ipv6'): raise SystemExit(f'network configuration differs from the approved model: {name}')
         ipam=actual.get('IPAM') or {}
         if ipam.get('Driver') not in (None,'default') or ipam.get('Options') not in (None,{}): raise SystemExit(f'network IPAM is invalid: {name}')
         ipv4=[]
@@ -257,7 +258,8 @@ for kind in ('volume','network'):
             if not isinstance(config,dict) or config.get('AuxAddress'): raise SystemExit(f'network IPAM is invalid: {name}')
             try: subnet=ipaddress.ip_network(config.get('Subnet',''))
             except ValueError: raise SystemExit(f'network IPAM is invalid: {name}')
-            if subnet.version == 4: ipv4.append((subnet,config.get('Gateway')))
+            if subnet.version != 4: raise SystemExit(f'network IPv6 allocation is unsupported: {name}')
+            ipv4.append((subnet,config.get('Gateway')))
         if len(ipv4) != 1: raise SystemExit(f'network IPv4 allocation is invalid: {name}')
         subnet,gateway=ipv4[0]
         approved=any(subnet.version == ipaddress.ip_network(pool.get('Base','')).version and subnet.prefixlen == pool.get('Size') and subnet.subnet_of(ipaddress.ip_network(pool.get('Base',''))) for pool in pools)
@@ -472,6 +474,10 @@ socket_mode=$(stat -c %a "$docker_socket")
 (( (8#$socket_mode & 0002) == 0 )) || die 'local Docker socket is writable outside its administration group'
 unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$docker_socket"
+# Docker client proxies and credentials must not enter application containers.
+docker_client_config=$(mktemp -d)
+trap 'rm -rf -- "$docker_client_config"' EXIT
+export DOCKER_CONFIG=$docker_client_config
 [[ $(docker info --format '{{.DockerRootDir}}') == "$(root_path /var/lib/docker)" ]] || die 'Docker daemon root is not the expected local path'
 case $action in
   --check|--health|--converge|--reset)

@@ -19,7 +19,11 @@ Compose source validation requires Debian's `python3-yaml` package. It decodes Y
 
 Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. A running service without a Docker healthcheck is allowed; an unhealthy Docker healthcheck still fails validation. Health checks also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
 
-Compose provider executables, init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Networks must keep IPv4 enabled. Service-level `tmpfs` is unsupported; declare tmpfs mounts through `volumes` with `type: tmpfs`. Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units. Admission and health also reject foreign roles reported by systemd's loaded-unit and unit-file inventories.
+Compose provider executables, init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Networks must keep IPv4 enabled; IPv6 networks and allocations are unsupported. Service-level `tmpfs` is unsupported; declare tmpfs mounts through `volumes` with `type: tmpfs`. 
+
+Runtime commands use a fresh empty Docker client configuration, so inherited client proxies, credential helpers, and registry credentials are unavailable. Images must be pullable without those credentials or already available to the daemon. 
+
+Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units. Admission and health also reject foreign roles reported by systemd's loaded-unit and unit-file inventories.
 
 The host's root administrators and Docker daemon are trusted. Health checks verify the isolation settings listed above; they do not attest process arguments, environment variables, or healthcheck definitions after an administrator recreates a container outside this runtime. Review image defaults and use the protected definitions for application changes. Restrict Docker administration to authorized operators.
 

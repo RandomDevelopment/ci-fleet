@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 printf '%s\n' "$*" >>"${FAKE_TESTER_DOCKER_LOG:?}"
 [[ -z ${FAKE_TESTER_EVENT_LOG:-} ]] || printf 'docker %s\n' "$*" >>"$FAKE_TESTER_EVENT_LOG"
+if [[ $1 == compose && ${FAKE_TESTER_EXPECT_EMPTY_CLIENT_CONFIG:-0} == 1 ]]; then
+  [[ -n ${DOCKER_CONFIG:-} && -d $DOCKER_CONFIG && $DOCKER_CONFIG != "${FAKE_TESTER_INHERITED_CLIENT_CONFIG:?}" && ! -e $DOCKER_CONFIG/config.json ]] || { printf 'unsafe Docker client configuration\n' >&2; exit 9; }
+  printf '%s\n' "$DOCKER_CONFIG" >>"${FAKE_TESTER_CLIENT_CONFIG_LOG:?}"
+fi
 if [[ $1 == ps || ( $1 == volume || $1 == network ) && $2 == ls ]] && [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then
   project=${*: -1}; project=${project#label=com.docker.compose.project=}
   kind=$1; [[ $kind != ps ]] || kind=container
@@ -113,7 +117,12 @@ if [[ $1 == network && $2 == inspect ]]; then
     printf '[{"Name":"%s","Driver":"bridge","Options":{},"Labels":{"com.docker.compose.project":"ci-fleet-test-preview-a","com.docker.compose.network":"default"},"Internal":false,"Attachable":false,"Ingress":false,"EnableIPv6":false,"IPAM":{"Driver":"default","Options":{},"Config":[{"Subnet":"203.0.113.0/24","Gateway":"203.0.113.1"}]}}]\n' "$FAKE_TESTER_PREEXISTING_NETWORK"
   elif [[ " $* " != *' --format '* ]]; then
     name=${*: -1}; project=${name%_default}
-    printf '[{"Name":"%s","Driver":"bridge","Options":{},"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Internal":false,"Attachable":false,"Ingress":false,"EnableIPv6":false,"IPAM":{"Driver":"default","Options":{},"Config":[{"Subnet":"198.51.100.0/28","Gateway":"198.51.100.1"}]}}]\n' "$name" "$project"
+    ipv6=false; extra_ipam=
+    case ${FAKE_TESTER_LIVE_POLICY:-} in
+      ipv6-enabled) ipv6=true ;;
+      ipv6-allocation) extra_ipam=',{"Subnet":"fd00::/64","Gateway":"fd00::1"}' ;;
+    esac
+    printf '[{"Name":"%s","Driver":"bridge","Options":{},"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Internal":false,"Attachable":false,"Ingress":false,"EnableIPv6":%s,"IPAM":{"Driver":"default","Options":{},"Config":[{"Subnet":"198.51.100.0/28","Gateway":"198.51.100.1"}%s]}}]\n' "$name" "$project" "$ipv6" "$extra_ipam"
   else printf '%s\n' "${FAKE_TESTER_ORPHAN_NETWORK_PROJECT:-}"; fi
   exit 0
 fi
@@ -154,6 +163,7 @@ case ${operation:-} in
       duplicate-network) network_extra=$(printf '},"alias":{"name":"%s_default"' "$project") ;;
       duplicate-volume) volume_extra=$(printf '},"alias":{"name":"%s_data"' "$project") ;;
       ipv4-disabled) network_extra=',"enable_ipv4":false,"enable_ipv6":true' ;;
+      ipv6-enabled) network_extra=',"enable_ipv6":true' ;;
       service-tmpfs) service_extra+=',"tmpfs":["/tmp"]' ;;
       ipam) network_extra=',"ipam":{"config":[{"subnet":"172.30.0.0/24"}]}' ;;
       replicas) service_extra=',"deploy":{"replicas":2}' ;;

@@ -220,7 +220,7 @@ for policy in mutable privileged bind broad-port udp-route external-network envi
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
   if grep -Fq 'up -d' "$tmp/docker.log"; then fail "unsafe policy reached activation: $policy"; fi
 done
-for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority; do
+for policy in wrong-volume host-network extra-network bind-volume oom-disabled oom-priority ipv6-enabled ipv6-allocation; do
   if FAKE_TESTER_LIVE_POLICY=$policy "$runtime" --health >/dev/null 2>&1; then fail "unsafe live policy passed health: $policy"; fi
 done
 if FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'unreachable loopback route passed health'; fi
@@ -228,7 +228,7 @@ grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared rout
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
   if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
 done
-for policy in ipv4-disabled service-tmpfs device-cgroup duplicate-network duplicate-volume capdrop-extra; do
+for policy in ipv4-disabled ipv6-enabled service-tmpfs device-cgroup duplicate-network duplicate-volume capdrop-extra; do
   write_environment "$policy" 18098
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "$policy" >"$tmp/model-rejection.out" 2>&1; then fail "unsupported model was accepted: $policy"; fi
@@ -237,11 +237,26 @@ for policy in ipv4-disabled service-tmpfs device-cgroup duplicate-network duplic
     device-cgroup) grep -Fq 'build/device/capability/external mount/global identity is forbidden' "$tmp/model-rejection.out" || fail 'device rules failed outside model validation' ;;
     duplicate-network|duplicate-volume) grep -Fq 'duplicate resolved resource name' "$tmp/model-rejection.out" || fail 'duplicate names failed outside model validation' ;;
     ipv4-disabled) grep -Fq 'IPv4 is required' "$tmp/model-rejection.out" || fail 'IPv4-disabled network failed outside model validation' ;;
+    ipv6-enabled) grep -Fq 'IPv6 is unsupported' "$tmp/model-rejection.out" || fail 'IPv6-enabled network failed outside model validation' ;;
     service-tmpfs) grep -Fq 'service-level tmpfs is unsupported' "$tmp/model-rejection.out" || fail 'service tmpfs failed outside model validation' ;;
   esac
   [[ ! -e $root/var/lib/ci-fleet-tester/environments/$policy.state ]] || fail "unsupported model created tracked state: $policy"
   if grep -Fq 'up -d' "$tmp/docker.log"; then fail "unsupported model reached activation: $policy"; fi
 done
+proxy_config=$tmp/proxy-client
+mkdir "$proxy_config"
+printf '%s\n' '{"proxies":{"default":{"httpProxy":"http://proxy.invalid:3128"}}}' >"$proxy_config/config.json"
+proxy_config_hash=$(sha256sum "$proxy_config/config.json")
+for client_config_mode in inherited default; do
+  client_environment=(env FAKE_TESTER_EXPECT_EMPTY_CLIENT_CONFIG=1 "FAKE_TESTER_INHERITED_CLIENT_CONFIG=$proxy_config" "FAKE_TESTER_CLIENT_CONFIG_LOG=$tmp/client-config.log")
+  if [[ $client_config_mode == inherited ]]; then client_environment+=("DOCKER_CONFIG=$proxy_config"); else client_environment=(env -u DOCKER_CONFIG "${client_environment[@]:1}"); fi
+  : >"$tmp/client-config.log"
+  "${client_environment[@]}" "$runtime" --converge --environment preview-a >/dev/null || fail 'Docker client isolation prevented valid convergence'
+  "${client_environment[@]}" "$runtime" --health >/dev/null || fail 'Docker client isolation prevented health checks'
+  [[ -s $tmp/client-config.log ]] || fail 'Compose did not verify its client configuration'
+  while IFS= read -r client_config; do [[ ! -e $client_config ]] || fail 'Docker client configuration was not cleaned up'; done <"$tmp/client-config.log"
+done
+[[ $(sha256sum "$proxy_config/config.json") == "$proxy_config_hash" ]] || fail 'runtime changed the inherited Docker client configuration'
 write_environment source-policy 18096
 for source in 'services: {web: {extends: {file: /etc/passwd, service: web}}}' '!!str &external include: [{path: /etc/passwd}]' '!!str &external label_file: /etc/passwd' 'services: {web: {env_file: /etc/passwd}}' 'services: {}\nservices: {}'; do
   printf '%b\n' "$source" >"$root/etc/ci-fleet-tester/definitions/source-policy.yaml"
