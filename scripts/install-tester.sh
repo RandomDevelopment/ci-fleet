@@ -307,7 +307,7 @@ write_lkg() {
 }
 
 activate_release() {
-  local commit=$1 target=$release_dir/$1 previous=
+  local commit=$1 target=$release_dir/$1 previous= record_previous=${2:-1}
   reject_other_roles
   reject_unit_dropins
   reject_tmpfiles_overrides
@@ -328,7 +328,7 @@ activate_release() {
     fi
     die 'candidate tester activation failed; previous release restored when available'
   fi
-  if [[ $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous" && ! write_lkg "$previous"; then
+  if [[ $record_previous == 1 && $previous =~ ^[0-9a-f]{40}$ && $previous != "$commit" ]] && release_complete "$release_dir/$previous" "$previous" && ! write_lkg "$previous"; then
     ln -sfn "$release_dir/$previous" "$current_link.new"; mv -Tf "$current_link.new" "$current_link"
     if ! install_launcher "$release_dir/$previous" || ! install_units "$release_dir/$previous" || ! enable_timers; then die 'last-known-good recording failed and incumbent restore failed; incumbent link retained for recovery'; fi
     die 'last-known-good recording failed; previous release restored'
@@ -415,7 +415,7 @@ case $action in
     release_complete "$release_dir/$target" "$target" || die 'last-known-good release is incomplete'
     reject_other_roles
     ensure_directories
-    activate_release "$target"
+    activate_release "$target" 0
     report "ROLLBACK_OK source_revision=$target"
     ;;
   --uninstall)

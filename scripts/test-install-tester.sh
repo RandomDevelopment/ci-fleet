@@ -711,6 +711,12 @@ write_environment rollback-env 18086
 FAKE_TESTER_ROUTE_PORT=18086 "$runtime" --converge --environment rollback-env >/dev/null
 rollback_state_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/rollback-env.state")
 pre_rollback_release=$(readlink -f "$root/opt/ci-fleet-tester/current")
+for rollback_attempt in 1 2; do
+  FAKE_TESTER_ROUTE_PORT=18086 "$installer" --rollback --config /etc/ci-fleet-tester/tester.env >/dev/null
+  [[ $(readlink -f "$root/opt/ci-fleet-tester/current") == "$root/opt/ci-fleet-tester/releases/$old" ]] || fail "rollback $rollback_attempt returned to the bad revision"
+  [[ $(<"$root/var/lib/ci-fleet-tester/last-known-good") == "$old" ]] || fail 'rollback overwrote the recovery point with a complete bad incumbent'
+done
+ln -sfn "$pre_rollback_release" "$root/opt/ci-fleet-tester/current"
 chmod u+w "$pre_rollback_release/scripts/tester-runtime.sh"
 printf '# corrupt before rollback\n' >>"$pre_rollback_release/scripts/tester-runtime.sh"
 chmod 0555 "$pre_rollback_release/scripts/tester-runtime.sh"
