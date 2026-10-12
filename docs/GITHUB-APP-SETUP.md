@@ -58,6 +58,12 @@ by the organization owner. The App itself receives access only to the separate
 configuration repository; the project name/ID pairs scope runner-group routing
 without granting the controller App project source access.
 
+GitHub App names are globally unique. If the default
+`ci-fleet-ORGANIZATION-INSTANCE` is unavailable, add `--app-name UNIQUE_NAME`
+with a reviewed lowercase name of at most 34 characters. Bootstrap binds the
+returned slug to that name and persists it. Reruns reuse the persisted slug;
+an explicitly different name is rejected.
+
 The bootstrap:
 
 - requests `contents: read`, metadata read, and organization self-hosted
@@ -79,8 +85,15 @@ The bootstrap:
 - retains the protected creation marker and acknowledged group ID until routing
   verification or confirmed deletion completes. SIGKILL, host failure, or an
   uncertain rollback leaves owner reconciliation required before any retry;
-- destroys the conversion code, JWTs, installation token, callback state, and
-  temporary curl configurations on exit. After a successful conversion, a
+- records registration uncertainty in root-owned mode-`0600`
+  `bootstrap-registration.pending` before exposing the portal. A callback
+  atomically publishes its code as protected `bootstrap-registration-code`.
+  A rerun with the same identity resumes a captured code without registering
+  another App. Without a captured code, retries stop for owner reconciliation,
+  including after cancellation, timeout, or a dropped tunnel;
+- destroys JWTs, installation tokens, callback nonces, and temporary curl
+  configurations on exit. The captured code remains protected until conversion
+  is attempted. After a successful conversion, a
   protected mode-`0600` `bootstrap-recovery.json` or
   `bootstrap-recovery.pending` is deliberately retained until the PEM and
   identity record are installed. Bootstrap syncs the completed response to disk
@@ -271,12 +284,22 @@ sudo /opt/ci-fleet/manager/current/scripts/remote-reconcile.sh --check-only
 
 ## Accidental creation rollback
 
+An unresolved `bootstrap-registration.pending` means GitHub may have created
+the App before a callback reached the host. An owner must reconcile the exact
+organization and App name in that protected marker. Resume a durably captured
+code with the identical live command while GitHub still accepts it. Otherwise,
+confirm no App was created or revoke/delete only the exact newly registered App
+before approving removal of the marker and any retained code. An unrelated App
+that already holds the same name must remain untouched.
+
 If the runner-group creation response is lost or malformed, bootstrap performs
 read-only discovery and retains root-owned mode-`0600`
 `/etc/ci-fleet/bootstrap-group.pending`. The new group has no repository access.
 The marker also survives SIGKILL or a failed rollback after acknowledged
 creation, and records the acknowledged group ID until verification or confirmed
 deletion completes. Reconcile that exact ID when present.
+Automatic deletion must return HTTP 204. A redirect, unexpected status, or
+transport failure retains the marker for owner reconciliation.
 Every later live/check invocation stops before making a GitHub request until an
 organization owner reconciles the recorded organization/group with GitHub.
 An absent group immediately after a timeout does not prove creation failed.

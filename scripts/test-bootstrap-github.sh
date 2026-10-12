@@ -41,6 +41,8 @@ python3 "$callback" --parent-pid "$$" --socket "$callback_socket" --operator-uid
   --manifest '{"name":"fixture"}' --output "$code_file" --handoff "$handoff_file" --timeout 30 >"$tmp/callback.out" 2>"$tmp/callback.err" &
 processes+=("$!")
 wait_http "http://127.0.0.1:$callback_port/" "$tmp/callback.html"
+status=$(callback_curl -sS -H 'Host: untrusted.example' -o "$tmp/wrong-host.html" -w '%{http_code}' "http://127.0.0.1:$callback_port/")
+[[ $status == 403 ]] || fail 'callback exposed its nonce under an untrusted hostname'
 [[ $(stat -c %a "$callback_socket") == 600 && $(stat -c %u "$callback_socket") == "$(id -u)" ]] || fail 'callback socket is not operator-private'
 if tr '\0' '\n' <"/proc/${processes[-1]}/cmdline" | grep -Fxq fixture-state; then fail 'callback nonce appeared in process arguments'; fi
 if [[ $(id -u) == 0 ]] && command -v runuser >/dev/null; then
@@ -139,6 +141,13 @@ for _ in {1..100}; do
   sleep 0.05
 done
 if callback_curl -fsS "http://127.0.0.1:$routing_port/" -o /dev/null 2>/dev/null; then fail 'callback outlived its bootstrap parent'; fi
+registration_marker=$routing_root/etc/ci-fleet/bootstrap-registration.pending
+[[ -f $registration_marker && $(stat -c %a "$registration_marker") == 600 ]] || fail 'cancelled portal lost registration uncertainty'
+if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$routing_root "$bootstrap" --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 \
+  --config-repo "$config_checkout" --config-ref "$config_ref" >"$tmp/registration-retry.out" 2>"$tmp/registration-retry.err"; then fail 'uncertain registration was retried'; fi
+grep -Fq 'registration outcome is uncertain' "$tmp/registration-retry.err" || fail 'uncertain registration did not require owner reconciliation'
+if grep -Fq CALLBACK_SOCKET "$tmp/registration-retry.out"; then fail 'uncertain registration exposed another portal'; fi
 if "$bootstrap" --dry-run --organization acme-org --instance example-ci-01 --runner-group example-ci-experimental \
   --allow-repository acme-org/example-repo --bind 10.0.0.1 --callback-host 10.0.0.1 >/dev/null 2>&1; then
   fail 'plaintext non-loopback callback was accepted'
@@ -242,11 +251,15 @@ cancel_delete_count=$(grep -c '^DELETE runner-group-delete$' "$tmp/api.log")
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE=1 CI_FLEET_ROOT_PREFIX=$live_root "$bootstrap" --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'injected cancellation after group creation succeeded'; fi
 [[ $(grep -c '^DELETE runner-group-delete$' "$tmp/api.log") == "$((cancel_delete_count + 1))" && ! -e $FAKE_BOOTSTRAP_STATE ]] || fail 'cancellation did not roll back the new runner group'
-for interruption in kill rollback-timeout; do
+for interruption in kill rollback-timeout rollback-redirect rollback-wrong-success; do
   if [[ $interruption == kill ]]; then
     interruption_flags=(CI_FLEET_TEST_KILL_AFTER_GROUP_CREATE=1)
-  else
+  elif [[ $interruption == rollback-timeout ]]; then
     interruption_flags=(CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE=1 FAKE_BOOTSTRAP_DELETE_TIMEOUT=1)
+  else
+    deletion_status=302
+    [[ $interruption != rollback-wrong-success ]] || deletion_status=200
+    interruption_flags=(CI_FLEET_TEST_CANCEL_AFTER_GROUP_CREATE=1 "FAKE_BOOTSTRAP_DELETE_STATUS=$deletion_status")
   fi
   if env PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX="$live_root" "${interruption_flags[@]}" "$bootstrap" --organization acme-org --instance example-ci-01 \
     --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'interrupted group creation succeeded'; fi
@@ -284,6 +297,39 @@ grep -Fq 'CREDENTIALS_VERIFIED' "$tmp/check.out" || fail 'check mode did not ver
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root bash -x "$bootstrap" --check --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >"$tmp/traced.out" 2>"$tmp/traced.err"
 if grep -Fq -e fixture-installation-token-value -e eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9 "$tmp/traced.out" "$tmp/traced.err"; then fail 'inherited shell tracing exposed credentials'; fi
+
+# A durably captured callback resumes without registering another App, including a custom name.
+captured_root=$tmp/captured-root
+captured_port=$(port)
+api_before=$(wc -l <"$tmp/api.log")
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$captured_root CI_FLEET_TEST_CANCEL_AFTER_CALLBACK=1 "$bootstrap" --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 \
+  --app-name reviewed-unique-app --port "$captured_port" --timeout 30 >"$tmp/captured.out" 2>"$tmp/captured.err" &
+captured_pid=$!
+processes+=("$captured_pid")
+wait_http "http://127.0.0.1:$captured_port/" "$tmp/captured.html" "$tmp/captured.out"
+captured_state=$(python3 - "$tmp/captured.html" <<'PY'
+import html,re,sys,urllib.parse
+body=html.unescape(open(sys.argv[1]).read())
+assert '&quot;' not in body and 'reviewed-unique-app' in body
+print(urllib.parse.unquote(re.search(r"settings/apps/new\?state=([^'&]+)",body).group(1)))
+PY
+)
+callback_curl -fsS --get --data-urlencode code=fixture-captured-code --data-urlencode "state=$captured_state" \
+  "http://127.0.0.1:$captured_port/callback" -o "$tmp/captured-callback.html"
+if wait "$captured_pid"; then fail 'injected interruption after callback succeeded'; fi
+[[ -f $captured_root/etc/ci-fleet/bootstrap-registration.pending && $(stat -c %a "$captured_root/etc/ci-fleet/bootstrap-registration-code") == 600 ]] || fail 'captured callback was not retained privately'
+[[ $(wc -l <"$tmp/api.log") == "$api_before" ]] || fail 'callback interruption reached conversion before durable recovery'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$captured_root FAKE_BOOTSTRAP_APP_NAME=reviewed-unique-app "$bootstrap" --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 \
+  --app-name reviewed-unique-app >"$tmp/captured-resume.out" 2>"$tmp/captured-resume.err" || fail 'durable callback recovery failed'
+if grep -Fq CALLBACK_SOCKET "$tmp/captured-resume.out"; then fail 'callback recovery registered another App'; fi
+[[ ! -e $captured_root/etc/ci-fleet/bootstrap-registration.pending && ! -e $captured_root/etc/ci-fleet/bootstrap-registration-code ]] || fail 'successful callback recovery retained temporary registration state'
+grep -Fxq CI_FLEET_GITHUB_APP_SLUG=reviewed-unique-app "$captured_root/etc/ci-fleet/bootstrap-app.env" || fail 'custom App identity was not persisted'
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$captured_root FAKE_BOOTSTRAP_APP_NAME=reviewed-unique-app "$bootstrap" --check --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1 || fail 'persisted custom App identity was not reused'
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$captured_root "$bootstrap" --check --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 --app-name other-reviewed-app >/dev/null 2>&1; then fail 'persisted App was rebound to another requested name'; fi
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_DISCOVERY_PAGE=1 "$bootstrap" --check --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1 || fail 'target runner group on second discovery page was rejected'
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_SECOND_GROUP_PAGE=1 "$bootstrap" --check --organization acme-org --instance example-ci-01 \

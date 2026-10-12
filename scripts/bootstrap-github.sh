@@ -10,6 +10,7 @@ Usage: bootstrap-github.sh [--dry-run|--check] --organization ORG --instance ID
   --allow-repository ORG/PROJECT=NUMERIC_ID [--allow-repository ORG/PROJECT=NUMERIC_ID ...]
   [--bind ADDRESS --callback-host HOST --port PORT --timeout SECONDS]
   [--operator-uid UID]
+  [--app-name UNIQUE_NAME]
   [--config-repo LOCAL_CHECKOUT --config-ref COMMIT] [--install]
 EOF
 }
@@ -17,7 +18,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
 mode=live; mode_selected=false; organization=; instance=; runner_group=; config_repository=; bind=127.0.0.1; callback_host=127.0.0.1
-port=8765; timeout=600; run_installer=false; config_repo=; config_ref=; operator_uid=
+port=8765; timeout=600; run_installer=false; config_repo=; config_ref=; operator_uid=; requested_app_name=
 repositories=()
 while (($#)); do
   case $1 in
@@ -33,6 +34,7 @@ while (($#)); do
     --port) (($# >= 2)) || die '--port requires a value'; port=$2; shift 2 ;;
     --timeout) (($# >= 2)) || die '--timeout requires a value'; timeout=$2; shift 2 ;;
     --operator-uid) (($# >= 2)) || die '--operator-uid requires a value'; operator_uid=$2; shift 2 ;;
+    --app-name) (($# >= 2)) || die '--app-name requires a value'; requested_app_name=$2; shift 2 ;;
     --install) run_installer=true; shift ;;
     --config-repo) (($# >= 2)) || die '--config-repo requires a value'; config_repo=$2; shift 2 ;;
     --config-ref) (($# >= 2)) || die '--config-ref requires a value'; config_ref=$2; shift 2 ;;
@@ -44,8 +46,8 @@ done
 [[ $instance =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'invalid instance identity'
 [[ $runner_group =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $runner_group != default ]] || die 'runner group must be a lowercase schema-v3 slug and non-default'
 [[ $config_repository =~ ^${organization}/[A-Za-z0-9_.-]+$ ]] || die "configuration repository must belong to $organization"
-app_name=ci-fleet-$organization-$instance
-((${#app_name} <= 34)) || die 'generated GitHub App name exceeds 34 characters'
+app_name=${requested_app_name:-ci-fleet-$organization-$instance}
+[[ $app_name =~ ^[a-z0-9][a-z0-9-]{0,33}$ ]] || die 'GitHub App name must be a lowercase slug of at most 34 characters'
 ((${#repositories[@]} > 0)) || die 'at least one --allow-repository is required'
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die 'invalid callback port'
 [[ $timeout =~ ^[0-9]+$ && $timeout -ge 30 && $timeout -le 1800 ]] || die 'timeout must be 30-1800 seconds'
@@ -150,6 +152,8 @@ bootstrap_state=$etc_dir/bootstrap-app.env
 bootstrap_recovery=$etc_dir/bootstrap-recovery.json
 bootstrap_pending=$etc_dir/bootstrap-recovery.pending
 group_pending=$etc_dir/bootstrap-group.pending
+registration_pending=$etc_dir/bootstrap-registration.pending
+registration_code=$etc_dir/bootstrap-registration-code
 expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 
@@ -172,8 +176,11 @@ if payload:
 Path(target).write_text('\n'.join(lines) + '\n')
 PY
   chmod 600 "$config"
-  local status=0
-  curl -q --config "$config" || status=$?
+  local status=0 http_status
+  http_status=$(curl -q --config "$config" --write-out '%{http_code}') || status=$?
+  if ((status == 0)); then
+    [[ $http_status =~ ^2[0-9][0-9]$ && ( $method != DELETE || $http_status == 204 ) ]] || status=1
+  fi
   rm -f "$config"
   return "$status"
 }
@@ -254,6 +261,7 @@ PY
     return 1
   fi
   [[ ${CI_FLEET_GITHUB_APP_ID:-} =~ ^([0-9]+|(Iv1\.)?[A-Za-z0-9]+)$ && ${CI_FLEET_GITHUB_APP_CLIENT_ID:-} =~ ^(Iv1\.)?[A-Za-z0-9]+$ && ${CI_FLEET_GITHUB_APP_SLUG:-} =~ ^[a-z0-9-]+$ ]] || die 'existing bootstrap state is invalid'
+  [[ -z $requested_app_name || $requested_app_name == "$CI_FLEET_GITHUB_APP_SLUG" ]] || die 'requested App name differs from persisted identity'
   [[ ${CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE:-/etc/ci-fleet/secrets/github-app.pem} == /etc/ci-fleet/secrets/github-app.pem ]] || die 'existing bootstrap PEM path is unsupported'
   [[ -f $pem && ! -L $pem && $(stat -c %a "$pem") == 600 && $(stat -c %u "$pem") == "$expected_uid" ]] || die 'existing bootstrap PEM is invalid'
 }
@@ -261,15 +269,15 @@ PY
 recover_conversion() {
   [[ -f $bootstrap_recovery && ! -L $bootstrap_recovery && $(stat -c %a "$bootstrap_recovery") == 600 && $(stat -c %u "$bootstrap_recovery") == "$expected_uid" ]] || die 'bootstrap recovery record is invalid'
   local staged_pem=$temporary/recovered.pem staged_state=$temporary/recovered.env
-  python3 - "$bootstrap_recovery" "$staged_pem" "$staged_state" "$organization" "$instance" <<'PY' || die 'bootstrap recovery record is malformed'
+  python3 - "$bootstrap_recovery" "$staged_pem" "$staged_state" "$organization" "$instance" "$app_name" <<'PY' || die 'bootstrap recovery record is malformed'
 import json, os, re, sys
 from pathlib import Path
-source, pem, state = map(Path, sys.argv[1:4]); organization, instance = sys.argv[4:]
+source, pem, state = map(Path, sys.argv[1:4]); organization, instance, app_name = sys.argv[4:]
 value=json.loads(source.read_text())
 if not isinstance(value.get('pem'),str) or 'PRIVATE KEY' not in value['pem']: raise SystemExit(1)
 if not isinstance(value.get('id'),int) or not re.fullmatch(r'(Iv1\.)?[A-Za-z0-9]+',str(value.get('client_id',''))): raise SystemExit(1)
 slug=str(value.get('slug',''))
-if slug != f'ci-fleet-{organization}-{instance}' or not re.fullmatch(r'[a-z0-9-]+',slug): raise SystemExit(1)
+if slug != app_name or not re.fullmatch(r'[a-z0-9-]+',slug): raise SystemExit(1)
 pem.write_text(value['pem']); os.chmod(pem,0o600)
 state.write_text(f'CI_FLEET_BOOTSTRAP_ORGANIZATION={organization}\nCI_FLEET_BOOTSTRAP_INSTANCE={instance}\nCI_FLEET_GITHUB_APP_ID={value["id"]}\nCI_FLEET_GITHUB_APP_CLIENT_ID={value["client_id"]}\nCI_FLEET_GITHUB_APP_SLUG={slug}\n'); os.chmod(state,0o600)
 PY
@@ -291,7 +299,7 @@ PY
   if [[ ${CI_FLEET_TEST_FAIL_AFTER_PEM_PUBLISH:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected interruption after atomic PEM publication'; fi
   publish_private "$staged_state" "$bootstrap_state"
   load_metadata
-  rm -f "$bootstrap_recovery"
+  rm -f "$bootstrap_recovery" "$registration_code"
 }
 
 if [[ $mode == dry-run ]]; then
@@ -331,6 +339,18 @@ PY
   read -r approval_repository_id approval_branch <<<"$approval_identity"
   approval_gate=true
 fi
+if [[ -e $registration_pending || -L $registration_pending ]]; then
+  [[ -f $registration_pending && ! -L $registration_pending && $(stat -c %u "$registration_pending") == "$expected_uid" && $(stat -c %a "$registration_pending") == 600 ]] || die 'registration marker is unsafe'
+  python3 - "$registration_pending" "$organization" "$instance" "$app_name" <<'PY' || die 'registration marker belongs to another identity'
+import json,sys
+if json.load(open(sys.argv[1])) != dict(zip(('organization','instance','app_name'),sys.argv[2:])): raise SystemExit(1)
+PY
+  [[ -f $registration_code && ! -L $registration_code && $(stat -c %u "$registration_code") == "$expected_uid" && $(stat -c %a "$registration_code") == 600 ]] || die "registration outcome is uncertain; owner reconciliation is required before removing $registration_pending"
+  [[ $mode != check ]] || die 'registration callback recovery is pending; rerun live bootstrap first'
+  [[ ! -e $bootstrap_state && ! -e $pem && ! -e $host_env ]] || die 'registration recovery conflicts with active identity'
+elif [[ -e $registration_code || -L $registration_code ]]; then
+  [[ -e $bootstrap_pending || -e $bootstrap_recovery ]] || die 'orphaned registration code requires owner reconciliation'
+fi
 if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
   [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
   publish_conversion || die "incomplete protected conversion response remains at $bootstrap_pending; do not retry or delete it without owner recovery/abandonment approval"
@@ -347,51 +367,64 @@ fi
 if ! load_metadata; then
   [[ $mode != check ]] || die 'bootstrap state is missing; run live bootstrap first'
   [[ ! -e $pem && ! -L $pem && ! -e $host_env && ! -L $host_env ]] || die 'existing credentials lack matching bootstrap identity; no replacement made'
-  state=$(openssl rand -hex 32)
-  state_file=$temporary/manifest-state
-  printf '%s' "$state" >"$state_file"
-  callback_url="http://$callback_host:$port/callback"
-  manifest=$(python3 - "$organization" "$instance" "$callback_url" "$approval_gate" <<'PY'
+  code_file=$registration_code
+  if [[ ! -e $registration_pending ]]; then
+    printf '{"organization":"%s","instance":"%s","app_name":"%s"}\n' "$organization" "$instance" "$app_name" >"$temporary/registration-pending"
+    publish_private "$temporary/registration-pending" "$registration_pending"
+    state=$(openssl rand -hex 32)
+    state_file=$temporary/manifest-state
+    printf '%s' "$state" >"$state_file"
+    callback_url="http://$callback_host:$port/callback"
+    manifest=$(python3 - "$organization" "$app_name" "$callback_url" "$approval_gate" <<'PY'
 import json, sys
-organization, instance, callback, approval_gate = sys.argv[1:]
+organization, app_name, callback, approval_gate = sys.argv[1:]
 permissions={'contents': 'read', 'metadata': 'read', 'organization_self_hosted_runners': 'write'}
 if approval_gate=='true': permissions.update(actions='read',pull_requests='read')
 print(json.dumps({
-  'name': f'ci-fleet-{organization}-{instance}', 'url': 'https://github.com/RandomDevelopment/ci-fleet',
+  'name': app_name, 'url': 'https://github.com/RandomDevelopment/ci-fleet',
   'redirect_url': callback, 'public': False, 'hook_attributes': {'active': False, 'url': callback},
   'default_permissions': permissions,
   'default_events': []
 }, separators=(',', ':')))
 PY
-)
-  code_file=$temporary/manifest-code
-  handoff_file=$temporary/installation-url
-  if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
-    # Keep test sockets below Linux's Unix-socket pathname limit.
-    portal_directory=$(mktemp -d /tmp/ci-fleet-bootstrap.XXXXXX)
-  else
-    portal_directory=$(mktemp -d /run/ci-fleet-bootstrap.XXXXXX)
+    )
+    handoff_file=$temporary/installation-url
+    if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then
+      # Keep test sockets below Linux's Unix-socket pathname limit.
+      portal_directory=$(mktemp -d /tmp/ci-fleet-bootstrap.XXXXXX)
+    else
+      portal_directory=$(mktemp -d /run/ci-fleet-bootstrap.XXXXXX)
+    fi
+    install -d -m 0700 -o "$operator_uid" "$portal_directory"
+    callback_socket=$portal_directory/callback.sock
+    python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --socket "$callback_socket" --operator-uid "$operator_uid" --port "$port" --organization "$organization" --state-file "$state_file" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
+    callback_pid=$!
+    note "CALLBACK_SOCKET $callback_socket"
+    note "TUNNEL ssh -N -L 127.0.0.1:$port:$callback_socket HOST"
+    note "REGISTRATION_URL http://$callback_host:$port/"
+    note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
+    deadline=$((SECONDS + timeout))
+    while [[ ! -f $code_file && $SECONDS -lt $deadline ]]; do
+      callback_is_running || { reap_callback_if_exited; die 'registration callback stopped before receiving approval'; }
+      sleep 1
+    done
+    [[ -f $code_file ]] || die 'registration callback timed out'
   fi
-  install -d -m 0700 -o "$operator_uid" "$portal_directory"
-  callback_socket=$portal_directory/callback.sock
-  python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --socket "$callback_socket" --operator-uid "$operator_uid" --port "$port" --organization "$organization" --state-file "$state_file" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
-  callback_pid=$!
-  note "CALLBACK_SOCKET $callback_socket"
-  note "TUNNEL ssh -N -L 127.0.0.1:$port:$callback_socket HOST"
-  note "REGISTRATION_URL http://$callback_host:$port/"
-  note 'Open the URL, authenticate to GitHub, and approve App creation. Return here without copying any value.'
-  deadline=$((SECONDS + timeout))
-  while [[ ! -f $code_file && $SECONDS -lt $deadline ]]; do
-    callback_is_running || { reap_callback_if_exited; die 'registration callback stopped before receiving approval'; }
-    sleep 1
-  done
-  [[ -f $code_file ]] || die 'registration callback timed out'
+  if [[ ${CI_FLEET_TEST_CANCEL_AFTER_CALLBACK:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then kill -TERM "$$"; fi
   conversion_config=$temporary/conversion.conf
-  python3 - "$code_file" "$bootstrap_pending" "$conversion_config" <<'PY'
+  python3 - "$code_file" "$bootstrap_pending" "$conversion_config" "$expected_uid" <<'PY'
 from pathlib import Path
-import sys
-code_file, output, config = map(Path, sys.argv[1:])
-code = code_file.read_text().strip()
+import os,stat,sys
+code_file, output, config = map(Path, sys.argv[1:4])
+descriptor=os.open(code_file,os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(descriptor) as handle:
+    metadata=os.fstat(handle.fileno())
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid!=int(sys.argv[4]) or stat.S_IMODE(metadata.st_mode)!=0o600: raise SystemExit(1)
+    code=handle.read().strip()
+    os.fsync(handle.fileno())
+descriptor=os.open(code_file.parent,os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(descriptor)
+finally: os.close(descriptor)
 if not code or len(code) > 512 or any(ch.isspace() for ch in code): raise SystemExit(1)
 config.write_text('\n'.join(['silent','show-error','fail-with-body','connect-timeout = "10"','max-time = "30"','request = "POST"',
  f'url = "https://api.github.com/app-manifests/{code}/conversions"', f'output = "{output}"',
@@ -400,6 +433,7 @@ PY
   chmod 600 "$conversion_config"
   printf '{}\n' >"$temporary/conversion-pending"
   publish_private "$temporary/conversion-pending" "$bootstrap_pending"
+  rm -f "$registration_pending"
   conversion_status=0
   curl -q --config "$conversion_config" || conversion_status=$?
   chmod 600 "$bootstrap_pending"

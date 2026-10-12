@@ -9,6 +9,7 @@ import signal
 import socket
 import socketserver
 import stat
+import tempfile
 import urllib.parse
 from typing import cast
 
@@ -53,6 +54,10 @@ class Callback(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
+        host = self.headers.get("Host")
+        if host != f"127.0.0.1:{self.app_server.server_port}" and not (self.app_server.server_port == 80 and host == "127.0.0.1"):
+            self.reply(403, "Invalid callback host")
+            return
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/" and not parsed.query:
             action = f"https://github.com/organizations/{urllib.parse.quote(self.app_server.organization, safe='')}/settings/apps/new?state={urllib.parse.quote(self.app_server.state, safe='')}"
@@ -99,13 +104,25 @@ class Callback(http.server.BaseHTTPRequestHandler):
         if not code or len(code) > 512 or any(character.isspace() for character in code):
             self.reply(400, "Invalid callback")
             return
+        directory = os.path.dirname(self.app_server.output)
+        descriptor, temporary = tempfile.mkstemp(prefix=".manifest-code.", dir=directory)
         try:
-            descriptor = os.open(self.app_server.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            self.reply(409, "Callback already consumed")
-            return
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(code)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(code)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, self.app_server.output)
+            except FileExistsError:
+                self.reply(409, "Callback already consumed")
+                return
+        finally:
+            os.unlink(temporary)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         self.app_server.consumed = True
         self.reply(200, "<meta http-equiv=refresh content='1;url=/next'><h1>Registration received</h1><p>Preparing installation approval. No value needs to be copied.</p>")
 
@@ -141,6 +158,7 @@ def main() -> int:
     if not state or len(state) > 256:
         return 2
     server = Server(args.socket, Callback)
+    server.server_port = args.port
     os.chmod(args.socket, 0o600)
     if args.operator_uid != os.geteuid():
         os.chown(args.socket, args.operator_uid, -1)

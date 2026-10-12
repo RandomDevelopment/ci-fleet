@@ -74,7 +74,7 @@ elif endpoint.endswith("/actions/runner-groups/789/repositories"):
         response = {"total_count": len(repositories), "repositories": repositories}
 elif endpoint.endswith("/actions/runner-groups/789") and method == "DELETE":
     kind = "runner-group-delete"
-    if not os.environ.get("FAKE_BOOTSTRAP_DELETE_TIMEOUT"):
+    if not os.environ.get("FAKE_BOOTSTRAP_DELETE_TIMEOUT") and not os.environ.get("FAKE_BOOTSTRAP_DELETE_STATUS"):
         state.unlink(missing_ok=True)
     response = {}
 elif endpoint.endswith("/actions/runner-groups/789"):
@@ -87,6 +87,8 @@ if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_ALL_REPOSITORIES")
 if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID") == "1":
     assert isinstance(response, dict)
     response["client_id"] = "Iv1DifferentClient"
+if kind in {"app", "manifest-conversion"} and os.environ.get("FAKE_BOOTSTRAP_APP_NAME"):
+    response["slug"] = os.environ["FAKE_BOOTSTRAP_APP_NAME"]
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_CONTENTS") == "1":
     assert isinstance(response, dict)
     response["permissions"].pop("contents")
@@ -140,3 +142,6 @@ if kind == "runner-group-create":
         output.write_text('{"id":')
 if kind == "manifest-conversion" and os.environ.get("FAKE_BOOTSTRAP_CONVERSION_NONZERO") == "1":
     raise SystemExit(22)
+if "--write-out" in sys.argv:
+    print(int(os.environ["FAKE_BOOTSTRAP_DELETE_STATUS"]) if kind == "runner-group-delete" and os.environ.get("FAKE_BOOTSTRAP_DELETE_STATUS")
+          else 204 if method in {"PUT", "DELETE"} else 201 if method == "POST" else 200, end="")
