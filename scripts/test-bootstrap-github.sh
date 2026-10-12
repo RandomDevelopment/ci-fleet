@@ -6,11 +6,13 @@ bootstrap=$repo_root/scripts/bootstrap-github.sh
 callback=$repo_root/scripts/bootstrap-github-callback.py
 real_curl=$(command -v curl)
 tmp=$(mktemp -d)
+approval_root=
 processes=()
 cleanup() {
   local process
   for process in "${processes[@]}"; do kill "$process" >/dev/null 2>&1 || true; done
   [[ ${KEEP_TEST_TMP:-0} == 1 ]] || rm -rf "$tmp"
+  [[ -z $approval_root ]] || rm -rf "$approval_root"
 }
 trap cleanup EXIT
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
@@ -296,14 +298,44 @@ for kind in installation-repositories runner-groups runner-group-repositories; d
     --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail "truncated $kind page was accepted"; fi
 done
 
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_APPROVAL_READS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'extra approval reads were accepted without the protected gate'; fi
+approval_root=$(mktemp -d "$repo_root/scripts/.bootstrap-approval.XXXXXX")
+cp -a "$live_root/." "$approval_root/"
+cp "$repo_root/host/config-review-policy.json.example" "$approval_root/etc/ci-fleet/config-review-policy.json"
+printf '1\n' >"$approval_root/etc/ci-fleet/config-review-required"
+chmod 600 "$approval_root/etc/ci-fleet/config-review-policy.json" "$approval_root/etc/ci-fleet/config-review-required"
+PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1 || fail 'protected approval-gate reads were rejected'
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_APPROVAL_WRITE=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
+  --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'approval write permission was accepted'; fi
+for permission in actions pull_requests; do
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_NO_APPROVAL_READ=$permission "$bootstrap" --check --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'effective token without approval reads was accepted'; fi
+done
+
 # A conversion consumed by GitHub with zero response bytes must block registration retries.
-uncertain_root=$tmp/uncertain-conversion-root
+uncertain_root=$approval_root/fresh
+mkdir -p "$uncertain_root"
+cp -a "$approval_root/etc" "$uncertain_root/etc"
+rm "$uncertain_root/etc/ci-fleet/bootstrap-app.env" "$uncertain_root/etc/ci-fleet/host.env" "$uncertain_root/etc/ci-fleet/secrets/github-app.pem"
 uncertain_port=$(port)
 PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$uncertain_root FAKE_BOOTSTRAP_CONVERSION_NO_RESPONSE=1 "$bootstrap" --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 --port "$uncertain_port" --timeout 30 >"$tmp/zero.out" 2>"$tmp/zero.err" &
 uncertain_pid=$!
 processes+=("$uncertain_pid")
 wait_http "http://127.0.0.1:$uncertain_port/" "$tmp/zero.html"
+python3 - "$tmp/zero.html" <<'PY'
+from html.parser import HTMLParser
+import json,sys
+class Manifest(HTMLParser):
+    def handle_starttag(self,tag,attributes):
+        values=dict(attributes)
+        if tag=='input' and values.get('name')=='manifest':
+            self.permissions=json.loads(values['value'])['default_permissions']
+page=Manifest(); page.feed(open(sys.argv[1]).read())
+assert page.permissions['actions']=='read' and page.permissions['pull_requests']=='read'
+PY
 zero_state=$(python3 - "$tmp/zero.html" <<'PY'
 import html,re,sys,urllib.parse
 print(urllib.parse.unquote(re.search(r"settings/apps/new\?state=([^'&]+)",html.unescape(open(sys.argv[1]).read())).group(1)))

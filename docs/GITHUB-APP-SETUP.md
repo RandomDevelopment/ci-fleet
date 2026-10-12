@@ -51,8 +51,10 @@ without granting the controller App project source access.
 
 The bootstrap:
 
-- requests only `contents: read`, metadata read, and organization self-hosted
-  runner write permission;
+- requests `contents: read`, metadata read, and organization self-hosted
+  runner write permission. With a valid protected configuration-approval policy
+  and activation marker, it also requests and verifies `actions: read` and
+  `pull_requests: read`. It rejects unrelated or broader permissions;
 - creates a private, independently revocable App identity for the host;
 - verifies callback state and expires the callback after 30–1800 seconds;
 - publishes the PEM at `/etc/ci-fleet/secrets/github-app.pem` and the
@@ -69,7 +71,9 @@ The bootstrap:
   temporary curl configurations on exit. After a successful conversion, a
   protected mode-`0600` `bootstrap-recovery.json` or
   `bootstrap-recovery.pending` is deliberately retained until the PEM and
-  identity record are installed. Rerun the identical live command to recover.
+  identity record are installed. Bootstrap syncs the completed response to disk
+  and syncs its recovery pathname before installing credentials. Rerun the
+  identical live command to recover.
   A durable pending marker exists before conversion starts. A lost response,
   including zero response bytes, blocks registration retries until owner
   recovery or abandonment. Recovery never overwrites a different active PEM

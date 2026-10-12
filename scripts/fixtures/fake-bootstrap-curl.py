@@ -89,6 +89,12 @@ if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID") == "1":
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_CONTENTS") == "1":
     assert isinstance(response, dict)
     response["permissions"].pop("contents")
+if kind in {"app", "installation-token"} and os.environ.get("FAKE_BOOTSTRAP_APPROVAL_READS") == "1":
+    response["permissions"].update(actions="read", pull_requests="read")
+    if os.environ.get("FAKE_BOOTSTRAP_APPROVAL_WRITE") == "1":
+        response["permissions"]["actions"] = "write"
+if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_APPROVAL_READ"):
+    response["permissions"].pop(os.environ["FAKE_BOOTSTRAP_NO_APPROVAL_READ"])
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_RUNNER_PERMISSION"):
     if os.environ["FAKE_BOOTSTRAP_RUNNER_PERMISSION"] == "none":
         response["permissions"].pop("organization_self_hosted_runners")

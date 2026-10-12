@@ -177,6 +177,23 @@ finally: os.close(descriptor)
 PY
 }
 
+publish_conversion() {
+  python3 - "$bootstrap_pending" "$bootstrap_recovery" <<'PY'
+import json,os,sys
+from pathlib import Path
+source,target=map(Path,sys.argv[1:])
+descriptor=os.open(source,os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(descriptor) as handle:
+    value=json.load(handle)
+    if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
+    os.fsync(handle.fileno())
+os.replace(source,target)
+descriptor=os.open(target.parent,os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(descriptor)
+finally: os.close(descriptor)
+PY
+}
+
 rollback_new_group() {
   $created_group || return 0
   local deleted=$temporary/group-delete.json
@@ -282,17 +299,22 @@ if [[ ! -e $bootstrap_lock && ! -L $bootstrap_lock ]]; then (set -o noclobber; :
 exec {bootstrap_lock_fd}<>"$bootstrap_lock"
 flock -n "$bootstrap_lock_fd" || die 'another bootstrap transaction is active'
 [[ ! -e $group_pending && ! -L $group_pending ]] || die "uncertain runner-group creation remains at $group_pending; owner reconciliation is required"
-if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
-  if python3 - "$bootstrap_pending" <<'PY'
-import json,sys
-value=json.load(open(sys.argv[1]))
-if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
+approval_gate=false
+approval_policy=$etc_dir/config-review-policy.json
+approval_marker=$etc_dir/config-review-required
+if [[ -e $approval_policy || -L $approval_policy || -e $approval_marker || -L $approval_marker ]]; then
+  python3 - "$script_dir" "$approval_policy" "$expected_uid" <<'PY' || die 'configuration approval policy is invalid'
+from pathlib import Path
+import sys
+sys.path.insert(0,sys.argv[1])
+from verify_config_approval import read_policy
+read_policy(Path(sys.argv[2]),int(sys.argv[3]))
 PY
-  then
-    [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
-    mv -T "$bootstrap_pending" "$bootstrap_recovery"
-  else die "incomplete protected conversion response remains at $bootstrap_pending; do not retry or delete it without owner recovery/abandonment approval"
-  fi
+  approval_gate=true
+fi
+if [[ -f $bootstrap_pending && ! -L $bootstrap_pending && $(stat -c %u "$bootstrap_pending") == "$expected_uid" && $(stat -c %a "$bootstrap_pending") == 600 ]]; then
+  [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
+  publish_conversion || die "incomplete protected conversion response remains at $bootstrap_pending; do not retry or delete it without owner recovery/abandonment approval"
 elif [[ -e $bootstrap_pending || -L $bootstrap_pending ]]; then
   die 'pending conversion response has unsafe ownership, mode, or type'
 fi
@@ -308,13 +330,15 @@ if ! load_metadata; then
   [[ ! -e $pem && ! -L $pem && ! -e $host_env && ! -L $host_env ]] || die 'existing credentials lack matching bootstrap identity; no replacement made'
   state=$(openssl rand -hex 32)
   callback_url="http://$callback_host:$port/callback"
-  manifest=$(python3 - "$organization" "$instance" "$callback_url" <<'PY'
+  manifest=$(python3 - "$organization" "$instance" "$callback_url" "$approval_gate" <<'PY'
 import json, sys
-organization, instance, callback = sys.argv[1:]
+organization, instance, callback, approval_gate = sys.argv[1:]
+permissions={'contents': 'read', 'metadata': 'read', 'organization_self_hosted_runners': 'write'}
+if approval_gate=='true': permissions.update(actions='read',pull_requests='read')
 print(json.dumps({
   'name': f'ci-fleet-{organization}-{instance}', 'url': 'https://github.com/RandomDevelopment/ci-fleet',
   'redirect_url': callback, 'public': False, 'hook_attributes': {'active': False, 'url': callback},
-  'default_permissions': {'contents': 'read', 'metadata': 'read', 'organization_self_hosted_runners': 'write'},
+  'default_permissions': permissions,
   'default_events': []
 }, separators=(',', ':')))
 PY
@@ -349,16 +373,8 @@ PY
   curl -q --config "$conversion_config" || conversion_status=$?
   chmod 600 "$bootstrap_pending"
   rm -f "$code_file" "$conversion_config"
-  if python3 - "$bootstrap_pending" <<'PY'
-import json,sys
-value=json.load(open(sys.argv[1]))
-if any(not value.get(key) for key in ('id','client_id','pem','slug')): raise SystemExit(1)
-PY
-  then
-    [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
-    mv -T "$bootstrap_pending" "$bootstrap_recovery"
-  else die "manifest conversion did not produce a complete response (curl status $conversion_status); protected pending bytes retained for owner recovery"
-  fi
+  [[ ! -e $bootstrap_recovery && ! -L $bootstrap_recovery ]] || die 'pending and recovery records both exist; owner reconciliation is required'
+  publish_conversion || die "manifest conversion did not produce a complete durable response (curl status $conversion_status); protected recovery records retained for owner recovery"
   if [[ ${CI_FLEET_TEST_FAIL_AFTER_CONVERSION:-0} == 1 && ${CI_FLEET_TESTING:-0} == 1 ]]; then die 'injected failure after manifest conversion'; fi
   recover_conversion
 fi
@@ -367,12 +383,13 @@ app_jwt=$temporary/app.jwt
 make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
 app_response=$temporary/app.json
 write_auth_config "$app_jwt" GET https://api.github.com/app "$app_response"
-mapfile -t app_data < <(python3 - "$app_response" "$organization" "$CI_FLEET_GITHUB_APP_SLUG" "$CI_FLEET_GITHUB_APP_CLIENT_ID" <<'PY'
+mapfile -t app_data < <(python3 - "$app_response" "$organization" "$CI_FLEET_GITHUB_APP_SLUG" "$CI_FLEET_GITHUB_APP_CLIENT_ID" "$approval_gate" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1])); owner=v.get('owner',{}); expected=sys.argv[3]
 if (expected and v.get('slug') != expected) or v.get('client_id') != sys.argv[4] or owner.get('login','').lower() != sys.argv[2].lower() or owner.get('type') != 'Organization': raise SystemExit(1)
 permissions=v.get('permissions',{})
 expected_permissions={'contents':'read','metadata':'read','organization_self_hosted_runners':'write'}
+if sys.argv[5]=='true': expected_permissions.update(actions='read',pull_requests='read')
 if permissions != expected_permissions or v.get('events') not in ([], None) or v.get('public') is not False: raise SystemExit(1)
 print(v['slug']); print(v['id'])
 PY
@@ -433,12 +450,13 @@ printf '{}\n' >"$empty_payload"
 make_app_jwt "$CI_FLEET_GITHUB_APP_ID" "$pem" "$app_jwt"
 write_auth_config "$app_jwt" POST "https://api.github.com/app/installations/$installation_id/access_tokens" "$installation_response" "$empty_payload"
 installation_token=$temporary/installation.token
-python3 - "$installation_response" "$installation_token" <<'PY'
+python3 - "$installation_response" "$installation_token" "$approval_gate" <<'PY'
 import json,os,sys
 from pathlib import Path
 value=json.load(open(sys.argv[1])); token=value.get('token')
 permissions=value.get('permissions',{})
 if not isinstance(token,str) or len(token)<20 or permissions.get('contents') != 'read' or permissions.get('organization_self_hosted_runners') != 'write': raise SystemExit(1)
+if sys.argv[3]=='true' and any(permissions.get(name)!='read' for name in ('actions','pull_requests')): raise SystemExit(1)
 Path(sys.argv[2]).write_text(token); os.chmod(sys.argv[2],0o600)
 PY
 rm -f "$installation_response"
