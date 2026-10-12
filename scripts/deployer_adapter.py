@@ -326,6 +326,14 @@ class Policy:
                 require(binding.get("HostIp") == "127.0.0.1" and str(binding.get("HostPort", "")).isdigit()
                         and 1024 <= int(binding["HostPort"]) <= 65535, "only loopback application ports are allowed")
         self.mounts(host)
+        image = self.backend.inspect("images", self.image)
+        config = image.get("Config")
+        require(isinstance(config, dict), "approved image configuration is unavailable")
+        declared = config.get("Volumes") or {}
+        require(isinstance(declared, dict), "invalid image volume declarations")
+        mounted = {mount["Target"] for mount in host.get("Mounts", []) if mount["Type"] == "volume"}
+        mounted.update(binding.split(":")[1] for binding in host.get("Binds") or [] if not binding.startswith("/"))
+        require(set(declared) <= mounted, "image volumes must use pre-created scoped labelled volumes")
 
     def authorize(self, method: str, url: str, body: bytes) -> tuple[str, bytes]:
         parsed = urllib.parse.urlsplit(url)
