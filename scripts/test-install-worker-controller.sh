@@ -3261,6 +3261,14 @@ expect_failure 'selected engine does not advertise required status reporting' "$
 # Exercise telemetry removal without changing the existing Docker network policy.
 legacy_engine_ref=8bd27a2e7451806a1e37f79a15eeb7c677a12c3e
 legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
+export FAKE_PRIOR_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE
+export FAKE_PRIOR_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE
+export FAKE_PRIOR_IMAGE_STATES=$tmp/telemetry-incumbent-image-states
+mkdir -p "$FAKE_PRIOR_IMAGE_STATES"
+cp "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
@@ -3281,6 +3289,13 @@ unset FAKE_SYSTEMCTL_LOG
 [[ $(readlink -f "$adopt_root/opt/ci-fleet/manager/current") == "$adopt_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'legacy downgrade replaced the forward-compatible manager'
 [[ ! -e "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'legacy runtime retained capacity units'
 retained_installer=$adopt_root/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh
+export FAKE_PRIOR_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE
+export FAKE_PRIOR_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE
+export FAKE_PRIOR_IMAGE_STATES=$tmp/telemetry-incumbent-image-states
+cp "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-state"
+cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
+cp "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
+cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
 export FAKE_ENGINE_REF=$engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
