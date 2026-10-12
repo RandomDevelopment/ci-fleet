@@ -712,6 +712,12 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(health.capacity_report(history, now=999_000)["pools"], {})
                 self.assertFalse(health.record_capacity(history, snapshot, now=2_000_000, cached=True))
                 self.assertEqual(history.read_text(), "")
+                snapshot["runners"]["current"] = 1
+                with patch.object(health, "CAPACITY_COMPACT_SAMPLES", 4), patch.object(health, "CAPACITY_MAX_SAMPLES", 3):
+                    for timestamp in range(2_000_030, 2_000_271, 30):
+                        self.assertTrue(health.record_capacity(history, snapshot, run=run, now=timestamp, cached=True))
+                        self.assertLessEqual(len(history.read_text().splitlines()), 4)
+                    self.assertGreaterEqual(len(history.read_text().splitlines()), 3)
 
     def test_capacity_failure_survives_success_until_health_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_TESTING": "1", "CI_FLEET_ROOT_PREFIX": directory, "CI_FLEET_HEALTH_SUPPRESS_DELIVERY": "1"}):
@@ -736,6 +742,15 @@ class HealthTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     health._local(local)
             self.assertTrue(failure.exists())
+            original_writer = health._write_report
+            newer = {**event, "event": "newer-failure"}
+            def write_with_new_failure(path, report):
+                health._write_capacity_json(failure, newer)
+                original_writer(path, report)
+            with patch.object(health, "collect_snapshot", return_value=snapshot), patch.object(health, "_write_report", side_effect=write_with_new_failure):
+                self.assertEqual(health._local(local), 2)
+            self.assertEqual(json.loads(failure.read_text()), newer)
+            snapshot["capacity_failure"] = newer
             with patch.object(health, "collect_snapshot", return_value=snapshot):
                 self.assertEqual(health._local(local), 2)
             self.assertFalse(failure.exists())

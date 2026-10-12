@@ -557,7 +557,10 @@ def _memory_details(root: Path, *, strict: bool = False) -> tuple[dict[str, int]
     try:
         for line in (root / "proc/meminfo").read_text().splitlines():
             key, value = line.split(":", 1)
-            values[key] = int(value.split()[0]) * 1024
+            fields = value.split()
+            if strict and key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"} and (len(fields) != 2 or fields[1] != "kB"):
+                raise ValueError("memory counter units are invalid")
+            values[key] = int(fields[0]) * 1024
     except (OSError, ValueError, IndexError) as error:
         if strict:
             raise ValueError("memory counters are unavailable") from error
