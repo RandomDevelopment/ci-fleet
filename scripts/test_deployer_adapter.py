@@ -36,6 +36,7 @@ class Containment(unittest.TestCase):
         self.values = {'ARTIFACT_IMAGE': 'registry.example.invalid/app@sha256:' + 'a' * 64,
                        'DEPLOYER_IDENTITY': 'example', 'ENVIRONMENT': 'staging', 'TARGET_ID': 'app'}
         self.policy = adapter.Policy(self.values, self.backend, '/approved/application')
+        self.backend.resources['images', self.policy.image] = {'Config': {'Volumes': None}}
         self.network = 'ci-fleet-deploy-example-network'
         self.volume = 'ci-fleet-deploy-example-volume'
         self.backend.resources['networks', self.network] = {'Labels': self.policy.labels, 'Driver': 'bridge', 'Internal': True}
@@ -53,6 +54,23 @@ class Containment(unittest.TestCase):
         value['NetworkingConfig'] = {'EndpointsConfig': {self.network: {'IPAMConfig': None, 'Aliases': None}}}
         path, _ = self.policy.authorize('POST', '/v1.47/containers/create?name=ci-fleet-deploy-example-app', json.dumps(value).encode())
         self.assertEqual(path, '/containers/create?name=ci-fleet-deploy-example-app')
+
+    def test_image_volumes_cannot_create_unlabelled_resources(self):
+        image = self.backend.resources['images', self.policy.image]
+        image['Config']['Volumes'] = {'/data': {}}
+        self.policy.container(self.body)
+        body = copy.deepcopy(self.body)
+        body['HostConfig'].pop('Mounts')
+        with self.assertRaises(ValueError):
+            self.policy.container(body)
+        body['HostConfig']['Binds'] = [self.volume + ':/data:rw']
+        self.policy.container(body)
+        image['Config']['Volumes']['/anonymous'] = {}
+        with self.assertRaises(ValueError):
+            self.policy.container(body)
+        image['Config']['Volumes'] = ['/malformed']
+        with self.assertRaises(ValueError):
+            self.policy.container(body)
 
     def test_host_escape_requests(self):
         for key, value in {'Privileged': True, 'CapAdd': ['SYS_ADMIN'], 'PidMode': 'host', 'IpcMode': 'host',

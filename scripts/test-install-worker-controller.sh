@@ -795,6 +795,7 @@ expect_failure 'deployer host state is present' "$installer" --install "${base_a
 rm "$root/etc/systemd/system/ci-fleet-deployer.service"
 rmdir "$root/var/lib/ci-fleet-deployer"
 for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
+  mkdir -p "$(dirname "$root$marker")"
   ln -s /missing "$root$marker"
   expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
   rm "$root$marker"
