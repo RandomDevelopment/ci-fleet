@@ -178,7 +178,8 @@ class Containment(unittest.TestCase):
                                    unit='ci-fleet-deployer-adapter-1-2.service', seconds=120, request=None,
                                    marker=None, operation='deploy')
             backend = SimpleNamespace(uid=os.getuid(), path='/run/rootless/docker.sock')
-            with patch.object(adapter, 'Backend', return_value=backend), patch.object(adapter, 'trusted_directory'), \
+            with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}), \
+                 patch.object(adapter, 'Backend', return_value=backend), patch.object(adapter, 'trusted_directory'), \
                  patch.object(adapter.subprocess, 'run', side_effect=OSError('interrupted dispatcher')):
                 with self.assertRaises(OSError):
                     adapter.run_adapter(args)
