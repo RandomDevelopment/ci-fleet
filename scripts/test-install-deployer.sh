@@ -38,6 +38,7 @@ chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
+[[ -z ${FAKE_DOCKER_UNAVAILABLE:-} ]] || exit 42
 case "${1:-}" in
   info) exit "${FAKE_DOCKER_INFO_EXIT:-0}" ;;
   compose) [[ "${2:-}" == version ]] && exit "${FAKE_COMPOSE_EXIT:-0}" ;;
@@ -1811,8 +1812,12 @@ for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/s
   fi
   rmdir "$role_path"
 done
-FAKE_DOCKER_PS='foreign|controller|example-controller' expect_failure 'unrelated Docker workload is present' "$runtime" drain >/dev/null
-[[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker role drift published a drain marker'
+FAKE_DOCKER_UNAVAILABLE=1 expect_success "$runtime" drain >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker outage prevented emergency drain'
+rm "$root/var/lib/ci-fleet-deployer/drained"
+FAKE_DOCKER_PS='foreign|controller|example-controller' expect_success "$runtime" drain >/dev/null
+[[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker resource drift prevented emergency drain'
+rm "$root/var/lib/ci-fleet-deployer/drained"
 mv "$adapter" "$adapter.saved"
 expect_success "$runtime" drain >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'runtime drain required a healthy adapter'

@@ -257,8 +257,8 @@ secure_directory() {
   local path=$1 description=$2
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
 }
-reject_mixed_role() {
-  local unit runner_unit line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+reject_other_role_state() {
+  local unit runner_unit path
   for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'tester host state is present'
   done
@@ -277,6 +277,10 @@ reject_mixed_role() {
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'ordinary CI controller or runner state is present'
   done
+}
+reject_mixed_role() {
+  local line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}"
+  reject_other_role_state
   output=$(docker ps -a --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker workload inventory failed'
   while IFS= read -r line; do [[ -z "$line" || ${line#*|} == "$expected" ]] || die 'unrelated Docker workload is present'; done <<<"$output"
   output=$(docker network ls --filter type=custom --format '{{.ID}}|{{.Label "io.randomdevelopment.ci-fleet.role"}}|{{.Label "io.randomdevelopment.ci-fleet.identity"}}') || die 'Docker network inventory failed'
@@ -382,7 +386,7 @@ if [[ $own_realpath == */releases/* ]]; then
 fi
 [[ ${cfg[ENVIRONMENT]} =~ ^[a-z][a-z0-9-]{0,31}$ && ${cfg[TARGET_ID]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die 'invalid environment or target identity'
 if [[ "$operation" == drain ]]; then
-  reject_mixed_role
+  reject_other_role_state
   [[ ! -e "$active" && ! -L "$active" ]] || die 'active deployment prevents drain'
   temporary=$(mktemp "$state_root/.drained.XXXXXX")
   chmod 0600 "$temporary"
