@@ -1711,6 +1711,8 @@ PY
 
 activate_candidate() {
   local check_health=${1:-true} staged_state
+  restore_reviewed_image_tags "$candidate_env" || die 'verified candidate image publication failed'
+  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
   rm -f "$systemd_dir/.ci-fleet-reconcile-unit-restore"
   [[ "$target_state" == active ]] || remove_inactive_managed_runners
   install -d -m 0700 "$etc_dir" "$state_root" "$checkpoints_dir"
@@ -1835,6 +1837,21 @@ raise SystemExit(0 if supported else 1)
 PYTHON
 }
 
+managed_image_objects_match() {
+  local environment=$1 engine identifier expression
+  local -a identifiers=()
+  engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  [[ "$engine" =~ ^[0-9a-f]{40}$ ]] || return 1
+  mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" || $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  [[ ${#identifiers[@]} == 2 ]] || return 1
+  printf -v expression '{{eq (index .Config.Labels "org.opencontainers.image.revision") "%s"}}' "$engine"
+  for identifier in "${identifiers[@]}"; do
+    [[ "$identifier" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+    [[ $(docker image inspect --format '{{.Id}}' "$identifier" 2>/dev/null) == "$identifier" ]] || return 1
+    [[ $(docker image inspect --format "$expression" "$identifier" 2>/dev/null) == true ]] || return 1
+  done
+}
+
 restore_reviewed_image_tags() {
   local environment=$1 image identifier mapping
   local -a mappings=()
@@ -1875,8 +1892,7 @@ preflight_checkpoint_images() {
       [[ $(docker image inspect --format '{{.Id}}' "$identifier" 2>/dev/null) == "$identifier" ]] || return 1
     fi
   done
-  restore_reviewed_image_tags "$environment" || return 1
-  managed_images_match "$environment"
+  managed_image_objects_match "$environment"
 }
 
 rebuild_checkpoint_images() {
@@ -1885,8 +1901,8 @@ rebuild_checkpoint_images() {
     note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy images require retained objects or verified offline import'
     return 1
   fi
-  build_managed_images "$release" "$environment" || return 1
-  managed_images_match "$environment"
+  build_managed_images "$release" "$environment" true || return 1
+  managed_image_objects_match "$environment"
 }
 
 retag_checkpoint_image() {
@@ -2466,8 +2482,6 @@ perform_converge() {
   build_candidate
   build_before_drain=true
   require_commands
-  restore_reviewed_image_tags "$candidate_env" || die 'verified candidate image publication failed'
-  managed_images_match "$candidate_env" || die 'managed image digest does not match reviewed desired state'
   transaction_active=true
   if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
     policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")

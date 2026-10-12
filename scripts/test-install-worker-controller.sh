@@ -155,7 +155,11 @@ case "${1:-}" in
         image=${!#}
         if [[ $image =~ ^sha256:[0-9a-f]{64}$ ]]; then
           if [[ -f ${FAKE_AVAILABLE_IMAGE_IDS:-} ]] && grep -Fxq "$image" "$FAKE_AVAILABLE_IMAGE_IDS"; then
-            printf '%s\n' "$image"
+            if [[ "$*" == *'{{eq '* && "$*" =~ \"([0-9a-f]{40})\" ]]; then
+              if grep -Fxq "$image ${BASH_REMATCH[1]}" "$FAKE_AVAILABLE_IMAGE_IDS.revisions" 2>/dev/null; then printf 'true\n'; else printf 'false\n'; fi
+            else
+              printf '%s\n' "$image"
+            fi
             exit 0
           fi
           printf 'Error: No such image: %s\n' "$image" >&2
@@ -164,6 +168,10 @@ case "${1:-}" in
         [[ -z "${FAKE_IMAGE_INSPECT_LOG:-}" ]] || printf '%s\n' "$image" >>"$FAKE_IMAGE_INSPECT_LOG"
         image_paths || exit 1
         [[ ! -f "$image_state" ]] || cp "$image_state" "$image_state.provenance"
+        # Fixture IDs are reused across engine refs; retain each observed revision.
+        if [[ -f "$image_state" && -f "$image_id_state" ]]; then
+          printf '%s %s\n' "$(<"$image_id_state")" "$(<"$image_state")" >>"$FAKE_AVAILABLE_IMAGE_IDS.revisions"
+        fi
         if [[ "$*" == *'{{.Id}}'* ]]; then
           if [[ ! -f "$image_id_state" ]]; then
             [[ -z ${FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT:-} ]] || : >"$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
@@ -177,6 +185,10 @@ case "${1:-}" in
       tag)
         image_id=${3:-}
         image=${4:-}
+        if [[ "$image" == "${FAKE_RUNNER_IMAGE:-}" && -n ${FAKE_FAIL_RUNNER_TAG_ONCE:-} && -f "$FAKE_FAIL_RUNNER_TAG_ONCE" ]]; then
+          rm -f "$FAKE_FAIL_RUNNER_TAG_ONCE"
+          exit 47
+        fi
         [[ -n "${FAKE_AVAILABLE_IMAGE_IDS:-}" && -f "$FAKE_AVAILABLE_IMAGE_IDS" ]] || exit 1
         grep -Fxq "$image_id" "$FAKE_AVAILABLE_IMAGE_IDS" || exit 1
         image_paths || exit 1
@@ -891,6 +903,21 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
+publication_prior_controller=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
+publication_old_tag=sha256:6666666666666666666666666666666666666666666666666666666666666666
+printf '%s\n' "$publication_old_tag" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+printf '%s\n' "$publication_old_tag" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+export FAKE_FAIL_RUNNER_TAG_ONCE=$tmp/fail-runner-publication-once
+: >"$FAKE_FAIL_RUNNER_TAG_ONCE"
+publication_output=$tmp/publication-failure.out
+if "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >"$publication_output" 2>&1; then
+  fail 'partial canonical publication unexpectedly succeeded'
+fi
+unset FAKE_FAIL_RUNNER_TAG_ONCE
+grep -Fq 'ROLLBACK_RESTORED' "$publication_output" || fail "publication failure did not restore its checkpoint: $(<"$publication_output")"
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$publication_old_tag" ]] || fail 'publication failure did not restore the incumbent controller tag'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && -f "$FAKE_DOCKER_STATE" ]] || fail 'publication failure changed the runner tag or left the controller offline'
+printf '%s\n' "$publication_prior_controller" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
 proxy_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || proxy_health_result=$?
@@ -2735,6 +2762,8 @@ if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output";
 invalid_image_output=$tmp/invalid-image-id.out
 export FAKE_COMPOSE_LOG=$tmp/invalid-image-id-compose.log
 : >"$FAKE_COMPOSE_LOG"
+printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
+printf '%s\n' "sha256:$runner_image_digest" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 prior_runner_image_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
 printf 'not-a-sha256-image-id\n' >"$FAKE_RUNNER_IMAGE_ID_STATE"
 if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$invalid_image_output" 2>&1; then

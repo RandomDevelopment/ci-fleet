@@ -76,6 +76,7 @@ TEST
 bash "$temporary/recovery.sh"
 {
   printf 'set -Eeuo pipefail\n'
+  sed -n '/^managed_image_objects_match() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^checkpoint_images_reproducible() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^restore_reviewed_image_tags() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^preflight_checkpoint_images() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
@@ -96,12 +97,13 @@ for legacy_manifest in missing disabled; do
   grep -Fq ROLLBACK_IMAGE_REINSTALL_REQUIRED "$root/rebuild-notes.log"
 done
 identifier=sha256:3333333333333333333333333333333333333333333333333333333333333333
-printf 'CI_FLEET_CONTROLLER_IMAGE=controller\nCI_FLEET_RUNNER_IMAGE=runner\nCI_FLEET_CONTROLLER_IMAGE_DIGEST=%s\nCI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$identifier" "$identifier" >"$root/checkpoint.env"
+printf 'CI_FLEET_ENGINE_REF=0000000000000000000000000000000000000001\nCI_FLEET_CONTROLLER_IMAGE=controller\nCI_FLEET_RUNNER_IMAGE=runner\nCI_FLEET_CONTROLLER_IMAGE_DIGEST=%s\nCI_FLEET_RUNNER_IMAGE_DIGEST=%s\n' "$identifier" "$identifier" >"$root/checkpoint.env"
 checkpoint_images=(controller runner "$identifier" absent)
 docker() {
   case "$1 ${2:-}" in
     'image inspect')
-      if [[ ${image_present:-false} == true ]]; then printf '%s\n' "$identifier";
+      if [[ ${image_present:-false} == true ]]; then
+        if [[ "$*" == *'{{eq '* ]]; then printf '%s\n' "${match_images:-true}"; else printf '%s\n' "$identifier"; fi
       else printf 'Error: No such image: %s\n' "$identifier" >&2; return 1; fi ;;
     'image tag') printf 'tag\n' >>"$root/tag.log" ;;
     'info ') [[ ${daemon_available:-true} == true ]] ;;
@@ -114,9 +116,9 @@ image_present=true
 preflight_checkpoint_images "$root/legacy" "$root/checkpoint.env"
 image_present=false
 build_available=false
-before_tags=$(wc -l <"$root/tag.log")
+before_tags=$(cat "$root/tag.log" 2>/dev/null || true)
 if preflight_checkpoint_images "$root/reviewed" "$root/checkpoint.env"; then exit 1; fi
-[[ ! -e "$root/rebuild.log" && $(wc -l <"$root/tag.log") == "$before_tags" ]]
+[[ ! -e "$root/rebuild.log" && $(cat "$root/tag.log" 2>/dev/null || true) == "$before_tags" ]]
 build_available=true
 daemon_available=false
 if preflight_checkpoint_images "$root/reviewed" "$root/checkpoint.env"; then exit 1; fi
@@ -126,10 +128,11 @@ preflight_checkpoint_images "$root/reviewed" "$root/checkpoint.env"
 [[ $(<"$root/rebuild.log") == build && "$image_present" == true ]]
 preflight_checkpoint_images "$root/reviewed" "$root/checkpoint.env"
 [[ $(wc -l <"$root/rebuild.log") == 1 ]]
-rebuild_checkpoint_images "$root/reviewed" fixture-env
+[[ ! -e "$root/tag.log" ]] || { printf 'preflight changed canonical tags\n' >&2; exit 1; }
+rebuild_checkpoint_images "$root/reviewed" "$root/checkpoint.env"
 [[ $(wc -l <"$root/rebuild.log") == 2 ]]
 match_images=false
-if rebuild_checkpoint_images "$root/reviewed" fixture-env; then exit 1; fi
+if rebuild_checkpoint_images "$root/reviewed" "$root/checkpoint.env"; then exit 1; fi
 TEST
 } >"$temporary/rebuild.sh"
 bash "$temporary/rebuild.sh" "$repo_root" "$temporary"
