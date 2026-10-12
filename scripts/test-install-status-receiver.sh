@@ -65,12 +65,23 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   echo "partial deployer unit set was accepted by the status receiver" >&2; exit 1
 fi
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
-for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer; do
+for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
+  /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
   mkdir -p "$(dirname "$root$marker")"
   ln -s /missing "$root$marker"
   if run --install --ref "$first" >/dev/null 2>&1; then
     echo "tester role marker was accepted by the status receiver" >&2; exit 1
   fi
+  rm "$root$marker"
+done
+for marker in /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  : >"$root$marker"
+  for mode in install check; do
+    if run "--$mode" --ref "$first" >"$tmp/tester-role.out" 2>&1; then
+      echo "tester runtime was accepted by the status receiver" >&2; exit 1
+    fi
+    grep -Fq 'tester host state is present' "$tmp/tester-role.out"
+  done
   rm "$root$marker"
 done
 role_lock="$root/run/ci-fleet-role-admission.lock"

@@ -775,7 +775,9 @@ for marker in /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer; do
   rm "$root$marker"
 done
 
-for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer; do
+for marker in /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
+  /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
   ln -s /missing "$root$marker"
   expect_failure 'tester host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
   rm "$root$marker"
@@ -837,6 +839,14 @@ for role in deployer tester; do
   printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-$role-cleanup.timer"
   expect_failure "$role host state is present" "$installer" --check "${base_args[@]}" --ref "$ref_one"
   rm "$root/etc/systemd/system/ci-fleet-$role-cleanup.timer"
+done
+for marker in /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  : >"$root$marker"
+  expect_failure 'tester host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+  ln -s /missing "$root$marker"
+  expect_failure 'tester host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
 done
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 

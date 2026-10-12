@@ -2123,7 +2123,9 @@ perform_check() {
 
 reject_isolated_host() {
   # Isolated application hosts must not run controller checks or mutations.
-  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-tester*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-tester)" || -L "$(root_path /var/lib/ci-fleet-tester)" || -e "$(root_path /etc/ci-fleet-tester)" || -L "$(root_path /etc/ci-fleet-tester)" ]]; then
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-tester*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-tester)" || -L "$(root_path /var/lib/ci-fleet-tester)" || -e "$(root_path /etc/ci-fleet-tester)" || -L "$(root_path /etc/ci-fleet-tester)" ||
+       -e "$(root_path /opt/ci-fleet-tester/current)" || -L "$(root_path /opt/ci-fleet-tester/current)" ||
+       -e "$(root_path /opt/ci-fleet-tester/tester-runtime)" || -L "$(root_path /opt/ci-fleet-tester/tester-runtime)" ]]; then
     die 'tester host state is present; controller and tester roles are separate hosts'
   fi
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
