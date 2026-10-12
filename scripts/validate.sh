@@ -48,6 +48,7 @@ python3 scripts/desired_state.py validate-engine-capabilities --manifest engine-
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group fast >/dev/null
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
+bash scripts/test-capacity-unit-stop.sh
 scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh
