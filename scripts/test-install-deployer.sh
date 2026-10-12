@@ -982,9 +982,11 @@ retained_pointer_before=$(readlink "$root/opt/ci-fleet-deployer/current")
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 mv "$retained_release" "$tmp/retained-release.saved"
 expect_failure 'deployed rollback core release is incomplete' "$installer" --upgrade --config "$config" >/dev/null
+expect_failure 'deployed rollback core release is incomplete' "$installer" --repair --config "$config" >/dev/null
 mv "$tmp/retained-release.saved" "$retained_release"
 printf '# corrupted retained core\n' >>"$retained_release/scripts/deployer-runtime.sh"
 expect_failure 'deployed rollback core release is incomplete' "$installer" --upgrade --config "$config" >/dev/null
+expect_failure 'deployed rollback core release is incomplete' "$installer" --repair --config "$config" >/dev/null
 [[ $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json") == "$retained_state_before" && $(readlink "$root/opt/ci-fleet-deployer/current") == "$retained_pointer_before" ]] || fail 'unusable retained core changed installed state'
 [[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'unusable retained core reached the adapter'
 install -m 0600 "$tmp/retained-policy.saved" "$deployed_current/policy.conf"
