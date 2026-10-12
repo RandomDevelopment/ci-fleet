@@ -28,7 +28,7 @@ if "/app-manifests/" in url:
                 "client_secret": "fixture-client-secret", "webhook_secret": "fixture-webhook-secret"}
 elif endpoint.endswith("/app"):
     kind = "app"
-    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-acme-org-example-ci-01", "public": False, "events": [], "owner": {"login": "acme-org", "type": "Organization"},
+    response = {"id": 123, "client_id": "Iv1FixtureClient", "slug": "ci-fleet-acme-org-example-ci-01", "events": [], "owner": {"login": "acme-org", "type": "Organization"},
                 "permissions": {"contents": "read", "metadata": "read", "organization_self_hosted_runners": "write"}}
 elif endpoint.endswith("/app/installations"):
     kind = "installations"
@@ -87,6 +87,8 @@ if kind == "installations" and os.environ.get("FAKE_BOOTSTRAP_ALL_REPOSITORIES")
 if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID") == "1":
     assert isinstance(response, dict)
     response["client_id"] = "Iv1DifferentClient"
+if kind == "app" and os.environ.get("FAKE_BOOTSTRAP_PUBLIC_APP") == "1":
+    response["public"] = True
 if kind in {"app", "manifest-conversion"} and os.environ.get("FAKE_BOOTSTRAP_APP_NAME"):
     response["slug"] = os.environ["FAKE_BOOTSTRAP_APP_NAME"]
 if kind == "installation-token" and os.environ.get("FAKE_BOOTSTRAP_NO_CONTENTS") == "1":

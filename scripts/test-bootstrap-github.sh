@@ -70,6 +70,9 @@ CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$dry_root "$bootstrap" --dry-run --organ
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >"$tmp/dry.out"
 grep -Fq 'NO_GITHUB_MUTATION' "$tmp/dry.out" || fail 'dry-run omitted its no-mutation result'
 [[ ! -e $dry_root ]] || fail 'dry-run wrote host state'
+TMPDIR=$tmp/unavailable-temp CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$dry_root "$bootstrap" --dry-run --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null || fail 'dry-run allocated temporary state'
+[[ ! -e $tmp/unavailable-temp ]] || fail 'dry-run created its unavailable temporary directory'
 conflicting_root=$tmp/conflicting-mode-root
 if CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$conflicting_root "$bootstrap" --dry-run --check --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'conflicting dry-run/check modes were accepted'; fi
@@ -399,6 +402,8 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'archived project repository was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID=1 "$bootstrap" --check --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'mismatched App client ID was accepted'; fi
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_PUBLIC_APP=1 "$bootstrap" --check --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'explicitly public App response was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_NO_CONTENTS=1 "$bootstrap" --check --organization acme-org --instance example-ci-01 \
   --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 >/dev/null 2>&1; then fail 'installation token without contents permission was accepted'; fi
 for permission in read none; do

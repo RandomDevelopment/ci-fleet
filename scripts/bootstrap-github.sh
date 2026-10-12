@@ -51,6 +51,7 @@ app_name=${requested_app_name:-ci-fleet-$organization-$instance}
 ((${#repositories[@]} > 0)) || die 'at least one --allow-repository is required'
 [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die 'invalid callback port'
 [[ $timeout =~ ^[0-9]+$ && $timeout -ge 30 && $timeout -le 1800 ]] || die 'timeout must be 30-1800 seconds'
+[[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
 for repository in "${repositories[@]}"; do
   [[ $repository =~ ^${organization}/[A-Za-z0-9_.-]+=([1-9][0-9]*)$ ]] || die "project repository must use ORG/REPO=NUMERIC_ID: $repository"
 done
@@ -72,6 +73,14 @@ if $run_installer; then
 fi
 if [[ $mode == live || -n $config_repo || -n $config_ref ]]; then
   [[ -n $config_repo && $config_ref =~ ^[0-9a-f]{40}$ ]] || die 'live bootstrap requires --config-repo and a 40-character --config-ref'
+fi
+root_prefix=${CI_FLEET_ROOT_PREFIX:-}
+if [[ -n $root_prefix && ${CI_FLEET_TESTING:-0} != 1 ]]; then die 'CI_FLEET_ROOT_PREFIX is test-only'; fi
+if [[ $mode == dry-run ]]; then
+  note "DRY_RUN organization=$organization instance=$instance runner_group=$runner_group repositories=${#repositories[@]}"
+  note "CALLBACK_URL http://$callback_host:$port/"
+  note 'NO_GITHUB_MUTATION credentials_written=false installer_run=false'
+  exit 0
 fi
 for command in bash curl flock openssl python3 install mktemp stat; do command -v "$command" >/dev/null || die "required command is unavailable: $command"; done
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -141,8 +150,6 @@ if value["organization"]["slug"] != organization or pool["runner_group"] != runn
 PY
 fi
 
-root_prefix=${CI_FLEET_ROOT_PREFIX:-}
-if [[ -n $root_prefix && ${CI_FLEET_TESTING:-0} != 1 ]]; then die 'CI_FLEET_ROOT_PREFIX is test-only'; fi
 root_path() { printf '%s%s' "$root_prefix" "$1"; }
 etc_dir=$(root_path /etc/ci-fleet)
 secret_dir=$etc_dir/secrets
@@ -158,7 +165,6 @@ expected_uid=0
 [[ ${CI_FLEET_TESTING:-0} != 1 ]] || expected_uid=$(id -u)
 
 if [[ $mode != dry-run && ${CI_FLEET_TESTING:-0} != 1 && ${EUID:-$(id -u)} -ne 0 ]]; then die 'run live/check bootstrap as root'; fi
-[[ $bind == 127.0.0.1 && $callback_host == 127.0.0.1 ]] || die 'callback bind/host must both be IPv4 loopback 127.0.0.1'
 
 write_auth_config() {
   local credential=$1 method=$2 url=$3 output=$4 payload=${5:-} transfer_timeout=${6:-30}
@@ -302,13 +308,6 @@ PY
   rm -f "$bootstrap_recovery" "$registration_code"
 }
 
-if [[ $mode == dry-run ]]; then
-  note "DRY_RUN organization=$organization instance=$instance runner_group=$runner_group repositories=${#repositories[@]}"
-  note "CALLBACK_URL http://$callback_host:$port/"
-  note 'NO_GITHUB_MUTATION credentials_written=false installer_run=false'
-  exit 0
-fi
-
 for directory in "$etc_dir" "$secret_dir"; do
   if [[ -e $directory || -L $directory ]]; then
     [[ -d $directory && ! -L $directory && $(stat -c %a "$directory") == 700 && $(stat -c %u "$directory") == "$expected_uid" ]] || die "protected directory is unsafe: $directory"
@@ -395,7 +394,7 @@ PY
     else
       portal_directory=$(mktemp -d /run/ci-fleet-bootstrap.XXXXXX)
     fi
-    install -d -m 0700 -o "$operator_uid" "$portal_directory"
+    install -d -m 0700 "$portal_directory"
     callback_socket=$portal_directory/callback.sock
     python3 "$script_dir/bootstrap-github-callback.py" --parent-pid "$$" --socket "$callback_socket" --operator-uid "$operator_uid" --port "$port" --organization "$organization" --state-file "$state_file" --manifest "$manifest" --output "$code_file" --handoff "$handoff_file" --timeout "$timeout" &
     callback_pid=$!
@@ -455,7 +454,9 @@ if (expected and v.get('slug') != expected) or v.get('client_id') != sys.argv[4]
 permissions=v.get('permissions',{})
 expected_permissions={'contents':'read','metadata':'read','organization_self_hosted_runners':'write'}
 if sys.argv[5]=='true': expected_permissions.update(actions='read',pull_requests='read')
-if permissions != expected_permissions or v.get('events') not in ([], None) or v.get('public') is not False: raise SystemExit(1)
+if permissions != expected_permissions or v.get('events') not in ([], None): raise SystemExit(1)
+# The documented App response has no visibility field; the owner confirms it in GitHub.
+if 'public' in v and v['public'] is not False: raise SystemExit(1)
 print(v['slug']); print(v['id'])
 PY
 ) || die 'existing App identity or ownership is unexpected'

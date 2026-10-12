@@ -39,6 +39,11 @@ an SSH `TUNNEL` command shape, and a local `REGISTRATION_URL`. Establish the
 forward, open the URL, press the single registration button, install the
 new App for **only** the private configuration repository, and return to the
 terminal. The target host receives and exchanges the temporary code itself.
+Before creating or installing the App, the owner must confirm GitHub's
+**Only on this account** installation setting. The manifest requests a private
+App, but GitHub's documented App API does not report visibility. Bootstrap
+verifies ownership, permissions, and installation scope; it cannot replace this
+owner visibility check.
 Neither the code nor any credential is copied through a phone, clipboard, chat,
 email, issue, or second computer.
 
@@ -107,7 +112,9 @@ The bootstrap:
   exact newly created App, then explicitly remove those recovery files; ordinary
   cleanup never discards potentially unique credentials.
 
-Inspect a request without local writes or GitHub calls:
+Inspect the argument format without local writes or GitHub calls. Dry-run does
+not validate a configuration checkout; live mode validates the pinned commit
+before mutation.
 
 ```bash
 sudo ./scripts/bootstrap-github.sh --dry-run \
@@ -152,6 +159,7 @@ Organization Settings → Developer settings → GitHub Apps → New GitHub App.
 | Name | one per controller, e.g. `ci-fleet-<controller-id>` |
 | Homepage URL | your organization or fleet repository URL |
 | Webhook | disabled — the controller polls; nothing calls it |
+| Installation availability | Only on this account |
 
 ## 2. Grant minimum permissions
 

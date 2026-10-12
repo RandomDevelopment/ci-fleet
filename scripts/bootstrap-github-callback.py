@@ -162,6 +162,8 @@ def main() -> int:
     os.chmod(args.socket, 0o600)
     if args.operator_uid != os.geteuid():
         os.chown(args.socket, args.operator_uid, -1)
+        # Publish operator access after the socket's ownership is final.
+        os.chown(os.path.dirname(args.socket), args.operator_uid, -1)
     server.organization = args.organization
     server.state = state
     server.manifest = args.manifest

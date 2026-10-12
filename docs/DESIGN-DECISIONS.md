@@ -124,3 +124,19 @@ trusted SSH account's UID. Live phone acceptance remains tracked in issue #27.
 Replace this transport only after an equally authenticated portal has proved
 nonce confidentiality, one-shot behavior, and cleanup without credential
 transport through chat or process arguments.
+
+## Confirm App visibility in GitHub's owner UI
+
+GitHub's documented [`GET /app` response](https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app)
+has no App visibility field. Bootstrap requests `public: false` in the manifest
+and requires the owner to confirm **Only on this account** before creation or
+installation. It verifies the API-supported ownership, permission, and selected
+repository fields and rejects an explicitly public response if GitHub reports
+one. Missing visibility is never described as machine-verified private status.
+
+An owner can broaden App distribution in GitHub outside this workflow. That
+could permit installations in additional accounts and expand the effect of a
+leaked private key. Live setup and periodic owner checks must retain private
+distribution. Issue #27 includes live acceptance of this requirement. Replace
+this manual check when GitHub exposes a supported, authoritative visibility
+field that bootstrap can verify without browser credentials.
