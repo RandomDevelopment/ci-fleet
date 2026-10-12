@@ -372,7 +372,10 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         validation.require(pool.get("job_submission_policy") == "all-independent-jobs", f"{path}.job_submission_policy", "must submit every independent job and leave capacity control to infrastructure")
 
     managed_images = config.get("managed_images")
-    if managed_images is None:
+    if "managed_images" not in config:
+        managed_images = {}
+    elif config.get("managed_images") is None:
+        validation.errors.append("$.managed_images: null is not a valid manager-only staging omission")
         managed_images = {}
     elif not isinstance(managed_images, dict) or not managed_images:
         validation.errors.append("$.managed_images: must be a non-empty object")
@@ -679,6 +682,7 @@ def validate_transition(
             )
             validation.require(old.get("engine_ref") != new.get("engine_ref"), f"$.controllers.{name}.engine_ref", "manager-only staging requires every controller engine_ref to change")
     if "managed_images" not in previous and "managed_images" in current:
+        validation.require(old_controllers == new_controllers, "$.controllers", "image-policy introduction must retain controller settings from manager staging")
         validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
         for name in set(old_controllers) & set(new_controllers):
             old, new = old_controllers[name], new_controllers[name]
@@ -701,6 +705,12 @@ def validate_transition(
         if not isinstance(old, dict):
             continue
         current_evidence = compatible_engine_refs.get(name, {})
+        bootstrap = "managed_images" not in current or "managed_images" not in previous
+        if bootstrap:
+            # Bootstrap changes the manager before activating a reviewed runtime.
+            runtime_ref = current_evidence.get("engine_ref", old.get("engine_ref"))
+            old = {**old, "engine_ref": runtime_ref}
+            new = {**new, "engine_ref": runtime_ref}
         previous_evidence_source = (
             compatible_engine_refs
             if previous_compatible_engine_refs is None
@@ -811,6 +821,13 @@ def main() -> int:
         scan_secret_material(config, validation)
         validate_config(config, validation, args.strict)
         current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
+        previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
+        bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)
+        if bootstrap:
+            previous_bootstrap_evidence = load_json(args.previous_rollout_evidence.absolute(), validation) if args.previous_rollout_evidence else None
+            retained_evidence = validate_rollout_evidence(previous_bootstrap_evidence, validation) if previous_bootstrap_evidence is not None else {}
+            validation.require(current_compatible_engine_refs == retained_evidence, "engine-rollout-evidence.json", "manager bootstrap must retain incumbent runtime capability evidence")
+            current_controllers = {name: {**value, "engine_ref": current_compatible_engine_refs.get(name, {}).get("engine_ref", value.get("engine_ref"))} if isinstance(value, dict) else value for name, value in current_controllers.items()}
         for controller, evidence in current_compatible_engine_refs.items():
             current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
             validation.require(

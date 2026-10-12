@@ -2288,6 +2288,10 @@ perform_check() {
     [[ -L "$manager_current" && $(readlink -f "$manager_current") == "$manager_releases/$engine_ref" ]] \
       || die 'manager-only staging is incomplete'
     staged_runtime_matches || die 'manager-only staging changed the installed runtime'
+    local timer
+    for timer in "${timer_names[@]}"; do
+      systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || die 'manager-only staging has inactive mandatory maintenance timers'
+    done
     note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
     return
   fi
@@ -2363,12 +2367,14 @@ perform_converge() {
     ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
       || die 'managed_images cannot be removed after image enforcement'
     installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
-    [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "$installed_engine" != "$engine_ref" ]] \
+    [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "$manager_ref" != "$engine_ref" ]] \
       || die 'manager-only staging requires a new engine revision'
     staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
     install_release
-    install_manager
-    install_systemd_units "$(readlink -f "$manager_current")"
+    install_manager "$engine_ref" "$release_dir"
+    install_systemd_units "$(current_runtime_release)"
+    systemctl enable --now "${timer_names[@]}" >/dev/null
+    [[ ! -f "$systemd_dir/ci-fleet-capacity.timer" ]] || systemctl enable --now ci-fleet-capacity.timer >/dev/null
     staged_runtime_matches || die 'manager-only staging changed the installed runtime'
     note "MANAGER_STAGED engine_ref=$engine_ref runtime_ref=$installed_engine"
     return

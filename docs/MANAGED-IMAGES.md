@@ -9,7 +9,7 @@ Convergence rejects an image whose revision label is correct but whose image ID 
 
 ## Reviewed upstream inputs
 
-Base-image and runner selections updated on 2026-10-12 from official upstream endpoints. Snapshot and Docker package pins retain their 2026-08-16 review:
+Base-image and runner selections updated on 2026-10-12 from official upstream endpoints. The signed Debian snapshots were reviewed on 2026-10-12. Docker package pins retain their 2026-08-16 review:
 
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
@@ -28,8 +28,9 @@ The Dockerfiles fail closed if an upstream artifact no longer matches. Updating 
 
 Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
 
-1. Merge and reconcile a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged.
-2. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime.
+1. Separately authorize the bootstrap on each host. Before publishing the staging revision, stop its reconciliation timer so the incumbent manager cannot race the bootstrap. Check out the reviewed candidate engine and invoke that checkout's `scripts/install-worker-controller.sh --upgrade` with the approved staging configuration ref. The incumbent installer cannot stage the new manager. Its attempt to load the new Compose release fails closed when reviewed image IDs are missing.
+2. Merge and apply a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged.
+3. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime.
 
 Fresh installation, field removal after enforcement, unrelated staging changes, and runtime activation without reviewed IDs all fail closed.
 
