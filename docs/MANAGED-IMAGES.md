@@ -19,7 +19,7 @@ Base-image and runner selections updated on 2026-10-12 from official upstream en
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
 | Compose plugin 5.4.0 amd64 / arm64 | exact package version and SHA-256 `75391b38459edf75a975504903673fdb87a5a4016d689d9b198e2db1ae2796e0` / `81261f286d48c1c9e586065bc52065bbbe3b023705ebdb72377ec465c216dcaf` | official Docker Debian `trixie` package index |
-| Actions Runner 2.337.0 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
+| Actions Runner 2.338.0 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
 | Controller modules | versions plus checksums in `controller/go.mod` and `controller/go.sum` | Go checksum-verified module inputs |
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.

@@ -677,6 +677,16 @@ def validate_transition(
                 "manager-only staging may change only engine_ref",
             )
             validation.require(old.get("engine_ref") != new.get("engine_ref"), f"$.controllers.{name}.engine_ref", "manager-only staging requires every controller engine_ref to change")
+    if "managed_images" not in previous and "managed_images" in current:
+        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
+        for name in set(old_controllers) & set(new_controllers):
+            old, new = old_controllers[name], new_controllers[name]
+            if isinstance(old, dict) and isinstance(new, dict):
+                validation.require(
+                    old.get("engine_ref") == new.get("engine_ref"),
+                    f"$.controllers.{name}.engine_ref",
+                    "image policy must be introduced after the same compatible engine_ref is active",
+                )
     for name, new in new_controllers.items():
         old = old_controllers.get(name)
         if not isinstance(new, dict):

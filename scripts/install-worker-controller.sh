@@ -193,7 +193,9 @@ require_commands() {
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
-  docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable'
+  if [[ "$mode" != uninstall ]]; then
+    docker buildx version >/dev/null 2>&1 || die 'Docker Buildx is unavailable'
+  fi
   [[ "$mode" == rollback || "$mode" == uninstall ]] && return
 
   for command in curl jq df openssl; do command -v "$command" >/dev/null || die "$command is required"; done

@@ -116,6 +116,25 @@ class PolicyTests(unittest.TestCase):
         validate_transition(enforced, previous, {}, validation)
         self.assertTrue(any("cannot be removed" in error for error in validation.errors), validation.errors)
 
+    def test_image_policy_introduction_retains_activated_engine(self) -> None:
+        current = reference_config()
+        for controller in current["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        previous = copy.deepcopy(current)
+        previous.pop("managed_images")
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("same compatible engine_ref" in error for error in validation.errors), validation.errors)
+        current = reference_config()
+        current["controllers"]["another-controller"] = copy.deepcopy(first_controller(current))
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("cannot add or remove" in error for error in validation.errors), validation.errors)
+
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
         config = json.loads((ROOT / "fleet.json").read_text())
         self.assert_rejected(config, "replace the fixture image digest", strict=True)

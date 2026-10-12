@@ -66,7 +66,7 @@ case "${1:-}" in
     ;;
   buildx)
     case "${2:-}" in
-      version) printf 'github.com/docker/buildx v0.32.1\n' ;;
+      version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx v0.32.1\n' ;;
       inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: v0.32.2\n' ;;
       create|rm) ;;
       build)
@@ -2670,10 +2670,11 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$missing_tag_outp
 fi
 unset FAKE_PARTIAL_BUILD_FAIL
 grep -Fq 'DRAIN_OK managed_runners=0' "$missing_tag_output" || fail "missing managed tag did not reach the deferred build failure: $(<"$missing_tag_output")"
-grep -Fq 'ROLLBACK_RESTORED' "$missing_tag_output" || fail 'missing-tag build failure did not restore the checkpoint'
+grep -Fq 'ROLLBACK_FAILED' "$missing_tag_output" || fail 'missing-tag rollback ignored the failed reviewed-image rebuild'
+if grep -Fq 'ROLLBACK_RESTORED' "$missing_tag_output"; then fail 'failed reviewed-image rebuild reported restored rollback'; fi
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$missing_tag_output")
 grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'checkpoint did not record the missing runner tag'
-[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" ]] || fail 'rollback retained a runner tag that was absent before repair'
+[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" ]] || fail 'failed reviewed-image rebuild retained a verified runner image'
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$prior_controller_image_id" ]] || fail 'missing-tag rollback did not restore the prior controller image ID'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'missing-tag rollback changed the installed environment'
 grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
@@ -2681,7 +2682,11 @@ grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rol
 runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
-[[ -n "$runner_rm_line" && -n "$controller_tag_line" && -n "$rollback_up_line" && "$runner_rm_line" -lt "$rollback_up_line" && "$controller_tag_line" -lt "$rollback_up_line" ]] || fail 'missing-tag rollback restarted the controller before restoring both image states'
+[[ -n "$runner_rm_line" && -n "$controller_tag_line" && -z "$rollback_up_line" ]] || fail 'failed reviewed-image rebuild restarted the controller'
+recovered_missing_tag=$(expect_success "$installer" --rollback)
+grep -Fq 'ROLLBACK_RESTORED' <<<"$recovered_missing_tag" || fail 'explicit rollback did not rebuild the missing reviewed runner image'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 ]] || fail 'explicit rollback accepted an unreviewed runner image'
+rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE"
 daemon_failure_output=$tmp/missing-tag-daemon-failure.out
 export FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT=$tmp/docker-info-fail-after-image-inspect
 : >"$FAKE_COMPOSE_LOG"
@@ -2692,10 +2697,12 @@ rm -f "$FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT"
 unset FAKE_DOCKER_INFO_FAIL_AFTER_IMAGE_INSPECT
 grep -Fq 'Docker daemon is unavailable' "$daemon_failure_output" || fail 'image absence was accepted without confirming Docker availability'
 if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$daemon_failure_output" || grep -Eq '^(stop|build)\|' "$FAKE_COMPOSE_LOG"; then fail 'Docker daemon failure entered the transaction'; fi
+export FAKE_BUILDX_UNAVAILABLE=1
 uninstall_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$uninstall_output" || fail 'uninstall rejected a missing managed image tag'
+unset FAKE_BUILDX_UNAVAILABLE
 expect_success "$installer" --rollback >/dev/null
-[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the missing-tag installation'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 && -f "$FAKE_DOCKER_STATE" ]] || fail 'uninstall rollback did not restore the reviewed runner image'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 unset FAKE_COMPOSE_LOG
@@ -2756,7 +2763,7 @@ grep -Fq 'CHECKPOINT_CREATED' "$drifted_controller_output" || fail 'drifted-cont
 grep -Fq 'DRAIN_OK managed_runners=0' "$drifted_controller_output" || fail 'drifted-controller timer failure did not drain before activation'
 grep -Fq 'ROLLBACK_RESTORED' "$drifted_controller_output" || fail "drifted-controller timer failure did not restore the checkpoint: $(<"$drifted_controller_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$drifted_tag_controller_image_id" ]] || fail 'drifted-controller rollback did not preserve the prior tag mapping'
-[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$drifted_live_controller_image_id" ]] || fail 'drifted-controller rollback did not recreate the exact prior controller image'
+[[ $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == sha256:3333333333333333333333333333333333333333333333333333333333333333 ]] || fail 'drifted-controller rollback restarted an unreviewed controller image'
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$drifted_controller_output")
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_ID=$drifted_tag_controller_image_id" "$checkpoint_path/image-ids.env" || fail 'checkpoint omitted the drifted controller tag image ID'
 grep -Fxq "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=$drifted_live_controller_image_id" "$checkpoint_path/image-ids.env" || fail 'checkpoint omitted the drifted live controller image ID'
@@ -2780,7 +2787,7 @@ grep -Fq 'ROLLBACK_RESTORED' "$stopped_runner_output" || fail "stopped candidate
 checkpoint_path=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$stopped_runner_output")
 grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || fail 'stopped-runner checkpoint did not preserve the absent runner tag'
 [[ ! -e "$FAKE_ALL_RUNNER_STATE" ]] || fail 'rollback retained the stopped candidate runner'
-[[ ! -e "$FAKE_RUNNER_IMAGE_STATE" && ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" ]] || fail 'stopped-runner rollback retained a runner tag that was previously absent'
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 ]] || fail 'stopped-runner rollback did not rebuild the reviewed runner image'
 container_rm_line=$(grep -n -m1 '^container-rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
