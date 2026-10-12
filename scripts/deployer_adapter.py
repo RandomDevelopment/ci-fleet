@@ -78,8 +78,8 @@ def parse_policy(body: bytes) -> dict[str, str]:
 
 
 class UnixConnection(http.client.HTTPConnection):
-    def __init__(self, path: str, *, rootless: bool = True):
-        super().__init__("localhost", timeout=120)
+    def __init__(self, path: str, *, rootless: bool = True, timeout: float = 120):
+        super().__init__("localhost", timeout=timeout)
         self.path, self.rootless, self.peer_uid, self.peer_gid = path, rootless, None, None
 
     def connect(self) -> None:
@@ -141,7 +141,8 @@ def reject_rootful_workloads(backend_path: str) -> None:
 
 
 class Backend:
-    def __init__(self, path: str):
+    def __init__(self, path: str, seconds: int = 120):
+        self.deadline = time.monotonic() + seconds + 10
         require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
         self.path = path
         connection = UnixConnection(path)
@@ -157,7 +158,9 @@ class Backend:
             connection.close()
 
     def request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes]:
-        connection = UnixConnection(self.path)
+        remaining = self.deadline - time.monotonic()
+        require(remaining > 0, "Docker operation deadline elapsed")
+        connection = UnixConnection(self.path, timeout=remaining)
         try:
             connection.connect()
             require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
@@ -177,14 +180,31 @@ class Backend:
 
 
 class Policy:
-    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None):
+    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
         self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
+        self.artifact_store = artifact_store
+        self.protected_images = (protected_images or set()) | {values["ARTIFACT_IMAGE"]}
         self.image = values["ARTIFACT_IMAGE"]
         require(bool(IMAGE.fullmatch(self.image)), "approved artifact is not immutable")
         self.labels = {LABEL + "role": "deployer", LABEL + "identity": values["DEPLOYER_IDENTITY"],
                        LABEL + "environment": values["ENVIRONMENT"], LABEL + "target": values["TARGET_ID"]}
         self.prefix = "ci-fleet-deploy-" + values["DEPLOYER_IDENTITY"] + "-"
+
+    def artifacts(self) -> dict:
+        if self.artifact_store is None or not self.artifact_store.exists():
+            return {}
+        uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+        return decode(protected_file(self.artifact_store, uid))
+
+    def record_artifact(self) -> None:
+        if self.artifact_store is not None:
+            records = self.artifacts()
+            records[self.image] = self.labels
+            durable_file(self.artifact_store, json.dumps(records, sort_keys=True).encode())
+
+    def artifact_owned(self, image: str) -> bool:
+        return bool(IMAGE.fullmatch(image)) and self.artifacts().get(image) == self.labels
 
     def owned(self, kind: str, name: str) -> dict:
         require(bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", name)), "invalid resource identity")
@@ -313,6 +333,12 @@ class Policy:
             require(not body and set(query) <= {"fromImage", "tag"} and image == self.image,
                     "only the approved artifact may be pulled")
             return path + "?" + urllib.parse.urlencode(query, doseq=True), body
+        if method == "DELETE" and path.startswith("/images/"):
+            image = path[len("/images/"):]
+            require(self.operation == "cleanup" and self.artifact_owned(image) and image not in self.protected_images
+                    and not body and set(query) <= {"force", "noprune"} and query.get("force", ["false"])[0] in ("false", "0"),
+                    "only unused retired target artifacts may be removed")
+            return path + "?force=false&noprune=true", body
         if method == "GET" and path.startswith("/images/") and path.endswith("/json"):
             require(path[8:-5] == self.image and not query, "only the approved image may be inspected")
             return path, body
@@ -398,8 +424,14 @@ def handler(policy: Policy):
                     headers = {"Content-Type": "application/json"}
                     if path.startswith("/images/create") and self.headers.get("X-Registry-Auth"):
                         headers["X-Registry-Auth"] = self.headers["X-Registry-Auth"]
+                    if self.command == "POST" and path.startswith("/images/create?"):
+                        policy.record_artifact()
                     mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
+                    if self.command == "DELETE" and path.startswith("/images/") and 200 <= status < 300 and policy.artifact_store is not None:
+                        records = policy.artifacts()
+                        records.pop(path.split("?", 1)[0][len("/images/"):], None)
+                        durable_file(policy.artifact_store, json.dumps(records, sort_keys=True).encode())
                     if mutation and status >= 500:
                         policy.uncertain = True
                         if policy.uncertain_marker is not None:
@@ -489,6 +521,16 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
                 and not uncertain.exists() and not uncertain.is_symlink())
     except (ValueError, KeyError, OSError):
         return False
+
+
+def retire_journal(store: Path, unit: str, uid: int = 0) -> None:
+    require(journal_complete(store, unit, uid), "journal completion is unverified")
+    shutil.rmtree(store / unit)
+    descriptor = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def materialize_credential(store: Path, values: dict, body: bytes, owner: int, daemon_uid: int, daemon_gid: int) -> Path:
@@ -598,7 +640,7 @@ def run_adapter(args) -> int:
     credential_bytes = protected_file(credential, uid)
     adapter_bytes = protected_file(args.adapter, uid, adapter_fd=True)
     require(hashlib.sha256(adapter_bytes).hexdigest() == values["ADAPTER_SHA256"], "adapter changed before dispatch")
-    backend = Backend(values["DOCKER_SOCKET"])
+    backend = Backend(values["DOCKER_SOCKET"], args.seconds)
     require(bool(UNIT.fullmatch(args.unit)), "invalid transient unit")
     journal = args.store / args.unit
     trusted_directory(args.store, uid, 0o700)
@@ -626,7 +668,14 @@ def run_adapter(args) -> int:
         approved = stage / "adapter"
         approved.write_bytes(adapter_bytes)
         approved.chmod(0o600)
-        policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain")
+        protected_images = {values["ARTIFACT_IMAGE"]}
+        for source in (args.store.parent / "active-policy.conf", args.store.parent / "last-known-good-policy.conf",
+                       args.store.parent / "deployed/current/policy.conf"):
+            if source.exists():
+                retained = parse_policy(protected_file(source.resolve(), uid))
+                protected_images.add(retained["ARTIFACT_IMAGE"])
+        policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain",
+                        args.store / "artifact-images.json", protected_images)
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
@@ -653,6 +702,9 @@ def main() -> int:
     execute.add_argument("operation")
     check = sub.add_parser("check")
     check.add_argument("socket")
+    retire = sub.add_parser("journal-retire")
+    retire.add_argument("--store", type=Path, required=True)
+    retire.add_argument("unit")
     complete = sub.add_parser("journal-complete")
     complete.add_argument("--store", type=Path, required=True)
     complete.add_argument("unit")
@@ -669,6 +721,10 @@ def main() -> int:
     run.add_argument("operation")
     args = parser.parse_args()
     try:
+        if args.command == "journal-retire":
+            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+            retire_journal(args.store, args.unit, uid)
+            return 0
         if args.command == "journal-complete":
             uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
             return 0 if journal_complete(args.store, args.unit, uid) else 1

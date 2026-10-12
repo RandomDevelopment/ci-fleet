@@ -237,6 +237,7 @@ valid_utc() {
 }
 credential_reference_safe() {
   local provider=$1 reference=$2 description=$3
+  [[ $testing == 1 || $provider == file ]] || die 'contained adapters require a materialized file credential'
   case $provider in
     file)
       inside "$reference" "$etc_root/credentials" || die "$description credential reference is outside the approved credential directory"
@@ -343,6 +344,7 @@ validate_config() {
     [[ -v "cfg[$key]" ]] || block "configuration is missing required key: $key"
   done
   [[ ${cfg[DEPLOYER_IDENTITY]} =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || block 'invalid deployer identity'
+  [[ $testing == 1 || ${cfg[CREDENTIAL_PROVIDER]} == file ]] || block 'contained adapters require a materialized file credential'
   [[ ${cfg[CREDENTIAL_SCOPE]} == "$environment" ]] || block 'credential scope must exactly match the explicit environment'
   candidate_core=${cfg[CORE_REF]}; candidate_artifact=${cfg[ARTIFACT_IMAGE]}
   [[ "$candidate_core" =~ ^[0-9a-f]{40}$ && ${cfg[SOURCE_COMMIT]} =~ ^[0-9a-f]{40}$ ]] || block 'core and source revisions must be full lowercase commit SHAs'
@@ -1328,6 +1330,9 @@ retire_adapter_guard() {
     rm -f -- "$guard" || return
     sync -f "${guard%/*}" 2>/dev/null || return
   done
+  if [[ $testing != 1 ]]; then
+    python3 "$repo_root/scripts/deployer_adapter.py" journal-retire --store "$state_root/.adapter-recovery" "$unit" || return 1
+  fi
 }
 
 recover_adapter_guard() {
@@ -1373,8 +1378,9 @@ run_adapter() {
     install -d -m 0711 "$credential_store"
     local -a confined=(python3 "$repo_root/scripts/deployer_adapter.py" run --policy "$policy" --adapter "/proc/$$/fd/7" --store "$recovery" --runtime "$runtime" --credential-store "$credential_store" --unit "$unit" --seconds "$seconds")
     [[ -z "$marker" ]] || confined+=(--marker "$marker")
+    [[ $operation_name != rollback ]] || inhibitor=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback is active' --)
     status=0
-    timeout --signal=TERM --kill-after=10s "$((seconds + 30))s" "${confined[@]}" "$operation_name" 8>&- 9<&- || status=$?
+    timeout --signal=TERM --kill-after=10s "$((seconds + 30))s" "${inhibitor[@]}" "${confined[@]}" "$operation_name" 8>&- 9<&- || status=$?
     { stop_adapter_unit "$unit" && retire_adapter_guard "$unit"; } || block 'adapter termination could not be verified; retain its guard until it stops'
     active_adapter_unit=
     return "$status"
@@ -1589,6 +1595,10 @@ PY
   [[ -e "$state_root/last-request.conf" || -L "$state_root/last-request.conf" ]] || block 'no completed deployment is available to roll back to'
   validate_completed_request "$state_root/last-request.conf" "$environment" "$target"
   cfg[DEPLOYER_IDENTITY]=${rollback_policy[DEPLOYER_IDENTITY]}
+  [[ $testing == 1 || -v 'rollback_policy[DOCKER_SOCKET]' ]] || block 'last-known-good policy requires its dedicated Docker socket'
+  DOCKER_HOST=unix://${rollback_policy[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
+  export DOCKER_HOST
+  unset DOCKER_CONTEXT
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
   reject_mixed_role
   begin_transaction
