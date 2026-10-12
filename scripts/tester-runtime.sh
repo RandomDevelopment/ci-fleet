@@ -170,6 +170,8 @@ for name,service in services.items():
     if service.get('build') or service.get('devices') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if not all(isinstance(service.get(key),(int,float)) and not isinstance(service[key],bool) and math.isfinite(service[key]) and service[key] > 0 for key in ('cpus','mem_limit','pids_limit')): raise SystemExit(f'{name}: positive CPU, memory, and PID limits are required')
+    swap_limit=service.get('memswap_limit',0)
+    if not isinstance(swap_limit,(int,float)) or isinstance(swap_limit,bool) or not math.isfinite(swap_limit) or swap_limit < 0 or 0 < swap_limit < service['mem_limit']: raise SystemExit(f'{name}: memory plus swap must use a finite limit at least as large as memory')
     if service.get('oom_kill_disable') or service.get('oom_score_adj',0) < 0: raise SystemExit(f'{name}: OOM priority overrides are forbidden')
     if service.get('models'): raise SystemExit(f'{name}: external model runners are forbidden')
     if service.get('environment') or service.get('env_file') or service.get('configs'): raise SystemExit(f'{name}: alternate credential channels are forbidden')
@@ -251,7 +253,7 @@ for kind in ('volume','network'):
             if subnet.version == 4: ipv4.append((subnet,config.get('Gateway')))
         if len(ipv4) != 1: raise SystemExit(f'network IPv4 allocation is invalid: {name}')
         subnet,gateway=ipv4[0]
-        approved=any(subnet.prefixlen == pool.get('Size') and subnet.subnet_of(ipaddress.ip_network(pool.get('Base',''))) for pool in pools)
+        approved=any(subnet.version == ipaddress.ip_network(pool.get('Base','')).version and subnet.prefixlen == pool.get('Size') and subnet.subnet_of(ipaddress.ip_network(pool.get('Base',''))) for pool in pools)
         if not approved or gateway is not None and ipaddress.ip_address(gateway) not in subnet: raise SystemExit(f'network IPAM is outside approved Docker address pools: {name}')
 PY
 }
@@ -375,6 +377,7 @@ networks={model['networks'][name]['name'] for name in service.get('networks',{'d
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
        not host.get('CapAdd') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
        host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
+       host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and
        host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
        host.get('OomKillDisable') in (None,False) and host.get('OomScoreAdj',0)==service.get('oom_score_adj',0) and
        host.get('NetworkMode') in networks and set((actual.get('NetworkSettings') or {}).get('Networks') or {})==networks)

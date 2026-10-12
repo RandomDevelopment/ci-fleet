@@ -22,7 +22,9 @@ if [[ $1 == context && $2 == show ]]; then printf 'default\n'; exit 0; fi
 if [[ $1 == info ]]; then
   if [[ " $* " == *'len .DefaultAddressPools'* ]]; then
     [[ ${FAKE_TESTER_EMPTY_ADDRESS_POOLS:-0} == 1 ]] && printf '0\n' || printf '1\n'
-  elif [[ " $* " == *'DefaultAddressPools'* ]]; then printf '[{"Base":"198.51.100.0/24","Size":28}]\n';
+  elif [[ " $* " == *'DefaultAddressPools'* ]]; then
+    if [[ ${FAKE_TESTER_MIXED_ADDRESS_POOLS:-0} == 1 ]]; then printf '[{"Base":"2001::/16","Size":28},{"Base":"198.51.100.0/24","Size":28}]\n';
+    else printf '[{"Base":"198.51.100.0/24","Size":28}]\n'; fi
   else printf '%s\n' "${FAKE_TESTER_DOCKER_ROOT:?}"; fi
   exit 0
 fi
@@ -46,11 +48,12 @@ if [[ $1 == inspect ]]; then
     printf '%s %s\n' "$service" "${FAKE_TESTER_CONTAINER_IMAGE:-registry.example/example/app@sha256:$(printf 'a%.0s' {1..64})}"
   elif [[ " $* " != *' --format '* ]]; then
     project=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$(<"${FAKE_TESTER_MODEL_PATH:?}")")
-    privileged=false; nano_cpus=500000000; memory=134217728; pids_limit=128; oom_disable=false; oom_score=0; network_mode=${project}_default; networks=$(printf '{"%s":{}}' "$network_mode"); mounts=$(printf '[{"Type":"volume","Name":"%s_data","Destination":"/data","RW":true}]' "$project"); ports=$(printf '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}")
+    privileged=false; nano_cpus=500000000; memory=134217728; memory_swap=268435456; pids_limit=128; oom_disable=false; oom_score=0; network_mode=${project}_default; networks=$(printf '{"%s":{}}' "$network_mode"); mounts=$(printf '[{"Type":"volume","Name":"%s_data","Destination":"/data","RW":true}]' "$project"); ports=$(printf '{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}")
     case ${FAKE_TESTER_LIVE_POLICY:-valid} in
       privileged) privileged=true ;;
       bind) mounts='[{"Type":"bind","Source":"/","Destination":"/host"}]' ;;
       broad-port) ports=$(printf '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"%s"}]}' "${FAKE_TESTER_ROUTE_PORT:-18080}") ;;
+      unlimited-swap) memory_swap=-1 ;;
       unbounded) nano_cpus=0; memory=0; pids_limit=0 ;;
       wrong-volume) mounts='[{"Type":"volume","Name":"ci-fleet-test-other_data","Destination":"/data","RW":true}]' ;;
       host-network) network_mode=host ;;
@@ -58,13 +61,14 @@ if [[ $1 == inspect ]]; then
       oom-disabled) oom_disable=true ;;
       oom-priority) oom_score=-1000 ;;
     esac
+    [[ ${FAKE_TESTER_POLICY:-valid} != finite-swap ]] || memory_swap=402653184
     if [[ -n ${FAKE_TESTER_SECRET_FILE:-} ]]; then
       secret_target=${FAKE_TESTER_SECRET_TARGET:-/run/secrets/credential}
       [[ $secret_target != credential ]] || secret_target=/run/secrets/credential
       mounts=${mounts%]}$(printf ',{"Type":"bind","Source":"%s","Destination":"%s","RW":false}]' "$FAKE_TESTER_SECRET_FILE" "$secret_target")
     fi
     if [[ ${*: -1} == fixture-worker-id ]]; then mounts='[]'; ports='{}'; fi
-    printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$networks" "$mounts"
+    printf '[{"HostConfig":{"Privileged":%s,"ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges:true"],"NanoCpus":%s,"Memory":%s,"MemorySwap":%s,"PidsLimit":%s,"PortBindings":%s,"OomKillDisable":%s,"OomScoreAdj":%s,"NetworkMode":"%s"},"NetworkSettings":{"Networks":%s},"Mounts":%s}]\n' "$privileged" "$nano_cpus" "$memory" "$memory_swap" "$pids_limit" "$ports" "$oom_disable" "$oom_score" "$network_mode" "$networks" "$mounts"
   else
     printf '%s\n' "${FAKE_TESTER_CONTAINER_STATE:-running healthy}"
   fi
@@ -167,6 +171,8 @@ case ${operation:-} in
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
       runtime) service_extra=',"runtime":"alternative"' ;;
       unbounded) service_extra=',"cpus":0,"mem_limit":0,"pids_limit":-1' ;;
+      unlimited-swap) service_extra+=',"memswap_limit":-1' ;;
+      finite-swap) service_extra+=',"memswap_limit":402653184' ;;
       oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;
       two-services) extra_services=$(printf ',"worker":{"image":"%s","privileged":false,"read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"volumes":[],"cpus":0.5,"mem_limit":134217728,"pids_limit":128}' "$image") ;;
       valid-secret|outside-secret)

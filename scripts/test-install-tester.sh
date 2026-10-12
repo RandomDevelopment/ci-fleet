@@ -145,9 +145,13 @@ grep -v '^CI_FLEET_TESTER_EXPIRES_AT=' "$root/etc/ci-fleet-tester/environments/p
 mv "$tmp/spec" "$root/etc/ci-fleet-tester/environments/preview-a.env"; chmod 600 "$root/etc/ci-fleet-tester/environments/preview-a.env"
 FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-a >/dev/null
 [[ $(awk -F= '$1=="EXPIRES_AT"{print $2}' "$state") == "$original_expiry" ]] || fail 'idempotent converge extended expiration'
+FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_MIXED_ADDRESS_POOLS=1 "$runtime" --converge --environment preview-a >/dev/null || fail 'IPv6 pool prevented matching the approved IPv4 network'
+write_environment finite-swap 18099
+FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_POLICY=finite-swap "$runtime" --converge --environment finite-swap >/dev/null || fail 'finite memory-plus-swap limit was rejected'
+FAKE_TESTER_ROUTE_PORT=18099 "$runtime" --remove --environment finite-swap >/dev/null
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded unlimited-swap oom-priority; do
   write_environment "bad-$policy" 18081
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
@@ -208,7 +212,7 @@ FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtim
 FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' "$runtime" --health >/dev/null || fail 'health rejected a reachable route without a Docker healthcheck'
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_STATE='running none' FAKE_TESTER_ROUTE_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unreachable route without a Docker healthcheck'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_CONTAINER_IMAGE="registry.example/example/app@sha256:$(printf 'b%.0s' {1..64})" "$runtime" --health >/dev/null 2>&1; then fail 'health accepted a container using an unapproved image digest'; fi
-for live_policy in privileged bind broad-port unbounded; do
+for live_policy in privileged bind broad-port unbounded unlimited-swap; do
   if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=$live_policy "$runtime" --health >/dev/null 2>&1; then fail "health accepted unsafe live container settings: $live_policy"; fi
 done
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
