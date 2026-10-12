@@ -506,6 +506,14 @@ if sys.argv[3] and (actual[0].get('id')!=int(sys.argv[3]) or actual[0].get('defa
 PY
 rm -f "$visible"
 
+if $run_installer && $approval_gate; then
+  config_tree=$(git -C "$config_repo" rev-parse "$config_ref^{tree}") || die 'cannot inspect the pinned configuration tree'
+  python3 "$script_dir/verify_config_approval.py" --policy "$approval_policy" \
+    --repository "$config_repository" --commit "$config_ref" --tree "$config_tree" \
+    --installed-state "$(root_path /var/lib/ci-fleet/install-state.json)" <"$installation_token" \
+    || die 'configuration approval rejected before runner-group provisioning'
+fi
+
 discover_group() {
   local page=1 total=-1 seen=0 groups stats page_total page_count
   local pages=()
@@ -582,7 +590,7 @@ fi
 if ! python3 - "$response" "$runner_group" <<'PY'
 import json,sys
 v=json.load(open(sys.argv[1]))
-if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('allows_public_repositories') is not False or v.get('restricted_to_workflows') is not False: raise SystemExit(1)
+if v.get('name')!=sys.argv[2] or v.get('visibility')!='selected' or v.get('default') or v.get('inherited') is not False or v.get('allows_public_repositories') is not False or v.get('restricted_to_workflows') is not False: raise SystemExit(1)
 PY
 then
   if $created_group; then rollback_new_group || die 'new runner group failed identity verification and rollback failed'; die 'new runner group failed identity verification and was rolled back'; fi

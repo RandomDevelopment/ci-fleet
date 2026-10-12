@@ -68,7 +68,7 @@ The bootstrap:
   client/installation IDs at `/etc/ci-fleet/host.env` through atomic file
   replacement, root-owned mode `0600`;
 - rejects public, archived, wrong-organization, broader App installation, and
-  default/broad runner-group access;
+  default, enterprise-inherited, or broad runner-group access;
 - creates a missing selected-repository runner group with no repository access.
   Only an acknowledged creation receives the requested access. An acknowledged
   group created by this invocation is automatically deleted if inspection,
@@ -112,10 +112,13 @@ Pass `--install --config-repo /PATH/TO/PINNED/CHECKOUT --config-ref REVIEWED_COM
 on the initial live command for direct handoff to the idempotent host installer.
 Bootstrap requires the commit in that local checkout and verifies that its
 selected controller pool exactly matches the requested organization, runner
-group, and project allowlist before any GitHub mutation. Remote `OWNER/REPO`
-handoff is rejected because a fresh host has no independently verified Git
-credential before App creation. Without `--install`, the redacted final report
-prints the installer shape. Externally provisioned credentials remain supported;
+group, and project allowlist before any GitHub mutation.
+When the protected approval gate is enabled, bootstrap also verifies the pinned
+configuration commit's review and CI evidence against the installed trusted
+baseline before discovering or provisioning a runner group.
+Remote `OWNER/REPO` handoff is rejected because a fresh host has no independently
+verified Git credential before App creation. Without `--install`, the redacted
+final report prints the installer shape. Externally provisioned credentials remain supported;
 the generic installer never requires this bootstrap on every run.
 
 ## Manual provisioning

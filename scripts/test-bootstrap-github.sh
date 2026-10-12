@@ -309,6 +309,14 @@ if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAK
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'public-repository runner group was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_RESTRICTED_GROUP=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'workflow-restricted runner group was accepted'; fi
+for inherited in true missing; do
+  inherited_before=$(sha256sum "$host_env" "$FAKE_BOOTSTRAP_STATE")
+  : >"$FAKE_BOOTSTRAP_LOG"
+  if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_INHERITED_GROUP=$inherited "$bootstrap" --organization example-org --instance example-ci-01 \
+    --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'enterprise-inherited or unknown-origin runner group was accepted'; fi
+  [[ $(sha256sum "$host_env" "$FAKE_BOOTSTRAP_STATE") == "$inherited_before" ]] || fail 'inherited group rejection changed existing state'
+  if grep -Eq '^(PUT|DELETE) runner-group|^POST runner-group' "$FAKE_BOOTSTRAP_LOG"; then fail 'inherited group rejection mutated runner-group access'; fi
+done
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_ARCHIVED_REPOSITORY=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
   --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'archived project repository was accepted'; fi
 if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$live_root FAKE_BOOTSTRAP_BAD_APP_CLIENT_ID=1 "$bootstrap" --check --organization example-org --instance example-ci-01 \
@@ -352,6 +360,20 @@ for permission in actions pull_requests; do
   if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_NO_APPROVAL_READ=$permission "$bootstrap" --check --organization example-org --instance example-ci-01 \
     --config-repository example-org/config --runner-group example-ci-experimental --allow-repository example-org/example-repo=101 >/dev/null 2>&1; then fail 'effective token without approval reads was accepted'; fi
 done
+
+# A schema-valid candidate still needs protected approval before routing is inspected.
+approval_install_root=$approval_root/install
+mkdir "$approval_install_root"
+cp -a "$approval_root/etc" "$approval_install_root/etc"
+sed -i 's/example-org/acme-org/g' "$approval_install_root/etc/ci-fleet/bootstrap-app.env"
+gate_before=$(sha256sum "$approval_install_root/etc/ci-fleet/host.env" "$FAKE_BOOTSTRAP_STATE")
+: >"$FAKE_BOOTSTRAP_LOG"
+if PATH="$fake_bin:$PATH" CI_FLEET_TESTING=1 CI_FLEET_ROOT_PREFIX=$approval_install_root FAKE_BOOTSTRAP_APPROVAL_READS=1 FAKE_BOOTSTRAP_ORGANIZATION=acme-org "$bootstrap" --organization acme-org --instance example-ci-01 \
+  --config-repository acme-org/config --runner-group example-ci-experimental --allow-repository acme-org/example-repo=101 \
+  --install --config-repo "$config_checkout" --config-ref "$config_ref" >"$tmp/unapproved.out" 2>"$tmp/unapproved.err"; then fail 'unapproved candidate reached installer handoff'; fi
+grep -Fq 'configuration approval rejected before runner-group provisioning' "$tmp/unapproved.err" || fail 'unapproved candidate did not reach the protected verifier'
+if grep -q 'runner-group' "$FAKE_BOOTSTRAP_LOG"; then fail 'unapproved candidate reached runner-group discovery or mutation'; fi
+[[ $(sha256sum "$approval_install_root/etc/ci-fleet/host.env" "$FAKE_BOOTSTRAP_STATE") == "$gate_before" ]] || fail 'approval rejection changed host or routing state'
 
 # A conversion consumed by GitHub with zero response bytes must block registration retries.
 uncertain_root=$approval_root/fresh
