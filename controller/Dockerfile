@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY controller/go.mod controller/*.go ./
-COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/desired_state.py /scripts/
+COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/cleanup_storage.py scripts/desired_state.py /scripts/
 RUN go mod tidy && go mod verify
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev
@@ -15,7 +15,7 @@ FROM debian:13.7-slim
 ARG CI_FLEET_COMMIT=unknown
 LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
       io.randomdevelopment.ci-fleet.managed="true" \
-      io.randomdevelopment.ci-fleet.network-cleanup-lock="v1"
+      io.randomdevelopment.ci-fleet.network-cleanup-lock="v2"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && install -d -o 65532 -g 65532 /run/ci-fleet \
     && rm -rf /var/lib/apt/lists/*

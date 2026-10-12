@@ -23,6 +23,13 @@ NETWORK_CREATION_GRACE_SECONDS = 10 * 60
 IDLE_WAIT_SECONDS = 10 * 60
 IDLE_POLL_SECONDS = 1
 PROXY_PROTOCOL_LABEL = f"{LABEL_PREFIX}network-cleanup-lock"
+COMMAND_TIMEOUT_SECONDS = 30
+# Leave a minute before systemd's 15-minute limit; diagnostics and idle waits count too.
+SERVICE_DEADLINE = time.monotonic() + 14 * 60
+
+
+class MaintenanceDeferred(Exception):
+    """Stop before dispatching a mutation that cannot fit the service budget."""
 
 
 def host_path(path: str) -> Path:
@@ -85,7 +92,9 @@ def sync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def removal_marker() -> Path:
+def removal_marker(*, timeout: float = COMMAND_TIMEOUT_SECONDS) -> Path:
+    if time.monotonic() + timeout >= SERVICE_DEADLINE:
+        raise MaintenanceDeferred("cleanup service-deadline; remaining candidates retained")
     boot_id = host_boot_id()
     root = host_path("/run/lock/ci-fleet/removals")
     directory = root / boot_id
@@ -142,7 +151,7 @@ def active_work() -> bool:
         mounts = item.get("Mounts") or []
         coordinated = (
             labels.get("com.docker.compose.project") == "ci-fleet"
-            and labels.get(PROXY_PROTOCOL_LABEL) == "v1"
+            and labels.get(PROXY_PROTOCOL_LABEL) in {"v1", "v2"}
             and any(mount.get("Type") == "bind" and mount.get("RW") is True
                     and mount.get("Source") == str(host_path("/run/lock/ci-fleet"))
                     and mount.get("Destination") == "/run/ci-fleet/locks" for mount in mounts)
@@ -174,7 +183,10 @@ def configured_pools() -> list[ipaddress.IPv4Network]:
 
 
 def docker(*args: str) -> str:
-    return subprocess.run(["docker", *args], check=True, capture_output=True, text=True).stdout
+    if time.monotonic() + COMMAND_TIMEOUT_SECONDS >= SERVICE_DEADLINE:
+        raise MaintenanceDeferred("cleanup service-deadline; remaining candidates retained")
+    return subprocess.run(["docker", *args], check=True, capture_output=True, text=True,
+                          timeout=COMMAND_TIMEOUT_SECONDS).stdout
 
 
 def in_pools(item: dict, pools: list[ipaddress.IPv4Network]) -> bool:
@@ -288,9 +300,11 @@ def remove_networks(*, apply: bool, instance: str, pools: list[ipaddress.IPv4Net
             print(f"WOULD_REMOVE network {name} {reason}")
 
 
-def cleanup_networks(*, apply: bool, instance: str) -> None:
+def cleanup_networks(*, apply: bool, instance: str, maintenance=None) -> None:
     pools = configured_pools()
     if not apply:
+        if maintenance is not None:
+            maintenance(False)
         remove_networks(apply=False, instance=instance, pools=pools)
         return
     with ExitStack() as stack:
@@ -322,6 +336,8 @@ def cleanup_networks(*, apply: bool, instance: str) -> None:
                     else:
                         idle_checks += 1
                         if idle_checks == 2:
+                            if maintenance is not None:
+                                maintenance(True)
                             remove_networks(apply=True, instance=instance, pools=pools)
                             return
                 finally:
@@ -343,5 +359,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+    except MaintenanceDeferred as error:
+        print(f"DEFER {error}")
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError) as error:
         raise SystemExit(f"ERROR network cleanup failed: {error}") from error

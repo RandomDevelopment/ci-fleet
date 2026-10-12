@@ -187,6 +187,7 @@ def main() -> int:
         temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
     print("Next: replace RFC 5737 Docker network values, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
+    print("Storage retention remains disabled. After activating a compatible engine and inventorying an exclusive fleet daemon, add docker_storage_retention in a separate reviewed change. See README.md.")
     return 0
 
 

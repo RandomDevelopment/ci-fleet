@@ -1,5 +1,10 @@
 # Git-authored controller desired state
 
+Optional `docker_storage_retention: {"exclusive_fleet_daemon": true}` admits
+bounded image/default-builder cache maintenance on an isolated disposable-CI
+daemon. Activate a compatible engine before adding the policy. See the
+[retention and activation contract](HOST-MAINTENANCE.md#docker-storage-retention).
+
 Schema v3 makes a reviewed private configuration repository the authority for controller routing, capacity, lifecycle, and engine revision within the fixed `RandomDevelopment/ci-fleet` public engine repository. A configuration-only change cannot redirect root execution to another repository. The target host keeps credentials and rendered runtime state outside Git.
 
 ## Responsibility boundary

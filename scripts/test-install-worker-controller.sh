@@ -224,9 +224,11 @@ case "${1:-}" in
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n "${FAKE_CONTROLLER_PROTOCOL_FILE:-}" ]]; then
           printf '<no value>\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
-          if grep -Fq 'io.randomdevelopment.ci-fleet.network-cleanup-lock="v1"' "${compose_file%/deploy/compose.yaml}/controller/Dockerfile" 2>/dev/null; then
-            printf 'v1\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
-          fi
+          for protocol in v1 v2; do
+            if grep -Fq "io.randomdevelopment.ci-fleet.network-cleanup-lock=\"$protocol\"" "${compose_file%/deploy/compose.yaml}/controller/Dockerfile" 2>/dev/null; then
+              printf '%s\n' "$protocol" >"$FAKE_CONTROLLER_PROTOCOL_FILE"
+            fi
+          done
         fi
         if [[ -n "${FAKE_RESTART_AFTER_UP:-}" && -f "$FAKE_RESTART_AFTER_UP" ]]; then
           rm -f "$FAKE_RESTART_AFTER_UP"
@@ -433,6 +435,10 @@ fi
 if [[ ${1:-} == */health.py ]]; then
   # The simulated controller must not inherit the shared test machine's load.
   exec "$REAL_PYTHON3" -c 'import os,runpy,sys; os.getloadavg=lambda: (0.0,0.0,0.0); sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); runpy.run_path(sys.argv[0],run_name="__main__")' "$@"
+fi
+if [[ ${1:-} == */cleanup_storage.py ]]; then
+  # This installer fixture has a simulated CLI and no live Docker accounting socket.
+  exec "$REAL_PYTHON3" -c 'import os,sys; sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); import cleanup_storage; cleanup_storage.docker_usage=lambda: {"Images": [], "Containers": [], "BuildCache": []}; cleanup_storage.disk_percent=lambda: 10; cleanup_storage.main()' "$@"
 fi
 if [[ -n "${FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE:-}" && -f "$FAKE_FAIL_ATOMIC_DIRECTORY_FSYNC_ONCE" && "${1:-}" == - ]]; then
   script=$(</dev/stdin)
@@ -800,7 +806,7 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
-[[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v1 ]] || fail 'current controller did not retain its cleanup protocol label'
+[[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
 proxy_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || proxy_health_result=$?

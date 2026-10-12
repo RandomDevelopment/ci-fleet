@@ -82,6 +82,47 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_storage_retention_schema_requires_explicit_exclusive_admission(self) -> None:
+        controller = contract_schema()["$defs"]["controller"]
+        self.assertNotIn("docker_storage_retention", controller["required"])
+        self.assertEqual(controller["properties"]["docker_storage_retention"], {
+            "type": "object", "additionalProperties": False,
+            "required": ["exclusive_fleet_daemon"],
+            "properties": {"exclusive_fleet_daemon": {"const": True}},
+        })
+
+    def test_reference_configurations_keep_storage_retention_opt_in(self) -> None:
+        for path in (ROOT / "fleet.json", ROOT / "examples/multi-host/fleet.json"):
+            with self.subTest(path=path):
+                config = json.loads(path.read_text())
+                self.assertEqual(errors_for(config), [])
+                for controller in config["controllers"].values():
+                    self.assertNotIn("docker_storage_retention", controller)
+                    controller["docker_storage_retention"] = {"exclusive_fleet_daemon": True}
+                self.assertEqual(errors_for(config), [])
+
+    def test_storage_retention_rejects_invalid_admissions(self) -> None:
+        for policy in (None, False, [], {}, {"exclusive_fleet_daemon": False},
+                       {"exclusive_fleet_daemon": 1}, {"exclusive_fleet_daemon": "true"},
+                       {"exclusive_fleet_daemon": True, "extra": True}):
+            with self.subTest(policy=policy):
+                config = reference_config()
+                first_controller(config)["docker_storage_retention"] = policy
+                self.assert_rejected(config, "docker_storage_retention")
+
+    def test_initializer_keeps_storage_retention_disabled_for_staged_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/init.py"),
+                "--organization", "sample-org", "--project", "sample-app",
+                "--engine-ref", "1" * 40, "--output", str(output),
+            ], check=True, text=True, capture_output=True)
+            config = json.loads(output.read_text())
+        self.assertEqual(errors_for(config), [])
+        self.assertNotIn("docker_storage_retention", first_controller(config))
+        self.assertIn("Storage retention remains disabled", result.stdout)
+
     def test_schema_defines_docker_network_policy_contract(self) -> None:
         controller_schema = contract_schema()["$defs"]["controller"]
         self.assertNotIn("docker_network_policy", controller_schema["required"])

@@ -317,12 +317,14 @@ def _count(run: Runner, args: list[str]) -> int:
 
 def _stale_resources(run: Runner, instance: str) -> dict[str, int]:
     result = run([str(Path(__file__).with_name("cleanup.sh")), "--instance", instance])
-    stale = {"containers": 0, "networks": 0, "volumes": 0}
+    stale = {"containers": 0, "networks": 0, "volumes": 0, "images": 0}
     if result.returncode == 0:
         for line in result.stdout.splitlines():
             match = re.match(r"(?:WOULD_REMOVE|KEEP) (container|network|volume) ", line)
             if match:
                 stale[f"{match.group(1)}s"] += 1
+            elif line.startswith("ELIGIBLE image "):
+                stale["images"] += 1
     return stale
 
 
@@ -692,7 +694,7 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
             managed["unhealthy"] += int("unhealthy" in status)
             managed["restarting"] += int(state == "restarting" or "restarting" in status)
     oom = run(["journalctl", "--dmesg", "--since=-24h", "--grep=Out of memory|Killed process", "--quiet"])
-    timer_ages = {"health": 900, "cleanup": 172800, "drift": 3600}
+    timer_ages = {"health": 900, "cleanup": 7200, "drift": 3600}
     remote_config = bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", values.get("CI_FLEET_CONFIG_REPOSITORY", "")))
     reconciliation = _reconcile_state(root / "var/lib/ci-fleet/reconcile/state.json") if remote_config else None
     if reconciliation and values.get("CI_FLEET_HEALTH_BOOTSTRAP") == "1":
@@ -715,8 +717,9 @@ def collect_snapshot(values: dict[str, str], *, root: Path = Path("/"), run: Run
         # ponytail: activation validates unit installation separately; scheduled runs verify maintenance state after commit.
         timers = {name: "ok" for name in timers}
         services = {name: "ok" for name in services}
-    stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0}
-    stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"]) if docker_ok else 0
+    stale = _stale_resources(run, instance) if docker_ok else {"containers": 0, "networks": 0, "volumes": 0, "images": 0}
+    if docker_ok and not values.get("CI_FLEET_DOCKER_STORAGE_RETENTION"):
+        stale["images"] = _count(run, ["docker", "images", "-q", "--filter", "dangling=true", "--filter", "label=io.randomdevelopment.ci-fleet.managed=true"])
     stale["build_cache"] = _count(run, ["docker", "buildx", "du", "--filter", "until=168h", "--format", "json"]) if docker_ok else 0
     docker_network_headroom = _docker_network_headroom(run, values, docker_ok=docker_ok)
     return {

@@ -41,6 +41,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
     "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT",
     "CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR",
     "CI_FLEET_DOCKER_GID",
+    "CI_FLEET_DOCKER_STORAGE_RETENTION",
     "CI_FLEET_DOCKER_NETWORKS_PER_RUNNER",
     "CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS",
     "CI_FLEET_ENGINE_REF",
@@ -433,6 +434,12 @@ def build_rendered_env(
         ):
             raise DesiredStateError("selected engine does not support default bridge CIDR configuration")
     short_commit = engine_commit[:12]
+    storage_retention = controller.get("docker_storage_retention")
+    if "docker_storage_retention" in controller:
+        if not isinstance(storage_retention, dict) or storage_retention != {"exclusive_fleet_daemon": True} or storage_retention.get("exclusive_fleet_daemon") is not True:
+            raise DesiredStateError("Docker storage retention requires exclusive_fleet_daemon: true")
+        if "docker_storage_retention" not in (engine_capabilities or set()):
+            raise DesiredStateError("selected engine does not support Docker storage retention")
     rendered = {
         "CI_FLEET_CAPACITY_BUDGET": str(pool["capacity_budget"]),
         "CI_FLEET_COMMIT": engine_commit,
@@ -466,6 +473,8 @@ def build_rendered_env(
         for index, pool_config in enumerate(parsed_pools):
             rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_BASE"] = pool_config["base"]
             rendered[f"CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_{index}_SIZE"] = str(pool_config["size"])
+    if storage_retention is not None:
+        rendered["CI_FLEET_DOCKER_STORAGE_RETENTION"] = "exclusive-fleet-daemon-v1"
     reporting_configured = "status_reporting" in controller
     reporting_required = (controller.get("status_reporting") or {}).get("enabled") is True
     if reporting_required and REQUIRED_STATUS_CAPABILITY not in (engine_capabilities or set()):

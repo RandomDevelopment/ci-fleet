@@ -53,6 +53,31 @@ proxy survives controller-only restarts; proxy restarts may interrupt clients
 that bind its socket file directly. Direct runners also mount the shared
 directory and use `DOCKER_HOST` so their later jobs can reconnect.
 
+## Admit disposable Docker storage retention
+
+[Issue #111](https://github.com/RandomDevelopment/ci-fleet/issues/111) adds an
+opt-in storage admission in reviewed schema-v3 controller desired state.
+`docker_storage_retention.exclusive_fleet_daemon: true` declares ownership of
+disposable images and the default builder cache across an isolated ordinary-CI
+daemon. It permits age-bounded image removal and unused default-builder cache
+reclamation under the installer and proxy maintenance locks. It does not admit
+shared application daemons or authorize deletion by project/name prefix.
+
+The cleanup timer now runs hourly. The unchanged 80% upgrade gate remains a
+backstop. Storage cleanup starts at 70%, targets 65%, preserves seven days of
+images/cache, retains a 10 GiB cache reserve, and limits a pass to 50 images and
+two minutes of storage removal. Installed and checkpointed controller/runner
+images remain protected. Protected or recent storage can still exceed capacity.
+Admission therefore requires measured growth and sufficient disk capacity.
+
+Workload diagnostics report terminal CI attempts without stopping their
+containers. Future run-based removal requires independently verified task/shard
+ownership and a concurrent lifecycle contract. Review this admission before
+introducing another daemon owner or builder driver. Remove the admission before
+sharing a daemon. The complete retention, uncertainty, bootstrap, and live proof
+contract is in [host maintenance](HOST-MAINTENANCE.md#docker-storage-retention).
+No host activation or live removal is authorized by repository implementation.
+
 ## Independent review of configuration candidates
 
 The opt-in trust boundary prepared under [issue #108](https://github.com/RandomDevelopment/ci-fleet/issues/108)
