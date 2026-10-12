@@ -119,24 +119,6 @@ load_spec() {
   secret_dir=$secret_root/$id
 }
 
-compose_snapshot() {
-  local project=$1 source=$2 variable replay=$docker_client_config/replay.json
-  shift 2
-  python3 - "$source" "$replay" <<'PY_REPLAY' || return 1
-import json,sys
-def escape(value):
-    if isinstance(value,str): return value.replace('$','$$')
-    if isinstance(value,list): return [escape(item) for item in value]
-    if isinstance(value,dict): return {key:escape(item) for key,item in value.items()}
-    return value
-with open(sys.argv[2],'w') as output: json.dump(escape(json.load(open(sys.argv[1]))),output)
-PY_REPLAY
-  local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST" "DOCKER_CONFIG=$DOCKER_CONFIG")
-  if [[ ${CI_FLEET_TESTING:-0} == 1 ]]; then for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done; fi
-  : >"$docker_client_config/empty.env"
-  "${clean_environment[@]}" docker compose --env-file "$docker_client_config/empty.env" -p "$project" -f "$replay" "$@"
-}
-
 validate_compose() {
   local rendered=$1 empty_env variable
   local -a clean_environment=(env -i "PATH=$PATH" "DOCKER_HOST=$DOCKER_HOST" "DOCKER_CONFIG=$DOCKER_CONFIG")
@@ -329,7 +311,7 @@ apply_converge() {
   validate_existing_resources "$prepared_rendered" || die 'pre-existing Docker resource validation failed'
   [[ -f $(state_path "$environment") ]] || install -m 0600 "$prepared_rendered" "$(deployed_compose_path "$environment")"
   write_state
-  if ! compose_snapshot "$compose_project" "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait --wait-timeout 60; then
+  if ! docker compose -p "$compose_project" -f "$(deployed_compose_path "$environment")" up -d --remove-orphans --wait --wait-timeout 60; then
     rm -f "$prepared_rendered"
     die 'environment activation failed; tracked state retained for cleanup'
   fi
@@ -348,7 +330,7 @@ remove_environment() {
     compose=$(awk -F= '$1=="COMPOSE_FILE"{print substr($0,index($0,"=")+1)}' "$target")
     [[ $compose == "$(deployed_compose_path "$id")" ]] || die 'stored compose path is unexpected'
     secure_file "$compose" 600
-    compose_snapshot "$(project_name "$id")" "$compose" down --timeout 10 --volumes --remove-orphans || return 1
+    docker compose -p "$(project_name "$id")" -f "$compose" down --timeout 10 --volumes --remove-orphans || return 1
     project_resources_absent "$id" || return 1
     rm -f -- "$target" "$(deployed_compose_path "$id")"
   else
@@ -440,7 +422,7 @@ inspect_environment() {
   validate_existing_resources "$compose" "$id" true || status=unhealthy
   expected=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["services"]))' "$compose")
   while read -r service configured_image; do expected_images[$service]=$configured_image; done < <(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\n".join("%s %s" % (name,service["image"]) for name,service in value["services"].items()))' "$compose")
-  mapfile -t containers < <(compose_snapshot "$(project_name "$id")" "$compose" ps -q)
+  mapfile -t containers < <(docker compose -p "$(project_name "$id")" -f "$compose" ps -q)
   [[ ${#containers[@]} == "$expected" ]] || status=unhealthy
   for resource in "${containers[@]}"; do
     running_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$resource")

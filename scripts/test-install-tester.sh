@@ -343,11 +343,6 @@ write_environment interpolation 18090
 TOKEN=must-not-render FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=interpolation "$runtime" --converge --environment interpolation >/dev/null
 if grep -Fq must-not-render "$root/var/lib/ci-fleet-tester/environments/interpolation.compose.json"; then fail 'caller environment was interpolated into the Compose model'; fi
 FAKE_TESTER_ROUTE_PORT=18090 "$runtime" --remove --environment interpolation >/dev/null
-write_environment literal-dollar 18090
-TOKEN=caller-value CURL_HOME=/fictional/root-curl FAKE_TESTER_ROUTE_PORT=18090 FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --converge --environment literal-dollar >/dev/null || fail 'literal Compose dollars changed during activation'
-TOKEN=caller-value FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --health >/dev/null || fail 'literal Compose dollars changed during health'
-FAKE_TESTER_POLICY=literal-dollar FAKE_TESTER_EXPECT_LITERAL_DOLLARS=1 "$runtime" --remove --environment literal-dollar >/dev/null || fail 'literal Compose dollars prevented cleanup'
-[[ ! -e $root/var/lib/ci-fleet-tester/environments/literal-dollar.state ]] || fail 'literal-dollar environment was not removed'
 deployed_hash=$(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json")
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_POLICY=changed-model "$runtime" --converge --environment preview-a >/dev/null 2>&1; then fail 'converge replaced the incumbent Compose model without reset'; fi
 [[ $(sha256sum "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$deployed_hash" ]] || fail 'rejected model replacement changed incumbent state'
@@ -445,7 +440,7 @@ for signal in TERM KILL; do
   sed -i 's/^EXPIRES_AT=.*/EXPIRES_AT=1/' "$interrupted_state"
   : >"$tmp/docker.log"
   timeout 10 "$runtime" --cleanup >/dev/null || fail "$signal blocked subsequent expiration cleanup"
-  grep -Eq -- "-p ci-fleet-test-$id -f [^ ]+ down --timeout 10 --volumes --remove-orphans" "$tmp/docker.log" || fail "$signal cleanup did not target the interrupted project"
+  grep -Fq -- "-p ci-fleet-test-$id -f $interrupted_compose down --timeout 10 --volumes --remove-orphans" "$tmp/docker.log" || fail "$signal cleanup did not target the interrupted project"
   [[ ! -e $interrupted_state && ! -e $interrupted_compose ]] || fail "$signal left expired state behind"
   [[ $(sha256sum "$state" "$root/var/lib/ci-fleet-tester/environments/preview-a.compose.json") == "$incumbent_hash" ]] || fail "$signal cleanup changed the incumbent environment"
   if grep -Fq -- '-p ci-fleet-test-preview-a' "$tmp/docker.log"; then fail "$signal cleanup touched the unexpired environment"; fi
