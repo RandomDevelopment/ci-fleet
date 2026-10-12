@@ -180,6 +180,7 @@ for name,service in services.items():
     if service.get('label_file'): raise SystemExit(f'{name}: external label files are forbidden')
     if service.get('read_only') is not True or 'ALL' not in service.get('cap_drop',[]): raise SystemExit(f'{name}: read_only and cap_drop ALL are required')
     if service.get('security_opt') not in (['no-new-privileges:true'],['no-new-privileges=true']): raise SystemExit(f'{name}: no-new-privileges=true must be the only security option')
+    if service.get('tmpfs'): raise SystemExit(f'{name}: service-level tmpfs is unsupported; use volumes with type tmpfs')
     for mount in service.get('volumes',[]):
         if isinstance(mount,str) or mount.get('type') not in ('volume','tmpfs'): raise SystemExit(f'{name}: host bind mounts are forbidden')
         if mount['type']=='volume' and mount.get('source') not in value.get('volumes',{}): raise SystemExit(f'{name}: volume mounts must name a declared project volume')
@@ -194,6 +195,7 @@ for section in ('networks','volumes'):
         resolved=item.get('name',f'{project}_{name}')
         if item.get('external') or not resolved.startswith(f'{project}_'): raise SystemExit(f'{section}.{name}: external/unscoped names are forbidden')
         if section == 'networks' and (item.get('driver') not in (None,'bridge') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom network drivers are forbidden')
+        if section == 'networks' and item.get('enable_ipv4') is False: raise SystemExit(f'{section}.{name}: IPv4 is required')
         if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
 secrets=value.get('secrets',{})

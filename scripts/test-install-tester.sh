@@ -175,6 +175,17 @@ grep -Fxq 18080 "$tmp/route.log" || fail 'health did not probe the declared rout
 for orphan in FAKE_TESTER_ORPHAN_PROJECT FAKE_TESTER_ORPHAN_VOLUME_PROJECT FAKE_TESTER_ORPHAN_NETWORK_PROJECT; do
   if env "$orphan=ci-fleet-test-missing" "$runtime" --remove --environment missing >/dev/null 2>&1; then fail 'removal falsely succeeded for a project with missing state'; fi
 done
+for policy in ipv4-disabled service-tmpfs; do
+  write_environment "$policy" 18098
+  : >"$tmp/docker.log"
+  if FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "$policy" >"$tmp/model-rejection.out" 2>&1; then fail "unsupported model was accepted: $policy"; fi
+  case $policy in
+    ipv4-disabled) grep -Fq 'IPv4 is required' "$tmp/model-rejection.out" || fail 'IPv4-disabled network failed outside model validation' ;;
+    service-tmpfs) grep -Fq 'service-level tmpfs is unsupported' "$tmp/model-rejection.out" || fail 'service tmpfs failed outside model validation' ;;
+  esac
+  [[ ! -e $root/var/lib/ci-fleet-tester/environments/$policy.state ]] || fail "unsupported model created tracked state: $policy"
+  if grep -Fq 'up -d' "$tmp/docker.log"; then fail "unsupported model reached activation: $policy"; fi
+done
 write_environment source-policy 18096
 for source in 'services: {web: {extends: {file: /etc/passwd, service: web}}}' '!!str &external include: [{path: /etc/passwd}]' '!!str &external label_file: /etc/passwd' 'services: {web: {env_file: /etc/passwd}}' 'services: {}\nservices: {}'; do
   printf '%b\n' "$source" >"$root/etc/ci-fleet-tester/definitions/source-policy.yaml"
