@@ -1836,6 +1836,23 @@ restore_systemd_snapshot() {
   return "$failed"
 }
 
+rebuild_checkpoint_images() {
+  local release=$1 environment=$2
+  if ! python3 - "$repo_root/scripts" "$release/engine-capabilities.json" <<'PYTHON'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from desired_state import load_engine_capabilities
+raise SystemExit(0 if "reproducible_managed_images" in load_engine_capabilities(Path(sys.argv[2])) else 1)
+PYTHON
+  then
+    note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy images require retained objects or verified offline import'
+    return 1
+  fi
+  build_managed_images "$release" "$environment" || return 1
+  managed_images_match "$environment"
+}
+
 retag_checkpoint_image() {
   local identifier=$1 tag=$2 error
   if docker image tag "$identifier" "$tag"; then
@@ -2132,8 +2149,7 @@ PY
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
       if $missing_checkpoint_image || ! managed_images_match "$rendered_env"; then
-        build_managed_images "$release_dir" "$rendered_env" || failed=1
-        if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
+        rebuild_checkpoint_images "$release_dir" "$rendered_env" || failed=1
       fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
@@ -2286,14 +2302,14 @@ mandatory_timers_active() {
 }
 
 stage_manager_only() {
-  local manager_ref=$1 installed_engine
+  local installed_engine
   [[ "$mode" == upgrade && -f "$state_file" && -f "$rendered_env" ]] \
     || die 'managed_images may be omitted only for an existing managed engine upgrade'
   ! grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env" \
     || die 'managed_images cannot be removed after image enforcement'
   installed_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$rendered_env")
-  [[ "$installed_engine" =~ ^[0-9a-f]{40}$ && "${manager_ref:-}" != "$engine_ref" ]] \
-    || die 'manager-only staging requires a new engine revision'
+  [[ "$installed_engine" =~ ^[0-9a-f]{40}$ ]] \
+    || die 'manager-only staging requires a valid installed engine revision'
   staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
   install_release
   install_manager "$engine_ref" "$release_dir"
@@ -2398,7 +2414,7 @@ perform_converge() {
     die 'manager current pointer is invalid'
   fi
   if ! managed_image_ids_configured; then
-    stage_manager_only "${manager_ref:-}"
+    stage_manager_only
     return
   fi
   drift_count

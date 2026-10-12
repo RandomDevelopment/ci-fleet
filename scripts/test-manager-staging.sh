@@ -21,19 +21,27 @@ mkdir -p "$systemd_dir"
 printf 'CI_FLEET_ENGINE_REF=%040d\n' 1 >"$rendered_env"
 die() { printf '%s\n' "$*" >&2; exit 1; }
 install_release() { :; }
-install_manager() { [[ $1 == "$engine_ref" && $2 == candidate-runtime ]]; }
+install_manager() { [[ $1 == "$engine_ref" && $2 == candidate-runtime ]]; printf '%s\n' "$engine_ref" >"$root/manager-ref"; }
 current_runtime_release() { printf '%s\n' "$runtime"; }
 install_systemd_units() { [[ $1 == incumbent-runtime ]]; }
 staged_runtime_matches() { :; }
 systemctl() { printf '%s\n' "$*" >>"$root/systemctl.log"; [[ ${timer_failure:-false} != true ]]; }
 note() { printf '%s\n' "$*"; }
 printf -v engine_ref '%040d' 2
-stage_manager_only "$(printf '%040d' 1)"
+stage_manager_only
 grep -Fqx 'enable --now ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer' "$root/systemctl.log"
 printf -v engine_ref '%040d' 1
-stage_manager_only "$(printf '%040d' 2)"
+stage_manager_only
 timer_failure=true
 if mandatory_timers_active; then exit 1; fi
+# Fail after pointer publication, then retry that same staging revision.
+set +e
+( set -e; stage_manager_only )
+status=$?
+set -e
+[[ $status != 0 && $(<"$root/manager-ref") == "$engine_ref" ]]
+timer_failure=false
+stage_manager_only
 TEST
 } >"$temporary/staging.sh"
 bash "$temporary/staging.sh" "$temporary"
@@ -66,4 +74,29 @@ trap 'status=0; retag_checkpoint_image "$identifier" fixture-tag || status=$?; [
 TEST
 } >"$temporary/recovery.sh"
 bash "$temporary/recovery.sh"
+{
+  printf 'set -Eeuo pipefail\n'
+  sed -n '/^rebuild_checkpoint_images() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
+  cat <<'TEST'
+repo_root=$1
+root=$2
+mkdir -p "$root/legacy" "$root/reviewed"
+printf '{"schema_version":1,"capabilities":{"reproducible_managed_images":false}}\n' >"$root/legacy/engine-capabilities.json"
+cp "$repo_root/engine-capabilities.json" "$root/reviewed/engine-capabilities.json"
+build_managed_images() { printf 'build\n' >>"$root/rebuild.log"; }
+managed_images_match() { [[ ${match_images:-true} == true ]]; }
+note() { printf '%s\n' "$*" >>"$root/rebuild-notes.log"; }
+for legacy_manifest in missing disabled; do
+  if [[ $legacy_manifest == missing ]]; then release=$root/absent; else release=$root/legacy; fi
+  if rebuild_checkpoint_images "$release" fixture-env 2>/dev/null; then exit 1; fi
+  [[ ! -e "$root/rebuild.log" ]]
+  grep -Fq ROLLBACK_IMAGE_REINSTALL_REQUIRED "$root/rebuild-notes.log"
+done
+rebuild_checkpoint_images "$root/reviewed" fixture-env
+[[ $(<"$root/rebuild.log") == build ]]
+match_images=false
+if rebuild_checkpoint_images "$root/reviewed" fixture-env; then exit 1; fi
+TEST
+} >"$temporary/rebuild.sh"
+bash "$temporary/rebuild.sh" "$repo_root" "$temporary"
 printf 'MANAGER_STAGING_AND_IMAGE_RECOVERY_TESTS_OK\n'

@@ -147,4 +147,6 @@ A controller without reviewed managed image IDs may temporarily select a new man
 
 The incumbent manager must not activate the new runtime before reviewed IDs exist. The candidate Compose file requires those IDs, so an incumbent reconciliation attempt fails before drain or build. An operator must separately authorize the bootstrap, pause reconciliation before publishing staging, and invoke the reviewed candidate installer. Staging reconciles mandatory maintenance timers without replacing the runtime. Reverting staging may repoint the manager to the retained runtime revision.
 
+Legacy checkpoint image IDs do not make their mutable build inputs reproducible. Retain these image objects or verified offline exports during bootstrap. Missing legacy objects block rollback and require separately authorized import or reinstall; reconstruction is limited to releases declaring reproducible managed-image support.
+
 The remaining risks are incorrect operator sequencing and inaccurate host evidence. Issue #36 retains the operational bootstrap, repeated-build and private image-ID proof. Remove this transitional exception after participating hosts have adopted image enforcement and the retained pre-enforcement rollback paths are retired through reviewed policy.

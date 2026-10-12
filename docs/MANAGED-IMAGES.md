@@ -5,7 +5,7 @@ Managed controller and runner images have two independent pins:
 1. the engine checkout fixes all build instructions and checked module hashes;
 2. the reviewed private desired state maps that full engine commit to exact local Docker image IDs (`sha256:...`).
 
-Convergence rejects an image whose revision label is correct but whose image ID differs. A missing image is rebuilt only from the pinned engine release and accepted only when its rebuilt ID equals the reviewed value. Rollback applies the same check and deterministic rebuild before it starts the restored controller.
+Convergence rejects an image whose revision label is correct but whose image ID differs. A missing image is rebuilt only from the pinned engine release and accepted only when its rebuilt ID equals the reviewed value. Rollback applies the same check before it starts the restored controller. Reconstruction requires the checkpoint release to declare `reproducible_managed_images`. Pre-enforcement images have mutable inputs and must remain retained or be restored by separately authorized offline import with exact-ID verification. If a legacy object is lost, rollback fails closed with `ROLLBACK_IMAGE_REINSTALL_REQUIRED`; restore a verified saved image or separately authorize reinstall from an image-enforced configuration. Do not rebuild a legacy Dockerfile and assume its captured ID is reproducible.
 
 ## Reviewed upstream inputs
 
@@ -30,7 +30,7 @@ Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upg
 
 1. Separately authorize the bootstrap on each host and stop its reconciliation timer before publishing the staging revision. The incumbent installer cannot stage the new manager. Its attempt to load the new Compose release fails closed when reviewed image IDs are missing.
 2. Merge a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged. Apply it with the reviewed candidate checkout's `scripts/install-worker-controller.sh --upgrade` and the approved staging configuration ref. Preserve the incumbent runtime capability evidence and all controller settings during this revision.
-3. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime. Preserve the incumbent capability evidence for this activation commit, then update it to the verified new runtime in a follow-up revision. Restart reconciliation using the staged manager. A staging rollback may select the retained runtime engine through the same candidate installer.
+3. After every target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime. Preserve the incumbent capability evidence for this activation commit, then update it to the verified new runtime in a follow-up revision. Restart reconciliation using the staged manager. A staging rollback may select the retained runtime engine through the same candidate installer. If unit or timer setup fails after the manager pointer moves, retry the same staging revision to reconcile it; the installer validates the retained runtime and manager tree before re-entry.
 
 Fresh installation, field removal after enforcement, unrelated staging changes, and runtime activation without reviewed IDs all fail closed.
 
