@@ -34,6 +34,7 @@ def documents():
                      "CI_FLEET_LABELS": "docker-ci", "CI_FLEET_RUNNER_CPUS": "2",
                      "CI_FLEET_RUNNER_MEMORY_MIB": "4096", "CI_FLEET_MIN_RUNNERS": "0",
                      "CI_FLEET_MAX_RUNNERS": "4", "CI_FLEET_CONTROLLER_STATE": "active",
+                     "CI_FLEET_SCALE_SET_NAME": "example-ci-01-scale-set",
                      "CI_FLEET_CONFIGURED_MAX_RUNNERS": "4", "CI_FLEET_CAPACITY_BUDGET": "8"},
         "controller": {"controller": CONTROLLER, "software_version": "3" * 40,
                        "current": 2, "busy": 1, "maximum": 4, "generated_at": NOW - 10},
@@ -219,6 +220,7 @@ class SnapshotTests(unittest.TestCase):
                 del docs["installation"][field]
                 self.assertNotEqual(self.build(docs)["sources"]["installation"]["availability"], "available")
         for field, changed in (("CI_FLEET_CONTROLLER_STATE", "drained"),
+                               ("CI_FLEET_SCALE_SET_NAME", "different-scale-set"),
                                ("CI_FLEET_CONFIGURED_MAX_RUNNERS", "5"), ("CI_FLEET_CAPACITY_BUDGET", "9")):
             for missing in (False, True):
                 with self.subTest(field=field, missing=missing):

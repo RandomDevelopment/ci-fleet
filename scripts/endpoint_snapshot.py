@@ -225,6 +225,7 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
         raise SnapshotError("source_invalid")
     try:
         if (value["CI_FLEET_CONTROLLER_STATE"] != policy["policy_state"]
+                or value["CI_FLEET_SCALE_SET_NAME"] != policy["scale_set_name"]
                 or int(value["CI_FLEET_CONFIGURED_MAX_RUNNERS"]) != policy["reviewed_maximum"]
                 or int(value["CI_FLEET_CAPACITY_BUDGET"]) != policy["capacity_budget"]):
             raise SnapshotError("identity_mismatch")
