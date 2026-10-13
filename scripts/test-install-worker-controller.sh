@@ -1286,7 +1286,34 @@ cp "$tmp/pre-adapter-runner-image-present" "$FAKE_PRIOR_IMAGE_STATES/runner-stat
 cp "$tmp/pre-adapter-runner-image-id" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
 cp "$tmp/pre-adapter-controller-image-present" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
 cp "$tmp/pre-adapter-controller-image-id-state" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
-pre_adapter_upgrade_ref=$(write_config active 1 1 "$engine_ref")
+python3 - "$config_repo/fleet.json" "$engine_ref" <<'PY'
+import json
+import sys
+path, engine = sys.argv[1:]
+value = json.load(open(path))
+value["controllers"]["example-ci-01"]["engine_ref"] = engine
+with open(path, "w") as output:
+    json.dump(value, output)
+PY
+git -C "$config_repo" add fleet.json
+git -C "$config_repo" commit -qm 'fixture manager staging'
+pre_adapter_staging_ref=$(git -C "$config_repo" rev-parse HEAD)
+pre_adapter_staged=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_staging_ref")
+grep -Fq 'MANAGER_STAGED' <<<"$pre_adapter_staged" || fail 'historical upgrade did not stage the current manager'
+[[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'manager staging changed the historical runtime'
+pre_adapter_manager_current=$(readlink "$pre_adapter_root/opt/ci-fleet/manager/current")
+python3 - "$config_repo/fleet.json" "$engine_ref" <<'PY'
+import json
+import sys
+path, engine = sys.argv[1:]
+value = json.load(open(path))
+value["managed_images"] = {engine: {"amd64": {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "4" * 64}}}
+with open(path, "w") as output:
+    json.dump(value, output)
+PY
+git -C "$config_repo" add fleet.json
+git -C "$config_repo" commit -qm 'fixture image policy activation'
+pre_adapter_upgrade_ref=$(git -C "$config_repo" rev-parse HEAD)
 export FAKE_RESTART_AFTER_UP=$tmp/pre-adapter-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 pre_adapter_upgrade_output=$tmp/pre-adapter-upgrade.out
@@ -1308,6 +1335,11 @@ grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_converged" || fail 'post-roll
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current manager'
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
+
+# Introduce current-runtime capability evidence before enabling the managed policy.
+write_config active 1 1 "$engine_ref" omit omit >/dev/null
+pre_adapter_current_policy_ref=$(write_config active 1 1 "$engine_ref")
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_current_policy_ref" >/dev/null
 
 FAKE_ENGINE_REF=$pre_adapter_ref
 FAKE_RUNNER_IMAGE=$pre_adapter_runner_image
