@@ -26,13 +26,15 @@ def documents():
                          "installed_at": dt.datetime.fromtimestamp(NOW - 100, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "config_ref": "1" * 40, "engine_ref": "2" * 40, "pool": "validation",
                          "lifecycle": "stable", "configured_max_runners": 4, "capacity_budget": 8,
-                         "architecture": "amd64", "scale_set_name": "example-scale-set",
-                         "status_reporting_configured": True, "status_reporting_required": False},
+                         "architecture": "amd64", "scale_set_name": "example-ci-01-scale-set",
+                         "status_reporting_configured": True, "status_reporting_required": False,
+                         "docker_network_policy_configured": False},
         "rendered": {"CI_FLEET_INSTANCE": CONTROLLER, "CI_FLEET_CONFIG_REF": "1" * 40,
                      "CI_FLEET_ENGINE_REF": "2" * 40, "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
                      "CI_FLEET_LABELS": "docker-ci", "CI_FLEET_RUNNER_CPUS": "2",
                      "CI_FLEET_RUNNER_MEMORY_MIB": "4096", "CI_FLEET_MIN_RUNNERS": "0",
-                     "CI_FLEET_MAX_RUNNERS": "4"},
+                     "CI_FLEET_MAX_RUNNERS": "4", "CI_FLEET_CONTROLLER_STATE": "active",
+                     "CI_FLEET_CONFIGURED_MAX_RUNNERS": "4", "CI_FLEET_CAPACITY_BUDGET": "8"},
         "controller": {"controller": CONTROLLER, "software_version": "3" * 40,
                        "current": 2, "busy": 1, "maximum": 4, "generated_at": NOW - 10},
         "health": {"schema_version": 1, "controller": CONTROLLER, "desired_state": "active", "status": "healthy", "timestamp": NOW - 20,
@@ -121,6 +123,7 @@ class SnapshotTests(unittest.TestCase):
             *({'id': name, 'status': 'warning', 'message': 'PRIVATE-DETAIL'}
               for name in ('stale_container', 'timer_capacity', 'reconcile')),
         ]
+        docs['health']['status'] = 'unhealthy'
         value = self.build(docs)
         health = value['sources']['health']
         self.assertEqual(health['availability'], 'available')
@@ -201,11 +204,51 @@ class SnapshotTests(unittest.TestCase):
                 with self.subTest(state=state, minimum=minimum, maximum=maximum):
                     docs = documents()
                     docs["installation"]["controller_state"] = state
+                    docs["rendered"]["CI_FLEET_CONTROLLER_STATE"] = state
                     docs["rendered"]["CI_FLEET_MIN_RUNNERS"] = str(minimum)
                     docs["rendered"]["CI_FLEET_MAX_RUNNERS"] = str(maximum)
                     value = self.build(docs)
                     valid = minimum == 0 and maximum == (4 if state == "active" else 0)
                     self.assertEqual(value["sources"]["configuration"]["availability"] == "available", valid)
+
+    def test_complete_installation_and_rendered_capacity_are_required(self):
+        for field in ("architecture", "scale_set_name", "status_reporting_configured", "status_reporting_required",
+                      "docker_network_policy_configured"):
+            with self.subTest(field=field):
+                docs = documents()
+                del docs["installation"][field]
+                self.assertNotEqual(self.build(docs)["sources"]["installation"]["availability"], "available")
+        for field, changed in (("CI_FLEET_CONTROLLER_STATE", "drained"),
+                               ("CI_FLEET_CONFIGURED_MAX_RUNNERS", "5"), ("CI_FLEET_CAPACITY_BUDGET", "9")):
+            for missing in (False, True):
+                with self.subTest(field=field, missing=missing):
+                    docs = documents()
+                    if missing:
+                        del docs["rendered"][field]
+                    else:
+                        docs["rendered"][field] = changed
+                    self.assertNotEqual(self.build(docs)["sources"]["configuration"]["availability"], "available")
+
+    def test_engine_and_routing_identity_reject_impossible_schema_v3_values(self):
+        docs = documents()
+        docs["installation"]["engine_ref"] = docs["rendered"]["CI_FLEET_ENGINE_REF"] = "0" * 40
+        self.assertNotEqual(self.build(docs)["sources"]["installation"]["availability"], "available")
+        for label in ("self-hosted", "example-ci-01-scale-set", "UPPERCASE", "x" * 64):
+            docs = documents()
+            docs["rendered"]["CI_FLEET_LABELS"] = label
+            self.assertNotEqual(self.build(docs)["sources"]["configuration"]["availability"], "available")
+        for field, changed in (("pool", "UPPERCASE"), ("scale_set_name", "unbound-scale-set")):
+            docs = documents()
+            docs["installation"][field] = changed
+            self.assertNotEqual(self.build(docs)["sources"]["installation"]["availability"], "available")
+
+    def test_health_summary_cannot_understate_approved_check_severity(self):
+        for summary, severity in (("healthy", "warning"), ("healthy", "critical"), ("warning", "critical"),
+                                  ("maintenance", "critical")):
+            docs = documents()
+            docs["health"]["status"] = summary
+            docs["health"]["checks"][1]["status"] = severity
+            self.assertNotEqual(self.build(docs)["sources"]["health"]["availability"], "available")
 
     def test_installation_requires_possible_schema_v3_capacity(self):
         for state, maximum, budget in (("active", 0, 8), ("active", 4, 0), ("active", 9, 8),
@@ -364,9 +407,16 @@ class SnapshotTests(unittest.TestCase):
             lambda v: v["sources"]["installation"]["data"].update(capacity_budget=0),
             lambda v: v["sources"]["installation"]["data"].update(capacity_budget=3),
             lambda v: v["sources"]["installation"]["data"].pop("capacity_budget"),
+            lambda v: v["sources"]["installation"]["data"].pop("architecture"),
+            lambda v: v["sources"]["installation"]["data"].update(engine_ref="0" * 40),
+            lambda v: v["sources"]["installation"]["data"].update(scale_set_name="unbound-scale-set"),
+            lambda v: v["sources"]["installation"]["data"].update(reporting_configured=False, reporting_required=True),
             lambda v: v["sources"]["configuration"]["data"].update(runner_cpu_cores=0.5),
+            lambda v: v["sources"]["configuration"]["data"].update(routing_labels=["self-hosted"]),
+            lambda v: v["sources"]["configuration"]["data"].update(routing_labels=["example-ci-01-scale-set"]),
             lambda v: v["sources"]["configuration"]["data"].update(runner_memory_mib=511),
             lambda v: v["sources"]["health"]["data"].update(desired_state="drained"),
+            lambda v: v["sources"]["health"]["data"]["checks"][1].update(status="critical"),
             lambda v: v["sources"]["reconciliation"]["data"].update(last_success_at=NOW + 1),
             lambda v: v["sources"]["reconciliation"]["data"].update(desired_commit="4" * 40),
             lambda v: v["sources"]["reconciliation"]["data"].pop("applied_commit"),
@@ -494,6 +544,7 @@ class SnapshotReadbackTests(unittest.TestCase):
         self.assertEqual(read["sources"]["controller"]["freshness"], "unknown")
         docs = documents()
         docs["health"]["checks"][0]["status"] = "warning"
+        docs["health"]["status"] = "warning"
         store.publish_endpoint(self.base, snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW), self.gid)
         read = self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
         self.assertEqual(read["publisher_freshness"], "unknown")
@@ -503,6 +554,7 @@ class SnapshotReadbackTests(unittest.TestCase):
             with self.subTest(status=status, claim=claim):
                 docs = documents()
                 docs["health"]["checks"][0]["status"] = status
+                docs["health"]["status"] = {"ok": "healthy", "warning": "warning", "critical": "unhealthy"}[status]
                 value = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
                 value["clock_state"] = claim
                 store.publish_endpoint(self.base, value, self.gid)
@@ -554,6 +606,7 @@ class SnapshotReadbackTests(unittest.TestCase):
     def test_failed_health_read_preserves_recent_clock_warning_until_new_evidence(self):
         docs = documents()
         docs["health"]["checks"][0]["status"] = "warning"
+        docs["health"]["status"] = "warning"
         previous = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
         value = snapshot.build_snapshot(CONTROLLER, docs, {"health": "source_unavailable"},
                                         now=NOW + 10, previous=previous)
@@ -565,6 +618,7 @@ class SnapshotReadbackTests(unittest.TestCase):
         self.assertEqual(read["sources"]["health"]["availability"], "unavailable")
         self.assertEqual(read["sources"]["health"]["last_success_at"], previous["sources"]["health"]["observed_at"])
         docs["health"]["checks"][0]["status"] = "ok"
+        docs["health"]["status"] = "healthy"
         docs["health"]["timestamp"] = NOW + 20
         recovered = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW + 20, previous=value)
         store.publish_endpoint(self.base, recovered, self.gid)

@@ -17,7 +17,6 @@ from endpoint_snapshot_sources import collect_documents
 from endpoint_snapshot_store import StoreError, publication_lock, publish_endpoint, read_endpoint
 
 MAX_BYTES = 65_536
-IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 CONTROLLER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[A-Za-z0-9_.+-]{1,64}")
@@ -55,11 +54,11 @@ def integer(value: Any) -> bool:
 
 
 def token(value: Any) -> bool:
-    return isinstance(value, str) and IDENTITY.fullmatch(value) is not None
+    return isinstance(value, str) and CONTROLLER_ID.fullmatch(value) is not None
 
 
 def commit(value: Any) -> bool:
-    return isinstance(value, str) and COMMIT.fullmatch(value) is not None
+    return isinstance(value, str) and COMMIT.fullmatch(value) is not None and value != "0" * 40
 
 
 def choice(*values: str):
@@ -68,7 +67,7 @@ def choice(*values: str):
 
 def labels(value: Any) -> bool:
     return (isinstance(value, list) and len(value) >= 1
-            and all(isinstance(item, str) and CONTROLLER_ID.fullmatch(item) for item in value)
+            and all(token(item) and item != "self-hosted" for item in value)
             and len(set(value)) == len(value))
 
 
@@ -149,12 +148,21 @@ def validate_data(name: str, value: dict) -> None:
             if set(value) != {"record_state"}:
                 raise SnapshotError("invalid_snapshot")
         else:
-            required |= {"installed_at", "policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum", "capacity_budget"}
+            required = set(DATA_FIELDS["installation"])
     if not required <= value.keys():
         raise SnapshotError("invalid_snapshot")
     if (name == "installation" and value["record_state"] == "installed"
             and value["policy_state"] != "disabled" and value["reviewed_maximum"] > value["capacity_budget"]):
         raise SnapshotError("invalid_snapshot")
+    if (name == "installation" and value["record_state"] == "installed"
+            and value["reporting_required"] and not value["reporting_configured"]):
+        raise SnapshotError("invalid_snapshot")
+    if name == "health":
+        rank = {"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}[value["status"]]
+        if (any({"ok": 0, "warning": 1, "critical": 2}[check["status"]] > rank for check in value["checks"])
+                or value["status"] == "maintenance" and value["desired_state"] == "active"
+                or value["status"] == "healthy" and value["desired_state"] != "active"):
+            raise SnapshotError("invalid_snapshot")
     if name == "controller" and not value["busy"] <= value["current"] <= value["maximum"]:
         raise SnapshotError("invalid_snapshot")
     if name == "configuration" and value["minimum_runners"] > value["maximum_runners"]:
@@ -193,10 +201,12 @@ def project_installation(value: dict, controller: str, now: int) -> dict:
     for source, target in mapping.items():
         if source in value:
             result[target] = value[source]
-    required = {"policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum", "capacity_budget"}
+    required = set(DATA_FIELDS["installation"])
     if not required <= result.keys():
         raise SnapshotError("source_invalid")
     data("installation", result)
+    if controller not in result["scale_set_name"]:
+        raise SnapshotError("identity_mismatch")
     if result["policy_state"] != "disabled" and result["reviewed_maximum"] > result["capacity_budget"]:
         raise SnapshotError("source_invalid")
     return evidence(result, observed_at=observed)
@@ -214,6 +224,10 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
     if "CI_FLEET_DOCKER_STORAGE_RETENTION" in value and value["CI_FLEET_DOCKER_STORAGE_RETENTION"] != "exclusive-fleet-daemon-v1":
         raise SnapshotError("source_invalid")
     try:
+        if (value["CI_FLEET_CONTROLLER_STATE"] != policy["policy_state"]
+                or int(value["CI_FLEET_CONFIGURED_MAX_RUNNERS"]) != policy["reviewed_maximum"]
+                or int(value["CI_FLEET_CAPACITY_BUDGET"]) != policy["capacity_budget"]):
+            raise SnapshotError("identity_mismatch")
         result = {"applied_commit": policy["applied_commit"], "engine_ref": policy["engine_ref"],
                   "routing_labels": value["CI_FLEET_LABELS"].split(","),
                   "runner_cpu_cores": int(value["CI_FLEET_RUNNER_CPUS"]),
@@ -224,6 +238,8 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise SnapshotError("source_invalid") from error
     if result["maximum_runners"] != (policy["reviewed_maximum"] if policy["policy_state"] == "active" else 0):
+        raise SnapshotError("source_invalid")
+    if policy["scale_set_name"] in result["routing_labels"]:
         raise SnapshotError("source_invalid")
     return evidence(data("configuration", result), observed_at=installation["observed_at"])
 
@@ -314,7 +330,9 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
             value = documents.get(source)
             if not isinstance(value, dict):
                 raise SnapshotError("source_unavailable")
-            sources[name] = projector(value)
+            observed = projector(value)
+            validate_data(name, observed["data"])
+            sources[name] = observed
         except SnapshotError as error:
             retained = old.get(name)
             if name in {"configuration", "reconciliation"} and retained and retained["data"]:
@@ -327,7 +345,7 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
                         or retained["last_success_at"] < installation["data"]["installed_at"]):
                     sources[name] = failure("revision_unverified")
                     return
-            sources[name] = failure(error.code, retained)
+            sources[name] = failure("source_invalid" if error.code == "invalid_snapshot" else error.code, retained)
             if name == "controller":
                 sources[name]["data"].pop("matches_reviewed_maximum", None)
             if name == "health" and sources[name]["data"]:
@@ -405,6 +423,8 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
     reconciliation = value["sources"]["reconciliation"]
     health = value["sources"]["health"]
     runtime = value["sources"]["controller"]
+    if policy["data"].get("record_state") == "installed" and controller not in policy["data"]["scale_set_name"]:
+        raise SnapshotError("invalid_snapshot")
     if value["clock_state"] != clock_state(value["sources"], value["published_at"]):
         raise SnapshotError("invalid_snapshot")
     if configuration["data"]:
@@ -414,6 +434,7 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
                 or configured["applied_commit"] != installed["applied_commit"]
                 or configured["engine_ref"] != installed["engine_ref"]
                 or configuration["last_success_at"] != installed["installed_at"]
+                or installed["scale_set_name"] in configured["routing_labels"]
                 or configured["maximum_runners"] != (installed["reviewed_maximum"] if installed["policy_state"] == "active" else 0)):
             raise SnapshotError("invalid_snapshot")
     if "matches_reviewed_maximum" in runtime["data"]:
