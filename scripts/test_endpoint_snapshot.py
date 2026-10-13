@@ -81,6 +81,17 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(value["sources"]["health"]["data"]["checks"][0], {"id": "clock", "status": "ok"})
         self.assertNotIn("metrics", value["sources"]["health"]["data"])
 
+    def test_publisher_preserves_incumbent_during_clock_rollback(self):
+        previous = self.build()
+        with patch.object(snapshot, 'read_endpoint', return_value=previous), \
+             patch.object(snapshot, 'collect_documents', return_value=(documents(), {})), \
+             patch.object(snapshot, 'publish_endpoint') as publish:
+            self.assert_snapshot_error(lambda: snapshot.publish(CONTROLLER, observer_gid=1, now=NOW - 5),
+                                       'clock_uncertain')
+            publish.assert_not_called()
+        value = self.build(previous=previous, now=NOW + 1)
+        self.assertEqual(value['sources']['controller']['observed_at'], NOW - 10)
+
     def test_source_loss_retains_original_last_success_without_zero_fallback(self):
         previous = self.build()
         value = self.build(errors={"controller": "source_timeout"}, previous=previous, now=NOW + 30)

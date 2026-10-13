@@ -286,6 +286,8 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
         raise SnapshotError("invalid_argument")
     if previous is not None:
         validate_snapshot(previous, controller=controller)
+        if now < previous["published_at"]:
+            raise SnapshotError("clock_uncertain")
     old = previous["sources"] if previous else {}
     sources = {name: failure("unsupported") for name in SOURCE_NAMES}
 
