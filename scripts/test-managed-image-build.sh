@@ -71,5 +71,10 @@ with tempfile.TemporaryDirectory() as temporary:
         if case != 'success':
             assert (root / 'runner-state').read_text().strip() == old_revision, case
             assert (root / 'controller-state').read_text().strip() == old_revision, case
+    (root / 'runner-state').write_text(old_revision + '\n')
+    (root / 'runner-id').write_text(old_runner + '\n')
+    subprocess.run([str(mock), 'image', 'tag', runner_id, values['CI_FLEET_RUNNER_IMAGE']], env=env, check=True)
+    assert (root / 'runner-state').read_text().strip() == revision
+    assert (root / 'runner-id').read_text().strip() == runner_id
 print('MANAGED_IMAGE_STAGING_TESTS_OK')
 PY

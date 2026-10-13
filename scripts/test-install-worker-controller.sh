@@ -158,7 +158,11 @@ case "${1:-}" in
         if [[ $image =~ ^sha256:[0-9a-f]{64}$ ]]; then
           if [[ -f ${FAKE_AVAILABLE_IMAGE_IDS:-} ]] && grep -Fxq "$image" "$FAKE_AVAILABLE_IMAGE_IDS"; then
             if [[ "$*" == *'{{eq '* && "$*" =~ \"([0-9a-f]{40})\" ]]; then
-              if grep -Fxq "$image ${BASH_REMATCH[1]}" "$FAKE_AVAILABLE_IMAGE_IDS.revisions" 2>/dev/null; then printf 'true\n'; else printf 'false\n'; fi
+              if grep -Fxq "$image ${BASH_REMATCH[1]}" "$FAKE_AVAILABLE_IMAGE_IDS.revisions" 2>/dev/null; then
+                # Fixture IDs span revisions; select the label verified for this object.
+                printf '%s %s\n' "$image" "${BASH_REMATCH[1]}" >>"$FAKE_AVAILABLE_IMAGE_IDS.revisions"
+                printf 'true\n'
+              else printf 'false\n'; fi
             else
               printf '%s\n' "$image"
             fi
@@ -197,6 +201,8 @@ case "${1:-}" in
         if [[ -f "$image_id_state.stage" && $(<"$image_id_state.stage") == "$image_id" ]]; then
           cp "$image_state.stage" "$image_state"
         fi
+        revision=$(awk -v identifier="$image_id" '$1 == identifier && length($2) == 40 && $2 ~ /^[0-9a-f]+$/ {revision=$2} END {print revision}' "$FAKE_AVAILABLE_IMAGE_IDS.revisions" 2>/dev/null || true)
+        [[ -z "$revision" ]] || printf '%s\n' "$revision" >"$image_state"
         [[ -f "$image_state" || ! -f "$image_state.provenance" ]] || cp "$image_state.provenance" "$image_state"
         printf '%s\n' "$image_id" >"$image_id_state"
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'image-tag|%s|%s\n' "$image_id" "$image" >>"$FAKE_COMPOSE_LOG"
