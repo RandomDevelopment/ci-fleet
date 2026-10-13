@@ -2885,6 +2885,7 @@ if [[ "$mode" == policy-action ]]; then
 fi
 case "$mode" in
   check|install|adopt|upgrade)
+    reject_deployer_host
     validate_common_arguments
     resolve_config
     validate_candidate_config_commit

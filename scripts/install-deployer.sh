@@ -664,6 +664,9 @@ acquire_lock() {
   exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
   flock -n 8 || block 'another ci-fleet role installation is already running'
   reject_other_role_state
+  if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
+    python3 "$repo_root/scripts/deployer_adapter.py" consumption --store "$log_root" || block 'approval consumption recovery failed'
+  fi
   recover_adapter_guard
   [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
@@ -1259,7 +1262,7 @@ PY
 }
 
 publish_deployed_snapshot() {
-  local policy=$1 state=$2 snapshot pointer retired incumbent
+  local policy=$1 state=$2 created_record=${3:-} snapshot pointer retired incumbent record_temporary
   secure_directory "$deployed_root" 700 1 || return
   if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
     # An unusable incumbent snapshot must not block publication of a freshly
@@ -1272,8 +1275,18 @@ publish_deployed_snapshot() {
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
     rm -f -- "$deployed_current" || return
   fi
-  snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
-  chmod 0700 "$snapshot" || return
+  if [[ -n $created_record ]]; then
+    snapshot=$(mktemp -u "$deployed_root/.snapshot.XXXXXX") || return
+    record_temporary=$(mktemp "$(dirname "$created_record")/.deployed-created.XXXXXX") || return
+    printf '%s\n' "${snapshot##*/}" >"$record_temporary" || return
+    sync -f "$record_temporary" 2>/dev/null || block 'created snapshot recovery record is not durable'
+    mv -Tf "$record_temporary" "$created_record" || return
+    sync -f "$(dirname "$created_record")" 2>/dev/null || block 'created snapshot recovery record publication is not durable'
+    mkdir -m 0700 "$snapshot" || return
+  else
+    snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
+    chmod 0700 "$snapshot" || return
+  fi
   install -m 0600 "$policy" "$snapshot/policy.conf" || return
   install -m 0600 "$state" "$snapshot/state.json" || return
   pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
@@ -1571,8 +1584,7 @@ PY
   restore_adapter_state || die 'candidate health state restoration failed'
   if ! state_matches || ! current_matches || ! units_match; then die 'candidate health changed installed core state'; fi
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
-    publish_deployed_snapshot "$active_policy" "$state_file"
-    if [[ -n ${transaction_dir:-} && -d $transaction_dir ]]; then readlink "$deployed_current" >"$transaction_dir/deployed-created"; fi
+    publish_deployed_snapshot "$active_policy" "$state_file" "$transaction_dir/deployed-created"
   fi
   commit_transaction
   health=healthy

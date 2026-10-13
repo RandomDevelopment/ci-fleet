@@ -430,6 +430,10 @@ exec 7<"${cfg[ADAPTER_PATH]}"
 [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
 adapter_path=/proc/$$/fd/7
 validate_credential
+if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
+  [[ $operation == deploy ]] || die 'pending approval consumption requires mutating installer recovery'
+  python3 "$script_dir/deployer_adapter.py" consumption --store "$log_root" || die 'approval consumption recovery failed'
+fi
 
 run_application_adapter() {
   local action=$1 unit guard=$state_root/.adapter-recovery/pending-unit status=0 seconds=2400 recovery=$state_root/.adapter-recovery
@@ -679,14 +683,16 @@ PY
     snapshot_state_backup=$(base64 -w0 "$snapshot/state.json")
     reject_mixed_role
     validate_credential
+    consumption_record=$(printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=consumed phase=pre-adapter status=none\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}")
+    printf '%s\n' "$consumption_record" | python3 "$script_dir/deployer_adapter.py" consumption --store "$log_root" --prepare || die 'deployment consumption record is not durable'
     audit_pending=1
     audit_phase=pre-adapter
     adapter_status=
     trap deploy_exit EXIT
     trap 'exit 2' INT TERM
-    install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
-    sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
-    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || die 'deployment request consumption is not durable'
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     active_temporary=$temporary
@@ -698,14 +704,6 @@ PY
     active_temporary=
     sync -f "$active" 2>/dev/null || sync "$active" 2>/dev/null || die 'active operation marker is not durable'
     sync -f "$state_root" 2>/dev/null || die 'active operation marker publication is not durable'
-    # Record the durably consumed approval before the adapter runs, so even a
-    # SIGKILL or power loss mid-adapter leaves the attempt's identities.
-    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=consumed phase=pre-adapter status=none\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
-      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
-      >&8 || die 'deployment consumption audit record failed'
-    sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
     audit_prefix_backup=$(base64 -w0 "$audit_log")
     # Preserve the retained rollback pair in unexported process memory. A

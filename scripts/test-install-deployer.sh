@@ -35,6 +35,15 @@ printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" \
   "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence"
 
+export DEPLOYER_TEST_REAL_SYNC
+DEPLOYER_TEST_REAL_SYNC=$(command -v sync)
+cat >"$fake_bin/sync" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${FAKE_FAIL_CREATED_RECORD_SYNC:-0} == 1 && ${2:-} == */.deployed-created.* ]]; then exit 87; fi
+exec "$DEPLOYER_TEST_REAL_SYNC" "$@"
+EOF
+chmod +x "$fake_bin/sync"
+
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
@@ -540,6 +549,8 @@ cp "$root/etc/os-release" "$root/usr/lib/os-release"
 rm "$root/etc/os-release"
 ln -s ../usr/lib/os-release "$root/etc/os-release"
 export FAKE_ADAPTER_FORBID_CONFIG_PATH=$config
+CI_FLEET_DEPLOYER_TEST_SANDBOX=1 FAKE_FAIL_CREATED_RECORD_SYNC=1 expect_failure 'created snapshot recovery record is not durable' "$installer" --install --config "$config" >/dev/null
+[[ ! -L "$root/var/lib/ci-fleet-deployer/deployed/current" ]] || fail 'failed created-snapshot record published a deployment pointer'
 first=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --install --config "$config")
 unset FAKE_ADAPTER_FORBID_CONFIG_PATH
 rm "$root/etc/os-release" "$root/usr/lib/os-release"

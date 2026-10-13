@@ -883,6 +883,12 @@ mkdir -p "$root/etc/systemd/system" "$root/var/lib/ci-fleet-deployer"
 printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+cp "$host_config" "$root/etc/ci-fleet/ci-fleet.env"
+mv "$host_config" "$tmp/adopt-role-host.env.saved"
+expect_failure 'deployer host state is present' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+[[ ! -e "$host_config" ]] || fail 'rejected adopt materialized controller credential state'
+rm "$root/etc/ci-fleet/ci-fleet.env"
+mv "$tmp/adopt-role-host.env.saved" "$host_config"
 rmdir "$root/var/lib/ci-fleet-deployer"
 for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
   mkdir -p "$(dirname "$root$marker")"

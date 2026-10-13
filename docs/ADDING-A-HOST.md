@@ -2,7 +2,7 @@
 
 Use this runbook to add a virtual machine, physical computer, remote-site machine, or VPS to an existing ci-fleet installation.
 
-Controller installation, checks and rollback, including bootstrap last-known-good restoration, reject deployer host state and deployer units in systemd unit-file or loaded-unit inventories, including vendor, runtime and transient units. An unavailable inventory blocks admission. Use a separate host for deployment.
+Controller installation, checks and rollback, including bootstrap last-known-good restoration, reject deployer host state and deployer units in systemd unit-file or loaded-unit inventories, including vendor, runtime and transient units. An unavailable inventory blocks admission. The guard runs before configuration authentication or adoption can materialize host credentials. Use a separate host for deployment.
 
 ## Outcome
 

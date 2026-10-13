@@ -141,20 +141,48 @@ class Containment(unittest.TestCase):
         for acl, rejected in [(OSError(errno.ENODATA, 'absent'), False),
                               (OSError(errno.ENOTSUP, 'unsupported'), False),
                               (b'named-user-acl', True), (OSError(errno.EACCES, 'denied'), True)]:
+            def access_acl(path, *_args, **_kwargs):
+                if str(path) != '/run/docker.sock':
+                    raise OSError(errno.ENODATA, 'absent')
+                if isinstance(acl, OSError):
+                    raise acl
+                return acl
             with self.subTest(acl=acl), patch.object(adapter.socket, 'socket', return_value=peer), \
-                 patch.object(adapter.os, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=45678)), \
+                 patch.object(adapter.os, 'lstat', side_effect=lambda path: SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=45678, st_gid=45678) if str(path) == '/run/rootless/docker.sock' else SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)), \
                  patch.object(adapter.Path, 'read_text', return_value=status), \
                  patch.object(adapter.grp, 'getgrnam', side_effect=KeyError), \
+                 patch.object(adapter.grp, 'getgrgid', return_value=SimpleNamespace(gr_mem=[])), \
+                 patch.object(adapter.pwd, 'getpwall', return_value=[SimpleNamespace(pw_uid=45678, pw_gid=45678)]), \
                  patch.object(adapter.Path, 'exists', return_value=True), \
                  patch.object(adapter.Path, 'resolve', return_value=Path('/run/docker.sock')), \
                  patch.object(adapter.Path, 'stat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFSOCK | 0o660)), \
-                 patch.object(adapter.os, 'getxattr', **({'side_effect': acl} if isinstance(acl, OSError) else {'return_value': acl})):
+                 patch.object(adapter.os, 'getxattr', side_effect=access_acl):
                 connection = adapter.UnixConnection('/run/rootless/docker.sock')
                 if rejected:
                     with self.assertRaises(ValueError):
                         connection.connect()
                 else:
                     connection.connect()
+
+    def test_backend_socket_rejects_other_principals(self):
+        for case in ('safe', 'world', 'wrong-group', 'acl', 'parent-writable', 'parent-owner', 'member', 'primary-member'):
+            with self.subTest(case=case):
+                def metadata(path):
+                    if str(path) == '/run/private/docker.sock':
+                        return SimpleNamespace(st_mode=stat.S_IFSOCK | (0o666 if case == 'world' else 0o660),
+                                               st_uid=45678, st_gid=12345 if case == 'wrong-group' else 45678)
+                    return SimpleNamespace(st_mode=stat.S_IFDIR | (0o777 if case == 'parent-writable' else 0o755),
+                                           st_uid=12345 if case == 'parent-owner' else 0)
+                with patch.object(adapter.os, 'lstat', side_effect=metadata), \
+                     patch.object(adapter.os, 'getxattr', **({'return_value': b'extended'} if case == 'acl' else {'side_effect': OSError(errno.ENODATA, 'absent')})), \
+                     patch.object(adapter.grp, 'getgrgid', return_value=SimpleNamespace(gr_mem=['outsider'] if case == 'member' else [])), \
+                     patch.object(adapter.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=12345)), \
+                     patch.object(adapter.pwd, 'getpwall', return_value=[SimpleNamespace(pw_uid=12345 if case == 'primary-member' else 45678, pw_gid=45678)]):
+                    if case == 'safe':
+                        adapter.check_backend_socket('/run/private/docker.sock', 45678, 45678)
+                    else:
+                        with self.assertRaises(ValueError):
+                            adapter.check_backend_socket('/run/private/docker.sock', 45678, 45678)
 
     def test_pull_ownership_requires_success_and_confirmed_digest(self):
         for status, response, recorded in [(404, b'{"message":"absent"}', False),
@@ -376,6 +404,57 @@ class Containment(unittest.TestCase):
             self.assertEqual([item['Id'] for item in inventory], ['owned'])
             self.assertEqual(inventory[0]['RepoTags'], [])
 
+    def test_credential_store_rejects_inherited_acl_before_exposing_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            with patch.object(adapter.os, 'getxattr', return_value=b'default-named-user-acl'):
+                with self.assertRaises(ValueError):
+                    adapter.materialize_credential(store, self.values, b'secret-canary',
+                                                   os.getuid(), os.getuid(), os.getgid())
+            self.assertEqual(list(store.iterdir()), [])
+
+    def test_consumption_recovers_marker_audit_and_partial_write_crashes(self):
+        line = ('time=2026-10-13T00:00:00Z environment=staging target=app source=' + 'a' * 40
+                + ' artifact=sha256:' + 'b' * 64
+                + ' approval=approval-1 approver=reviewer policy=policy checkpoint=checkpoint authorized_by=none gate=none result=consumed phase=pre-adapter status=none\n')
+        for boundary in ('marker', 'partial-audit', 'retirement'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                store = Path(directory)
+                ledger = store / 'consumed-requests'
+                ledger.mkdir(mode=0o700)
+                audit = store / 'audit.log'
+                adapter.durable_file(audit, b'prior history\n')
+                real_durable, real_write, real_unlink = adapter.durable_file, os.write, Path.unlink
+                def durable(path, body):
+                    if boundary == 'marker' and path.parent == ledger:
+                        raise OSError('simulated power loss before marker publication')
+                    real_durable(path, body)
+                writes = []
+                def write(descriptor, body):
+                    if boundary == 'partial-audit':
+                        if writes:
+                            raise OSError('simulated power loss during audit publication')
+                        writes.append(True)
+                        return real_write(descriptor, body[:len(body) // 2])
+                    return real_write(descriptor, body)
+                def unlink(path, *args, **kwargs):
+                    if boundary == 'retirement' and path.name == 'pending-consumption.json':
+                        raise OSError('simulated power loss after audit publication')
+                    return real_unlink(path, *args, **kwargs)
+                with patch.object(adapter, 'durable_file', side_effect=durable), \
+                     patch.object(adapter.os, 'write', side_effect=write), \
+                     patch.object(Path, 'unlink', unlink):
+                    with self.assertRaises(OSError):
+                        adapter.consume_approval(store, line, os.getuid())
+                self.assertTrue((store / 'pending-consumption.json').exists())
+                adapter.consume_approval(store, uid=os.getuid())
+                self.assertEqual(audit.read_bytes(), b'prior history\n' + line.encode())
+                self.assertEqual(len(list(ledger.iterdir())), 1)
+                self.assertEqual(next(ledger.iterdir()).read_bytes(), b'')
+                self.assertFalse((store / 'pending-consumption.json').exists())
+                adapter.consume_approval(store, uid=os.getuid())
+                self.assertEqual(audit.read_bytes().count(line.encode()), 1)
+
     def test_guard_requires_completed_protected_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory)
@@ -385,7 +464,7 @@ class Containment(unittest.TestCase):
             status = journal / 'status.json'
             with patch.object(adapter, 'trusted_directory'):
                 for operation, state, code, expected in [('rollback', 'inflight', 0, False),
-                                                        ('rollback', 'completed', 1, False),
+                                                        ('rollback', 'completed', 1, True),
                                                         ('rollback', 'completed', 0, True),
                                                         ('health', 'completed', 1, True),
                                                         ('cleanup', 'completed', 1, False)]:
@@ -394,6 +473,8 @@ class Containment(unittest.TestCase):
                     self.assertEqual(adapter.journal_complete(store, unit, os.getuid()), expected)
                 adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'deploy', 'status': 'completed', 'exit_code': 0}).encode())
                 adapter.durable_file(journal / 'docker-uncertain', b'uncertain')
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'rollback', 'status': 'completed', 'exit_code': 1}).encode())
                 self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
 
     def test_failed_forwarded_mutation_keeps_durable_uncertainty(self):
