@@ -189,12 +189,14 @@ class CleanupNetworksTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "run").mkdir()
+            maintenance_calls = []
             with (root / "run/ci-fleet-installer.lock").open("w+") as lock:
                 cleanup.fcntl.flock(lock, cleanup.fcntl.LOCK_EX)
-                remaining, calls, output = self.run_cleanup({"old": network()}, root=root)
+                remaining, calls, output = self.run_cleanup({"old": network()}, root=root, maintenance=maintenance_calls.append)
             self.assertEqual(set(remaining), {"old"})
             self.assertFalse(any(call[:2] == ("network", "rm") for call in calls))
             self.assertIn("DEFER network cleanup installer-active", output)
+            self.assertEqual(maintenance_calls, [])
 
     def test_swarm_or_unknown_daemon_state_defers_network_cleanup(self):
         for state in ("active", "pending", "error", ""):

@@ -14,18 +14,22 @@ state_file=$root/state
 rendered_env=$root/env
 systemd_dir=$root/units
 release_dir=candidate-runtime
-runtime=incumbent-runtime
+runtime=$root/retained-runtime
 timer_names=(ci-fleet-health.timer ci-fleet-cleanup.timer ci-fleet-drift.timer)
+unit_names=(ci-fleet-health.service ci-fleet-cleanup.service ci-fleet-drift.service "${timer_names[@]}")
+capacity_unit_names=(ci-fleet-capacity.service ci-fleet-capacity.timer)
 mkdir -p "$systemd_dir"
+mkdir -p "$runtime/host/systemd" "$runtime/scripts"
+for unit in "${unit_names[@]}"; do printf 'trusted %s\n' "$unit" >"$runtime/host/systemd/$unit"; done
 : >"$state_file"
 printf 'CI_FLEET_ENGINE_REF=%040d\n' 1 >"$rendered_env"
 die() { printf '%s\n' "$*" >&2; exit 1; }
 install_release() { :; }
 install_manager() { [[ $1 == "$engine_ref" && $2 == candidate-runtime ]]; printf '%s\n' "$engine_ref" >"$root/manager-ref"; }
 current_runtime_release() { printf '%s\n' "$runtime"; }
-install_systemd_units() { [[ $1 == incumbent-runtime ]]; }
+install_systemd_units() { [[ $1 == "$runtime" ]]; cp "$runtime/host/systemd/"* "$systemd_dir/"; }
 staged_runtime_matches() { :; }
-systemctl() { printf '%s\n' "$*" >>"$root/systemctl.log"; [[ ${timer_failure:-false} != true ]]; }
+systemctl() { printf '%s\n' "$*" >>"$root/systemctl.log"; [[ ${timer_failure:-false} != true && ${!#} != "${failed_timer:-}" ]]; }
 note() { printf '%s\n' "$*"; }
 printf -v engine_ref '%040d' 2
 stage_manager_only
@@ -42,6 +46,22 @@ set -e
 [[ $status != 0 && $(<"$root/manager-ref") == "$engine_ref" ]]
 timer_failure=false
 stage_manager_only
+printf 'changed\n' >>"$systemd_dir/ci-fleet-drift.service"
+if mandatory_timers_active; then exit 1; fi
+cp "$runtime/host/systemd/ci-fleet-drift.service" "$systemd_dir/ci-fleet-drift.service"
+rm "$systemd_dir/ci-fleet-health.service"
+if mandatory_timers_active; then exit 1; fi
+cp "$runtime/host/systemd/ci-fleet-health.service" "$systemd_dir/ci-fleet-health.service"
+touch "$runtime/scripts/capacity-sample.sh"
+chmod +x "$runtime/scripts/capacity-sample.sh"
+for unit in "${capacity_unit_names[@]}"; do printf 'trusted %s\n' "$unit" >"$runtime/host/systemd/$unit"; done
+install_systemd_units "$runtime"
+mandatory_timers_active
+failed_timer=ci-fleet-capacity.timer
+if mandatory_timers_active; then exit 1; fi
+failed_timer=''
+rm "$systemd_dir/ci-fleet-capacity.timer"
+if mandatory_timers_active; then exit 1; fi
 TEST
 } >"$temporary/staging.sh"
 bash "$temporary/staging.sh" "$temporary"
@@ -182,6 +202,7 @@ function = re.search(r"^validate_candidate_config_commit\(\) \{.*?^\}", (repo / 
 wrapper = root / "validate-staging.sh"
 wrapper.write_text('''set -Eeuo pipefail
 mode=$1
+restore_lkg=false
 repo_root=$2
 temporary=$3
 config_source_checkout=$4

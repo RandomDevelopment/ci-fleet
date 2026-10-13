@@ -250,6 +250,47 @@ resolve_config() {
   config_identity=$config_repo
 }
 
+find_bootstrap_lkg_checkpoint() {
+  python3 - "$repo_root/scripts" "$checkpoints_dir" "${CI_FLEET_LKG_DIR:-$state_root/last-known-good}/metadata.json" "$config_identity" "$config_ref" "$controller_id" "$testing" <<'PYTHON'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+sys.path.insert(0, sys.argv[1])
+from desired_state import parse_env
+owner = os.getuid() if sys.argv[7] == "1" else 0
+
+def trusted(path, directory=False):
+    info = path.lstat()
+    return info.st_uid == owner and stat.S_IMODE(info.st_mode) == (0o700 if directory else 0o600) and (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+
+root, metadata_path = map(Path, sys.argv[2:4])
+expected = dict(zip(("config_repository", "config_ref", "controller"), sys.argv[4:7]))
+if not trusted(metadata_path) or not trusted(root, True):
+    raise SystemExit(1)
+metadata = json.loads(metadata_path.read_text())
+if any(metadata.get(key) != value for key, value in expected.items()):
+    raise SystemExit(1)
+for checkpoint in sorted(root.iterdir(), key=lambda path: path.name, reverse=True):
+    if checkpoint.name.startswith(".") or not trusted(checkpoint, True):
+        continue
+    paths = [checkpoint / name for name in (".complete", "install-state.json", "ci-fleet.env")]
+    if not all(path.exists() and trusted(path) for path in paths):
+        continue
+    state = json.loads(paths[1].read_text())
+    environment = parse_env(paths[2], allow_unknown=True)
+    keys = {"config_repository": "CI_FLEET_CONFIG_REPOSITORY", "config_ref": "CI_FLEET_CONFIG_REF", "controller": "CI_FLEET_INSTANCE"}
+    if any(state.get(key) != value or environment.get(keys[key]) != value for key, value in expected.items()):
+        continue
+    if {"CI_FLEET_CONTROLLER_IMAGE_DIGEST", "CI_FLEET_RUNNER_IMAGE_DIGEST"}.intersection(environment):
+        continue
+    print(checkpoint)
+    raise SystemExit(0)
+raise SystemExit(1)
+PYTHON
+}
+
 validate_candidate_config_commit() {
   retained_installed_ref=false
   local tree_paths=$temporary/config-tree-paths evidence=$temporary/engine-rollout-evidence.json
@@ -260,7 +301,11 @@ validate_candidate_config_commit() {
     git -C "$config_source_checkout" show "$config_ref:engine-rollout-evidence.json" >"$evidence" || die 'cannot read engine rollout evidence'
     args+=(--rollout-evidence "$evidence")
   fi
-  if [[ "$mode" == check && -f "$state_file" && -f "$rendered_env" ]] && python3 - "$repo_root/scripts" "$state_file" "$rendered_env" "$config_ref" "$config_identity" "$controller_id" "$testing" <<'PY'
+  bootstrap_lkg_checkpoint=''
+  if [[ "$restore_lkg" == true ]] && python3 -c 'import json, sys; sys.exit(0 if "managed_images" not in json.load(open(sys.argv[1])) else 1)' "$candidate_config"; then
+    bootstrap_lkg_checkpoint=$(find_bootstrap_lkg_checkpoint) || die 'image-free last-known-good requires a matching protected activation checkpoint'
+    retained_installed_ref=true
+  elif [[ "$mode" == check && -f "$state_file" && -f "$rendered_env" ]] && python3 - "$repo_root/scripts" "$state_file" "$rendered_env" "$config_ref" "$config_identity" "$controller_id" "$testing" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -575,6 +620,10 @@ controller_environment_matches() {
     CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID \
     CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
     expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    if [[ "$key" == CI_FLEET_RUNNER_IMAGE ]] && grep -q '^CI_FLEET_RUNNER_IMAGE_DIGEST=' "$candidate_env" \
+      && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$(current_runtime_release)/deploy/compose.yaml"; then
+      expected=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$candidate_env")
+    fi
     if [[ -z "$expected" && "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR ]]; then
       actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
       [[ -z "$actual" ]] || return 1
@@ -1526,7 +1575,8 @@ make_checkpoint() {
     [[ "$testing" != 1 ]] || expected_owner=$(id -u)
     [[ $(stat -c %u "$rendered_env") == "$expected_owner" && $(stat -c %a "$rendered_env") == 600 ]] || die "rendered environment must be owned by root with mode 0600: $rendered_env"
     install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
-    capture_legacy_image_ids "$checkpoint_dir/ci-fleet.env"
+    install -m 0600 "$rendered_env" "$checkpoint_dir/image-env"
+    capture_legacy_image_ids "$checkpoint_dir/image-env"
     load_checkpoint_images "$checkpoint_dir/ci-fleet.env" || die 'installed image tags are invalid'
     if ! runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null); then
       docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
@@ -1989,7 +2039,7 @@ retag_checkpoint_image() {
 
 restore_checkpoint() {
   local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
-  local restore_controller_tag_after_start=false fresh_path identifier
+  local restore_controller_tag_after_start=false fresh_path identifier image_environment=$checkpoint_dir/ci-fleet.env
   local -a fresh_checkpoint_images=()
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
@@ -2176,7 +2226,21 @@ PY
       note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
       return 1
     fi
-    preflight_checkpoint_images "$checkpoint_release" "$checkpoint_dir/ci-fleet.env" || return 1
+    if [[ -e "$checkpoint_dir/image-env" || -L "$checkpoint_dir/image-env" ]]; then
+      image_environment=$checkpoint_dir/image-env
+      [[ -f "$image_environment" && ! -L "$image_environment" && $(stat -c %u "$image_environment") == "$expected_owner" && $(stat -c %a "$image_environment") == 600 ]] || return 1
+      python3 - "$repo_root/scripts" "$checkpoint_dir/ci-fleet.env" "$image_environment" <<'PYTHON' || return 1
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from desired_state import parse_env
+original, captured = (parse_env(Path(path), allow_unknown=True) for path in sys.argv[2:])
+allowed = {"CI_FLEET_ENGINE_REF", "CI_FLEET_CONTROLLER_IMAGE_DIGEST", "CI_FLEET_RUNNER_IMAGE_DIGEST"}
+if any(captured.get(key) != value for key, value in original.items()) or set(captured) - set(original) - allowed:
+    raise SystemExit(1)
+PYTHON
+    fi
+    preflight_checkpoint_images "$checkpoint_release" "$image_environment" || return 1
     restore_images=true
   elif $new_format && [[ -e "$image_ids" || -L "$image_ids" ]]; then
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
@@ -2446,10 +2510,23 @@ trap on_error ERR
 trap on_term TERM
 
 mandatory_timers_active() {
-  local timer
+  local timer unit retained
+  retained=$(current_runtime_release)
+  [[ -n "$retained" ]] || return 1
+  for unit in "${unit_names[@]}"; do
+    [[ -f "$systemd_dir/$unit" ]] && cmp -s "$retained/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+  done
   for timer in "${timer_names[@]}"; do
     systemctl is-enabled --quiet "$timer" && systemctl is-active --quiet "$timer" || return 1
   done
+  if [[ -x "$retained/scripts/capacity-sample.sh" ]]; then
+    for unit in "${capacity_unit_names[@]}"; do
+      [[ -f "$systemd_dir/$unit" ]] && cmp -s "$retained/host/systemd/$unit" "$systemd_dir/$unit" || return 1
+    done
+    systemctl is-enabled --quiet ci-fleet-capacity.timer && systemctl is-active --quiet ci-fleet-capacity.timer || return 1
+  else
+    for unit in "${capacity_unit_names[@]}"; do [[ ! -e "$systemd_dir/$unit" ]] || return 1; done
+  fi
 }
 
 stage_manager_only() {
@@ -2783,6 +2860,15 @@ case "$mode" in
     validate_candidate_config_commit
     config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'
     verify_configuration_approval
+    if [[ -n "$bootstrap_lkg_checkpoint" ]]; then
+      checkpoint_dir=$bootstrap_lkg_checkpoint
+      candidate_env=$checkpoint_dir/ci-fleet.env
+      docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'
+      restore_checkpoint || die 'last-known-good checkpoint restoration failed'
+      note "ROLLBACK_OK checkpoint=$checkpoint_dir"
+      write_transaction_result applied
+      exit 0
+    fi
     prepare_host_config
     verify_host_files
     select_engine

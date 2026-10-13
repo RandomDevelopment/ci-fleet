@@ -293,6 +293,10 @@ case "${1:-}" in
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$env_file" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
+        if [[ -n ${FAKE_CONTROLLER_ENV_FILE:-} ]] && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$compose_file"; then
+          runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$env_file")
+          sed -i "s|^CI_FLEET_RUNNER_IMAGE=.*|CI_FLEET_RUNNER_IMAGE=$runner_digest|" "$FAKE_CONTROLLER_ENV_FILE"
+        fi
         if [[ -n "${FAKE_CONTROLLER_PROTOCOL_FILE:-}" ]]; then
           printf '<no value>\n' >"$FAKE_CONTROLLER_PROTOCOL_FILE"
           for protocol in v1 v2; do
@@ -1326,14 +1330,31 @@ unset FAKE_RESTART_AFTER_UP
 [[ $(grep -Fc 'ROLLBACK_RESTORED' "$pre_adapter_upgrade_output" || true) == 1 ]] || fail "pre-adapter upgrade did not emit exactly one restored marker: $(<"$pre_adapter_upgrade_output")"
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_current" ]] || fail 'pre-adapter rollback did not restore the exact runtime pointer'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_manager_current" ]] || fail 'pre-adapter rollback did not restore the exact manager pointer'
-grep -v -E '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=' "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" >"$tmp/pre-adapter-restored.env"
-cmp -s "$pre_adapter_rendered" "$tmp/pre-adapter-restored.env" || fail 'pre-adapter rollback changed the prior rendered state'
-grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$(printf '3%.0s' {1..64})" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy rollback did not retain its captured controller ID'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$(printf '4%.0s' {1..64})" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy rollback did not retain its captured runner ID'
+cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'pre-adapter rollback changed the prior rendered state'
+legacy_checkpoint=$(find "$pre_adapter_root/var/lib/ci-fleet/checkpoints" -name image-env | sort | tail -1)
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$(printf '3%.0s' {1..64})" "$legacy_checkpoint" || fail 'legacy checkpoint did not retain its captured controller ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$(printf '4%.0s' {1..64})" "$legacy_checkpoint" || fail 'legacy checkpoint did not retain its captured runner ID'
+pre_adapter_restage=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_staging_ref")
+grep -Fq MANAGER_STAGED <<<"$pre_adapter_restage" || fail 'restored legacy environment prevented manager restaging'
 pre_adapter_converged=$(expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref")
 grep -Fq 'CONVERGED mode=upgrade' <<<"$pre_adapter_converged" || fail 'post-rollback upgrade did not converge to the current engine'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$pre_adapter_root/opt/ci-fleet/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current runtime'
 [[ $(readlink "$pre_adapter_root/opt/ci-fleet/manager/current") == "$pre_adapter_root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'post-rollback upgrade did not activate the current manager'
+install -d -m 0700 "$pre_adapter_root/var/lib/ci-fleet/last-known-good"
+python3 - "$pre_adapter_root/var/lib/ci-fleet/last-known-good/metadata.json" "$config_repo" "$pre_adapter_config_ref" <<'PYTHON'
+import json, os, sys
+with open(sys.argv[1], "w") as stream:
+    json.dump({"config_repository": sys.argv[2], "config_ref": sys.argv[3], "controller": "example-ci-01", "saved_at": 1}, stream)
+os.chmod(sys.argv[1], 0o600)
+PYTHON
+(
+  exec 9>"$pre_adapter_root/run/ci-fleet-installer.lock"
+  flock -n 9
+  expect_success "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >"$tmp/bootstrap-lkg-restore.out"
+)
+grep -Fq ROLLBACK_OK "$tmp/bootstrap-lkg-restore.out" || fail 'image-free bootstrap LKG was not restored'
+cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'bootstrap LKG restore changed its original environment'
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE
 
 # Introduce current-runtime capability evidence before enabling the managed policy.
@@ -2782,7 +2803,9 @@ grep -Fxq "CI_FLEET_RUNNER_IMAGE=$prior_runner_image" "$rendered_env" || fail 's
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE" "$rendered_env" || fail 'same-controller-tag build failure changed installed controller state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'same-controller-tag build failure changed the installed manager'
 unset FAKE_COMPOSE_LOG
-python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], "CI_FLEET_RUNNER_IMAGE="))' "$FAKE_CONTROLLER_ENV_FILE" "CI_FLEET_RUNNER_IMAGE=$prior_runner_image"
+prior_live_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {print $2}' "$FAKE_CONTROLLER_ENV_FILE")
+[[ "$prior_live_runner_image" == "sha256:$runner_image_digest" ]] || fail 'controller did not receive the reviewed runner image ID'
+python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], "CI_FLEET_RUNNER_IMAGE="))' "$FAKE_CONTROLLER_ENV_FILE" "CI_FLEET_RUNNER_IMAGE=$prior_live_runner_image"
 empty_live_image_output=$tmp/empty-live-image-build.out
 export FAKE_COMPOSE_LOG=$tmp/empty-live-image-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
@@ -2800,7 +2823,7 @@ grep -Fxq "CI_FLEET_RUNNER_IMAGE=$prior_runner_image" "$rendered_env" || fail 'e
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=" "$FAKE_CONTROLLER_ENV_FILE" || fail 'preparation failure changed the incumbent runtime environment'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'empty live runner image build failure changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'empty live runner image build failure changed the installed manager'
-python3 - "$FAKE_CONTROLLER_ENV_FILE" "$prior_runner_image" <<'PYTHON'
+python3 - "$FAKE_CONTROLLER_ENV_FILE" "$prior_live_runner_image" <<'PYTHON'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
@@ -2808,7 +2831,7 @@ path.write_text(path.read_text().replace("CI_FLEET_RUNNER_IMAGE=\n", "CI_FLEET_R
 PYTHON
 unset FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_EMPTY_LIVE_IMAGE_BUILD:-0} != 1 ]] || { printf 'EMPTY_LIVE_IMAGE_BUILD_REGRESSION_OK\n'; exit 0; }
-python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$FAKE_CONTROLLER_ENV_FILE" "$prior_runner_image" "$FAKE_RUNNER_IMAGE"
+python3 -c 'from pathlib import Path; import sys; path = Path(sys.argv[1]); path.write_text(path.read_text().replace(sys.argv[2], sys.argv[3]))' "$FAKE_CONTROLLER_ENV_FILE" "$prior_live_runner_image" "$FAKE_RUNNER_IMAGE"
 live_drift_build_output=$tmp/live-drift-build.out
 export FAKE_COMPOSE_LOG=$tmp/live-drift-build-compose.log
 : >"$FAKE_COMPOSE_LOG"
@@ -3035,7 +3058,7 @@ grep -Fq 'DRAIN_OK managed_runners=0' "$restartable_tag_build_output" || fail 'r
 grep -Fq 'ROLLBACK_RESTORED' "$restartable_tag_build_output" || fail 'matching-image timer activation failure did not restore the checkpoint'
 [[ -f "$FAKE_DOCKER_STATE" && ! -f "$FAKE_CONTROLLER_STATUS_FILE" ]] || fail 'matching-image timer activation failure did not restore the installed controller'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'matching-image timer activation failure changed installed environment'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$FAKE_CONTROLLER_ENV_FILE" || fail 'matching-image timer activation failure did not restore the installed controller environment'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE=sha256:$runner_image_digest" "$FAKE_CONTROLLER_ENV_FILE" || fail 'matching-image timer activation failure did not restore the installed controller environment'
 grep -Fq 'CI_FLEET_MAX_RUNNERS=1' "$rendered_env" || fail 'matching-image timer activation failure changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'matching-image timer activation failure changed the installed manager'
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "$prior_runner_image_id" ]] || fail 'timer rollback changed the reviewed runner image ID'

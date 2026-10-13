@@ -70,7 +70,7 @@ def protected_images() -> set[str]:
         coordination.trusted_path(checkpoints, directory=True)
         for directory in checkpoints.iterdir():
             coordination.trusted_path(directory, directory=True)
-            for name in ("ci-fleet.env", "image-ids.env", "fresh-image-env", "fresh-image-ids"):
+            for name in ("ci-fleet.env", "image-env", "image-ids.env", "fresh-image-env", "fresh-image-ids"):
                 path = directory / name
                 if path.exists() or path.is_symlink():
                     files.append(path)

@@ -67,7 +67,7 @@ services:
       CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-}
       CI_FLEET_LABELS: ${CI_FLEET_LABELS:-docker-ci-experimental}
       CI_FLEET_RUNNER_GROUP: ${CI_FLEET_RUNNER_GROUP:-Default}
-      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}
       CI_FLEET_INSTANCE: ${CI_FLEET_INSTANCE:?set a unique stable host identifier}
       CI_FLEET_GITHUB_APP_CLIENT_ID: ${CI_FLEET_GITHUB_APP_CLIENT_ID:?set the GitHub App client ID}
       CI_FLEET_GITHUB_APP_INSTALLATION_ID: ${CI_FLEET_GITHUB_APP_INSTALLATION_ID:?set the installation ID}
