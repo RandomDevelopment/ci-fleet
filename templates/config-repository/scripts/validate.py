@@ -818,9 +818,13 @@ def main() -> int:
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
+    if config is None:
+        validate_config(config, validation, args.strict)
     if config is not None:
         scan_secret_material(config, validation)
         previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
+        if isinstance(config, dict) and "managed_images" not in config and args.previous_config:
+            validate_config(previous_for_bootstrap, validation, False)
         validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict))
         current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
         bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)

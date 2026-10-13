@@ -201,6 +201,13 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("initial strict configuration requires reviewed image IDs", result.stderr)
             result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for invalid_previous in ({}, None, current):
+                baseline.write_text(json.dumps(invalid_previous))
+                result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, (invalid_previous, result.stdout, result.stderr))
+            candidate.write_text("null")
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
     def test_storage_retention_schema_requires_explicit_exclusive_admission(self) -> None:
         controller = contract_schema()["$defs"]["controller"]
         self.assertNotIn("docker_storage_retention", controller["required"])
