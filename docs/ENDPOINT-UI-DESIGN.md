@@ -1,6 +1,10 @@
 # Endpoint observation UI
 
-Status: proposed ADR for [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). Implementation is planned. This document adds no supported command, schema field, service, listener, or engine capability. A reviewed merge accepts the design; installation and network access still require their separate authorization.
+Implementation status: planned. This ADR addresses [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It adds no supported command, schema field, service, listener, or engine capability.
+
+## Acceptance record
+
+[PR #126](https://github.com/RandomDevelopment/ci-fleet/pull/126) is the durable acceptance record. The design is proposed while that PR is open and becomes accepted when the reviewed PR merges into `main`. Closing it without a merge leaves the design unaccepted. Its merge commit identifies the accepted design revision. Later changes require their own reviewed PRs. Design acceptance does not authorize installation, credentials, or network access.
 
 ## Decision and scope
 
@@ -135,7 +139,7 @@ Version local exports and read responses independently. Unsupported contracts fa
 | --- | --- |
 | [#118 snapshots](https://github.com/RandomDevelopment/ci-fleet/issues/118) and [#119 history](https://github.com/RandomDevelopment/ci-fleet/issues/119) | Implement the approved local contracts, with source validity and bounded independent failure |
 | [#120 diagnostics](https://github.com/RandomDevelopment/ci-fleet/issues/120) and [#121 worker UI](https://github.com/RandomDevelopment/ci-fleet/issues/121) | Consume the contracts; missing upstream failure evidence stays unknown |
-| [#122 packaging](https://github.com/RandomDevelopment/ci-fleet/issues/122) | Reconcile with accepted worker-installer changes from PRs #69, #74, and #76; complete existing CI and separately authorized host proof |
+| [#122 packaging](https://github.com/RandomDevelopment/ci-fleet/issues/122) | Build on the accepted [worker desired-state lifecycle](DESIRED-STATE.md). At the review introducing this ADR, #69/#76 proposed additional role-admission changes and #74 proposed reviewed-image changes; none was an accepted dependency. Check their current state, coordinate overlap, and incorporate those contracts only after acceptance; preserve existing CI and separately authorized host proof |
 | [#123 fleet console](https://github.com/RandomDevelopment/ci-fleet/issues/123) | Follow [#66 receiver deployment](https://github.com/RandomDevelopment/ci-fleet/issues/66), with no inbound worker polling |
 | [#124 tester](https://github.com/RandomDevelopment/ci-fleet/issues/124) | Follow accepted tester contracts; show environment health, immutable revisions, expiry and recovery; preserve application ingress and forbid reset/removal |
 | [#125 deployer](https://github.com/RandomDevelopment/ci-fleet/issues/125) | Follow accepted deployer contracts; show target, approved/deployed artifacts, guards and recovery; grant no deployment or production authority |

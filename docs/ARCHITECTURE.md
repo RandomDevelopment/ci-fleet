@@ -170,7 +170,7 @@ See [Network reclamation](HOST-MAINTENANCE.md#network-reclamation).
 
 ## Planned endpoint observation
 
-The [endpoint observation UI proposal](ENDPOINT-UI-DESIGN.md) defines a future optional host service on loopback port 80, authenticated through an independently provisioned HTTPS gateway. It keeps observation independent of Docker and preserves role, credential, configuration, and outbound-reporting boundaries. No endpoint UI or inbound listener is implemented by that design.
+The [endpoint observation UI design](ENDPOINT-UI-DESIGN.md) defines a future optional host service on loopback port 80, authenticated through an independently provisioned HTTPS gateway. Its [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) distinguishes the proposal from a reviewed decision. It keeps observation independent of Docker and preserves role, credential, configuration, and outbound-reporting boundaries. No endpoint UI or inbound listener is implemented by that design.
 
 ## Project adoption
 
