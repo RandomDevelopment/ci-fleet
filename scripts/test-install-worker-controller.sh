@@ -290,7 +290,7 @@ case "${1:-}" in
         fi
         : >"$state"
         [[ -z "$stopped_state" ]] || rm -f "$stopped_state"
-        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$env_file" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
+        [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || "$0" image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_image" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
         [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n ${FAKE_CONTROLLER_ENV_FILE:-} ]] && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$compose_file"; then
