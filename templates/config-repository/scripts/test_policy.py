@@ -177,6 +177,30 @@ class PolicyTests(unittest.TestCase):
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
         config = json.loads((ROOT / "fleet.json").read_text())
         self.assert_rejected(config, "replace the fixture image digest", strict=True)
+
+    def test_strict_image_omission_requires_staging_transition(self) -> None:
+        current = reference_config()
+        project = first_project(current)
+        current["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+        current["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
+        project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+        current.pop("managed_images")
+        for controller in current["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        previous = copy.deepcopy(current)
+        for controller in current["controllers"].values():
+            controller["engine_ref"] = "3" * 40
+        self.assert_rejected(current, "initial strict configuration requires reviewed image IDs", strict=True)
+        with tempfile.TemporaryDirectory() as directory:
+            candidate, baseline = (Path(directory) / name for name in ("current.json", "previous.json"))
+            candidate.write_text(json.dumps(current))
+            baseline.write_text(json.dumps(previous))
+            command = [sys.executable, str(ROOT / "scripts/validate.py"), "--strict", "--skip-path-scan", "--config", str(candidate)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("initial strict configuration requires reviewed image IDs", result.stderr)
+            result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
     def test_storage_retention_schema_requires_explicit_exclusive_admission(self) -> None:
         controller = contract_schema()["$defs"]["controller"]
         self.assertNotIn("docker_storage_retention", controller["required"])

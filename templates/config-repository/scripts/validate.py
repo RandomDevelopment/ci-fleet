@@ -296,7 +296,7 @@ def scan_tree_path_list(path_list: Path, validation: Validation) -> None:
             validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
 
 
-def validate_config(config: Any, validation: Validation, strict: bool) -> None:
+def validate_config(config: Any, validation: Validation, strict: bool, *, allow_manager_staging: bool = False) -> None:
     required_top = {
         "schema_version",
         "organization",
@@ -373,6 +373,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
 
     managed_images = config.get("managed_images")
     if "managed_images" not in config:
+        validation.require(not strict or allow_manager_staging, "$.managed_images", "initial strict configuration requires reviewed image IDs; staging omission needs the previous configuration")
         managed_images = {}
     elif config.get("managed_images") is None:
         validation.errors.append("$.managed_images: null is not a valid manager-only staging omission")
@@ -819,9 +820,9 @@ def main() -> int:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
     if config is not None:
         scan_secret_material(config, validation)
-        validate_config(config, validation, args.strict)
-        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
         previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
+        validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict))
+        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
         bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)
         if bootstrap:
             previous_bootstrap_evidence = load_json(args.previous_rollout_evidence.absolute(), validation) if args.previous_rollout_evidence else None

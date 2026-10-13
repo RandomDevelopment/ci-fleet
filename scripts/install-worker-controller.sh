@@ -240,7 +240,7 @@ resolve_config() {
   config_source_checkout=$checkout
   git init -q "$checkout"
   git -C "$checkout" remote add origin "https://github.com/${config_repo}.git"
-  if ! GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --filter=blob:none --depth=1 origin "$config_ref"; then
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$checkout" fetch -q --filter=blob:none --depth=2 origin "$config_ref"; then
     die 'configuration fetch failed; configure a read-only credential on this host or use a local pinned checkout'
   fi
   resolved=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
@@ -251,11 +251,23 @@ resolve_config() {
 
 validate_candidate_config_commit() {
   local tree_paths=$temporary/config-tree-paths evidence=$temporary/engine-rollout-evidence.json
+  local previous=$temporary/staging-previous.json previous_evidence=$temporary/staging-previous-evidence.json
   local args=(--config "$candidate_config" --strict --tree-paths "$tree_paths")
   git -C "$config_source_checkout" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
   if git -C "$config_source_checkout" cat-file -e "$config_ref:engine-rollout-evidence.json" 2>/dev/null; then
     git -C "$config_source_checkout" show "$config_ref:engine-rollout-evidence.json" >"$evidence" || die 'cannot read engine rollout evidence'
     args+=(--rollout-evidence "$evidence")
+  fi
+  if [[ ( "$mode" == upgrade || "$mode" == check ) && -f "$state_file" && -f "$rendered_env" ]] \
+    && python3 -c 'import json, sys; value=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(value, dict) and "managed_images" not in value else 1)' "$candidate_config"; then
+    git -C "$config_source_checkout" show "$config_ref^:fleet.json" >"$previous" \
+      || die 'manager staging requires its previous configuration commit'
+    args+=(--previous-config "$previous")
+    if git -C "$config_source_checkout" cat-file -e "$config_ref^:engine-rollout-evidence.json" 2>/dev/null; then
+      git -C "$config_source_checkout" show "$config_ref^:engine-rollout-evidence.json" >"$previous_evidence" \
+        || die 'cannot read previous manager-staging evidence'
+      args+=(--previous-rollout-evidence "$previous_evidence")
+    fi
   fi
   python3 "$repo_root/templates/config-repository/scripts/validate.py" \
     "${args[@]}" || die 'configuration commit validation failed'

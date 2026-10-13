@@ -147,4 +147,52 @@ printf 'printf "older-release-contract %%s %%s\\n" "$1" "$2"\n' >"$root/older-re
 TEST
 } >"$temporary/release-build.sh"
 bash "$temporary/release-build.sh" "$temporary"
+python3 - "$repo_root" "$temporary" <<'PYTHON'
+import copy
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+repo, root = map(Path, sys.argv[1:])
+configuration = root / "staging-config"
+configuration.mkdir()
+value = json.loads((repo / "templates/config-repository/fleet.json").read_text())
+value.pop("managed_images")
+value["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+project = next(iter(value["projects"].values()))
+value["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
+project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+for controller in value["controllers"].values():
+    controller.pop("docker_network_policy", None)
+subprocess.run(["git", "init", "-q", str(configuration)], check=True)
+for index in range(2):
+    candidate = copy.deepcopy(value)
+    for controller in candidate["controllers"].values():
+        controller["engine_ref"] = str(index + 1) * 40
+    (configuration / "fleet.json").write_text(json.dumps(candidate))
+    subprocess.run(["git", "-C", str(configuration), "add", "fleet.json"], check=True)
+    subprocess.run(["git", "-C", str(configuration), "-c", "user.name=fixture", "-c", "user.email=fixture@invalid.example", "commit", "-qm", "fixture"], check=True)
+function = re.search(r"^validate_candidate_config_commit\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
+wrapper = root / "validate-staging.sh"
+wrapper.write_text('''set -Eeuo pipefail
+mode=$1
+repo_root=$2
+temporary=$3
+config_source_checkout=$4
+config_ref=$(git -C "$config_source_checkout" rev-parse HEAD)
+candidate_config=$config_source_checkout/fleet.json
+state_file=$temporary/state
+rendered_env=$temporary/env
+mkdir -p "$temporary"
+if [[ "$mode" != install ]]; then touch "$state_file" "$rendered_env"; fi
+die() { printf '%s\\n' "$*" >&2; exit 1; }
+''' + function + "\nvalidate_candidate_config_commit\n")
+for mode in ("upgrade", "check", "install"):
+    result = subprocess.run(["bash", str(wrapper), mode, str(repo), str(root / ("context-" + mode)), str(configuration)], capture_output=True, text=True)
+    assert (result.returncode == 0) == (mode != "install"), (mode, result.stdout, result.stderr)
+    if mode == "install":
+        assert "initial strict configuration requires reviewed image IDs" in result.stderr
+PYTHON
 printf 'MANAGER_STAGING_AND_IMAGE_RECOVERY_TESTS_OK\n'
