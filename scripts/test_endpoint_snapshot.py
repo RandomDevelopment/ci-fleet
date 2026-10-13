@@ -103,6 +103,16 @@ class SnapshotTests(unittest.TestCase):
                 self.assertEqual(value['sources']['installation']['data']['lifecycle'], lifecycle)
                 self.assertEqual(value['sources']['configuration']['availability'], 'available')
 
+    def test_controller_version_matches_the_existing_status_contract(self):
+        for version in ("dev", "unknown", "v1.2.3-rc.1+build", "3" * 40):
+            with self.subTest(version=version):
+                docs = documents()
+                docs["controller"]["software_version"] = version
+                source = self.build(docs)["sources"]["controller"]
+                self.assertEqual(source["availability"], "available")
+                self.assertEqual(source["data"]["software_version"], version)
+                self.assertEqual(source["data"]["current"], 2)
+
     def test_capacity_and_dynamic_service_diagnostics_are_distinct_and_redacted(self):
         docs = documents()
         docs['health']['checks'] += [
@@ -179,7 +189,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_invalid_counts_times_and_policy_values_fail_independently(self):
         for field, bad in (("current", False), ("busy", 3), ("maximum", -1), ("generated_at", NOW + 1),
-                           ("software_version", "arbitrary-private-value")):
+                           ("software_version", "arbitrary private value")):
             docs = documents()
             docs["controller"][field] = bad
             value = self.build(docs)
@@ -403,6 +413,30 @@ class SnapshotReadbackTests(unittest.TestCase):
                 docs["health"]["checks"][0]["status"] = status
                 value = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
                 value["clock_state"] = claim
+                store.publish_endpoint(self.base, value, self.gid)
+                with self.assertRaises(snapshot.SnapshotError):
+                    self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
+
+    def test_reader_rejects_reconciliation_without_installation_time_binding(self):
+        for changed in ("old_check", "retained_old_check", "absent", "unavailable"):
+            with self.subTest(changed=changed):
+                value = snapshot.build_snapshot(CONTROLLER, documents(), {}, now=NOW)
+                if changed in {"old_check", "retained_old_check"}:
+                    source = value["sources"]["reconciliation"]
+                    source["observed_at"] = source["last_success_at"] = NOW - 200
+                    source["data"]["last_success_at"] = NOW - 200
+                    if changed == "retained_old_check":
+                        source["availability"] = "unavailable"
+                        source["observed_at"] = None
+                        source["error"] = "source_timeout"
+                elif changed == "absent":
+                    value["sources"]["installation"] = snapshot.evidence({"record_state": "absent"}, observed_at=NOW)
+                    value["sources"]["configuration"] = snapshot.failure("revision_unverified")
+                    del value["sources"]["controller"]["data"]["matches_reviewed_maximum"]
+                else:
+                    value["sources"]["installation"] = snapshot.failure("source_timeout", value["sources"]["installation"])
+                    value["sources"]["configuration"] = snapshot.failure("revision_unverified")
+                    del value["sources"]["controller"]["data"]["matches_reviewed_maximum"]
                 store.publish_endpoint(self.base, value, self.gid)
                 with self.assertRaises(snapshot.SnapshotError):
                     self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)

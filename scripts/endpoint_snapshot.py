@@ -21,7 +21,7 @@ MAX_BYTES = 65_536
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 CONTROLLER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
-VERSION = re.compile(r"(?:[0-9a-f]{40}|v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)")
+VERSION = re.compile(r"[A-Za-z0-9_.+-]{1,64}")
 BEARER = re.compile(r"[A-Za-z0-9_-]{43}")
 AVAILABILITY = {"available", "not_configured", "unsupported", "unavailable", "unknown"}
 ERRORS = {"not_found", "source_unsafe", "source_too_large", "source_invalid", "source_unavailable",
@@ -377,6 +377,7 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
             timestamp(source["data"]["last_success_at"], source["last_success_at"])
     policy = value["sources"]["installation"]
     configuration = value["sources"]["configuration"]
+    reconciliation = value["sources"]["reconciliation"]
     runtime = value["sources"]["controller"]
     if value["clock_state"] != clock_state(value["sources"], value["published_at"]):
         raise SnapshotError("invalid_snapshot")
@@ -393,6 +394,10 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
             raise SnapshotError("invalid_snapshot")
         matches = runtime["data"]["maximum"] == policy["data"]["reviewed_maximum"]
         if runtime["data"]["matches_reviewed_maximum"] != matches:
+            raise SnapshotError("invalid_snapshot")
+    if reconciliation["data"]:
+        if (policy["availability"] != "available" or policy["data"].get("record_state") != "installed"
+                or reconciliation["last_success_at"] < policy["data"]["installed_at"]):
             raise SnapshotError("invalid_snapshot")
     try:
         encoded = (json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode()
