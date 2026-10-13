@@ -54,6 +54,34 @@ class SnapshotStoreTests(unittest.TestCase):
     def read(self) -> dict:
         return store.read_endpoint(self.base, self.observer_gid)
 
+    def test_private_exports_reject_access_default_and_uninspectable_acls(self) -> None:
+        self.publish({'incumbent': True})
+        before = self.endpoint.read_bytes()
+        for attribute in ('system.posix_acl_access', 'system.posix_acl_default', 'denied'):
+            with self.subTest(attribute=attribute):
+                def acl(descriptor, name):
+                    if attribute == 'denied':
+                        raise OSError(errno.EACCES, 'denied')
+                    if name == attribute:
+                        return b'extended-acl'
+                    raise OSError(errno.ENODATA, 'absent')
+                with patch.object(store.os, 'getxattr', side_effect=acl):
+                    self.assert_error('unsafe_path', self.publish, {'replacement': True})
+                    self.assert_error('unsafe_path', self.read)
+                self.assertEqual(self.endpoint.read_bytes(), before)
+
+    def test_export_file_acl_is_rejected_without_replacing_incumbent(self) -> None:
+        self.publish({'incumbent': True})
+        before = self.endpoint.read_bytes()
+        def acl(descriptor, name):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return b'extended-acl'
+            raise OSError(errno.ENODATA, 'absent')
+        with patch.object(store.os, 'getxattr', side_effect=acl):
+            self.assert_error('unsafe_file', self.read)
+            self.assert_error('unsafe_file', self.publish, {'replacement': True})
+        self.assertEqual(self.endpoint.read_bytes(), before)
+
     def test_atomic_publication_has_protected_metadata(self) -> None:
         self.publish({"schema_version": 1, "controller": "example"})
         self.assertEqual(self.read(), {"schema_version": 1, "controller": "example"})

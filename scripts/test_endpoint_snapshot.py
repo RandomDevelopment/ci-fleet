@@ -23,7 +23,7 @@ def documents():
         "installation": {"schema_version": 1, "controller": CONTROLLER, "controller_state": "active",
                          "installed_at": dt.datetime.fromtimestamp(NOW - 100, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "config_ref": "1" * 40, "engine_ref": "2" * 40, "pool": "validation",
-                         "lifecycle": "disposable", "configured_max_runners": 4, "capacity_budget": 8,
+                         "lifecycle": "stable", "configured_max_runners": 4, "capacity_budget": 8,
                          "architecture": "amd64", "scale_set_name": "example-scale-set",
                          "status_reporting_configured": True, "status_reporting_required": False},
         "rendered": {"CI_FLEET_INSTANCE": CONTROLLER, "CI_FLEET_CONFIG_REF": "1" * 40,
@@ -83,7 +83,8 @@ class SnapshotTests(unittest.TestCase):
 
     def test_publisher_preserves_incumbent_during_clock_rollback(self):
         previous = self.build()
-        with patch.object(snapshot, 'read_endpoint', return_value=previous), \
+        with patch.object(snapshot, 'publication_lock'), \
+             patch.object(snapshot, 'read_endpoint', return_value=previous), \
              patch.object(snapshot, 'collect_documents', return_value=(documents(), {})), \
              patch.object(snapshot, 'publish_endpoint') as publish:
             self.assert_snapshot_error(lambda: snapshot.publish(CONTROLLER, observer_gid=1, now=NOW - 5),
@@ -91,6 +92,29 @@ class SnapshotTests(unittest.TestCase):
             publish.assert_not_called()
         value = self.build(previous=previous, now=NOW + 1)
         self.assertEqual(value['sources']['controller']['observed_at'], NOW - 10)
+
+    def test_authoritative_lifecycle_values_are_available(self):
+        for lifecycle in ('experimental', 'stable', 'retiring'):
+            with self.subTest(lifecycle=lifecycle):
+                docs = documents(); docs['installation']['lifecycle'] = lifecycle
+                value = self.build(docs)
+                self.assertEqual(value['sources']['installation']['data']['lifecycle'], lifecycle)
+                self.assertEqual(value['sources']['configuration']['availability'], 'available')
+
+    def test_capacity_and_dynamic_service_diagnostics_are_distinct_and_redacted(self):
+        docs = documents()
+        docs['health']['checks'] += [
+            {'id': 'capacity', 'status': 'ok', 'configured': {'max': 4}, 'effective': {'max': 4}},
+            {'id': 'capacity', 'status': 'critical', 'state': 'failed'},
+            *({'id': name, 'status': 'warning', 'message': 'PRIVATE-DETAIL'}
+              for name in ('stale_container', 'timer_capacity', 'reconcile')),
+        ]
+        value = self.build(docs)
+        health = value['sources']['health']
+        self.assertEqual(health['availability'], 'available')
+        self.assertEqual({check['id'] for check in health['data']['checks']},
+                         {'clock', 'docker', 'capacity', 'capacity_service', 'stale_container', 'timer_capacity', 'reconcile'})
+        self.assertNotIn('PRIVATE-DETAIL', json.dumps(value))
 
     def test_source_loss_retains_original_last_success_without_zero_fallback(self):
         previous = self.build()
@@ -247,6 +271,16 @@ class SnapshotReadbackTests(unittest.TestCase):
                     self.reader.read(headers, now=NOW)
                 self.assertEqual(caught.exception.code, "authentication_failed")
                 read.assert_not_called()
+
+    def test_publisher_holds_writer_lock_during_collection(self):
+        def collect(*args, **kwargs):
+            with self.assertRaises(store.StoreError) as error:
+                with store.publication_lock(self.base, self.gid):
+                    self.fail('overlapping publisher acquired the writer lock')
+            self.assertEqual(error.exception.code, 'busy')
+            return documents(), {}
+        with patch.object(snapshot, 'collect_documents', side_effect=collect):
+            snapshot.publish(CONTROLLER, observer_gid=self.gid, root=self.root, now=NOW)
 
     def test_publish_and_authenticated_read_keep_sources_out_of_consumer_access(self):
         with patch.object(snapshot, "collect_documents", return_value=(documents(), {})):

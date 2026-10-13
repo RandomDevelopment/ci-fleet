@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import errno
 import fcntl
 import json
@@ -43,6 +44,16 @@ def _os_error(error: OSError) -> StoreError:
     if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
         return StoreError("unsafe_path")
     return StoreError("io")
+
+
+def _no_acl(descriptor: int, code: str) -> None:
+    for name in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            os.getxattr(descriptor, name)
+        except OSError as error:
+            _require(error.errno in (errno.ENODATA, errno.ENOTSUP), code)
+        else:
+            raise StoreError(code)
 
 
 def _directory(metadata: os.stat_result, *, sticky_tmp: bool = False) -> None:
@@ -86,6 +97,8 @@ def _read_at(directory_fd: int, name: str, *, modes: tuple[int, ...], max_bytes:
     try:
         actual = os.fstat(descriptor)
         _regular(actual, modes=modes, max_bytes=max_bytes, gid=gid)
+        if gid is not None:
+            _no_acl(descriptor, "unsafe_file")
         _require((before.st_dev, before.st_ino) == (actual.st_dev, actual.st_ino), "unsafe_file")
         deadline = time.monotonic() + READ_TIMEOUT_SECONDS
         value = bytearray()
@@ -164,10 +177,12 @@ def _open_exports(base: Path, observer_gid: int) -> int:
         metadata = os.fstat(base_fd)
         _require(metadata.st_uid == OWNER_UID and metadata.st_gid == observer_gid
                  and stat.S_IMODE(metadata.st_mode) == 0o750, "unsafe_path")
+        _no_acl(base_fd, "unsafe_path")
         exports_fd = os.open("exports", DIRECTORY_FLAGS, dir_fd=base_fd)
         metadata = os.fstat(exports_fd)
         _require(metadata.st_uid == OWNER_UID and metadata.st_gid == observer_gid
                  and stat.S_IMODE(metadata.st_mode) == 0o750, "unsafe_path")
+        _no_acl(exports_fd, "unsafe_path")
         return exports_fd
     except BaseException:
         if exports_fd is not None:
@@ -177,7 +192,28 @@ def _open_exports(base: Path, observer_gid: int) -> int:
         os.close(base_fd)
 
 
+@contextmanager
+def publication_lock(base: Path, observer_gid: int):
+    descriptor = None
+    try:
+        descriptor = _open_exports(base, observer_gid)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StoreError("busy") from None
+        yield descriptor
+    except OSError as error:
+        raise _os_error(error) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _validate_exports(directory_fd: int, observer_gid: int) -> tuple[list[str], int]:
+    metadata = os.fstat(directory_fd)
+    _require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == OWNER_UID
+             and metadata.st_gid == observer_gid and stat.S_IMODE(metadata.st_mode) == 0o750, "unsafe_path")
+    _no_acl(directory_fd, "unsafe_path")
     temporary = []
     total = 0
     with os.scandir(directory_fd) as entries:
@@ -193,12 +229,21 @@ def _validate_exports(directory_fd: int, observer_gid: int) -> tuple[list[str], 
                 temporary.append(entry.name)
             else:
                 _regular(metadata, modes=(0o640,), max_bytes=limit, gid=observer_gid)
+            if stat.S_IMODE(metadata.st_mode) == 0o640:
+                descriptor = os.open(entry.name, READ_FLAGS, dir_fd=directory_fd)
+                try:
+                    actual = os.fstat(descriptor)
+                    _regular(actual, modes=(0o640,), max_bytes=limit, gid=observer_gid)
+                    _require((metadata.st_dev, metadata.st_ino) == (actual.st_dev, actual.st_ino), "unsafe_file")
+                    _no_acl(descriptor, "unsafe_file")
+                finally:
+                    os.close(descriptor)
             total += metadata.st_size
             _require(total <= MAX_EXPORT_BYTES, "too_large")
     return temporary, total
 
 
-def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int) -> None:
+def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int, *, _directory_fd: int | None = None) -> None:
     _require(isinstance(snapshot, dict), "invalid_json")
     try:
         value = (json.dumps(snapshot, separators=(",", ":"), sort_keys=True, ensure_ascii=False,
@@ -206,14 +251,15 @@ def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int) ->
     except (UnicodeError, TypeError, ValueError, RecursionError):
         raise StoreError("invalid_json") from None
     _require(len(value) <= MAX_ENDPOINT_BYTES, "too_large")
-    directory_fd = None
+    directory_fd = _directory_fd
     temporary_fd = None
     try:
-        directory_fd = _open_exports(base, observer_gid)
-        try:
-            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise StoreError("busy") from None
+        if directory_fd is None:
+            directory_fd = _open_exports(base, observer_gid)
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise StoreError("busy") from None
         temporary, _ = _validate_exports(directory_fd, observer_gid)
         for name in temporary:
             os.unlink(name, dir_fd=directory_fd)
@@ -224,6 +270,7 @@ def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int) ->
         os.fchmod(temporary_fd, 0o600)
         metadata = os.fstat(temporary_fd)
         _regular(metadata, modes=(0o600,), max_bytes=MAX_ENDPOINT_BYTES, gid=INITIAL_GID)
+        _no_acl(temporary_fd, "unsafe_file")
         offset = 0
         while offset < len(value):
             written = os.write(temporary_fd, value[offset:])
@@ -241,19 +288,20 @@ def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int) ->
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
-        if directory_fd is not None:
+        if _directory_fd is None and directory_fd is not None:
             os.close(directory_fd)
 
 
-def read_endpoint(base: Path, observer_gid: int) -> dict[str, Any]:
-    directory_fd = None
+def read_endpoint(base: Path, observer_gid: int, *, _directory_fd: int | None = None) -> dict[str, Any]:
+    directory_fd = _directory_fd
     try:
-        directory_fd = _open_exports(base, observer_gid)
+        if directory_fd is None:
+            directory_fd = _open_exports(base, observer_gid)
         _validate_exports(directory_fd, observer_gid)
         return decode_json(_read_at(directory_fd, "endpoint.json", modes=(0o640,),
                                    max_bytes=MAX_ENDPOINT_BYTES, gid=observer_gid))
     except OSError as error:
         raise _os_error(error) from None
     finally:
-        if directory_fd is not None:
+        if _directory_fd is None and directory_fd is not None:
             os.close(directory_fd)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from endpoint_snapshot_sources import collect_documents
-from endpoint_snapshot_store import StoreError, publish_endpoint, read_endpoint
+from endpoint_snapshot_store import StoreError, publication_lock, publish_endpoint, read_endpoint
 
 MAX_BYTES = 65_536
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -30,9 +30,9 @@ HEALTH_IDS = {
     "disk_root", "disk_docker", "inode_root", "inode_docker", "memory", "load", "swap", "oom",
     "docker", "docker_network_inspection", "docker_network_headroom", "docker_network_legacy",
     "docker_default_bridge", "controller", "controller_status", "docker_socket_proxy", "restarts",
-    "capacity", "managed_unhealthy", "managed_inactive", "stale_image", "stale_network", "stale_volume",
+    "capacity", "capacity_service", "managed_unhealthy", "managed_inactive", "stale_container", "stale_image", "stale_network", "stale_volume",
     "stale_build_cache_byte", "cleanup", "drift", "timer_health", "timer_cleanup", "timer_drift",
-    "timer_updates", "timer_reconcile", "updates", "reboot", "clock", "backup", "reconciliation",
+    "timer_updates", "timer_reconcile", "timer_capacity", "reconcile", "updates", "reboot", "clock", "backup", "reconciliation",
     "status_delivery",
 }
 STATES = {"active", "drained", "disabled"}
@@ -80,7 +80,7 @@ def checks(value: Any) -> bool:
 
 DATA_FIELDS = {
     "installation": {
-        "record_state": choice("installed", "absent"), "lifecycle": choice("disposable", "recoverable"),
+        "record_state": choice("installed", "absent"), "lifecycle": choice("experimental", "stable", "retiring"),
         "policy_state": choice(*STATES), "installed_at": integer, "applied_commit": commit,
         "engine_ref": commit, "architecture": choice("amd64", "arm64"), "pool": token,
         "reviewed_maximum": integer, "capacity_budget": integer, "scale_set_name": token,
@@ -246,7 +246,8 @@ def project_health(value: dict, controller: str, now: int) -> dict:
         if not isinstance(check, dict) or not isinstance(check.get("id"), str):
             raise SnapshotError("source_invalid")
         if check["id"] in HEALTH_IDS:
-            approved.append({"id": check["id"], "status": check.get("status")})
+            identifier = "capacity_service" if check["id"] == "capacity" and "state" in check else check["id"]
+            approved.append({"id": identifier, "status": check.get("status")})
     result = data("health", {"status": value.get("status"), "checks": approved})
     return evidence(result, observed_at=timestamp(value.get("timestamp"), now))
 
@@ -422,16 +423,17 @@ class SnapshotReader:
 
 def publish(controller: str, *, observer_gid: int, root: Path = Path("/"), now: int | None = None) -> dict:
     base = root / "var/lib/ci-fleet-observer"
-    previous = None
-    try:
-        previous = read_endpoint(base, observer_gid)
-        validate_snapshot(previous, controller=controller)
-    except (StoreError, SnapshotError):
+    with publication_lock(base, observer_gid) as directory_fd:
         previous = None
-    documents, errors = collect_documents(controller, root=root)
-    value = build_snapshot(controller, documents, errors, now=int(time.time()) if now is None else now, previous=previous)
-    publish_endpoint(base, value, observer_gid)
-    return value
+        try:
+            previous = read_endpoint(base, observer_gid, _directory_fd=directory_fd)
+            validate_snapshot(previous, controller=controller)
+        except (StoreError, SnapshotError):
+            previous = None
+        documents, errors = collect_documents(controller, root=root)
+        value = build_snapshot(controller, documents, errors, now=int(time.time()) if now is None else now, previous=previous)
+        publish_endpoint(base, value, observer_gid, _directory_fd=directory_fd)
+        return value
 
 
 def main() -> int:
