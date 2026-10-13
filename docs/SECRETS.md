@@ -18,6 +18,10 @@ Project test or integration secrets belong in GitHub repository or environment s
 
 Normal validation should use no secret when possible. Deployment credentials must not be available to the normal shared validation pool.
 
+### Deployment credentials
+
+Dedicated deployer adapters receive the scoped application credential through the [contained adapter contract](DEPLOYER-HOST.md#application-adapter-contract). The Docker broker drops adapter-supplied registry authentication headers. It supports anonymous artifact pulls; private artifacts require separately authorized operator provisioning into the dedicated daemon. Keep registry provisioning credentials separate from the application credential.
+
 ### Host-local identity and secrets
 
 A single-host prototype may use root-owned files outside the repository checkout, for example:

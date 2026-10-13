@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Adversarial checks for the deployment Docker and recovery boundary."""
+import base64
 import copy
 import errno
 import json
@@ -181,6 +182,32 @@ class Containment(unittest.TestCase):
                         server.shutdown()
                         thread.join()
                 self.assertEqual(policy.artifact_owned(policy.image), recorded)
+
+    def test_registry_auth_is_not_forwarded(self):
+        auth = base64.b64encode(json.dumps({'username': 'application', 'password': 'secret-canary'}).encode()).decode()
+        for operation in ('deploy', 'rollback'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                policy = adapter.Policy(self.values, self.backend, operation=operation)
+                self.backend.resources['images', policy.image] = {'RepoDigests': [policy.image]}
+                request = MagicMock(return_value=(200, b'{"status":"Pull complete"}\n'))
+                self.backend.request = request
+                path = str(Path(directory) / 'broker.sock')
+                with adapter.ProxyServer(path, adapter.handler(policy)) as server:
+                    thread = threading.Thread(target=server.serve_forever)
+                    thread.start()
+                    try:
+                        connection = adapter.UnixConnection(path, rootless=False)
+                        query = adapter.urllib.parse.urlencode({'fromImage': policy.image})
+                        connection.request('POST', '/images/create?' + query,
+                                           headers={'x-registry-auth': auth, 'X-Registry-Config': auth})
+                        result = connection.getresponse()
+                        self.assertEqual(result.status, 200)
+                        result.read()
+                        connection.close()
+                    finally:
+                        server.shutdown()
+                        thread.join()
+                self.assertEqual(request.call_args.args[3], {'Content-Type': 'application/json'})
 
     def test_adapter_has_no_caller_stdin(self):
         with tempfile.TemporaryDirectory() as directory:

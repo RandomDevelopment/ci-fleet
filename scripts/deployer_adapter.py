@@ -447,8 +447,6 @@ def handler(policy: Policy):
                 else:
                     path, body = policy.authorize(self.command, self.path, body)
                     headers = {"Content-Type": "application/json"}
-                    if path.startswith("/images/create") and self.headers.get("X-Registry-Auth"):
-                        headers["X-Registry-Auth"] = self.headers["X-Registry-Auth"]
                     mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
                     if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:

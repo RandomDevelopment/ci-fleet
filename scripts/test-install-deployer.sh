@@ -595,6 +595,27 @@ printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$
 printf 'interrupted\n' >>"$root/var/lib/ci-fleet-deployer/install-state.json"
 printf 'interrupted\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'interrupted installer transaction requires recovery' "$installer" --check --config "$config" >/dev/null
+recovery_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service")
+recovery_current_before=$(readlink "$root/opt/ci-fleet-deployer/current")
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-capacity.service ci-fleet-tester-health.service ci-fleet-status-receiver.service; do
+    export "$inventory=$role_unit loaded"
+    for mode in --rollback --drain --resume --uninstall; do
+      expect_failure 'is present' "$installer" "$mode" --config "$config" >/dev/null
+      [[ -d "$interrupted" && $(readlink "$root/opt/ci-fleet-deployer/current") == "$recovery_current_before" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'mixed-role admission recovered a transaction before blocking'
+    done
+  done
+  unset "$inventory"
+done
+printf 'controller\n' >"$root/etc/systemd/system/ci-fleet-capacity.service"
+for mode in --rollback --drain --resume --uninstall; do
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" "$mode" --config "$config" >/dev/null
+  [[ -d "$interrupted" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'filesystem role admission changed recovery state'
+done
+rm "$root/etc/systemd/system/ci-fleet-capacity.service"
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --rollback --config "$config" >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --drain --config "$config" >/dev/null
+[[ -d "$interrupted" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'failed inventory changed recovery state'
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$interrupted" ]] || fail 'interrupted transaction was not recovered'
 expect_success "$installer" --check --config "$config" >/dev/null

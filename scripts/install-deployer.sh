@@ -663,6 +663,7 @@ acquire_lock() {
   install -d -m 0755 "$(root_path /run)"
   exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
   flock -n 8 || block 'another ci-fleet role installation is already running'
+  reject_other_role_state
   recover_adapter_guard
   [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
