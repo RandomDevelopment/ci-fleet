@@ -912,20 +912,6 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
-cp "$fresh_checkpoint/fresh-image-ids" "$tmp/fresh-original-image-ids"
-missing_fresh_id=sha256:8888888888888888888888888888888888888888888888888888888888888888
-printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n' "$missing_fresh_id" >"$fresh_checkpoint/fresh-image-ids"
-touch "$fresh_checkpoint/.complete"
-export FAKE_COMPOSE_LOG=$tmp/fresh-missing-image-rollback.log
-: >"$FAKE_COMPOSE_LOG"
-expect_failure 'ROLLBACK_IMAGE_REINSTALL_REQUIRED' "$installer" --rollback
-if grep -Eq '^(stop|rm|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'missing fresh checkpoint image mutated the installed runtime'; fi
-[[ -f "$FAKE_DOCKER_STATE" && -f "$root/etc/ci-fleet/ci-fleet.env" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'missing fresh checkpoint image removed installed state'
-[[ $(readlink -f "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$engine_ref" && $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "sha256:$controller_image_digest" ]] || fail 'missing fresh checkpoint image changed the installed release or tags'
-cp "$tmp/fresh-original-image-ids" "$fresh_checkpoint/fresh-image-ids"
-unset FAKE_COMPOSE_LOG
-[[ ${CI_FLEET_TEST_STOP_AFTER_FRESH_IMAGE_PREFLIGHT:-0} != 1 ]] || { printf 'FRESH_IMAGE_PREFLIGHT_REGRESSION_OK\n'; exit 0; }
-
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
 publication_prior_controller=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
 publication_old_tag=sha256:6666666666666666666666666666666666666666666666666666666666666666
@@ -1136,6 +1122,22 @@ except FileNotFoundError:
     value = {}
 assert "default-address-pools" not in value
 PY
+cp "$fresh_checkpoint/fresh-image-ids" "$tmp/fresh-original-image-ids"
+missing_fresh_id=sha256:8888888888888888888888888888888888888888888888888888888888888888
+printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n' "$missing_fresh_id" >"$fresh_checkpoint/fresh-image-ids"
+cp -p "$fresh_checkpoint/.complete" "$tmp/fresh-complete-snapshot"
+touch "$fresh_checkpoint/.complete"
+export FAKE_COMPOSE_LOG=$tmp/fresh-missing-image-rollback.log
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'ROLLBACK_IMAGE_REINSTALL_REQUIRED' "$installer" --rollback
+if grep -Eq '^(stop|rm|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'missing fresh checkpoint image mutated the installed runtime'; fi
+[[ -f "$FAKE_DOCKER_STATE" && -f "$root/etc/ci-fleet/ci-fleet.env" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'missing fresh checkpoint image removed installed state'
+[[ $(readlink -f "$root/opt/ci-fleet/current") == "$root/opt/ci-fleet/releases/$engine_ref" && $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "sha256:$controller_image_digest" ]] || fail 'missing fresh checkpoint image changed the installed release or tags'
+cp "$tmp/fresh-original-image-ids" "$fresh_checkpoint/fresh-image-ids"
+touch -r "$tmp/fresh-complete-snapshot" "$fresh_checkpoint/.complete"
+unset FAKE_COMPOSE_LOG
+[[ ${CI_FLEET_TEST_STOP_AFTER_FRESH_IMAGE_PREFLIGHT:-0} != 1 ]] || { printf 'FRESH_IMAGE_PREFLIGHT_REGRESSION_OK\n'; exit 0; }
+
 no_policy_rendered=$tmp/no-policy-rendered.env
 cp "$root/etc/ci-fleet/ci-fleet.env" "$no_policy_rendered"
 export FAKE_COMPOSE_LOG=$tmp/policy-mismatch-rollback-compose.log
