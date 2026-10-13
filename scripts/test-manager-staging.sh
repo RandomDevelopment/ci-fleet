@@ -165,14 +165,18 @@ project = next(iter(value["projects"].values()))
 value["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
 project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
 for controller in value["controllers"].values():
-    controller.pop("docker_network_policy", None)
+    controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+evidence = {"schema_version": 1, "status_reporting_engine_capabilities": {
+    name: dict(engine_ref="1" * 40, docker_network_policy_config=True, docker_default_bridge_cidr_config=True, status_reporting_config=False, required_status_reporting=False)
+    for name in value["controllers"]}}
+(configuration / "engine-rollout-evidence.json").write_text(json.dumps(evidence))
 subprocess.run(["git", "init", "-q", str(configuration)], check=True)
 for index in range(2):
     candidate = copy.deepcopy(value)
     for controller in candidate["controllers"].values():
         controller["engine_ref"] = str(index + 1) * 40
     (configuration / "fleet.json").write_text(json.dumps(candidate))
-    subprocess.run(["git", "-C", str(configuration), "add", "fleet.json"], check=True)
+    subprocess.run(["git", "-C", str(configuration), "add", "."], check=True)
     subprocess.run(["git", "-C", str(configuration), "-c", "user.name=fixture", "-c", "user.email=fixture@invalid.example", "commit", "-qm", "fixture"], check=True)
 function = re.search(r"^validate_candidate_config_commit\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
 wrapper = root / "validate-staging.sh"
@@ -183,6 +187,9 @@ temporary=$3
 config_source_checkout=$4
 config_ref=$(git -C "$config_source_checkout" rev-parse HEAD)
 candidate_config=$config_source_checkout/fleet.json
+config_identity=fixture-org/fleet-config
+controller_id=example-ci-01
+testing=1
 state_file=$temporary/state
 rendered_env=$temporary/env
 mkdir -p "$temporary"
@@ -194,5 +201,56 @@ for mode in ("upgrade", "check", "install"):
     assert (result.returncode == 0) == (mode != "install"), (mode, result.stdout, result.stderr)
     if mode == "install":
         assert "initial strict configuration requires reviewed image IDs" in result.stderr
+staged_ref = subprocess.check_output(["git", "-C", str(configuration), "rev-parse", "HEAD"], text=True).strip()
+candidate["managed_images"] = {"2" * 40: {"amd64": dict(controller="sha256:" + "3" * 64, runner="sha256:" + "4" * 64)}}
+(configuration / "fleet.json").write_text(json.dumps(candidate))
+subprocess.run(["git", "-C", str(configuration), "add", "."], check=True)
+subprocess.run(["git", "-C", str(configuration), "-c", "user.name=fixture", "-c", "user.email=fixture@invalid.example", "commit", "-qm", "activation"], check=True)
+result = subprocess.run(["bash", str(wrapper), "upgrade", str(repo), str(root / "context-activation"), str(configuration)], capture_output=True, text=True)
+assert result.returncode == 0, (result.stdout, result.stderr)
+remote = re.search(r"^validate_config\(\) \{.*?^\}", (repo / "scripts/remote-reconcile.sh").read_text(), re.M | re.S).group()
+remote_wrapper = root / "validate-reconciliation.sh"
+remote_wrapper.write_text('''set -Eeuo pipefail
+repo_root=$1
+temp_dir=$2
+mkdir -p "$temp_dir"
+log_json() { printf '%s\\n' "$*" >&2; }
+''' + remote + '\nvalidate_config "$3" "$4"\n')
+activation_ref = subprocess.check_output(["git", "-C", str(configuration), "rev-parse", "HEAD"], text=True).strip()
+for commit in (staged_ref, activation_ref):
+    result = subprocess.run(["bash", str(remote_wrapper), str(repo), str(root / ("remote-" + commit)), str(configuration), commit], capture_output=True, text=True)
+    assert result.returncode == 0, (commit, result.stdout, result.stderr)
+legacy = root / "retained-config"
+subprocess.run(["git", "clone", "-q", str(configuration), str(legacy)], check=True)
+subprocess.run(["git", "-C", str(legacy), "checkout", "-q", staged_ref + "^"], check=True)
+legacy_ref = subprocess.check_output(["git", "-C", str(legacy), "rev-parse", "HEAD"], text=True).strip()
+context = root / "context-retained"
+context.mkdir()
+(context / "state").write_text(json.dumps(dict(schema_version=1, config_repository="fixture-org/fleet-config", config_ref=legacy_ref, controller="example-ci-01", engine_ref="1" * 40)))
+(context / "env").write_text(f"CI_FLEET_CONFIG_REPOSITORY=fixture-org/fleet-config\nCI_FLEET_CONFIG_REF={legacy_ref}\nCI_FLEET_INSTANCE=example-ci-01\nCI_FLEET_ENGINE_REF={'1' * 40}\n")
+for name in ("state", "env"):
+    (context / name).chmod(0o600)
+result = subprocess.run(["bash", str(wrapper), "check", str(repo), str(context), str(legacy)], capture_output=True, text=True)
+assert result.returncode == 0, (result.stdout, result.stderr)
+check = re.search(r"^perform_check\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
+probe = root / "retained-check.sh"
+probe.write_text('''set -Eeuo pipefail
+retained_installed_ref=true
+config_ref=retained
+engine_ref=old-runtime
+manager_releases=/trusted-managers
+display_last_health() { :; }
+managed_image_ids_configured() { return 1; }
+manager_release_from_raw_pointer() { printf '/trusted-managers/new-manager\\n'; }
+staged_runtime_matches() { return "${runtime_failure:-0}"; }
+mandatory_timers_active() { return "${timer_failure:-0}"; }
+note() { printf '%s\\n' "$*"; }
+die() { printf '%s\\n' "$*" >&2; exit 1; }
+''' + check + "\nperform_check\n")
+result = subprocess.run(["bash", str(probe)], capture_output=True, text=True)
+assert result.returncode == 0 and "CHECK_RETAINED" in result.stdout, (result.stdout, result.stderr)
+for variable in ("runtime_failure", "timer_failure"):
+    result = subprocess.run(["env", f"{variable}=1", "bash", str(probe)], capture_output=True, text=True)
+    assert result.returncode != 0, variable
 PYTHON
 printf 'MANAGER_STAGING_AND_IMAGE_RECOVERY_TESTS_OK\n'

@@ -670,6 +670,7 @@ def validate_transition(
             "manager-only staging may change only controller engine_ref values",
         )
         validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "manager-only staging cannot add or remove controllers")
+        validation.require(any(isinstance(old_controllers[name], dict) and isinstance(new_controllers[name], dict) and old_controllers[name].get("engine_ref") != new_controllers[name].get("engine_ref") for name in set(old_controllers) & set(new_controllers)), "$.controllers", "manager-only staging requires at least one engine_ref change")
         for name in set(old_controllers) & set(new_controllers):
             old = old_controllers[name]
             new = new_controllers[name]
@@ -681,7 +682,6 @@ def validate_transition(
                 f"$.controllers.{name}",
                 "manager-only staging may change only engine_ref",
             )
-            validation.require(old.get("engine_ref") != new.get("engine_ref"), f"$.controllers.{name}.engine_ref", "manager-only staging requires every controller engine_ref to change")
     if "managed_images" not in previous and "managed_images" in current:
         validation.require(old_controllers == new_controllers, "$.controllers", "image-policy introduction must retain controller settings from manager staging")
         validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
@@ -801,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
+def main(*, retained_configuration: bool = False) -> int:
     args = parse_args()
     validation = Validation()
     config_path = args.config.absolute()
@@ -823,11 +823,11 @@ def main() -> int:
     if config is not None:
         scan_secret_material(config, validation)
         previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
-        if isinstance(config, dict) and "managed_images" not in config and args.previous_config:
-            validate_config(previous_for_bootstrap, validation, False)
-        validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict))
-        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
         bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)
+        if bootstrap or (isinstance(config, dict) and "managed_images" not in config and args.previous_config):
+            validate_config(previous_for_bootstrap, validation, False)
+        validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict) or retained_configuration)
+        current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
         if bootstrap:
             previous_bootstrap_evidence = load_json(args.previous_rollout_evidence.absolute(), validation) if args.previous_rollout_evidence else None
             retained_evidence = validate_rollout_evidence(previous_bootstrap_evidence, validation) if previous_bootstrap_evidence is not None else {}

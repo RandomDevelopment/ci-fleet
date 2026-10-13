@@ -174,6 +174,28 @@ class PolicyTests(unittest.TestCase):
         validate_transition(previous, current, {}, validation)
         self.assertTrue(any("cannot add or remove" in error for error in validation.errors), validation.errors)
 
+    def test_staging_rollback_can_change_one_controller(self) -> None:
+        previous = reference_config()
+        previous.pop("managed_images")
+        for controller in previous["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        second = copy.deepcopy(first_controller(previous))
+        second["scale_set_name"] = "other-ci-01"
+        previous["controllers"]["other-ci-01"] = second
+        previous["runner_pools"][second["pool"]]["capacity_budget"] = 2
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        self.assertEqual(errors_for(current), [])
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(current, previous, {}, validation)
+        self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(current, current, {}, validation)
+        self.assertTrue(any("at least one engine_ref" in error for error in validation.errors))
+
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
         config = json.loads((ROOT / "fleet.json").read_text())
         self.assert_rejected(config, "replace the fixture image digest", strict=True)
@@ -394,23 +416,6 @@ class PolicyTests(unittest.TestCase):
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
-
-    def test_manager_staging_requires_every_controller_to_advance(self) -> None:
-        previous = reference_config()
-        previous.pop("managed_images")
-        for controller in previous["controllers"].values():
-            controller.pop("docker_network_policy", None)
-        original = next(iter(previous["controllers"].values()))
-        previous["controllers"]["second-controller"] = copy.deepcopy(original)
-        current = copy.deepcopy(previous)
-        first_controller(current)["engine_ref"] = "3" * 40
-        validation = Validation()
-        validate_transition(previous, current, {}, validation)
-        self.assertTrue(any("second-controller.engine_ref" in error for error in validation.errors), validation.errors)
-        current["controllers"]["second-controller"]["engine_ref"] = "3" * 40
-        validation = Validation()
-        validate_transition(previous, current, {}, validation)
-        self.assertEqual(validation.errors, [])
 
     def test_managed_image_ids_reject_identical_controller_and_runner(self) -> None:
         config = reference_config()

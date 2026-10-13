@@ -16,6 +16,7 @@ policy_action=
 root_prefix=${CI_FLEET_ROOT_PREFIX:-}
 testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
+retained_installed_ref=false
 checkpoint_dir=
 staging_paths=()
 captured_current_state=
@@ -250,6 +251,7 @@ resolve_config() {
 }
 
 validate_candidate_config_commit() {
+  retained_installed_ref=false
   local tree_paths=$temporary/config-tree-paths evidence=$temporary/engine-rollout-evidence.json
   local previous=$temporary/staging-previous.json previous_evidence=$temporary/staging-previous-evidence.json
   local args=(--config "$candidate_config" --strict --tree-paths "$tree_paths")
@@ -258,10 +260,37 @@ validate_candidate_config_commit() {
     git -C "$config_source_checkout" show "$config_ref:engine-rollout-evidence.json" >"$evidence" || die 'cannot read engine rollout evidence'
     args+=(--rollout-evidence "$evidence")
   fi
-  if [[ ( "$mode" == upgrade || "$mode" == check ) && -f "$state_file" && -f "$rendered_env" ]] \
-    && python3 -c 'import json, sys; value=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(value, dict) and "managed_images" not in value else 1)' "$candidate_config"; then
-    git -C "$config_source_checkout" show "$config_ref^:fleet.json" >"$previous" \
-      || die 'manager staging requires its previous configuration commit'
+  if [[ "$mode" == check && -f "$state_file" && -f "$rendered_env" ]] && python3 - "$repo_root/scripts" "$state_file" "$rendered_env" "$config_ref" "$config_identity" "$controller_id" "$testing" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+sys.path.insert(0, sys.argv[1])
+from desired_state import parse_env
+try:
+    state, environment = map(Path, sys.argv[2:4])
+    owner = os.getuid() if sys.argv[7] == "1" else 0
+    for path in (state, environment):
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ValueError
+    installed = json.loads(state.read_text())
+    values = parse_env(environment, allow_unknown=True)
+    identities = (("config_ref", sys.argv[4], "CI_FLEET_CONFIG_REF"), ("config_repository", sys.argv[5], "CI_FLEET_CONFIG_REPOSITORY"), ("controller", sys.argv[6], "CI_FLEET_INSTANCE"))
+    valid = type(installed.get("schema_version")) is int and installed["schema_version"] == 1
+    valid = valid and all(installed.get(name) == expected == values.get(variable) for name, expected, variable in identities)
+    valid = valid and re.fullmatch(r"[0-9a-f]{40}", str(installed.get("engine_ref", ""))) and installed["engine_ref"] == values.get("CI_FLEET_ENGINE_REF")
+    valid = valid and not {"CI_FLEET_CONTROLLER_IMAGE_DIGEST", "CI_FLEET_RUNNER_IMAGE_DIGEST"}.intersection(values)
+except (OSError, ValueError, AttributeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+  then
+    retained_installed_ref=true
+  elif [[ -f "$state_file" && -f "$rendered_env" ]] && git -C "$config_source_checkout" show "$config_ref^:fleet.json" >"$previous" 2>/dev/null \
+    && python3 -c 'import json, sys; current, previous=(json.load(open(path)) for path in sys.argv[1:]); sys.exit(0 if isinstance(current, dict) and isinstance(previous, dict) and ("managed_images" not in current or "managed_images" not in previous) else 1)' "$candidate_config" "$previous"; then
     args+=(--previous-config "$previous")
     if git -C "$config_source_checkout" cat-file -e "$config_ref^:engine-rollout-evidence.json" 2>/dev/null; then
       git -C "$config_source_checkout" show "$config_ref^:engine-rollout-evidence.json" >"$previous_evidence" \
@@ -269,8 +298,19 @@ validate_candidate_config_commit() {
       args+=(--previous-rollout-evidence "$previous_evidence")
     fi
   fi
-  python3 "$repo_root/templates/config-repository/scripts/validate.py" \
-    "${args[@]}" || die 'configuration commit validation failed'
+  if $retained_installed_ref; then
+    python3 - "$repo_root/scripts" "${args[@]}" <<'PY' || die 'installed configuration validation failed'
+import sys
+sys.path.insert(0, sys.argv[1])
+from desired_state import load_template_validator
+validator = load_template_validator()
+sys.argv = sys.argv[:1] + sys.argv[2:]
+raise SystemExit(validator.main(retained_configuration=True))
+PY
+  else
+    python3 "$repo_root/templates/config-repository/scripts/validate.py" \
+      "${args[@]}" || die 'configuration commit validation failed'
+  fi
   python3 "$repo_root/scripts/scan_committed_secrets.py" \
     --repository "$config_source_checkout" --commit "$config_ref" || die 'configuration commit secret scan failed'
 }
@@ -2451,11 +2491,19 @@ perform_check() {
   local count
   display_last_health
   if ! managed_image_ids_configured; then
-    [[ $(manager_release_from_raw_pointer || true) == "$manager_releases/$engine_ref" ]] \
-      || die 'manager-only staging is incomplete'
+    if $retained_installed_ref; then
+      [[ -n $(manager_release_from_raw_pointer || true) ]] || die 'retained installation has no trusted manager'
+    else
+      [[ $(manager_release_from_raw_pointer || true) == "$manager_releases/$engine_ref" ]] \
+        || die 'manager-only staging is incomplete'
+    fi
     staged_runtime_matches || die 'manager-only staging changed the installed runtime'
     mandatory_timers_active || die 'manager-only staging has inactive mandatory maintenance timers'
-    note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
+    if $retained_installed_ref; then
+      note "CHECK_RETAINED config_ref=$config_ref runtime_ref=$engine_ref"
+    else
+      note "CHECK_STAGED manager_ref=$engine_ref runtime_unchanged=true"
+    fi
     return
   fi
   drift_count
