@@ -264,6 +264,7 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        [[ -z ${FAKE_PROXY_STATE:-} ]] || : >"$FAKE_PROXY_STATE"
         controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$env_file")
         "$0" image inspect --format '{{.Id}}' "$controller_image" >/dev/null 2>&1 || {
           printf 'configured controller image is unavailable: %s\n' "$controller_image" >&2
@@ -310,7 +311,9 @@ case "${1:-}" in
         fi
         [[ -z "${FAKE_ACTIVE_MANAGED_AFTER_STOP:-}" ]] || : >"$FAKE_ACTIVE_MANAGED_AFTER_STOP"
         ;;
-      down|rm) rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "$stopped_state" ]] || rm -f "$stopped_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
+      down|rm)
+        [[ "$command" != down || -z ${FAKE_PROXY_STATE:-} ]] || rm -f "$FAKE_PROXY_STATE"
+        rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "$stopped_state" ]] || rm -f "$stopped_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
         if [[ -n "$paused_state" && -f "$paused_state" ]]; then
           printf 'Error response from daemon: container is already paused\n' >&2
@@ -891,6 +894,19 @@ rm "$root/etc/ci-fleet/config-review-required"
 unset FAKE_APPROVAL_LOG
 rm "$fake_bin/openssl" "$fake_bin/curl"
 
+export FAKE_PROXY_STATE=$tmp/fresh-socket-proxy
+export FAKE_DOCKER_PROXY_UNAVAILABLE=1
+export FAKE_COMPOSE_LOG=$tmp/fresh-health-rollback.log
+fresh_health_output=$tmp/fresh-health-failure.out
+if "$installer" --install "${base_args[@]}" --ref "$ref_one" >"$fresh_health_output" 2>&1; then
+  fail 'fresh installation with an unhealthy proxy unexpectedly succeeded'
+fi
+unset FAKE_DOCKER_PROXY_UNAVAILABLE
+grep -Fq 'ROLLBACK_RESTORED' "$fresh_health_output" || fail "fresh health failure did not recover: $(<"$fresh_health_output")"
+grep -Eq '^down\|.*--project-name ci-fleet .*down --remove-orphans' "$FAKE_COMPOSE_LOG" || fail 'fresh rollback did not tear down the scoped Compose project'
+[[ ! -e "$FAKE_PROXY_STATE" && ! -e "$FAKE_DOCKER_STATE" && ! -e "$root/etc/ci-fleet/ci-fleet.env" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh rollback retained candidate services or installed state'
+unset FAKE_PROXY_STATE FAKE_COMPOSE_LOG
+
 export FAKE_FAIL_RUNNER_TAG_ONCE=$tmp/fail-fresh-publication-once
 : >"$FAKE_FAIL_RUNNER_TAG_ONCE"
 fresh_publication_output=$tmp/fresh-publication-failure.out
@@ -913,7 +929,6 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
-publication_prior_controller=$(<"$FAKE_CONTROLLER_IMAGE_ID_STATE")
 publication_old_tag=sha256:6666666666666666666666666666666666666666666666666666666666666666
 printf '%s\n' "$publication_old_tag" >>"$FAKE_AVAILABLE_IMAGE_IDS"
 printf '%s\n' "$publication_old_tag" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
@@ -927,7 +942,11 @@ unset FAKE_FAIL_RUNNER_TAG_ONCE
 grep -Fq 'ROLLBACK_RESTORED' "$publication_output" || fail "publication failure did not restore its checkpoint: $(<"$publication_output")"
 [[ $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "$publication_old_tag" ]] || fail 'publication failure did not restore the incumbent controller tag'
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && -f "$FAKE_DOCKER_STATE" ]] || fail 'publication failure changed the runner tag or left the controller offline'
-printf '%s\n' "$publication_prior_controller" >"$FAKE_CONTROLLER_IMAGE_ID_STATE"
+export FAKE_COMPOSE_LOG=$tmp/retained-object-convergence.log
+FAKE_BUILDX_UNAVAILABLE=1 FAKE_FAIL_BUILD=1 expect_success "$installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
+if grep -q '^build|' "$FAKE_COMPOSE_LOG"; then fail 'retained reviewed objects triggered a rebuild'; fi
+[[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == "sha256:$runner_image_digest" && $(<"$FAKE_CONTROLLER_IMAGE_ID_STATE") == "sha256:$controller_image_digest" && -f "$FAKE_DOCKER_STATE" ]] || fail 'retained-object convergence did not restore reviewed tags and the controller'
+unset FAKE_COMPOSE_LOG
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
 proxy_health_result=0
 "$repo_root/scripts/healthcheck.sh" >/dev/null || proxy_health_result=$?
@@ -2679,6 +2698,13 @@ cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/runner-id"
 cp "$FAKE_CONTROLLER_IMAGE_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-state"
 cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
 rm -f "$FAKE_RUNNER_IMAGE_STATE" "$FAKE_RUNNER_IMAGE_ID_STATE"
+# The build-failure cases require a missing object, not just a missing tag.
+python3 - "$FAKE_AVAILABLE_IMAGE_IDS" "sha256:$runner_image_digest" <<'PYTHON'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+path.write_text("".join(line + "\n" for line in path.read_text().splitlines() if line != sys.argv[2]))
+PYTHON
 cp -a "$root" "$build_failure_root"
 export FAKE_COMPOSE_LOG=$tmp/stopped-distinct-tag-build-compose.log
 : >"$FAKE_COMPOSE_LOG"

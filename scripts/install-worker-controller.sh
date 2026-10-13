@@ -1179,7 +1179,9 @@ run_candidate_preflight() {
 build_candidate() {
   # Quiescence is enforced after drain, not while preparing validated image inputs.
   compose "$release_dir" "$candidate_env" config --quiet
-  if ! managed_images_match "$candidate_env"; then build_managed_images "$release_dir" "$candidate_env" true; fi
+  if ! managed_images_match "$candidate_env" && ! managed_image_objects_match "$candidate_env"; then
+    build_managed_images "$release_dir" "$candidate_env" true
+  fi
 }
 
 capture_legacy_image_ids() {
@@ -2165,6 +2167,12 @@ PY
   if ! remove_inactive_managed_runners; then
     note 'ROLLBACK_FAILED reason=could not remove inactive managed runners'
     return 1
+  fi
+  if [[ ! -f "$checkpoint_dir/ci-fleet.env" && ! -f "$checkpoint_dir/install-state.json" && -f "$drain_env" && -n "$drain_release" ]]; then
+    compose "$drain_release" "$drain_env" down --remove-orphans || {
+      note 'ROLLBACK_FAILED reason=could not remove the fresh candidate Compose project'
+      return 1
+    }
   fi
   if [[ -f "$checkpoint_dir/install-state.json" || -f "$checkpoint_dir/ci-fleet.env" ]]; then
     load_installed_controller_identity "$checkpoint_dir/install-state.json" "$checkpoint_dir/ci-fleet.env"
