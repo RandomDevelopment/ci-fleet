@@ -155,6 +155,16 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(value["sources"]["reconciliation"]["error"], "revision_unverified")
         self.assertEqual(value["sources"]["reconciliation"]["data"], {})
 
+    def test_future_installation_date_discards_previous_evidence(self):
+        docs = documents()
+        docs["installation"]["installed_at"] = dt.datetime.fromtimestamp(NOW + 1, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        value = self.build(docs, previous=self.build())
+        installation = value["sources"]["installation"]
+        self.assertEqual(installation["availability"], "unknown")
+        self.assertEqual(installation["error"], "clock_uncertain")
+        self.assertEqual(installation["data"], {})
+        self.assertIsNone(installation["last_success_at"])
+
     def test_snapshot_schema_rejects_unknown_fields_versions_and_hostile_types(self):
         paths = (("schema_version",), ("clock_state",), ("sources", "health", "availability"),
                  ("sources", "health", "data", "checks"))
@@ -279,6 +289,25 @@ class SnapshotReadbackTests(unittest.TestCase):
                 store.publish_endpoint(self.base, value, self.gid)
                 with self.assertRaises(snapshot.SnapshotError):
                     self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
+
+    def test_failed_health_read_preserves_recent_clock_warning_until_new_evidence(self):
+        docs = documents()
+        docs["health"]["checks"][0]["status"] = "warning"
+        previous = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
+        value = snapshot.build_snapshot(CONTROLLER, docs, {"health": "source_unavailable"},
+                                        now=NOW + 10, previous=previous)
+        store.publish_endpoint(self.base, value, self.gid)
+        read = self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW + 10)
+        self.assertEqual(read["clock_state"], "uncertain")
+        self.assertEqual(read["publisher_freshness"], "unknown")
+        self.assertEqual(read["sources"]["controller"]["freshness"], "unknown")
+        self.assertEqual(read["sources"]["health"]["availability"], "unavailable")
+        self.assertEqual(read["sources"]["health"]["last_success_at"], previous["sources"]["health"]["observed_at"])
+        docs["health"]["checks"][0]["status"] = "ok"
+        docs["health"]["timestamp"] = NOW + 20
+        recovered = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW + 20, previous=value)
+        store.publish_endpoint(self.base, recovered, self.gid)
+        self.assertEqual(self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW + 20)["publisher_freshness"], "current")
 
     @unittest.skipUnless(os.geteuid() == 0, "requires isolated root-owned permission fixture")
     def test_unprivileged_observer_reads_export_but_cannot_read_private_sources(self):

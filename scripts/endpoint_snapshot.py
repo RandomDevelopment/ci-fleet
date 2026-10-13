@@ -116,9 +116,10 @@ def installed_time(value: Any, now: int) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value):
         raise SnapshotError("source_invalid")
     try:
-        return timestamp(int(dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()), now)
+        observed = int(dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp())
     except (ValueError, OverflowError) as error:
         raise SnapshotError("source_invalid") from error
+    return timestamp(observed, now)
 
 
 def data(name: str, value: dict) -> dict:
@@ -266,10 +267,13 @@ def project_reconciliation(value: dict, now: int, installation: dict) -> dict:
 
 
 def clock_state(health: dict, now: int) -> str:
-    if health["availability"] == "available" and now - health["observed_at"] <= STALE_AFTER["health"]:
-        for check in health["data"]["checks"]:
+    observed = health["last_success_at"]
+    if observed is not None and now - observed <= STALE_AFTER["health"]:
+        for check in health["data"].get("checks", []):
             if check["id"] == "clock":
-                return "synchronized" if check["status"] == "ok" else "uncertain"
+                if check["status"] != "ok":
+                    return "uncertain"
+                return "synchronized" if health["availability"] == "available" else "unknown"
     return "unknown"
 
 
