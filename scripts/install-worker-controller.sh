@@ -1495,6 +1495,22 @@ make_checkpoint() {
     [[ -z "$controller_live_id" ]] || printf 'CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=%s\n' "$controller_live_id" >>"$checkpoint_dir/image-ids.env"
     chmod 0600 "$checkpoint_dir/image-ids.env"
   fi
+  if [[ ! -f "$rendered_env" && -f "${candidate_env:-}" ]]; then
+    install -m 0600 "$candidate_env" "$checkpoint_dir/fresh-image-env"
+    load_checkpoint_images "$candidate_env" || die 'candidate image tags are invalid'
+    if ! runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      runner_id=absent
+    fi
+    if ! controller_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[1]}" 2>/dev/null); then
+      docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+      controller_id=absent
+    fi
+    [[ "$runner_id" == absent || "$runner_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'candidate runner tag ID is invalid'
+    [[ "$controller_id" == absent || "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die 'candidate controller tag ID is invalid'
+    printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/fresh-image-ids"
+    chmod 0600 "$checkpoint_dir/fresh-image-ids"
+  fi
   [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   if [[ -n "$target" ]]; then
     printf '%s\n' "$target" >"$checkpoint_dir/release-target"
@@ -1919,7 +1935,8 @@ retag_checkpoint_image() {
 
 restore_checkpoint() {
   local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
-  local restore_controller_tag_after_start=false
+  local restore_controller_tag_after_start=false fresh_path
+  local -a fresh_checkpoint_images=()
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
@@ -2111,6 +2128,14 @@ PY
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
     return 1
   fi
+  if [[ -e "$checkpoint_dir/fresh-image-env" || -L "$checkpoint_dir/fresh-image-env" || -e "$checkpoint_dir/fresh-image-ids" || -L "$checkpoint_dir/fresh-image-ids" ]]; then
+    [[ ! -e "$checkpoint_dir/ci-fleet.env" && ! -L "$checkpoint_dir/ci-fleet.env" ]] || return 1
+    for fresh_path in "$checkpoint_dir/fresh-image-env" "$checkpoint_dir/fresh-image-ids"; do
+      [[ -f "$fresh_path" && ! -L "$fresh_path" && $(stat -c %u "$fresh_path") == "$expected_owner" && $(stat -c %a "$fresh_path") == 600 ]] || return 1
+    done
+    load_checkpoint_images "$checkpoint_dir/fresh-image-env" "$checkpoint_dir/fresh-image-ids" || return 1
+    fresh_checkpoint_images=("${checkpoint_images[@]}")
+  fi
   drain_release=$(current_runtime_release)
   [[ -n "$drain_release" ]] || drain_release=$checkpoint_release
   if [[ -f "$rendered_env" ]]; then
@@ -2184,6 +2209,19 @@ PY
       fi
     done
   fi
+  for index in 0 1; do
+    [[ ${#fresh_checkpoint_images[@]} == 4 ]] || break
+    if [[ ${fresh_checkpoint_images[index + 2]} == absent ]]; then
+      if docker image inspect --format '{{.Id}}' "${fresh_checkpoint_images[index]}" >/dev/null 2>&1; then
+        docker image rm --force "${fresh_checkpoint_images[index]}" >/dev/null || failed=1
+      else
+        docker info >/dev/null 2>&1 || failed=1
+      fi
+      if docker image inspect --format '{{.Id}}' "${fresh_checkpoint_images[index]}" >/dev/null 2>&1; then failed=1; else docker info >/dev/null 2>&1 || failed=1; fi
+    else
+      retag_checkpoint_image "${fresh_checkpoint_images[index + 2]}" "${fresh_checkpoint_images[index]}" || failed=1
+    fi
+  done
   restore_systemd_snapshot || failed=1
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1

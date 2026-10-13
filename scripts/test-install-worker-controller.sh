@@ -891,6 +891,16 @@ rm "$root/etc/ci-fleet/config-review-required"
 unset FAKE_APPROVAL_LOG
 rm "$fake_bin/openssl" "$fake_bin/curl"
 
+export FAKE_FAIL_RUNNER_TAG_ONCE=$tmp/fail-fresh-publication-once
+: >"$FAKE_FAIL_RUNNER_TAG_ONCE"
+fresh_publication_output=$tmp/fresh-publication-failure.out
+if "$installer" --install "${base_args[@]}" --ref "$ref_one" >"$fresh_publication_output" 2>&1; then
+  fail 'fresh partial canonical publication unexpectedly succeeded'
+fi
+unset FAKE_FAIL_RUNNER_TAG_ONCE
+grep -Fq 'ROLLBACK_RESTORED' "$fresh_publication_output" || fail "fresh publication failure did not verify recovery: $(<"$fresh_publication_output")"
+[[ ! -e "$FAKE_RUNNER_IMAGE_ID_STATE" && ! -e "$FAKE_CONTROLLER_IMAGE_ID_STATE" && ! -e "$FAKE_DOCKER_STATE" ]] || fail 'fresh publication failure retained canonical tags or controller activation'
+[[ ! -e "$root/etc/ci-fleet/ci-fleet.env" && ! -e "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh publication failure retained installation state'
 export FAKE_WRONG_SOURCE_INSTALLER_OWNER=$installer
 first=$(expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one")
 unset FAKE_WRONG_SOURCE_INSTALLER_OWNER
@@ -2803,7 +2813,7 @@ grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'mi
 grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'missing-tag rollback changed the installed manager'
 runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+controller_tag_line=$(grep -n "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 [[ -z "$runner_rm_line" && -z "$controller_tag_line" && -z "$rollback_up_line" ]] || fail 'failed reconstruction preflight mutated rollback tags or restarted the controller'
 recovered_missing_tag=$(expect_success "$installer" --rollback)
