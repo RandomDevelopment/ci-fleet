@@ -2134,6 +2134,7 @@ PY
       [[ -f "$fresh_path" && ! -L "$fresh_path" && $(stat -c %u "$fresh_path") == "$expected_owner" && $(stat -c %a "$fresh_path") == 600 ]] || return 1
     done
     load_checkpoint_images "$checkpoint_dir/fresh-image-env" "$checkpoint_dir/fresh-image-ids" || return 1
+    [[ ${#checkpoint_images[@]} == 4 ]] || return 1
     fresh_checkpoint_images=("${checkpoint_images[@]}")
     for identifier in "${fresh_checkpoint_images[@]:2}"; do
       [[ "$identifier" != absent ]] || continue

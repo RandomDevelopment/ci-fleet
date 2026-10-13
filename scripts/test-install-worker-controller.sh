@@ -1124,11 +1124,14 @@ assert "default-address-pools" not in value
 PY
 cp "$fresh_checkpoint/fresh-image-ids" "$tmp/fresh-original-image-ids"
 missing_fresh_id=sha256:8888888888888888888888888888888888888888888888888888888888888888
-printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n' "$missing_fresh_id" >"$fresh_checkpoint/fresh-image-ids"
 cp -p "$fresh_checkpoint/.complete" "$tmp/fresh-complete-snapshot"
 touch "$fresh_checkpoint/.complete"
 export FAKE_COMPOSE_LOG=$tmp/fresh-missing-image-rollback.log
 : >"$FAKE_COMPOSE_LOG"
+printf 'CI_FLEET_RUNNER_IMAGE_ID=sha256:%s\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_LIVE_IMAGE_ID=sha256:%s\n' "$runner_image_digest" "$controller_image_digest" >"$fresh_checkpoint/fresh-image-ids"
+expect_failure 'checkpoint restoration failed' "$installer" --rollback
+if grep -Eq '^(stop|rm|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'malformed fresh checkpoint mapping mutated the installed runtime'; fi
+printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n' "$missing_fresh_id" >"$fresh_checkpoint/fresh-image-ids"
 expect_failure 'ROLLBACK_IMAGE_REINSTALL_REQUIRED' "$installer" --rollback
 if grep -Eq '^(stop|rm|up|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'missing fresh checkpoint image mutated the installed runtime'; fi
 [[ -f "$FAKE_DOCKER_STATE" && -f "$root/etc/ci-fleet/ci-fleet.env" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'missing fresh checkpoint image removed installed state'
