@@ -3007,6 +3007,12 @@ if ! "$installer" --rollback >"$legacy_output" 2>&1; then
 fi
 grep -Fq 'ROLLBACK_LEGACY_IMAGE_STATE_UNVERIFIED' "$legacy_output" || fail 'legacy rollback omitted its image-state warning'
 if grep -Eq '^image-(tag|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'legacy rollback claimed or changed image identity'; fi
+legacy_runner_id=$(<"$FAKE_RUNNER_IMAGE_ID_STATE")
+printf 'sha256:%064d\n' 7 >"$FAKE_RUNNER_IMAGE_ID_STATE"
+: >"$FAKE_COMPOSE_LOG"
+expect_failure 'ROLLBACK_IMAGE_REINSTALL_REQUIRED' "$installer" --rollback
+if [[ ! -f "$FAKE_DOCKER_STATE" ]] || grep -Eq '^(stop|up|rm|build|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'legacy image mismatch caused rollback side effects'; fi
+printf '%s\n' "$legacy_runner_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 printf '4\n' >"$legacy_checkpoint/format-version"
 chmod 0600 "$legacy_checkpoint/format-version"
 : >"$FAKE_COMPOSE_LOG"

@@ -2127,6 +2127,11 @@ PY
   elif $new_format && [[ -e "$image_ids" || -L "$image_ids" ]]; then
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
     return 1
+  elif ! $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
+    if ! managed_images_match "$checkpoint_dir/ci-fleet.env"; then
+      note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy checkpoint requires matching reviewed image tags'
+      return 1
+    fi
   fi
   if [[ -e "$checkpoint_dir/fresh-image-env" || -L "$checkpoint_dir/fresh-image-env" || -e "$checkpoint_dir/fresh-image-ids" || -L "$checkpoint_dir/fresh-image-ids" ]]; then
     [[ ! -e "$checkpoint_dir/ci-fleet.env" && ! -L "$checkpoint_dir/ci-fleet.env" ]] || return 1
@@ -2235,7 +2240,7 @@ PY
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
-      restore_reviewed_image_tags "$rendered_env" || failed=1
+      if $new_format; then restore_reviewed_image_tags "$rendered_env" || failed=1; fi
       if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'

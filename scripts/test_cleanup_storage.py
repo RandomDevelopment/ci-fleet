@@ -292,7 +292,8 @@ class StorageTests(unittest.TestCase):
             current.write_text("CI_FLEET_RUNNER_IMAGE=runner:current\nCI_FLEET_CONTROLLER_IMAGE=controller:current\n")
             checkpoint = Path(directory) / "var/lib/ci-fleet/checkpoints/previous"
             checkpoint.mkdir(parents=True)
-            (checkpoint / "ci-fleet.env").write_text("CI_FLEET_RUNNER_IMAGE=runner:previous\n")
+            reviewed = "sha256:" + "c" * 64
+            (checkpoint / "ci-fleet.env").write_text(f"CI_FLEET_RUNNER_IMAGE=runner:previous\nCI_FLEET_RUNNER_IMAGE_DIGEST={reviewed}\n")
             ids = checkpoint / "image-ids.env"
             ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={IMAGE}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
             fresh = checkpoint.parent / "fresh"
@@ -301,8 +302,9 @@ class StorageTests(unittest.TestCase):
             fresh_ids = fresh / "fresh-image-ids"
             fresh_ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={OTHER}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
             protected = cleanup.protected_images()
-            self.assertEqual(protected, {"runner:current", "controller:current", "runner:previous", "runner:original", IMAGE, OTHER})
+            self.assertEqual(protected, {"runner:current", "controller:current", "runner:previous", "runner:original", IMAGE, OTHER, reviewed})
             self.assertEqual(cleanup.image_reason(image(OTHER, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
+            self.assertEqual(cleanup.image_reason(image(reviewed, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
             for path in (ids, fresh_ids):
                 content = path.read_text()
                 path.unlink()

@@ -83,6 +83,7 @@ def protected_images() -> set[str]:
         if path == current:
             current_values = values
         for name in ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE",
+                     "CI_FLEET_RUNNER_IMAGE_DIGEST", "CI_FLEET_CONTROLLER_IMAGE_DIGEST",
                      "CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID",
                      "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID"):
             reference = values.get(name)
