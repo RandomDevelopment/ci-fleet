@@ -295,11 +295,22 @@ class StorageTests(unittest.TestCase):
             (checkpoint / "ci-fleet.env").write_text("CI_FLEET_RUNNER_IMAGE=runner:previous\n")
             ids = checkpoint / "image-ids.env"
             ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={IMAGE}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
-            self.assertEqual(cleanup.protected_images(), {"runner:current", "controller:current", "runner:previous", IMAGE})
-            ids.unlink()
-            ids.symlink_to(current)
-            with self.assertRaises(ValueError):
-                cleanup.protected_images()
+            fresh = checkpoint.parent / "fresh"
+            fresh.mkdir()
+            (fresh / "fresh-image-env").write_text("CI_FLEET_RUNNER_IMAGE=runner:original\n")
+            fresh_ids = fresh / "fresh-image-ids"
+            fresh_ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={OTHER}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
+            protected = cleanup.protected_images()
+            self.assertEqual(protected, {"runner:current", "controller:current", "runner:previous", "runner:original", IMAGE, OTHER})
+            self.assertEqual(cleanup.image_reason(image(OTHER, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
+            for path in (ids, fresh_ids):
+                content = path.read_text()
+                path.unlink()
+                path.symlink_to(current)
+                with self.assertRaises(ValueError):
+                    cleanup.protected_images()
+                path.unlink()
+                path.write_text(content)
 
     def test_uncertain_mutation_blocks_later_maintenance(self):
         for failure in (subprocess.TimeoutExpired(["docker", "builder", "prune"], 1), OSError(errno.EIO, "output read failed")):

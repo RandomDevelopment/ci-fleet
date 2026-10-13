@@ -1935,7 +1935,7 @@ retag_checkpoint_image() {
 
 restore_checkpoint() {
   local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
-  local restore_controller_tag_after_start=false fresh_path
+  local restore_controller_tag_after_start=false fresh_path identifier
   local -a fresh_checkpoint_images=()
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
   [[ -n "$checkpoint_dir" && -d "$checkpoint_dir" ]] || return 1
@@ -2135,6 +2135,13 @@ PY
     done
     load_checkpoint_images "$checkpoint_dir/fresh-image-env" "$checkpoint_dir/fresh-image-ids" || return 1
     fresh_checkpoint_images=("${checkpoint_images[@]}")
+    for identifier in "${fresh_checkpoint_images[@]:2}"; do
+      [[ "$identifier" != absent ]] || continue
+      if [[ $(docker image inspect --format '{{.Id}}' "$identifier" 2>/dev/null) != "$identifier" ]]; then
+        note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=fresh checkpoint image object requires verified offline import'
+        return 1
+      fi
+    done
   fi
   drain_release=$(current_runtime_release)
   [[ -n "$drain_release" ]] || drain_release=$checkpoint_release
