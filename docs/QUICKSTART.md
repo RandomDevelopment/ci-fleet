@@ -98,7 +98,12 @@ jobs through the Docker socket.
      --runner-group YOUR-CREATED-RUNNER-GROUP \
      --capacity-budget 1 \
      --max-runners 1 \
-     --engine-ref PINNED_ENGINE_COMMIT
+     --engine-ref PINNED_ENGINE_COMMIT \
+     --architecture YOUR-HOST-ARCHITECTURE \
+     --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID_FOR_HOST_ARCHITECTURE \
+     --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID_FOR_HOST_ARCHITECTURE
+   # Choose amd64 or arm64 for YOUR-HOST-ARCHITECTURE and supply the
+   # corresponding reviewed image IDs for that host architecture.
    # Validate before committing so a rejected file or accidental value
    # never enters branch history, then commit the initialized result:
    ./scripts/validate.sh --strict

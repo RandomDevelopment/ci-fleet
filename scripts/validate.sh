@@ -49,6 +49,8 @@ python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.jso
 python3 .github/actions/plan/plan.py --plan examples/project/scripts/ci/plan.json --group full >/dev/null
 scripts/test-capacity-preflight.sh
 bash scripts/test-capacity-unit-stop.sh
+bash scripts/test-manager-staging.sh
+bash scripts/test-managed-image-build.sh
 scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh
@@ -68,7 +70,14 @@ export CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE="$tmp"
 export CI_FLEET_DOCKER_GID=999
 export CI_FLEET_RUNNER_IMAGE=${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
 export CI_FLEET_CONTROLLER_IMAGE=${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+if env -u CI_FLEET_RUNNER_IMAGE_DIGEST -u CI_FLEET_CONTROLLER_IMAGE_DIGEST docker compose -f deploy/compose.yaml config --quiet; then
+  printf 'FAIL: an incumbent installer can load runtime Compose without reviewed image IDs\n' >&2
+  exit 1
+fi
+export CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:4444444444444444444444444444444444444444444444444444444444444444
+export CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:3333333333333333333333333333333333333333333333333333333333333333
 docker compose -f deploy/compose.yaml config --quiet
+docker compose -f deploy/compose.yaml config --format json | python3 -c 'import json, os, sys; config = json.load(sys.stdin); assert config["services"]["controller"]["environment"]["CI_FLEET_RUNNER_IMAGE"] == os.environ["CI_FLEET_RUNNER_IMAGE_DIGEST"]'
 
 docker compose -f deploy/compose.yaml build runner-image controller
 docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'

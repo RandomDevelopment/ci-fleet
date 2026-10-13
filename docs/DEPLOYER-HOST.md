@@ -28,10 +28,12 @@ The installer supports Debian 12/13 and Ubuntu 22.04/24.04 with systemd. It chec
 
 It rejects:
 
-- ordinary ci-fleet controller state or runner units;
+- ordinary ci-fleet controller state or runner units, including the capacity sampler service and timer;
 - any unrelated running or stopped Docker container;
 - any unrelated custom Docker network or volume;
 - unsafe owners, modes, symlinks, traversal, malformed configuration, or ambiguous identities.
+
+Role admission checks installed unit paths, systemd unit-file inventory and all loaded units, including vendor, runtime and transient units. Controller, tester, status-receiver and ordinary runner units block installation, upgrade, repair, check, resume and drain, plus runtime operations. An unavailable unit inventory fails admission. Emergency drain still works during a Docker outage, but cannot bypass mixed-role systemd state.
 
 `--check` makes no persistent configuration or application change. It takes the existing operation lock and runs health in a bounded transient service, with a temporary protected adapter guard that successful completion removes. An interrupted check can retain that guard and require serialized recovery. It creates a transient DynamicUser service and protected recovery records, but no persistent user, release, service/timer, image, container, registration, or GitHub state. Mutating modes require root.
 

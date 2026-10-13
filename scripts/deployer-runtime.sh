@@ -259,15 +259,16 @@ secure_directory() {
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
 }
 reject_other_role_state() {
-  local unit runner_unit path
+  local unit runner_unit path output loaded_unit
+  local -a controller_units=(ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer ci-fleet-capacity.service ci-fleet-capacity.timer actions.runner.service)
   for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'tester host state is present'
   done
   for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'status receiver state is present'
   done
-  for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
+  for unit in "${controller_units[@]}"; do
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -278,6 +279,19 @@ reject_other_role_state() {
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'ordinary CI controller or runner state is present'
   done
+  output=$(systemctl list-unit-files --no-legend --no-pager) || die 'systemd unit-file inventory failed'
+  output+=$'\n'
+  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || die 'systemd loaded-unit inventory failed'
+  while read -r loaded_unit _; do
+    case "$loaded_unit" in
+      ci-fleet-tester*) die 'tester host state is present' ;;
+      ci-fleet-status-receiver.service) die 'status receiver state is present' ;;
+      actions.runner.service|actions.runner.*.service) die 'ordinary GitHub Actions runner service is present' ;;
+    esac
+    for unit in "${controller_units[@]}"; do
+      [[ "$loaded_unit" != "$unit" ]] || die 'ordinary CI controller or runner state is present'
+    done
+  done <<<"$output"
 }
 reject_mixed_role() {
   local line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}|${cfg[ENVIRONMENT]}|${cfg[TARGET_ID]}"

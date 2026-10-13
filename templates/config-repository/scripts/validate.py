@@ -17,6 +17,7 @@ SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 ORG_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 IMAGE = re.compile(r"^[a-z0-9.-]+/[a-z0-9._/-]+$")
+IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 HIGH_CONFIDENCE_SECRET_PATTERNS = (
@@ -295,7 +296,7 @@ def scan_tree_path_list(path_list: Path, validation: Validation) -> None:
             validation.errors.append(f"{relative_text}: secret-bearing files are forbidden")
 
 
-def validate_config(config: Any, validation: Validation, strict: bool) -> None:
+def validate_config(config: Any, validation: Validation, strict: bool, *, allow_manager_staging: bool = False) -> None:
     required_top = {
         "schema_version",
         "organization",
@@ -305,7 +306,7 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
         "environments",
         "projects",
     }
-    if not validation.exact_keys(config, "$", required_top, {"$schema"}):
+    if not validation.exact_keys(config, "$", required_top, {"$schema", "managed_images"}):
         return
 
     validation.require(config.get("schema_version") == 3, "$.schema_version", "must equal 3")
@@ -370,6 +371,34 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
             pool_capacity[name] = budget
         validation.require(pool.get("job_submission_policy") == "all-independent-jobs", f"{path}.job_submission_policy", "must submit every independent job and leave capacity control to infrastructure")
 
+    managed_images = config.get("managed_images")
+    if "managed_images" not in config:
+        validation.require(not strict or allow_manager_staging, "$.managed_images", "initial strict configuration requires reviewed image IDs; staging omission needs the previous configuration")
+        managed_images = {}
+    elif config.get("managed_images") is None:
+        validation.errors.append("$.managed_images: null is not a valid manager-only staging omission")
+        managed_images = {}
+    elif not isinstance(managed_images, dict) or not managed_images:
+        validation.errors.append("$.managed_images: must be a non-empty object")
+        managed_images = {}
+    for engine_ref, images in managed_images.items():
+        path = f"$.managed_images.{engine_ref}"
+        validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, path, "key must be a nonzero full lowercase engine commit SHA")
+        if not isinstance(images, dict) or not images:
+            validation.errors.append(f"{path}: must declare at least one architecture")
+            continue
+        unsupported = sorted(set(images) - {"amd64", "arm64"})
+        validation.require(not unsupported, path, "contains unsupported architecture keys")
+        for architecture, identifiers in images.items():
+            architecture_path = f"{path}.{architecture}"
+            if validation.exact_keys(identifiers, architecture_path, {"controller", "runner"}):
+                validation.require(identifiers["controller"] != identifiers["runner"], architecture_path, "controller and runner image IDs must differ")
+                for name in ("controller", "runner"):
+                    digest = identifiers.get(name)
+                    validation.require(isinstance(digest, str) and bool(IMAGE_DIGEST.fullmatch(digest)) and digest != "sha256:" + "0" * 64, f"{architecture_path}.{name}", "must be a nonzero sha256 image digest")
+                    if strict:
+                        validation.require(digest not in {"sha256:" + "1" * 64, "sha256:" + "2" * 64}, f"{architecture_path}.{name}", "replace the fixture image digest before use")
+
     controllers = config.get("controllers")
     if not isinstance(controllers, dict) or not controllers:
         validation.errors.append("$.controllers: must be a non-empty object")
@@ -414,6 +443,8 @@ def validate_config(config: Any, validation: Validation, strict: bool) -> None:
                 scale_sets[scale_set] = name
         validation.require(lifecycle in {"experimental", "stable", "retiring"}, f"{path}.lifecycle", "must be experimental, stable, or retiring")
         validation.require(isinstance(engine_ref, str) and bool(COMMIT_SHA.fullmatch(engine_ref)) and engine_ref != "0" * 40, f"{path}.engine_ref", "must be a nonzero full lowercase commit SHA")
+        if managed_images:
+            validation.require(engine_ref in managed_images, f"{path}.engine_ref", "must have reviewed controller and runner digests in $.managed_images")
         validation.require(type(minimum) is int and minimum >= 0, f"{path}.min_runners", "must be a non-negative integer")
         validation.require(type(maximum) is int and maximum > 0, f"{path}.max_runners", "must be a positive integer")
         if type(minimum) is int and type(maximum) is int:
@@ -630,6 +661,38 @@ def validate_transition(
     new_controllers = current.get("controllers")
     if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
         return
+    if "managed_images" not in current:
+        validation.require("managed_images" not in previous, "$.managed_images", "cannot be removed after image enforcement")
+        validation.require(
+            {key: value for key, value in previous.items() if key != "controllers"}
+            == {key: value for key, value in current.items() if key != "controllers"},
+            "$",
+            "manager-only staging may change only controller engine_ref values",
+        )
+        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "manager-only staging cannot add or remove controllers")
+        validation.require(any(isinstance(old_controllers[name], dict) and isinstance(new_controllers[name], dict) and old_controllers[name].get("engine_ref") != new_controllers[name].get("engine_ref") for name in set(old_controllers) & set(new_controllers)), "$.controllers", "manager-only staging requires at least one engine_ref change")
+        for name in set(old_controllers) & set(new_controllers):
+            old = old_controllers[name]
+            new = new_controllers[name]
+            if not isinstance(old, dict) or not isinstance(new, dict):
+                continue
+            validation.require(
+                {key: value for key, value in old.items() if key != "engine_ref"}
+                == {key: value for key, value in new.items() if key != "engine_ref"},
+                f"$.controllers.{name}",
+                "manager-only staging may change only engine_ref",
+            )
+    if "managed_images" not in previous and "managed_images" in current:
+        validation.require(old_controllers == new_controllers, "$.controllers", "image-policy introduction must retain controller settings from manager staging")
+        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
+        for name in set(old_controllers) & set(new_controllers):
+            old, new = old_controllers[name], new_controllers[name]
+            if isinstance(old, dict) and isinstance(new, dict):
+                validation.require(
+                    old.get("engine_ref") == new.get("engine_ref"),
+                    f"$.controllers.{name}.engine_ref",
+                    "image policy must be introduced after the same compatible engine_ref is active",
+                )
     for name, new in new_controllers.items():
         old = old_controllers.get(name)
         if not isinstance(new, dict):
@@ -643,6 +706,12 @@ def validate_transition(
         if not isinstance(old, dict):
             continue
         current_evidence = compatible_engine_refs.get(name, {})
+        bootstrap = "managed_images" not in current or "managed_images" not in previous
+        if bootstrap:
+            # Bootstrap changes the manager before activating a reviewed runtime.
+            runtime_ref = current_evidence.get("engine_ref", old.get("engine_ref"))
+            old = {**old, "engine_ref": runtime_ref}
+            new = {**new, "engine_ref": runtime_ref}
         previous_evidence_source = (
             compatible_engine_refs
             if previous_compatible_engine_refs is None
@@ -732,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
+def main(*, retained_configuration: bool = False) -> int:
     args = parse_args()
     validation = Validation()
     config_path = args.config.absolute()
@@ -749,10 +818,21 @@ def main() -> int:
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
+    if config is None:
+        validate_config(config, validation, args.strict)
     if config is not None:
         scan_secret_material(config, validation)
-        validate_config(config, validation, args.strict)
+        previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
+        bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)
+        if bootstrap or (isinstance(config, dict) and "managed_images" not in config and args.previous_config):
+            validate_config(previous_for_bootstrap, validation, False)
+        validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict) or retained_configuration)
         current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
+        if bootstrap:
+            previous_bootstrap_evidence = load_json(args.previous_rollout_evidence.absolute(), validation) if args.previous_rollout_evidence else None
+            retained_evidence = validate_rollout_evidence(previous_bootstrap_evidence, validation) if previous_bootstrap_evidence is not None else {}
+            validation.require(current_compatible_engine_refs == retained_evidence, "engine-rollout-evidence.json", "manager bootstrap must retain incumbent runtime capability evidence")
+            current_controllers = {name: {**value, "engine_ref": current_compatible_engine_refs.get(name, {}).get("engine_ref", value.get("engine_ref"))} if isinstance(value, dict) else value for name, value in current_controllers.items()}
         for controller, evidence in current_compatible_engine_refs.items():
             current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
             validation.require(

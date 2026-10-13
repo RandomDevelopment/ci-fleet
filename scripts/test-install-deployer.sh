@@ -56,6 +56,8 @@ log=${FAKE_SYSTEMCTL_LOG:-/dev/null}
 printf '%s\n' "$*" >>"$log"
 [[ -z ${FAKE_SYSTEMCTL_FAIL_COMMAND:-} || ${1:-} != "$FAKE_SYSTEMCTL_FAIL_COMMAND" ]] || exit 1
 case "${1:-}" in
+  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
+  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
   is-system-running)
     [[ -z "${FAKE_SYSTEMD_FAIL:-}" ]] || exit 1
     printf '%s\n' "${FAKE_SYSTEMD_STATE:-running}"
@@ -804,6 +806,32 @@ rm "$root/etc/systemd/system/ci-fleet-health.service"
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-drift.timer"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-drift.timer"
+role_adapter_calls=$(wc -l <"$FAKE_ADAPTER_LOG")
+for unit in ci-fleet-capacity.service ci-fleet-capacity.timer; do
+  printf 'mixed-role\n' >"$root/etc/systemd/system/$unit"
+  for mode in --check --repair; do
+    expect_failure 'ordinary CI controller or runner state is present' "$installer" "$mode" --config "$config" >/dev/null
+  done
+  rm "$root/etc/systemd/system/$unit"
+  ln -s "$tmp/missing-capacity-unit" "$root/etc/systemd/system/$unit"
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+  rm "$root/etc/systemd/system/$unit"
+  mkdir -p "$root/etc/systemd/system/timers.target.wants"
+  ln -s "$tmp/missing-capacity-unit" "$root/etc/systemd/system/timers.target.wants/$unit"
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+  rm "$root/etc/systemd/system/timers.target.wants/$unit"
+done
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for unit in ci-fleet-capacity.service ci-fleet-capacity.timer ci-fleet-health.service ci-fleet-tester-health.service actions.runner.example.service ci-fleet-status-receiver.service; do
+    export "$inventory=$unit enabled"
+    for mode in --check --repair; do expect_failure 'is present' "$installer" "$mode" --config "$config" >/dev/null; done
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --check --config "$config" >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --check --config "$config" >/dev/null
+[[ $(wc -l <"$FAKE_ADAPTER_LOG") == "$role_adapter_calls" ]] || fail 'role rejection invoked an application adapter'
+FAKE_SYSTEMD_LOADED_UNITS='ci-fleet-deployer-health.service loaded active running' expect_success "$installer" --check --config "$config" >/dev/null
 printf 'receiver\n' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 expect_failure 'status receiver state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
@@ -1863,7 +1891,7 @@ install -m 0600 "$tmp/config.staging" "$config"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'usage: deployer-runtime.sh health|cleanup|deploy|drain' "$runtime" rollback >/dev/null
-for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/systemd/system/actions.runner.drain-test.service" "$root/etc/ci-fleet-tester" "$root/etc/systemd/system/ci-fleet-status-receiver.service" "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
+for role_path in "$root/etc/systemd/system/ci-fleet-capacity.service" "$root/etc/systemd/system/ci-fleet-capacity.timer" "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/systemd/system/actions.runner.drain-test.service" "$root/etc/ci-fleet-tester" "$root/etc/systemd/system/ci-fleet-status-receiver.service" "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
   mkdir "$role_path"
   expect_failure 'is present' "$runtime" drain >/dev/null
   [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'mixed-role runtime drain published a maintenance marker'
@@ -1872,6 +1900,18 @@ for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/s
   fi
   rmdir "$role_path"
 done
+role_adapter_calls=$(wc -l <"$FAKE_ADAPTER_LOG")
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for unit in ci-fleet-capacity.service ci-fleet-capacity.timer ci-fleet-health.service ci-fleet-tester-health.service actions.runner.example.service ci-fleet-status-receiver.service; do
+    export "$inventory=$unit enabled"
+    for operation in health cleanup deploy drain; do expect_failure 'is present' "$runtime" "$operation" >/dev/null; done
+    [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'mixed-role runtime inventory published a drain marker'
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$runtime" drain >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$runtime" health >/dev/null
+[[ $(wc -l <"$FAKE_ADAPTER_LOG") == "$role_adapter_calls" ]] || fail 'runtime role rejection invoked an application adapter'
 FAKE_DOCKER_UNAVAILABLE=1 expect_success "$runtime" drain >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker outage prevented emergency drain'
 rm "$root/var/lib/ci-fleet-deployer/drained"
