@@ -266,7 +266,10 @@ def project_reconciliation(value: dict, now: int, installation: dict) -> dict:
     return evidence(data("reconciliation", result), observed_at=observed)
 
 
-def clock_state(health: dict, now: int) -> str:
+def clock_state(sources: Mapping[str, dict], now: int) -> str:
+    if any(source["error"] == "clock_uncertain" for source in sources.values()):
+        return "uncertain"
+    health = sources["health"]
     observed = health["last_success_at"]
     if observed is not None and now - observed <= STALE_AFTER["health"]:
         for check in health["data"].get("checks", []):
@@ -306,7 +309,7 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
     observe("health", "health", lambda v: project_health(v, controller, now))
     observe("reconciliation", "reconciliation", lambda v: project_reconciliation(v, now, sources["installation"]))
     value = {"schema_version": 1, "role": "worker", "controller": controller,
-             "published_at": now, "clock_state": clock_state(sources["health"], now), "sources": sources}
+             "published_at": now, "clock_state": clock_state(sources, now), "sources": sources}
     validate_snapshot(value, controller=controller)
     return value
 
@@ -361,7 +364,7 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
     policy = value["sources"]["installation"]
     configuration = value["sources"]["configuration"]
     runtime = value["sources"]["controller"]
-    if value["clock_state"] != clock_state(value["sources"]["health"], value["published_at"]):
+    if value["clock_state"] != clock_state(value["sources"], value["published_at"]):
         raise SnapshotError("invalid_snapshot")
     if configuration["availability"] == "available":
         configured = configuration["data"]

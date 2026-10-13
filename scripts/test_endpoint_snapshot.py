@@ -309,6 +309,24 @@ class SnapshotReadbackTests(unittest.TestCase):
         store.publish_endpoint(self.base, recovered, self.gid)
         self.assertEqual(self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW + 20)["publisher_freshness"], "current")
 
+    def test_future_source_times_make_all_freshness_unknown(self):
+        future_installation = dt.datetime.fromtimestamp(NOW + 1, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for name, field, future in (("health", "timestamp", NOW + 1),
+                                    ("controller", "generated_at", NOW + 1),
+                                    ("reconciliation", "checked_at", NOW + 1),
+                                    ("installation", "installed_at", future_installation)):
+            with self.subTest(source=name):
+                docs = documents()
+                docs[name][field] = future
+                value = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
+                store.publish_endpoint(self.base, value, self.gid)
+                read = self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
+                self.assertEqual(read["clock_state"], "uncertain")
+                self.assertEqual(read["publisher_freshness"], "unknown")
+                self.assertTrue(all(source["freshness"] == "unknown" for source in read["sources"].values()))
+                self.assertEqual(read["sources"][name]["error"], "clock_uncertain")
+                self.assertEqual(read["sources"][name]["data"], {})
+
     @unittest.skipUnless(os.geteuid() == 0, "requires isolated root-owned permission fixture")
     def test_unprivileged_observer_reads_export_but_cannot_read_private_sources(self):
         self.root.chmod(0o755)
