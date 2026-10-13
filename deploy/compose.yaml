@@ -3,10 +3,13 @@ name: ci-fleet
 services:
   runner-image:
     image: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}
     build:
       context: ../runner
       args:
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-1786752000}
         RUNNER_VERSION: ${CI_FLEET_RUNNER_VERSION:-2.338.0}
     command: ["/bin/true"]
     deploy:
@@ -14,6 +17,8 @@ services:
 
   docker-socket-proxy:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     command: ["--docker-socket-proxy"]
     user: "0:0"
     restart: unless-stopped
@@ -40,12 +45,15 @@ services:
 
   controller:
     image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    labels:
+      io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     build:
       context: ..
       dockerfile: controller/Dockerfile
       args:
         CI_FLEET_VERSION: ${CI_FLEET_VERSION:-dev}
         CI_FLEET_COMMIT: ${CI_FLEET_COMMIT:-unknown}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-1786752000}
     restart: unless-stopped
     depends_on:
       docker-socket-proxy:
@@ -59,7 +67,7 @@ services:
       CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-}
       CI_FLEET_LABELS: ${CI_FLEET_LABELS:-docker-ci-experimental}
       CI_FLEET_RUNNER_GROUP: ${CI_FLEET_RUNNER_GROUP:-Default}
-      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
+      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}
       CI_FLEET_INSTANCE: ${CI_FLEET_INSTANCE:?set a unique stable host identifier}
       CI_FLEET_GITHUB_APP_CLIENT_ID: ${CI_FLEET_GITHUB_APP_CLIENT_ID:?set the GitHub App client ID}
       CI_FLEET_GITHUB_APP_INSTALLATION_ID: ${CI_FLEET_GITHUB_APP_INSTALLATION_ID:?set the installation ID}

@@ -66,9 +66,9 @@ jobs:
               git show "$BASE_SHA:engine-rollout-evidence.json" >"$RUNNER_TEMP/previous-rollout-evidence.json"
               args+=(--previous-rollout-evidence "$RUNNER_TEMP/previous-rollout-evidence.json")
             fi
-            ./scripts/validate.sh "${args[@]}"
+            ./scripts/validate.sh --strict "${args[@]}"
           else
-            ./scripts/validate.sh
+            ./scripts/validate.sh --strict
           fi
           ./scripts/validate.sh --config examples/multi-host/fleet.json
 
@@ -89,6 +89,9 @@ jobs:
             --project test-app \
             --registry BAD \
             --engine-ref "${engine_ref}" \
+            --architecture amd64 \
+            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
+            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --output "${temporary_directory}/invalid.json"; then
             echo 'initializer accepted an invalid registry' >&2
             exit 1
@@ -98,5 +101,8 @@ jobs:
             --organization test-company \
             --project test-app \
             --engine-ref "${engine_ref}" \
+            --architecture amd64 \
+            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
+            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
             --output "${temporary_directory}/fleet.json"
           test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644

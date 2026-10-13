@@ -6,6 +6,7 @@ ConditionPathExists=/etc/ci-fleet/ci-fleet.env
 
 [Service]
 Type=oneshot
+TimeoutStartSec=3min
 ExecStart=/opt/ci-fleet/current/scripts/capacity-sample.sh
 User=root
 Group=root

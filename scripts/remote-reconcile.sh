@@ -168,10 +168,10 @@ fetch_remote_config() {
   git init -q "$fetch_dir"
   # Use auth_url with embedded token for authenticated fetch
   local auth_url="https://x-access-token:${token}@github.com/${repo}.git"
-  GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 origin "$ref" 2>"$temp_dir/fetch_err" || {
+  GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=2 origin "$ref" 2>"$temp_dir/fetch_err" || {
     local err
     # Retry with auth_url if plain fetch failed (private repo needs auth)
-    GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=1 "$auth_url" "$ref" 2>"$temp_dir/fetch_err" || {
+    GIT_TERMINAL_PROMPT=0 git -C "$fetch_dir" fetch -q --filter=blob:none --depth=2 "$auth_url" "$ref" 2>"$temp_dir/fetch_err" || {
       local err
       err=$(<"$temp_dir/fetch_err")
       [[ -n "$err" ]] || err="fetch failed"
@@ -186,6 +186,7 @@ fetch_remote_config() {
 
 validate_config() {
   local checkout_dir=$1 commit=$2
+  local args=(--config "$temp_dir/fleet.json" --strict --tree-paths "$temp_dir/tree-paths")
   git -C "$checkout_dir" show "$commit:fleet.json" >"$temp_dir/fleet.json" 2>/dev/null || return 1
   git -C "$checkout_dir" ls-tree -rz --name-only "$commit" >"$temp_dir/tree-paths" 2>/dev/null || return 1
 
@@ -198,8 +199,17 @@ validate_config() {
     log_json "ERROR" "validation" "config validation failed"
     return 1
   }
-  python3 "$repo_root/templates/config-repository/scripts/validate.py" \
-    --config "$temp_dir/fleet.json" --strict --tree-paths "$temp_dir/tree-paths" 2>"$temp_dir/strict_err" || {
+  if git -C "$checkout_dir" show "$commit:engine-rollout-evidence.json" >"$temp_dir/rollout-evidence.json" 2>/dev/null; then
+    args+=(--rollout-evidence "$temp_dir/rollout-evidence.json")
+  fi
+  if git -C "$checkout_dir" show "$commit^:fleet.json" >"$temp_dir/previous-fleet.json" 2>/dev/null \
+    && python3 -c 'import json, sys; current, previous=(json.load(open(path)) for path in sys.argv[1:]); sys.exit(0 if isinstance(current, dict) and isinstance(previous, dict) and ("managed_images" not in current or "managed_images" not in previous) else 1)' "$temp_dir/fleet.json" "$temp_dir/previous-fleet.json"; then
+    args+=(--previous-config "$temp_dir/previous-fleet.json")
+    if git -C "$checkout_dir" show "$commit^:engine-rollout-evidence.json" >"$temp_dir/previous-evidence.json" 2>/dev/null; then
+      args+=(--previous-rollout-evidence "$temp_dir/previous-evidence.json")
+    fi
+  fi
+  python3 "$repo_root/templates/config-repository/scripts/validate.py" "${args[@]}" 2>"$temp_dir/strict_err" || {
     local err
     err=$(<"$temp_dir/strict_err")
     [[ -n "$err" ]] || err="strict validation failed"

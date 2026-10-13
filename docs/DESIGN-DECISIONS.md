@@ -140,3 +140,13 @@ leaked private key. Live setup and periodic owner checks must retain private
 distribution. Issue #27 includes live acceptance of this requirement. Replace
 this manual check when GitHub exposes a supported, authoritative visibility
 field that bootstrap can verify without browser credentials.
+
+## Image-enforcement bootstrap
+
+A controller without reviewed managed image IDs may temporarily select a new manager while keeping its existing runtime and rendered environment. This exception is limited to fieldless engine-ref-only staging and introduction of image policy with identical controller settings. Runtime capability evidence must remain identical to the previous integrated evidence during these commits. The next ordinary revision must attest the newly activated runtime.
+
+The incumbent manager must not activate the new runtime before reviewed IDs exist. The candidate Compose file requires those IDs, so an incumbent reconciliation attempt fails before drain or build. An operator must separately authorize the bootstrap, pause reconciliation before publishing staging, and invoke the reviewed candidate installer. Staging reconciles mandatory maintenance timers without replacing the runtime. Reverting staging may repoint the manager to the retained runtime revision.
+
+Legacy checkpoint image IDs do not make their mutable build inputs reproducible. Retain these image objects or verified offline exports during bootstrap. Missing legacy objects block rollback and require separately authorized import or reinstall; reconstruction is limited to releases declaring reproducible managed-image support.
+
+The remaining risks are incorrect operator sequencing and inaccurate host evidence. Issue #36 retains the operational bootstrap, repeated-build and private image-ID proof. Remove this transitional exception after participating hosts have adopted image enforcement and the retained pre-enforcement rollback paths are retired through reviewed policy.

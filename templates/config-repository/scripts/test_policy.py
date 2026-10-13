@@ -20,7 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def reference_config() -> dict:
-    return json.loads((ROOT / "fleet.json").read_text(encoding="utf-8"))
+    value = json.loads((ROOT / "fleet.json").read_text(encoding="utf-8"))
+    for architectures in value.get("managed_images", {}).values():
+        for images in architectures.values():
+            images["controller"] = "sha256:" + "3" * 64
+            images["runner"] = "sha256:" + "4" * 64
+    return value
 
 
 def contract_schema() -> dict:
@@ -69,6 +74,8 @@ class PolicyTests(unittest.TestCase):
 
     def assert_engine_ref_contract(self, value: str, accepted: bool) -> None:
         config = copy.deepcopy(reference_config())
+        images = next(iter(config["managed_images"].values()))
+        config["managed_images"] = {value: images}
         first_controller(config)["engine_ref"] = value
         self.assertEqual(schema_accepts_engine_ref(value), accepted)
         self.assertEqual(errors_for(config) == [], accepted)
@@ -82,6 +89,147 @@ class PolicyTests(unittest.TestCase):
     def test_reference_configuration_is_valid(self) -> None:
         self.assertEqual(errors_for(reference_config()), [])
 
+    def test_explicit_null_image_policy_is_rejected(self) -> None:
+        config = reference_config()
+        config["managed_images"] = None
+        self.assert_rejected(config, "null is not", strict=True)
+
+    def test_staging_retains_live_feature_evidence(self) -> None:
+        previous = reference_config()
+        previous.pop("managed_images")
+        controller = first_controller(previous)
+        controller["status_reporting"] = {"enabled": True, "config_file": "/etc/ci-fleet/monitoring.env"}
+        name = next(iter(previous["controllers"]))
+        evidence = {name: {"engine_ref": controller["engine_ref"], "status_reporting_config": True,
+                           "required_status_reporting": True, "docker_network_policy_config": True,
+                           "docker_default_bridge_cidr_config": True}}
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, evidence, validation, evidence)
+        self.assertEqual(validation.errors, [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "previous.json"
+            new = root / "current.json"
+            proof = root / "evidence.json"
+            old.write_text(json.dumps(previous))
+            new.write_text(json.dumps(current))
+            proof.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": evidence}))
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
+                                     "--previous-config", str(old), "--rollout-evidence", str(proof),
+                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # Reverting the staged manager keeps the same runtime and evidence.
+            old.write_text(json.dumps(current))
+            new.write_text(json.dumps(previous))
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
+                                     "--previous-config", str(old), "--rollout-evidence", str(proof),
+                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_managed_images_may_be_omitted_for_staged_engine_upgrade(self) -> None:
+        config = copy.deepcopy(reference_config())
+        config.pop("managed_images")
+        self.assertEqual(errors_for(config), [])
+        self.assertNotIn("managed_images", contract_schema()["required"])
+
+    def test_manager_only_staging_transition_is_engine_ref_only(self) -> None:
+        previous = copy.deepcopy(reference_config())
+        previous.pop("managed_images")
+        for controller in previous["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+
+        current["organization"]["slug"] = "other-org"
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("may change only" in error for error in validation.errors), validation.errors)
+
+        enforced = copy.deepcopy(reference_config())
+        validation = Validation()
+        validate_transition(enforced, previous, {}, validation)
+        self.assertTrue(any("cannot be removed" in error for error in validation.errors), validation.errors)
+
+    def test_image_policy_introduction_retains_activated_engine(self) -> None:
+        current = reference_config()
+        for controller in current["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        previous = copy.deepcopy(current)
+        previous.pop("managed_images")
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+        first_controller(current)["engine_ref"] = "3" * 40
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("same compatible engine_ref" in error for error in validation.errors), validation.errors)
+        current = reference_config()
+        current["controllers"]["another-controller"] = copy.deepcopy(first_controller(current))
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertTrue(any("cannot add or remove" in error for error in validation.errors), validation.errors)
+
+    def test_staging_rollback_can_change_one_controller(self) -> None:
+        previous = reference_config()
+        previous.pop("managed_images")
+        for controller in previous["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        second = copy.deepcopy(first_controller(previous))
+        second["scale_set_name"] = "other-ci-01"
+        previous["controllers"]["other-ci-01"] = second
+        previous["runner_pools"][second["pool"]]["capacity_budget"] = 2
+        current = copy.deepcopy(previous)
+        first_controller(current)["engine_ref"] = "3" * 40
+        self.assertEqual(errors_for(current), [])
+        validation = Validation()
+        validate_transition(previous, current, {}, validation)
+        self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(current, previous, {}, validation)
+        self.assertEqual(validation.errors, [])
+        validation = Validation()
+        validate_transition(current, current, {}, validation)
+        self.assertTrue(any("at least one engine_ref" in error for error in validation.errors))
+
+    def test_strict_validation_rejects_fixture_image_ids(self) -> None:
+        config = json.loads((ROOT / "fleet.json").read_text())
+        self.assert_rejected(config, "replace the fixture image digest", strict=True)
+
+    def test_strict_image_omission_requires_staging_transition(self) -> None:
+        current = reference_config()
+        project = first_project(current)
+        current["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+        current["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
+        project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+        current.pop("managed_images")
+        for controller in current["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        previous = copy.deepcopy(current)
+        for controller in current["controllers"].values():
+            controller["engine_ref"] = "3" * 40
+        self.assert_rejected(current, "initial strict configuration requires reviewed image IDs", strict=True)
+        with tempfile.TemporaryDirectory() as directory:
+            candidate, baseline = (Path(directory) / name for name in ("current.json", "previous.json"))
+            candidate.write_text(json.dumps(current))
+            baseline.write_text(json.dumps(previous))
+            command = [sys.executable, str(ROOT / "scripts/validate.py"), "--strict", "--skip-path-scan", "--config", str(candidate)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("initial strict configuration requires reviewed image IDs", result.stderr)
+            result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for invalid_previous in ({}, None, current):
+                baseline.write_text(json.dumps(invalid_previous))
+                result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, (invalid_previous, result.stdout, result.stderr))
+            candidate.write_text("null")
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
     def test_storage_retention_schema_requires_explicit_exclusive_admission(self) -> None:
         controller = contract_schema()["$defs"]["controller"]
         self.assertNotIn("docker_storage_retention", controller["required"])
@@ -116,6 +264,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts/init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--output", str(output),
             ], check=True, text=True, capture_output=True)
             config = json.loads(output.read_text())
@@ -257,17 +408,39 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
-                "--engine-ref", "1" * 40, "--output", str(output),
+                "--engine-ref", "1" * 40,
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
+                "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
             controller = first_controller(json.loads(output.read_text()))
         self.assertNotIn("status_reporting", controller)
 
+    def test_managed_image_ids_reject_identical_controller_and_runner(self) -> None:
+        config = reference_config()
+        for architecture in ("amd64", "arm64"):
+            images = next(iter(config["managed_images"].values()))
+            images[architecture] = {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "3" * 64}
+            self.assert_rejected(config, "image IDs must differ", strict=True)
+
+    def test_managed_image_ids_require_an_architecture_key(self) -> None:
+        config = copy.deepcopy(reference_config())
+        engine_ref = first_controller(config)["engine_ref"]
+        config["managed_images"][engine_ref] = {
+            "controller": "sha256:" + "1" * 64,
+            "runner": "sha256:" + "2" * 64,
+        }
+        self.assert_rejected(config, "architecture")
     def test_initializer_includes_default_bridge_cidr_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fleet.json"
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40,
                 "--default-bridge-cidr", "192.0.2.1/24",
                 "--output", str(output),
@@ -281,6 +454,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "16",
                 "--capacity-budget", "16", "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
@@ -295,6 +471,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "2",
                 "--capacity-budget", "2", "--networks-per-runner", "2",
                 "--output", str(output),
@@ -310,6 +489,9 @@ class PolicyTests(unittest.TestCase):
             subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "30",
                 "--capacity-budget", "30", "--output", str(output),
             ], check=True, stdout=subprocess.DEVNULL)
@@ -321,6 +503,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "31",
                 "--capacity-budget", "31", "--output", str(Path(directory) / "fleet.json"),
             ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -332,6 +517,9 @@ class PolicyTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(ROOT / "scripts" / "init.py"),
                 "--organization", "sample-org", "--project", "sample-app",
+                "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
                 "--engine-ref", "1" * 40, "--max-runners", "256",
                 "--capacity-budget", "256", "--output", str(Path(directory) / "fleet.json"),
             ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
