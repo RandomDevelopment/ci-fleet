@@ -35,7 +35,7 @@ def documents():
                      "CI_FLEET_MAX_RUNNERS": "4"},
         "controller": {"controller": CONTROLLER, "software_version": "3" * 40,
                        "current": 2, "busy": 1, "maximum": 4, "generated_at": NOW - 10},
-        "health": {"schema_version": 1, "controller": CONTROLLER, "status": "healthy", "timestamp": NOW - 20,
+        "health": {"schema_version": 1, "controller": CONTROLLER, "desired_state": "active", "status": "healthy", "timestamp": NOW - 20,
                    "checks": [{"id": "clock", "status": "ok"}, {"id": "docker", "status": "ok"}]},
         "reconciliation": {"status": "converged", "desired_commit": "1" * 40, "applied_commit": "1" * 40,
                            "checked_at": NOW - 30, "last_success_at": NOW - 30},
@@ -207,6 +207,50 @@ class SnapshotTests(unittest.TestCase):
                     valid = minimum == 0 and maximum == (4 if state == "active" else 0)
                     self.assertEqual(value["sources"]["configuration"]["availability"] == "available", valid)
 
+    def test_installation_requires_possible_schema_v3_capacity(self):
+        for state, maximum, budget in (("active", 0, 8), ("active", 4, 0), ("active", 9, 8),
+                                       ("drained", 9, 8), ("active", 4, None), ("disabled", 9, 8)):
+            with self.subTest(state=state, maximum=maximum, budget=budget):
+                docs = documents()
+                docs["installation"].update(controller_state=state, configured_max_runners=maximum)
+                if budget is None:
+                    del docs["installation"]["capacity_budget"]
+                else:
+                    docs["installation"]["capacity_budget"] = budget
+                source = self.build(docs)["sources"]["installation"]
+                self.assertEqual(source["availability"] == "available", state == "disabled")
+
+    def test_runner_resources_follow_schema_v3_types_and_minimums(self):
+        for field, invalid in (("CI_FLEET_RUNNER_CPUS", "0.5"), ("CI_FLEET_RUNNER_CPUS", "1.5"),
+                               ("CI_FLEET_RUNNER_MEMORY_MIB", "1"), ("CI_FLEET_RUNNER_MEMORY_MIB", "511")):
+            with self.subTest(field=field, invalid=invalid):
+                docs = documents()
+                docs["rendered"][field] = invalid
+                self.assertNotEqual(self.build(docs)["sources"]["configuration"]["availability"], "available")
+
+    def test_health_and_convergence_bind_to_authoritative_installation(self):
+        for desired in ("drained", "disabled", None):
+            docs = documents()
+            docs["health"]["desired_state"] = desired
+            source = self.build(docs)["sources"]["health"]
+            self.assertNotEqual(source["availability"], "available")
+            self.assertEqual(source["data"], {})
+        for field, changed in (("desired_commit", None), ("applied_commit", None),
+                               ("desired_commit", "4" * 40), ("applied_commit", "4" * 40)):
+            docs = documents()
+            docs["reconciliation"][field] = changed
+            source = self.build(docs)["sources"]["reconciliation"]
+            self.assertNotEqual(source["availability"], "available")
+            self.assertEqual(source["data"], {})
+
+    def test_failed_health_read_discards_old_policy_evidence(self):
+        docs = documents()
+        docs["installation"]["controller_state"] = "drained"
+        docs["rendered"]["CI_FLEET_MAX_RUNNERS"] = "0"
+        value = self.build(docs, errors={"health": "source_timeout"}, previous=self.build())
+        self.assertEqual(value["sources"]["health"]["error"], "revision_unverified")
+        self.assertEqual(value["sources"]["health"]["data"], {})
+
     def test_retained_controller_counts_do_not_keep_a_stale_policy_comparison(self):
         previous = self.build()
         docs = documents()
@@ -316,10 +360,25 @@ class SnapshotTests(unittest.TestCase):
             lambda v: v["sources"]["configuration"]["data"].update(minimum_runners=1),
             lambda v: v["sources"]["configuration"]["data"].update(applied_commit="4" * 40),
             lambda v: v["sources"]["installation"]["data"].update(installed_at=NOW + 1),
+            lambda v: v["sources"]["installation"]["data"].update(reviewed_maximum=0),
+            lambda v: v["sources"]["installation"]["data"].update(capacity_budget=0),
+            lambda v: v["sources"]["installation"]["data"].update(capacity_budget=3),
+            lambda v: v["sources"]["installation"]["data"].pop("capacity_budget"),
+            lambda v: v["sources"]["configuration"]["data"].update(runner_cpu_cores=0.5),
+            lambda v: v["sources"]["configuration"]["data"].update(runner_memory_mib=511),
+            lambda v: v["sources"]["health"]["data"].update(desired_state="drained"),
             lambda v: v["sources"]["reconciliation"]["data"].update(last_success_at=NOW + 1),
+            lambda v: v["sources"]["reconciliation"]["data"].update(desired_commit="4" * 40),
+            lambda v: v["sources"]["reconciliation"]["data"].pop("applied_commit"),
         ):
             value = self.build()
             mutate(value)
+            self.assert_snapshot_error(lambda: snapshot.validate_snapshot(value, controller=CONTROLLER))
+
+    def test_retained_data_requires_a_supported_source_version(self):
+        for name in ("controller", "configuration", "health", "reconciliation"):
+            value = self.build(errors={"rendered" if name == "configuration" else name: "source_timeout"}, previous=self.build())
+            value["sources"][name]["source_version"] = None
             self.assert_snapshot_error(lambda: snapshot.validate_snapshot(value, controller=CONTROLLER))
 
     def test_placeholder_sources_cannot_claim_available_proof(self):

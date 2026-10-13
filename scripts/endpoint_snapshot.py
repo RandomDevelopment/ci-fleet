@@ -8,7 +8,6 @@ import datetime as dt
 import grp
 import hmac
 import json
-import math
 import re
 import time
 from pathlib import Path
@@ -85,21 +84,22 @@ DATA_FIELDS = {
         "record_state": choice("installed", "absent"), "lifecycle": choice("experimental", "stable", "retiring"),
         "policy_state": choice(*STATES), "installed_at": integer, "applied_commit": commit,
         "engine_ref": commit, "architecture": choice("amd64", "arm64"), "pool": token,
-        "reviewed_maximum": integer, "capacity_budget": integer, "scale_set_name": token,
+        "reviewed_maximum": lambda v: integer(v) and v > 0, "capacity_budget": lambda v: integer(v) and v > 0, "scale_set_name": token,
         "reporting_configured": lambda v: type(v) is bool, "reporting_required": lambda v: type(v) is bool,
         "network_policy_configured": lambda v: type(v) is bool,
     },
     "configuration": {
         "applied_commit": commit, "engine_ref": commit, "routing_labels": labels,
-        "runner_cpu_cores": lambda v: type(v) in {int, float} and math.isfinite(v) and v > 0,
-        "runner_memory_mib": lambda v: integer(v) and v > 0,
+        "runner_cpu_cores": lambda v: integer(v) and v >= 1,
+        "runner_memory_mib": lambda v: integer(v) and v >= 512,
         "minimum_runners": lambda v: type(v) is int and v == 0, "maximum_runners": integer,
         "storage_retention_configured": lambda v: type(v) is bool,
     },
     "controller": {"software_version": lambda v: isinstance(v, str) and len(v) <= 64 and VERSION.fullmatch(v) is not None,
                    "current": integer, "busy": integer, "maximum": integer,
                    "matches_reviewed_maximum": lambda v: type(v) is bool},
-    "health": {"status": choice("healthy", "warning", "unhealthy", "maintenance"), "checks": checks},
+    "health": {"status": choice("healthy", "warning", "unhealthy", "maintenance"), "checks": checks,
+               "desired_state": choice(*STATES)},
     "reconciliation": {"state": choice(*RECONCILIATION), "desired_commit": commit, "applied_commit": commit,
                        "last_success_at": integer},
     **{name: {} for name in UNSUPPORTED_SOURCES},
@@ -141,7 +141,7 @@ def validate_data(name: str, value: dict) -> None:
         "installation": {"record_state"},
         "configuration": set(DATA_FIELDS["configuration"]),
         "controller": {"software_version", "current", "busy", "maximum"},
-        "health": {"status", "checks"},
+        "health": {"status", "checks", "desired_state"},
         "reconciliation": {"state"},
     }.get(name, set())
     if name == "installation":
@@ -149,8 +149,11 @@ def validate_data(name: str, value: dict) -> None:
             if set(value) != {"record_state"}:
                 raise SnapshotError("invalid_snapshot")
         else:
-            required |= {"installed_at", "policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum"}
+            required |= {"installed_at", "policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum", "capacity_budget"}
     if not required <= value.keys():
+        raise SnapshotError("invalid_snapshot")
+    if (name == "installation" and value["record_state"] == "installed"
+            and value["policy_state"] != "disabled" and value["reviewed_maximum"] > value["capacity_budget"]):
         raise SnapshotError("invalid_snapshot")
     if name == "controller" and not value["busy"] <= value["current"] <= value["maximum"]:
         raise SnapshotError("invalid_snapshot")
@@ -190,10 +193,13 @@ def project_installation(value: dict, controller: str, now: int) -> dict:
     for source, target in mapping.items():
         if source in value:
             result[target] = value[source]
-    required = {"policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum"}
+    required = {"policy_state", "applied_commit", "engine_ref", "lifecycle", "pool", "reviewed_maximum", "capacity_budget"}
     if not required <= result.keys():
         raise SnapshotError("source_invalid")
-    return evidence(data("installation", result), observed_at=observed)
+    data("installation", result)
+    if result["policy_state"] != "disabled" and result["reviewed_maximum"] > result["capacity_budget"]:
+        raise SnapshotError("source_invalid")
+    return evidence(result, observed_at=observed)
 
 
 def project_configuration(value: dict, installation: dict, controller: str) -> dict:
@@ -210,7 +216,7 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
     try:
         result = {"applied_commit": policy["applied_commit"], "engine_ref": policy["engine_ref"],
                   "routing_labels": value["CI_FLEET_LABELS"].split(","),
-                  "runner_cpu_cores": float(value["CI_FLEET_RUNNER_CPUS"]),
+                  "runner_cpu_cores": int(value["CI_FLEET_RUNNER_CPUS"]),
                   "runner_memory_mib": int(value["CI_FLEET_RUNNER_MEMORY_MIB"]),
                   "minimum_runners": int(value["CI_FLEET_MIN_RUNNERS"]),
                   "maximum_runners": int(value["CI_FLEET_MAX_RUNNERS"]),
@@ -236,7 +242,7 @@ def project_controller(value: dict, controller: str, now: int, installation: dic
     return evidence(result, observed_at=timestamp(value.get("generated_at"), now))
 
 
-def project_health(value: dict, controller: str, now: int) -> dict:
+def project_health(value: dict, controller: str, now: int, installation: dict) -> dict:
     if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise SnapshotError("unsupported")
     if value.get("controller") != controller:
@@ -250,8 +256,12 @@ def project_health(value: dict, controller: str, now: int) -> dict:
         if check["id"] in HEALTH_IDS:
             identifier = check["id"] + "_service" if check["id"] in {"capacity", "updates"} and "state" in check else check["id"]
             approved.append({"id": identifier, "status": check.get("status")})
-    result = data("health", {"status": value.get("status"), "checks": approved})
-    return evidence(result, observed_at=timestamp(value.get("timestamp"), now))
+    result = data("health", {"status": value.get("status"), "checks": approved, "desired_state": value.get("desired_state")})
+    observed = timestamp(value.get("timestamp"), now)
+    if installation["availability"] == "available" and installation["data"].get("record_state") == "installed":
+        if result["desired_state"] != installation["data"]["policy_state"] or observed < installation["data"]["installed_at"]:
+            raise SnapshotError("revision_unverified")
+    return evidence(result, observed_at=observed)
 
 
 def project_reconciliation(value: dict, now: int, installation: dict) -> dict:
@@ -266,6 +276,9 @@ def project_reconciliation(value: dict, now: int, installation: dict) -> dict:
             result[name] = value[name]
     if value.get("last_success_at") is not None:
         result["last_success_at"] = timestamp(value["last_success_at"], observed)
+    if result["state"] == "converged" and any(result.get(name) != installation["data"]["applied_commit"]
+                                               for name in ("desired_commit", "applied_commit")):
+        raise SnapshotError("revision_unverified")
     return evidence(data("reconciliation", result), observed_at=observed)
 
 
@@ -317,6 +330,12 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
             sources[name] = failure(error.code, retained)
             if name == "controller":
                 sources[name]["data"].pop("matches_reviewed_maximum", None)
+            if name == "health" and sources[name]["data"]:
+                installation = sources["installation"]
+                if installation["availability"] == "available" and installation["data"].get("record_state") == "installed":
+                    if (sources[name]["data"]["desired_state"] != installation["data"]["policy_state"]
+                            or sources[name]["last_success_at"] < installation["data"]["installed_at"]):
+                        sources[name] = failure("revision_unverified")
 
     if errors.get("installation") == "not_found":
         sources["installation"] = evidence({"record_state": "absent"}, observed_at=now)
@@ -324,7 +343,7 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
         observe("installation", "installation", lambda v: project_installation(v, controller, now))
     observe("configuration", "rendered", lambda v: project_configuration(v, sources["installation"], controller))
     observe("controller", "controller", lambda v: project_controller(v, controller, now, sources["installation"]))
-    observe("health", "health", lambda v: project_health(v, controller, now))
+    observe("health", "health", lambda v: project_health(v, controller, now, sources["installation"]))
     observe("reconciliation", "reconciliation", lambda v: project_reconciliation(v, now, sources["installation"]))
     value = {"schema_version": 1, "role": "worker", "controller": controller,
              "published_at": now, "clock_state": clock_state(sources, now), "sources": sources}
@@ -366,6 +385,8 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
             raise SnapshotError("invalid_snapshot")
         data(name, source["data"])
         if source["data"]:
+            if source["source_version"] != 1:
+                raise SnapshotError("unsupported_schema")
             validate_data(name, source["data"])
         if source["availability"] == "available":
             if source["source_version"] != 1 or source["observed_at"] is None or source["last_success_at"] != source["observed_at"] or source["error"] is not None:
@@ -382,6 +403,7 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
     policy = value["sources"]["installation"]
     configuration = value["sources"]["configuration"]
     reconciliation = value["sources"]["reconciliation"]
+    health = value["sources"]["health"]
     runtime = value["sources"]["controller"]
     if value["clock_state"] != clock_state(value["sources"], value["published_at"]):
         raise SnapshotError("invalid_snapshot")
@@ -403,6 +425,13 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
     if reconciliation["data"]:
         if (policy["availability"] != "available" or policy["data"].get("record_state") != "installed"
                 or reconciliation["last_success_at"] < policy["data"]["installed_at"]):
+            raise SnapshotError("invalid_snapshot")
+        if reconciliation["data"]["state"] == "converged" and any(
+                reconciliation["data"].get(name) != policy["data"]["applied_commit"] for name in ("desired_commit", "applied_commit")):
+            raise SnapshotError("invalid_snapshot")
+    if health["data"] and policy["availability"] == "available" and policy["data"].get("record_state") == "installed":
+        if (health["data"]["desired_state"] != policy["data"]["policy_state"]
+                or health["last_success_at"] < policy["data"]["installed_at"]):
             raise SnapshotError("invalid_snapshot")
     try:
         encoded = (json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode()
