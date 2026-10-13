@@ -4,6 +4,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 python3 - "$repo_root" <<'PY'
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,8 +34,11 @@ with tempfile.TemporaryDirectory() as temporary:
                            FAKE_RUNNER_IMAGE_ID_STATE=str(root / 'runner-id'),
                            FAKE_CONTROLLER_IMAGE_ID_STATE=str(root / 'controller-id'),
                            FAKE_AVAILABLE_IMAGE_IDS=str(root / 'available'),
+                           FAKE_BUILDER_LOG=str(root / 'builders'),
                            FAKE_PARTIAL_RUNNER_IMAGE_ID=wrong_id)
-    for case in ('partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
+    builder_names = set()
+    for case in ('create_failure', 'bootstrap_failure', 'partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
+        (root / 'builders').write_text('')
         (root / 'running').touch()
         (root / 'runner-state').write_text(old_revision + '\n')
         (root / 'controller-state').write_text(old_revision + '\n')
@@ -42,6 +46,8 @@ with tempfile.TemporaryDirectory() as temporary:
         (root / 'controller-id').write_text(old_controller + '\n')
         (root / 'available').write_text(old_runner + '\n' + old_controller + '\n')
         injected = dict(env)
+        if case == 'create_failure': injected['FAKE_FAIL_BUILDER_CREATE'] = '1'
+        if case == 'bootstrap_failure': injected['FAKE_FAIL_BUILDER_BOOTSTRAP'] = '1'
         if case == 'partial': injected['FAKE_PARTIAL_BUILD_FAIL'] = '1'
         if case == 'runner_mismatch': injected['FAKE_BUILT_RUNNER_IMAGE_ID'] = wrong_id
         if case == 'controller_mismatch': injected['FAKE_BUILT_CONTROLLER_IMAGE_ID'] = wrong_id
@@ -50,6 +56,12 @@ with tempfile.TemporaryDirectory() as temporary:
         result = subprocess.run(command,
                                 env=injected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert (result.returncode == 0) == (case in ('prepare', 'success')), (case, result.stdout)
+        operations = (root / 'builders').read_text().splitlines()
+        create = shlex.split(operations[0].split('|', 1)[1])
+        builder = create[create.index('--name') + 1]
+        assert builder.startswith('ci-fleet-managed-') and builder not in builder_names, operations
+        builder_names.add(builder)
+        assert operations[1:] == ([] if case == 'create_failure' else [f'rm|buildx rm --force {builder}']), operations
         expected = (runner_id, controller_id) if case == 'success' else (old_runner, old_controller)
         assert tuple((root / name).read_text().strip() for name in ('runner-id', 'controller-id')) == expected, case
         assert (root / 'running').exists(), case

@@ -49,11 +49,10 @@ CI_FLEET_COMMIT=$(git rev-parse 'HEAD^{commit}')
 CI_FLEET_VERSION=${CI_FLEET_COMMIT:0:12}
 SOURCE_DATE_EPOCH=1786752000
 BUILDKIT_IMAGE=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
-BUILDER=ci-fleet-managed-review
+BUILDER=ci-fleet-managed-review-$(</proc/sys/kernel/random/uuid)
 export CI_FLEET_COMMIT CI_FLEET_VERSION SOURCE_DATE_EPOCH
 cleanup() { docker buildx rm --force "$BUILDER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-cleanup
 docker buildx create --name "$BUILDER" --driver docker-container \
   --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap
 
@@ -73,7 +72,7 @@ docker image inspect --format '{{.Id}}' \
 
 Managed builds require the reviewed Docker Buildx client v0.32.1. Read-only checks, manager staging, maintenance that reuses matching images, uninstall and retained-image rollback do not require that plugin. Rollback that must rebuild requires the reviewed client. Host tool installation or upgrade remains separately authorized.
 
-Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes the temporary builder afterward.
+Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes only its own temporary builder afterward. Builder and staging names include a per-invocation UUID; an existing operator builder is never removed.
 
 Repeat the build on every supported host architecture. After each architecture's repeated IDs match, add them to one private desired-state entry:
 

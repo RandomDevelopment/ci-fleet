@@ -74,8 +74,10 @@ case "${1:-}" in
   buildx)
     case "${2:-}" in
       version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-v0.32.1}" ;;
-      inspect) printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit: v0.32.2\n' ;;
-      create|rm) ;;
+      inspect) [[ ${FAKE_FAIL_BUILDER_BOOTSTRAP:-0} == 0 ]] || exit 1; printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit: v0.32.2\n' ;;
+      create|rm)
+        [[ -z ${FAKE_BUILDER_LOG:-} ]] || printf '%s|%s\n' "$2" "$*" >>"$FAKE_BUILDER_LOG"
+        [[ "$2" != create || ${FAKE_FAIL_BUILDER_CREATE:-0} == 0 ]] || exit 1 ;;
       build)
         [[ "$*" == *'--build-arg SOURCE_DATE_EPOCH=1786752000'* ]] || exit 94
         [[ -z "${FAKE_COMPOSE_LOG:-}" ]] || printf 'build|%s\n' "$*" >>"$FAKE_COMPOSE_LOG"

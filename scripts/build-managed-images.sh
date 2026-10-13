@@ -9,23 +9,25 @@ set -a
 # shellcheck disable=SC1090
 . "$environment"
 set +a
-managed_builder=ci-fleet-managed
+build_id=$(</proc/sys/kernel/random/uuid)
+managed_builder=ci-fleet-managed-$build_id
+builder_created=false
 managed_buildkit='moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
 keep_staged=false
-staged_runner=$CI_FLEET_RUNNER_IMAGE-staged-$$
-staged_controller=$CI_FLEET_CONTROLLER_IMAGE-staged-$$
+staged_runner=$CI_FLEET_RUNNER_IMAGE-staged-$build_id
+staged_controller=$CI_FLEET_CONTROLLER_IMAGE-staged-$build_id
 cleanup_build() {
   local image
   if [[ "$keep_staged" != true ]]; then
     for image in "$staged_runner" "$staged_controller"; do docker image rm "$image" >/dev/null 2>&1 || true; done
   fi
-  docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true
+  if $builder_created; then docker buildx rm --force "$managed_builder" >/dev/null 2>&1 || true; fi
 }
 trap cleanup_build EXIT
-cleanup_build
 docker buildx create --name "$managed_builder" --driver docker-container \
-  --driver-opt "image=$managed_buildkit" --bootstrap >/dev/null
-[[ $(docker buildx inspect "$managed_builder" | awk '$1 == "BuildKit:" {print $2; exit}') == v0.32.2 ]] \
+  --driver-opt "image=$managed_buildkit" >/dev/null
+builder_created=true
+[[ $(docker buildx inspect --bootstrap "$managed_builder" | awk '$1 == "BuildKit:" {print $2; exit}') == v0.32.2 ]] \
   || { printf 'reviewed BuildKit backend v0.32.2 is unavailable\n' >&2; exit 1; }
 docker buildx build --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
   --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH=1786752000 \
