@@ -2941,9 +2941,9 @@ grep -Fxq 'CI_FLEET_RUNNER_IMAGE_ID=absent' "$checkpoint_path/image-ids.env" || 
 [[ ! -e "$FAKE_ALL_RUNNER_STATE" ]] || fail 'rollback retained the stopped candidate runner'
 [[ $(<"$FAKE_RUNNER_IMAGE_ID_STATE") == sha256:4444444444444444444444444444444444444444444444444444444444444444 ]] || fail 'stopped-runner rollback did not rebuild the reviewed runner image'
 container_rm_line=$(grep -n -m1 '^container-rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+runner_tag_line=$(grep -n "^image-tag|sha256:$runner_image_digest|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
-[[ -n "$container_rm_line" && -n "$runner_rm_line" && -n "$rollback_up_line" && "$container_rm_line" -lt "$runner_rm_line" && "$runner_rm_line" -lt "$rollback_up_line" ]] || fail 'rollback did not remove the stopped candidate runner before restoring images and restarting the controller'
+[[ -n "$container_rm_line" && -n "$runner_tag_line" && -n "$rollback_up_line" && "$container_rm_line" -lt "$runner_tag_line" && "$runner_tag_line" -lt "$rollback_up_line" ]] || fail 'rollback did not remove the stopped candidate runner before restoring images and restarting the controller'
 printf '%s\n' "$engine_ref" >"$FAKE_RUNNER_IMAGE_STATE"
 printf '%s\n' "$prior_runner_image_id" >"$FAKE_RUNNER_IMAGE_ID_STATE"
 unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
