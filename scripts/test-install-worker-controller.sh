@@ -1399,6 +1399,20 @@ printf 'retired history\n' >"$pre_adapter_root/var/lib/ci-fleet/capacity/history
 (
   exec 9>"$pre_adapter_root/run/ci-fleet-installer.lock"
   flock -n 9
+  bootstrap_current_before=$(readlink "$pre_adapter_root/opt/ci-fleet/current")
+  bootstrap_env_before=$(sha256sum "$pre_adapter_root/etc/ci-fleet/ci-fleet.env")
+  mkdir "$pre_adapter_root/var/lib/ci-fleet-deployer"
+  expect_failure 'deployer host state is present' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  rmdir "$pre_adapter_root/var/lib/ci-fleet-deployer"
+  for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+    export "$inventory=ci-fleet-deployer-adapter-transient.service loaded"
+    expect_failure 'deployer host state is present' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+    unset "$inventory"
+  done
+  FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$bootstrap_current_before" && $(sha256sum "$pre_adapter_root/etc/ci-fleet/ci-fleet.env") == "$bootstrap_env_before" ]] || fail 'blocked bootstrap restore changed active runtime state'
+  [[ -f "$pre_adapter_root/var/lib/ci-fleet/capacity/history" ]] || fail 'blocked bootstrap restore retired active capacity history'
   expect_success "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >"$tmp/bootstrap-lkg-restore.out"
 )
 grep -Fq ROLLBACK_OK "$tmp/bootstrap-lkg-restore.out" || fail 'image-free bootstrap LKG was not restored'

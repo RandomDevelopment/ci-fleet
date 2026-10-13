@@ -2891,6 +2891,7 @@ case "$mode" in
     config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'
     verify_configuration_approval
     if [[ -n "$bootstrap_lkg_checkpoint" ]]; then
+      reject_deployer_host
       checkpoint_dir=$bootstrap_lkg_checkpoint
       candidate_env=$checkpoint_dir/ci-fleet.env
       docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'
