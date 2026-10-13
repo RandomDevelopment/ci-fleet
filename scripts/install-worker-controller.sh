@@ -2599,6 +2599,13 @@ reject_deployer_host() {
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /opt/ci-fleet-deployer)" || -L "$(root_path /opt/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
+  local output unit
+  output=$(systemctl list-unit-files --no-legend --no-pager) || die 'systemd unit-file inventory failed'
+  output+=$'\n'
+  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || die 'systemd loaded-unit inventory failed'
+  while read -r unit _; do
+    [[ $unit != ci-fleet-deployer* ]] || die 'deployer host state is present; controller and deployer roles are separate hosts'
+  done <<<"$output"
 }
 
 perform_converge() {

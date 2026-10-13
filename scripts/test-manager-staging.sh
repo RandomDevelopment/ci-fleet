@@ -259,6 +259,7 @@ probe = root / "retained-check.sh"
 probe.write_text('''set -Eeuo pipefail
 root=$1
 root_path() { printf '%s%s' "$root" "$1"; }
+systemctl() { [[ $1 == list-unit-files || $1 == list-units ]]; }
 retained_installed_ref=true
 config_ref=retained
 engine_ref=old-runtime

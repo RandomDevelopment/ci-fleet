@@ -16,6 +16,8 @@ credentials, or inbound connection to a controller. The Python application binds
 only to `127.0.0.1:8080`; an existing reverse proxy terminates HTTPS. Controllers
 submit outbound HTTPS. The read API is authenticated and has no mutation route.
 
+The receiver installer rejects deployer host state and units from installed paths, systemd unit-file inventory and loaded-unit inventory. Vendor, runtime and transient deployer units block admission too. An inventory query failure blocks installation, upgrade, check and rollback.
+
 ## Install from a reviewed commit
 
 On the prepared receiver host, use the supported `/usr/bin/python3` version 3.9

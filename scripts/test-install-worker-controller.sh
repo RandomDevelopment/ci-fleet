@@ -368,6 +368,10 @@ EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
+case "${1:-}" in
+  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
+  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
+esac
 if [[ -n "${FAKE_FAIL_CAPACITY_STOP_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_STOP_ONCE" && "$*" == 'stop ci-fleet-capacity.service' ]]; then
   rm -f "$FAKE_FAIL_CAPACITY_STOP_ONCE"
   exit 96
@@ -887,6 +891,17 @@ for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-de
   rm "$root$marker"
 done
 
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-deployer.service ci-fleet-deployer-health.timer ci-fleet-deployer-adapter-transient.service; do
+    export "$inventory=$role_unit loaded"
+    expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+[[ ! -L "$root/opt/ci-fleet/current" ]] || fail 'mixed-role inventory admission published a controller'
+
 # A rejected review must stop every direct candidate path before installation.
 export FAKE_REAL_OPENSSL FAKE_REAL_CURL
 FAKE_REAL_OPENSSL=$(command -v openssl)
@@ -965,6 +980,11 @@ done
 printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
 expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  export "$inventory=ci-fleet-deployer.service loaded"
+  for mode in --check --upgrade --rollback; do expect_failure 'deployer host state is present' "$installer" "$mode" "${base_args[@]}" --ref "$ref_one"; done
+  unset "$inventory"
+done
 expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'

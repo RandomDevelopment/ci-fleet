@@ -2117,6 +2117,29 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran with unsafe file credentials'
 chmod 0600 "$credential"
+# The retained credential can differ from the already-advanced deployed snapshot.
+retained_policy=$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf
+install -m 0600 "$retained_policy" "$tmp/runtime-lkg-credential-policy.saved"
+retained_credential=$root/etc/ci-fleet-deployer/credentials/retained-only.credential
+python3 - "$retained_policy" "$retained_credential" <<'PYTEST'
+from pathlib import Path
+import re, sys
+p = Path(sys.argv[1]); p.write_text(re.sub(r'(?m)^CREDENTIAL_REF=.*$', 'CREDENTIAL_REF=' + sys.argv[2], p.read_text()))
+PYTEST
+consumption_before=$(find "$ledger" -type f -printf '%f\n' | sort)
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+for invalid_credential in missing symlink writable; do
+  rm -f "$retained_credential"
+  case $invalid_credential in
+    symlink) ln -s "$credential" "$retained_credential" ;;
+    writable) install -m 0644 "$credential" "$retained_credential" ;;
+  esac
+  expect_failure 'credential file' "$runtime" deploy >/dev/null
+  [[ $(find "$ledger" -type f -printf '%f\n' | sort) == "$consumption_before" ]] || fail 'unusable retained credential consumed approval'
+  [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && ! -e $active ]] || fail 'unusable retained credential invoked deploy'
+done
+rm -f "$retained_credential"
+install -m 0600 "$tmp/runtime-lkg-credential-policy.saved" "$retained_policy"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
 rm -f "$root/var/log/ci-fleet-deployer/audit.log"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"

@@ -335,16 +335,19 @@ parse_file() {
 }
 
 validate_credential() {
-  [[ $testing == 1 || ${cfg[CREDENTIAL_PROVIDER]} == file ]] || die 'contained adapters require a materialized file credential'
+  local -n credential_policy=${1:-cfg}
+  local key
+  for key in CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "credential_policy[$key]" ]] || die "credential policy is missing $key"; done
+  [[ $testing == 1 || ${credential_policy[CREDENTIAL_PROVIDER]} == file ]] || die 'contained adapters require a materialized file credential'
   secure_directory "$deployer_etc" 'deployer configuration directory'
   secure_directory "$credential_dir" 'credential directory'
-  [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
-  case ${cfg[CREDENTIAL_PROVIDER]} in
+  [[ ${credential_policy[CREDENTIAL_SCOPE]} == "${credential_policy[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
+  case ${credential_policy[CREDENTIAL_PROVIDER]} in
     file)
-      inside "${cfg[CREDENTIAL_REF]}" "$credential_dir" || die 'credential reference is outside the protected credential directory'
-      secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
+      inside "${credential_policy[CREDENTIAL_REF]}" "$credential_dir" || die 'credential reference is outside the protected credential directory'
+      secure_file "${credential_policy[CREDENTIAL_REF]}" 'credential file'
       ;;
-    external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
+    external) [[ ${credential_policy[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
     *) die 'unsupported credential provider' ;;
   esac
 }
@@ -623,6 +626,7 @@ PY
       inside "${lkg_policy[ADAPTER_PATH]}" "$deployer_etc/adapters" || die 'last-known-good adapter is outside the protected adapter directory'
       [[ ! -L "${lkg_policy[ADAPTER_PATH]}" && -f "${lkg_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${lkg_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'last-known-good adapter is missing or unsafe'
       [[ $(sha256sum "${lkg_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${lkg_policy[ADAPTER_SHA256]}" ]] || die 'last-known-good adapter digest does not match its retained policy'
+      validate_credential lkg_policy
     fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'

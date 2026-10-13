@@ -61,6 +61,13 @@ reject_deployer_role() {
   for path in "$root/opt/ci-fleet-deployer" "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer-container-credentials"; do
     [[ ! -e "$path" && ! -L "$path" ]] || { echo "deployer host state is present" >&2; exit 1; }
   done
+  local output unit
+  output=$(systemctl list-unit-files --no-legend --no-pager) || { echo 'systemd unit-file inventory failed' >&2; exit 1; }
+  output+=$'\n'
+  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || { echo 'systemd loaded-unit inventory failed' >&2; exit 1; }
+  while read -r unit _; do
+    [[ $unit != ci-fleet-deployer* ]] || { echo 'deployer host state is present' >&2; exit 1; }
+  done <<<"$output"
 }
 reject_deployer_role
 
