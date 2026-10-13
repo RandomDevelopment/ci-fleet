@@ -31,8 +31,8 @@ HEALTH_IDS = {
     "docker", "docker_network_inspection", "docker_network_headroom", "docker_network_legacy",
     "docker_default_bridge", "controller", "controller_status", "docker_socket_proxy", "restarts",
     "capacity", "capacity_service", "managed_unhealthy", "managed_inactive", "stale_container", "stale_image", "stale_network", "stale_volume",
-    "stale_build_cache_byte", "cleanup", "drift", "timer_health", "timer_cleanup", "timer_drift",
-    "timer_updates", "timer_reconcile", "timer_capacity", "reconcile", "updates", "reboot", "clock", "backup", "reconciliation",
+    "stale_build_cache_byte", "stale_build_cache", "cleanup", "drift", "timer_health", "timer_cleanup", "timer_drift",
+    "timer_updates", "timer_reconcile", "timer_capacity", "reconcile", "updates", "updates_service", "reboot", "clock", "backup", "reconciliation",
     "status_delivery",
 }
 STATES = {"active", "drained", "disabled"}
@@ -246,7 +246,7 @@ def project_health(value: dict, controller: str, now: int) -> dict:
         if not isinstance(check, dict) or not isinstance(check.get("id"), str):
             raise SnapshotError("source_invalid")
         if check["id"] in HEALTH_IDS:
-            identifier = "capacity_service" if check["id"] == "capacity" and "state" in check else check["id"]
+            identifier = check["id"] + "_service" if check["id"] in {"capacity", "updates"} and "state" in check else check["id"]
             approved.append({"id": identifier, "status": check.get("status")})
     result = data("health", {"status": value.get("status"), "checks": approved})
     return evidence(result, observed_at=timestamp(value.get("timestamp"), now))

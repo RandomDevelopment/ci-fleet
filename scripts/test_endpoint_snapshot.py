@@ -10,6 +10,8 @@ import unittest
 from unittest.mock import patch
 
 import endpoint_snapshot as snapshot
+import health
+from test_health import healthy_snapshot
 import endpoint_snapshot_sources as sources
 import endpoint_snapshot_store as store
 
@@ -115,6 +117,22 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual({check['id'] for check in health['data']['checks']},
                          {'clock', 'docker', 'capacity', 'capacity_service', 'stale_container', 'timer_capacity', 'reconcile'})
         self.assertNotIn('PRIVATE-DETAIL', json.dumps(value))
+
+    def test_current_health_producer_keeps_every_emitted_diagnostic(self):
+        observed = healthy_snapshot()
+        observed['services'].update(capacity='failed', updates='failed', reconcile='failed')
+        observed['timers'].update(capacity='failed', reconcile='failed')
+        observed['stale'] = {name: 1 for name in ('containers', 'images', 'networks', 'volumes', 'build_cache')}
+        report = health.evaluate(observed, health.Thresholds())
+        report['timestamp'] = NOW - 20
+        docs = documents(); docs['health'] = report
+        value = self.build(docs)
+        projected = value['sources']['health']
+        self.assertEqual(projected['availability'], 'available')
+        expected = {item['id'] + '_service' if item['id'] in {'capacity', 'updates'} and 'state' in item else item['id']
+                    for item in report['checks']}
+        self.assertEqual({item['id'] for item in projected['data']['checks']}, expected)
+        self.assertTrue({'capacity_service', 'updates_service', 'stale_build_cache', 'timer_capacity', 'reconcile'} <= expected)
 
     def test_source_loss_retains_original_last_success_without_zero_fallback(self):
         previous = self.build()
