@@ -40,7 +40,7 @@ The worker installer does not enable SSH, create firewall rules, install a gatew
 
 ## Local exports and read API
 
-Use a non-symlink directory at `/var/lib/ci-fleet/observer/exports`, owned by root and the dedicated observer group with mode `0750`. Snapshot and job exports are root-owned regular files with mode `0640`. Atomic publication uses a protected temporary file in the same directory. Readers validate ownership, type, size, schema, and source identity before accepting data. Never widen permissions on existing root-only installation, bootstrap, capacity, or recovery stores.
+Use a non-symlink directory at `/var/lib/ci-fleet/observer/exports`, owned by root and the dedicated observer group with mode `0750`. Both temporary and published snapshot/job exports are regular files owned by root and that same observer group with mode `0640`. The producer sets the expected UID, GID, and mode before atomically renaming a protected temporary file in that directory; directory permissions alone do not provide group inheritance. Readers validate the expected UID/GID, type, mode, size, schema, and source identity before accepting data. Never widen permissions on existing root-only installation, bootstrap, capacity, or recovery stores.
 
 The producer reads only the existing role's approved evidence. It must not follow web-supplied paths, execute commands supplied by a request, or copy arbitrary logs. Its controller event input uses a protected channel; do not add private job metadata to the existing broadly readable controller-status file.
 
