@@ -1347,12 +1347,15 @@ with open(sys.argv[1], "w") as stream:
     json.dump({"config_repository": sys.argv[2], "config_ref": sys.argv[3], "controller": "example-ci-01", "saved_at": 1}, stream)
 os.chmod(sys.argv[1], 0o600)
 PYTHON
+install -d -m 0700 "$pre_adapter_root/var/lib/ci-fleet/capacity"
+printf 'retired history\n' >"$pre_adapter_root/var/lib/ci-fleet/capacity/history"
 (
   exec 9>"$pre_adapter_root/run/ci-fleet-installer.lock"
   flock -n 9
   expect_success "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >"$tmp/bootstrap-lkg-restore.out"
 )
 grep -Fq ROLLBACK_OK "$tmp/bootstrap-lkg-restore.out" || fail 'image-free bootstrap LKG was not restored'
+[[ ! -e "$pre_adapter_root/var/lib/ci-fleet/capacity" ]] || fail 'bootstrap LKG restore retained history after removing its sampler'
 cmp -s "$pre_adapter_rendered" "$pre_adapter_root/etc/ci-fleet/ci-fleet.env" || fail 'bootstrap LKG restore changed its original environment'
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_upgrade_ref" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE

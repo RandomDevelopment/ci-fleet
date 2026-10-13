@@ -2866,6 +2866,7 @@ case "$mode" in
       candidate_env=$checkpoint_dir/ci-fleet.env
       docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'
       restore_checkpoint || die 'last-known-good checkpoint restoration failed'
+      if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
       note "ROLLBACK_OK checkpoint=$checkpoint_dir"
       write_transaction_result applied
       exit 0
