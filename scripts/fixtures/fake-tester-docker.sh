@@ -7,6 +7,29 @@ if [[ $1 == compose && ${FAKE_TESTER_EXPECT_EMPTY_CLIENT_CONFIG:-0} == 1 ]]; the
   [[ -n ${DOCKER_CONFIG:-} && -d $DOCKER_CONFIG && $DOCKER_CONFIG != "${FAKE_TESTER_INHERITED_CLIENT_CONFIG:?}" && ! -e $DOCKER_CONFIG/config.json ]] || { printf 'unsafe Docker client configuration\n' >&2; exit 9; }
   printf '%s\n' "$DOCKER_CONFIG" >>"${FAKE_TESTER_CLIENT_CONFIG_LOG:?}"
 fi
+if [[ ( $1 == ps || ( $1 == volume || $1 == network ) && $2 == ls ) && " $* " == *'json (.Label "com.docker.compose.project")'* ]]; then
+  kind=$1; [[ $kind != ps ]] || kind=container
+  case $kind in
+    container) [[ ${FAKE_TESTER_PS_FAIL:-0} != 1 ]] || exit 9 ;;
+    volume) [[ ${FAKE_TESTER_VOLUME_LS_FAIL:-0} != 1 ]] || exit 9 ;;
+    network) [[ ${FAKE_TESTER_NETWORK_LS_FAIL:-0} != 1 ]] || exit 9 ;;
+  esac
+  for resource_state in "${FAKE_TESTER_RESOURCE_STATE:?}"/*; do
+    [[ -f $resource_state ]] || continue
+    state=$(<"$resource_state")
+    [[ $state == all || $state == "$kind" || $state == "$kind-unlabelled" || $state == "$kind-relabeled" ]] || continue
+    project=${resource_state##*/}; label=$project
+    [[ $state != "$kind-unlabelled" ]] || label=
+    [[ $state != "$kind-relabeled" ]] || label=ci-fleet-test-drifted
+    case $kind in
+      container) name=$project-web-1 ;;
+      volume) name=${project}_data ;;
+      network) name=${project}_default ;;
+    esac
+    printf '["%s","%s"]\n' "$name" "$label"
+  done
+  exit 0
+fi
 if [[ $1 == ps || ( $1 == volume || $1 == network ) && $2 == ls ]] && [[ " $* " == *' label=com.docker.compose.project=ci-fleet-test-'* ]]; then
   project=${*: -1}; project=${project#label=com.docker.compose.project=}
   kind=$1; [[ $kind != ps ]] || kind=container
@@ -77,6 +100,7 @@ if [[ $1 == inspect ]]; then
       broad-port) ports=$(printf '{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"%s"}]}' "$route_port") ;;
       unlimited-swap) memory_swap=-1 ;;
       unbounded) nano_cpus=0; memory=0; pids_limit=0 ;;
+      sub-nano-cpu) nano_cpus=0 ;;
       wrong-volume) mounts='[{"Type":"volume","Name":"ci-fleet-test-other_data","Destination":"/data","RW":true}]' ;;
       host-network) network_mode=host ;;
       extra-network) networks=$(printf '{"%s":{},"other-environment":{}}' "$network_mode") ;;
@@ -206,6 +230,7 @@ case ${operation:-} in
       label-file) service_extra=',"label_file":"/root/credential.env"' ;;
       runtime) service_extra=',"runtime":"alternative"' ;;
       unbounded) service_extra=',"cpus":0,"mem_limit":0,"pids_limit":-1' ;;
+      sub-nano-cpu) service_extra=',"cpus":0.0000000005,"mem_limit":134217728,"pids_limit":128' ;;
       unlimited-swap) service_extra+=',"memswap_limit":-1' ;;
       finite-swap) service_extra+=',"memswap_limit":402653184' ;;
       oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;

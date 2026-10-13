@@ -303,7 +303,7 @@ FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_POLICY=finite-swap "$runtime" --converg
 FAKE_TESTER_ROUTE_PORT=18099 "$runtime" --remove --environment finite-swap >/dev/null
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded unlimited-swap oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded sub-nano-cpu unlimited-swap oom-priority; do
   write_environment "bad-$policy" 18081
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi
@@ -413,6 +413,14 @@ with open(path,'w') as output: json.dump(model,output)
 PY_LEGACY
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=unlimited-swap "$runtime" --health >/dev/null 2>&1; then fail 'health accepted unlimited swap from an older protected model'; fi
 mv "$tmp/legacy-model.json" "$legacy_model"
+cp "$legacy_model" "$tmp/legacy-cpu-model.json"
+python3 - "$legacy_model" <<'PY_CPU'
+import json,sys
+path=sys.argv[1]; model=json.load(open(path)); model['services']['web']['cpus']=0.0000000005
+with open(path,'w') as output: json.dump(model,output)
+PY_CPU
+if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_LIVE_POLICY=sub-nano-cpu "$runtime" --health >/dev/null 2>&1; then fail 'health accepted an unlimited CPU quota from an older protected model'; fi
+mv "$tmp/legacy-cpu-model.json" "$legacy_model"
 
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_DISK_USED_PERCENT=80 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health accepted Docker storage at the configured warning threshold'; fi
 if FAKE_TESTER_ROUTE_PORT=18080 FAKE_TESTER_GETENT_FAIL=1 "$runtime" --health >/dev/null 2>&1; then fail 'scheduled health ignored a failed DNS probe'; fi
@@ -459,7 +467,7 @@ if FAKE_TESTER_ROUTE_PORT=18084 FAKE_TESTER_UP_FAIL=1 "$runtime" --converge --en
 [[ -f $root/var/lib/ci-fleet-tester/environments/partial-up.state && -f $root/var/lib/ci-fleet-tester/environments/partial-up.compose.json ]] || fail 'partial activation was not tracked for cleanup'
 grep -q 'up -d --remove-orphans --wait --wait-timeout 60' "$tmp/docker.log" || fail 'Compose activation wait was not bounded'
 FAKE_TESTER_ROUTE_PORT=18084 "$runtime" --remove --environment partial-up >/dev/null
-for remaining_kind in container volume network; do
+for remaining_kind in container volume network container-unlabelled volume-unlabelled network-unlabelled container-relabeled volume-relabeled network-relabeled; do
   write_environment retained-removal 18084
   FAKE_TESTER_ROUTE_PORT=18084 "$runtime" --converge --environment retained-removal >/dev/null
   retained_state=$root/var/lib/ci-fleet-tester/environments/retained-removal.state

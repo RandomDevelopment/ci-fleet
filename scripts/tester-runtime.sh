@@ -172,6 +172,7 @@ for name,service in services.items():
     if service.get('build') or service.get('devices') or service.get('device_cgroup_rules') or service.get('gpus') or reservations.get('devices') or service.get('cap_add') or service.get('container_name') or service.get('hostname') or service.get('use_api_socket') or service.get('volumes_from'): raise SystemExit(f'{name}: build/device/capability/external mount/global identity is forbidden')
     if service.get('scale',1) != 1 or deploy.get('replicas',1) != 1: raise SystemExit(f'{name}: exactly one replica is required')
     if not all(isinstance(service.get(key),(int,float)) and not isinstance(service[key],bool) and math.isfinite(service[key]) and service[key] > 0 for key in ('cpus','mem_limit','pids_limit')): raise SystemExit(f'{name}: positive CPU, memory, and PID limits are required')
+    if service['cpus'] * 1_000_000_000 < 1: raise SystemExit(f'{name}: CPU limit must produce a positive NanoCPU quota')
     swap_limit=service.get('memswap_limit',0)
     if not isinstance(swap_limit,(int,float)) or isinstance(swap_limit,bool) or not math.isfinite(swap_limit) or swap_limit < 0 or 0 < swap_limit < service['mem_limit']: raise SystemExit(f'{name}: memory plus swap must use a finite limit at least as large as memory')
     if service.get('oom_kill_disable') or service.get('oom_score_adj',0) < 0: raise SystemExit(f'{name}: OOM priority overrides are forbidden')
@@ -342,16 +343,23 @@ remove_environment() {
 }
 
 project_resources_absent() {
-  local project inventory kind
-  project=$(project_name "$1")
-  for kind in container volume network; do
-    case $kind in
-      container) inventory=$(docker ps -aq --filter "label=com.docker.compose.project=$project") || return 1 ;;
-      volume) inventory=$(docker volume ls -q --filter "label=com.docker.compose.project=$project") || return 1 ;;
-      network) inventory=$(docker network ls -q --filter "label=com.docker.compose.project=$project") || return 1 ;;
-    esac
-    [[ -z $inventory ]] || { printf 'ERROR: project %s resources remain after teardown; protected state retained\n' "$kind" >&2; return 1; }
-  done
+  python3 - "$(deployed_compose_path "$1")" "$(project_name "$1")" <<'PY'
+import json,subprocess,sys
+model=json.load(open(sys.argv[1])); project=sys.argv[2]
+containers={f'{project}{separator}{service}{separator}1' for service in model['services'] for separator in ('-','_')}
+for kind in ('container','volume','network'):
+    names=containers if kind=='container' else {item.get('name',f'{project}_{logical}') for logical,item in model.get(kind+'s',{}).items()}
+    field='Names' if kind=='container' else 'Name'
+    command=['docker','ps','-a'] if kind=='container' else ['docker',kind,'ls']
+    command+=['--format','[{{json .'+field+'}},{{json (.Label "com.docker.compose.project")}}]']
+    result=subprocess.run(command,text=True,capture_output=True)
+    if result.returncode: raise SystemExit(f'Docker {kind} inventory failed; protected state retained')
+    for line in result.stdout.splitlines():
+        item=json.loads(line)
+        if not isinstance(item,list) or len(item)!=2 or not all(isinstance(value,str) for value in item): raise SystemExit('Docker resource inventory is invalid; protected state retained')
+        observed={value.lstrip('/') for value in item[0].split(',')} if kind=='container' else {item[0]}
+        if item[1]==project or observed & names: raise SystemExit(f'project {kind} resources remain after teardown; protected state retained')
+PY
 }
 
 reject_orphaned_projects() {
@@ -397,7 +405,7 @@ networks={model['networks'][name]['name'] for name in service.get('networks',{'d
 valid=(host.get('Privileged') is False and host.get('ReadonlyRootfs') is True and set(host.get('CapDrop') or [])=={'ALL'} and
        host.get('PidMode')=='' and host.get('IpcMode')=='private' and host.get('UTSMode')=='' and host.get('UsernsMode')=='' and
        not host.get('CapAdd') and not host.get('Devices') and not host.get('DeviceRequests') and not host.get('DeviceCgroupRules') and security(host.get('SecurityOpt'))==security(service['security_opt']) and
-       host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('Memory')==service['mem_limit'] and
+       host.get('NanoCpus')==int(service['cpus']*1_000_000_000) and host.get('NanoCpus',0)>0 and host.get('Memory')==service['mem_limit'] and
        host.get('MemorySwap')==(service.get('memswap_limit') or 2*service['mem_limit']) and host['MemorySwap'] >= service['mem_limit'] and
        host.get('CgroupnsMode')=='private' and host.get('PidsLimit')==service['pids_limit'] and (host.get('PortBindings') or {})==expected_ports and actual_mounts==expected_mounts and
        host.get('OomKillDisable') in (None,False) and host.get('OomScoreAdj',0)==service.get('oom_score_adj',0) and
