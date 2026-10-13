@@ -441,6 +441,23 @@ class SnapshotReadbackTests(unittest.TestCase):
                 with self.assertRaises(snapshot.SnapshotError):
                     self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
 
+    def test_reader_rejects_retained_configuration_from_another_installation(self):
+        for field, changed in (("applied_commit", "4" * 40), ("engine_ref", "5" * 40),
+                               ("last_success_at", NOW - 200)):
+            with self.subTest(field=field):
+                value = snapshot.build_snapshot(CONTROLLER, documents(), {}, now=NOW)
+                source = value["sources"]["configuration"]
+                source["availability"] = "unavailable"
+                source["observed_at"] = None
+                source["error"] = "source_timeout"
+                if field == "last_success_at":
+                    source[field] = changed
+                else:
+                    source["data"][field] = changed
+                store.publish_endpoint(self.base, value, self.gid)
+                with self.assertRaises(snapshot.SnapshotError):
+                    self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
+
     def test_failed_health_read_preserves_recent_clock_warning_until_new_evidence(self):
         docs = documents()
         docs["health"]["checks"][0]["status"] = "warning"

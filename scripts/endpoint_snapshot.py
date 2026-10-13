@@ -381,12 +381,13 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
     runtime = value["sources"]["controller"]
     if value["clock_state"] != clock_state(value["sources"], value["published_at"]):
         raise SnapshotError("invalid_snapshot")
-    if configuration["availability"] == "available":
+    if configuration["data"]:
         configured = configuration["data"]
         installed = policy["data"]
         if (policy["availability"] != "available" or installed.get("record_state") != "installed"
                 or configured["applied_commit"] != installed["applied_commit"]
                 or configured["engine_ref"] != installed["engine_ref"]
+                or configuration["last_success_at"] != installed["installed_at"]
                 or configured["maximum_runners"] > installed["reviewed_maximum"]):
             raise SnapshotError("invalid_snapshot")
     if runtime["availability"] == "available" and "matches_reviewed_maximum" in runtime["data"]:
