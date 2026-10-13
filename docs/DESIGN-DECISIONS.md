@@ -1,5 +1,7 @@
 # Accepted design decisions
 
+Proposals awaiting reviewed acceptance are marked explicitly. The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) is proposed under [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. It adds no runtime, schema field, host activation, or accepted change to the decisions below.
+
 ## Managed controller desired state after the isolated proof
 
 **Status:** accepted on 2026-07-22 for isolated CI fleet hosts.

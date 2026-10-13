@@ -168,6 +168,10 @@ See [Network reclamation](HOST-MAINTENANCE.md#network-reclamation).
 - Fleet updates use rolling replacement and an explicit rollback version.
 - Controller routing, capacity, lifecycle, and engine updates use reviewed full commits from private desired-state configuration; hosts never follow an unreviewed moving branch.
 
+## Planned endpoint observation
+
+The [endpoint observation UI proposal](ENDPOINT-UI-DESIGN.md) defines a future optional host service on loopback port 80, authenticated through an independently provisioned HTTPS gateway. It keeps observation independent of Docker and preserves role, credential, configuration, and outbound-reporting boundaries. No endpoint UI or inbound listener is implemented by that design.
+
 ## Project adoption
 
 All projects must follow the [Project CI Standard](PROJECT-STANDARD.md). Existing workflows must use the staged process in [Migrating Existing CI](MIGRATING-EXISTING-CI.md). Operators use [How to add a fleet host](ADDING-A-HOST.md) and [How to add a project](ADDING-A-PROJECT.md) without introducing project-specific host state.
