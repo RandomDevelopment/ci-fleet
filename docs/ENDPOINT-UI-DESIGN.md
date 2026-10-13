@@ -40,6 +40,8 @@ Use a non-symlink directory at `/var/lib/ci-fleet/observer/exports`, owned by ro
 
 The producer reads only the existing role's approved evidence. It must not follow web-supplied paths, execute commands supplied by a request, or copy arbitrary logs. Its controller event input uses a protected channel; do not add private job metadata to the existing broadly readable controller-status file.
 
+The producer checks for updated controller status and protected job-event evidence every 30 seconds, independently of the five-minute health timer. It copies existing health/capacity observations without rerunning those probes or increasing outbound reporting. Source reads have bounded timeouts; slow or failed sources remain unavailable or stale without delaying runner handling or other exports. Copying a source never refreshes its original observation time.
+
 The observer exposes authenticated `GET` and `HEAD` reads for a fixed endpoint summary, paginated jobs, approved capacity aggregates, and diagnostic preview/export. Other methods fail without side effects. Job pages contain at most 100 records. Responses and diagnostic exports are capped at 1 MiB, use `Cache-Control: no-store`, and have no cross-origin access. Use fixed routes and opaque pagination cursors, never a URL proxy or file browser.
 
 Render metadata as text, reject unsafe links, and use a restrictive content-security policy. No untrusted HTML, inline execution, arbitrary attachment preview, or raw log streaming is included. The gateway owns user-access auditing; endpoint logs use controlled request/error codes and omit job contents and authentication material.
