@@ -3440,6 +3440,9 @@ cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_PRIOR_IMAGE_STATES/controller-id"
 export FAKE_ENGINE_REF=$legacy_engine_ref
 export FAKE_RUNNER_IMAGE=ci-fleet-runner:${legacy_engine_ref:0:12}
 export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_engine_ref:0:12}
+# Legacy downgrade requires verified retained objects, not mutable reconstruction.
+printf '%s\n%s\n' "sha256:$runner_image_digest" "sha256:$controller_image_digest" >>"$FAKE_AVAILABLE_IMAGE_IDS"
+printf '%s %s\n%s %s\n' "sha256:$runner_image_digest" "$legacy_engine_ref" "sha256:$controller_image_digest" "$legacy_engine_ref" >>"$FAKE_AVAILABLE_IMAGE_IDS.revisions"
 export FAKE_SYSTEMCTL_LOG=$tmp/legacy-systemctl.log
 export FAKE_FAIL_CAPACITY_TIMER_ONCE=$tmp/fail-capacity-timer-once
 : >"$FAKE_FAIL_CAPACITY_TIMER_ONCE"
