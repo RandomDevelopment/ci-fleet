@@ -2364,9 +2364,9 @@ PY
   if [[ -n "$release_dir" && -f "$rendered_env" ]]; then
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
-    if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$rendered_env"; then
-      if $new_format; then restore_reviewed_image_tags "$rendered_env" || failed=1; fi
-      if ((failed == 0)); then managed_images_match "$rendered_env" || failed=1; fi
+    if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$image_environment"; then
+      if $new_format; then restore_reviewed_image_tags "$image_environment" || failed=1; fi
+      if ((failed == 0)); then managed_images_match "$image_environment" || failed=1; fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
       failed=1
