@@ -21,6 +21,9 @@ BEARER = "a" * 43
 
 
 def documents():
+    observed = healthy_snapshot()
+    observed["configured_capacity"] = observed["effective_capacity"] = {"min": 0, "max": 4}
+    observed["stale"] = {name: 0 for name in ("containers", "images", "networks", "volumes", "build_cache")}
     return {
         "installation": {"schema_version": 1, "controller": CONTROLLER, "controller_state": "active",
                          "installed_at": dt.datetime.fromtimestamp(NOW - 100, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -38,8 +41,7 @@ def documents():
                      "CI_FLEET_CONFIGURED_MAX_RUNNERS": "4", "CI_FLEET_CAPACITY_BUDGET": "8"},
         "controller": {"controller": CONTROLLER, "software_version": "3" * 40,
                        "current": 2, "busy": 1, "maximum": 4, "generated_at": NOW - 10},
-        "health": {"schema_version": 1, "controller": CONTROLLER, "desired_state": "active", "status": "healthy", "timestamp": NOW - 20,
-                   "checks": [{"id": "clock", "status": "ok"}, {"id": "docker", "status": "ok"}]},
+        "health": {**health.evaluate(observed, health.Thresholds()), "timestamp": NOW - 20},
         "reconciliation": {"status": "converged", "desired_commit": "1" * 40, "applied_commit": "1" * 40,
                            "checked_at": NOW - 30, "last_success_at": NOW - 30},
     }
@@ -77,13 +79,13 @@ class SnapshotTests(unittest.TestCase):
         docs["installation"].update(location=private, config_repository=private, credential_file=private)
         docs["rendered"].update(CI_FLEET_GITHUB_URL=private, CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=private,
                                 HTTPS_PROXY=private, CI_FLEET_CONTROLLER_IMAGE_DIGEST=private)
-        docs["health"]["checks"][0].update(message=private, password=private, value=0)
+        next(c for c in docs["health"]["checks"] if c["id"] == "clock").update(message=private, password=private, value=0)
         docs["health"]["checks"].append({"id": private, "status": "ok", "message": private})
         docs["reconciliation"]["message"] = private
         docs["controller"]["private_error"] = private
         value = self.build(docs)
         self.assertNotIn(private, json.dumps(value))
-        self.assertEqual(value["sources"]["health"]["data"]["checks"][0], {"id": "clock", "status": "ok"})
+        self.assertEqual(next(c for c in value["sources"]["health"]["data"]["checks"] if c["id"] == "clock"), {"id": "clock", "status": "ok"})
         self.assertNotIn("metrics", value["sources"]["health"]["data"])
 
     def test_publisher_preserves_incumbent_during_clock_rollback(self):
@@ -119,17 +121,16 @@ class SnapshotTests(unittest.TestCase):
     def test_capacity_and_dynamic_service_diagnostics_are_distinct_and_redacted(self):
         docs = documents()
         docs['health']['checks'] += [
-            {'id': 'capacity', 'status': 'ok', 'configured': {'max': 4}, 'effective': {'max': 4}},
             {'id': 'capacity', 'status': 'critical', 'state': 'failed'},
             *({'id': name, 'status': 'warning', 'message': 'PRIVATE-DETAIL'}
-              for name in ('stale_container', 'timer_capacity', 'reconcile')),
+              for name in ('timer_capacity', 'reconcile')),
         ]
         docs['health']['status'] = 'unhealthy'
         value = self.build(docs)
         health = value['sources']['health']
         self.assertEqual(health['availability'], 'available')
         self.assertEqual({check['id'] for check in health['data']['checks']},
-                         {'clock', 'docker', 'capacity', 'capacity_service', 'stale_container', 'timer_capacity', 'reconcile'})
+                         {c['id'] for c in documents()['health']['checks']} | {'capacity_service', 'timer_capacity', 'reconcile'})
         self.assertNotIn('PRIVATE-DETAIL', json.dumps(value))
 
     def test_current_health_producer_keeps_every_emitted_diagnostic(self):
@@ -249,7 +250,7 @@ class SnapshotTests(unittest.TestCase):
                                   ("maintenance", "critical")):
             docs = documents()
             docs["health"]["status"] = summary
-            docs["health"]["checks"][1]["status"] = severity
+            next(c for c in docs["health"]["checks"] if c["id"] == "docker")["status"] = severity
             self.assertNotEqual(self.build(docs)["sources"]["health"]["availability"], "available")
 
     def test_installation_requires_possible_schema_v3_capacity(self):
@@ -272,6 +273,39 @@ class SnapshotTests(unittest.TestCase):
                 docs = documents()
                 docs["rendered"][field] = invalid
                 self.assertNotEqual(self.build(docs)["sources"]["configuration"]["availability"], "available")
+
+    def test_numeric_environment_requires_canonical_decimal_strings(self):
+        for field, invalid in (("CI_FLEET_RUNNER_CPUS", "1_0"), ("CI_FLEET_RUNNER_MEMORY_MIB", "4_096"),
+                               ("CI_FLEET_MIN_RUNNERS", "0_0"), ("CI_FLEET_MAX_RUNNERS", "0_4"),
+                               ("CI_FLEET_CONFIGURED_MAX_RUNNERS", "0_4"), ("CI_FLEET_CAPACITY_BUDGET", "0_8")):
+            with self.subTest(field=field):
+                docs = documents()
+                docs["rendered"][field] = invalid
+                self.assertNotEqual(self.build(docs)["sources"]["configuration"]["availability"], "available")
+
+    def test_health_requires_each_guaranteed_baseline_check(self):
+        docs = documents()
+        for removed in ("disk_root", "memory", "docker", "capacity", "updates", "reboot", "clock", "backup"):
+            changed = copy.deepcopy(docs)
+            changed["health"]["checks"] = [c for c in changed["health"]["checks"] if c["id"] != removed]
+            self.assertNotEqual(self.build(changed)["sources"]["health"]["availability"], "available")
+        docs["health"]["checks"] = []
+        self.assertNotEqual(self.build(docs)["sources"]["health"]["availability"], "available")
+
+    def test_failure_envelopes_cannot_claim_discarded_or_unsupported_evidence(self):
+        for error in ("identity_mismatch", "clock_uncertain", "revision_unverified"):
+            value = self.build()
+            source = value["sources"]["controller"]
+            source.update(availability="unknown" if error != "identity_mismatch" else "unavailable", observed_at=None, error=error)
+            value["clock_state"] = "uncertain" if error == "clock_uncertain" else "synchronized"
+            self.assert_snapshot_error(lambda: snapshot.validate_snapshot(value, controller=CONTROLLER))
+        for name in snapshot.UNSUPPORTED_SOURCES:
+            value = self.build()
+            value["sources"][name].update(source_version=1, last_success_at=NOW)
+            self.assert_snapshot_error(lambda: snapshot.validate_snapshot(value, controller=CONTROLLER))
+        value = self.build(errors={"controller": "source_timeout"}, previous=self.build())
+        value["sources"]["controller"]["data"] = {}
+        self.assert_snapshot_error(lambda: snapshot.validate_snapshot(value, controller=CONTROLLER))
 
     def test_health_and_convergence_bind_to_authoritative_installation(self):
         for desired in ("drained", "disabled", None):
@@ -418,7 +452,7 @@ class SnapshotTests(unittest.TestCase):
             lambda v: v["sources"]["configuration"]["data"].update(routing_labels=["example-ci-01-scale-set"]),
             lambda v: v["sources"]["configuration"]["data"].update(runner_memory_mib=511),
             lambda v: v["sources"]["health"]["data"].update(desired_state="drained"),
-            lambda v: v["sources"]["health"]["data"]["checks"][1].update(status="critical"),
+            lambda v: next(c for c in v["sources"]["health"]["data"]["checks"] if c["id"] == "docker").update(status="critical"),
             lambda v: v["sources"]["reconciliation"]["data"].update(last_success_at=NOW + 1),
             lambda v: v["sources"]["reconciliation"]["data"].update(desired_commit="4" * 40),
             lambda v: v["sources"]["reconciliation"]["data"].pop("applied_commit"),
@@ -545,7 +579,7 @@ class SnapshotReadbackTests(unittest.TestCase):
         self.assertEqual(read["clock_state"], "uncertain")
         self.assertEqual(read["sources"]["controller"]["freshness"], "unknown")
         docs = documents()
-        docs["health"]["checks"][0]["status"] = "warning"
+        next(c for c in docs["health"]["checks"] if c["id"] == "clock")["status"] = "warning"
         docs["health"]["status"] = "warning"
         store.publish_endpoint(self.base, snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW), self.gid)
         read = self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
@@ -555,7 +589,7 @@ class SnapshotReadbackTests(unittest.TestCase):
         for status, claim in (("warning", "synchronized"), ("critical", "unknown"), ("ok", "uncertain")):
             with self.subTest(status=status, claim=claim):
                 docs = documents()
-                docs["health"]["checks"][0]["status"] = status
+                next(c for c in docs["health"]["checks"] if c["id"] == "clock")["status"] = status
                 docs["health"]["status"] = {"ok": "healthy", "warning": "warning", "critical": "unhealthy"}[status]
                 value = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
                 value["clock_state"] = claim
@@ -607,7 +641,7 @@ class SnapshotReadbackTests(unittest.TestCase):
 
     def test_failed_health_read_preserves_recent_clock_warning_until_new_evidence(self):
         docs = documents()
-        docs["health"]["checks"][0]["status"] = "warning"
+        next(c for c in docs["health"]["checks"] if c["id"] == "clock")["status"] = "warning"
         docs["health"]["status"] = "warning"
         previous = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW)
         value = snapshot.build_snapshot(CONTROLLER, docs, {"health": "source_unavailable"},
@@ -619,7 +653,7 @@ class SnapshotReadbackTests(unittest.TestCase):
         self.assertEqual(read["sources"]["controller"]["freshness"], "unknown")
         self.assertEqual(read["sources"]["health"]["availability"], "unavailable")
         self.assertEqual(read["sources"]["health"]["last_success_at"], previous["sources"]["health"]["observed_at"])
-        docs["health"]["checks"][0]["status"] = "ok"
+        next(c for c in docs["health"]["checks"] if c["id"] == "clock")["status"] = "ok"
         docs["health"]["status"] = "healthy"
         docs["health"]["timestamp"] = NOW + 20
         recovered = snapshot.build_snapshot(CONTROLLER, docs, {}, now=NOW + 20, previous=value)

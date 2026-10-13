@@ -33,6 +33,12 @@ HEALTH_IDS = {
     "timer_updates", "timer_reconcile", "timer_capacity", "reconcile", "updates", "updates_service", "reboot", "clock", "backup", "reconciliation",
     "status_delivery",
 }
+BASELINE_HEALTH_IDS = {
+    "disk_root", "disk_docker", "inode_root", "inode_docker", "memory", "load", "swap", "oom", "docker",
+    "controller", "controller_status", "restarts", "capacity", "managed_unhealthy", "managed_inactive",
+    "stale_container", "stale_image", "stale_network", "stale_volume", "stale_build_cache",
+    "cleanup", "drift", "timer_health", "timer_cleanup", "timer_drift", "updates", "reboot", "clock", "backup",
+}
 STATES = {"active", "drained", "disabled"}
 RECONCILIATION = {"bootstrap", "converged", "drift", "failed", "invalid", "pending", "reconciling", "rolled_back"}
 STALE_AFTER = {"controller": 120, "health": 900, "reconciliation": 900}
@@ -51,6 +57,15 @@ class SnapshotError(ValueError):
 
 def integer(value: Any) -> bool:
     return type(value) is int and 0 <= value <= 2**63 - 1
+
+
+def rendered_integer(value: Any) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise SnapshotError("source_invalid")
+    result = int(value)
+    if not integer(result):
+        raise SnapshotError("source_invalid")
+    return result
 
 
 def token(value: Any) -> bool:
@@ -158,6 +173,8 @@ def validate_data(name: str, value: dict) -> None:
             and value["reporting_required"] and not value["reporting_configured"]):
         raise SnapshotError("invalid_snapshot")
     if name == "health":
+        if not BASELINE_HEALTH_IDS <= {check["id"] for check in value["checks"]}:
+            raise SnapshotError("invalid_snapshot")
         rank = {"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}[value["status"]]
         if (any({"ok": 0, "warning": 1, "critical": 2}[check["status"]] > rank for check in value["checks"])
                 or value["status"] == "maintenance" and value["desired_state"] == "active"
@@ -226,15 +243,15 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
     try:
         if (value["CI_FLEET_CONTROLLER_STATE"] != policy["policy_state"]
                 or value["CI_FLEET_SCALE_SET_NAME"] != policy["scale_set_name"]
-                or int(value["CI_FLEET_CONFIGURED_MAX_RUNNERS"]) != policy["reviewed_maximum"]
-                or int(value["CI_FLEET_CAPACITY_BUDGET"]) != policy["capacity_budget"]):
+                or rendered_integer(value["CI_FLEET_CONFIGURED_MAX_RUNNERS"]) != policy["reviewed_maximum"]
+                or rendered_integer(value["CI_FLEET_CAPACITY_BUDGET"]) != policy["capacity_budget"]):
             raise SnapshotError("identity_mismatch")
         result = {"applied_commit": policy["applied_commit"], "engine_ref": policy["engine_ref"],
                   "routing_labels": value["CI_FLEET_LABELS"].split(","),
-                  "runner_cpu_cores": int(value["CI_FLEET_RUNNER_CPUS"]),
-                  "runner_memory_mib": int(value["CI_FLEET_RUNNER_MEMORY_MIB"]),
-                  "minimum_runners": int(value["CI_FLEET_MIN_RUNNERS"]),
-                  "maximum_runners": int(value["CI_FLEET_MAX_RUNNERS"]),
+                  "runner_cpu_cores": rendered_integer(value["CI_FLEET_RUNNER_CPUS"]),
+                  "runner_memory_mib": rendered_integer(value["CI_FLEET_RUNNER_MEMORY_MIB"]),
+                  "minimum_runners": rendered_integer(value["CI_FLEET_MIN_RUNNERS"]),
+                  "maximum_runners": rendered_integer(value["CI_FLEET_MAX_RUNNERS"]),
                   "storage_retention_configured": value.get("CI_FLEET_DOCKER_STORAGE_RETENTION") == "exclusive-fleet-daemon-v1"}
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise SnapshotError("source_invalid") from error
@@ -403,7 +420,7 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
         if not isinstance(source["data"], dict):
             raise SnapshotError("invalid_snapshot")
         data(name, source["data"])
-        if source["data"]:
+        if source["data"] or source["last_success_at"] is not None:
             if source["source_version"] != 1:
                 raise SnapshotError("unsupported_schema")
             validate_data(name, source["data"])
@@ -413,7 +430,12 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
             if name in UNSUPPORTED_SOURCES:
                 raise SnapshotError("invalid_snapshot")
             validate_data(name, source["data"])
-        elif source["observed_at"] is not None or (source["data"] and source["last_success_at"] is None):
+        elif source["availability"] == "not_configured":
+            if source != evidence(availability="not_configured"):
+                raise SnapshotError("invalid_snapshot")
+        elif source != failure(source["error"], source):
+            raise SnapshotError("invalid_snapshot")
+        if name in UNSUPPORTED_SOURCES and source != failure("unsupported"):
             raise SnapshotError("invalid_snapshot")
         if name == "installation" and "installed_at" in source["data"]:
             timestamp(source["data"]["installed_at"], source["last_success_at"])
