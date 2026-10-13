@@ -68,7 +68,9 @@ def choice(*values: str):
 
 
 def labels(value: Any) -> bool:
-    return isinstance(value, list) and 1 <= len(value) <= 32 and all(token(item) for item in value) and len(set(value)) == len(value)
+    return (isinstance(value, list) and len(value) >= 1
+            and all(isinstance(item, str) and CONTROLLER_ID.fullmatch(item) for item in value)
+            and len(set(value)) == len(value))
 
 
 def checks(value: Any) -> bool:
@@ -91,7 +93,7 @@ DATA_FIELDS = {
         "applied_commit": commit, "engine_ref": commit, "routing_labels": labels,
         "runner_cpu_cores": lambda v: type(v) in {int, float} and math.isfinite(v) and v > 0,
         "runner_memory_mib": lambda v: integer(v) and v > 0,
-        "minimum_runners": integer, "maximum_runners": integer,
+        "minimum_runners": lambda v: type(v) is int and v == 0, "maximum_runners": integer,
         "storage_retention_configured": lambda v: type(v) is bool,
     },
     "controller": {"software_version": lambda v: isinstance(v, str) and len(v) <= 64 and VERSION.fullmatch(v) is not None,
@@ -215,7 +217,7 @@ def project_configuration(value: dict, installation: dict, controller: str) -> d
                   "storage_retention_configured": value.get("CI_FLEET_DOCKER_STORAGE_RETENTION") == "exclusive-fleet-daemon-v1"}
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise SnapshotError("source_invalid") from error
-    if result["minimum_runners"] > result["maximum_runners"] or result["maximum_runners"] > policy["reviewed_maximum"]:
+    if result["maximum_runners"] != (policy["reviewed_maximum"] if policy["policy_state"] == "active" else 0):
         raise SnapshotError("source_invalid")
     return evidence(data("configuration", result), observed_at=installation["observed_at"])
 
@@ -313,6 +315,8 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
                     sources[name] = failure("revision_unverified")
                     return
             sources[name] = failure(error.code, retained)
+            if name == "controller":
+                sources[name]["data"].pop("matches_reviewed_maximum", None)
 
     if errors.get("installation") == "not_found":
         sources["installation"] = evidence({"record_state": "absent"}, observed_at=now)
@@ -388,9 +392,9 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
                 or configured["applied_commit"] != installed["applied_commit"]
                 or configured["engine_ref"] != installed["engine_ref"]
                 or configuration["last_success_at"] != installed["installed_at"]
-                or configured["maximum_runners"] > installed["reviewed_maximum"]):
+                or configured["maximum_runners"] != (installed["reviewed_maximum"] if installed["policy_state"] == "active" else 0)):
             raise SnapshotError("invalid_snapshot")
-    if runtime["availability"] == "available" and "matches_reviewed_maximum" in runtime["data"]:
+    if "matches_reviewed_maximum" in runtime["data"]:
         if policy["availability"] != "available" or "reviewed_maximum" not in policy["data"]:
             raise SnapshotError("invalid_snapshot")
         matches = runtime["data"]["maximum"] == policy["data"]["reviewed_maximum"]

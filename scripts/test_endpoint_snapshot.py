@@ -187,6 +187,37 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(value["sources"]["configuration"]["error"], "identity_mismatch")
             self.assertEqual(value["sources"]["configuration"]["data"], {})
 
+    def test_routing_labels_follow_schema_v3_without_a_private_count_limit(self):
+        docs = documents()
+        expected = [f"capability-{index}" for index in range(40)]
+        docs["rendered"]["CI_FLEET_LABELS"] = ",".join(expected)
+        source = self.build(docs)["sources"]["configuration"]
+        self.assertEqual(source["availability"], "available")
+        self.assertEqual(source["data"]["routing_labels"], expected)
+
+    def test_configuration_capacity_matches_authoritative_policy_state(self):
+        for state in ("active", "drained", "disabled"):
+            for minimum, maximum in ((0, 0), (0, 3), (0, 4), (1, 4)):
+                with self.subTest(state=state, minimum=minimum, maximum=maximum):
+                    docs = documents()
+                    docs["installation"]["controller_state"] = state
+                    docs["rendered"]["CI_FLEET_MIN_RUNNERS"] = str(minimum)
+                    docs["rendered"]["CI_FLEET_MAX_RUNNERS"] = str(maximum)
+                    value = self.build(docs)
+                    valid = minimum == 0 and maximum == (4 if state == "active" else 0)
+                    self.assertEqual(value["sources"]["configuration"]["availability"] == "available", valid)
+
+    def test_retained_controller_counts_do_not_keep_a_stale_policy_comparison(self):
+        previous = self.build()
+        docs = documents()
+        docs["installation"]["configured_max_runners"] = 5
+        docs["rendered"]["CI_FLEET_MAX_RUNNERS"] = "5"
+        value = self.build(docs, errors={"controller": "source_timeout"}, previous=previous)
+        runtime = value["sources"]["controller"]
+        self.assertEqual(runtime["last_success_at"], NOW - 10)
+        self.assertEqual(runtime["data"]["maximum"], 4)
+        self.assertNotIn("matches_reviewed_maximum", runtime["data"])
+
     def test_invalid_counts_times_and_policy_values_fail_independently(self):
         for field, bad in (("current", False), ("busy", 3), ("maximum", -1), ("generated_at", NOW + 1),
                            ("software_version", "arbitrary private value")):
@@ -281,6 +312,8 @@ class SnapshotTests(unittest.TestCase):
             lambda v: v["sources"]["controller"]["data"].update(current=0, busy=3, maximum=1),
             lambda v: v["sources"]["controller"]["data"].update(matches_reviewed_maximum=False),
             lambda v: v["sources"]["configuration"]["data"].update(maximum_runners=99),
+            lambda v: v["sources"]["configuration"]["data"].update(maximum_runners=3),
+            lambda v: v["sources"]["configuration"]["data"].update(minimum_runners=1),
             lambda v: v["sources"]["configuration"]["data"].update(applied_commit="4" * 40),
             lambda v: v["sources"]["installation"]["data"].update(installed_at=NOW + 1),
             lambda v: v["sources"]["reconciliation"]["data"].update(last_success_at=NOW + 1),
@@ -442,7 +475,8 @@ class SnapshotReadbackTests(unittest.TestCase):
                     self.reader.read({"Authorization": "Bearer " + BEARER}, now=NOW)
 
     def test_reader_rejects_retained_configuration_from_another_installation(self):
-        for field, changed in (("applied_commit", "4" * 40), ("engine_ref", "5" * 40),
+        for field, changed in (("applied_commit", "4" * 40), ("engine_ref", "5" * 40), ("maximum_runners", 3),
+                               ("minimum_runners", 1),
                                ("last_success_at", NOW - 200)):
             with self.subTest(field=field):
                 value = snapshot.build_snapshot(CONTROLLER, documents(), {}, now=NOW)
