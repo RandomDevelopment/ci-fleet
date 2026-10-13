@@ -301,7 +301,18 @@ def build_snapshot(controller: str, documents: Mapping[str, dict | None], errors
                 raise SnapshotError("source_unavailable")
             sources[name] = projector(value)
         except SnapshotError as error:
-            sources[name] = failure(error.code, old.get(name))
+            retained = old.get(name)
+            if name in {"configuration", "reconciliation"} and retained and retained["data"]:
+                installation = sources["installation"]
+                prior_installation = old["installation"]
+                if (installation["availability"] != "available"
+                        or installation["data"].get("record_state") != "installed"
+                        or prior_installation["availability"] != "available"
+                        or prior_installation["data"] != installation["data"]
+                        or retained["last_success_at"] < installation["data"]["installed_at"]):
+                    sources[name] = failure("revision_unverified")
+                    return
+            sources[name] = failure(error.code, retained)
 
     if errors.get("installation") == "not_found":
         sources["installation"] = evidence({"record_state": "absent"}, observed_at=now)
@@ -428,7 +439,13 @@ def publish(controller: str, *, observer_gid: int, root: Path = Path("/"), now: 
         try:
             previous = read_endpoint(base, observer_gid, _directory_fd=directory_fd)
             validate_snapshot(previous, controller=controller)
-        except (StoreError, SnapshotError):
+        except StoreError as error:
+            if error.code not in {"not_found", "invalid_json"}:
+                raise
+            previous = None
+        except SnapshotError as error:
+            if error.code not in {"invalid_snapshot", "source_invalid", "snapshot_too_large"}:
+                raise
             previous = None
         documents, errors = collect_documents(controller, root=root)
         value = build_snapshot(controller, documents, errors, now=int(time.time()) if now is None else now, previous=previous)

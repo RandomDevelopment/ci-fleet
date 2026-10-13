@@ -208,6 +208,33 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(value["sources"]["reconciliation"]["error"], "revision_unverified")
         self.assertEqual(value["sources"]["reconciliation"]["data"], {})
 
+    def test_failed_dependent_reads_discard_evidence_from_another_installation(self):
+        previous = self.build()
+        for field, changed in (("config_ref", "4" * 40), ("engine_ref", "5" * 40),
+                               ("installed_at", dt.datetime.fromtimestamp(NOW - 5, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))):
+            for error in ("not_found", "source_timeout", "source_invalid"):
+                with self.subTest(field=field, error=error):
+                    docs = documents()
+                    docs["installation"][field] = changed
+                    value = self.build(docs, errors={"rendered": error, "reconciliation": error}, previous=previous)
+                    for name in ("configuration", "reconciliation"):
+                        source = value["sources"][name]
+                        self.assertEqual(source["error"], "revision_unverified")
+                        self.assertEqual(source["data"], {})
+                        self.assertIsNone(source["last_success_at"])
+
+    def test_failed_dependent_reads_retain_only_verified_installation_evidence(self):
+        previous = self.build()
+        value = self.build(errors={"rendered": "source_timeout", "reconciliation": "not_found"}, previous=previous)
+        for name in ("configuration", "reconciliation"):
+            self.assertEqual(value["sources"][name]["data"], previous["sources"][name]["data"])
+            self.assertEqual(value["sources"][name]["last_success_at"], previous["sources"][name]["last_success_at"])
+        for installation_error in ("not_found", "source_timeout", "source_unsafe"):
+            value = self.build(errors={"installation": installation_error, "rendered": "not_found", "reconciliation": "not_found"}, previous=previous)
+            for name in ("configuration", "reconciliation"):
+                self.assertEqual(value["sources"][name]["error"], "revision_unverified")
+                self.assertEqual(value["sources"][name]["data"], {})
+
     def test_future_installation_date_discards_previous_evidence(self):
         docs = documents()
         docs["installation"]["installed_at"] = dt.datetime.fromtimestamp(NOW + 1, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -299,6 +326,33 @@ class SnapshotReadbackTests(unittest.TestCase):
             return documents(), {}
         with patch.object(snapshot, 'collect_documents', side_effect=collect):
             snapshot.publish(CONTROLLER, observer_gid=self.gid, root=self.root, now=NOW)
+
+    def test_publisher_preserves_unsupported_schema_and_wrong_identity_exports(self):
+        for field, value, expected in (("schema_version", 2, "unsupported_schema"),
+                                       ("source_version", 2, "unsupported_schema"),
+                                       ("controller", "different-ci-01", "identity_mismatch")):
+            with self.subTest(field=field):
+                incumbent = snapshot.build_snapshot(CONTROLLER, documents(), {}, now=NOW + 10)
+                if field == "source_version":
+                    incumbent["sources"]["health"][field] = value
+                else:
+                    incumbent[field] = value
+                store.publish_endpoint(self.base, incumbent, self.gid)
+                before = self.exports.joinpath("endpoint.json").read_bytes()
+                with patch.object(snapshot, "collect_documents", return_value=(documents(), {})) as collect:
+                    with self.assertRaises(snapshot.SnapshotError) as error:
+                        snapshot.publish(CONTROLLER, observer_gid=self.gid, root=self.root, now=NOW)
+                    self.assertEqual(error.exception.code, expected)
+                    collect.assert_not_called()
+                self.assertEqual(self.exports.joinpath("endpoint.json").read_bytes(), before)
+
+    def test_publisher_recovers_malformed_incumbent(self):
+        path = self.exports / "endpoint.json"
+        path.write_text("{")
+        path.chmod(0o640)
+        with patch.object(snapshot, "collect_documents", return_value=(documents(), {})):
+            value = snapshot.publish(CONTROLLER, observer_gid=self.gid, root=self.root, now=NOW)
+        self.assertEqual(store.read_endpoint(self.base, self.gid), value)
 
     def test_publish_and_authenticated_read_keep_sources_out_of_consumer_access(self):
         with patch.object(snapshot, "collect_documents", return_value=(documents(), {})):
