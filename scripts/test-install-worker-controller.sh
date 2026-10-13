@@ -3415,6 +3415,7 @@ export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 : >"$FAKE_COMPOSE_LOG"
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
+cp "$adopt_root/etc/ci-fleet/ci-fleet.env" "$tmp/adopt-incumbent.env"
 adopt_failure_output=$tmp/adopt-restart-loop.out
 set +e
 "$installer" --adopt "${base_args[@]}" --ref "$ref_one" >"$adopt_failure_output" 2>&1
@@ -3423,9 +3424,12 @@ set -e
 [[ "$adopt_failure_status" == 20 ]] || fail "adoption restart-loop rollback returned $adopt_failure_status instead of 20: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
 [[ $(grep -Fc 'ROLLBACK_RESTORED checkpoint=' "$adopt_failure_output" || true) == 1 ]] || fail "adoption restart-loop rollback did not emit exactly one restored marker: $(<"$adopt_failure_output"); compose log: $(<"$FAKE_COMPOSE_LOG")"
 [[ ! -e "$adopt_root/etc/docker/daemon.json" && ! -L "$adopt_root/etc/docker/daemon.json" ]] || fail 'adoption restart-loop rollback did not restore absent daemon.json'
-grep -Fxq "CI_FLEET_ENGINE_REF=$engine_ref" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed engine revision'
-grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed controller image ID'
-grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy checkpoint did not retain the installed runner image ID'
+cmp -s "$tmp/adopt-incumbent.env" "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'legacy adoption rollback changed the installed environment'
+adopt_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); print $2; exit}' "$adopt_failure_output")
+adopt_checkpoint_images=$adopt_checkpoint/image-env
+grep -Fxq "CI_FLEET_ENGINE_REF=$engine_ref" "$adopt_checkpoint_images" || fail 'legacy checkpoint did not retain the installed engine revision'
+grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_checkpoint_images" || fail 'legacy checkpoint did not retain the installed controller image ID'
+grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_checkpoint_images" || fail 'legacy checkpoint did not retain the installed runner image ID'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
 grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
