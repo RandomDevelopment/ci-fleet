@@ -273,5 +273,40 @@ assert result.returncode == 0 and "CHECK_RETAINED" in result.stdout, (result.std
 for variable in ("runtime_failure", "timer_failure"):
     result = subprocess.run(["env", f"{variable}=1", "bash", str(probe)], capture_output=True, text=True)
     assert result.returncode != 0, variable
+# A restore context must match protected LKG metadata and a complete checkpoint.
+selector = re.search(r"^find_bootstrap_lkg_checkpoint\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
+checkpoints = root / "lkg-checkpoints"
+checkpoint = checkpoints / "checkpoint"
+checkpoint.mkdir(parents=True)
+checkpoints.chmod(0o700)
+checkpoint.chmod(0o700)
+metadata = root / "lkg" / "metadata.json"
+metadata.parent.mkdir()
+identity = dict(config_repository="fixture-org/fleet-config", config_ref=legacy_ref, controller="example-ci-01")
+metadata.write_text(json.dumps(identity))
+metadata.chmod(0o600)
+(checkpoint / "install-state.json").write_text(json.dumps(identity))
+(checkpoint / "ci-fleet.env").write_text((context / "env").read_text())
+(checkpoint / ".complete").touch()
+for path in checkpoint.iterdir():
+    path.chmod(0o600)
+selector_script = root / "select-lkg.sh"
+selector_script.write_text(f"set -Eeuo pipefail\nrepo_root={repo}\ncheckpoints_dir={checkpoints}\nCI_FLEET_LKG_DIR={metadata.parent}\nconfig_identity=fixture-org/fleet-config\nconfig_ref={legacy_ref}\ncontroller_id=example-ci-01\ntesting=1\n" + selector + "\nfind_bootstrap_lkg_checkpoint\n")
+def select():
+    return subprocess.run(["bash", str(selector_script)], capture_output=True, text=True)
+result = select()
+assert result.returncode == 0 and result.stdout.strip() == str(checkpoint), (result.stdout, result.stderr)
+metadata.write_text(json.dumps({**identity, "controller": "another-controller"}))
+assert select().returncode != 0
+metadata.write_text(json.dumps(identity))
+(checkpoint / ".complete").unlink()
+assert select().returncode != 0
+(checkpoint / ".complete").touch(mode=0o600)
+(checkpoint / "ci-fleet.env").chmod(0o644)
+assert select().returncode != 0
+(checkpoint / "ci-fleet.env").chmod(0o600)
+with (checkpoint / "ci-fleet.env").open("a") as stream:
+    stream.write("CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:" + "4" * 64 + "\n")
+assert select().returncode != 0
 PYTHON
 printf 'MANAGER_STAGING_AND_IMAGE_RECOVERY_TESTS_OK\n'
