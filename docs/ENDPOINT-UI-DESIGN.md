@@ -2,6 +2,8 @@
 
 Implementation status: planned. This ADR addresses [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It adds no supported command, schema field, service, listener, or engine capability.
 
+The [worker snapshot foundation](ENDPOINT-SNAPSHOTS.md) records the current #118 interfaces and their remaining evidence coverage. The UI and its host activation remain planned.
+
 ## Acceptance record
 
 [PR #126](https://github.com/RandomDevelopment/ci-fleet/pull/126) is the durable acceptance record. The design is proposed while that PR is open and becomes accepted when the reviewed PR merges into `main`. Closing it without a merge leaves the design unaccepted. Its merge commit identifies the accepted design revision. Later changes require their own reviewed PRs. Design acceptance does not authorize installation, credentials, or network access.

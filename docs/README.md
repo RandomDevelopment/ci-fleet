@@ -53,6 +53,7 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 - [Runner controller design](CONTROLLER-DESIGN.md)
 - [Accepted design decisions](DESIGN-DECISIONS.md)
 - [Endpoint observation UI design and acceptance](ENDPOINT-UI-DESIGN.md)
+- [Worker snapshot foundation and evidence limits](ENDPOINT-SNAPSHOTS.md)
 - [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)

@@ -17,6 +17,12 @@ python3 -m py_compile \
   scripts/cleanup_storage.py \
   scripts/test_cleanup_storage.py \
   scripts/health.py \
+  scripts/endpoint_snapshot.py \
+  scripts/endpoint_snapshot_sources.py \
+  scripts/endpoint_snapshot_store.py \
+  scripts/test_endpoint_snapshot.py \
+  scripts/test_endpoint_snapshot_sources.py \
+  scripts/test_endpoint_snapshot_store.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
   scripts/scan_committed_secrets.py \
@@ -38,6 +44,9 @@ python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py
 python3 scripts/test_health.py
+python3 scripts/test_endpoint_snapshot.py
+python3 scripts/test_endpoint_snapshot_sources.py
+python3 scripts/test_endpoint_snapshot_store.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
 scripts/test-bootstrap-github.sh
