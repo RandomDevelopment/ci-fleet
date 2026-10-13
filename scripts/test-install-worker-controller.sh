@@ -2813,7 +2813,7 @@ grep -Fxq "CI_FLEET_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE" "$rendered_env" || fail 'mi
 grep -Fq '"configured_max_runners": 1' "$install_state" || fail 'missing-tag rollback changed installed state'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$prior_manager" ]] || fail 'missing-tag rollback changed the installed manager'
 runner_rm_line=$(grep -n -m1 "^image-rm|$FAKE_RUNNER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-controller_tag_line=$(grep -n "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
+controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 [[ -z "$runner_rm_line" && -z "$controller_tag_line" && -z "$rollback_up_line" ]] || fail 'failed reconstruction preflight mutated rollback tags or restarted the controller'
 recovered_missing_tag=$(expect_success "$installer" --rollback)
@@ -2865,7 +2865,7 @@ grep -Fxq "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID=$prior_controller_image_id" "$check
 candidate_up_line=$(grep -n -m1 '^up|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
 rollback_stop_line=$(grep -n '^stop|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 candidate_rm_line=$(grep -n -m1 '^rm|' "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
-controller_tag_line=$(grep -n -m1 "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | cut -d: -f1 || true)
+controller_tag_line=$(grep -n "^image-tag|$prior_controller_image_id|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 rollback_up_line=$(grep -n '^up|' "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 controller_rm_line=$(grep -n "^image-rm-force|$FAKE_CONTROLLER_IMAGE$" "$FAKE_COMPOSE_LOG" | tail -n1 | cut -d: -f1 || true)
 [[ -n "$candidate_up_line" && -n "$rollback_stop_line" && -n "$candidate_rm_line" && -n "$controller_tag_line" && -n "$rollback_up_line" && -n "$controller_rm_line" \
