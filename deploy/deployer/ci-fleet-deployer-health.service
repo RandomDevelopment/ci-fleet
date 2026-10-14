@@ -1,0 +1,27 @@
+[Unit]
+Description=Check ci-fleet deployer health
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=root
+# Recreate the boot-volatile lock outside the read-only service namespace.
+ExecStartPre=+/usr/bin/mkdir -p -m 0700 /var/lock/ci-fleet-deployer
+ExecStart=/opt/ci-fleet-deployer/current/scripts/deployer-runtime.sh health
+Environment=CI_FLEET_DEPLOYER_CONFIG=/var/lib/ci-fleet-deployer/active-policy.conf
+TimeoutStartSec=4min
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/ci-fleet-deployer /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /var/log/ci-fleet-deployer
+ReadWritePaths=-/run/docker.sock
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE
+RestrictSUIDSGID=yes
+
+RuntimeDirectory=ci-fleet-deployer-adapters
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/ci-fleet-deployer-adapters /var/lib/ci-fleet-deployer/.adapter-recovery /var/lib/ci-fleet-deployer-container-credentials

@@ -254,8 +254,12 @@ for name in ("state", "env"):
 result = subprocess.run(["bash", str(wrapper), "check", str(repo), str(context), str(legacy)], capture_output=True, text=True)
 assert result.returncode == 0, (result.stdout, result.stderr)
 check = re.search(r"^perform_check\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
+admission = re.search(r"^reject_deployer_host\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
 probe = root / "retained-check.sh"
 probe.write_text('''set -Eeuo pipefail
+root=$1
+root_path() { printf '%s%s' "$root" "$1"; }
+systemctl() { [[ $1 == list-unit-files || $1 == list-units ]]; }
 retained_installed_ref=true
 config_ref=retained
 engine_ref=old-runtime
@@ -267,12 +271,17 @@ staged_runtime_matches() { return "${runtime_failure:-0}"; }
 mandatory_timers_active() { return "${timer_failure:-0}"; }
 note() { printf '%s\\n' "$*"; }
 die() { printf '%s\\n' "$*" >&2; exit 1; }
-''' + check + "\nperform_check\n")
-result = subprocess.run(["bash", str(probe)], capture_output=True, text=True)
+''' + admission + '\n' + check + "\nperform_check\n")
+result = subprocess.run(["bash", str(probe), str(root)], capture_output=True, text=True)
 assert result.returncode == 0 and "CHECK_RETAINED" in result.stdout, (result.stdout, result.stderr)
 for variable in ("runtime_failure", "timer_failure"):
-    result = subprocess.run(["env", f"{variable}=1", "bash", str(probe)], capture_output=True, text=True)
+    result = subprocess.run(["env", f"{variable}=1", "bash", str(probe), str(root)], capture_output=True, text=True)
     assert result.returncode != 0, variable
+deployer = root / "etc/ci-fleet-deployer"
+deployer.mkdir(parents=True)
+result = subprocess.run(["bash", str(probe), str(root)], capture_output=True, text=True)
+assert result.returncode != 0 and "deployer host state is present" in result.stderr, (result.stdout, result.stderr)
+deployer.rmdir()
 # A restore context must match protected LKG metadata and a complete checkpoint.
 selector = re.search(r"^find_bootstrap_lkg_checkpoint\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
 checkpoints = root / "lkg-checkpoints"

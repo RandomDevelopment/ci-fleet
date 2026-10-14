@@ -49,6 +49,27 @@ if ! mkdir -m 0700 "$lock_directory" 2>/dev/null; then
 fi
 exec 9<"$lock_directory"
 flock 9
+role_lock="$root/run/ci-fleet-role-admission.lock"
+exec 8>"$role_lock"
+flock -n 8 || { echo "another ci-fleet role installation is already running" >&2; exit 1; }
+
+reject_deployer_role() {
+  local path
+  if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then
+    echo "deployer host state is present" >&2; exit 1
+  fi
+  for path in "$root/opt/ci-fleet-deployer" "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer-container-credentials"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || { echo "deployer host state is present" >&2; exit 1; }
+  done
+  local output unit
+  output=$(systemctl list-unit-files --no-legend --no-pager) || { echo 'systemd unit-file inventory failed' >&2; exit 1; }
+  output+=$'\n'
+  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || { echo 'systemd loaded-unit inventory failed' >&2; exit 1; }
+  while read -r unit _; do
+    [[ $unit != ci-fleet-deployer* ]] || { echo 'deployer host state is present' >&2; exit 1; }
+  done <<<"$output"
+}
+reject_deployer_role
 
 current_ref() {
   local link release releases target
