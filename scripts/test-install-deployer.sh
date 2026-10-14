@@ -534,6 +534,7 @@ write_config
 
 export CI_FLEET_DEPLOYER_EUID_OVERRIDE=1000
 expect_failure 'run this mode as root' "$installer" --install --config "$config" >/dev/null
+expect_failure 'run this mode as root' "$installer" --check --config "$config" >/dev/null
 export CI_FLEET_DEPLOYER_EUID_OVERRIDE=0
 
 before=$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)

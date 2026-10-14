@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -454,6 +455,105 @@ class Containment(unittest.TestCase):
                 self.assertFalse((store / 'pending-consumption.json').exists())
                 adapter.consume_approval(store, uid=os.getuid())
                 self.assertEqual(audit.read_bytes().count(line.encode()), 1)
+
+    def test_installer_check_requires_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([str(Path(__file__).with_name('install-deployer.sh')),
+                                     '--check', '--config', directory + '/absent.conf'],
+                                    env=dict(os.environ, CI_FLEET_DEPLOYER_TESTING='1',
+                                             CI_FLEET_DEPLOYER_ROOT=directory,
+                                             CI_FLEET_DEPLOYER_EUID_OVERRIDE='1000'),
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('run this mode as root', result.stderr)
+
+    def test_rollback_recovery_requires_durable_completion_after_reboot(self):
+        installer = Path(__file__).with_name('install-deployer.sh')
+        function = subprocess.check_output(['sed', '-n', '/^recover_interrupted_transaction() {$/,/^}$/p',
+                                            str(installer)], text=True)
+        shell = function + r'''
+block() { printf '%s\n' "$*" >&2; exit 42; }
+secure_file() { test -f "$1"; }
+secure_directory() { test -d "$1"; }
+adapter_unit_inactive() { return 0; }
+rollback_commit_marker_uncommitted() { test ! -e "$1"; }
+restore_transaction() { printf restored >"$result_file"; }
+finalize_committed_rollback() { printf finalized >"$result_file"; }
+python3() { command "$test_python" -c "$journal_probe" "$@"; }
+recover_interrupted_transaction
+'''
+        # Directory ancestry is covered separately; this fixture lives in /tmp.
+        probe = "import sys; from unittest.mock import patch; import deployer_adapter as a; sys.argv=sys.argv[1:]; " \
+                "p=patch.object(a,'trusted_directory'); p.start(); raise SystemExit(a.main())"
+        for committed in (False, True):
+            for state, uncertain in [('missing', False), ('inflight', False), ('completed', True), ('completed', False)]:
+                with self.subTest(committed=committed, state=state, uncertain=uncertain), \
+                        tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    transactions, store = root / 'transactions', root / 'state'
+                    transactions.mkdir()
+                    store.mkdir()
+                    transaction = transactions / '.transaction.rollback'
+                    transaction.mkdir(mode=0o700)
+                    unit = 'ci-fleet-deployer-adapter-1-2.service'
+                    adapter.durable_file(transaction / 'kind', b'rollback\n')
+                    adapter.durable_file(transaction / 'adapter-unit', (unit + '\n').encode())
+                    if committed:
+                        adapter.durable_file(transaction / 'application-rollback-committed', b'committed\n')
+                    if state != 'missing':
+                        journal = store / '.adapter-recovery' / unit
+                        journal.mkdir(parents=True, mode=0o700)
+                        adapter.durable_file(journal / 'status.json', json.dumps({
+                            'unit': unit, 'operation': 'rollback', 'status': state, 'exit_code': 1}).encode())
+                        if uncertain:
+                            adapter.durable_file(journal / 'docker-uncertain', b'uncertain\n')
+                    result_file = root / 'result'
+                    result = subprocess.run(['bash', '-c', shell], capture_output=True, text=True,
+                                            env=dict(os.environ, transaction_root=str(transactions),
+                                                     state_root=str(store), expected_uid=str(os.getuid()),
+                                                     repo_root=str(installer.parent.parent),
+                                                     CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
+                                                     test_python=sys.executable, journal_probe=probe,
+                                                     PYTHONPATH=str(installer.parent)))
+                    if state != 'completed' or uncertain:
+                        self.assertEqual(result.returncode, 42, result.stderr)
+                        self.assertIn('rollback adapter journal completion is unverified', result.stderr)
+                        self.assertFalse(result_file.exists())
+                        self.assertTrue(transaction.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result_file.read_text(), 'finalized' if committed else 'restored')
+
+    def test_failed_rollback_commit_publication_keeps_uncertainty(self):
+        for published in (False, True):
+            with self.subTest(published=published), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker, uncertain = root / 'rollback-commit', root / 'docker-uncertain'
+                policy = adapter.Policy(self.values, self.backend, marker=marker, operation='rollback',
+                                        uncertain_marker=uncertain)
+                durable = adapter.durable_file
+                def failing_publication(path, body):
+                    if path == marker:
+                        if published:
+                            durable(path, body)
+                        raise OSError('commit publication failed')
+                    durable(path, body)
+                with adapter.ProxyServer(str(root / 'broker.sock'), adapter.handler(policy)) as server:
+                    thread = threading.Thread(target=server.serve_forever)
+                    thread.start()
+                    try:
+                        with patch.object(adapter, 'durable_file', side_effect=failing_publication):
+                            connection = adapter.UnixConnection(str(root / 'broker.sock'), rootless=False)
+                            connection.request('POST', '/ci-fleet/rollback-commit', b'committed')
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 403)
+                            response.read()
+                            connection.close()
+                    finally:
+                        server.shutdown()
+                        thread.join()
+                self.assertTrue(policy.uncertain)
+                self.assertEqual(uncertain.read_bytes(), b'uncertain\n')
 
     def test_guard_requires_completed_protected_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

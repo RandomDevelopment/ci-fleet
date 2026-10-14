@@ -470,6 +470,7 @@ def handler(policy: Policy):
                 body = self.rfile.read(length)
                 if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
                     require(policy.marker is not None and body == b"committed", "rollback marker is not authorized")
+                    mutation = True
                     durable_file(policy.marker, b"committed\n")
                     status, response = 204, b""
                 else:

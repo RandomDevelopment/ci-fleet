@@ -191,7 +191,7 @@ else
   [[ -z "$root" ]] || die 'alternate root is forbidden'
   [[ -z ${CI_FLEET_DEPLOYER_EUID_OVERRIDE:-} ]] || die 'effective UID override is test-only'
 fi
-if [[ "$mode" != check && "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
+if [[ "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
 
 root_path() { printf '%s%s' "$root" "$1"; }
 etc_root=$(root_path /etc/ci-fleet-deployer)
@@ -1032,6 +1032,9 @@ recover_interrupted_transaction() {
     pending_unit=$(<"$candidate/adapter-unit")
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
     adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
+    if [[ $transaction_kind == rollback ]]; then
+      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+    fi
   fi
   local candidate_marker=$candidate/application-rollback-committed
   if [[ -e "$candidate/commit" || -L "$candidate/commit" ]]; then
