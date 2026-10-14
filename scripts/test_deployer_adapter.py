@@ -66,6 +66,7 @@ class Containment(unittest.TestCase):
         for no_new_privileges in ('no-new-privileges', 'no-new-privileges:true'):
             for encoded in (canonical, json.dumps(profile, indent=2)):
                 body = copy.deepcopy(self.body)
+                body['User'] = '1000'
                 body['HostConfig']['SecurityOpt'] = [no_new_privileges, 'seccomp=' + encoded]
                 _, forwarded = self.policy.authorize('POST', '/containers/create?name=ci-fleet-deploy-example-browser', json.dumps(body).encode())
                 self.assertEqual(json.loads(forwarded)['HostConfig']['SecurityOpt'], body['HostConfig']['SecurityOpt'])
@@ -74,7 +75,25 @@ class Containment(unittest.TestCase):
                 body['HostConfig'][field] = value
                 self.policy.container(body)
             body = copy.deepcopy(self.body)
+            body['User'] = '1000'
             body['HostConfig']['SecurityOpt'] = ['no-new-privileges', 'seccomp=' + canonical]
+
+    def test_chromium_profile_requires_declared_non_root_user(self):
+        profile = (Path(__file__).resolve().parents[1] / 'deploy/seccomp/chromium-v1.json').read_text()
+        body = copy.deepcopy(self.body)
+        body['HostConfig']['SecurityOpt'] = ['no-new-privileges', 'seccomp=' + profile]
+        image = self.backend.resources['images', self.policy.image]['Config']
+        for user in ('', 'root', '0', '000:1000', 'root:1000'):
+            with self.subTest(user=user), self.assertRaises(ValueError):
+                image['User'] = user
+                self.policy.container(body)
+        image['User'] = '1000'
+        self.policy.container(body)
+        body['User'] = 'root'
+        with self.assertRaises(ValueError):
+            self.policy.container(body)
+        body['User'] = '1001'
+        self.policy.container(body)
 
     def test_reject_unreviewed_seccomp_and_missing_privilege_restriction(self):
         profile = json.loads((Path(__file__).resolve().parents[1] / 'deploy/seccomp/chromium-v1.json').read_text())

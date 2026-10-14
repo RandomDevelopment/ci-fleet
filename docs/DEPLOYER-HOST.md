@@ -96,6 +96,10 @@ Whitespace and JSON key order may vary; any changed policy content fails closed.
 No broker or installer file lookup is added. Host paths, `unconfined`, missing
 no-new-privileges and additional security options remain forbidden.
 
+The profile requires an explicit non-root `User` in the container request or
+the approved image configuration. Empty, `root` and zero UID declarations are
+rejected. Review named users in the approved image and verify the actual runtime
+UID; a username declaration alone does not attest the image's passwd contents.
 The profile permits Chromium's user-namespace sandbox operations while retaining
 the profile's default deny action and the broker's other containment limits.
 Chromium must remain non-root and launch with its sandbox enabled. Actual browser

@@ -378,6 +378,11 @@ class Policy:
         image = self.backend.inspect("images", self.image)
         config = image.get("Config")
         require(isinstance(config, dict), "approved image configuration is unavailable")
+        if len(host["SecurityOpt"]) == 2:
+            user = value.get("User", config.get("User", ""))
+            require(isinstance(user, str) and user.split(":")[0] not in ("", "root")
+                    and (not user.split(":")[0].isdecimal() or int(user.split(":")[0]) > 0),
+                    "the Chromium profile requires a declared non-root container user")
         declared = config.get("Volumes") or {}
         require(isinstance(declared, dict), "invalid image volume declarations")
         mounted = {mount["Target"] for mount in host.get("Mounts", []) if mount["Type"] == "volume"}
