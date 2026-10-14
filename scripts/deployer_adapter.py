@@ -380,8 +380,9 @@ class Policy:
         require(isinstance(config, dict), "approved image configuration is unavailable")
         if len(host["SecurityOpt"]) == 2:
             user = value.get("User", config.get("User", ""))
-            require(isinstance(user, str) and user.split(":")[0] not in ("", "root")
-                    and (not user.split(":")[0].isdecimal() or int(user.split(":")[0]) > 0),
+            user_id = user.split(":")[0] if isinstance(user, str) else ""
+            require(user_id not in ("", "root")
+                    and (not re.fullmatch(r"[+-]?[0-9]+", user_id) or int(user_id) > 0),
                     "the Chromium profile requires a declared non-root container user")
         declared = config.get("Volumes") or {}
         require(isinstance(declared, dict), "invalid image volume declarations")

@@ -83,16 +83,17 @@ class Containment(unittest.TestCase):
         body = copy.deepcopy(self.body)
         body['HostConfig']['SecurityOpt'] = ['no-new-privileges', 'seccomp=' + profile]
         image = self.backend.resources['images', self.policy.image]['Config']
-        for user in ('', 'root', '0', '000:1000', 'root:1000'):
+        for user in ('', 'root', '0', '000:1000', 'root:1000', '+0', '-0', '+000:1000', '-000:1000', '-1'):
             with self.subTest(user=user), self.assertRaises(ValueError):
                 image['User'] = user
                 self.policy.container(body)
         image['User'] = '1000'
         self.policy.container(body)
-        body['User'] = 'root'
-        with self.assertRaises(ValueError):
-            self.policy.container(body)
-        body['User'] = '1001'
+        for user in ('root', '+0', '-0'):
+            body['User'] = user
+            with self.subTest(override=user), self.assertRaises(ValueError):
+                self.policy.container(body)
+        body['User'] = '+1001'
         self.policy.container(body)
 
     def test_reject_unreviewed_seccomp_and_missing_privilege_restriction(self):
