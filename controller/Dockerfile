@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
-FROM golang:1.27.1-bookworm@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66 AS build
+FROM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
 ARG SOURCE_DATE_EPOCH=1786752000
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/20261012T000000Z bookworm main\n' >/etc/apt/sources.list \
