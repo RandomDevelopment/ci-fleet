@@ -74,3 +74,11 @@ Keep changes small and reversible. Existing project CI must continue operating u
 - When reviewing, report missing or inaccurate documentation as a finding.
 - Before declaring the work complete, check updated examples, commands, links, and configuration names. Run applicable documentation checks.
 - When creating or updating a PR, state the documentation impact in its description. In all cases, include the assessment in the completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.
+
+## Configuration template follow-up
+
+- Assess every feature rollout for impact on the standalone `RandomDevelopment/ci-fleet-config-template`: schema, desired state, initializer, validation, capability evidence, examples, setup, and operator guidance. Include host features that need only adoption documentation.
+- When support or guidance is affected, automatically search existing template issues and create or reuse a matching open issue without waiting for a separate user request. Follow the [contributor procedure](docs/CONTRIBUTING.md#configuration-template-follow-up). Record the follow-up by engine merge or release, whichever happens first.
+- Identify the source engine issue/PR, full reviewed commit, gap, affected template files, acceptance checks, capability staging, migration requirements, and documentation impact. Mark unmerged features pending and update the follow-up with the full merged commit when available.
+- Link the template issue in the engine PR description and completion report, or explain why no template change is needed. If issue lookup, creation, or update fails, report the missing tracking as outstanding rollout work; do not claim template synchronization.
+- A tracked issue is not a completed template change. Engine availability, a published template release, adopter engine promotion, and live-host acceptance require separate evidence and authorization. This workflow grants no template merge, release, private configuration change, or host activation authority. Keep ordinary CI read-only; no new automation credentials are required.

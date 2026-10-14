@@ -106,6 +106,102 @@ interfaces. A breaking change to any entry increments the MAJOR version.
 Non-API commits (docs, tests, CI, chore, style) never bump the public version
 for API purposes; CI enforces PATCH-level change at minimum.
 
+## Configuration template follow-up
+
+For every feature rollout, assess the impact on the standalone
+[configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template).
+Check schema, desired state, initializer, validation, capability evidence,
+examples, setup, and operator guidance. A host feature can require template
+adoption guidance even when it adds no configuration field. The engine's
+embedded examples and the standalone template must each be assessed.
+
+When template support or guidance is affected, the responsible contributor or
+agent must automatically create or reuse a matching open template issue,
+without waiting for a separate user request. Record it by the engine feature's
+merge or release, whichever happens first. File it during PR preparation when
+the impact is known. Mark the feature pending until merged, then update the
+issue with the full merged engine commit when available. A pending issue should
+identify the full reviewed PR head and must not describe it as merged.
+
+Run the following from a development checkout with `gh` authenticated to the
+appropriate repositories. Listing and inspection are read-only; issue creation,
+editing, and comments change GitHub tracking. Replace uppercase placeholders
+and fictional commit values before publishing.
+
+1. Search open and closed issues using the feature's name, capability, and source
+   issue/PR. Repeat with related terms and inspect matching bodies before filing:
+
+   ```bash
+   gh issue list --repo RandomDevelopment/ci-fleet-config-template \
+     --state all --search 'FEATURE_KEYWORD' --limit 100
+   gh issue view TEMPLATE_ISSUE_NUMBER \
+     --repo RandomDevelopment/ci-fleet-config-template
+   ```
+
+   Reuse a matching open issue and preserve its existing requirements. A closed
+   match may already document completed support; verify that support before
+   deciding whether a new gap exists. An empty search alone does not establish
+   that there is no matching issue.
+
+2. Prepare the issue body in a temporary file outside the repository. Include
+   all of the following, using public links and fictional examples only:
+
+   ```bash
+   template_issue_body=$(mktemp)
+   cat > "$template_issue_body" <<'EOF'
+   Source: ENGINE_ISSUE_URL and ENGINE_PR_URL
+   Status: pending engine merge
+   Reviewed engine PR head: 1111111111111111111111111111111111111111
+   Merged engine commit: pending
+
+   Gap: describe the missing behavior or operator guidance.
+   Affected template files: list the actual paths to change.
+   Acceptance checks: name validation, tests, examples, and documentation checks.
+   Capability staging: identify required capabilities and evidence, or explain
+   why none are needed. Separate manager staging from runtime activation.
+   Migration: describe compatibility, adoption order, and rollback requirements,
+   or explain why no migration is needed. Do not activate hosts through this issue.
+   Documentation impact: list affected guides and examples, or explain why none.
+   EOF
+   ```
+
+3. If no matching open issue covers the gap, create one and retain its URL:
+
+   ```bash
+   gh issue create --repo RandomDevelopment/ci-fleet-config-template \
+     --title 'feat: support FEATURE_NAME' --body-file "$template_issue_body" &&
+   rm -- "$template_issue_body"
+   ```
+
+   For an existing open issue, edit its body to include missing information
+   while preserving prior scope and acceptance criteria. After the engine
+   merges, update the status and full merged commit with `gh issue edit
+   TEMPLATE_ISSUE_NUMBER --repo RandomDevelopment/ci-fleet-config-template
+   --body-file PATH_TO_COMPLETE_UPDATED_BODY`. Keep the reviewed PR head as
+   distinct evidence if the merge commit differs. Do not close the template
+   issue merely because the engine merged.
+
+If lookup, creation, or update fails, report the missing tracking as outstanding
+rollout work. Do not claim template synchronization without a created or reused
+issue, and do not claim implementation or adoption from issue tracking alone.
+
+### PR and completion checklist
+
+- [ ] Assess documentation impact and update affected engine documentation.
+- [ ] Link the matching template issue, or explain why no template change is needed.
+- [ ] Include the source revision, acceptance checks, staging/migration needs,
+  and documentation impact in the follow-up; update pending status after merge.
+- [ ] Report checks, unresolved tracking, and separate rollout evidence in the
+  completion report.
+
+Template compatibility checks validate one reviewed engine baseline. Passing
+them does not prove parity with the latest engine. Merged engine availability,
+a published template release, adopter engine promotion, and live-host acceptance
+are separate milestones. Creating a follow-up authorizes none of the latter
+actions. This contributor workflow needs no new GitHub Actions automation or
+credentials; ordinary CI keeps read-only permissions. See the
+[repository boundaries](PUBLIC-PRIVATE-CONFIGURATION.md#engine-and-template-rollouts).
+
 ## Release gate
 
 A version is released (tagged on `main`) only when:
