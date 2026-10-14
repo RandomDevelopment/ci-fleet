@@ -225,6 +225,7 @@ class Policy:
     def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
         self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
+        self.rollback_outcome = None
         self.artifact_store = artifact_store
         self.protected_images = (protected_images or set()) | {values["ARTIFACT_IMAGE"]}
         self.image = values["ARTIFACT_IMAGE"]
@@ -469,9 +470,17 @@ def handler(policy: Policy):
                 require(0 <= length <= MAX_REQUEST, "request exceeded the bound")
                 body = self.rfile.read(length)
                 if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
-                    require(policy.marker is not None and body == b"committed", "rollback marker is not authorized")
-                    mutation = True
-                    durable_file(policy.marker, b"committed\n")
+                    require(policy.operation == "rollback" and policy.marker is not None
+                            and body in (b"committed", b"failed"), "rollback outcome is not authorized")
+                    outcome = body.decode()
+                    require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
+                    if outcome == "committed":
+                        mutation = True
+                        durable_file(policy.marker, b"committed\n")
+                    else:
+                        require(not policy.marker.exists() and not policy.marker.is_symlink(),
+                                "failed rollback conflicts with its commit marker")
+                    policy.rollback_outcome = outcome
                     status, response = 204, b""
                 else:
                     path, body = policy.authorize(self.command, self.path, body)
@@ -657,6 +666,17 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
         trusted_directory(journal, uid, 0o700)
         value = decode(protected_file(journal / "status.json", uid))
         uncertain = journal / "docker-uncertain"
+        if value.get("operation") == "rollback":
+            outcome, marker = value.get("rollback_outcome"), value.get("rollback_marker")
+            require(outcome in ("committed", "failed") and isinstance(marker, str), "rollback outcome is unverified")
+            marker = Path(marker)
+            require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
+            if outcome == "committed":
+                require(protected_file(marker, uid) == b"committed\n"
+                        and stat.S_IMODE(marker.stat().st_mode) == 0o600, "rollback commit marker is unverified")
+            else:
+                require(value.get("exit_code") != 0 and not marker.exists() and not marker.is_symlink(),
+                        "failed rollback outcome is unverified")
         return (value.get("unit") == unit and value.get("status") == "completed"
                 and type(value.get("exit_code")) is int
                 and value.get("operation") in ("validate", "health", "cleanup", "deploy", "rollback")
@@ -740,12 +760,17 @@ def execute_adapter(operation: str) -> int:
     if os.environ.get("CI_FLEET_DEPLOYER_COMMIT_ALLOWED") == "1":
         environment["CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"] = str(commit)
     status = subprocess.run([str(adapter), operation], env=environment, stdin=subprocess.DEVNULL, close_fds=True).returncode
-    if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment and commit.exists():
-        require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
+    if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment:
+        if commit.exists() or commit.is_symlink():
+            require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
+            outcome = b"committed"
+        else:
+            require(status > 0, "rollback outcome is unverified")
+            outcome = b"failed"
         connection = UnixConnection(str(runtime / "docker.sock"), rootless=False)
         try:
-            connection.request("POST", "/ci-fleet/rollback-commit", b"committed")
-            require(connection.getresponse().status == 204, "rollback marker publication failed")
+            connection.request("POST", "/ci-fleet/rollback-commit", outcome)
+            require(connection.getresponse().status == 204, "rollback outcome publication failed")
         finally:
             connection.close()
     return status
@@ -837,8 +862,12 @@ def run_adapter(args) -> int:
                 thread.join(timeout=5)
     require(not policy.uncertain, "Docker mutation completion is unverified")
     require(unit_inactive(args.unit), "adapter termination is unverified")
+    require(args.operation != "rollback" or policy.rollback_outcome == "committed"
+            or policy.rollback_outcome == "failed" and result != 0, "rollback outcome is unverified")
     durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
-                                                   "status": "completed", "exit_code": result}).encode())
+                                                   "status": "completed", "exit_code": result,
+                                                   "rollback_outcome": policy.rollback_outcome,
+                                                   "rollback_marker": str(args.marker) if args.marker is not None else None}).encode())
     return result
 
 
