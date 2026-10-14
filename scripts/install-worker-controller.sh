@@ -2567,7 +2567,7 @@ staged_runtime_matches() {
 
 perform_check() {
   local count
-  reject_deployer_host
+  reject_isolated_host
   display_last_health
   if ! managed_image_ids_configured; then
     if $retained_installed_ref; then
@@ -2594,24 +2594,37 @@ perform_check() {
   note "CHECK_OK controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
 }
 
-reject_deployer_host() {
-  # A deployer host is a separate role; controller checks must reject it too.
+reject_isolated_host() {
+  local inventory_kind inventory_status inventory unit
+  # Isolated application hosts must not run controller checks or mutations.
+  if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-tester*" >/dev/null || [[ -e "$(root_path /opt/ci-fleet-tester)" || -L "$(root_path /opt/ci-fleet-tester)" || -e "$(root_path /var/lib/ci-fleet-tester)" || -L "$(root_path /var/lib/ci-fleet-tester)" || -e "$(root_path /etc/ci-fleet-tester)" || -L "$(root_path /etc/ci-fleet-tester)" ||
+       -e "$(root_path /opt/ci-fleet-tester/current)" || -L "$(root_path /opt/ci-fleet-tester/current)" ||
+       -e "$(root_path /opt/ci-fleet-tester/tester-runtime)" || -L "$(root_path /opt/ci-fleet-tester/tester-runtime)" ]]; then
+    die 'tester host state is present; controller and tester roles are separate hosts'
+  fi
   if compgen -G "$(root_path /etc/systemd/system)/ci-fleet-deployer*" >/dev/null || [[ -e "$(root_path /opt/ci-fleet-deployer)" || -L "$(root_path /opt/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer)" || -L "$(root_path /var/lib/ci-fleet-deployer)" || -e "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -L "$(root_path /var/lib/ci-fleet-deployer-container-credentials)" || -e "$(root_path /etc/ci-fleet-deployer)" || -L "$(root_path /etc/ci-fleet-deployer)" ]]; then
     die 'deployer host state is present; controller and deployer roles are separate hosts'
   fi
-  local output unit
-  output=$(systemctl list-unit-files --no-legend --no-pager) || die 'systemd unit-file inventory failed'
-  output+=$'\n'
-  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || die 'systemd loaded-unit inventory failed'
-  while read -r unit _; do
-    [[ $unit != ci-fleet-deployer* ]] || die 'deployer host state is present; controller and deployer roles are separate hosts'
-  done <<<"$output"
+  for inventory_kind in list-unit-files list-units; do
+    inventory_status=0
+    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+    # list-unit-files returns status 1 for an empty inventory without diagnostics.
+    if ((inventory_status != 0)); then
+      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || die 'isolated-role systemd unit inventory could not be inspected'
+    fi
+    while read -r unit _; do
+      case $unit in
+        ci-fleet-tester*) die 'tester host state is present' ;;
+        ci-fleet-deployer*) die 'deployer host state is present' ;;
+      esac
+    done <<<"$inventory"
+  done
 }
 
 perform_converge() {
   local count existing_status installed_engine candidate_runner_image candidate_controller_image current_target current_ref manager_target manager_ref manager_source policy_status policy_env policy_metadata pending_checkpoint pending_checkpoint_status policy_pid='' policy_wait_interrupted policy_term_pending=false
   local desired_controller_id=$controller_id build_before_drain=false
-  reject_deployer_host
+  reject_isolated_host
   if [[ "$mode" == upgrade && ! -f "$state_file" ]]; then
     die '--upgrade requires an existing managed installation; use --install or --adopt'
   fi
@@ -2777,7 +2790,7 @@ latest_checkpoint() {
 
 perform_rollback() {
   local checkpoint_env
-  reject_deployer_host
+  reject_isolated_host
   checkpoint_dir=$(latest_checkpoint)
   [[ -n "$checkpoint_dir" ]] || die 'no controller checkpoint is available'
   if [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
@@ -2885,14 +2898,14 @@ if [[ "$mode" == policy-action ]]; then
 fi
 case "$mode" in
   check|install|adopt|upgrade)
-    reject_deployer_host
+    reject_isolated_host
     validate_common_arguments
     resolve_config
     validate_candidate_config_commit
     config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'
     verify_configuration_approval
     if [[ -n "$bootstrap_lkg_checkpoint" ]]; then
-      reject_deployer_host
+      reject_isolated_host
       checkpoint_dir=$bootstrap_lkg_checkpoint
       candidate_env=$checkpoint_dir/ci-fleet.env
       docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'

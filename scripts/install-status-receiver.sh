@@ -53,23 +53,37 @@ role_lock="$root/run/ci-fleet-role-admission.lock"
 exec 8>"$role_lock"
 flock -n 8 || { echo "another ci-fleet role installation is already running" >&2; exit 1; }
 
-reject_deployer_role() {
-  local path
+reject_isolated_role() {
+  local path inventory_kind inventory_status inventory unit
+  if compgen -G "$root/etc/systemd/system/ci-fleet-tester*" >/dev/null; then
+    echo "tester host state is present" >&2; exit 1
+  fi
+  for path in "$root/opt/ci-fleet-tester" "$root/etc/ci-fleet-tester" "$root/var/lib/ci-fleet-tester" \
+    "$root/opt/ci-fleet-tester/current" "$root/opt/ci-fleet-tester/tester-runtime"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || { echo "tester host state is present" >&2; exit 1; }
+  done
   if compgen -G "$root/etc/systemd/system/ci-fleet-deployer*" >/dev/null; then
     echo "deployer host state is present" >&2; exit 1
   fi
   for path in "$root/opt/ci-fleet-deployer" "$root/etc/systemd/system/ci-fleet-deployer.service" "$root/etc/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer" "$root/var/lib/ci-fleet-deployer-container-credentials"; do
     [[ ! -e "$path" && ! -L "$path" ]] || { echo "deployer host state is present" >&2; exit 1; }
   done
-  local output unit
-  output=$(systemctl list-unit-files --no-legend --no-pager) || { echo 'systemd unit-file inventory failed' >&2; exit 1; }
-  output+=$'\n'
-  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || { echo 'systemd loaded-unit inventory failed' >&2; exit 1; }
-  while read -r unit _; do
-    [[ $unit != ci-fleet-deployer* ]] || { echo 'deployer host state is present' >&2; exit 1; }
-  done <<<"$output"
+  for inventory_kind in list-unit-files list-units; do
+    inventory_status=0
+    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+    # list-unit-files returns status 1 for an empty inventory without diagnostics.
+    if ((inventory_status != 0)); then
+      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || { echo 'isolated-role systemd unit inventory could not be inspected' >&2; exit 1; }
+    fi
+    while read -r unit _; do
+      case $unit in
+        ci-fleet-tester*) echo 'tester host state is present' >&2; exit 1 ;;
+        ci-fleet-deployer*) echo 'deployer host state is present' >&2; exit 1 ;;
+      esac
+    done <<<"$inventory"
+  done
 }
-reject_deployer_role
+reject_isolated_role
 
 current_ref() {
   local link release releases target

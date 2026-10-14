@@ -1,0 +1,12 @@
+[Unit]
+Description=Check ci-fleet test environments every five minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+Persistent=true
+RandomizedDelaySec=30s
+Unit=ci-fleet-tester-health.service
+
+[Install]
+WantedBy=timers.target

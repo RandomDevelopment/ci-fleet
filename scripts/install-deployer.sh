@@ -481,9 +481,9 @@ require_maintenance_host() {
 }
 
 reject_other_role_state() {
-  local unit path runner_unit output loaded_unit
+  local unit path runner_unit output loaded_unit inventory_status
   local -a controller_units=(ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer ci-fleet-capacity.service ci-fleet-capacity.timer actions.runner.service)
-  for path in "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
+  for path in "$(root_path /opt/ci-fleet-tester)" "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'tester host state is present'
   done
   for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
@@ -501,9 +501,14 @@ reject_other_role_state() {
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'ordinary CI controller or runner state is present'
   done
-  output=$(systemctl list-unit-files --no-legend --no-pager) || block 'systemd unit-file inventory failed'
+  inventory_status=0
+  output=$(SYSTEMD_COLORS=0 systemctl list-unit-files --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+  # list-unit-files returns status 1 for an empty inventory without diagnostics.
+  if ((inventory_status != 0)); then
+    [[ $inventory_status == 1 && -z $output ]] || block 'systemd unit-file inventory failed'
+  fi
   output+=$'\n'
-  output+=$(systemctl list-units --all --plain --no-legend --no-pager) || block 'systemd loaded-unit inventory failed'
+  output+=$(SYSTEMD_COLORS=0 systemctl list-units --all --full --plain --no-legend --no-pager 2>&1) || block 'systemd loaded-unit inventory failed'
   while read -r loaded_unit _; do
     case "$loaded_unit" in
       ci-fleet-tester*) block 'tester host state is present' ;;

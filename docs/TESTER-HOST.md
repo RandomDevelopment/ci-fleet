@@ -1,0 +1,130 @@
+# Test-environment host
+
+Status: repository implementation complete; prepared isolated-host acceptance remains required.
+
+This role runs persistent or expiring deployed application test environments. It is deliberately separate from ephemeral CI workers and production deployers. It cannot register ordinary CI runners or promote production releases.
+
+## Boundary
+
+A tester host accepts only:
+
+- a reviewed `ci-fleet` source commit for the tester service;
+- root-owned host configuration and environment declarations;
+- application images addressed by an immutable `sha256` digest;
+- environment secrets stored below that environment's fixed host-local secret directory.
+
+It rejects mutable images, public port binds, host bind mounts, external/unscoped Docker resources, custom volume drivers/options, privileged containers, added capabilities, host or shared namespaces, Docker API access, global container names, and credentials outside the environment secret boundary. Compose environment variables, env files, and configs are forbidden credential channels; use only fixed mode-`0600` Compose secrets. Every service must define positive CPU, memory, and PID limits, use a finite memory-plus-swap limit, remain OOM-killable, be read-only, set `cap_drop: [ALL]`, set `no-new-privileges=true`, and explicitly set `cgroup: private`. Health checks require the live cgroup namespace to remain private and revalidate the protected secret directory and files. The validated rendered Compose model is copied into protected runtime state before activation, so partial starts remain tracked and later cleanup does not depend on a mutable or deleted source definition. Test identity, networks, storage, routes, domains, data, and credentials must have no production authority. Host/network isolation is an external acceptance gate, not something this repository-only change can prove.
+
+Compose source validation requires Debian's `python3-yaml` package. It decodes YAML keys before Compose runs and rejects external file loaders, including `include`, `extends`, `label_file`, and `env_file`. Escaped, tagged, anchored, and aliased keys follow the same rule. Duplicate and complex mapping keys are unsupported.
+
+Compose may render memory and swap byte limits as JSON numbers or decimal strings. The runtime stores both as numeric byte limits before activation and live inspection; malformed or unlimited values still fail policy validation. Repeated convergence compares decoded models so a change in JSON formatting alone does not require a reset.
+
+Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. A running service without a Docker healthcheck is allowed; an unhealthy Docker healthcheck still fails validation. Health checks also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
+
+Compose provider executables, init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Override every image-declared `VOLUME` target with a declared project mount; otherwise post-activation inspection rejects its anonymous mount and retains the environment for scoped removal. Networks must keep IPv4 enabled; IPv6 networks and allocations are unsupported. Service-level `tmpfs` is unsupported; declare tmpfs mounts through `volumes` with `type: tmpfs`.
+
+Runtime commands use a fresh empty Docker client configuration, so inherited client proxies, credential helpers, and registry credentials are unavailable. Images must be pullable without those credentials or already available to the daemon.
+
+Removal keeps the protected state until the project has no remaining containers, networks, or volumes. Installation and checks verify systemd's effective fragment and drop-in paths before accepting the maintenance units. Admission and health also reject foreign roles reported by systemd's loaded-unit and unit-file inventories. Higher-priority files or symlinks named `ci-fleet-tester-lock.conf` in `/etc/tmpfiles.d`, `/run/tmpfiles.d`, or `/usr/local/lib/tmpfiles.d` are forbidden. Uninstall stops both maintenance services after disabling their timers and before removing the runtime.
+
+The host's root administrators and Docker daemon are trusted. Health checks verify the isolation settings listed above; they do not attest process arguments, environment variables, or healthcheck definitions after an administrator recreates a container outside this runtime. Review image defaults and use the protected definitions for application changes. Restrict Docker administration to authorized operators.
+
+## Prepare host-local configuration
+
+The installer supports only `/etc/ci-fleet-tester/tester.env`. Create it and all protected directories as root; never commit them:
+
+```bash
+sudo install -d -m 0700 \
+  /etc/ci-fleet-tester \
+  /etc/ci-fleet-tester/environments \
+  /etc/ci-fleet-tester/definitions \
+  /etc/ci-fleet-tester/secrets
+sudo install -m 0600 /dev/null /etc/ci-fleet-tester/tester.env
+```
+
+Example non-secret settings:
+
+```text
+CI_FLEET_TESTER_DEFAULT_TTL_SECONDS=86400
+CI_FLEET_TESTER_MAX_ENVIRONMENTS=20
+CI_FLEET_TESTER_DISK_WARN_PERCENT=80
+CI_FLEET_TESTER_NETWORK_PROBE_HOST=tester-probe.invalid
+CI_FLEET_TESTER_HTTPS_PROBE_URL=https://tester-probe.invalid/health
+CI_FLEET_TESTER_ISOLATION_ACK=test-only-no-production-authority
+```
+
+Set both probe values to a test-only host whose DNS resolution and HTTPS HEAD response exercise the intended local proxy path without carrying credentials. The acknowledgement is required but is not proof: an authorized operator must still verify that the prepared host has no production identity or network authority.
+
+For environment `example-preview`, create root-owned mode-`0600` `/etc/ci-fleet-tester/environments/example-preview.env`:
+
+```text
+CI_FLEET_TESTER_PROJECT=example-project
+CI_FLEET_TESTER_OWNER=example-owner
+CI_FLEET_TESTER_COMPOSE_FILE=/etc/ci-fleet-tester/definitions/example-preview.yaml
+CI_FLEET_TESTER_EXPIRES_AT=REVIEWED_FUTURE_UNIX_TIME
+CI_FLEET_TESTER_ROUTE_SERVICE=web
+CI_FLEET_TESTER_ROUTE_PORT=18080
+```
+
+The Compose file is root-owned mode `0644` and may contain no credential value. Each image must use `registry/path@sha256:REVIEWED_64_HEX_DIGEST`, and each service must set positive `cpus`, `mem_limit`, and `pids_limit` values and `cgroup: private`. Exactly one route is published, on loopback only, at the declared port. Compose-generated network and volume names must remain below `ci-fleet-test-<environment>_...`; explicit external names are rejected.
+
+If credentials are required, create `/etc/ci-fleet-tester/secrets/example-preview` as root-owned mode `0700`, put only test-scope regular files there as root-owned mode `0600`, and reference them through Compose `secrets.file`. Symlinks, external secrets, production credentials, environment-variable secret transport, and files outside that exact directory are unsupported.
+
+## Fresh install or repair
+
+Use a clean reviewed checkout at the exact commit:
+
+```bash
+ref=$(git rev-parse 'HEAD^{commit}')
+sudo ./scripts/install-tester.sh --install \
+  --config /etc/ci-fleet-tester/tester.env \
+  --ref "$ref"
+```
+
+The command fails before mutation unless it sees Debian 12 or newer with `python3-yaml`, root, the local default Docker context/socket/root, Compose v2, required generic tools, protected paths, and Docker storage below 80%, and explicit Docker default address pools. Configure those pools during host preparation; an empty custom-pool setting fails before application activation. It stages an immutable source release, validates it, switches the `current` symlink, installs health and expiration timers, and verifies both configuration and active environments. Repeating the same command is idempotent.
+
+## Environment lifecycle
+
+The runtime command is the one interface for create/update, inspect, reset, and removal:
+
+```bash
+sudo /opt/ci-fleet-tester/tester-runtime --converge --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --inspect --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --reset --environment example-preview
+sudo /opt/ci-fleet-tester/tester-runtime --remove --environment example-preview
+```
+
+`--converge` validates the full resolved Compose model before `up --wait`. `--reset` removes only that exact Compose project and its volumes, then recreates it from the approved definition and digest. `--remove` uses the same scoped `compose down --volumes`; no global Docker prune is used. State reports only environment/project/owner, loopback route, expiry, source revision, timestamps, and health—not Compose environment values or secret content.
+
+`ci-fleet-tester-health.timer` checks every five minutes. `ci-fleet-tester-cleanup.timer` checks expiration every fifteen minutes. Expired environments are removed through the same scoped path. Cleanup passes have a five-minute limit. Successful removals delete their protected state; an interrupted pass resumes the remaining expired environments on the next timer run. Disposable environment data is intentionally removed on reset/expiry. Reviewed definitions and fixture sources belong outside runtime state and need ordinary configuration backups; credentials and disposable volumes are never backed up by this service.
+
+## Upgrade, validation, and rollback
+
+```bash
+ref=$(git rev-parse 'HEAD^{commit}')
+sudo ./scripts/install-tester.sh --upgrade --config /etc/ci-fleet-tester/tester.env --ref "$ref"
+sudo ./scripts/install-tester.sh --check --config /etc/ci-fleet-tester/tester.env
+sudo ./scripts/install-tester.sh --rollback --config /etc/ci-fleet-tester/tester.env
+```
+
+Upgrade validates the candidate before activation and restores the complete previous release if post-switch checks fail. A successful switch records only the previous complete source revision as last known good. Rollback changes the tester service release; it does not rewrite an application's immutable image digest or reset environment data.
+
+## Removal
+
+Remove every environment explicitly, verify no state remains, then uninstall:
+
+```bash
+sudo ./scripts/install-tester.sh --uninstall --config /etc/ci-fleet-tester/tester.env
+```
+
+Scoped environment removal and expiration cleanup remain available during foreign-role drift, missing or malformed global configuration, and missing definitions or secrets directories. They verify protected state and operate only on the recorded Compose projects.
+
+Uninstall fails while any managed environment exists. It removes only tester units and immutable service releases. Host configuration, definitions, and secrets remain for explicit operator disposition; the script never guesses which credential may be deleted.
+
+## External acceptance gate
+
+Before this PR can merge, an authorized operator must use a prepared isolated Debian Docker host with test-only identity/network/storage/domain boundaries and provide evidence for: fresh install, unchanged second install, immutable application converge, health, scoped reset, expiration cleanup, upgrade, failed-upgrade restoration, rollback, and removal. No production credentials, database, network authority, ordinary CI runner, or live production system may participate.
+
+Every service must declare the local Docker logging driver with `max-size: "10m"`, `max-file: "3"`, and `compress: "true"`. Add this policy before upgrading existing definitions. The daemon default runtime must be `runc`; preflight and live inspection reject another runtime. Health verifies the effective logging limits and runtime.
+
+Installer activation records the incumbent in a root-owned, durable journal before switching the active release. After interruption, retry the installer or run `--rollback` to restore that incumbent, including the first upgrade before a last-known-good file exists. Read-only checks and environment reset refuse an outstanding activation. HTTPS probes disable curl's default configuration before processing other options.

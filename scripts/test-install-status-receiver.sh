@@ -9,20 +9,34 @@ test -f "$unit"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+fake_bin=$tmp/bin
+mkdir "$fake_bin"
+cat >"$fake_bin/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  case "$1" in
+    list-unit-files)
+      printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"
+      [[ ${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_UNIT_FILES_EXIT"; }
+      ;;
+    list-units)
+      printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"
+      [[ ${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_LOADED_UNITS_EXIT"; }
+      ;;
+  esac
+  if [[ -n ${FAKE_ISOLATED_INVENTORY_ERROR:-} ]]; then printf 'inventory inspection failed\n' >&2; exit "$FAKE_ISOLATED_INVENTORY_ERROR"; fi
+  if [[ ${FAKE_ISOLATED_INVENTORY_EMPTY:-0} == 1 ]]; then [[ $1 != list-unit-files ]] || exit 1; exit 0; fi
+  printf 'ci-fleet-health.service static\nci-fleet-status-receiver.service static\n'
+  if [[ -n ${FAKE_ISOLATED_UNIT:-} && ${FAKE_ISOLATED_UNIT_KIND:-$1} == "$1" ]]; then printf '%s static\n' "$FAKE_ISOLATED_UNIT"; fi
+  exit 0
+fi
+printf 'unexpected systemctl operation: %s\n' "$*" >&2
+exit 42
+EOF_SYSTEMCTL
+chmod 0755 "$fake_bin/systemctl"
+export PATH="$fake_bin:$PATH"
 source_tree="$tmp/source"
 root="$tmp/root"
-fake_bin="$tmp/bin"
-mkdir -p "$fake_bin"
-cat >"$fake_bin/systemctl" <<'EOF'
-#!/usr/bin/env bash
-case "${1:-}" in
-  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
-  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
-  *) exit 1 ;;
-esac
-EOF
-chmod +x "$fake_bin/systemctl"
-export PATH="$fake_bin:$PATH"
 mkdir -p "$source_tree/scripts" "$source_tree/deploy/status-receiver"
 mkdir -p "$root/run/lock"
 chmod 1777 "$root/run/lock"
@@ -77,6 +91,45 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   echo "partial deployer unit set was accepted by the status receiver" >&2; exit 1
 fi
 rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+for marker in /opt/ci-fleet-tester /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
+  /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
+  ln -s /missing "$root$marker"
+  if run --install --ref "$first" >/dev/null 2>&1; then
+    echo "tester role marker was accepted by the status receiver" >&2; exit 1
+  fi
+  rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
+done
+for marker in /opt/ci-fleet-tester /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
+  : >"$root$marker"
+  for mode in install check; do
+    if run "--$mode" --ref "$first" >"$tmp/tester-role.out" 2>&1; then
+      echo "tester runtime was accepted by the status receiver" >&2; exit 1
+    fi
+    grep -Fq 'tester host state is present' "$tmp/tester-role.out"
+  done
+  rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
+done
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    for mode in install check; do
+      ref_args=(); [[ $mode != install ]] || ref_args=(--ref "$first")
+      if FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind run "--$mode" "${ref_args[@]}" >"$tmp/inventory-rejection.out" 2>&1; then
+        echo 'status receiver accepted an effective isolated-role unit' >&2; exit 1
+      fi
+      grep -Fq "$role host state is present" "$tmp/inventory-rejection.out"
+    done
+  done
+done
+for inventory_error in 1 7; do
+  if FAKE_ISOLATED_INVENTORY_ERROR=$inventory_error run --install --ref "$first" >"$tmp/inventory-rejection.out" 2>&1; then
+    echo 'status receiver accepted an inventory inspection failure' >&2; exit 1
+  fi
+  grep -Fq 'isolated-role systemd unit inventory could not be inspected' "$tmp/inventory-rejection.out"
+done
 mkdir -p "$root/var/lib/ci-fleet-deployer-container-credentials"
 if run --check >/dev/null 2>&1; then
   echo "retained deployer credentials were accepted by the status receiver" >&2; exit 1
@@ -104,7 +157,7 @@ done
 for inventory in FAKE_SYSTEMD_UNIT_FILES_EXIT FAKE_SYSTEMD_LOADED_UNITS_EXIT; do
   export "$inventory=1"
   output=$(run --install --ref "$first" 2>&1) && { echo 'failed systemd inventory was accepted by receiver' >&2; exit 1; }
-  grep -Fq 'inventory failed' <<<"$output"
+  grep -Fq 'isolated-role systemd unit inventory could not be inspected' <<<"$output"
   unset "$inventory"
 done
 test ! -L "$root/opt/ci-fleet-status/current"
@@ -124,7 +177,7 @@ if run --install --ref "$first" >/dev/null 2>&1; then
   exit 1
 fi
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
-test "$(run --install --ref "$first")" = NO_CHANGE
+test "$(FAKE_ISOLATED_INVENTORY_EMPTY=1 run --install --ref "$first")" = NO_CHANGE
 assert_systemd_mode
 test "$(readlink "$root/opt/ci-fleet-status/current")" = "releases/$first"
 test -f "$root/opt/ci-fleet-status/current/status_receiver.py"

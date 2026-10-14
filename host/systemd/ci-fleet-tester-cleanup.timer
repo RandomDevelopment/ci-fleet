@@ -1,0 +1,12 @@
+[Unit]
+Description=Expire abandoned ci-fleet test environments
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=15m
+Persistent=true
+RandomizedDelaySec=1m
+Unit=ci-fleet-tester-cleanup.service
+
+[Install]
+WantedBy=timers.target

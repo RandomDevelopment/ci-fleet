@@ -368,10 +368,23 @@ EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
-case "${1:-}" in
-  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
-  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
-esac
+if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  case "$1" in
+    list-unit-files)
+      printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"
+      [[ ${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_UNIT_FILES_EXIT"; }
+      ;;
+    list-units)
+      printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"
+      [[ ${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_LOADED_UNITS_EXIT"; }
+      ;;
+  esac
+  if [[ -n ${FAKE_ISOLATED_INVENTORY_ERROR:-} ]]; then printf 'inventory inspection failed\n' >&2; exit "$FAKE_ISOLATED_INVENTORY_ERROR"; fi
+  if [[ ${FAKE_ISOLATED_INVENTORY_EMPTY:-0} == 1 ]]; then [[ $1 != list-unit-files ]] || exit 1; exit 0; fi
+  printf 'ci-fleet-health.service static\nci-fleet-status-receiver.service static\n'
+  if [[ -n ${FAKE_ISOLATED_UNIT:-} && ${FAKE_ISOLATED_UNIT_KIND:-$1} == "$1" ]]; then printf '%s static\n' "$FAKE_ISOLATED_UNIT"; fi
+  exit 0
+fi
 if [[ -n "${FAKE_FAIL_CAPACITY_STOP_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_STOP_ONCE" && "$*" == 'stop ci-fleet-capacity.service' ]]; then
   rm -f "$FAKE_FAIL_CAPACITY_STOP_ONCE"
   exit 96
@@ -897,6 +910,20 @@ for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-de
   rm "$root$marker"
 done
 
+for marker in /opt/ci-fleet-tester /var/lib/ci-fleet-tester /etc/ci-fleet-tester /etc/systemd/system/ci-fleet-tester-cleanup.timer \
+  /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
+  ln -s /missing "$root$marker"
+  expect_failure 'tester host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
+done
+
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    expect_failure "$role host state is present" env FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  done
+done
 for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
   for role_unit in ci-fleet-deployer.service ci-fleet-deployer-health.timer ci-fleet-deployer-adapter-transient.service; do
     export "$inventory=$role_unit loaded"
@@ -904,8 +931,8 @@ for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
   done
   unset "$inventory"
 done
-FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
-FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'isolated-role systemd unit inventory could not be inspected' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'isolated-role systemd unit inventory could not be inspected' "$installer" --install "${base_args[@]}" --ref "$ref_one"
 [[ ! -L "$root/opt/ci-fleet/current" ]] || fail 'mixed-role inventory admission published a controller'
 
 # A rejected review must stop every direct candidate path before installation.
@@ -974,8 +1001,16 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
 
-# Read-only checks must reject deployer-role drift on a converged controller.
-for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
+expect_success env FAKE_ISOLATED_INVENTORY_EMPTY=1 "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
+for inventory_kind in list-unit-files list-units; do
+  for role in tester deployer; do
+    expect_failure "$role host state is present" env FAKE_ISOLATED_UNIT=ci-fleet-$role-health.service FAKE_ISOLATED_UNIT_KIND=$inventory_kind "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  done
+done
+for inventory_error in 1 7; do
+  expect_failure 'isolated-role systemd unit inventory could not be inspected' env FAKE_ISOLATED_INVENTORY_ERROR=$inventory_error "$installer" --check "${base_args[@]}" --ref "$ref_one"
+done
+for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
   mkdir -p "$root$marker"
   expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
   rmdir "$root$marker"
@@ -983,9 +1018,30 @@ for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-de
   expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
   rm "$root$marker"
 done
-printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
-expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
-rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+# Read-only checks must reject isolated-role drift on a converged controller.
+for role in deployer tester; do
+  for marker in /var/lib/ci-fleet-$role /etc/ci-fleet-$role; do
+    mkdir -p "$root$marker"
+    expect_failure "$role host state is present" "$installer" --check "${base_args[@]}" --ref "$ref_one"
+    rmdir "$root$marker"
+    ln -s /missing "$root$marker"
+    expect_failure "$role host state is present" "$installer" --check "${base_args[@]}" --ref "$ref_one"
+    rm "$root$marker"
+  done
+  printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-$role-cleanup.timer"
+  expect_failure "$role host state is present" "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root/etc/systemd/system/ci-fleet-$role-cleanup.timer"
+done
+for marker in /opt/ci-fleet-tester /opt/ci-fleet-tester/current /opt/ci-fleet-tester/tester-runtime; do
+  mkdir -p "$(dirname "$root$marker")"
+  : >"$root$marker"
+  expect_failure 'tester host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+  ln -s /missing "$root$marker"
+  expect_failure 'tester host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+  [[ $marker != /opt/ci-fleet-tester/* ]] || rmdir "$(dirname "$root$marker")"
+done
 for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
   export "$inventory=ci-fleet-deployer.service loaded"
   for mode in --check --upgrade --rollback; do expect_failure 'deployer host state is present' "$installer" "$mode" "${base_args[@]}" --ref "$ref_one"; done
@@ -1415,8 +1471,8 @@ printf 'retired history\n' >"$pre_adapter_root/var/lib/ci-fleet/capacity/history
     expect_failure 'deployer host state is present' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
     unset "$inventory"
   done
-  FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
-  FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'isolated-role systemd unit inventory could not be inspected' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'isolated-role systemd unit inventory could not be inspected' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
   [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$bootstrap_current_before" && $(sha256sum "$pre_adapter_root/etc/ci-fleet/ci-fleet.env") == "$bootstrap_env_before" ]] || fail 'blocked bootstrap restore changed active runtime state'
   [[ -f "$pre_adapter_root/var/lib/ci-fleet/capacity/history" ]] || fail 'blocked bootstrap restore retired active capacity history'
   expect_success "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >"$tmp/bootstrap-lkg-restore.out"
