@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -564,7 +565,8 @@ acquire_lock
                     thread = threading.Thread(target=server.serve_forever)
                     thread.start()
                     try:
-                        with patch.object(adapter, 'durable_file', side_effect=failing_publication):
+                        with patch.object(adapter, 'durable_file', side_effect=failing_publication), \
+                                patch.object(adapter, 'executor_peer', return_value=True):
                             connection = adapter.UnixConnection(str(root / 'broker.sock'), rootless=False)
                             connection.request('POST', '/ci-fleet/rollback-commit', b'committed')
                             response = connection.getresponse()
@@ -610,6 +612,8 @@ acquire_lock
                             response.read()
                             connection.close()
                         return subprocess.CompletedProcess(command, code)
+                    if '--property=MainPID' in command:
+                        return subprocess.CompletedProcess(command, 0, str(os.getpid()))
                     return subprocess.CompletedProcess(command, 0, 'LoadState=loaded\nActiveState=inactive\n')
                 with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}), \
                         patch.object(adapter, 'Backend', return_value=backend), \
@@ -627,7 +631,7 @@ acquire_lock
                         self.assertEqual(status['rollback_outcome'], outcome)
 
     def test_executor_confirms_rollback_outcome(self):
-        for code, committed in [(42, False), (0, True), (1, True), (0, False), (-9, False)]:
+        for code, committed in [(42, False), (0, True), (1, True), (0, False), (-9, False), (-9, True)]:
             with self.subTest(code=code, committed=committed), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 credentials, runtime = root / 'credentials', root / 'runtime'
@@ -646,8 +650,10 @@ acquire_lock
                                              'CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL': '/approved/application',
                                              'CI_FLEET_DEPLOYER_COMMIT_ALLOWED': '1'}), \
                         patch.object(adapter.subprocess, 'run', side_effect=application), \
+                        patch.object(adapter.ctypes, 'CDLL') as library, \
                         patch.object(adapter, 'UnixConnection', return_value=connection):
-                    if not committed and code <= 0:
+                    library.return_value.prctl.return_value = 0
+                    if committed and code != 0 or not committed and code <= 0:
                         with self.assertRaises(ValueError):
                             adapter.execute_adapter('rollback')
                         connection.request.assert_not_called()
@@ -655,6 +661,76 @@ acquire_lock
                         self.assertEqual(adapter.execute_adapter('rollback'), code)
                         connection.request.assert_called_once_with('POST', '/ci-fleet/rollback-commit',
                                                                   b'committed' if committed else b'failed')
+
+    def test_adapter_cannot_publish_executor_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'commit'
+            policy = adapter.Policy(self.values, self.backend, marker=marker, operation='rollback',
+                                    unit='ci-fleet-deployer-adapter-1-2.service')
+            path = str(root / 'broker.sock')
+            child = "import sys,http.client,socket; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); " \
+                    "c=http.client.HTTPConnection('localhost'); c.sock=s; " \
+                    "c.request('POST','/ci-fleet/rollback-commit',b'committed'); r=c.getresponse(); " \
+                    "print(r.status); r.read(); c.close()"
+            with adapter.ProxyServer(path, adapter.handler(policy)) as server, \
+                    patch.object(adapter.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, str(os.getpid()))):
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                try:
+                    process = subprocess.Popen([sys.executable, '-c', child, path], stdout=subprocess.PIPE, text=True)
+                    output, _ = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertEqual(output.strip(), '403')
+                    self.assertFalse(marker.exists())
+                    self.assertIsNone(policy.rollback_outcome)
+                    connection = adapter.UnixConnection(path, rootless=False)
+                    connection.request('POST', '/ci-fleet/rollback-commit', b'failed')
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 204)
+                    response.read()
+                    connection.close()
+                    self.assertEqual(policy.rollback_outcome, 'failed')
+                finally:
+                    server.shutdown()
+                    thread.join()
+
+    def test_executor_peer_requires_current_main_pid(self):
+        connection = MagicMock()
+        connection.getsockopt.return_value = struct.pack('3i', os.getpid(), os.getuid(), os.getgid())
+        for code, value, expected in [(0, str(os.getpid()), True), (0, '0', False),
+                                      (0, str(os.getpid() + 1), False), (1, str(os.getpid()), False),
+                                      (0, '', False), (0, 'unavailable', False)]:
+            with self.subTest(code=code, value=value), \
+                    patch.object(adapter.subprocess, 'run', return_value=subprocess.CompletedProcess([], code, value)):
+                self.assertEqual(adapter.executor_peer(connection, 'ci-fleet-deployer-adapter-1-2.service'), expected)
+        with patch.object(adapter.subprocess, 'run', side_effect=subprocess.TimeoutExpired('systemctl', 10)):
+            self.assertFalse(adapter.executor_peer(connection, 'ci-fleet-deployer-adapter-1-2.service'))
+
+    def test_executor_disables_dumping_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials, runtime = root / 'credentials', root / 'runtime'
+            credentials.mkdir()
+            runtime.mkdir()
+            adapter.durable_file(credentials / 'policy', b'CREDENTIAL_REF=fixture\n')
+            adapter.durable_file(credentials / 'adapter', b'#!/bin/sh\nexit 0\n')
+            code = '''import ctypes,subprocess
+from unittest.mock import patch
+import deployer_adapter as a
+def application(command, **kwargs):
+    assert ctypes.CDLL(None).prctl(3,0,0,0,0) == 0
+    assert kwargs['close_fds'] is True
+    return subprocess.CompletedProcess(command,0)
+with patch.object(a.subprocess,'run',side_effect=application):
+    assert a.execute_adapter('health') == 0
+'''
+            result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                                    env=dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials),
+                                             RUNTIME_DIRECTORY=str(runtime), CI_FLEET_DEPLOYER_COMMIT_ALLOWED='0',
+                                             CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL='/approved/application',
+                                             PYTHONPATH=str(Path(__file__).parent)))
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_guard_requires_completed_protected_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

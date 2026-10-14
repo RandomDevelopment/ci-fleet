@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import grp
 import hashlib
@@ -27,6 +28,7 @@ import time
 import urllib.parse
 
 MAX_REQUEST = 1024 * 1024
+PR_SET_DUMPABLE = 4
 MAX_RESPONSE = 32 * 1024 * 1024
 CONTAINER_LIMITS = {"Memory": 2 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 256}
 LABEL = "io.randomdevelopment.ci-fleet."
@@ -222,10 +224,11 @@ class Backend:
 
 
 class Policy:
-    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None):
+    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None, unit: str | None = None):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
         self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
         self.rollback_outcome = None
+        self.unit = unit
         self.artifact_store = artifact_store
         self.protected_images = (protected_images or set()) | {values["ARTIFACT_IMAGE"]}
         self.image = values["ARTIFACT_IMAGE"]
@@ -457,6 +460,18 @@ class ProxyServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             self.slots.release()
 
 
+def executor_peer(connection: socket.socket, unit: str | None) -> bool:
+    if unit is None or not UNIT.fullmatch(unit):
+        return False
+    try:
+        pid, _uid, _gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        result = subprocess.run(["systemctl", "show", unit, "--property=MainPID", "--value"],
+                                capture_output=True, text=True, timeout=10)
+        return result.returncode == 0 and pid > 0 and result.stdout.strip() == str(pid)
+    except (OSError, ValueError, struct.error, subprocess.SubprocessError):
+        return False
+
+
 def handler(policy: Policy):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -470,6 +485,7 @@ def handler(policy: Policy):
                 require(0 <= length <= MAX_REQUEST, "request exceeded the bound")
                 body = self.rfile.read(length)
                 if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
+                    require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
                     require(policy.operation == "rollback" and policy.marker is not None
                             and body in (b"committed", b"failed"), "rollback outcome is not authorized")
                     outcome = body.decode()
@@ -739,6 +755,8 @@ def materialize_credential(store: Path, values: dict, body: bytes, owner: int, d
 
 
 def execute_adapter(operation: str) -> int:
+    # The adapter must not borrow its parent's PID-authenticated socket through /proc or ptrace.
+    require(ctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0, "executor process protection failed")
     credentials = Path(os.environ["CREDENTIALS_DIRECTORY"])
     runtime = Path(os.environ["RUNTIME_DIRECTORY"])
     values = parse_policy((credentials / "policy").read_bytes())
@@ -762,6 +780,7 @@ def execute_adapter(operation: str) -> int:
     status = subprocess.run([str(adapter), operation], env=environment, stdin=subprocess.DEVNULL, close_fds=True).returncode
     if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment:
         if commit.exists() or commit.is_symlink():
+            require(status == 0, "rollback commitment requires successful adapter completion")
             require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
             outcome = b"committed"
         else:
@@ -847,7 +866,7 @@ def run_adapter(args) -> int:
                 retained = parse_policy(protected_file(source.resolve(), uid))
                 protected_images.add(retained["ARTIFACT_IMAGE"])
         policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain",
-                        args.store / "artifact-images.json", protected_images)
+                        args.store / "artifact-images.json", protected_images, args.unit)
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
