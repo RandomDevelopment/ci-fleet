@@ -22,9 +22,10 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Convert an existing GitHub Actions workflow | [Migrating existing CI](MIGRATING-EXISTING-CI.md) |
 | Make a project compliant | [Project CI standard](PROJECT-STANDARD.md) and [compliance checklist](COMPLIANCE-CHECKLIST.md) |
 | Split tests across parallel workers | [Project CI standard](PROJECT-STANDARD.md) and the [parallel workflow example](../examples/workflows/parallel-ci.yml.example) |
-| Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) |
+| Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) and [reproducible managed images](MANAGED-IMAGES.md) |
 | Install or operate a dedicated deployment host | [Deployer host installation](DEPLOYER-HOST.md) |
 | Monitor hosts and detect missed reports | [Fleet health monitoring](HEALTH-MONITORING.md), [local capacity telemetry](CAPACITY-TELEMETRY.md), and [authenticated status reporting](STATUS-REPORTING.md) |
+| Review the planned endpoint web UI and its access/data contracts | [Endpoint observation UI design](ENDPOINT-UI-DESIGN.md), design only; no supported UI yet |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
 | Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
 | Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
@@ -52,6 +53,8 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 - [System architecture](ARCHITECTURE.md)
 - [Runner controller design](CONTROLLER-DESIGN.md)
 - [Accepted design decisions](DESIGN-DECISIONS.md)
+- [Endpoint observation UI design and acceptance](ENDPOINT-UI-DESIGN.md)
+- [Worker snapshot foundation and evidence limits](ENDPOINT-SNAPSHOTS.md)
 - [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md)
 - [Secrets model](SECRETS.md)
 - [Security policy](../SECURITY.md)

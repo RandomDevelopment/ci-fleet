@@ -259,25 +259,16 @@ secure_directory() {
   [[ ! -L "$path" && -d "$path" && $(stat -c '%u:%a' "$path") == "$expected_uid:700" ]] || die "$description has unsafe owner, mode, or type"
 }
 reject_other_role_state() {
-  local unit runner_unit path inventory_kind inventory inventory_status
-  for inventory_kind in list-unit-files list-units; do
-    inventory_status=0
-    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
-    if ((inventory_status != 0)); then
-      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || die 'tester systemd inventory could not be inspected'
-    fi
-    while read -r unit _; do
-      case $unit in ci-fleet-tester*) die 'tester host state is present' ;; esac
-    done <<<"$inventory"
-  done
+  local unit runner_unit path output loaded_unit inventory_status
+  local -a controller_units=(ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer ci-fleet-capacity.service ci-fleet-capacity.timer actions.runner.service)
   for path in "$(root_path /opt/ci-fleet-tester)" "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'tester host state is present'
   done
   for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'status receiver state is present'
   done
-  for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
+  for unit in "${controller_units[@]}"; do
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || die 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -288,6 +279,24 @@ reject_other_role_state() {
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || die 'ordinary CI controller or runner state is present'
   done
+  inventory_status=0
+  output=$(SYSTEMD_COLORS=0 systemctl list-unit-files --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+  # list-unit-files returns status 1 for an empty inventory without diagnostics.
+  if ((inventory_status != 0)); then
+    [[ $inventory_status == 1 && -z $output ]] || die 'systemd unit-file inventory failed'
+  fi
+  output+=$'\n'
+  output+=$(SYSTEMD_COLORS=0 systemctl list-units --all --full --plain --no-legend --no-pager 2>&1) || die 'systemd loaded-unit inventory failed'
+  while read -r loaded_unit _; do
+    case "$loaded_unit" in
+      ci-fleet-tester*) die 'tester host state is present' ;;
+      ci-fleet-status-receiver.service) die 'status receiver state is present' ;;
+      actions.runner.service|actions.runner.*.service) die 'ordinary GitHub Actions runner service is present' ;;
+    esac
+    for unit in "${controller_units[@]}"; do
+      [[ "$loaded_unit" != "$unit" ]] || die 'ordinary CI controller or runner state is present'
+    done
+  done <<<"$output"
 }
 reject_mixed_role() {
   local line output expected="deployer|${cfg[DEPLOYER_IDENTITY]}|${cfg[ENVIRONMENT]}|${cfg[TARGET_ID]}"
@@ -331,16 +340,19 @@ parse_file() {
 }
 
 validate_credential() {
-  [[ $testing == 1 || ${cfg[CREDENTIAL_PROVIDER]} == file ]] || die 'contained adapters require a materialized file credential'
+  local -n credential_policy=${1:-cfg}
+  local key
+  for key in CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE ENVIRONMENT; do [[ -v "credential_policy[$key]" ]] || die "credential policy is missing $key"; done
+  [[ $testing == 1 || ${credential_policy[CREDENTIAL_PROVIDER]} == file ]] || die 'contained adapters require a materialized file credential'
   secure_directory "$deployer_etc" 'deployer configuration directory'
   secure_directory "$credential_dir" 'credential directory'
-  [[ ${cfg[CREDENTIAL_SCOPE]} == "${cfg[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
-  case ${cfg[CREDENTIAL_PROVIDER]} in
+  [[ ${credential_policy[CREDENTIAL_SCOPE]} == "${credential_policy[ENVIRONMENT]}" ]] || die 'credential scope does not match the deployment environment'
+  case ${credential_policy[CREDENTIAL_PROVIDER]} in
     file)
-      inside "${cfg[CREDENTIAL_REF]}" "$credential_dir" || die 'credential reference is outside the protected credential directory'
-      secure_file "${cfg[CREDENTIAL_REF]}" 'credential file'
+      inside "${credential_policy[CREDENTIAL_REF]}" "$credential_dir" || die 'credential reference is outside the protected credential directory'
+      secure_file "${credential_policy[CREDENTIAL_REF]}" 'credential file'
       ;;
-    external) [[ ${cfg[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
+    external) [[ ${credential_policy[CREDENTIAL_REF]} =~ ^external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}$ ]] || die 'external credential reference is malformed' ;;
     *) die 'unsupported credential provider' ;;
   esac
 }
@@ -423,6 +435,10 @@ exec 7<"${cfg[ADAPTER_PATH]}"
 [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
 adapter_path=/proc/$$/fd/7
 validate_credential
+if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
+  [[ $operation == deploy ]] || die 'pending approval consumption requires mutating installer recovery'
+  python3 "$script_dir/deployer_adapter.py" consumption --store "$log_root" || die 'approval consumption recovery failed'
+fi
 
 run_application_adapter() {
   local action=$1 unit guard=$state_root/.adapter-recovery/pending-unit status=0 seconds=2400 recovery=$state_root/.adapter-recovery
@@ -619,6 +635,7 @@ PY
       inside "${lkg_policy[ADAPTER_PATH]}" "$deployer_etc/adapters" || die 'last-known-good adapter is outside the protected adapter directory'
       [[ ! -L "${lkg_policy[ADAPTER_PATH]}" && -f "${lkg_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${lkg_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'last-known-good adapter is missing or unsafe'
       [[ $(sha256sum "${lkg_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${lkg_policy[ADAPTER_SHA256]}" ]] || die 'last-known-good adapter digest does not match its retained policy'
+      validate_credential lkg_policy
     fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'
@@ -671,14 +688,16 @@ PY
     snapshot_state_backup=$(base64 -w0 "$snapshot/state.json")
     reject_mixed_role
     validate_credential
+    consumption_record=$(printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=consumed phase=pre-adapter status=none\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
+      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
+      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}")
+    printf '%s\n' "$consumption_record" | python3 "$script_dir/deployer_adapter.py" consumption --store "$log_root" --prepare || die 'deployment consumption record is not durable'
     audit_pending=1
     audit_phase=pre-adapter
     adapter_status=
     trap deploy_exit EXIT
     trap 'exit 2' INT TERM
-    install -m 0600 /dev/null "$consumed_marker" || die 'deployment request consumption marker failed'
-    sync -f "$consumed_marker" 2>/dev/null || sync "$consumed_marker" 2>/dev/null || die 'deployment request consumption marker is not durable'
-    sync -f "$consumed_root" 2>/dev/null || sync "$consumed_root" 2>/dev/null || die 'deployment request consumption is not durable'
     umask 077
     temporary=$(mktemp "$state_root/.active.XXXXXX")
     active_temporary=$temporary
@@ -690,14 +709,6 @@ PY
     active_temporary=
     sync -f "$active" 2>/dev/null || sync "$active" 2>/dev/null || die 'active operation marker is not durable'
     sync -f "$state_root" 2>/dev/null || die 'active operation marker publication is not durable'
-    # Record the durably consumed approval before the adapter runs, so even a
-    # SIGKILL or power loss mid-adapter leaves the attempt's identities.
-    printf 'time=%s environment=%s target=%s source=%s artifact=%s approval=%s approver=%s policy=%s checkpoint=%s authorized_by=%s gate=%s result=consumed phase=pre-adapter status=none\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${req[ENVIRONMENT]}" "${req[TARGET_ID]}" \
-      "${req[SOURCE_COMMIT]}" "${req[ARTIFACT_IMAGE]#*@}" "${req[APPROVAL_ID]}" "${req[APPROVAL_IDENTITY]}" "${req[POLICY_IDENTITY]}" \
-      "${checkpoint[CHECKPOINT_ID]:-none}" "${production[AUTHORIZED_BY]:-none}" "${production[GATE_ID]:-none}" \
-      >&8 || die 'deployment consumption audit record failed'
-    sync -f "$audit_log" 2>/dev/null || sync "$audit_log" 2>/dev/null || die 'deployment consumption audit record is not durable'
     audit_prefix_sha=$(sha256sum "$audit_log" | cut -d' ' -f1)
     audit_prefix_backup=$(base64 -w0 "$audit_log")
     # Preserve the retained rollback pair in unexported process memory. A

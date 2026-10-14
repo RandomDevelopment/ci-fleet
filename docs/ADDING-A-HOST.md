@@ -2,6 +2,8 @@
 
 Use this runbook to add a virtual machine, physical computer, remote-site machine, or VPS to an existing ci-fleet installation.
 
+Controller installation, checks and rollback, including bootstrap last-known-good restoration, reject deployer host state and deployer units in systemd unit-file or loaded-unit inventories, including vendor, runtime and transient units. An unavailable inventory blocks admission. The guard runs before configuration authentication or adoption can materialize host credentials. Use a separate host for deployment.
+
 ## Outcome
 
 A host is a generic, location-independent Docker appliance. Configure it once. It must not contain repository names, project runtimes, project secrets, or project-specific test logic.
@@ -102,7 +104,7 @@ sudo ./scripts/install-worker-controller.sh \
   --controller example-ci-01
 ```
 
-Use `--adopt` when converting an existing manual controller. The installer validates the complete configuration, renders host-local runtime state, installs the pinned engine, and validates the candidate Compose configuration. It may build images with a distinct inert runner tag before creating a checkpoint and draining. A build that would retag the runner image used by the active controller waits until after checkpoint and drain. Managed preflight still runs after drain, before activation. A failed pre-transaction build may leave candidate image or layer artifacts, but it does not change installed state or stop the active controller.
+Use `--adopt` when converting an existing manual controller. The installer validates the complete configuration, renders host-local runtime state, installs the pinned engine, and validates candidate Compose. It captures the incumbent checkpoint, then builds and verifies any required images under temporary tags. After post-build host checks pass, the installer drains successfully, then publishes canonical tags within checkpoint recovery coverage. Managed workload-quiescence preflight runs after drain, before activation. Failed preparation may leave scoped candidate artifacts, but it preserves installed state, incumbent tags and the running controller.
 
 The configuration repository credential, when required, must be read-only and host-side. Credentials are never accepted in command arguments.
 

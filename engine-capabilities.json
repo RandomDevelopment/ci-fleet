@@ -2,6 +2,7 @@
   "schema_version": 1,
   "capabilities": {
     "capacity_telemetry": true,
+    "reproducible_managed_images": true,
     "docker_storage_retention": true,
     "docker_network_policy_config": true,
     "docker_network_policy_adapter": true,

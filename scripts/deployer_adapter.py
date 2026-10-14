@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import grp
 import hashlib
@@ -11,6 +12,7 @@ import http.client
 import http.server
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shutil
@@ -26,6 +28,7 @@ import time
 import urllib.parse
 
 MAX_REQUEST = 1024 * 1024
+PR_SET_DUMPABLE = 4
 MAX_RESPONSE = 32 * 1024 * 1024
 CONTAINER_LIMITS = {"Memory": 2 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 256}
 LABEL = "io.randomdevelopment.ci-fleet."
@@ -78,6 +81,35 @@ def parse_policy(body: bytes) -> dict[str, str]:
     return result
 
 
+def reject_acl(path: Path | int) -> None:
+    for name in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            os.getxattr(path, name, **({} if isinstance(path, int) else {"follow_symlinks": False}))
+        except OSError as error:
+            require(error.errno in (errno.ENODATA, errno.ENOTSUP), "access ACL cannot be inspected")
+        else:
+            raise ValueError("extended access or default ACL is forbidden")
+
+
+def check_backend_socket(path: str, uid: int, gid: int) -> None:
+    metadata = os.lstat(path)
+    require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == uid and metadata.st_gid == gid
+            and stat.S_IMODE(metadata.st_mode) in (0o600, 0o660), "rootless Docker socket permissions are unsafe")
+    for entry in (Path(path), *Path(path).parents):
+        reject_acl(entry)
+        if entry != Path(path):
+            parent = os.lstat(entry)
+            require(stat.S_ISDIR(parent.st_mode) and parent.st_uid in (0, uid)
+                    and not parent.st_mode & 0o022, "backend socket ancestry is unsafe")
+    try:
+        group = grp.getgrgid(gid)
+        require(all(pwd.getpwnam(name).pw_uid in (0, uid) for name in group.gr_mem)
+                and all(user.pw_uid in (0, uid) for user in pwd.getpwall() if user.pw_gid == gid),
+                "Docker daemon group has unrelated members")
+    except KeyError:
+        raise ValueError("Docker daemon group membership is unavailable") from None
+
+
 class UnixConnection(http.client.HTTPConnection):
     def __init__(self, path: str, *, rootless: bool = True, timeout: float = 120):
         super().__init__("localhost", timeout=timeout)
@@ -90,9 +122,7 @@ class UnixConnection(http.client.HTTPConnection):
         pid, uid, gid = struct.unpack("3i", self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if self.rootless:
             require(uid > 0 and gid > 0, "Docker daemon must run without host-root authority")
-            metadata = os.lstat(self.path)
-            require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == uid,
-                    "rootless Docker socket owner does not match its peer")
+            check_backend_socket(self.path, uid, gid)
             process = {}
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
                 key, _, value = line.partition(":")
@@ -194,9 +224,11 @@ class Backend:
 
 
 class Policy:
-    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None):
+    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None, unit: str | None = None):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
         self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
+        self.rollback_outcome = None
+        self.unit = unit
         self.artifact_store = artifact_store
         self.protected_images = (protected_images or set()) | {values["ARTIFACT_IMAGE"]}
         self.image = values["ARTIFACT_IMAGE"]
@@ -428,6 +460,18 @@ class ProxyServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             self.slots.release()
 
 
+def executor_peer(connection: socket.socket, unit: str | None) -> bool:
+    if unit is None or not UNIT.fullmatch(unit):
+        return False
+    try:
+        pid, _uid, _gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        result = subprocess.run(["systemctl", "show", unit, "--property=MainPID", "--value"],
+                                capture_output=True, text=True, timeout=10)
+        return result.returncode == 0 and pid > 0 and result.stdout.strip() == str(pid)
+    except (OSError, ValueError, struct.error, subprocess.SubprocessError):
+        return False
+
+
 def handler(policy: Policy):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -441,14 +485,22 @@ def handler(policy: Policy):
                 require(0 <= length <= MAX_REQUEST, "request exceeded the bound")
                 body = self.rfile.read(length)
                 if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
-                    require(policy.marker is not None and body == b"committed", "rollback marker is not authorized")
-                    durable_file(policy.marker, b"committed\n")
+                    require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
+                    require(policy.operation == "rollback" and policy.marker is not None
+                            and body in (b"committed", b"failed"), "rollback outcome is not authorized")
+                    outcome = body.decode()
+                    require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
+                    if outcome == "committed":
+                        mutation = True
+                        durable_file(policy.marker, b"committed\n")
+                    else:
+                        require(not policy.marker.exists() and not policy.marker.is_symlink(),
+                                "failed rollback conflicts with its commit marker")
+                    policy.rollback_outcome = outcome
                     status, response = 204, b""
                 else:
                     path, body = policy.authorize(self.command, self.path, body)
                     headers = {"Content-Type": "application/json"}
-                    if path.startswith("/images/create") and self.headers.get("X-Registry-Auth"):
-                        headers["X-Registry-Auth"] = self.headers["X-Registry-Auth"]
                     mutation = self.command not in ("GET", "HEAD")
                     status, response = policy.backend.request(self.command, path, body, headers)
                     if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
@@ -513,6 +565,80 @@ def durable_file(path: Path, body: bytes) -> None:
             os.unlink(temporary)
 
 
+def consume_approval(store: Path, line: str | None = None, uid: int = 0) -> None:
+    pending = store / "pending-consumption.json"
+    if line is None and not pending.exists() and not pending.is_symlink():
+        return
+    ledger = store / "consumed-requests"
+    for directory in (store, ledger):
+        metadata = directory.lstat()
+        require(directory.resolve() == directory and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == uid and stat.S_IMODE(metadata.st_mode) == 0o700,
+                "consumption directory is unsafe")
+    audit = store / "audit.log"
+    descriptor = os.open(audit, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == uid and metadata.st_nlink == 1
+                and stat.S_IMODE(metadata.st_mode) == 0o600, "consumption audit is unsafe")
+        if line is not None:
+            require(not pending.exists() and not pending.is_symlink(), "pending consumption requires recovery")
+            record = {"schema_version": 1, "audit_offset": metadata.st_size, "line": line}
+        else:
+            record = decode(protected_file(pending, uid))
+        require(set(record) == {"schema_version", "audit_offset", "line"}
+                and type(record["schema_version"]) is int and record["schema_version"] == 1
+                and type(record["audit_offset"]) is int and 0 <= record["audit_offset"] <= metadata.st_size,
+                "pending consumption record is invalid")
+        entry = record["line"]
+        require(isinstance(entry, str) and entry.isascii() and len(entry) <= 4096
+                and entry.endswith("\n") and entry.count("\n") == 1, "pending consumption audit is invalid")
+        parts = [item.partition("=") for item in entry[:-1].split(" ")]
+        values = {key: value for key, separator, value in parts if separator}
+        required = {"time", "environment", "target", "source", "artifact", "approval", "approver", "policy",
+                    "checkpoint", "authorized_by", "gate", "result", "phase", "status"}
+        require(len(parts) == len(values) and set(values) == required
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", values["time"])
+                and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", values["environment"])
+                and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", values["target"])
+                and re.fullmatch(r"[0-9a-f]{40}", values["source"])
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", values["artifact"])
+                and all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", values[key])
+                        for key in ("approval", "approver", "policy", "checkpoint", "authorized_by", "gate"))
+                and (values["result"], values["phase"], values["status"]) == ("consumed", "pre-adapter", "none"),
+                "pending consumption identities are invalid")
+        marker = ledger / ("approval-" + hashlib.sha256(values["approval"].encode()).hexdigest())
+        if line is not None:
+            require(not marker.exists() and not marker.is_symlink(), "approval is already consumed")
+            durable_file(pending, json.dumps(record, sort_keys=True).encode())
+        elif marker.exists() or marker.is_symlink():
+            require(protected_file(marker, uid) == b"", "consumption marker is unsafe")
+        durable_file(marker, b"")
+        body = entry.encode()
+        offset = record["audit_offset"]
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        retained = os.read(descriptor, len(body))
+        if retained != body:
+            require(len(retained) < len(body) and body.startswith(retained)
+                    and metadata.st_size == offset + len(retained), "pending consumption audit conflicts")
+            os.ftruncate(descriptor, offset)
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            written = 0
+            while written < len(body):
+                count = os.write(descriptor, body[written:])
+                require(count > 0, "consumption audit write failed")
+                written += count
+        os.fsync(descriptor)
+        pending.unlink()
+        directory = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.close(descriptor)
+
+
 def trusted_directory(path: Path, uid: int, mode: int) -> None:
     require(path.is_absolute() and path.resolve() == path and path.is_dir()
             and path.stat().st_uid == uid and stat.S_IMODE(path.stat().st_mode) == mode,
@@ -556,10 +682,21 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
         trusted_directory(journal, uid, 0o700)
         value = decode(protected_file(journal / "status.json", uid))
         uncertain = journal / "docker-uncertain"
+        if value.get("operation") == "rollback":
+            outcome, marker = value.get("rollback_outcome"), value.get("rollback_marker")
+            require(outcome in ("committed", "failed") and isinstance(marker, str), "rollback outcome is unverified")
+            marker = Path(marker)
+            require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
+            if outcome == "committed":
+                require(protected_file(marker, uid) == b"committed\n"
+                        and stat.S_IMODE(marker.stat().st_mode) == 0o600, "rollback commit marker is unverified")
+            else:
+                require(value.get("exit_code") != 0 and not marker.exists() and not marker.is_symlink(),
+                        "failed rollback outcome is unverified")
         return (value.get("unit") == unit and value.get("status") == "completed"
                 and type(value.get("exit_code")) is int
                 and value.get("operation") in ("validate", "health", "cleanup", "deploy", "rollback")
-                and (value["exit_code"] == 0 or value["operation"] in ("validate", "health"))
+                and (value["exit_code"] == 0 or value["operation"] in ("validate", "health", "rollback"))
                 and not uncertain.exists() and not uncertain.is_symlink())
     except (ValueError, KeyError, OSError):
         return False
@@ -576,6 +713,7 @@ def retire_journal(store: Path, unit: str, uid: int = 0) -> None:
 
 
 def materialize_credential(store: Path, values: dict, body: bytes, owner: int, daemon_uid: int, daemon_gid: int) -> Path:
+    reject_acl(store)
     identity = json.dumps([values[key] for key in ("DEPLOYER_IDENTITY", "ENVIRONMENT", "TARGET_ID")]
                           + [daemon_uid, daemon_gid], separators=(",", ":")).encode()
     key = hashlib.sha256(identity + b"\0" + body).hexdigest()
@@ -587,18 +725,21 @@ def materialize_credential(store: Path, values: dict, body: bytes, owner: int, d
     metadata = directory.lstat()
     require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == daemon_gid
             and stat.S_IMODE(metadata.st_mode) == 0o710, "credential directory is unsafe")
+    reject_acl(directory)
     secret = directory / "application"
     try:
         descriptor = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
         descriptor = os.open(secret, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
+            reject_acl(stream.fileno())
             metadata = os.fstat(stream.fileno())
             require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner and metadata.st_gid == daemon_gid
                     and metadata.st_nlink == 1 and stat.S_IMODE(metadata.st_mode) == 0o440
                     and stream.read(MAX_REQUEST + 1) == body, "retained credential changed")
     else:
         with os.fdopen(descriptor, "wb") as stream:
+            reject_acl(stream.fileno())
             os.fchown(stream.fileno(), owner, daemon_gid)
             os.fchmod(stream.fileno(), 0o440)
             stream.write(body)
@@ -614,6 +755,8 @@ def materialize_credential(store: Path, values: dict, body: bytes, owner: int, d
 
 
 def execute_adapter(operation: str) -> int:
+    # The adapter must not borrow its parent's PID-authenticated socket through /proc or ptrace.
+    require(ctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0, "executor process protection failed")
     credentials = Path(os.environ["CREDENTIALS_DIRECTORY"])
     runtime = Path(os.environ["RUNTIME_DIRECTORY"])
     values = parse_policy((credentials / "policy").read_bytes())
@@ -635,12 +778,18 @@ def execute_adapter(operation: str) -> int:
     if os.environ.get("CI_FLEET_DEPLOYER_COMMIT_ALLOWED") == "1":
         environment["CI_FLEET_DEPLOYER_ROLLBACK_COMMIT"] = str(commit)
     status = subprocess.run([str(adapter), operation], env=environment, stdin=subprocess.DEVNULL, close_fds=True).returncode
-    if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment and commit.exists():
-        require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
+    if "CI_FLEET_DEPLOYER_ROLLBACK_COMMIT" in environment:
+        if commit.exists() or commit.is_symlink():
+            require(status == 0, "rollback commitment requires successful adapter completion")
+            require(stat.S_ISREG(commit.lstat().st_mode) and not commit.is_symlink(), "unsafe rollback marker")
+            outcome = b"committed"
+        else:
+            require(status > 0, "rollback outcome is unverified")
+            outcome = b"failed"
         connection = UnixConnection(str(runtime / "docker.sock"), rootless=False)
         try:
-            connection.request("POST", "/ci-fleet/rollback-commit", b"committed")
-            require(connection.getresponse().status == 204, "rollback marker publication failed")
+            connection.request("POST", "/ci-fleet/rollback-commit", outcome)
+            require(connection.getresponse().status == 204, "rollback outcome publication failed")
         finally:
             connection.close()
     return status
@@ -717,7 +866,7 @@ def run_adapter(args) -> int:
                 retained = parse_policy(protected_file(source.resolve(), uid))
                 protected_images.add(retained["ARTIFACT_IMAGE"])
         policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain",
-                        args.store / "artifact-images.json", protected_images)
+                        args.store / "artifact-images.json", protected_images, args.unit)
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
@@ -732,8 +881,12 @@ def run_adapter(args) -> int:
                 thread.join(timeout=5)
     require(not policy.uncertain, "Docker mutation completion is unverified")
     require(unit_inactive(args.unit), "adapter termination is unverified")
+    require(args.operation != "rollback" or policy.rollback_outcome == "committed"
+            or policy.rollback_outcome == "failed" and result != 0, "rollback outcome is unverified")
     durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
-                                                   "status": "completed", "exit_code": result}).encode())
+                                                   "status": "completed", "exit_code": result,
+                                                   "rollback_outcome": policy.rollback_outcome,
+                                                   "rollback_marker": str(args.marker) if args.marker is not None else None}).encode())
     return result
 
 
@@ -744,6 +897,9 @@ def main() -> int:
     execute.add_argument("operation")
     check = sub.add_parser("check")
     check.add_argument("socket")
+    consumption = sub.add_parser("consumption")
+    consumption.add_argument("--store", type=Path, required=True)
+    consumption.add_argument("--prepare", action="store_true")
     retire = sub.add_parser("journal-retire")
     retire.add_argument("--store", type=Path, required=True)
     retire.add_argument("unit")
@@ -763,6 +919,11 @@ def main() -> int:
     run.add_argument("operation")
     args = parser.parse_args()
     try:
+        if args.command == "consumption":
+            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+            line = sys.stdin.buffer.read(4097).decode() if args.prepare else None
+            consume_approval(args.store, line, uid)
+            return 0
         if args.command == "journal-retire":
             uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
             retire_journal(args.store, args.unit, uid)

@@ -14,6 +14,16 @@ mkdir "$fake_bin"
 cat >"$fake_bin/systemctl" <<'EOF_SYSTEMCTL'
 #!/usr/bin/env bash
 if [[ $1 == list-unit-files || $1 == list-units ]]; then
+  case "$1" in
+    list-unit-files)
+      printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"
+      [[ ${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_UNIT_FILES_EXIT"; }
+      ;;
+    list-units)
+      printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"
+      [[ ${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_LOADED_UNITS_EXIT"; }
+      ;;
+  esac
   if [[ -n ${FAKE_ISOLATED_INVENTORY_ERROR:-} ]]; then printf 'inventory inspection failed\n' >&2; exit "$FAKE_ISOLATED_INVENTORY_ERROR"; fi
   if [[ ${FAKE_ISOLATED_INVENTORY_EMPTY:-0} == 1 ]]; then [[ $1 != list-unit-files ]] || exit 1; exit 0; fi
   printf 'ci-fleet-health.service static\nci-fleet-status-receiver.service static\n'
@@ -133,6 +143,24 @@ for form in directory symlink; do
   fi
   if [[ $form == directory ]]; then rmdir "$root/opt/ci-fleet-deployer"; else rm "$root/opt/ci-fleet-deployer"; fi
 done
+
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-deployer.service ci-fleet-deployer-health.timer ci-fleet-deployer-adapter-transient.service; do
+    export "$inventory=$role_unit loaded"
+    for mode in --install --check --upgrade --rollback; do
+      output=$(run "$mode" --ref "$first" 2>&1) && { echo 'effective deployer unit was accepted by receiver' >&2; exit 1; }
+      grep -Fq 'deployer host state is present' <<<"$output"
+    done
+  done
+  unset "$inventory"
+done
+for inventory in FAKE_SYSTEMD_UNIT_FILES_EXIT FAKE_SYSTEMD_LOADED_UNITS_EXIT; do
+  export "$inventory=1"
+  output=$(run --install --ref "$first" 2>&1) && { echo 'failed systemd inventory was accepted by receiver' >&2; exit 1; }
+  grep -Fq 'isolated-role systemd unit inventory could not be inspected' <<<"$output"
+  unset "$inventory"
+done
+test ! -L "$root/opt/ci-fleet-status/current"
 
 role_lock="$root/run/ci-fleet-role-admission.lock"
 exec 8>"$role_lock"

@@ -1,5 +1,7 @@
 # Accepted design decisions
 
+The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) has an explicit [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) under [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It is proposed while PR #126 is open and accepted after that reviewed PR merges into `main`. It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. Implementation remains planned; it adds no runtime, schema field, or host activation and preserves the decisions below.
+
 ## Managed controller desired state after the isolated proof
 
 **Status:** accepted on 2026-07-22 for isolated CI fleet hosts.
@@ -108,7 +110,7 @@ Reconsider only after tester and deployer roles are implemented, independently p
 
 ## Deployer adapter authority and recovery
 
-Status: stronger containment selected for issue #22 and PR #69. Implementation and adversarial prepared-host proof are required before merge. No host activation is authorized.
+Status: stronger containment selected for issue #22 and PR #69. On 2026-10-13 the owner replaced the prepared-host end-to-end merge gate with local repository verification, required current-head CI and review. No host activation is authorized.
 
 Application adapters must run with a transient DynamicUser identity, no capabilities, a read-only host filesystem, private devices and network, and no direct Docker or systemd socket. A root-owned broker exposes a constrained Docker API for exactly the reviewed environment, target and deployer identity. The backend is a dedicated rootless daemon with a non-root peer UID, no privileged groups, and no host-root Docker authority. The daemon user must have no sudo, privileged socket ACL, or other administrative grant. Prepared-host acceptance must verify those host-local facts.
 
@@ -116,7 +118,11 @@ The API permits approved immutable artifact pulls, labelled internal networks an
 
 Core retains activation state, replay protection, audits and installer journals under root-owned directories unavailable to either adapter or rootless daemon. Before dispatch, it fsyncs recovery copies and an outstanding-operation guard. A crash retains the guard and blocks subsequent operations. An operator must establish service termination and application/core alignment from protected recovery state or restore the authorized checkpoint before retiring it. Core does not infer application success after a crash. Rollback commit publication goes through a dedicated broker endpoint into the root-owned installer journal.
 
-Residual risks include adapter errors within the approved application target, rootless daemon or kernel vulnerabilities, host administrator bypass, and credential misuse within its approved scope. Keep both containment findings open and merge blocked until exact-head adversarial host tests cover direct writes, daemon-mediated mounts, forced termination, restart and checkpoint restoration. Repository tests do not establish that acceptance. Production remains separately gated.
+The core implementation may merge after local deployer lifecycle, replay-ledger, adversarial adapter and unit tests pass, required CI passes on the exact head, and actionable code findings are verified and resolved. Prepared-host end-to-end testing is not a prerequisite for that merge. This decision applies only to the deployer implementation; it does not remove ordinary-CI migration or production approval requirements.
+
+Residual risks include unverified host-local permissions and administrative grants, adapter errors within the approved application target, rootless daemon or kernel vulnerabilities, host administrator bypass, and credential misuse within its approved scope. Local tests model the containment and recovery contracts; they do not prove those host properties. Track application adapters, compatibility decisions and operational rollout separately in [MMPriceFeed migration](https://github.com/RandomDevelopment/mmrss/issues/126), [TF2 Recommendation Engine migration](https://github.com/RandomDevelopment/TF2-Recommendation-Engine/issues/373), and [configuration-template adoption](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/26). Resolve the containment code threads only after repository verification, while explicitly recording that real-host proof remains unclaimed.
+
+Operators still authorize host preparation, credentials, checkpoints and activation separately. Each adopter must reconcile its actual host identity, runtime/state/network requirements and recovery procedure before cutover. The outstanding operational uncertainty is retired through that adopter's authorized rollout evidence, not by merging the core or template implementation. Production remains separately gated.
 
 ## Authenticate the bootstrap callback through SSH
 
@@ -152,3 +158,13 @@ leaked private key. Live setup and periodic owner checks must retain private
 distribution. Issue #27 includes live acceptance of this requirement. Replace
 this manual check when GitHub exposes a supported, authoritative visibility
 field that bootstrap can verify without browser credentials.
+
+## Image-enforcement bootstrap
+
+A controller without reviewed managed image IDs may temporarily select a new manager while keeping its existing runtime and rendered environment. This exception is limited to fieldless engine-ref-only staging and introduction of image policy with identical controller settings. Runtime capability evidence must remain identical to the previous integrated evidence during these commits. The next ordinary revision must attest the newly activated runtime.
+
+The incumbent manager must not activate the new runtime before reviewed IDs exist. The candidate Compose file requires those IDs, so an incumbent reconciliation attempt fails before drain or build. An operator must separately authorize the bootstrap, pause reconciliation before publishing staging, and invoke the reviewed candidate installer. Staging reconciles mandatory maintenance timers without replacing the runtime. Reverting staging may repoint the manager to the retained runtime revision.
+
+Legacy checkpoint image IDs do not make their mutable build inputs reproducible. Retain these image objects or verified offline exports during bootstrap. Missing legacy objects block rollback and require separately authorized import or reinstall; reconstruction is limited to releases declaring reproducible managed-image support.
+
+The remaining risks are incorrect operator sequencing and inaccurate host evidence. Issue #36 retains the operational bootstrap, repeated-build and private image-ID proof. Remove this transitional exception after participating hosts have adopted image enforcement and the retained pre-enforcement rollback paths are retired through reviewed policy.

@@ -1,0 +1,175 @@
+# Endpoint observation UI
+
+Implementation status: planned. This ADR addresses [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It adds no supported command, schema field, service, listener, or engine capability.
+
+The [worker snapshot foundation](ENDPOINT-SNAPSHOTS.md) records the current #118 interfaces and their remaining evidence coverage. The UI and its host activation remain planned.
+
+## Acceptance record
+
+[PR #126](https://github.com/RandomDevelopment/ci-fleet/pull/126) is the durable acceptance record. The design is proposed while that PR is open and becomes accepted when the reviewed PR merges into `main`. Closing it without a merge leaves the design unaccepted. Its merge commit identifies the accepted design revision. Later changes require their own reviewed PRs. Design acceptance does not authorize installation, credentials, or network access.
+
+## Decision and scope
+
+Provide one optional, persistent observation UI per endpoint. Deliver the ordinary-CI worker first. It shows active work, health, enrollment evidence, approved configuration, and reasons the endpoint cannot accept more work. Keep worker, tester, deployer, and status-receiver roles separate.
+
+Use an unprivileged host service independent of Docker. A privileged producer exports approved observations into a dedicated directory; the observer reads only those exports. The browser-facing service receives no Docker socket, GitHub App key, controller token, deployment credential, shell, or arbitrary host-file access.
+
+```mermaid
+flowchart LR
+    S["Existing controller events and host evidence"] --> P["Privileged allowlist export"]
+    P --> O["Unprivileged observer on loopback port 80"]
+    G["HTTPS gateway authenticates operators"] -->|"Separate backend read credential"| O
+    B["Operator browser"] -->|HTTPS| G
+```
+
+Observation does not edit configuration, enroll a host, approve a change, cancel a job, drain, reset, deploy, repair, prune, or retire recovery guards. Those actions need separate reviewed contracts. Git-authored worker desired state, protected role policy, and existing approval gates remain authoritative.
+
+The UI must remain available during controller restart, scale-to-zero, runner destruction, and Docker daemon failure. It may display stale or unavailable observations during those failures. A stopped host, failed host filesystem, or lost network requires the independent fleet monitor. Observer failure must not alter runner handling, cleanup, reconciliation, or existing resource-admission gates.
+
+## Access on port 80
+
+The initial observer binds only `127.0.0.1:80`. Systemd socket activation supplies the listener to the unprivileged service; the service needs no root identity or bind capability. Never replace an existing listener to claim the port.
+
+An independently provisioned HTTPS gateway authenticates operators and authorizes access to all operational metadata on that endpoint. Reuse the installation's approved identity provider. The gateway forwards to the loopback observer on the same host. A gateway elsewhere requires an already approved encrypted transport terminating on that host; this design adds no remote bind or tunnel service.
+
+The observer requires its own backend read bearer on every request, including assets and API reads. The gateway strips client-supplied authentication and identity headers, then injects that bearer. The observer compares the bearer in constant time and ignores `Remote-User`, `X-Forwarded-User`, and other identity claims. Reaching loopback or forging headers never grants access. This also prevents another unprivileged host user from bypassing gateway authentication.
+
+Generate 32 random bytes and encode them as unpadded base64url for a separate 43-character backend bearer through authorized secret provisioning. Store those exact ASCII bytes without a trailing newline in root-owned mode-`0600` provisioning files. The privileged installer alone reads `/etc/ci-fleet/observer/access.json`; systemd `LoadCredential` delivers the approved bearer to the observer's isolated service credential directory. The observer does not traverse private `/etc/ci-fleet` directories. Provision the gateway's copy independently through its approved credential mechanism. Never reuse GitHub, reporting, deployment, or receiver-read credentials. Rotation revokes the old value at the observer before activating the new gateway copy; a temporary observation outage is acceptable. Credential contents, authorization headers, and request query strings must not enter logs.
+
+The browser receives no backend bearer, signing material, or receiver token. Its session remains at the HTTPS gateway. Do not put credentials in URLs, assets, browser storage, or unprotected HTTP. Limit initial access to fleet operators already authorized to see every repository and job on that endpoint; per-project sharing is separate work.
+
+The worker installer does not enable SSH, create firewall rules, install a gateway, or expose remote ingress. [Bootstrap's authenticated temporary callback](DESIGN-DECISIONS.md#authenticate-the-bootstrap-callback-through-ssh) remains separate. A management-interface bind, direct browser login on HTTP port 80, or different tunnel authorization model requires a new accepted decision and proof of bypass resistance.
+
+## Local exports and read API
+
+Use a separate non-symlink tree at `/var/lib/ci-fleet-observer`, with that directory and its `exports` child owned by root and the dedicated observer group with mode `0750`. Validate ancestor ownership and traversal without widening the existing mode-`0700` `/var/lib/ci-fleet` state tree. Published snapshot/job exports are regular files owned by root and that same observer group with mode `0640`. The producer creates a temporary file exclusively at mode `0600`, assigns its observer-group GID before changing its mode to `0640`, then atomically renames it. Directory permissions alone do not provide group inheritance. Readers validate the final file's expected UID/GID, type, mode, size, schema, and source identity before accepting data. Existing installation, bootstrap, capacity, and recovery stores remain private.
+
+The export directory contains only `endpoint.json`, `jobs.json`, and their fixed `.tmp` counterparts. A single-writer lock serializes publication. Endpoint files are capped at 64 KiB each, job exports at 4 MiB each, and the entire export directory at 16 MiB including abandoned temporary files. Recovery validates the exact temporary name, root ownership, regular-file type, one hard link, and absence of symlinks. It may discard mode-`0600` staging files with the initial root GID or observer GID, and mode-`0640` staging files with the observer GID. Never read or publish those interrupted contents; remove and recreate them under the lock. Other ownership/mode states stop publication. The observer reads only final names. No unique temporary filename, unbounded spool, or unrelated file may accumulate there.
+
+The 60-second job-export limit applies to payload-write attempts, including failures, retries, and restart recovery. Reserve the allowance in protected durable state before writing the temporary payload. Measure elapsed time with a monotonic clock; missing or invalid allowance state, a new boot, or uncertain clock provenance requires a full 60-second cooldown before a new reservation. Failed reservation persistence stops observation writes while CI continues. Filesystem and private-store write overhead require measurement during #119 acceptance.
+
+The producer reads only the existing role's approved evidence. It must not follow web-supplied paths, execute commands supplied by a request, or copy arbitrary logs. Its controller event input uses a protected channel; do not add private job metadata to the existing broadly readable controller-status file.
+
+The producer checks for updated controller status and protected job-event evidence every 30 seconds, independently of the five-minute health timer. It copies existing health/capacity observations without rerunning those probes or increasing outbound reporting. Source reads have bounded timeouts; slow or failed sources remain unavailable or stale without delaying runner handling or other exports. Copying a source never refreshes its original observation time.
+
+The observer exposes authenticated `GET` and `HEAD` reads for a fixed endpoint summary, paginated jobs, approved capacity aggregates, and diagnostic preview/export. Other methods fail without side effects. Job pages contain at most 100 records. Responses and diagnostic exports are capped at 1 MiB, use `Cache-Control: no-store`, and have no cross-origin access. Cache validated publication generations, close source descriptors after bounded reads, and bound request concurrency; a slow browser must not retain obsolete export files or cause full-history parsing on every poll. Authenticate before admitting requests to the bounded handler pool. Bound accepted connections, including unauthenticated connections, separately from handlers. Cap HTTP headers at 16 KiB, require complete headers within five seconds, and enforce 30-second read, write and idle deadlines. Close stalled or over-limit connections before they can consume authenticated handlers. Use fixed routes and opaque pagination cursors bound to the exact validated job-export generation. Reject a cursor after that generation changes and require pagination to restart; do not retain obsolete exports for a slow client. Never provide a URL proxy or file browser.
+
+Cache only the current validated job generation and bound parsing and response buffers. Retire superseded parsed histories promptly. In-flight requests retain only their bounded response buffers until the existing deadlines. Never retain old generations for pagination.
+
+Render metadata as text, reject unsafe links, and use a restrictive content-security policy. No untrusted HTML, inline execution, arbitrary attachment preview, or raw log streaming is included. The gateway owns user-access auditing; endpoint logs use controlled request/error codes and omit job contents and authentication material.
+
+## Snapshot version 1
+
+This is the contract to implement in [#118](https://github.com/RandomDevelopment/ci-fleet/issues/118), not a new version of [status-report v1](STATUS-REPORTING.md). Limit the complete local snapshot to 64 KiB. Reject unknown schema versions and unapproved fields.
+
+| Group | Approved observations |
+| --- | --- |
+| Envelope | Schema version, endpoint role, logical controller identity, boot time, publication time |
+| Source evidence | Source version, availability state, actual observation time, last successful observation time, controlled failure code |
+| Installation | Installed, absent, or unknown state; lifecycle; installed-at time; supported contract versions |
+| Configuration | Desired/applied commits, pool, routing labels, reviewed maximum, CPU/memory limits, approved maintenance flags |
+| Revisions | Desired engine, installed runtime, running controller, installed/staged manager, architecture, image-verification state and time |
+| Enrollment | Separate identity-presence, authentication, scale-set match, listener readiness, reporting, and owner-confirmation evidence |
+| Runtime and health | Verified runner counts, admission restrictions, Docker availability, redacted checks, existing resource measurements and timer states |
+| Reconciliation | State, check time, last-success time, desired/applied commits, trusted transaction phase/outcome |
+| Diagnostics | Controlled component/code, observation time, recovery status, fixed repository runbook reference |
+
+Each source distinguishes `available`, `not_configured`, `unsupported`, `unavailable`, and `unknown`. Freshness is separate from availability. Missing numeric observations are absent, never zero. A retained last-success value carries its original time and cannot be presented as a current observation after collection fails.
+
+The current `health/latest.json` stores redacted check results, not every raw probe measurement. Controller status publishes identity, version, counts, and time. Some existing health helpers substitute zero counts or capacity after failed reads, and may substitute a configured engine revision for an unavailable running revision. The new export must retain probe validity and provenance rather than treating those fallbacks as verified measurements. An unsupported producer supplies unknown evidence until its implementation exists.
+
+An installed credential proves presence only. A running process proves process state only. Listener readiness, GitHub authentication, scale-set identity, image content, and applied configuration require their own evidence. A matching image label does not prove a reviewed image ID. A staged manager upgrade does not prove runtime activation. GitHub App visibility remains an owner confirmation because the API does not attest it.
+
+Do not export raw desired-state files, rendered environments, protected trust policy, private endpoints, host inventory, proxy/`NO_PROXY` values, secret paths, arbitrary exception text, or reconciliation's free-text message. Maintenance and APT-cache settings may expose approved configured/absent/invalid state only. Reports and logs are not automatic redaction sources.
+
+## Freshness and failure interpretation
+
+Use Unix-second observation times from trusted producers. File modification time, export publication time, and browser refresh time do not refresh evidence. Reject invalid or implausibly future source timestamps and display clock uncertainty when the host clock is unsynchronized or moves backward.
+
+| Source | Current cadence and initial stale threshold |
+| --- | --- |
+| Controller counts/readiness | Status refreshes every minute and on lifecycle events; stale after 120 seconds |
+| Export publisher and job-event source | Separate last-success/availability evidence, checked every 30 seconds; stale after 120 seconds independently of the last job event |
+| Health and scheduled reconciliation | Normally every five minutes; stale after 900 seconds |
+| Capacity | Every 30 seconds while runners are active; stale active sampling after 120 seconds; idle sampling is intentionally paused |
+| Installation, policy, owner confirmation | Event-driven evidence; show recorded time and binding to the current identity/revision, never claim a recent live check from an old record |
+
+Thresholds label observations; they do not modify existing health thresholds, timers, or reporting rates. Browser polling is no faster than every five seconds, stops when the view is hidden, and backs off after failure.
+
+Keep intentional drain, blocked admission, process failure, stale evidence, and unknown readiness distinct. Show controlled reasons for network reserve, missing inspection, maintenance, or other gates only when an authoritative producer supplies them. A successful systemd invocation does not prove successful reconciliation. Missing transaction evidence cannot prove that nothing changed or that rollback succeeded.
+
+Publisher and listener liveness are separate. The existing controller status heartbeat does not prove that the job-event listener is healthy. The small endpoint export carries the publisher's last successful check, the event source's own last successful liveness observation, availability, coverage-gap evidence, and the exact job-export generation it describes. The observer accepts that evidence only when the generation matches the validated job export. Job exports change only when records or coverage change, and full job snapshots publish at most once per 60 seconds. Coalesce intervening updates. Lightweight liveness and coverage evidence still publish every 30 seconds without rewriting history. At the 4 MiB job-export cap this bounds full-snapshot writes to 5.625 GiB per day; disablement/removal clears exports immediately rather than waiting for that interval. Neither a quiet healthy listener nor idle work needs a new job event to prove liveness. If either source is unavailable or stale, retained running observations lose their claim of current activity and display stale/unknown activity, with their original event times. Never invent completion, cancellation, or a result from source loss. Verified historical terminal results remain historical.
+
+## Job history version 1
+
+The small endpoint export must flag pending job or coverage changes during coalescing or a failed publication. While changes are pending, retained running records show unknown current activity even if listener liveness is fresh. Historical terminal results remain visible. Clear the pending flag only after the matching validated job generation contains the coalesced changes or explicit loss evidence. Missing pending-state evidence defaults to unknown activity.
+
+[Issue #119](https://github.com/RandomDevelopment/ci-fleet/issues/119) records an allowlisted history through the existing authenticated scale-set listener. Observation does not change scaling, message acknowledgement, or runner cleanup and creates no competing message consumer. The pinned listener acknowledges batches before callbacks. Persist a protected unclean-session marker before listener polling begins. Missing, unreadable, or inconsistent durable coverage state defaults to unknown, including on first startup and after restart. If marker or observation persistence fails, ordinary CI continues, but observation cannot claim complete coverage. Clear the session marker only after a verified graceful listener shutdown and observation flush; this does not clear retained coverage gaps.
+
+After an unclean restart, retain a coverage gap until a separately approved reconciliation source independently inventories the affected jobs or recovers the missing batch. #119 must define and verify any such source before using it. The initial listener-only implementation has no reconciliation source and leaves the gap unknown. Optional GitHub Actions-read enrichment does not by itself establish completeness. A healthy heartbeat, a new event, or successful later persistence cannot clear a retained gap or turn missing durable state into complete coverage.
+
+| Field group | Contract |
+| --- | --- |
+| Identity | Logical controller and scale-set identity plus opaque scale-set `JobID`; keep GitHub's numeric REST job ID separate |
+| Display | Validated owner/repository, display name, workflow run ID, runner association |
+| Timing | Source queue/assignment/finish times when supplied; local start/completion observation times with provenance |
+| Outcome | Observed running/completed/unknown state, normalized result, controlled evidence-gap code |
+| Optional correlation | Run attempt, task, shard, or exact GitHub job ID only when independently verified |
+
+Validate identifiers and cap each display name at 512 UTF-8 bytes. Display truncation must be explicit. Keep each serialized record at or below 4 KiB. Generate GitHub run links from validated owner/repository/run ID on the installation's approved GitHub origin. Never assume string `JobID` is the numeric REST job ID or parse arbitrary display names into trusted task/shard identity.
+
+Keep no more than seven days or 5,000 records, and cap the whole private observation store at 32 MiB including job records, protected disk event spools, indexes, journals, and staging/temporary files. Whichever bound is reached first wins. Sweep expiry even while idle. Place it in `/var/lib/ci-fleet-observer/private`, a root-owned mode-`0700` directory with mode-`0600` files. Bound the private tree to 128 regular files and eight directories, including spools, indexes, journals and temporary files. Store records in bounded shared files rather than one file per job. Serialize writes and recovery, validate fixed approved names, ownership, mode, type and single-link regular files, and reject symlinks or unexpected entries. Reuse fixed staging names and remove interrupted staging files only after those checks. Enforce byte and entry limits before creating or extending files. Together with the export quota, observation-owned persistent storage cannot exceed 48 MiB. The browser reads only the bounded exports. Select records that fit the 4 MiB job-export cap, with observed nonterminal jobs first and terminal records newest first. Retain private history under its separate bounds, and publish exported/truncated record counts and the covered time range. A truncated or pending export cannot claim complete current activity.
+
+Persist private record and event changes incrementally rather than rewriting all retained history per event or export. Report retained/exported counts and omitted nonterminal counts. Omitted nonterminal records make current-work coverage incomplete. The browser cannot page through unexported private history.
+
+An observation queue is bounded and must drop excess observation work rather than block the listener. Count and expose event loss, retention truncation, corruption, and capped coverage explicitly. A coverage gap makes affected current activity unknown until independent evidence restores it. Excess storage writes fail independently; they never stop a job or weaken host disk admission. The UI must not imply that its retained list covers every active runner when evidence is incomplete. Authentic late-event observations must not change the controller's existing decisions to ignore events for removed runners.
+
+Duplicate and late events cannot regress a verified terminal outcome. A recovered runner can have an unknown job association. A runner exit alone does not prove job completion, cancellation, timeout, or test failure. Missing completion stays unknown until independent evidence supplies a result; expiry is data retention, not a successful job result. Scope demand counts to the observed scale set, never the entire fleet.
+
+Optional repository Actions-read enrichment requires a separate credential/access decision. The initial view uses listener metadata and GitHub run links without broadening the controller App's repository access.
+
+## Capacity, diagnostics, and central reporting
+
+Reuse the [anonymous local capacity history](CAPACITY-TELEMETRY.md) and its weekly aggregate. Keep its existing eight-day retention and record bounds. Export bounded chart/aggregate results through the privileged producer, without granting the observer access to the private history or correlating anonymous runner samples to jobs.
+
+[Issue #120](https://github.com/RandomDevelopment/ci-fleet/issues/120) presents controlled diagnostics. It consumes trusted rejection phase and sanitized reason from [#110](https://github.com/RandomDevelopment/ci-fleet/issues/110). Distinguish rejection before a transaction, verified rollback, uncertain interruption, and unverified rollback. Preserve outstanding-operation guards and maintenance uncertainty. A diagnostic download contains only the displayed allowlist, includes a preview, and stays within the response limit above. Full job and controller log access is separate work.
+
+The [central console in #123](https://github.com/RandomDevelopment/ci-fleet/issues/123) consumes the separately deployed authenticated receiver and reviewed expected inventory. Preserve outbound-only reporting, signed status-report v1, reporting rate, redaction, and retention. It receives no local job history or capacity samples. Its backend read token stays server-side.
+
+The current receiver read API returns report payloads and their generation times. It does not expose database receipt time. Receipt-age display requires a separately versioned authenticated read-response extension without changing the signed report payload. Worker-local monitoring does not depend on receiver activation.
+
+## Optional policy and compatibility
+
+The implementation will add an `endpoint_observation_ui` engine capability and an optional per-controller `endpoint_ui` declaration with `enabled: true` and the fixed access reference `/etc/ci-fleet/observer/access.json`. Absence means disabled. That access file contains only protected references to the backend credential and approved gateway provisioning evidence. Real gateway endpoints, addresses, credentials, and identity-provider settings remain host-local or externally managed.
+
+These names describe a future implementation contract. Current schema-v3 validators reject that new field, and current engines do not declare the capability. This design PR changes neither. Implement schema, validation, rendering, capability checks, and installation together under [#122](https://github.com/RandomDevelopment/ci-fleet/issues/122); never use a host-local switch to bypass reviewed worker desired state.
+
+Follow the staged [desired-state capability rollout](DESIRED-STATE.md#schema-v3): first upgrade to and verify a supporting engine while UI policy is absent, then record its reviewed capability evidence, then enable policy using prior-state evidence. Preserve [independent configuration review](CONFIGURATION-APPROVAL.md). Prepare gateway/access credentials out of band before enablement. No listener starts with missing, unsafe, or unverified access configuration.
+
+The installer validates policy, exports, access files, port ownership, and role admission before activation. It uses existing installation and role locks and preserves interrupted transactions and checkpoints. Committed disablement, uninstall, or downgrade to an unsupported engine removes the observer listener, exports, and the whole fleet-owned private observation store, including job history, event spools, indexes, journals, and temporary files. Do not leave private metadata behind after its retention sweeper stops. Existing role recovery records and operator-owned access policy/credentials stay retained for explicit disposition. A failed transition preserves the incumbent observer, bounded history, and CI state for rollback. Remove UI policy before selecting an engine that cannot validate it.
+
+Version local exports and read responses independently. Unsupported contracts fail closed for observation while ordinary CI continues under its existing gates. A supporting observer cannot read a newer or malformed export by guessing field meanings. Preserve legacy behavior when UI policy is absent. Observer resource exhaustion must fail independently; host-wide resource failure may still affect CI.
+
+## Role follow-ups and delivery gates
+
+| Work | Dependency and boundary |
+| --- | --- |
+| [#118 snapshots](https://github.com/RandomDevelopment/ci-fleet/issues/118) and [#119 history](https://github.com/RandomDevelopment/ci-fleet/issues/119) | Implement the approved local contracts, with source validity and bounded independent failure |
+| [#120 diagnostics](https://github.com/RandomDevelopment/ci-fleet/issues/120) and [#121 worker UI](https://github.com/RandomDevelopment/ci-fleet/issues/121) | Consume the contracts; missing upstream failure evidence stays unknown |
+| [#122 packaging](https://github.com/RandomDevelopment/ci-fleet/issues/122) | Build on the accepted [worker desired-state lifecycle](DESIRED-STATE.md). At the review introducing this ADR, #69/#76 proposed additional role-admission changes and #74 proposed reviewed-image changes; none was an accepted dependency. Check their current state, coordinate overlap, and incorporate those contracts only after acceptance; preserve existing CI and separately authorized host proof |
+| [#123 fleet console](https://github.com/RandomDevelopment/ci-fleet/issues/123) | Follow [#66 receiver deployment](https://github.com/RandomDevelopment/ci-fleet/issues/66), with no inbound worker polling |
+| [#124 tester](https://github.com/RandomDevelopment/ci-fleet/issues/124) | Follow accepted tester contracts; show environment health, immutable revisions, expiry and recovery; preserve application ingress and forbid reset/removal |
+| [#125 deployer](https://github.com/RandomDevelopment/ci-fleet/issues/125) | Follow accepted deployer contracts; show target, approved/deployed artifacts, guards and recovery; grant no deployment or production authority |
+
+The worker design and implementation need not wait for tester/deployer prepared-host acceptance. UI follow-ups add no acceptance gate to existing issues or active PRs. Shared presentation does not impose worker Git-policy semantics on protected tester/deployer configuration.
+
+Before packaging is called operational, verify unauthorized/direct requests, forged headers, credential rotation, safe text/link rendering, port conflicts, stale and malformed evidence, observer overload/storage limits, Docker outage, install/upgrade/interruption/rollback/uninstall, and disabled behavior. Retain required current-head CI, meaningful static/configuration/secret and image checks, isolated job/cleanup proof, read-only ordinary-CI permissions, credential-boundary proof, measured shard durations, and five-minute timeouts. Existing project CI and rollback remain available.
+
+Risks remain explicit. Trusted job code with Docker access is host-root-equivalent and can bypass host permissions; the observer cannot attest that host against hostile jobs. The HTTPS gateway can reveal all metadata its operators may read. Local history disappears with a disposable host unless a separate approved retention system exists. Revisit this decision before admitting untrusted jobs, sharing job metadata per project, adding remote binds/actions/raw logs, or treating observations as independent security attestations.
+
+## Sources
+
+- [Current fleet architecture](ARCHITECTURE.md), [secrets model](SECRETS.md), [host enrollment](ADDING-A-HOST.md), and [project boundaries](PROJECT-STANDARD.md).
+- [Health monitoring](HEALTH-MONITORING.md), [capacity telemetry](CAPACITY-TELEMETRY.md), and [authenticated status reporting](STATUS-REPORTING.md).
+- [Pinned scale-set metadata](https://github.com/actions/scaleset/blob/v0.4.0/types.go) and [GitHub workflow jobs API](https://docs.github.com/en/rest/actions/workflow-jobs).
+- [GitHub ephemeral runner guidance](https://docs.github.com/en/actions/reference/runners/self-hosted-runners) and [Docker socket access limits](https://dozzle.dev/guide/authentication).

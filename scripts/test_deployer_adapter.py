@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Adversarial checks for the deployment Docker and recovery boundary."""
+import base64
 import copy
 import errno
 import json
@@ -7,7 +8,9 @@ import os
 from pathlib import Path
 import socket
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -140,20 +143,48 @@ class Containment(unittest.TestCase):
         for acl, rejected in [(OSError(errno.ENODATA, 'absent'), False),
                               (OSError(errno.ENOTSUP, 'unsupported'), False),
                               (b'named-user-acl', True), (OSError(errno.EACCES, 'denied'), True)]:
+            def access_acl(path, *_args, **_kwargs):
+                if str(path) != '/run/docker.sock':
+                    raise OSError(errno.ENODATA, 'absent')
+                if isinstance(acl, OSError):
+                    raise acl
+                return acl
             with self.subTest(acl=acl), patch.object(adapter.socket, 'socket', return_value=peer), \
-                 patch.object(adapter.os, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=45678)), \
+                 patch.object(adapter.os, 'lstat', side_effect=lambda path: SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=45678, st_gid=45678) if str(path) == '/run/rootless/docker.sock' else SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)), \
                  patch.object(adapter.Path, 'read_text', return_value=status), \
                  patch.object(adapter.grp, 'getgrnam', side_effect=KeyError), \
+                 patch.object(adapter.grp, 'getgrgid', return_value=SimpleNamespace(gr_mem=[])), \
+                 patch.object(adapter.pwd, 'getpwall', return_value=[SimpleNamespace(pw_uid=45678, pw_gid=45678)]), \
                  patch.object(adapter.Path, 'exists', return_value=True), \
                  patch.object(adapter.Path, 'resolve', return_value=Path('/run/docker.sock')), \
                  patch.object(adapter.Path, 'stat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFSOCK | 0o660)), \
-                 patch.object(adapter.os, 'getxattr', **({'side_effect': acl} if isinstance(acl, OSError) else {'return_value': acl})):
+                 patch.object(adapter.os, 'getxattr', side_effect=access_acl):
                 connection = adapter.UnixConnection('/run/rootless/docker.sock')
                 if rejected:
                     with self.assertRaises(ValueError):
                         connection.connect()
                 else:
                     connection.connect()
+
+    def test_backend_socket_rejects_other_principals(self):
+        for case in ('safe', 'world', 'wrong-group', 'acl', 'parent-writable', 'parent-owner', 'member', 'primary-member'):
+            with self.subTest(case=case):
+                def metadata(path):
+                    if str(path) == '/run/private/docker.sock':
+                        return SimpleNamespace(st_mode=stat.S_IFSOCK | (0o666 if case == 'world' else 0o660),
+                                               st_uid=45678, st_gid=12345 if case == 'wrong-group' else 45678)
+                    return SimpleNamespace(st_mode=stat.S_IFDIR | (0o777 if case == 'parent-writable' else 0o755),
+                                           st_uid=12345 if case == 'parent-owner' else 0)
+                with patch.object(adapter.os, 'lstat', side_effect=metadata), \
+                     patch.object(adapter.os, 'getxattr', **({'return_value': b'extended'} if case == 'acl' else {'side_effect': OSError(errno.ENODATA, 'absent')})), \
+                     patch.object(adapter.grp, 'getgrgid', return_value=SimpleNamespace(gr_mem=['outsider'] if case == 'member' else [])), \
+                     patch.object(adapter.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=12345)), \
+                     patch.object(adapter.pwd, 'getpwall', return_value=[SimpleNamespace(pw_uid=12345 if case == 'primary-member' else 45678, pw_gid=45678)]):
+                    if case == 'safe':
+                        adapter.check_backend_socket('/run/private/docker.sock', 45678, 45678)
+                    else:
+                        with self.assertRaises(ValueError):
+                            adapter.check_backend_socket('/run/private/docker.sock', 45678, 45678)
 
     def test_pull_ownership_requires_success_and_confirmed_digest(self):
         for status, response, recorded in [(404, b'{"message":"absent"}', False),
@@ -181,6 +212,32 @@ class Containment(unittest.TestCase):
                         server.shutdown()
                         thread.join()
                 self.assertEqual(policy.artifact_owned(policy.image), recorded)
+
+    def test_registry_auth_is_not_forwarded(self):
+        auth = base64.b64encode(json.dumps({'username': 'application', 'password': 'secret-canary'}).encode()).decode()
+        for operation in ('deploy', 'rollback'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                policy = adapter.Policy(self.values, self.backend, operation=operation)
+                self.backend.resources['images', policy.image] = {'RepoDigests': [policy.image]}
+                request = MagicMock(return_value=(200, b'{"status":"Pull complete"}\n'))
+                self.backend.request = request
+                path = str(Path(directory) / 'broker.sock')
+                with adapter.ProxyServer(path, adapter.handler(policy)) as server:
+                    thread = threading.Thread(target=server.serve_forever)
+                    thread.start()
+                    try:
+                        connection = adapter.UnixConnection(path, rootless=False)
+                        query = adapter.urllib.parse.urlencode({'fromImage': policy.image})
+                        connection.request('POST', '/images/create?' + query,
+                                           headers={'x-registry-auth': auth, 'X-Registry-Config': auth})
+                        result = connection.getresponse()
+                        self.assertEqual(result.status, 200)
+                        result.read()
+                        connection.close()
+                    finally:
+                        server.shutdown()
+                        thread.join()
+                self.assertEqual(request.call_args.args[3], {'Content-Type': 'application/json'})
 
     def test_adapter_has_no_caller_stdin(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -349,6 +406,332 @@ class Containment(unittest.TestCase):
             self.assertEqual([item['Id'] for item in inventory], ['owned'])
             self.assertEqual(inventory[0]['RepoTags'], [])
 
+    def test_credential_store_rejects_inherited_acl_before_exposing_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            with patch.object(adapter.os, 'getxattr', return_value=b'default-named-user-acl'):
+                with self.assertRaises(ValueError):
+                    adapter.materialize_credential(store, self.values, b'secret-canary',
+                                                   os.getuid(), os.getuid(), os.getgid())
+            self.assertEqual(list(store.iterdir()), [])
+
+    def test_consumption_recovers_marker_audit_and_partial_write_crashes(self):
+        line = ('time=2026-10-13T00:00:00Z environment=staging target=app source=' + 'a' * 40
+                + ' artifact=sha256:' + 'b' * 64
+                + ' approval=approval-1 approver=reviewer policy=policy checkpoint=checkpoint authorized_by=none gate=none result=consumed phase=pre-adapter status=none\n')
+        for boundary in ('marker', 'partial-audit', 'retirement'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                store = Path(directory)
+                ledger = store / 'consumed-requests'
+                ledger.mkdir(mode=0o700)
+                audit = store / 'audit.log'
+                adapter.durable_file(audit, b'prior history\n')
+                real_durable, real_write, real_unlink = adapter.durable_file, os.write, Path.unlink
+                def durable(path, body):
+                    if boundary == 'marker' and path.parent == ledger:
+                        raise OSError('simulated power loss before marker publication')
+                    real_durable(path, body)
+                writes = []
+                def write(descriptor, body):
+                    if boundary == 'partial-audit':
+                        if writes:
+                            raise OSError('simulated power loss during audit publication')
+                        writes.append(True)
+                        return real_write(descriptor, body[:len(body) // 2])
+                    return real_write(descriptor, body)
+                def unlink(path, *args, **kwargs):
+                    if boundary == 'retirement' and path.name == 'pending-consumption.json':
+                        raise OSError('simulated power loss after audit publication')
+                    return real_unlink(path, *args, **kwargs)
+                with patch.object(adapter, 'durable_file', side_effect=durable), \
+                     patch.object(adapter.os, 'write', side_effect=write), \
+                     patch.object(Path, 'unlink', unlink):
+                    with self.assertRaises(OSError):
+                        adapter.consume_approval(store, line, os.getuid())
+                self.assertTrue((store / 'pending-consumption.json').exists())
+                adapter.consume_approval(store, uid=os.getuid())
+                self.assertEqual(audit.read_bytes(), b'prior history\n' + line.encode())
+                self.assertEqual(len(list(ledger.iterdir())), 1)
+                self.assertEqual(next(ledger.iterdir()).read_bytes(), b'')
+                self.assertFalse((store / 'pending-consumption.json').exists())
+                adapter.consume_approval(store, uid=os.getuid())
+                self.assertEqual(audit.read_bytes().count(line.encode()), 1)
+
+    def test_installer_check_requires_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([str(Path(__file__).with_name('install-deployer.sh')),
+                                     '--check', '--config', directory + '/absent.conf'],
+                                    env=dict(os.environ, CI_FLEET_DEPLOYER_TESTING='1',
+                                             CI_FLEET_DEPLOYER_ROOT=directory,
+                                             CI_FLEET_DEPLOYER_EUID_OVERRIDE='1000'),
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('run this mode as root', result.stderr)
+
+    def test_rollback_recovery_requires_durable_completion_after_reboot(self):
+        installer = Path(__file__).with_name('install-deployer.sh')
+        functions = ''.join(subprocess.check_output(['sed', '-n', f'/^{name}() {{$/,/^}}$/p',
+                                                     str(installer)], text=True)
+                            for name in ('acquire_lock', 'recover_adapter_guard',
+                                         'recover_interrupted_transaction', 'retire_adapter_guard'))
+        shell = functions + r'''
+block() { printf '%s\n' "$*" >&2; exit 42; }
+secure_file() { test -f "$1"; }
+secure_directory() { if [[ ${3:-0} == 1 ]]; then mkdir -p "$1"; chmod "$2" "$1"; fi; test -d "$1"; }
+root_path() { printf '%s%s' "$fixture_root" "$1"; }
+reject_other_role_state() { return 0; }
+adapter_unit_inactive() { return 0; }
+rollback_commit_marker_uncommitted() { test ! -e "$1"; }
+restore_transaction() { printf restored >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
+finalize_committed_rollback() { printf finalized >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
+python3() { command "$test_python" -c "$journal_probe" "$@"; }
+acquire_lock
+'''
+        # Directory ancestry is covered separately; this fixture lives in /tmp.
+        probe = "import sys; from unittest.mock import patch; import deployer_adapter as a; sys.argv=sys.argv[1:]; " \
+                "p=patch.object(a,'trusted_directory'); p.start(); raise SystemExit(a.main())"
+        for committed, volatile in ((False, False), (False, True), (True, False), (True, True)):
+            for state, uncertain, outcome in [('missing', False, None), ('inflight', False, None),
+                                              ('completed', True, 'committed' if committed else 'failed'),
+                                              ('completed', False, None),
+                                              ('completed', False, 'committed' if committed else 'failed')]:
+                with self.subTest(committed=committed, volatile=volatile, state=state,
+                                  uncertain=uncertain, outcome=outcome), \
+                        tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    transactions, store = root / 'transactions', root / 'state'
+                    transactions.mkdir()
+                    store.mkdir()
+                    lock, logs = root / 'locks', root / 'logs'
+                    lock.mkdir(mode=0o700)
+                    logs.mkdir(mode=0o700)
+                    transaction = transactions / '.transaction.rollback'
+                    transaction.mkdir(mode=0o700)
+                    unit = 'ci-fleet-deployer-adapter-1-2.service'
+                    adapter.durable_file(transaction / 'kind', b'rollback\n')
+                    adapter.durable_file(transaction / 'adapter-unit', (unit + '\n').encode())
+                    if volatile:
+                        adapter.durable_file(lock / 'adapter-unit', (unit + '\n').encode())
+                    if committed:
+                        adapter.durable_file(transaction / 'application-rollback-committed', b'committed\n')
+                    if state != 'missing':
+                        journal = store / '.adapter-recovery' / unit
+                        journal.mkdir(parents=True, mode=0o700)
+                        adapter.durable_file(journal / 'status.json', json.dumps({
+                            'unit': unit, 'operation': 'rollback', 'status': state,
+                            'exit_code': 1, 'rollback_outcome': outcome,
+                            'rollback_marker': str(transaction / 'application-rollback-committed')}).encode())
+                        if uncertain:
+                            adapter.durable_file(journal / 'docker-uncertain', b'uncertain\n')
+                    result_file = root / 'result'
+                    result = subprocess.run(['bash', '-c', shell], capture_output=True, text=True,
+                                            env=dict(os.environ, transaction_root=str(transactions),
+                                                     state_root=str(store), expected_uid=str(os.getuid()),
+                                                     repo_root=str(installer.parent.parent),
+                                                     fixture_root=str(root), install_root=str(root),
+                                                     lock_root=str(lock), log_root=str(logs), mode='repair',
+                                                     adapter_guard=str(lock / 'adapter-unit'), testing='0',
+                                                     active_operation=str(store / 'active-operation'),
+                                                     releases=str(root / 'absent-releases'),
+                                                     CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
+                                                     test_python=sys.executable, journal_probe=probe,
+                                                     PYTHONPATH=str(installer.parent)))
+                    if state != 'completed' or uncertain or outcome is None:
+                        self.assertEqual(result.returncode, 42, result.stderr)
+                        self.assertIn('rollback adapter journal completion is unverified', result.stderr)
+                        self.assertFalse(result_file.exists())
+                        self.assertTrue(transaction.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result_file.read_text(), 'finalized' if committed else 'restored')
+                        self.assertFalse((lock / 'adapter-unit').exists())
+                        self.assertFalse((store / '.adapter-recovery' / unit).exists())
+
+    def test_failed_rollback_commit_publication_keeps_uncertainty(self):
+        for published in (False, True):
+            with self.subTest(published=published), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker, uncertain = root / 'rollback-commit', root / 'docker-uncertain'
+                policy = adapter.Policy(self.values, self.backend, marker=marker, operation='rollback',
+                                        uncertain_marker=uncertain)
+                durable = adapter.durable_file
+                def failing_publication(path, body):
+                    if path == marker:
+                        if published:
+                            durable(path, body)
+                        raise OSError('commit publication failed')
+                    durable(path, body)
+                with adapter.ProxyServer(str(root / 'broker.sock'), adapter.handler(policy)) as server:
+                    thread = threading.Thread(target=server.serve_forever)
+                    thread.start()
+                    try:
+                        with patch.object(adapter, 'durable_file', side_effect=failing_publication), \
+                                patch.object(adapter, 'executor_peer', return_value=True):
+                            connection = adapter.UnixConnection(str(root / 'broker.sock'), rootless=False)
+                            connection.request('POST', '/ci-fleet/rollback-commit', b'committed')
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 403)
+                            response.read()
+                            connection.close()
+                    finally:
+                        server.shutdown()
+                        thread.join()
+                self.assertTrue(policy.uncertain)
+                self.assertEqual(uncertain.read_bytes(), b'uncertain\n')
+
+    def test_rollback_completion_requires_executor_outcome_confirmation(self):
+        for code, outcome in [(0, None), (1, None), (1, 'failed'), (0, 'committed'), (1, 'committed')]:
+            with self.subTest(code=code, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                store, runtime, credentials = root / '.adapter-recovery', root / 'runtime', root / 'credentials'
+                store.mkdir(mode=0o700)
+                runtime.mkdir(mode=0o711)
+                credentials.mkdir(mode=0o711)
+                source, secret, policy_path = root / 'adapter', root / 'application', root / 'policy'
+                adapter.durable_file(source, b'#!/bin/sh\nexit 0\n')
+                source.chmod(0o700)
+                adapter.durable_file(secret, b'fixture-only')
+                values = dict(self.values, CREDENTIAL_PROVIDER='file', CREDENTIAL_REF=str(secret),
+                              ADAPTER_SHA256=adapter.hashlib.sha256(source.read_bytes()).hexdigest(),
+                              DOCKER_SOCKET='/run/rootless/docker.sock')
+                adapter.durable_file(policy_path, ''.join(f'{k}={v}\n' for k, v in values.items()).encode())
+                unit = 'ci-fleet-deployer-adapter-1-2.service'
+                args = SimpleNamespace(policy=policy_path, adapter=source, store=store, runtime=runtime,
+                                       credential_store=credentials, unit=unit, seconds=120,
+                                       request=None, marker=root / 'commit', operation='rollback')
+                backend = SimpleNamespace(uid=os.getuid(), gid=os.getgid(), path='/run/rootless/docker.sock')
+                def dispatch(command, **_kwargs):
+                    if command[0] == 'systemd-run':
+                        if outcome:
+                            bind = next(item for item in command if item.startswith('--property=BindReadOnlyPaths='))
+                            proxy = bind.split('=', 2)[2].split(':', 1)[0]
+                            connection = adapter.UnixConnection(proxy, rootless=False)
+                            connection.request('POST', '/ci-fleet/rollback-commit', outcome.encode())
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 204)
+                            response.read()
+                            connection.close()
+                        return subprocess.CompletedProcess(command, code)
+                    if '--property=MainPID' in command:
+                        return subprocess.CompletedProcess(command, 0, str(os.getpid()))
+                    return subprocess.CompletedProcess(command, 0, 'LoadState=loaded\nActiveState=inactive\n')
+                with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1'}), \
+                        patch.object(adapter, 'Backend', return_value=backend), \
+                        patch.object(adapter, 'trusted_directory'), \
+                        patch.object(adapter.subprocess, 'run', side_effect=dispatch):
+                    if outcome is None:
+                        with self.assertRaises(ValueError):
+                            adapter.run_adapter(args)
+                    else:
+                        self.assertEqual(adapter.run_adapter(args), code)
+                    status = json.loads((store / unit / 'status.json').read_bytes())
+                    self.assertEqual(status['status'], 'completed' if outcome else 'inflight')
+                    self.assertEqual(adapter.journal_complete(store, unit, os.getuid()), bool(outcome))
+                    if outcome:
+                        self.assertEqual(status['rollback_outcome'], outcome)
+
+    def test_executor_confirms_rollback_outcome(self):
+        for code, committed in [(42, False), (0, True), (1, True), (0, False), (-9, False), (-9, True)]:
+            with self.subTest(code=code, committed=committed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                credentials, runtime = root / 'credentials', root / 'runtime'
+                credentials.mkdir()
+                runtime.mkdir()
+                adapter.durable_file(credentials / 'policy', b'CREDENTIAL_REF=fixture\n')
+                adapter.durable_file(credentials / 'adapter', b'#!/bin/sh\nexit 0\n')
+                def application(command, **kwargs):
+                    if committed:
+                        Path(kwargs['env']['CI_FLEET_DEPLOYER_ROLLBACK_COMMIT']).write_bytes(b'committed\n')
+                    return subprocess.CompletedProcess(command, code)
+                connection = MagicMock()
+                connection.getresponse.return_value.status = 204
+                with patch.dict(os.environ, {'CREDENTIALS_DIRECTORY': str(credentials),
+                                             'RUNTIME_DIRECTORY': str(runtime),
+                                             'CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL': '/approved/application',
+                                             'CI_FLEET_DEPLOYER_COMMIT_ALLOWED': '1'}), \
+                        patch.object(adapter.subprocess, 'run', side_effect=application), \
+                        patch.object(adapter.ctypes, 'CDLL') as library, \
+                        patch.object(adapter, 'UnixConnection', return_value=connection):
+                    library.return_value.prctl.return_value = 0
+                    if committed and code != 0 or not committed and code <= 0:
+                        with self.assertRaises(ValueError):
+                            adapter.execute_adapter('rollback')
+                        connection.request.assert_not_called()
+                    else:
+                        self.assertEqual(adapter.execute_adapter('rollback'), code)
+                        connection.request.assert_called_once_with('POST', '/ci-fleet/rollback-commit',
+                                                                  b'committed' if committed else b'failed')
+
+    def test_adapter_cannot_publish_executor_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'commit'
+            policy = adapter.Policy(self.values, self.backend, marker=marker, operation='rollback',
+                                    unit='ci-fleet-deployer-adapter-1-2.service')
+            path = str(root / 'broker.sock')
+            child = "import sys,http.client,socket; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); " \
+                    "c=http.client.HTTPConnection('localhost'); c.sock=s; " \
+                    "c.request('POST','/ci-fleet/rollback-commit',b'committed'); r=c.getresponse(); " \
+                    "print(r.status); r.read(); c.close()"
+            with adapter.ProxyServer(path, adapter.handler(policy)) as server, \
+                    patch.object(adapter.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, str(os.getpid()))):
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                try:
+                    process = subprocess.Popen([sys.executable, '-c', child, path], stdout=subprocess.PIPE, text=True)
+                    output, _ = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertEqual(output.strip(), '403')
+                    self.assertFalse(marker.exists())
+                    self.assertIsNone(policy.rollback_outcome)
+                    connection = adapter.UnixConnection(path, rootless=False)
+                    connection.request('POST', '/ci-fleet/rollback-commit', b'failed')
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 204)
+                    response.read()
+                    connection.close()
+                    self.assertEqual(policy.rollback_outcome, 'failed')
+                finally:
+                    server.shutdown()
+                    thread.join()
+
+    def test_executor_peer_requires_current_main_pid(self):
+        connection = MagicMock()
+        connection.getsockopt.return_value = struct.pack('3i', os.getpid(), os.getuid(), os.getgid())
+        for code, value, expected in [(0, str(os.getpid()), True), (0, '0', False),
+                                      (0, str(os.getpid() + 1), False), (1, str(os.getpid()), False),
+                                      (0, '', False), (0, 'unavailable', False)]:
+            with self.subTest(code=code, value=value), \
+                    patch.object(adapter.subprocess, 'run', return_value=subprocess.CompletedProcess([], code, value)):
+                self.assertEqual(adapter.executor_peer(connection, 'ci-fleet-deployer-adapter-1-2.service'), expected)
+        with patch.object(adapter.subprocess, 'run', side_effect=subprocess.TimeoutExpired('systemctl', 10)):
+            self.assertFalse(adapter.executor_peer(connection, 'ci-fleet-deployer-adapter-1-2.service'))
+
+    def test_executor_disables_dumping_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials, runtime = root / 'credentials', root / 'runtime'
+            credentials.mkdir()
+            runtime.mkdir()
+            adapter.durable_file(credentials / 'policy', b'CREDENTIAL_REF=fixture\n')
+            adapter.durable_file(credentials / 'adapter', b'#!/bin/sh\nexit 0\n')
+            code = '''import ctypes,subprocess
+from unittest.mock import patch
+import deployer_adapter as a
+def application(command, **kwargs):
+    assert ctypes.CDLL(None).prctl(3,0,0,0,0) == 0
+    assert kwargs['close_fds'] is True
+    return subprocess.CompletedProcess(command,0)
+with patch.object(a.subprocess,'run',side_effect=application):
+    assert a.execute_adapter('health') == 0
+'''
+            result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                                    env=dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials),
+                                             RUNTIME_DIRECTORY=str(runtime), CI_FLEET_DEPLOYER_COMMIT_ALLOWED='0',
+                                             CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL='/approved/application',
+                                             PYTHONPATH=str(Path(__file__).parent)))
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_guard_requires_completed_protected_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory)
@@ -356,17 +739,46 @@ class Containment(unittest.TestCase):
             journal = store / unit
             journal.mkdir(mode=0o700)
             status = journal / 'status.json'
+            marker = store / 'rollback-commit'
             with patch.object(adapter, 'trusted_directory'):
                 for operation, state, code, expected in [('rollback', 'inflight', 0, False),
-                                                        ('rollback', 'completed', 1, False),
+                                                        ('rollback', 'completed', 1, True),
                                                         ('rollback', 'completed', 0, True),
                                                         ('health', 'completed', 1, True),
                                                         ('cleanup', 'completed', 1, False)]:
+                    if code == 0:
+                        adapter.durable_file(marker, b'committed\n')
+                    else:
+                        marker.unlink(missing_ok=True)
                     adapter.durable_file(status, json.dumps({'unit': unit, 'operation': operation,
-                                                            'status': state, 'exit_code': code}).encode())
+                                                            'status': state, 'exit_code': code,
+                                                            'rollback_marker': str(marker),
+                                                            'rollback_outcome': 'committed' if code == 0 else 'failed'}).encode())
                     self.assertEqual(adapter.journal_complete(store, unit, os.getuid()), expected)
+                for code in (0, 1):
+                    adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'rollback',
+                                                            'status': 'completed', 'exit_code': code}).encode())
+                    self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'rollback', 'status': 'completed',
+                                                        'exit_code': 0, 'rollback_marker': str(marker),
+                                                        'rollback_outcome': 'committed'}).encode())
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                adapter.durable_file(marker, b'committed\n')
+                self.assertTrue(adapter.journal_complete(store, unit, os.getuid()))
+                marker.chmod(0o700)
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                marker.chmod(0o600)
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'rollback', 'status': 'completed',
+                                                        'exit_code': 1, 'rollback_marker': str(marker),
+                                                        'rollback_outcome': 'failed'}).encode())
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                marker.unlink()
                 adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'deploy', 'status': 'completed', 'exit_code': 0}).encode())
                 adapter.durable_file(journal / 'docker-uncertain', b'uncertain')
+                self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'rollback', 'status': 'completed',
+                                                        'exit_code': 1, 'rollback_marker': str(marker),
+                                                        'rollback_outcome': 'failed'}).encode())
                 self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
 
     def test_failed_forwarded_mutation_keeps_durable_uncertainty(self):

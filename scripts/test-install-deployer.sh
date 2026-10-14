@@ -35,6 +35,15 @@ printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 chmod 0700 "$root/etc/ci-fleet-deployer" "$root/etc/ci-fleet-deployer/adapters" \
   "$root/etc/ci-fleet-deployer/credentials" "$root/etc/ci-fleet-deployer/evidence"
 
+export DEPLOYER_TEST_REAL_SYNC
+DEPLOYER_TEST_REAL_SYNC=$(command -v sync)
+cat >"$fake_bin/sync" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${FAKE_FAIL_CREATED_RECORD_SYNC:-0} == 1 && ${2:-} == */.deployed-created.* ]]; then exit 87; fi
+exec "$DEPLOYER_TEST_REAL_SYNC" "$@"
+EOF
+chmod +x "$fake_bin/sync"
+
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -u
@@ -57,6 +66,16 @@ printf '%s\n' "$*" >>"$log"
 [[ -z ${FAKE_SYSTEMCTL_FAIL_COMMAND:-} || ${1:-} != "$FAKE_SYSTEMCTL_FAIL_COMMAND" ]] || exit 1
 case "${1:-}" in
   list-unit-files|list-units)
+  case "$1" in
+    list-unit-files)
+      printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"
+      [[ ${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_UNIT_FILES_EXIT"; }
+      ;;
+    list-units)
+      printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"
+      [[ ${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0} == 0 ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_SYSTEMD_LOADED_UNITS_EXIT"; }
+      ;;
+  esac
     [[ -z ${FAKE_DEPLOYER_TESTER_INVENTORY_ERROR:-} ]] || { printf 'inventory inspection failed\n' >&2; exit "$FAKE_DEPLOYER_TESTER_INVENTORY_ERROR"; }
     [[ -z ${FAKE_DEPLOYER_TESTER_UNIT:-} || ${FAKE_DEPLOYER_TESTER_UNIT_KIND:-$1} != "$1" ]] || printf '%s enabled\n' "$FAKE_DEPLOYER_TESTER_UNIT"
     exit 0
@@ -528,6 +547,7 @@ write_config
 
 export CI_FLEET_DEPLOYER_EUID_OVERRIDE=1000
 expect_failure 'run this mode as root' "$installer" --install --config "$config" >/dev/null
+expect_failure 'run this mode as root' "$installer" --check --config "$config" >/dev/null
 export CI_FLEET_DEPLOYER_EUID_OVERRIDE=0
 
 before=$(find "$root" -printf '%P %y %m\n' | sort | sha256sum)
@@ -543,6 +563,8 @@ cp "$root/etc/os-release" "$root/usr/lib/os-release"
 rm "$root/etc/os-release"
 ln -s ../usr/lib/os-release "$root/etc/os-release"
 export FAKE_ADAPTER_FORBID_CONFIG_PATH=$config
+CI_FLEET_DEPLOYER_TEST_SANDBOX=1 FAKE_FAIL_CREATED_RECORD_SYNC=1 expect_failure 'created snapshot recovery record is not durable' "$installer" --install --config "$config" >/dev/null
+[[ ! -L "$root/var/lib/ci-fleet-deployer/deployed/current" ]] || fail 'failed created-snapshot record published a deployment pointer'
 first=$(CI_FLEET_DEPLOYER_TEST_SANDBOX=1 expect_success "$installer" --install --config "$config")
 unset FAKE_ADAPTER_FORBID_CONFIG_PATH
 rm "$root/etc/os-release" "$root/usr/lib/os-release"
@@ -598,6 +620,27 @@ printf '%s\n' ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer >"$
 printf 'interrupted\n' >>"$root/var/lib/ci-fleet-deployer/install-state.json"
 printf 'interrupted\n' >>"$root/etc/systemd/system/ci-fleet-deployer.service"
 expect_failure 'interrupted installer transaction requires recovery' "$installer" --check --config "$config" >/dev/null
+recovery_state_before=$(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service")
+recovery_current_before=$(readlink "$root/opt/ci-fleet-deployer/current")
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-capacity.service ci-fleet-tester-health.service ci-fleet-status-receiver.service; do
+    export "$inventory=$role_unit loaded"
+    for mode in --rollback --drain --resume --uninstall; do
+      expect_failure 'is present' "$installer" "$mode" --config "$config" >/dev/null
+      [[ -d "$interrupted" && $(readlink "$root/opt/ci-fleet-deployer/current") == "$recovery_current_before" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'mixed-role admission recovered a transaction before blocking'
+    done
+  done
+  unset "$inventory"
+done
+printf 'controller\n' >"$root/etc/systemd/system/ci-fleet-capacity.service"
+for mode in --rollback --drain --resume --uninstall; do
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" "$mode" --config "$config" >/dev/null
+  [[ -d "$interrupted" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'filesystem role admission changed recovery state'
+done
+rm "$root/etc/systemd/system/ci-fleet-capacity.service"
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --rollback --config "$config" >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --drain --config "$config" >/dev/null
+[[ -d "$interrupted" && $(sha256sum "$root/var/lib/ci-fleet-deployer/install-state.json" "$root/etc/systemd/system/ci-fleet-deployer.service") == "$recovery_state_before" ]] || fail 'failed inventory changed recovery state'
 expect_success "$installer" --repair --config "$config" >/dev/null
 [[ ! -e "$interrupted" ]] || fail 'interrupted transaction was not recovered'
 expect_success "$installer" --check --config "$config" >/dev/null
@@ -810,7 +853,7 @@ for inventory_kind in list-unit-files list-units; do
   FAKE_DEPLOYER_TESTER_UNIT=ci-fleet-tester-health.service FAKE_DEPLOYER_TESTER_UNIT_KIND=$inventory_kind expect_failure 'tester host state is present' "$installer" --check --config "$config" >/dev/null
   FAKE_DEPLOYER_TESTER_UNIT=ci-fleet-tester-health.service FAKE_DEPLOYER_TESTER_UNIT_KIND=$inventory_kind expect_failure 'tester host state is present' "$runtime" health >/dev/null
 done
-FAKE_DEPLOYER_TESTER_INVENTORY_ERROR=7 expect_failure 'tester systemd inventory could not be inspected' "$installer" --check --config "$config" >/dev/null
+FAKE_DEPLOYER_TESTER_INVENTORY_ERROR=7 expect_failure 'systemd unit-file inventory failed' "$installer" --check --config "$config" >/dev/null
 for form in directory symlink; do
   if [[ $form == directory ]]; then mkdir "$root/opt/ci-fleet-tester"; else ln -s /missing "$root/opt/ci-fleet-tester"; fi
   expect_failure 'tester host state is present' "$installer" --check --config "$config" >/dev/null
@@ -819,6 +862,32 @@ done
 printf 'mixed-role\n' >"$root/etc/systemd/system/ci-fleet-drift.timer"
 expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-drift.timer"
+role_adapter_calls=$(wc -l <"$FAKE_ADAPTER_LOG")
+for unit in ci-fleet-capacity.service ci-fleet-capacity.timer; do
+  printf 'mixed-role\n' >"$root/etc/systemd/system/$unit"
+  for mode in --check --repair; do
+    expect_failure 'ordinary CI controller or runner state is present' "$installer" "$mode" --config "$config" >/dev/null
+  done
+  rm "$root/etc/systemd/system/$unit"
+  ln -s "$tmp/missing-capacity-unit" "$root/etc/systemd/system/$unit"
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+  rm "$root/etc/systemd/system/$unit"
+  mkdir -p "$root/etc/systemd/system/timers.target.wants"
+  ln -s "$tmp/missing-capacity-unit" "$root/etc/systemd/system/timers.target.wants/$unit"
+  expect_failure 'ordinary CI controller or runner state is present' "$installer" --check --config "$config" >/dev/null
+  rm "$root/etc/systemd/system/timers.target.wants/$unit"
+done
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for unit in ci-fleet-capacity.service ci-fleet-capacity.timer ci-fleet-health.service ci-fleet-tester-health.service actions.runner.example.service ci-fleet-status-receiver.service; do
+    export "$inventory=$unit enabled"
+    for mode in --check --repair; do expect_failure 'is present' "$installer" "$mode" --config "$config" >/dev/null; done
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --check --config "$config" >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --check --config "$config" >/dev/null
+[[ $(wc -l <"$FAKE_ADAPTER_LOG") == "$role_adapter_calls" ]] || fail 'role rejection invoked an application adapter'
+FAKE_SYSTEMD_LOADED_UNITS='ci-fleet-deployer-health.service loaded active running' expect_success "$installer" --check --config "$config" >/dev/null
 printf 'receiver\n' >"$root/etc/systemd/system/ci-fleet-status-receiver.service"
 expect_failure 'status receiver state is present' "$installer" --check --config "$config" >/dev/null
 rm "$root/etc/systemd/system/ci-fleet-status-receiver.service"
@@ -1878,7 +1947,7 @@ install -m 0600 "$tmp/config.staging" "$config"
 write_evidence staging example-staging
 cp "$approval" "$request"; chmod 0600 "$request"
 expect_failure 'usage: deployer-runtime.sh health|cleanup|deploy|drain' "$runtime" rollback >/dev/null
-for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/systemd/system/actions.runner.drain-test.service" "$root/etc/ci-fleet-tester" "$root/etc/systemd/system/ci-fleet-status-receiver.service" "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
+for role_path in "$root/etc/systemd/system/ci-fleet-capacity.service" "$root/etc/systemd/system/ci-fleet-capacity.timer" "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/systemd/system/actions.runner.drain-test.service" "$root/etc/ci-fleet-tester" "$root/etc/systemd/system/ci-fleet-status-receiver.service" "$root/opt/ci-fleet-status" "$root/var/lib/ci-fleet-status-installer"; do
   mkdir "$role_path"
   expect_failure 'is present' "$runtime" drain >/dev/null
   [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'mixed-role runtime drain published a maintenance marker'
@@ -1887,6 +1956,18 @@ for role_path in "$root/etc/systemd/system/ci-fleet-health.service" "$root/etc/s
   fi
   rmdir "$role_path"
 done
+role_adapter_calls=$(wc -l <"$FAKE_ADAPTER_LOG")
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for unit in ci-fleet-capacity.service ci-fleet-capacity.timer ci-fleet-health.service ci-fleet-tester-health.service actions.runner.example.service ci-fleet-status-receiver.service; do
+    export "$inventory=$unit enabled"
+    for operation in health cleanup deploy drain; do expect_failure 'is present' "$runtime" "$operation" >/dev/null; done
+    [[ ! -e "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'mixed-role runtime inventory published a drain marker'
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$runtime" drain >/dev/null
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$runtime" health >/dev/null
+[[ $(wc -l <"$FAKE_ADAPTER_LOG") == "$role_adapter_calls" ]] || fail 'runtime role rejection invoked an application adapter'
 FAKE_DOCKER_UNAVAILABLE=1 expect_success "$runtime" drain >/dev/null
 [[ -f "$root/var/lib/ci-fleet-deployer/drained" ]] || fail 'Docker outage prevented emergency drain'
 rm "$root/var/lib/ci-fleet-deployer/drained"
@@ -2092,6 +2173,29 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 expect_failure 'credential file has unsafe owner or mode' "$runtime" deploy >/dev/null
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'deployment ran with unsafe file credentials'
 chmod 0600 "$credential"
+# The retained credential can differ from the already-advanced deployed snapshot.
+retained_policy=$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf
+install -m 0600 "$retained_policy" "$tmp/runtime-lkg-credential-policy.saved"
+retained_credential=$root/etc/ci-fleet-deployer/credentials/retained-only.credential
+python3 - "$retained_policy" "$retained_credential" <<'PYTEST'
+from pathlib import Path
+import re, sys
+p = Path(sys.argv[1]); p.write_text(re.sub(r'(?m)^CREDENTIAL_REF=.*$', 'CREDENTIAL_REF=' + sys.argv[2], p.read_text()))
+PYTEST
+consumption_before=$(find "$ledger" -type f -printf '%f\n' | sort)
+deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
+for invalid_credential in missing symlink writable; do
+  rm -f "$retained_credential"
+  case $invalid_credential in
+    symlink) ln -s "$credential" "$retained_credential" ;;
+    writable) install -m 0644 "$credential" "$retained_credential" ;;
+  esac
+  expect_failure 'credential file' "$runtime" deploy >/dev/null
+  [[ $(find "$ledger" -type f -printf '%f\n' | sort) == "$consumption_before" ]] || fail 'unusable retained credential consumed approval'
+  [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" && ! -e $active ]] || fail 'unusable retained credential invoked deploy'
+done
+rm -f "$retained_credential"
+install -m 0600 "$tmp/runtime-lkg-credential-policy.saved" "$retained_policy"
 printf 'unrelated-audit\n' >"$tmp/unrelated-audit"
 rm -f "$root/var/log/ci-fleet-deployer/audit.log"
 ln -s "$tmp/unrelated-audit" "$root/var/log/ci-fleet-deployer/audit.log"

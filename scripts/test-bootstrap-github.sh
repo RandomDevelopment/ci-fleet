@@ -105,7 +105,8 @@ config_checkout=$tmp/config-checkout
 mkdir "$config_checkout"
 cp -a "$repo_root/templates/config-repository/." "$config_checkout/"
 fixture_engine_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["controllers"]["example-ci-01"]["engine_ref"])' "$config_checkout/fleet.json")
-python3 "$repo_root/templates/config-repository/scripts/init.py" --organization acme-org --project example-repo --repository acme-org/example-repo --runner-group example-ci-experimental --controller example-ci-01 --location example-site --engine-ref "$fixture_engine_ref" --output "$config_checkout/fleet.json" --force
+python3 "$repo_root/templates/config-repository/scripts/init.py" --organization acme-org --project example-repo --repository acme-org/example-repo --runner-group example-ci-experimental --controller example-ci-01 --location example-site --engine-ref "$fixture_engine_ref" \
+  --architecture amd64 --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" --output "$config_checkout/fleet.json" --force
 if python3 "$config_checkout/scripts/validate.py" --config "$config_checkout/fleet.json" --strict >/dev/null 2>&1; then fail 'unreviewed initializer network placeholder passed strict validation'; fi
 python3 - "$config_checkout/fleet.json" <<'PY'
 import json,sys

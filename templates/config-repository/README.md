@@ -64,7 +64,10 @@ flowchart LR
      --max-runners 1 \
      --networks-per-runner 1 \
      --default-bridge-cidr 192.0.2.1/24 \
-     --engine-ref <reviewed-ci-fleet-commit>
+     --engine-ref REVIEWED_CI_FLEET_COMMIT \
+     --architecture amd64 \
+     --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID \
+     --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    ```
 
 3. Edit `fleet.json` to add the organization's real logical mappings and replace

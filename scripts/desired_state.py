@@ -8,6 +8,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+import platform
 import re
 import stat
 import sys
@@ -36,6 +37,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
     "CI_FLEET_CONFIG_REF",
     "CI_FLEET_CONFIG_REPOSITORY",
     "CI_FLEET_CONTROLLER_IMAGE",
+    "CI_FLEET_CONTROLLER_IMAGE_DIGEST",
     "CI_FLEET_CONTROLLER_STATE",
     "CI_FLEET_DESIRED_STATE_SCHEMA",
     "CI_FLEET_DOCKER_DEFAULT_ADDRESS_POOL_COUNT",
@@ -54,6 +56,7 @@ RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
     "CI_FLEET_RUNNER_CPUS",
     "CI_FLEET_RUNNER_GROUP",
     "CI_FLEET_RUNNER_IMAGE",
+    "CI_FLEET_RUNNER_IMAGE_DIGEST",
     "CI_FLEET_RUNNER_MEMORY_MIB",
     "CI_FLEET_SCALE_SET_NAME",
     "CI_FLEET_STATUS_REPORTING_REQUIRED",
@@ -403,6 +406,7 @@ def build_rendered_env(
     config_repository: str,
     config_ref: str,
     docker_gid: int,
+    machine: str | None = None,
     engine_capabilities: set[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     controller, pool = select_controller(config, controller_id)
@@ -436,6 +440,17 @@ def build_rendered_env(
         ):
             raise DesiredStateError("selected engine does not support default bridge CIDR configuration")
     short_commit = engine_commit[:12]
+    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine or platform.machine())
+    if architecture is None:
+        raise DesiredStateError("host architecture is unsupported for managed images")
+    managed_images = config.get("managed_images")
+    if managed_images is None:
+        images = None
+    else:
+        try:
+            images = managed_images[engine_commit][architecture]
+        except KeyError as error:
+            raise DesiredStateError(f"reviewed managed image IDs are missing for {architecture}") from error
     storage_retention = controller.get("docker_storage_retention")
     if "docker_storage_retention" in controller:
         if not isinstance(storage_retention, dict) or storage_retention != {"exclusive_fleet_daemon": True} or storage_retention.get("exclusive_fleet_daemon") is not True:
@@ -449,6 +464,7 @@ def build_rendered_env(
         "CI_FLEET_CONFIG_REF": config_ref,
         "CI_FLEET_CONFIG_REPOSITORY": config_repository,
         "CI_FLEET_CONTROLLER_IMAGE": f"ci-fleet-controller:{short_commit}",
+
         "CI_FLEET_CONTROLLER_STATE": state,
         "CI_FLEET_DESIRED_STATE_SCHEMA": "3",
         "CI_FLEET_DOCKER_GID": str(docker_gid),
@@ -461,11 +477,16 @@ def build_rendered_env(
         "CI_FLEET_RUNNER_CPUS": str(controller["runner_resources"]["cpu_cores"]),
         "CI_FLEET_RUNNER_GROUP": pool["runner_group"],
         "CI_FLEET_RUNNER_IMAGE": f"ci-fleet-runner:{short_commit}",
+
         "CI_FLEET_RUNNER_MEMORY_MIB": str(controller["runner_resources"]["memory_mib"]),
         "CI_FLEET_SCALE_SET_NAME": controller["scale_set_name"],
         "CI_FLEET_VERSION": short_commit,
         **validate_host_values(host_values),
     }
+    if images is not None:
+        rendered["CI_FLEET_CONTROLLER_IMAGE_DIGEST"] = images["controller"]
+        rendered["CI_FLEET_RUNNER_IMAGE_DIGEST"] = images["runner"]
+
     if CAPACITY_TELEMETRY_CAPABILITY in (engine_capabilities or set()):
         rendered["CI_FLEET_POOL"] = controller["pool"]
     if network_policy_configured:
@@ -507,6 +528,7 @@ def build_rendered_env(
         "config_ref": config_ref,
         "engine_ref": engine_commit,
         "engine_repository": config["organization"]["delivery_engine"],
+        "architecture": architecture,
         "status_reporting_configured": reporting_configured,
         "status_reporting_required": reporting_required,
         "docker_network_policy_configured": network_policy_configured,

@@ -17,6 +17,12 @@ python3 -m py_compile \
   scripts/cleanup_storage.py \
   scripts/test_cleanup_storage.py \
   scripts/health.py \
+  scripts/endpoint_snapshot.py \
+  scripts/endpoint_snapshot_sources.py \
+  scripts/endpoint_snapshot_store.py \
+  scripts/test_endpoint_snapshot.py \
+  scripts/test_endpoint_snapshot_sources.py \
+  scripts/test_endpoint_snapshot_store.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
   scripts/scan_committed_secrets.py \
@@ -38,6 +44,9 @@ python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py
 python3 scripts/test_health.py
+python3 scripts/test_endpoint_snapshot.py
+python3 scripts/test_endpoint_snapshot_sources.py
+python3 scripts/test_endpoint_snapshot_store.py
 python3 scripts/test_status_receiver.py
 python3 scripts/test_quickstart.py
 scripts/test-bootstrap-github.sh
@@ -51,6 +60,8 @@ scripts/test-capacity-preflight.sh
 scripts/test-numeric-regressions.sh
 scripts/test-install-tester.sh
 bash scripts/test-capacity-unit-stop.sh
+bash scripts/test-manager-staging.sh
+bash scripts/test-managed-image-build.sh
 scripts/test-healthcheck.sh
 bash scripts/test-systemd-rollback.sh
 scripts/test-install-worker-controller.sh
@@ -70,7 +81,14 @@ export CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE="$tmp"
 export CI_FLEET_DOCKER_GID=999
 export CI_FLEET_RUNNER_IMAGE=${CI_FLEET_RUNNER_IMAGE:-ci-fleet-runner:dev}
 export CI_FLEET_CONTROLLER_IMAGE=${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+if env -u CI_FLEET_RUNNER_IMAGE_DIGEST -u CI_FLEET_CONTROLLER_IMAGE_DIGEST docker compose -f deploy/compose.yaml config --quiet; then
+  printf 'FAIL: an incumbent installer can load runtime Compose without reviewed image IDs\n' >&2
+  exit 1
+fi
+export CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:4444444444444444444444444444444444444444444444444444444444444444
+export CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:3333333333333333333333333333333333333333333333333333333333333333
 docker compose -f deploy/compose.yaml config --quiet
+docker compose -f deploy/compose.yaml config --format json | python3 -c 'import json, os, sys; config = json.load(sys.stdin); assert config["services"]["controller"]["environment"]["CI_FLEET_RUNNER_IMAGE"] == os.environ["CI_FLEET_RUNNER_IMAGE_DIGEST"]'
 
 docker compose -f deploy/compose.yaml build runner-image controller
 docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'

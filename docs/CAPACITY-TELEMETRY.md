@@ -15,7 +15,7 @@ Container IDs, names, repositories, jobs, logs, environment variables, source, n
 Run on the controller host; reads local state only and changes nothing:
 
 ```bash
-sudo /opt/ci-fleet/current/scripts/health.py capacity-report
+sudo python3 /opt/ci-fleet/current/scripts/health.py capacity-report
 ```
 
 The JSON report groups the preceding seven days by logical pool and gives nearest-rank p50/p95 values for every observed host and runner metric, plus sample and anonymous runner-observation counts. An empty report means no managed runner was observed during the period.

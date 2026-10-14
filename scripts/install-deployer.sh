@@ -191,7 +191,7 @@ else
   [[ -z "$root" ]] || die 'alternate root is forbidden'
   [[ -z ${CI_FLEET_DEPLOYER_EUID_OVERRIDE:-} ]] || die 'effective UID override is test-only'
 fi
-if [[ "$mode" != check && "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
+if [[ "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
 
 root_path() { printf '%s%s' "$root" "$1"; }
 etc_root=$(root_path /etc/ci-fleet-deployer)
@@ -481,25 +481,16 @@ require_maintenance_host() {
 }
 
 reject_other_role_state() {
-  local unit path runner_unit inventory_kind inventory inventory_status
-  for inventory_kind in list-unit-files list-units; do
-    inventory_status=0
-    inventory=$(SYSTEMD_COLORS=0 systemctl "$inventory_kind" --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
-    if ((inventory_status != 0)); then
-      [[ $inventory_kind == list-unit-files && $inventory_status == 1 && -z $inventory ]] || block 'tester systemd inventory could not be inspected'
-    fi
-    while read -r unit _; do
-      case $unit in ci-fleet-tester*) block 'tester host state is present' ;; esac
-    done <<<"$inventory"
-  done
+  local unit path runner_unit output loaded_unit inventory_status
+  local -a controller_units=(ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer ci-fleet-capacity.service ci-fleet-capacity.timer actions.runner.service)
   for path in "$(root_path /opt/ci-fleet-tester)" "$(root_path /etc/ci-fleet-tester)" "$(root_path /var/lib/ci-fleet-tester)" "$systemd_root"/ci-fleet-tester*; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'tester host state is present'
   done
   for path in "$systemd_root/ci-fleet-status-receiver.service" "$(root_path /etc/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status)" "$(root_path /opt/ci-fleet-status)" "$(root_path /var/lib/ci-fleet-status-installer)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'status receiver state is present'
   done
-  for unit in ci-fleet-health.service ci-fleet-health.timer ci-fleet-reconcile.service ci-fleet-reconcile.timer ci-fleet-cleanup.service ci-fleet-cleanup.timer ci-fleet-drift.service ci-fleet-drift.timer actions.runner.service; do
-    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
+  for unit in "${controller_units[@]}"; do
+    [[ ! -e "$systemd_root/$unit" && ! -L "$systemd_root/$unit" && ! -L "$systemd_root/multi-user.target.wants/$unit" && ! -L "$systemd_root/timers.target.wants/$unit" ]] || block 'ordinary CI controller or runner state is present'
   done
   shopt -s nullglob
   for runner_unit in "$systemd_root"/actions.runner.*.service "$systemd_root"/multi-user.target.wants/actions.runner.*.service; do
@@ -510,6 +501,24 @@ reject_other_role_state() {
   for path in "$(root_path /etc/ci-fleet/ci-fleet.env)" "$(root_path /etc/ci-fleet/host.env)" "$(root_path /etc/ci-fleet/secrets)" "$(root_path /opt/ci-fleet/current)" "$(root_path /var/lib/ci-fleet/install-state.json)"; do
     [[ ! -e "$path" && ! -L "$path" ]] || block 'ordinary CI controller or runner state is present'
   done
+  inventory_status=0
+  output=$(SYSTEMD_COLORS=0 systemctl list-unit-files --all --full --plain --no-legend --no-pager 2>&1) || inventory_status=$?
+  # list-unit-files returns status 1 for an empty inventory without diagnostics.
+  if ((inventory_status != 0)); then
+    [[ $inventory_status == 1 && -z $output ]] || block 'systemd unit-file inventory failed'
+  fi
+  output+=$'\n'
+  output+=$(SYSTEMD_COLORS=0 systemctl list-units --all --full --plain --no-legend --no-pager 2>&1) || block 'systemd loaded-unit inventory failed'
+  while read -r loaded_unit _; do
+    case "$loaded_unit" in
+      ci-fleet-tester*) block 'tester host state is present' ;;
+      ci-fleet-status-receiver.service) block 'status receiver state is present' ;;
+      actions.runner.service|actions.runner.*.service) block 'ordinary GitHub Actions runner service is present' ;;
+    esac
+    for unit in "${controller_units[@]}"; do
+      [[ "$loaded_unit" != "$unit" ]] || block 'ordinary CI controller or runner state is present'
+    done
+  done <<<"$output"
 }
 
 reject_mixed_role() {
@@ -659,7 +668,10 @@ acquire_lock() {
   install -d -m 0755 "$(root_path /run)"
   exec 8>"$(root_path /run/ci-fleet-role-admission.lock)"
   flock -n 8 || block 'another ci-fleet role installation is already running'
-  recover_adapter_guard
+  reject_other_role_state
+  if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
+    python3 "$repo_root/scripts/deployer_adapter.py" consumption --store "$log_root" || block 'approval consumption recovery failed'
+  fi
   [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
@@ -688,6 +700,7 @@ acquire_lock() {
   done
   shopt -u nullglob
   recover_interrupted_transaction
+  recover_adapter_guard
   if [[ -e "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
 }
 
@@ -1000,7 +1013,7 @@ restore_transaction() {
 }
 
 recover_interrupted_transaction() {
-  local candidates=() candidate
+  local candidates=() candidate pending_unit=
   shopt -s nullglob
   candidates=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
@@ -1020,15 +1033,20 @@ recover_interrupted_transaction() {
   fi
   if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
     secure_file "$candidate/adapter-unit" 'adapter unit guard'
-    local pending_unit
     pending_unit=$(<"$candidate/adapter-unit")
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
     adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
+    if [[ $transaction_kind == rollback ]]; then
+      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+    fi
   fi
   local candidate_marker=$candidate/application-rollback-committed
   if [[ -e "$candidate/commit" || -L "$candidate/commit" ]]; then
     secure_directory "$candidate/commit" 700 0 || block 'rollback commit directory is unsafe'
     candidate_marker=$candidate/commit/application-rollback-committed
+  fi
+  if [[ -n $pending_unit ]]; then
+    retire_adapter_guard "$pending_unit" "$candidate" || block 'completed adapter guard could not be retired; retain the transaction for operator recovery'
   fi
   transaction_dir=$candidate
   rollback_commit_file=$candidate_marker
@@ -1254,7 +1272,7 @@ PY
 }
 
 publish_deployed_snapshot() {
-  local policy=$1 state=$2 snapshot pointer retired incumbent
+  local policy=$1 state=$2 created_record=${3:-} snapshot pointer retired incumbent record_temporary
   secure_directory "$deployed_root" 700 1 || return
   if [[ -e "$deployed_current" || -L "$deployed_current" ]]; then
     # An unusable incumbent snapshot must not block publication of a freshly
@@ -1267,8 +1285,18 @@ publish_deployed_snapshot() {
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
     rm -f -- "$deployed_current" || return
   fi
-  snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
-  chmod 0700 "$snapshot" || return
+  if [[ -n $created_record ]]; then
+    snapshot=$(mktemp -u "$deployed_root/.snapshot.XXXXXX") || return
+    record_temporary=$(mktemp "$(dirname "$created_record")/.deployed-created.XXXXXX") || return
+    printf '%s\n' "${snapshot##*/}" >"$record_temporary" || return
+    sync -f "$record_temporary" 2>/dev/null || block 'created snapshot recovery record is not durable'
+    mv -Tf "$record_temporary" "$created_record" || return
+    sync -f "$(dirname "$created_record")" 2>/dev/null || block 'created snapshot recovery record publication is not durable'
+    mkdir -m 0700 "$snapshot" || return
+  else
+    snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
+    chmod 0700 "$snapshot" || return
+  fi
   install -m 0600 "$policy" "$snapshot/policy.conf" || return
   install -m 0600 "$state" "$snapshot/state.json" || return
   pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
@@ -1328,12 +1356,12 @@ adapter_unit_inactive() {
 }
 
 retire_adapter_guard() {
-  local unit=$1 guard
+  local unit=$1 guard guard_transaction=${2:-${transaction_dir:-}}
   if [[ $testing != 1 ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$unit" || return 1
   fi
   local -a guards=("$adapter_guard")
-  [[ -z ${transaction_dir:-} ]] || guards+=("$transaction_dir/adapter-unit")
+  [[ -z $guard_transaction ]] || guards+=("$guard_transaction/adapter-unit")
   for guard in "${guards[@]}"; do
     [[ -e $guard || -L $guard ]] || continue
     [[ ! -L $guard && -f $guard && $(stat -c '%u:%a' "$guard") == "$expected_uid:600" && $(<"$guard") == "$unit" ]] || return 1
@@ -1566,8 +1594,7 @@ PY
   restore_adapter_state || die 'candidate health state restoration failed'
   if ! state_matches || ! current_matches || ! units_match; then die 'candidate health changed installed core state'; fi
   if [[ ! -e "$deployed_current" && ! -L "$deployed_current" ]]; then
-    publish_deployed_snapshot "$active_policy" "$state_file"
-    if [[ -n ${transaction_dir:-} && -d $transaction_dir ]]; then readlink "$deployed_current" >"$transaction_dir/deployed-created"; fi
+    publish_deployed_snapshot "$active_policy" "$state_file" "$transaction_dir/deployed-created"
   fi
   commit_transaction
   health=healthy
