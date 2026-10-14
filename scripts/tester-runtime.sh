@@ -33,7 +33,7 @@ while (($#)); do
 done
 [[ -n $action ]] || { usage; exit 2; }
 case $action in --converge|--reset|--remove|--inspect) [[ $environment =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die 'environment ID is invalid' ;; *) [[ -z $environment ]] || die '--environment is not valid for this action' ;; esac
-required_commands='awk basename chmod cmp date df dirname docker du env find flock grep install mkdir mktemp mv python3 readlink rm stat wc'
+required_commands='awk basename chmod date df dirname docker du env find flock grep install mkdir mktemp mv python3 readlink rm stat wc'
 case $action in --check|--health) required_commands+=' curl getent' ;; esac
 case $action in --remove|--cleanup) ;; *) required_commands+=' systemctl' ;; esac
 case $action in --converge|--reset|--inspect|--health) required_commands+=' timeout' ;; esac
@@ -165,6 +165,9 @@ if not isinstance(services,dict) or route_service not in services: raise SystemE
 image=re.compile(r'^[a-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}$')
 ports=[]
 for name,service in services.items():
+    # Debian's Compose v2 renders byte limits as decimal strings.
+    for key in ('mem_limit','memswap_limit'):
+        if isinstance(service.get(key),str) and re.fullmatch(r'[0-9]+',service[key]): service[key]=int(service[key])
     if not image.fullmatch(str(service.get('image',''))): raise SystemExit(f'{name}: image must use an immutable sha256 digest')
     if service.get('privileged') or service.get('provider') or service.get('runtime') or service.get('network_mode') or service.get('pid') or service.get('ipc') or service.get('uts') or service.get('userns_mode') or service.get('external_links') or service.get('pre_start') or service.get('post_start') or service.get('pre_stop'): raise SystemExit(f'{name}: external runtime/namespace/link/logging/privileged lifecycle access is forbidden')
     if service.get('logging') != {'driver':'local','options':{'max-size':'10m','max-file':'3','compress':'true'}}: raise SystemExit(f'{name}: bounded local logging is required')
@@ -205,6 +208,7 @@ for section in ('networks','volumes'):
         if section == 'networks' and item.get('enable_ipv6'): raise SystemExit(f'{section}.{name}: IPv6 is unsupported')
         if section == 'networks' and item.get('ipam'): raise SystemExit(f'{section}.{name}: custom network IPAM configuration is forbidden')
         if section == 'volumes' and (item.get('driver') or item.get('driver_opts')): raise SystemExit(f'{section}.{name}: custom volume drivers are forbidden')
+with open(sys.argv[1],'w') as output: json.dump(value,output)
 PY
   validate_secrets "$rendered" "$secret_dir" || return 1
   image_digests=$(python3 - "$rendered" <<'PY'
@@ -305,7 +309,7 @@ prepare_converge() {
   if ! validate_compose "$prepared_rendered"; then rm -f "$prepared_rendered"; die 'compose policy validation failed'; fi
   if [[ $action == --converge && -f $(state_path "$environment") ]]; then
     secure_file "$(deployed_compose_path "$environment")" 600
-    if ! cmp -s "$prepared_rendered" "$(deployed_compose_path "$environment")"; then rm -f "$prepared_rendered"; die 'changing an installed Compose model requires reset'; fi
+    if ! python3 -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])) != json.load(open(sys.argv[2])))' "$prepared_rendered" "$(deployed_compose_path "$environment")"; then rm -f "$prepared_rendered"; die 'changing an installed Compose model requires reset'; fi
   fi
 }
 

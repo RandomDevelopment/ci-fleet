@@ -233,6 +233,11 @@ case ${operation:-} in
       sub-nano-cpu) service_extra=',"cpus":0.0000000005,"mem_limit":134217728,"pids_limit":128' ;;
       unlimited-swap) service_extra+=',"memswap_limit":-1' ;;
       finite-swap) service_extra+=',"memswap_limit":402653184' ;;
+      decimal-byte-limits) service_extra=',"cpus":0.5,"mem_limit":"134217728","memswap_limit":"268435456","pids_limit":128' ;;
+      numeric-byte-limits) service_extra+=',"memswap_limit":268435456' ;;
+      memory-unit-string) service_extra=',"cpus":0.5,"mem_limit":"128m","pids_limit":128' ;;
+      negative-swap-string) service_extra+=',"memswap_limit":"-1"' ;;
+      boolean-memory) service_extra=',"cpus":0.5,"mem_limit":true,"pids_limit":128' ;;
       oom-priority) service_extra=',"cpus":0.5,"mem_limit":134217728,"pids_limit":128,"oom_kill_disable":true,"oom_score_adj":-1000' ;;
       two-services) extra_services=$(printf ',"worker":{"image":"%s","cgroup":"private","privileged":false,"read_only":true,"logging":{"driver":"local","options":{"max-size":"10m","max-file":"3","compress":"true"}},"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"volumes":[],"cpus":0.5,"mem_limit":134217728,"pids_limit":128}' "$image") ;;
       valid-secret|outside-secret)

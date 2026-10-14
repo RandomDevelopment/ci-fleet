@@ -301,9 +301,20 @@ done
 write_environment finite-swap 18099
 FAKE_TESTER_ROUTE_PORT=18099 FAKE_TESTER_POLICY=finite-swap "$runtime" --converge --environment finite-swap >/dev/null || fail 'finite memory-plus-swap limit was rejected'
 FAKE_TESTER_ROUTE_PORT=18099 "$runtime" --remove --environment finite-swap >/dev/null
+write_environment decimal-bytes 18098
+FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=decimal-byte-limits "$runtime" --converge --environment decimal-bytes >/dev/null || fail 'Compose decimal byte limits were rejected'
+python3 - "$root/var/lib/ci-fleet-tester/environments/decimal-bytes.compose.json" <<'PY_BYTES'
+import json,sys
+model=json.load(open(sys.argv[1])); service=model['services']['web']
+assert service['mem_limit']==134217728 and service['memswap_limit']==268435456
+with open(sys.argv[1],'w') as output: json.dump(model,output,indent=2)
+PY_BYTES
+FAKE_TESTER_ROUTE_PORT=18098 FAKE_TESTER_POLICY=numeric-byte-limits "$runtime" --converge --environment decimal-bytes >/dev/null || fail 'numeric and decimal-string byte limits differed on repeated convergence'
+FAKE_TESTER_ROUTE_PORT=18098 "$runtime" --health >/dev/null || fail 'normalized byte limits failed live inspection'
+FAKE_TESTER_ROUTE_PORT=18098 "$runtime" --remove --environment decimal-bytes >/dev/null
 write_environment preview-b 18080
 if FAKE_TESTER_ROUTE_PORT=18080 "$runtime" --converge --environment preview-b >/dev/null 2>&1; then fail 'duplicate route port was accepted'; fi
-for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded sub-nano-cpu unlimited-swap oom-priority; do
+for policy in mutable privileged bind broad-port udp-route external-network environment configs use-api-socket namespace-share false-nnp unconfined custom-volume volumes-from external-links userns-host cgroup-host uts-host remote-logging custom-network ipam replicas scale lifecycle-hook provider pre-start models service-models top-models anonymous-volume undeclared-volume gpu deploy-device build profiles label-file runtime unbounded sub-nano-cpu unlimited-swap oom-priority memory-unit-string negative-swap-string boolean-memory; do
   write_environment "bad-$policy" 18081
   : >"$tmp/docker.log"
   if FAKE_TESTER_ROUTE_PORT=18081 FAKE_TESTER_POLICY=$policy "$runtime" --converge --environment "bad-$policy" >/dev/null 2>&1; then fail "unsafe compose policy was accepted: $policy"; fi

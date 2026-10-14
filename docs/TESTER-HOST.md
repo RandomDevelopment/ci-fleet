@@ -17,6 +17,8 @@ It rejects mutable images, public port binds, host bind mounts, external/unscope
 
 Compose source validation requires Debian's `python3-yaml` package. It decodes YAML keys before Compose runs and rejects external file loaders, including `include`, `extends`, `label_file`, and `env_file`. Escaped, tagged, anchored, and aliased keys follow the same rule. Duplicate and complex mapping keys are unsupported.
 
+Compose may render memory and swap byte limits as JSON numbers or decimal strings. The runtime stores both as numeric byte limits before activation and live inspection; malformed or unlimited values still fail policy validation. Repeated convergence compares decoded models so a change in JSON formatting alone does not require a reset.
+
 Health checks compare live volume names, drivers, network attachments, resource limits, and OOM settings with the protected model. A running service without a Docker healthcheck is allowed; an unhealthy Docker healthcheck still fails validation. Health checks also attempt a TCP connection to the declared loopback route with a five-second timeout. DNS and HTTPS probes bypass inherited proxies. Unmanaged systemd drop-ins and markers for another host role prevent activation.
 
 Compose provider executables, init containers, model-runner dependencies, and anonymous or undeclared volume mounts are unsupported. Override every image-declared `VOLUME` target with a declared project mount; otherwise post-activation inspection rejects its anonymous mount and retains the environment for scoped removal. Networks must keep IPv4 enabled; IPv6 networks and allocations are unsupported. Service-level `tmpfs` is unsupported; declare tmpfs mounts through `volumes` with `type: tmpfs`.
