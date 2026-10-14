@@ -379,7 +379,9 @@ class Policy:
         config = image.get("Config")
         require(isinstance(config, dict), "approved image configuration is unavailable")
         if len(host["SecurityOpt"]) == 2:
-            user = value.get("User", config.get("User", ""))
+            user = value.get("User", "")
+            if user == "":
+                user = config.get("User", "")
             user_id = user.split(":")[0] if isinstance(user, str) else ""
             require(user_id not in ("", "root")
                     and (not re.fullmatch(r"[+-]?[0-9]+", user_id) or int(user_id) > 0),

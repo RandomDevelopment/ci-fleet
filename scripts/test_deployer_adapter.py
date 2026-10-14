@@ -116,6 +116,19 @@ class Containment(unittest.TestCase):
                 body['HostConfig']['SecurityOpt'] = options
                 self.policy.authorize('POST', '/containers/create?name=ci-fleet-deploy-example-browser', json.dumps(body).encode())
 
+    def test_empty_request_user_inherits_reviewed_image_user(self):
+        profile = (Path(__file__).resolve().parents[1] / 'deploy/seccomp/chromium-v1.json').read_text()
+        body = copy.deepcopy(self.body)
+        body['User'] = ''
+        body['HostConfig']['SecurityOpt'] = ['no-new-privileges', 'seccomp=' + profile]
+        image = self.backend.resources['images', self.policy.image]['Config']
+        image['User'] = '1000'
+        self.policy.authorize('POST', '/containers/create?name=ci-fleet-deploy-example-browser', json.dumps(body).encode())
+        for user in ('', 'root', '0', '+0', '-0'):
+            with self.subTest(image_user=user), self.assertRaises(ValueError):
+                image['User'] = user
+                self.policy.container(body)
+
     def test_image_volumes_cannot_create_unlabelled_resources(self):
         image = self.backend.resources['images', self.policy.image]
         image['Config']['Volumes'] = {'/data': {}}
