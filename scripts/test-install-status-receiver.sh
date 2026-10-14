@@ -11,6 +11,18 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 source_tree="$tmp/source"
 root="$tmp/root"
+fake_bin="$tmp/bin"
+mkdir -p "$fake_bin"
+cat >"$fake_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
+  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$fake_bin/systemctl"
+export PATH="$fake_bin:$PATH"
 mkdir -p "$source_tree/scripts" "$source_tree/deploy/status-receiver"
 mkdir -p "$root/run/lock"
 chmod 1777 "$root/run/lock"
@@ -54,6 +66,57 @@ fi
 rm -rf "$root/opt/ci-fleet-status"
 mkdir -p "$root/etc/systemd/system"
 chmod 0750 "$root/etc/systemd/system"
+printf 'deployer\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "deployer role was accepted by the status receiver installer" >&2
+  exit 1
+fi
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+printf 'deployer\n' >"$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "partial deployer unit set was accepted by the status receiver" >&2; exit 1
+fi
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+mkdir -p "$root/var/lib/ci-fleet-deployer-container-credentials"
+if run --check >/dev/null 2>&1; then
+  echo "retained deployer credentials were accepted by the status receiver" >&2; exit 1
+fi
+rmdir "$root/var/lib/ci-fleet-deployer-container-credentials"
+
+for form in directory symlink; do
+  if [[ $form == directory ]]; then mkdir "$root/opt/ci-fleet-deployer"; else ln -s /missing "$root/opt/ci-fleet-deployer"; fi
+  if run --check >/dev/null 2>&1; then
+    echo "retained deployer install root was accepted by the status receiver" >&2; exit 1
+  fi
+  if [[ $form == directory ]]; then rmdir "$root/opt/ci-fleet-deployer"; else rm "$root/opt/ci-fleet-deployer"; fi
+done
+
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-deployer.service ci-fleet-deployer-health.timer ci-fleet-deployer-adapter-transient.service; do
+    export "$inventory=$role_unit loaded"
+    for mode in --install --check --upgrade --rollback; do
+      output=$(run "$mode" --ref "$first" 2>&1) && { echo 'effective deployer unit was accepted by receiver' >&2; exit 1; }
+      grep -Fq 'deployer host state is present' <<<"$output"
+    done
+  done
+  unset "$inventory"
+done
+for inventory in FAKE_SYSTEMD_UNIT_FILES_EXIT FAKE_SYSTEMD_LOADED_UNITS_EXIT; do
+  export "$inventory=1"
+  output=$(run --install --ref "$first" 2>&1) && { echo 'failed systemd inventory was accepted by receiver' >&2; exit 1; }
+  grep -Fq 'inventory failed' <<<"$output"
+  unset "$inventory"
+done
+test ! -L "$root/opt/ci-fleet-status/current"
+
+role_lock="$root/run/ci-fleet-role-admission.lock"
+exec 8>"$role_lock"
+flock -n 8
+if run --install --ref "$first" >/dev/null 2>&1; then
+  echo "status receiver installation ignored the shared role lock" >&2
+  exit 1
+fi
+flock -u 8; exec 8>&-
 export CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE=$tmp/fail-reload-once
 : >"$CI_FLEET_STATUS_TEST_FAIL_RELOAD_ONCE"
 if run --install --ref "$first" >/dev/null 2>&1; then

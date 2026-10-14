@@ -368,6 +368,10 @@ EOF
 cat >"$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 [[ -z "${FAKE_SYSTEMCTL_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_LOG"
+case "${1:-}" in
+  list-unit-files) printf '%s\n' "${FAKE_SYSTEMD_UNIT_FILES:-}"; exit "${FAKE_SYSTEMD_UNIT_FILES_EXIT:-0}" ;;
+  list-units) printf '%s\n' "${FAKE_SYSTEMD_LOADED_UNITS:-}"; exit "${FAKE_SYSTEMD_LOADED_UNITS_EXIT:-0}" ;;
+esac
 if [[ -n "${FAKE_FAIL_CAPACITY_STOP_ONCE:-}" && -f "$FAKE_FAIL_CAPACITY_STOP_ONCE" && "$*" == 'stop ci-fleet-capacity.service' ]]; then
   rm -f "$FAKE_FAIL_CAPACITY_STOP_ONCE"
   exit 96
@@ -874,6 +878,36 @@ expect_failure 'host configuration must be owned by root' "$installer" --install
 unset FAKE_WRONG_HOST_CONFIG_OWNER
 expect_failure 'managed installs require the default' "$installer" --check "${base_args[@]}" --ref "$ref_one" --host-config "$tmp/custom-host.env"
 
+# A controller must never install onto a deployer host.
+mkdir -p "$root/etc/systemd/system" "$root/var/lib/ci-fleet-deployer"
+printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer.service"
+expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+rm "$root/etc/systemd/system/ci-fleet-deployer.service"
+cp "$host_config" "$root/etc/ci-fleet/ci-fleet.env"
+mv "$host_config" "$tmp/adopt-role-host.env.saved"
+expect_failure 'deployer host state is present' "$installer" --adopt "${base_args[@]}" --ref "$ref_one"
+[[ ! -e "$host_config" ]] || fail 'rejected adopt materialized controller credential state'
+rm "$root/etc/ci-fleet/ci-fleet.env"
+mv "$tmp/adopt-role-host.env.saved" "$host_config"
+rmdir "$root/var/lib/ci-fleet-deployer"
+for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
+  mkdir -p "$(dirname "$root$marker")"
+  ln -s /missing "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+done
+
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  for role_unit in ci-fleet-deployer.service ci-fleet-deployer-health.timer ci-fleet-deployer-adapter-transient.service; do
+    export "$inventory=$role_unit loaded"
+    expect_failure 'deployer host state is present' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+  done
+  unset "$inventory"
+done
+FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "$installer" --install "${base_args[@]}" --ref "$ref_one"
+[[ ! -L "$root/opt/ci-fleet/current" ]] || fail 'mixed-role inventory admission published a controller'
+
 # A rejected review must stop every direct candidate path before installation.
 export FAKE_REAL_OPENSSL FAKE_REAL_CURL
 FAKE_REAL_OPENSSL=$(command -v openssl)
@@ -939,6 +973,25 @@ grep -Fq 'NETWORK_POLICY_APPLIED' <<<"$first" || fail 'fresh install did not app
 [[ -L "$root/opt/ci-fleet/current" && -f "$root/var/lib/ci-fleet/install-state.json" ]] || fail 'fresh install state is incomplete'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") == "$root/opt/ci-fleet/manager/releases/$engine_ref" ]] || fail 'installer manager did not activate the desired engine release'
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'active controller was not started'
+
+# Read-only checks must reject deployer-role drift on a converged controller.
+for marker in /opt/ci-fleet-deployer /var/lib/ci-fleet-deployer /etc/ci-fleet-deployer /var/lib/ci-fleet-deployer-container-credentials; do
+  mkdir -p "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rmdir "$root$marker"
+  ln -s /missing "$root$marker"
+  expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+  rm "$root$marker"
+done
+printf '[Unit]\n' >"$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+expect_failure 'deployer host state is present' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+rm "$root/etc/systemd/system/ci-fleet-deployer-cleanup.timer"
+for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+  export "$inventory=ci-fleet-deployer.service loaded"
+  for mode in --check --upgrade --rollback; do expect_failure 'deployer host state is present' "$installer" "$mode" "${base_args[@]}" --ref "$ref_one"; done
+  unset "$inventory"
+done
+expect_success "$installer" --check "${base_args[@]}" --ref "$ref_one" >/dev/null
 
 [[ $(<"$FAKE_CONTROLLER_PROTOCOL_FILE") == v2 ]] || fail 'current controller did not retain its cleanup protocol label'
 publication_old_tag=sha256:6666666666666666666666666666666666666666666666666666666666666666
@@ -1352,6 +1405,20 @@ printf 'retired history\n' >"$pre_adapter_root/var/lib/ci-fleet/capacity/history
 (
   exec 9>"$pre_adapter_root/run/ci-fleet-installer.lock"
   flock -n 9
+  bootstrap_current_before=$(readlink "$pre_adapter_root/opt/ci-fleet/current")
+  bootstrap_env_before=$(sha256sum "$pre_adapter_root/etc/ci-fleet/ci-fleet.env")
+  mkdir "$pre_adapter_root/var/lib/ci-fleet-deployer"
+  expect_failure 'deployer host state is present' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  rmdir "$pre_adapter_root/var/lib/ci-fleet-deployer"
+  for inventory in FAKE_SYSTEMD_UNIT_FILES FAKE_SYSTEMD_LOADED_UNITS; do
+    export "$inventory=ci-fleet-deployer-adapter-transient.service loaded"
+    expect_failure 'deployer host state is present' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+    unset "$inventory"
+  done
+  FAKE_SYSTEMD_UNIT_FILES_EXIT=1 expect_failure 'systemd unit-file inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  FAKE_SYSTEMD_LOADED_UNITS_EXIT=1 expect_failure 'systemd loaded-unit inventory failed' "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >/dev/null
+  [[ $(readlink "$pre_adapter_root/opt/ci-fleet/current") == "$bootstrap_current_before" && $(sha256sum "$pre_adapter_root/etc/ci-fleet/ci-fleet.env") == "$bootstrap_env_before" ]] || fail 'blocked bootstrap restore changed active runtime state'
+  [[ -f "$pre_adapter_root/var/lib/ci-fleet/capacity/history" ]] || fail 'blocked bootstrap restore retired active capacity history'
   expect_success "${pre_adapter_env[@]}" CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade --restore-last-known-good "${pre_adapter_args[@]}" --ref "$pre_adapter_config_ref" >"$tmp/bootstrap-lkg-restore.out"
 )
 grep -Fq ROLLBACK_OK "$tmp/bootstrap-lkg-restore.out" || fail 'image-free bootstrap LKG was not restored'
