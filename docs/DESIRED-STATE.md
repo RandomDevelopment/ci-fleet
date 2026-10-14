@@ -235,10 +235,42 @@ How it works:
 5. If unchanged, a drift check confirms convergence (NO_CHANGE).
 6. If changed, the new configuration is validated (schema, secret scan, tree completeness) before any mutation.
 7. On success, the last-known-good state is updated and the controller runs with the new configuration.
-8. On failure, the controller rolls back to the last-known-good checkpoint via the existing installer mechanism.
-9. State is recorded at `/var/lib/ci-fleet/reconcile/state.json` with desired commit, applied commit, health, and failure description.
+8. An explicit installer rejection before transaction start preserves the installed configuration. Failures inside a transaction use the installer's checkpoint recovery; recovery must be verified before reporting rollback success.
+9. State is recorded at `/var/lib/ci-fleet/reconcile/state.json` with desired commit, applied commit, health, failure description, and controlled rejection phase/reason when available.
 
-Bounded retries (up to 3 attempts) handle transient fetch or API failures. All logging is sanitized — tokens, private keys, and raw credential values never appear in stdout, stderr, or state files.
+Bounded retries up to three attempts handle transient fetch or API failures.
+
+### Rejected upgrades and uncertain recovery
+
+The installer reports an explicit rejection through its private transaction-result
+descriptor only when `die` stops it before a transaction has started. For example,
+the unchanged Docker disk gate rejects utilization at or above 80% before drain
+or activation. Reconciliation records `status=failed`,
+`transaction_phase=pre_transaction`, and `failure_reason=docker_disk_capacity`,
+retains the installed/applied commit, and emits `REJECTED` instead of
+`ROLLBACK_UNVERIFIED`. It leaves health `unknown` because rejection does not prove
+the incumbent controller is healthy. Other explicit early rejections use the
+controlled `installer_precondition` reason. Raw installer stderr is not copied
+into these durable rejection fields or their message.
+
+An empty, malformed, unsupported, or contradictory result is still unknown.
+Process interruption and failures after transaction start cannot claim an early
+rejection. Verified rollback retains its existing health check; unverified
+rollback continues to report `ROLLBACK_UNVERIFIED`. No outer recovery is attempted
+from an uncertain installer outcome. The additive phase/reason fields are empty
+when this rejection evidence is unavailable; empty fields do not prove that no
+transaction ran.
+
+Both the executing installer and reconciler must support this result contract.
+Selecting a candidate engine does not replace the older manager already running
+an upgrade. Missing results from an older installer remain unknown until the
+compatible manager is adopted through the reviewed upgrade procedure.
+
+Rejection and uncertain recovery both retain exit code 3. The systemd service
+accepts that code so its five-minute timer can retry; a successful unit result
+therefore does not establish successful reconciliation. Inspect the durable
+`status`, desired/applied commits and rejection fields, together with the service
+journal. These observations do not authorize cleanup or bypass any admission gate.
 
 Prerequisites:
 
