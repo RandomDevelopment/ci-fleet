@@ -3,6 +3,7 @@
 import base64
 import copy
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,43 @@ class Containment(unittest.TestCase):
         value['NetworkingConfig'] = {'EndpointsConfig': {self.network: {'IPAMConfig': None, 'Aliases': None}}}
         path, _ = self.policy.authorize('POST', '/v1.47/containers/create?name=ci-fleet-deploy-example-app', json.dumps(value).encode())
         self.assertEqual(path, '/containers/create?name=ci-fleet-deploy-example-app')
+
+    def test_pinned_chromium_profile_through_real_authorization(self):
+        profile = json.loads((Path(__file__).resolve().parents[1] / 'deploy/seccomp/chromium-v1.json').read_text())
+        canonical = json.dumps(profile, sort_keys=True, separators=(',', ':'))
+        self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(), adapter.CHROMIUM_SECCOMP_V1_SHA256)
+        for no_new_privileges in ('no-new-privileges', 'no-new-privileges:true'):
+            for encoded in (canonical, json.dumps(profile, indent=2)):
+                body = copy.deepcopy(self.body)
+                body['HostConfig']['SecurityOpt'] = [no_new_privileges, 'seccomp=' + encoded]
+                _, forwarded = self.policy.authorize('POST', '/containers/create?name=ci-fleet-deploy-example-browser', json.dumps(body).encode())
+                self.assertEqual(json.loads(forwarded)['HostConfig']['SecurityOpt'], body['HostConfig']['SecurityOpt'])
+        for field, value in (('CapAdd', ['SYS_ADMIN']), ('ReadonlyRootfs', False), ('NetworkMode', 'host')):
+            with self.subTest(field=field), self.assertRaises((ValueError, KeyError)):
+                body['HostConfig'][field] = value
+                self.policy.container(body)
+            body = copy.deepcopy(self.body)
+            body['HostConfig']['SecurityOpt'] = ['no-new-privileges', 'seccomp=' + canonical]
+
+    def test_reject_unreviewed_seccomp_and_missing_privilege_restriction(self):
+        profile = json.loads((Path(__file__).resolve().parents[1] / 'deploy/seccomp/chromium-v1.json').read_text())
+        changed = copy.deepcopy(profile)
+        changed['defaultAction'] = 'SCMP_ACT_ALLOW'
+        added = copy.deepcopy(profile)
+        added['syscalls'][0]['names'].append('mount')
+        encoded = 'seccomp=' + json.dumps(profile)
+        invalid = ([encoded], ['no-new-privileges', encoded, encoded], [encoded, 'no-new-privileges'],
+                   ['no-new-privileges', 'seccomp=unconfined'], ['no-new-privileges', 'seccomp=/tmp/profile.json'],
+                   ['no-new-privileges', 'seccomp=' + json.dumps(changed)],
+                   ['no-new-privileges', 'seccomp=' + json.dumps(added)],
+                   ['no-new-privileges', 'seccomp={"defaultAction":1,"defaultAction":2}'],
+                   ['no-new-privileges', 'seccomp={"value":NaN}'], ['no-new-privileges', 'seccomp=[]'],
+                   ['no-new-privileges', None])
+        for options in invalid:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                body = copy.deepcopy(self.body)
+                body['HostConfig']['SecurityOpt'] = options
+                self.policy.authorize('POST', '/containers/create?name=ci-fleet-deploy-example-browser', json.dumps(body).encode())
 
     def test_image_volumes_cannot_create_unlabelled_resources(self):
         image = self.backend.resources['images', self.policy.image]
