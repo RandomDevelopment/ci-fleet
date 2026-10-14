@@ -254,7 +254,7 @@ for name in ("state", "env"):
 result = subprocess.run(["bash", str(wrapper), "check", str(repo), str(context), str(legacy)], capture_output=True, text=True)
 assert result.returncode == 0, (result.stdout, result.stderr)
 check = re.search(r"^perform_check\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
-admission = re.search(r"^reject_deployer_host\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
+admission = re.search(r"^reject_isolated_host\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
 probe = root / "retained-check.sh"
 probe.write_text('''set -Eeuo pipefail
 root=$1
@@ -277,11 +277,12 @@ assert result.returncode == 0 and "CHECK_RETAINED" in result.stdout, (result.std
 for variable in ("runtime_failure", "timer_failure"):
     result = subprocess.run(["env", f"{variable}=1", "bash", str(probe), str(root)], capture_output=True, text=True)
     assert result.returncode != 0, variable
-deployer = root / "etc/ci-fleet-deployer"
-deployer.mkdir(parents=True)
-result = subprocess.run(["bash", str(probe), str(root)], capture_output=True, text=True)
-assert result.returncode != 0 and "deployer host state is present" in result.stderr, (result.stdout, result.stderr)
-deployer.rmdir()
+for role in ("deployer", "tester"):
+    isolated = root / f"etc/ci-fleet-{role}"
+    isolated.mkdir(parents=True)
+    result = subprocess.run(["bash", str(probe), str(root)], capture_output=True, text=True)
+    assert result.returncode != 0 and f"{role} host state is present" in result.stderr, (result.stdout, result.stderr)
+    isolated.rmdir()
 # A restore context must match protected LKG metadata and a complete checkpoint.
 selector = re.search(r"^find_bootstrap_lkg_checkpoint\(\) \{.*?^\}", (repo / "scripts/install-worker-controller.sh").read_text(), re.M | re.S).group()
 checkpoints = root / "lkg-checkpoints"

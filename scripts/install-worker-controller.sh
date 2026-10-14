@@ -2898,14 +2898,14 @@ if [[ "$mode" == policy-action ]]; then
 fi
 case "$mode" in
   check|install|adopt|upgrade)
-    reject_deployer_host
+    reject_isolated_host
     validate_common_arguments
     resolve_config
     validate_candidate_config_commit
     config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'
     verify_configuration_approval
     if [[ -n "$bootstrap_lkg_checkpoint" ]]; then
-      reject_deployer_host
+      reject_isolated_host
       checkpoint_dir=$bootstrap_lkg_checkpoint
       candidate_env=$checkpoint_dir/ci-fleet.env
       docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'
