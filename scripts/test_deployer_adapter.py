@@ -469,38 +469,48 @@ class Containment(unittest.TestCase):
 
     def test_rollback_recovery_requires_durable_completion_after_reboot(self):
         installer = Path(__file__).with_name('install-deployer.sh')
-        function = subprocess.check_output(['sed', '-n', '/^recover_interrupted_transaction() {$/,/^}$/p',
-                                            str(installer)], text=True)
-        shell = function + r'''
+        functions = ''.join(subprocess.check_output(['sed', '-n', f'/^{name}() {{$/,/^}}$/p',
+                                                     str(installer)], text=True)
+                            for name in ('acquire_lock', 'recover_adapter_guard',
+                                         'recover_interrupted_transaction', 'retire_adapter_guard'))
+        shell = functions + r'''
 block() { printf '%s\n' "$*" >&2; exit 42; }
 secure_file() { test -f "$1"; }
-secure_directory() { test -d "$1"; }
+secure_directory() { if [[ ${3:-0} == 1 ]]; then mkdir -p "$1"; chmod "$2" "$1"; fi; test -d "$1"; }
+root_path() { printf '%s%s' "$fixture_root" "$1"; }
+reject_other_role_state() { return 0; }
 adapter_unit_inactive() { return 0; }
 rollback_commit_marker_uncommitted() { test ! -e "$1"; }
-restore_transaction() { printf restored >"$result_file"; }
-finalize_committed_rollback() { printf finalized >"$result_file"; }
+restore_transaction() { printf restored >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
+finalize_committed_rollback() { printf finalized >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 python3() { command "$test_python" -c "$journal_probe" "$@"; }
-recover_interrupted_transaction
+acquire_lock
 '''
         # Directory ancestry is covered separately; this fixture lives in /tmp.
         probe = "import sys; from unittest.mock import patch; import deployer_adapter as a; sys.argv=sys.argv[1:]; " \
                 "p=patch.object(a,'trusted_directory'); p.start(); raise SystemExit(a.main())"
-        for committed in (False, True):
+        for committed, volatile in ((False, False), (False, True), (True, False), (True, True)):
             for state, uncertain, outcome in [('missing', False, None), ('inflight', False, None),
                                               ('completed', True, 'committed' if committed else 'failed'),
                                               ('completed', False, None),
                                               ('completed', False, 'committed' if committed else 'failed')]:
-                with self.subTest(committed=committed, state=state, uncertain=uncertain, outcome=outcome), \
+                with self.subTest(committed=committed, volatile=volatile, state=state,
+                                  uncertain=uncertain, outcome=outcome), \
                         tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     transactions, store = root / 'transactions', root / 'state'
                     transactions.mkdir()
                     store.mkdir()
+                    lock, logs = root / 'locks', root / 'logs'
+                    lock.mkdir(mode=0o700)
+                    logs.mkdir(mode=0o700)
                     transaction = transactions / '.transaction.rollback'
                     transaction.mkdir(mode=0o700)
                     unit = 'ci-fleet-deployer-adapter-1-2.service'
                     adapter.durable_file(transaction / 'kind', b'rollback\n')
                     adapter.durable_file(transaction / 'adapter-unit', (unit + '\n').encode())
+                    if volatile:
+                        adapter.durable_file(lock / 'adapter-unit', (unit + '\n').encode())
                     if committed:
                         adapter.durable_file(transaction / 'application-rollback-committed', b'committed\n')
                     if state != 'missing':
@@ -517,6 +527,11 @@ recover_interrupted_transaction
                                             env=dict(os.environ, transaction_root=str(transactions),
                                                      state_root=str(store), expected_uid=str(os.getuid()),
                                                      repo_root=str(installer.parent.parent),
+                                                     fixture_root=str(root), install_root=str(root),
+                                                     lock_root=str(lock), log_root=str(logs), mode='repair',
+                                                     adapter_guard=str(lock / 'adapter-unit'), testing='0',
+                                                     active_operation=str(store / 'active-operation'),
+                                                     releases=str(root / 'absent-releases'),
                                                      CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
                                                      test_python=sys.executable, journal_probe=probe,
                                                      PYTHONPATH=str(installer.parent)))
@@ -528,6 +543,8 @@ recover_interrupted_transaction
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result_file.read_text(), 'finalized' if committed else 'restored')
+                        self.assertFalse((lock / 'adapter-unit').exists())
+                        self.assertFalse((store / '.adapter-recovery' / unit).exists())
 
     def test_failed_rollback_commit_publication_keeps_uncertainty(self):
         for published in (False, True):

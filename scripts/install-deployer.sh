@@ -667,7 +667,6 @@ acquire_lock() {
   if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" consumption --store "$log_root" || block 'approval consumption recovery failed'
   fi
-  recover_adapter_guard
   [[ ! -e "$state_root/.adapter-recovery/pending-unit" && ! -L "$state_root/.adapter-recovery/pending-unit" ]] || block 'interrupted runtime adapter requires operator recovery'
   [[ ! -L "$active_operation" ]] || block 'active operation marker is an unsafe symlink'
   if [[ -e "$active_operation" && ! -f "$active_operation" ]]; then block 'active operation marker has an unsafe type'; fi
@@ -696,6 +695,7 @@ acquire_lock() {
   done
   shopt -u nullglob
   recover_interrupted_transaction
+  recover_adapter_guard
   if [[ -e "$state_root" ]]; then secure_directory "$state_root" 700 0 || block 'managed state boundary is unsafe'; fi
 }
 
@@ -1008,7 +1008,7 @@ restore_transaction() {
 }
 
 recover_interrupted_transaction() {
-  local candidates=() candidate
+  local candidates=() candidate pending_unit=
   shopt -s nullglob
   candidates=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
@@ -1028,7 +1028,6 @@ recover_interrupted_transaction() {
   fi
   if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
     secure_file "$candidate/adapter-unit" 'adapter unit guard'
-    local pending_unit
     pending_unit=$(<"$candidate/adapter-unit")
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
     adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
@@ -1040,6 +1039,9 @@ recover_interrupted_transaction() {
   if [[ -e "$candidate/commit" || -L "$candidate/commit" ]]; then
     secure_directory "$candidate/commit" 700 0 || block 'rollback commit directory is unsafe'
     candidate_marker=$candidate/commit/application-rollback-committed
+  fi
+  if [[ -n $pending_unit ]]; then
+    retire_adapter_guard "$pending_unit" "$candidate" || block 'completed adapter guard could not be retired; retain the transaction for operator recovery'
   fi
   transaction_dir=$candidate
   rollback_commit_file=$candidate_marker
@@ -1349,12 +1351,12 @@ adapter_unit_inactive() {
 }
 
 retire_adapter_guard() {
-  local unit=$1 guard
+  local unit=$1 guard guard_transaction=${2:-${transaction_dir:-}}
   if [[ $testing != 1 ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$unit" || return 1
   fi
   local -a guards=("$adapter_guard")
-  [[ -z ${transaction_dir:-} ]] || guards+=("$transaction_dir/adapter-unit")
+  [[ -z $guard_transaction ]] || guards+=("$guard_transaction/adapter-unit")
   for guard in "${guards[@]}"; do
     [[ -e $guard || -L $guard ]] || continue
     [[ ! -L $guard && -f $guard && $(stat -c '%u:%a' "$guard") == "$expected_uid:600" && $(<"$guard") == "$unit" ]] || return 1
