@@ -679,6 +679,7 @@ recover_interrupted_transaction
                                                         'exit_code': 1, 'rollback_marker': str(marker),
                                                         'rollback_outcome': 'failed'}).encode())
                 self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
+                marker.unlink()
                 adapter.durable_file(status, json.dumps({'unit': unit, 'operation': 'deploy', 'status': 'completed', 'exit_code': 0}).encode())
                 adapter.durable_file(journal / 'docker-uncertain', b'uncertain')
                 self.assertFalse(adapter.journal_complete(store, unit, os.getuid()))
