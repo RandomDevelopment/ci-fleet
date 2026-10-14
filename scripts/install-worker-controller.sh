@@ -2549,6 +2549,7 @@ stage_manager_only() {
   [[ "$installed_engine" =~ ^[0-9a-f]{40}$ ]] \
     || die 'manager-only staging requires a valid installed engine revision'
   staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
+  transaction_started=true
   install_release
   install_manager "$engine_ref" "$release_dir"
   install_systemd_units "$(current_runtime_release)"
