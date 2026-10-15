@@ -4,6 +4,7 @@ FROM ${RUNNER_IMAGE}
 USER root
 # Test tooling only. Package inputs use the runner's reviewed Debian snapshot.
 RUN apt-get update && apt-get install -y --no-install-recommends apt-cacher-ng python3 \
+    && install -d -o apt-cacher-ng -g apt-cacher-ng /var/cache/apt-cacher-ng /var/log/apt-cacher-ng /run/apt-cacher-ng \
     && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT ["/usr/sbin/apt-cacher-ng"]
-CMD ["ForeGround=1", "BindAddress=0.0.0.0"]
+CMD ["-c", "/etc/apt-cacher-ng", "ForeGround=1", "BindAddress=0.0.0.0"]

@@ -86,11 +86,16 @@ def main():
             step = "cache readiness"
             for attempt in range(30):
                 ready = subprocess.run(["docker", "exec", cache, "curl", "--silent", "--fail",
+                                        "--connect-timeout", "1", "--max-time", "2", "--noproxy", "*",
+                                        "--output", "/dev/null", "--write-out", "%{http_code}",
                                         "http://127.0.0.1:3142/acng-report.html"], capture_output=True)
                 if ready.returncode == 0: break
                 time.sleep(1)
             else:
-                raise RuntimeError("APT_CACHE_E2E_FAILED step=cache readiness")
+                state = run("docker", "inspect", "--format", "{{.State.Status}}/{{.State.ExitCode}}", cache)
+                status = ready.stdout.decode().strip()
+                status = status if status.isdigit() else "unknown"
+                raise RuntimeError(f"APT_CACHE_E2E_FAILED step=cache readiness state={state} curl_exit={ready.returncode} http_status={status}")
             # Readiness may not create a transfer log until the first APT request.
             run("docker", "exec", cache, "touch", "/var/log/apt-cacher-ng/apt-cacher.log")
             step = "fresh runner package installs"
