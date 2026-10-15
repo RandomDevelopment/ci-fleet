@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 const runnerAPTConfig = "/etc/apt/apt.conf.d/99-ci-fleet-cache"
@@ -116,7 +117,14 @@ func (s *Scaler) copyRunnerLogs(destination io.Writer, source io.Reader) error {
 		}
 	}
 	replacer := strings.NewReplacer(replacements...)
-	scanner := bufio.NewScanner(source)
+	// Docker can split one log line across multiplexed frames.
+	decoded, writer := io.Pipe()
+	defer decoded.Close()
+	go func() {
+		_, err := stdcopy.StdCopy(writer, writer, source)
+		_ = writer.CloseWithError(err)
+	}()
+	scanner := bufio.NewScanner(decoded)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		if _, err := fmt.Fprintln(destination, replacer.Replace(scanner.Text())); err != nil {
