@@ -8,6 +8,7 @@ import io
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -174,6 +175,38 @@ class RunnerTests(unittest.TestCase):
                 with self.subTest(command=command), self.assertRaises(error):
                     run(command, root, os.environ.copy(), root / "test.log", 1)
 
+    def test_pinned_configuration_validator_rejects_candidate_bypass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); repo = root / "config"
+            shutil.copytree(ROOT / "templates/config-repository", repo)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
+            git("init", "-b", "main")
+            git("config", "user.name", "Validation test"); git("config", "user.email", "test@example.invalid")
+            path = repo / "fleet.json"
+            fleet = json.loads(path.read_text().replace("example-org", "validation-company").replace("example-app", "validation-app"))
+            for architectures in fleet["managed_images"].values():
+                for images in architectures.values():
+                    images.update(controller="sha256:" + "3" * 64, runner="sha256:" + "4" * 64)
+            for controller in fleet["controllers"].values():
+                controller.pop("docker_network_policy", None)
+            path.write_text(json.dumps(fleet))
+            git("add", "."); git("commit", "-m", "feat: initialize fictional configuration")
+            base = git("rev-parse", "HEAD")
+            # Exercise the current trusted plan directly so the regression also
+            # runs before this change has a committed policy identity.
+            env = {**os.environ, "CI_FLEET_VALIDATION_ROOT": str(repo), "CI_FLEET_VALIDATION_BASE": base}
+            for bypass in (False, True):
+                if bypass:
+                    (repo / "scripts/validate.py").write_text("raise SystemExit(0)\n")
+                    fleet["environments"]["production"]["requires_approval"] = False
+                    path.write_text(json.dumps(fleet)); git("add", "."); git("commit", "-m", "test: attempt validator bypass")
+                result = subprocess.run(["bash", str(ROOT / "scripts/validate-configuration.sh")], cwd=repo, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, not bypass, result.stdout + result.stderr)
+                if bypass:
+                    self.assertIn("production deployment must require approval", result.stdout + result.stderr)
+
     def test_source_requires_full_resolvable_identities(self):
         result = subprocess.run(["python3", str(ROOT / "scripts/local_validate.py"), "--source", "HEAD",
                                  "--base", "HEAD", "--policy", "HEAD", "--main", "HEAD", "--output", "/unused"],
@@ -260,6 +293,15 @@ class PolicyExecutionTests(unittest.TestCase):
         result, report = self.validate("--tag", "v0.1.0-rc.1", "--tag-created")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["history_base"], "")
+
+    def test_execution_home_has_no_writable_parent(self):
+        self.git("checkout", "main")
+        (self.repo / "scripts/validate-configuration.sh").write_text(
+            "#!/bin/bash\npython3 -c 'from pathlib import Path; assert all(not p.stat().st_mode & 0o022 for p in Path.home().parents)'\n")
+        self.policy = self.commit("test: require protected fixture home")
+        result, report = self.validate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report["status"], "passed")
 
     def test_missing_tool_records_incomplete_failure(self):
         import argparse
