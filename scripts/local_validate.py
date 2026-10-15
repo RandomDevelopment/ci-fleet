@@ -17,6 +17,7 @@ import tempfile
 import time
 
 SHA = re.compile(r"[0-9a-f]{40}")
+NO_PRIOR = "0" * 40
 SUITE = "ci-fleet-local-v1"
 CLEANUP_GRACE_SECONDS = 60
 
@@ -113,21 +114,27 @@ def validate(args: argparse.Namespace) -> int:
     repo = args.repository.resolve()
     policy_repo = (args.policy_repository or repo).resolve()
     reviewed_head = args.reviewed_head or args.source
-    for origin, value in ((repo, args.source), (repo, reviewed_head), (repo, args.base), (policy_repo, args.policy), (repo, args.main)):
+    no_prior = args.base == NO_PRIOR
+    identities = [(repo, args.source), (repo, reviewed_head), (policy_repo, args.policy), (repo, args.main)]
+    if not no_prior:
+        identities.append((repo, args.base))
+    for origin, value in identities:
         if not SHA.fullmatch(value) or git(origin, "rev-parse", value + "^{commit}") != value:
             raise ValueError("source, base, policy and main must be full available commit SHAs")
     if git(repo, "rev-parse", "--is-shallow-repository") != "false":
         raise ValueError("complete Git history is required")
-    subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source], check=True)
+    if not no_prior:
+        subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source], check=True)
     if reviewed_head != args.source:
-        subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head], check=True)
+        if not no_prior:
+            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head], check=True)
         if git(repo, "rev-parse", args.source + "^{tree}") != git(repo, "rev-parse", reviewed_head + "^{tree}"):
             raise ValueError("integrated and reviewed source trees differ")
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {"schema_version": 1, "suite": SUITE if args.kind == "engine" else "ci-fleet-config-local-v1", "profile": args.profile,
               "source": args.source, "reviewed_head": reviewed_head, "tree": git(repo, "rev-parse", args.source + "^{tree}"),
-              "base": args.base, "policy": args.policy, "main": args.main,
+              "base": args.base, "prior_integrated_state": not no_prior, "policy": args.policy, "main": args.main,
               "pr_title": args.pr_title, "tag": args.tag, "tag_created": args.tag_created,
               "started_at": int(time.time()), "expected_skips": [], "tools": {}, "results": [], "status": "incomplete"}
     if args.profile == "quick" and args.kind == "engine":
@@ -140,8 +147,9 @@ def validate(args: argparse.Namespace) -> int:
             Path(fixture_temporary).chmod(0o755)
             report["run_id"] = root.name.lower()
             source, policy = root / "source", root / "policy"
+            source_identities = list(dict.fromkeys(value for value in (args.source, args.base, args.main, reviewed_head) if value != NO_PRIOR))
             for target, commit, origin in ((source, args.source, repo), (policy, args.policy, policy_repo)):
-                identities = [args.source, args.base, args.main, reviewed_head] if target == source else [args.policy]
+                identities = source_identities if target == source else [args.policy]
                 checkout(origin, target, commit, identities)
                 if target == source:
                     subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main], check=True)
@@ -179,24 +187,26 @@ def validate(args: argparse.Namespace) -> int:
             checks = []
             if args.pr_title is not None:
                 checks.append(("pr-title", ["python3", validator, "--pr-title", args.pr_title]))
-            history_base = args.base
+            history_base = "" if no_prior else args.base
             if args.tag:
                 if not args.tag_created:
                     raise ValueError("published tags must not be moved; supply --tag-created for a new tag")
-                history_base = subprocess.check_output(["python3", validator, "--release-base-for", args.source,
+                release_base = subprocess.check_output(["python3", validator, "--release-base-for", args.source,
                                                        "--exclude-tag", args.tag], cwd=source, env=env, text=True).strip()
                 checks.append(("tag", ["python3", validator, "--version", args.tag, "--tag-commit", args.source,
-                                       "--base", history_base, "--head", args.source, "--exclude-tag", args.tag]))
+                                       "--base", release_base, "--head", args.source, "--exclude-tag", args.tag]))
+                if not no_prior:
+                    history_base = release_base
             report["history_base"] = history_base
             heads = list(dict.fromkeys((args.source, reviewed_head)))
-            checks.append(("commits", ["python3", "-I", "-c",
-                "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--base', sys.argv[2], '--head', h], check=True) for h in sys.argv[3:]]",
-                validator, history_base, *heads]))
             commits = []
             for head in heads:
                 commits.extend(git(source, "rev-list", "--reverse", history_base + ".." + head if history_base else head).splitlines())
                 commits.append(head)
             commits = list(dict.fromkeys(commits))
+            checks.append(("commits", ["python3", "-I", "-c",
+                "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], *(['--base', sys.argv[2]] if sys.argv[2] else []), '--head', h], check=True) for h in sys.argv[3:]]",
+                validator, history_base, *(commits if no_prior else heads)]))
             checks.append(("history-secrets", ["python3", "-I", "-c",
                 "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--repository', sys.argv[2], '--commit', c], check=True) for c in sys.argv[3:]]",
                 scanner, str(source), *commits]))
@@ -213,7 +223,7 @@ def validate(args: argparse.Namespace) -> int:
                 env["CI_FLEET_VALIDATION_BASE"] = args.base
                 checks.append(("configuration", ["bash", str(policy / "scripts/validate-configuration.sh")]))
             seeds = []
-            for target, commit, identities in ((source, args.source, [args.source, args.base, args.main, reviewed_head]),
+            for target, commit, identities in ((source, args.source, source_identities),
                                                (policy, args.policy, [args.policy])):
                 seed = root / (target.name + "-seed")
                 target.rename(seed)
@@ -268,8 +278,9 @@ def main() -> int:
     parser.add_argument("--kind", choices=("engine", "configuration"), default="engine")
     parser.add_argument("--policy-repository", type=Path)
     parser.add_argument("--repository", type=Path, default=Path.cwd())
-    for name in ("source", "base", "policy", "main"):
+    for name in ("source", "policy", "main"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--base", required=True, help="previous integrated commit SHA, or 40 zeros for a root or initial push")
     parser.add_argument("--reviewed-head", help="original reviewed head when validating an integrated merge or squash commit")
     parser.add_argument("--pr-title")
     parser.add_argument("--tag")

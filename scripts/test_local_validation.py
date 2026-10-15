@@ -94,6 +94,7 @@ class LocalEvidenceTests(unittest.TestCase):
         changes = [((), "repository_id", 999), ((), "branch", "other"), ((), "pull_request", 99),
                    ((), "reviewed_head", PARENT), ((), "policy_sha256", "0" * 64)]
         for field, value in (("source", HEAD), ("reviewed_head", PARENT), ("tree", HEAD), ("base", HEAD), ("policy", HEAD),
+                             ("base", "0" * 40),
                              ("suite", "other"), ("profile", "quick"), ("status", "failed"),
                              ("expected_skips", ["configuration"]), ("tools", {}), ("results", []),
                              ("started_at", self.now - 4000), ("finished_at", self.now + 1)):
@@ -371,23 +372,28 @@ exit 0
                 with self.subTest(command=command), self.assertRaises(error):
                     run(command, root, os.environ.copy(), root / "test.log", 1)
 
+    def configuration_fixture(self, root):
+        repo = root / "config"
+        shutil.copytree(ROOT / "templates/config-repository", repo)
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
+        git("init", "-b", "main")
+        git("config", "user.name", "Validation test"); git("config", "user.email", "test@example.invalid")
+        path = repo / "fleet.json"
+        fleet = json.loads(path.read_text().replace("example-org", "validation-company").replace("example-app", "validation-app"))
+        for architectures in fleet["managed_images"].values():
+            for images in architectures.values():
+                images.update(controller="sha256:" + "3" * 64, runner="sha256:" + "4" * 64)
+        for controller in fleet["controllers"].values():
+            controller.pop("docker_network_policy", None)
+        path.write_text(json.dumps(fleet))
+        git("add", "."); git("commit", "-m", "feat: initialize fictional configuration")
+        return repo, fleet, git
+
     def test_pinned_configuration_validator_rejects_candidate_bypass(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); repo = root / "config"
-            shutil.copytree(ROOT / "templates/config-repository", repo)
-            def git(*args):
-                return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
-            git("init", "-b", "main")
-            git("config", "user.name", "Validation test"); git("config", "user.email", "test@example.invalid")
+            repo, fleet, git = self.configuration_fixture(Path(temporary))
             path = repo / "fleet.json"
-            fleet = json.loads(path.read_text().replace("example-org", "validation-company").replace("example-app", "validation-app"))
-            for architectures in fleet["managed_images"].values():
-                for images in architectures.values():
-                    images.update(controller="sha256:" + "3" * 64, runner="sha256:" + "4" * 64)
-            for controller in fleet["controllers"].values():
-                controller.pop("docker_network_policy", None)
-            path.write_text(json.dumps(fleet))
-            git("add", "."); git("commit", "-m", "feat: initialize fictional configuration")
             base = git("rev-parse", "HEAD")
             # Exercise the current trusted plan directly so the regression also
             # runs before this change has a committed policy identity.
@@ -402,6 +408,50 @@ exit 0
                 self.assertEqual(result.returncode == 0, not bypass, result.stdout + result.stderr)
                 if bypass:
                     self.assertIn("production deployment must require approval", result.stdout + result.stderr)
+
+    def test_no_prior_configuration_rejects_root_capability_and_evidence_staging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo, fleet, git = self.configuration_fixture(Path(temporary))
+            controller = next(iter(fleet["controllers"]))
+            evidence = {"schema_version": 1, "status_reporting_engine_capabilities": {
+                controller: {"engine_ref": fleet["controllers"][controller]["engine_ref"],
+                             "status_reporting_config": True, "required_status_reporting": False}}}
+            for attack in ("none", "reporting", "evidence"):
+                with self.subTest(attack=attack):
+                    candidate = copy.deepcopy(fleet)
+                    if attack == "reporting":
+                        candidate["controllers"][controller]["status_reporting"] = {
+                            "enabled": False, "config_file": "/etc/ci-fleet/monitoring.env"}
+                    (repo / "fleet.json").write_text(json.dumps(candidate))
+                    (repo / "engine-rollout-evidence.json").write_text(json.dumps(
+                        evidence if attack != "none" else {"schema_version": 1, "status_reporting_engine_capabilities": {}}))
+                    git("add", "."); git("commit", "--amend", "--no-edit")
+                    self.assertEqual(git("rev-list", "--count", "HEAD"), "1")
+                    env = {**os.environ, "CI_FLEET_VALIDATION_ROOT": str(repo), "CI_FLEET_VALIDATION_BASE": "0" * 40}
+                    result = subprocess.run(["bash", str(ROOT / "scripts/validate-configuration.sh")], cwd=repo, env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, attack == "none", result.stdout + result.stderr)
+                    if attack != "none":
+                        self.assertIn("previous integrated fleet configuration", result.stderr)
+                    if attack == "reporting":
+                        self.assertIn("must be omitted from a new controller", result.stderr)
+
+    def test_optional_hosted_job_cannot_emit_the_required_validate_context(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        jobs = workflow["jobs"]
+        self.assertEqual(set(jobs), {"hosted-validation"})
+        self.assertNotIn("validate", {job.get("name", key) for key, job in jobs.items()})
+        job = jobs["hosted-validation"]
+        self.assertEqual(job["if"], "${{ vars.CI_FLEET_HOSTED_VALIDATION == 'true' }}")
+        self.assertEqual(job["timeout-minutes"], 5)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        for step in job["steps"]:
+            if "uses" in step:
+                self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+                self.assertIs(step["with"]["persist-credentials"], False)
+        engine = (ROOT / ".github/workflows/validate.yml").read_text()
+        self.assertIn("name: Build without registering a runner", engine)
 
     def test_source_requires_full_resolvable_identities(self):
         result = subprocess.run(["python3", str(ROOT / "scripts/local_validate.py"), "--source", "HEAD",
@@ -461,6 +511,86 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
 
+    def test_no_prior_base_accepts_root_and_imported_history_without_fallback(self):
+        for source in (self.source, self.base):
+            with self.subTest(source=source):
+                result, report = self.validate("--base", "0" * 40, source=source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(report["base"], "0" * 40)
+                self.assertIs(report["prior_integrated_state"], False)
+                self.assertEqual(report["history_base"], "")
+                self.assertEqual([entry["name"] for entry in report["results"]], ["commits", "history-secrets", "configuration"])
+
+    def test_no_prior_base_does_not_relax_other_commit_identities(self):
+        for name in ("source", "policy", "main", "reviewed-head"):
+            with self.subTest(name=name):
+                result, report = self.validate("--base", "0" * 40, "--" + name, "0" * 40)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(report)
+        for base in ("0" * 39, "missing", "f" * 40):
+            with self.subTest(base=base):
+                result, report = self.validate("--base", base)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(report)
+
+    def test_no_prior_base_rejects_invalid_imported_commit_before_tip(self):
+        (self.repo / "payload").write_text("invalid historical commit")
+        self.commit("invalid historical subject")
+        (self.repo / "payload").write_text("valid tip")
+        head = self.commit("fix: finish imported history")
+        result, report = self.validate("--base", "0" * 40, source=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(report["results"][-1]["name"], "commits")
+
+    def test_no_prior_base_scans_removed_secrets_in_both_imported_histories(self):
+        (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden filename")
+        (self.repo / ".env").unlink()
+        self.commit("fix: remove forbidden filename")
+        self.git("tag", "v0.1.0")
+        (self.repo / "payload").write_text("clean tip")
+        reviewed = self.commit("fix: finish imported history")
+        self.git("checkout", "--orphan", "integrated")
+        integrated = self.commit("fix: integrate reviewed source tree")
+        for source, extra in ((reviewed, ()), (integrated, ("--reviewed-head", reviewed)),
+                              (reviewed, ("--tag", "v0.1.1-rc.1", "--tag-created"))):
+            with self.subTest(source=source, extra=extra):
+                result, report = self.validate("--base", "0" * 40, *extra, source=source)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(report["history_base"], "")
+                self.assertEqual(report["results"][-1]["name"], "history-secrets")
+
+    def test_embedded_workflow_passes_pr_title_base_and_main_and_preserves_initial_push(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        step = next(step for step in workflow["jobs"]["hosted-validation"]["steps"]
+                    if step["name"] == "Run complete local configuration validation")
+        self.assertEqual(step["env"]["BASE"], "${{ github.event.pull_request.base.sha || github.event.before }}")
+        self.assertEqual(step["env"]["MAIN"], "${{ github.event.pull_request.base.sha || github.sha }}")
+        self.assertEqual(step["env"]["PR_TITLE"], "${{ github.event.pull_request.title }}")
+        self.assertNotIn("${{", step["run"])
+        validator = self.repo / ".ci-fleet-validator"
+        subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.repo), str(validator)], check=True)
+        subprocess.run(["git", "-C", str(validator), "checkout", "--quiet", self.policy], check=True)
+        shutil.copyfile(ROOT / "scripts/local_validate.py", validator / "scripts/local_validate.py")
+        for event, title, base, main, accepted in (
+                ("pull_request", "invalid $(touch title-injected)", self.base, self.base, False),
+                ("pull_request", 'fix: keep "$(touch title-injected)"', self.base, self.base, True),
+                ("push", "invalid unused title", "0" * 40, self.source, True)):
+            with self.subTest(event=event, title=title):
+                runtime = self.root / ("workflow-" + str(self.count)); self.count += 1
+                runtime.mkdir()
+                env = {**os.environ, "RUNNER_TEMP": str(runtime), "SOURCE": self.source, "BASE": base, "MAIN": main,
+                       "PR_TITLE": title, "EVENT_NAME": event, "VALIDATOR": self.policy}
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.repo, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                report = json.loads((runtime / "local-validation/result.json").read_text())
+                self.assertEqual((report["base"], report["main"]), (base, main))
+                self.assertEqual(report["pr_title"], title if event == "pull_request" else None)
+                if not accepted:
+                    self.assertEqual(report["results"][-1]["name"], "pr-title")
+                self.assertFalse((self.repo / "title-injected").exists())
+
     @unittest.skipUnless(os.geteuid() == 0, "engine fixtures require root")
     def test_each_stage_gets_fresh_checkouts_and_allows_generated_caches(self):
         import argparse
@@ -474,13 +604,16 @@ class PolicyExecutionTests(unittest.TestCase):
                 cache.write_bytes(b"fixture cache")
             log.write_text("fixture stage\n")
             calls.append(command)
-        output = self.root / "fresh-stages"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
-            base=self.base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
-            pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
-        with patch("local_validate.run", side_effect=stage):
-            self.assertEqual(local_validate.validate(args), 0)
-        self.assertGreater(len(calls), 1)
+        for base in (self.base, "0" * 40):
+            with self.subTest(base=base):
+                calls.clear()
+                output = self.root / ("fresh-stages-" + base)
+                args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                    base=base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
+                    pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
+                with patch("local_validate.run", side_effect=stage):
+                    self.assertEqual(local_validate.validate(args), 0)
+                self.assertGreater(len(calls), 1)
 
     def test_candidate_cannot_mutate_verification_seeds(self):
         self.git("checkout", "main")

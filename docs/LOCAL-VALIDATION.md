@@ -64,6 +64,15 @@ success is never full evidence. The engine's lower-level `scripts/validate.sh`
 remains useful for development, but it omits workflow policy and other checks.
 It cannot claim complete validation by itself.
 
+For a root commit or an initial push with no prior integrated state, either
+repository kind accepts `--base 0000000000000000000000000000000000000000`.
+Preserve that exact initial-push value even when imported history has parents.
+Do not substitute the source or its parent. All other commit identities must
+name real full commit SHAs. The report retains the zero base and records
+`prior_integrated_state: false`. Commit policy runs without a range base, and
+secret scanning covers every commit reachable from the source and original
+reviewed head. A real base retains its ancestry and range checks.
+
 For a new release add `--tag v0.2.0 --tag-created`. Never pass `--tag-created`
 for a tag update. A release validates conventional messages and committed blobs
 back through the previous stable release, or all history for an initial release.
@@ -149,6 +158,13 @@ commit, even when its tree matches. Every integrated commit after the installed
 baseline needs its own result and review evidence. Reconcile and repeat review
 when a base change changes the proposed tree.
 
+With the zero-base sentinel, transition validation uses empty prior controllers
+and no prior rollout or approval evidence. A root or initial-push configuration
+cannot supply its own prior capability or activation evidence to bypass staging.
+A developer report with a zero base does not authorize an ordinary applied
+commit. Host verification still requires that commit's real first-parent base
+and the existing signed-evidence checks.
+
 ## Coverage and hosted adapter
 
 | Previously workflow-only check | Complete local implementation |
@@ -166,10 +182,19 @@ The engine workflow calls the full local entry point and preserves the
 commit and secret policy guards remain separate during staging. Hosted PR jobs
 execute the proposed suite from the checked-out revision, as before; trusted
 local acceptance instead pins an independently reviewed suite outside the
-candidate. Protection migration remains separately gated. The embedded template convenience workflow is default-off through the repository
-variable `CI_FLEET_HOSTED_VALIDATION=true`. Set `CI_FLEET_VALIDATOR_REVISION` to a
-reviewed full supporting engine commit before enabling it. The standalone
-template must adopt the same behavior under #32. Enabling that workflow must not add a required
+candidate. Protection migration remains separately gated. The embedded template
+convenience job is named `hosted-validation` and is default-off. Set repository
+variable `CI_FLEET_HOSTED_VALIDATION=true` and set `CI_FLEET_VALIDATOR_REVISION`
+to an independently reviewed full supporting engine commit to enable it. Its PR
+runs use the target base SHA as both base and main, and validate the PR title
+passed as a quoted argument. Push runs use the source SHA as main and retain the
+event's base, including the zero sentinel for an initial push. The standalone
+template must adopt the same behavior under #32.
+
+The optional job never emits the old `validate` check context, including when
+disabled. A skipped optional job must not satisfy a required `validate` check.
+Keep existing protections until a deliberate reviewed migration reconciles
+that required context. Enabling the convenience job does not add a required
 check or a host requirement. Disabling the variable, removing the workflow,
 Actions outages and quota blocks must leave local execution complete.
 

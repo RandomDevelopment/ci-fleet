@@ -23,6 +23,10 @@ if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:f
     args+=(--previous-rollout-evidence "$temporary_directory/previous-rollout-evidence.json")
   fi
   python3 "$validator" --strict "${current[@]}" "${args[@]}"
+elif [[ "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+  # No integrated controller can supply capability or rollout evidence yet.
+  printf '{"managed_images":{},"controllers":{}}\n' >"$temporary_directory/previous-fleet.json"
+  python3 "$validator" --strict "${current[@]}" --previous-config "$temporary_directory/previous-fleet.json"
 else
   python3 "$validator" --strict "${current[@]}"
 fi

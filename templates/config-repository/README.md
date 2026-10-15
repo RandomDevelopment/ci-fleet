@@ -296,13 +296,33 @@ includes policy tests, history secret scanning, transition checks and initialize
 checks. `scripts/validate.sh --strict` remains a useful individual validator.
 A complete trusted run and independent review remain separate requirements.
 
+Use Linux with mounted `/proc`, Bash, Git, Python 3.11 or later, ShellCheck and
+OpenSSL. Configuration validation requires neither root nor Docker. Missing
+tools, unexpected skipped tests and interrupted checks fail a complete run.
+
+For a root commit or initial push with no prior integrated state, pass
+`--base 0000000000000000000000000000000000000000`. Preserve that value even
+when imported history has parents. The report retains the zero base and records
+`prior_integrated_state: false`. Commit policy has no range base, and secret
+scanning covers every commit reachable from the source and original reviewed
+head. Transition checks use empty prior controllers and no prior sidecar
+evidence; the initial configuration cannot provide its own prior activation
+evidence. Use real full commit SHAs for every other identity. Normal
+applied-commit host verification still requires the real first-parent base and
+signed evidence.
+
 Hosted validation is disabled by default. Set repository Actions variables
 `CI_FLEET_VALIDATOR_REVISION` to a full reviewed supporting engine commit and
 `CI_FLEET_HOSTED_VALIDATION` to `true` to enable the convenience workflow. Set the
 latter to `false`, delete it, or remove `.github/workflows/validate.yml` to disable
 hosted execution. Local validation still works with Actions disabled or quota
 blocked. Do not require this optional check merely because it is enabled.
-Existing required checks need a deliberate reviewed migration before disabling
-their workflow. Host policy-v1 keeps requiring hosted evidence until separately
-migrated to the compatible signed-local policy. No workflow variable changes
+The optional job is named `hosted-validation`; it never emits the old `validate`
+check context, even when disabled. Keep any existing required `validate`
+protection until a deliberate reviewed migration reconciles it. A skipped
+convenience job cannot substitute for that required check. PR runs use the
+target base SHA as base and main and pass the title as a quoted argument. Push
+runs use the source SHA as main and retain the event's base, including an
+initial push's zero sentinel. Host policy-v1 keeps requiring hosted evidence
+until separately migrated to the compatible signed-local policy. No workflow variable changes
 host policy, and the public template receives no private runner access.

@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
+  hosted-validation:
     # Convenience only. Enabling this never changes host or required-check policy.
     if: ${{ vars.CI_FLEET_HOSTED_VALIDATION == 'true' }}
     runs-on: ubuntu-latest
@@ -47,12 +47,14 @@ jobs:
         env:
           SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MAIN: ${{ github.event.pull_request.base.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_NAME: ${{ github.event_name }}
           VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
         run: |
-          if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]]; then
-            if parent=$(git rev-parse --verify "$SOURCE^" 2>/dev/null); then BASE=$parent; else BASE=$SOURCE; fi
-          fi
+          args=()
+          if [[ "$EVENT_NAME" == pull_request ]]; then args+=(--pr-title "$PR_TITLE"); fi
           python3 .ci-fleet-validator/scripts/local_validate.py \
-            --kind configuration --repository "$PWD" --source "$SOURCE" --base "$BASE" --main "$SOURCE" \
+            --kind configuration --repository "$PWD" --source "$SOURCE" --base "$BASE" --main "$MAIN" \
             --policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR" \
-            --output "$RUNNER_TEMP/local-validation"
+            --output "$RUNNER_TEMP/local-validation" "${args[@]}"
