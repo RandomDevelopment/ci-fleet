@@ -412,7 +412,7 @@ class CodexApprovalTests(unittest.TestCase):
 
     def test_known_clean_response_follow_up_sentences(self):
         body = self.comment["body"]
-        for sentence in ("", " Keep it up!", " Nice work!"):
+        for sentence in ("", " Keep it up!", " Nice work!", " :tada:"):
             self.comment["body"] = body.replace(" What shall we delve into next?", sentence)
             self.check()
 

@@ -22,7 +22,7 @@ SHA = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workflow_id", "required_jobs", "reviewer_ids"}
 CODEX_CLEAN = re.compile(
-    r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!)?\n\n"
+    r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
     r"(?:\n(<details>[\s\S]*</details>\s*))?\Z"
 )
