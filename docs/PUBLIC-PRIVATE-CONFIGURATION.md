@@ -45,6 +45,34 @@ A private application repository may use the restricted runner group directly. A
 
 Each organization generates its own private installation configuration from the public [configuration template](../templates/config-repository/README.md). The resulting private repository is an implementation detail of that organization and is not required to be accessible to users of the public project.
 
+## Engine and template rollouts
+
+The [standalone configuration template](https://github.com/RandomDevelopment/ci-fleet-config-template)
+has its own reviewed changes and releases. Assess every engine feature for
+template support and operator-guidance impact, including host features that
+require adoption documentation without new schema fields. When affected, the
+responsible contributor or agent automatically creates or reuses a matching
+open template issue by engine merge or release, whichever happens first. Follow
+the [search, issue-content, and PR checklist procedure](CONTRIBUTING.md#configuration-template-follow-up).
+Link that issue in the engine PR and completion report, or explain why the
+template needs no change. Failed tracking remains outstanding rollout work.
+
+Template compatibility tests establish compatibility with their pinned reviewed
+engine baseline. They do not prove that the template supports every feature on
+the latest engine. Keep these milestones separate:
+
+| Milestone | Required evidence |
+| --- | --- |
+| Engine feature available | Reviewed merged engine commit and applicable checks |
+| Template support published | Implemented template follow-up, reviewed compatibility baseline, and immutable template release |
+| Adopter engine promoted | Reviewed private configuration and applicable capability-staging/migration evidence |
+| Host accepted | Separately authorized activation, health, recovery, and workload evidence for that host |
+
+A follow-up issue records a gap; it proves none of the implementation or rollout
+milestones. It grants no authority to merge a template PR, publish a release,
+change private configuration, or activate a host. Keep credentials and private
+infrastructure details out of public tracking.
+
 ## Public source with private CI and deployment
 
 A public project can use fleet workers without granting the public repository access to them:
