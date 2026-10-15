@@ -50,7 +50,7 @@ func aptCacheConfig(proxy, noProxy string) (string, error) {
 	if !validAPTHost(parsed.Hostname()) || parsed.User != nil || strings.HasSuffix(parsed.Host, ":") {
 		return "", invalid
 	}
-	if strings.HasPrefix(parsed.Host, "[") && net.ParseIP(parsed.Hostname()) == nil {
+	if strings.HasPrefix(parsed.Host, "[") && (!strings.Contains(parsed.Hostname(), ":") || net.ParseIP(parsed.Hostname()) == nil) {
 		return "", invalid
 	}
 	if port := parsed.Port(); port != "" {

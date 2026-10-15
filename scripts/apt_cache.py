@@ -19,7 +19,7 @@ def valid_host(host: str) -> bool:
     except ValueError:
         return len(host) <= 253 and all(
             re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-            for label in host.rstrip(".").split(".")
+            for label in host.removesuffix(".").split(".")
         )
 
 
@@ -36,6 +36,7 @@ def apt_config(proxy: str, no_proxy: str = "") -> str:
         if (not parsed.hostname or not valid_host(parsed.hostname)
                 or parsed.path not in ("", "/") or parsed.username is not None
                 or parsed.query or parsed.fragment
+                or (parsed.netloc.startswith("[") and ":" not in parsed.hostname)
                 or parsed.netloc.endswith(":")
                 or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
             raise ValueError(error)
