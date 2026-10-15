@@ -70,7 +70,7 @@ def validate(args: argparse.Namespace) -> int:
                 tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
             root = Path(temporary)
             # Permission fixtures deliberately drop UID and chmod their own directories.
-            Path(fixture_temporary).chmod(0o711)
+            Path(fixture_temporary).chmod(0o755)
             report["run_id"] = root.name.lower()
             source, policy = root / "source", root / "policy"
             for target, commit, origin in ((source, args.source, repo), (policy, args.policy, policy_repo)):
