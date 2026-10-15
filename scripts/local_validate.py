@@ -168,16 +168,17 @@ def validate(args: argparse.Namespace) -> int:
                     raise ValueError("engine validation requires --disposable-host on an isolated disposable Docker host")
                 if args.profile == "full":
                     tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
-            # Neither profile may execute candidate code on an installed fleet role.
-            installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status")
+            # Neither profile may execute candidate code on a fleet or signing role.
+            installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status", "ci-fleet-signing")
             markers = [Path(parent, role) for parent in ("/etc", "/var/lib", "/opt") for role in installed]
             markers.extend((Path("/var/lib/ci-fleet-status-installer"),
-                            Path("/var/lib/ci-fleet-deployer-container-credentials")))
+                            Path("/var/lib/ci-fleet-deployer-container-credentials"),
+                            Path("/srv/ci-fleet-signing")))
             for parent in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"):
                 for pattern in ("ci-fleet-*", "actions.runner*"):
                     markers.extend(Path(parent).rglob(pattern))
             if any(path.exists() or path.is_symlink() for path in markers):
-                raise ValueError("validation refuses an installed fleet host")
+                raise ValueError("validation refuses an installed fleet host or signing authority")
             if args.kind == "engine" and (os.geteuid() != 0 or not Path("/dev/shm").is_dir()):
                 raise ValueError("complete fixture coverage requires root and /dev/shm on an isolated execution host")
             for name, command in tools.items():

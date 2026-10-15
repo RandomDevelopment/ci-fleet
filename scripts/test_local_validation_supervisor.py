@@ -26,8 +26,8 @@ from pathlib import Path
 root = Path(sys.argv[1])
 def record():
     start = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
-    with (root / 'pids').open('a') as handle:
-        handle.write(str(os.getpid()) + ' ' + start + '\\n')
+    with (root / 'pids').open('ab', buffering=0) as handle:
+        handle.write((str(os.getpid()) + ' ' + start + '\\n').encode())
 def ready():
     (root / 'ready').touch()
 def wait_ready():
@@ -139,17 +139,21 @@ if os.fork() == 0:
     record()
     def finish(*_):
         global generation
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         if generation == 3: os._exit(0)
         child = os.fork()
         if child: os._exit(0)
         generation += 1
         os.setsid()
+        # Allow rediscovery before recording without reentering this handler.
+        time.sleep(.02)
         record()
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     signal.signal(signal.SIGTERM, finish)
     ready()
     while True: signal.pause()
 wait_ready()
-""", grace=1)
+""", grace=3)
         self.assert_reaped(5)
 
     def test_term_ignored_by_leader_times_out_after_cleanup(self):

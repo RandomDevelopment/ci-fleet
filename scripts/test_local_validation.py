@@ -255,6 +255,22 @@ class LocalEvidenceTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
 
+    def test_signer_rejects_nonpositive_pr_ids_before_reading_policy_or_signing(self):
+        import attest_local_validation
+        output = self.root / "invalid-pr-evidence.json"
+        for number in (0, -1):
+            command = ["attest", "--policy", str(self.path), "--result", str(self.root),
+                       "--key", str(self.key), "--reviewed-head", HEAD, "--pull-request", str(number),
+                       "--output", str(output)]
+            with self.subTest(number=number), patch("sys.argv", command), \
+                    patch("attest_local_validation.read_policy") as policy, \
+                    patch("attest_local_validation.subprocess.run") as signing, \
+                    self.assertRaisesRegex(Rejected, "pull-request number must be a positive ID"):
+                attest_local_validation.main()
+            policy.assert_not_called()
+            signing.assert_not_called()
+            self.assertFalse(output.exists())
+
     @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
     def test_signer_enforces_verifier_log_and_envelope_limits(self):
         run_dir = self.root / "bounded-run"; run_dir.mkdir()
@@ -970,6 +986,36 @@ class PolicyExecutionTests(unittest.TestCase):
                         report = json.loads((output / "result.json").read_text())
                         self.assertIn("installed fleet host", report["error"])
                         self.assertEqual(report["results"], [])
+
+    def test_signing_authority_markers_reject_both_kinds_and_profiles_before_execution(self):
+        import argparse
+        import local_validate
+        exists, is_symlink = Path.exists, Path.is_symlink
+        markers = ("/etc/ci-fleet-signing", "/var/lib/ci-fleet-signing",
+                   "/opt/ci-fleet-signing", "/srv/ci-fleet-signing")
+        for kind in ("engine", "configuration"):
+            for profile in ("quick", "full"):
+                for marker in markers:
+                    for dangling in (False, True):
+                        with self.subTest(kind=kind, profile=profile, marker=marker, dangling=dangling):
+                            output = self.root / (kind + profile + marker.replace("/", "-") + str(dangling))
+                            args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                                base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile=profile,
+                                pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
+                            with patch("local_validate.Path.exists", autospec=True,
+                                       side_effect=lambda p: not dangling if str(p) == marker else exists(p)), \
+                                 patch("local_validate.Path.is_symlink", autospec=True,
+                                       side_effect=lambda p: dangling if str(p) == marker else is_symlink(p)), \
+                                 patch("local_validate.run") as stage, \
+                                 patch("local_validate.supervise_stage") as supervisor, \
+                                 patch("sys.stderr", io.StringIO()):
+                                self.assertEqual(local_validate.validate(args), 1)
+                            stage.assert_not_called()
+                            supervisor.assert_not_called()
+                            report = json.loads((output / "result.json").read_text())
+                            self.assertIn("signing authority", report["error"])
+                            self.assertEqual(report["results"], [])
+                            self.assertEqual(report["tools"], {})
 
     def test_missing_tool_records_incomplete_failure(self):
         import argparse

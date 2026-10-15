@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 from verify_config_approval import (
-    LOCAL_EVIDENCE_MAX_BYTES, policy_digest, read_policy, require, require_local_evidence_freshness, unique_object,
+    LOCAL_EVIDENCE_MAX_BYTES, policy_digest, positive_id, read_policy, require, require_local_evidence_freshness, unique_object,
 )
 
 
@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--pull-request", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    require(positive_id(args.pull_request), "pull-request number must be a positive ID")
     policy = read_policy(args.policy)
     require(policy["schema_version"] == 2, "local evidence requires policy v2")
     local = policy["local_validation"]

@@ -252,6 +252,8 @@ report alone never establishes execution provenance.
 Before publishing evidence, the helper verifies the generated signature with
 the protected policy's public key. A wrong private key fails without creating
 the exclusive output file; correct the key or reviewed rotation policy first.
+The pull-request number must be positive. Zero and negative values are rejected
+before the helper reads policy, uses the signing key or creates output.
 Before signing, it rejects a report, log,
 or encoded evidence envelope over the verifier's 1 MiB file limit.
 The signer must also check source, tree,

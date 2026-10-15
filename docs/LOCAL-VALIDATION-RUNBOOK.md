@@ -18,6 +18,11 @@ role, application workload, controller credential, signing key or unrelated
 Docker resource. A separate checkout or Unix account does not isolate Docker
 access from host root. Keep console access and discard the machine after testing.
 
+Both profiles reject standard signing-authority paths, including
+`/etc/ci-fleet-signing`, `/var/lib/ci-fleet-signing` and `/srv/ci-fleet-signing`,
+before candidate execution. Partial bootstrap, leftover files and dangling
+symlinks also block execution, even with `--disposable-host`.
+
 On that machine, install the [listed prerequisites](LOCAL-VALIDATION.md#tools-and-execution-boundary).
 For example, install the non-Docker tools from the distribution's reviewed
 package repositories:
