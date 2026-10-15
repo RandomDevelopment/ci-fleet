@@ -76,5 +76,23 @@ with tempfile.TemporaryDirectory() as temporary:
     subprocess.run([str(mock), 'image', 'tag', runner_id, values['CI_FLEET_RUNNER_IMAGE']], env=env, check=True)
     assert (root / 'runner-state').read_text().strip() == revision
     assert (root / 'runner-id').read_text().strip() == runner_id
+    for case in ('enabled', 'failure', 'invalid', 'removed', 'ambient'):
+        secret_copy = root / 'secret-copy'
+        secret_copy.unlink(missing_ok=True)
+        proxy = 'http://cache.example.invalid:3142'
+        extra = '' if case in ('removed', 'ambient') else f'CI_FLEET_APT_HTTP_PROXY={proxy}\n'
+        if case == 'invalid': extra = 'CI_FLEET_APT_HTTP_PROXY=http://user:password@cache.example.invalid\n'
+        environment.write_text(''.join(f'{key}={value}\n' for key, value in values.items()) + extra)
+        injected = dict(env, FAKE_APT_SECRET_CONFIG=str(secret_copy))
+        if case == 'ambient': injected['CI_FLEET_APT_HTTP_PROXY'] = proxy
+        if case == 'failure': injected['FAKE_FAIL_BUILD'] = '1'
+        result = subprocess.run(['bash', str(repo / 'scripts/build-managed-images.sh'), str(repo), str(environment)],
+                                env=injected, capture_output=True, text=True)
+        assert (result.returncode == 0) == (case in ('enabled', 'removed', 'ambient')), (case, result.stderr)
+        assert secret_copy.exists() == (case == 'enabled'), case
+        if secret_copy.exists():
+            assert f'Acquire::http::Proxy "{proxy}";' in secret_copy.read_text()
+            assert 'Acquire::https::Proxy "DIRECT";' in secret_copy.read_text()
+        assert proxy not in result.stdout + result.stderr and 'password' not in result.stdout + result.stderr
 print('MANAGED_IMAGE_STAGING_TESTS_OK')
 PY

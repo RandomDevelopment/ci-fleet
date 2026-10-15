@@ -32,7 +32,7 @@ A single-host prototype may use root-owned files outside the repository checkout
 /etc/ci-fleet/ci-fleet.env
 ```
 
-`host.env` contains the App client ID, installation ID, private-key path, and runner TTL. `ci-fleet.env` is rendered from reviewed desired state plus those approved host fields. Neither contains the PEM or application secrets, but both remain root-owned mode `0600` because they describe the controller identity and private installation.
+`host.env` contains the App client ID, installation ID, private-key path, runner TTL, and optional APT cache settings. `ci-fleet.env` is rendered from reviewed desired state plus those approved host fields. Neither contains the PEM or application secrets, but both remain root-owned mode `0600` because they describe the controller identity and private installation. A configured cache endpoint is intentionally visible to trusted jobs through their APT configuration. Keep it out of Git and public evidence. See [optional APT cache boundaries](APT-CACHE.md).
 
 Credential provisioning files should be owned by root and readable only through their intended service's approved delivery mechanism. GitHub App private keys are mounted only into the controller. The installer never accepts a private key, token, or Git credential in a command-line argument.
 

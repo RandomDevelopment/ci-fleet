@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 FROM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
 ARG SOURCE_DATE_EPOCH=1786752000
-RUN rm -f /etc/apt/sources.list.d/debian.sources \
+RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \
+    rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/20261012T000000Z bookworm main\n' >/etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends python3 \
@@ -10,7 +11,8 @@ WORKDIR /src
 COPY controller/go.mod controller/go.sum ./
 RUN go mod download && go mod verify
 COPY controller/*.go ./
-COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/cleanup_storage.py scripts/desired_state.py /scripts/
+COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/cleanup_storage.py scripts/desired_state.py scripts/apt_cache.py /scripts/
+COPY scripts/fixtures/apt-cache.json /scripts/fixtures/apt-cache.json
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev
 ARG CI_FLEET_COMMIT=unknown
@@ -25,6 +27,7 @@ LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
       io.randomdevelopment.ci-fleet.managed="true" \
       io.randomdevelopment.ci-fleet.network-cleanup-lock="v2"
 RUN --mount=type=bind,from=build,source=/out,target=/out \
+    --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \
     rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" >/etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \

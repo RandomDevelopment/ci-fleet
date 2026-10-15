@@ -1,0 +1,32 @@
+{
+  "valid": [
+    ["", ""],
+    ["http://cache.example.invalid:3142", ""],
+    ["http://cache.example.invalid/", "mirror.example.invalid,192.0.2.1"],
+    ["http://[2001:db8::1]:3142", "localhost"]
+  ],
+  "invalid": [
+    ["", "mirror.example.invalid"],
+    ["https://cache.example.invalid", ""],
+    ["http://user:password@cache.example.invalid", ""],
+    ["http://cache.example.invalid/path", ""],
+    ["http://cache.example.invalid?query", ""],
+    ["http://cache.example.invalid#fragment", ""],
+    ["http://cache.example.invalid:\";", ""],
+    ["http://cache.example.invalid\n", ""],
+    ["http://cache.example.invalid\u0000", ""],
+    ["http://cache.example.invalid:0", ""],
+    ["http://cache.example.invalid:65536", ""],
+    ["http://cache.example.invalid:", ""],
+    ["http://cache.example.invalid:abc", ""],
+    ["http://[cache.example.invalid]", ""],
+    ["http://bad_host", ""],
+    ["http://$(command)", ""],
+    ["http://cache.example.invalid", "*.example.invalid"],
+    ["http://cache.example.invalid", "192.0.2.0/24"],
+    ["http://cache.example.invalid", "mirror.example.invalid,"],
+    ["http://cache.example.invalid", "mirror.example.invalid:80"],
+    ["http://cache.example.invalid", "mirror.example.invalid\";"],
+    ["http://cache.example.invalid", "2001:db8::1"]
+  ]
+}

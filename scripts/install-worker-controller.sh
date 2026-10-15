@@ -791,7 +791,7 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
-    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh; do
+    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh apt_cache:apt_cache.py; do
       policy_script=${required#*:}
       if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
 import json, sys
@@ -799,7 +799,8 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))
 raise SystemExit(value.get("capabilities", {}).get(sys.argv[2]) is not True)
 PY
       then
-        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" && -x "$path/scripts/$policy_script" ]] || return 1
+        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" ]] || return 1
+        [[ "$policy_script" == *.py || -x "$path/scripts/$policy_script" ]] || return 1
       fi
     done
   fi

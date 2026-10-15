@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Prove APT payload reuse on an inert Docker validation daemon, without real endpoints."""
+
+import io
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tarfile
+import tempfile
+import time
+import uuid
+
+from apt_cache import apt_config
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BUILDKIT = "moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+
+
+def main():
+    prefix = "ci-fleet-apt-test-" + uuid.uuid4().hex[:12]
+    runner_image = os.environ.get("CI_FLEET_RUNNER_IMAGE", "ci-fleet-runner:dev")
+    controller_image = os.environ.get("CI_FLEET_CONTROLLER_IMAGE", "ci-fleet-controller:dev")
+    containers, images, builders = [], [], []
+    measurements = []
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        temporary = Path(directory)
+        step = "setup"
+
+        def run(*args, timeout=1200, input=None):
+            result = subprocess.run(args, input=input, capture_output=True, timeout=timeout)
+            with (temporary / "commands.log").open("ab") as log:
+                log.write(result.stdout + result.stderr)
+            if result.returncode:
+                raise RuntimeError(f"APT_CACHE_E2E_FAILED step={step}")
+            return result.stdout.decode().strip()
+
+        def totals(cache):
+            text = run("docker", "exec", cache, "cat", "/var/log/apt-cacher-ng/apt-cacher.log")
+            incoming = outgoing = 0
+            for line in text.splitlines():
+                fields = line.split("|")
+                if len(fields) >= 5 and fields[-1].endswith(".deb"):
+                    if fields[1] == "I": incoming += int(fields[2])
+                    if fields[1] == "O": outgoing += int(fields[2])
+            return incoming, outgoing
+
+        def measure(cache, name, action, cold=False):
+            before = totals(cache)
+            start = time.monotonic()
+            action()
+            after = totals(cache)
+            incoming, outgoing = (after[index] - before[index] for index in (0, 1))
+            if outgoing <= 0 or (incoming <= 0 if cold else incoming != 0):
+                raise RuntimeError(f"APT_CACHE_E2E_FAILED step={name} missing expected package reuse")
+            measurements.append(dict(path=name, elapsed_seconds=round(time.monotonic() - start, 2),
+                                     upstream_package_bytes=incoming, served_package_bytes=outgoing))
+
+        try:
+            step = "disposable cache image"
+            tools_image = prefix + "-tools"
+            images.append(tools_image)
+            run("docker", "build", "--build-arg", "RUNNER_IMAGE=" + runner_image, "-t", tools_image,
+                str(ROOT / "scripts/fixtures/apt-cache"))
+            cache = prefix + "-cache"
+            containers.append(cache)
+            run("docker", "run", "-d", "--name", cache, tools_image)
+            address = run("docker", "inspect", "--format", "{{.NetworkSettings.IPAddress}}", cache)
+            proxy = f"http://{address}:3142"
+            secret = temporary / "apt.conf"
+            secret.write_text(apt_config(proxy))
+            os.chmod(secret, 0o600)
+            step = "cache readiness"
+            for attempt in range(30):
+                ready = subprocess.run(["docker", "exec", cache, "curl", "--silent", "--fail",
+                                        "http://127.0.0.1:3142/acng-report.html"], capture_output=True)
+                if ready.returncode == 0: break
+                time.sleep(1)
+            else:
+                raise RuntimeError("APT_CACHE_E2E_FAILED step=cache readiness")
+            # Readiness may not create a transfer log until the first APT request.
+            run("docker", "exec", cache, "touch", "/var/log/apt-cacher-ng/apt-cacher.log")
+            step = "fresh runner package installs"
+            install = "apt-get update && apt-get install -y --no-install-recommends hello"
+            for index in range(2):
+                client = prefix + f"-runner-{index}"
+                containers.append(client)
+                run("docker", "create", "--name", client, "--user", "0", "--entrypoint", "/bin/sh",
+                    runner_image, "-ec", install)
+                run("docker", "cp", str(secret), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
+                measure(cache, f"runner-{index}", lambda: run("docker", "start", "-a", client), cold=index == 0)
+            concurrent = []
+            for index in range(2):
+                name = prefix + f"-parallel-{index}"
+                containers.append(name)
+                concurrent.append(name)
+                run("docker", "create", "--name", name, "--user", "0", "--entrypoint", "/bin/sh",
+                    runner_image, "-ec", install)
+                run("docker", "cp", str(secret), name + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
+            def install_concurrently():
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    list(executor.map(lambda name: run("docker", "start", "-a", name), concurrent))
+            measure(cache, "concurrent-runners", install_concurrently)
+            step = "disabled fresh runner"
+            run("docker", "run", "--rm", "--entrypoint", "/bin/sh", runner_image, "-ec",
+                'test ! -e /etc/apt/apt.conf.d/99-ci-fleet-cache; test -z "${CI_FLEET_APT_CONFIG:-}"')
+            client = prefix + "-build-client"
+            containers.append(client)
+            run("docker", "run", "-d", "--name", client, "--entrypoint", "/bin/sh",
+                "--volume", "/var/run/docker.sock:/var/run/docker.sock", tools_image, "-c", "sleep 1800")
+            run("docker", "cp", str(secret), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
+            context = temporary / "context"
+            context.mkdir()
+            (context / "Dockerfile").write_text(
+                "# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf\n"
+                "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nUSER root\n"
+                "RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache "
+                + install + "\n")
+            run("docker", "cp", str(context), client + ":/context")
+            args = ["--no-cache", "--build-arg", "BASE_IMAGE=" + runner_image,
+                    "--secret", "id=ci_fleet_apt,src=/etc/apt/apt.conf.d/99-ci-fleet-cache"]
+            for path in ("docker", "compose", "buildx"):
+                step = path + " build"
+                tag = prefix + "-" + path
+                images.append(tag)
+                if path == "compose":
+                    compose = dict(services={"test": dict(image=tag, build=dict(context="/context",
+                                   args=dict(BASE_IMAGE=runner_image), secrets=["ci_fleet_apt"]))},
+                                   secrets={"ci_fleet_apt": dict(file="/etc/apt/apt.conf.d/99-ci-fleet-cache")})
+                    compose_file = temporary / "compose.json"
+                    compose_file.write_text(json.dumps(compose))
+                    run("docker", "cp", str(compose_file), client + ":/compose.json")
+                    command = ["docker", "compose", "-p", prefix, "-f", "/compose.json", "build", "--no-cache"]
+                elif path == "buildx":
+                    builders.append((client, prefix))
+                    containers.append("buildx_buildkit_" + prefix + "0")
+                    run("docker", "exec", client, "docker", "buildx", "create", "--name", prefix,
+                        "--driver", "docker-container", "--driver-opt", "image=" + BUILDKIT)
+                    command = ["docker", "buildx", "build", "--builder", prefix, "--load", *args, "-t", tag, "/context"]
+                else:
+                    command = ["docker", "build", *args, "-t", tag, "/context"]
+                measure(cache, path, lambda: run("docker", "exec", client, *command))
+                exported = temporary / (path + ".tar")
+                run("docker", "image", "save", "--output", str(exported), tag)
+                with exported.open("rb") as image:
+                    tail = b""
+                    while data := image.read(1024 * 1024):
+                        if proxy.encode() in tail + data:
+                            raise RuntimeError("APT_CACHE_E2E_FAILED step=image endpoint redaction")
+                        tail = data[-len(proxy):]
+                run("docker", "run", "--rm", "--entrypoint", "/bin/sh", tag, "-ec",
+                    "test ! -e /etc/apt/apt.conf.d/99-ci-fleet-cache")
+            step = "managed images preserve reviewed identities"
+            run("docker", "exec", client, "mkdir", "/release")
+            tracked = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT)
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode="w") as tar:
+                for raw in tracked.split(b"\0"):
+                    name = os.fsdecode(raw)
+                    if name.startswith(("controller/", "runner/", "scripts/")) and (ROOT / name).is_file():
+                        tar.add(ROOT / name, arcname=name, recursive=False)
+            run("docker", "cp", "-", client + ":/release", input=archive.getvalue())
+            revision = run("docker", "image", "inspect", "--format", '{{index .Config.Labels "org.opencontainers.image.revision"}}', runner_image)
+            settings = dict(CI_FLEET_ENGINE_REF=revision, CI_FLEET_COMMIT=revision, CI_FLEET_VERSION="dev",
+                            CI_FLEET_RUNNER_IMAGE=prefix + "-managed-runner", CI_FLEET_CONTROLLER_IMAGE=prefix + "-managed-controller",
+                            CI_FLEET_RUNNER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", runner_image),
+                            CI_FLEET_CONTROLLER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", controller_image),
+                            CI_FLEET_APT_HTTP_PROXY=proxy)
+            images.extend([settings["CI_FLEET_RUNNER_IMAGE"], settings["CI_FLEET_CONTROLLER_IMAGE"]])
+            environment = temporary / "managed.env"
+            environment.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items()))
+            run("docker", "cp", str(environment), client + ":/managed.env")
+            before = totals(cache)
+            started = time.monotonic()
+            run("docker", "exec", client, "bash", "/release/scripts/build-managed-images.sh", "/release", "/managed.env")
+            after = totals(cache)
+            if after[1] <= before[1]:
+                raise RuntimeError("APT_CACHE_E2E_FAILED step=managed image package traffic")
+            # These builds use the cache for every APT stage and reject any identity mismatch.
+            measurements.append(dict(path="managed-images", reviewed_identities="matched",
+                                     elapsed_seconds=round(time.monotonic() - started, 2),
+                                     upstream_package_bytes=after[0] - before[0], served_package_bytes=after[1] - before[1]))
+            step = "cache outage and direct HTTPS"
+            unreachable = temporary / "unreachable.conf"
+            unreachable.write_text(apt_config("http://127.0.0.1:9"))
+            run("docker", "cp", str(unreachable), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
+            run("docker", "exec", client, "sh", "-ec", "if apt-get update >/dev/null 2>&1; then exit 1; fi", timeout=60)
+            source = temporary / "https.list"
+            source.write_text("deb https://snapshot.debian.org/archive/debian/20261012T000000Z trixie main\n")
+            run("docker", "cp", str(source), client + ":/https.list")
+            run("docker", "exec", client, "apt-get", "-o", "Dir::Etc::sourcelist=/https.list",
+                "-o", "Dir::Etc::sourceparts=-", "update", timeout=120)
+            print("APT_CACHE_E2E_OK " + json.dumps(measurements, sort_keys=True))
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout") from None
+        finally:
+            for owner, builder in builders:
+                subprocess.run(["docker", "exec", owner, "docker", "buildx", "rm", "--force", builder], capture_output=True, timeout=60)
+            for container in containers:
+                subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
+            for image in images:
+                subprocess.run(["docker", "image", "rm", image], capture_output=True)
+
+
+if __name__ == "__main__":
+    main()

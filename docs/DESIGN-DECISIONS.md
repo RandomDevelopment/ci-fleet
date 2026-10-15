@@ -1,5 +1,20 @@
 # Accepted design decisions
 
+## Optional host-local APT cache
+
+Trusted private pools may opt into an existing apt-cacher-ng server through
+host-local configuration. The endpoint is excluded from Git-authored desired
+state. Routing, capacity, lifecycle, and engine revision remain desired-state
+authority. The selected engine must advertise `apt_cache` before its renderer
+accepts these settings. Support is disabled by default.
+
+Use APT-specific configuration and optional BuildKit secrets, preserving direct
+HTTPS traffic and image identity verification. Project builds and runtime
+containers require explicit integration. Jobs can inspect the runtime endpoint,
+so this does not grant network isolation or permit use in untrusted pools.
+Host APT and cache-server administration remain operator responsibilities.
+See [APT cache support](APT-CACHE.md) for activation, removal, and evidence.
+
 ## Opt-in pinned Chromium profile for the deployment broker
 
 The owner approved this repository capability on 2026-10-14 under [issue #130](https://github.com/RandomDevelopment/ci-fleet/issues/130).

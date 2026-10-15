@@ -74,6 +74,8 @@ Application runtimes, dependencies, service containers, migrations, test fixture
 
 ## 5. Add the read-only workflow
 
+Projects may opt into [APT build-secret and runtime-container examples](APT-CACHE.md#project-build-examples) when their pool enables a cache. Keep endpoints out of project files. APT in project containers does not inherit runner configuration automatically. Local builds must also work without a cache.
+
 Start from `examples/workflows/parallel-ci.yml.example` and:
 
 - pin ci-fleet actions to a reviewed immutable commit;

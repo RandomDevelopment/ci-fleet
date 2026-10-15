@@ -14,20 +14,22 @@ import (
 )
 
 type Config struct {
-	RegistrationURL string
-	ScaleSetName    string
-	RunnerGroup     string
-	RunnerImage     string
-	FleetInstance   string
-	Labels          []string
-	GitHubApp       scaleset.GitHubAppAuth
-	MaxRunners      int
-	MinRunners      int
-	RunnerCPUs      int64
-	RunnerMemory    int64
-	DockerGID       string
-	RunnerTTL       time.Duration
-	StatusFile      string
+	RegistrationURL             string
+	ScaleSetName                string
+	RunnerGroup                 string
+	RunnerImage                 string
+	FleetInstance               string
+	Labels                      []string
+	GitHubApp                   scaleset.GitHubAppAuth
+	MaxRunners                  int
+	MinRunners                  int
+	RunnerCPUs                  int64
+	RunnerMemory                int64
+	DockerGID                   string
+	RunnerTTL                   time.Duration
+	StatusFile                  string
+	APTHTTPProxy                string
+	NoProxy                     string
 	DockerNetworksPerRunner     int
 	DockerNetworkReserveSubnets int
 }
@@ -64,9 +66,13 @@ func configFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("CI_FLEET_RUNNER_TTL: %w", err)
 	}
 	dockerNetworksPerRunner, err := envInt("CI_FLEET_DOCKER_NETWORKS_PER_RUNNER", 0)
-	if err != nil { return Config{}, err }
+	if err != nil {
+		return Config{}, err
+	}
 	dockerNetworkReserveSubnets, err := envInt("CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS", 0)
-	if err != nil { return Config{}, err }
+	if err != nil {
+		return Config{}, err
+	}
 
 	fleetInstance := strings.TrimSpace(os.Getenv("CI_FLEET_INSTANCE"))
 	scaleSetName := strings.TrimSpace(os.Getenv("CI_FLEET_SCALE_SET_NAME"))
@@ -86,13 +92,15 @@ func configFromEnv() (Config, error) {
 			InstallationID: installationID,
 			PrivateKey:     string(privateKey),
 		},
-		MinRunners:   minRunners,
-		MaxRunners:   maxRunners,
-		RunnerCPUs:   runnerCPUs,
-		RunnerMemory: runnerMemoryMiB * 1024 * 1024,
-		DockerGID:    os.Getenv("CI_FLEET_DOCKER_GID"),
-		RunnerTTL:    runnerTTL,
-		StatusFile:   getenv("CI_FLEET_STATUS_FILE", "/run/ci-fleet/status.json"),
+		MinRunners:                  minRunners,
+		MaxRunners:                  maxRunners,
+		RunnerCPUs:                  runnerCPUs,
+		RunnerMemory:                runnerMemoryMiB * 1024 * 1024,
+		DockerGID:                   os.Getenv("CI_FLEET_DOCKER_GID"),
+		RunnerTTL:                   runnerTTL,
+		StatusFile:                  getenv("CI_FLEET_STATUS_FILE", "/run/ci-fleet/status.json"),
+		APTHTTPProxy:                os.Getenv("CI_FLEET_APT_HTTP_PROXY"),
+		NoProxy:                     os.Getenv("CI_FLEET_NO_PROXY"),
 		DockerNetworksPerRunner:     dockerNetworksPerRunner,
 		DockerNetworkReserveSubnets: dockerNetworkReserveSubnets,
 	}
@@ -100,6 +108,9 @@ func configFromEnv() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if _, err := aptCacheConfig(c.APTHTTPProxy, c.NoProxy); err != nil {
+		return err
+	}
 	parsed, err := url.ParseRequestURI(c.RegistrationURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" {
 		return fmt.Errorf("CI_FLEET_GITHUB_URL must be an https://github.com organization or repository URL")

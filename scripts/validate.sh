@@ -38,6 +38,7 @@ python3 -m py_compile \
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_apt_cache.py
 python3 scripts/test_config_approval.py
 python3 scripts/test_cleanup_networks.py
 python3 scripts/test_cleanup_storage.py
@@ -92,6 +93,7 @@ docker compose -f deploy/compose.yaml config --format json | python3 -c 'import 
 
 docker compose -f deploy/compose.yaml build runner-image controller
 docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+python3 scripts/test_apt_cache_e2e.py
 bash scripts/test-cleanup-e2e.sh
 CI_FLEET_INSTANCE=validation scripts/cleanup.sh
 

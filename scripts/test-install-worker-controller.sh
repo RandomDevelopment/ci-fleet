@@ -86,6 +86,10 @@ case "${1:-}" in
         previous=''
         for argument in "$@"; do
           [[ "$previous" != --tag ]] || image=$argument
+          if [[ "$previous" == --secret && -n ${FAKE_APT_SECRET_CONFIG:-} ]]; then
+            [[ "$argument" == id=ci_fleet_apt,src=* ]] || exit 95
+            cp -- "${argument#*src=}" "$FAKE_APT_SECRET_CONFIG"
+          fi
           previous=$argument
         done
         image_paths || exit 1
