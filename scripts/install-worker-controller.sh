@@ -2658,8 +2658,10 @@ perform_converge() {
       current_ref=${current_target##*/}
       if ! runtime_release_complete "$current_target" "$current_ref"; then
         [[ "$mode" == install ]] || die 'current release is incomplete; operator recovery or reinstall required'
+        transaction_started=true
         install_release "$current_ref" "$current_target" 0 0
       elif ! release_tree_permissions_trusted "$current_target"; then
+        transaction_started=true
         install_release "$current_ref" "$current_target" 0 0
       fi
     elif raw_pointer_target_exists "$current_link"; then
@@ -2671,15 +2673,18 @@ perform_converge() {
     [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
     manager_ref=${manager_target##*/}
     if [[ "$mode" == upgrade ]] && release_tree_permissions_trusted "$manager_target"; then
+      transaction_started=true
       CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
         || die 'manager current pointer is invalid'
     elif ! manager_release_complete "$manager_target" "$manager_ref"; then
       [[ "$mode" == install ]] || die 'manager current pointer is incomplete; operator recovery or reinstall required'
       manager_source=$releases_dir/$manager_ref
+      transaction_started=true
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
     elif ! release_tree_permissions_trusted "$manager_target"; then
       manager_source=$releases_dir/$manager_ref
+      transaction_started=true
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
     fi

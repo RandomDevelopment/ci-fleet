@@ -26,6 +26,62 @@ INSTALLER = SCRIPTS / "install-worker-controller.sh"
 
 
 class TestInstallerRejection(unittest.TestCase):
+    def test_incumbent_repairs_cannot_report_early_rejection(self):
+        content = INSTALLER.read_text()
+        prefix = content.split("while (($#)); do", 1)[0]
+        converge = "perform_converge() {" + content.split("perform_converge() {", 1)[1].split("\nlatest_checkpoint()", 1)[0]
+        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "scripts").mkdir()
+                repair = root / "scripts" / "repair-manager-bytecode-drift.py"
+                repair.write_text('#!/usr/bin/env bash\n: >"$REPAIR_MARKER"\n')
+                repair.chmod(0o755)
+                script = prefix + converge + r'''
+repo_root=$1
+scenario=$2
+exec 7>"$repo_root/result.json"
+CI_FLEET_TRANSACTION_RESULT_FD=7
+export REPAIR_MARKER=$repo_root/repaired
+mode=install
+[[ $scenario != bytecode ]] || mode=upgrade
+state_file=$repo_root/state
+rendered_env=$repo_root/env
+current_link=$repo_root/current
+manager_current=$repo_root/manager
+releases_dir=$repo_root/releases
+manager_releases=$repo_root/managers
+lock_file=$repo_root/installer.lock
+controller_id=example-ci-01
+touch "$state_file" "$rendered_env"
+mkdir "$releases_dir" "$manager_releases"
+if [[ $scenario == *_runtime ]]; then
+  ln -s "$releases_dir" "$current_link"
+else
+  ln -s "$manager_releases" "$manager_current"
+fi
+reject_isolated_host() { :; }
+docker_network_policy_matches() { :; }
+controller_status() { :; }
+configuration_approval_required() { return 1; }
+canonical_release_target_from_raw_pointer() { readlink -f "$1"; }
+runtime_release_complete() { [[ $scenario != incomplete_runtime ]]; }
+manager_release_complete() { [[ $scenario != incomplete_manager ]]; }
+release_tree_permissions_trusted() { [[ $scenario == bytecode ]]; }
+install_release() { : >"$REPAIR_MARKER"; }
+install_manager() { : >"$REPAIR_MARKER"; }
+managed_image_ids_configured() { :; }
+drift_count() { die 'fixture-sensitive-value'; }
+perform_converge
+'''
+                fixture = root / "installer.sh"
+                fixture.write_text(script)
+                result = subprocess.run(["bash", str(fixture), str(root), scenario],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue((root / "repaired").exists(), result.stdout + result.stderr)
+                self.assertEqual((root / "result.json").read_text(), "")
+
     def test_only_explicit_pre_transaction_failures_report_rejection(self):
         prefix = INSTALLER.read_text().split("while (($#)); do", 1)[0]
         for started, message, expected in (
