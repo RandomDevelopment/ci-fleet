@@ -61,6 +61,12 @@ def main() -> int:
         subprocess.run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(args.key), "-in", str(root / "payload"),
                         "-out", str(root / "signature")], check=True, timeout=10,
                        env={"PATH": "/usr/bin:/bin", "OPENSSL_CONF": "/dev/null"})
+        (root / "public-key").write_text(local["public_key"])
+        verified = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(root / "public-key"),
+                                   "-in", str(root / "payload"), "-sigfile", str(root / "signature")],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                  env={"PATH": "/usr/bin:/bin", "OPENSSL_CONF": "/dev/null"})
+        require(verified.returncode == 0, "signing key does not match the policy public key")
         envelope["signature"] = base64.b64encode((root / "signature").read_bytes()).decode()
     require_local_evidence_freshness(result, local["max_age_seconds"])
     descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

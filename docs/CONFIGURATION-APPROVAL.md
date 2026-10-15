@@ -249,6 +249,9 @@ no later than the signer's current time. Age from the original start must not
 exceed the protected policy's `local_validation.max_age_seconds`. Signing
 preserves the recorded timestamps and does not extend their expiry. A candidate
 report alone never establishes execution provenance.
+Before publishing evidence, the helper verifies the generated signature with
+the protected policy's public key. A wrong private key fails without creating
+the exclusive output file; correct the key or reviewed rotation policy first.
 Before signing, it rejects a report, log,
 or encoded evidence envelope over the verifier's 1 MiB file limit.
 The signer must also check source, tree,

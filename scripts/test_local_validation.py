@@ -235,6 +235,27 @@ class LocalEvidenceTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
     @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
+    def test_signer_rejects_private_keys_that_do_not_match_policy(self):
+        run_dir = self.root / "key-mismatch-run"; run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps(self.payload["result"]))
+        (run_dir / "configuration.log").write_bytes(self.log.read_bytes())
+        output = self.root / "wrong-key-evidence.json"
+        for algorithm in ("ED25519", "RSA"):
+            with self.subTest(algorithm=algorithm):
+                output.unlink(missing_ok=True)
+                wrong = self.root / ("wrong-" + algorithm + ".key")
+                generate = ["openssl", "genpkey", "-algorithm", algorithm, "-out", str(wrong)]
+                if algorithm == "RSA":
+                    generate.extend(("-pkeyopt", "rsa_keygen_bits:2048"))
+                subprocess.run(generate, check=True, capture_output=True)
+                command = ["python3", str(ROOT / "scripts/attest_local_validation.py"), "--policy", str(self.path),
+                           "--result", str(run_dir), "--key", str(wrong), "--reviewed-head", HEAD,
+                           "--pull-request", "8", "--output", str(output)]
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
     def test_signer_enforces_verifier_log_and_envelope_limits(self):
         run_dir = self.root / "bounded-run"; run_dir.mkdir()
         output = self.root / "bounded.json"
