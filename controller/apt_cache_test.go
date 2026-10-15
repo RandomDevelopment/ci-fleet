@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 func TestAPTCacheSharedValidationCases(t *testing.T) {
@@ -43,16 +44,21 @@ func TestAPTCacheSharedValidationCases(t *testing.T) {
 
 func TestAPTCacheRunnerLogRedaction(t *testing.T) {
 	scaler := &Scaler{config: Config{APTHTTPProxy: "http://cache.example.invalid:3142", NoProxy: "mirror.example.invalid"}}
+	framedLog := func(value string) io.Reader {
+		var framed bytes.Buffer
+		_, _ = io.WriteString(stdcopy.NewStdWriter(&framed, stdcopy.Stdout), value)
+		return &framed
+	}
 	var output bytes.Buffer
 	input := "normal output\nhttp://cache.example.invalid:3142\ncache.example.invalid:3142\ncache.example.invalid\nmirror.example.invalid\n"
-	if err := scaler.copyRunnerLogs(&output, strings.NewReader(input)); err != nil {
+	if err := scaler.copyRunnerLogs(&output, framedLog(input)); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(output.String(), "example.invalid") || !strings.Contains(output.String(), "normal output") {
 		t.Error("runner logs exposed cache configuration or lost ordinary output")
 	}
 	output.Reset()
-	if err := scaler.copyRunnerLogs(&output, strings.NewReader(strings.Repeat("x", 1024*1024+1))); err == nil || output.Len() != 0 {
+	if err := scaler.copyRunnerLogs(&output, framedLog(strings.Repeat("x", 1024*1024+1))); err == nil || output.Len() != 0 {
 		t.Error("oversized logs did not stop safely")
 	}
 	scaler.config = Config{}
@@ -142,5 +148,25 @@ func TestRunnerAPTConfigurationIsOptionalAndCopyFailurePreventsStart(t *testing.
 				t.Error("Docker error exposed private configuration")
 			}
 		})
+	}
+}
+
+func TestAPTCacheRunnerLogRedactionAcrossDockerFrames(t *testing.T) {
+	scaler := &Scaler{config: Config{APTHTTPProxy: "http://cache.example.invalid:3142"}}
+	var framed, output bytes.Buffer
+	writer := stdcopy.NewStdWriter(&framed, stdcopy.Stdout)
+	for _, part := range []string{"connection failed: http://cache.ex", "ample.invalid:3142\n"} {
+		if _, err := io.WriteString(writer, part); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scaler.copyRunnerLogs(&output, &framed); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "cache.ex") || strings.Contains(output.String(), "ample.invalid") {
+		t.Fatal("Docker log frames defeated cache endpoint redaction")
+	}
+	if !strings.Contains(output.String(), "[APT cache]") {
+		t.Fatal("missing redacted endpoint")
 	}
 }
