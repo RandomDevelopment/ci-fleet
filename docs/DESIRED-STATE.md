@@ -244,8 +244,10 @@ Bounded retries up to three attempts handle transient fetch or API failures.
 
 The installer reports an explicit rejection through its private transaction-result
 descriptor only when `die` stops it before a transaction or shared-state mutation
-has started. Incumbent runtime/manager repair, retained-checkpoint repair, and manager-only staging also end
-eligibility for an early-rejection result; later failures remain uncertain.
+has started. Shared runtime/manager preparation, retained-checkpoint repair, and
+manager-only staging also end eligibility for an early-rejection result; later
+failures remain uncertain. The guard starts before that preparation phase,
+including paths where preparation ultimately needs no repair.
 The unchanged Docker disk gate rejects utilization at or above 80% before drain
 or activation. Reconciliation records `status=failed`,
 `transaction_phase=pre_transaction`, and `failure_reason=docker_disk_capacity`,

@@ -26,11 +26,11 @@ INSTALLER = SCRIPTS / "install-worker-controller.sh"
 
 
 class TestInstallerRejection(unittest.TestCase):
-    def test_incumbent_repairs_cannot_report_early_rejection(self):
+    def test_shared_preparation_cannot_report_early_rejection(self):
         content = INSTALLER.read_text()
         prefix = content.split("while (($#)); do", 1)[0]
         converge = "perform_converge() {" + content.split("perform_converge() {", 1)[1].split("\nlatest_checkpoint()", 1)[0]
-        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime", "pending_checkpoint"):
+        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime", "pending_checkpoint", "candidate_preparation"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 (root / "scripts").mkdir()
@@ -60,7 +60,7 @@ printf 'CI_FLEET_RUNNER_IMAGE=fixture-runner\nCI_FLEET_CONTROLLER_IMAGE=fixture-
 mkdir "$releases_dir" "$manager_releases"
 if [[ $scenario == *_runtime ]]; then
   ln -s "$releases_dir" "$current_link"
-elif [[ $scenario != pending_checkpoint ]]; then
+elif [[ $scenario != pending_checkpoint && $scenario != candidate_preparation ]]; then
   ln -s "$manager_releases" "$manager_current"
 fi
 reject_isolated_host() { :; }
@@ -75,11 +75,11 @@ install_release() { [[ $scenario == pending_checkpoint ]] || : >"$REPAIR_MARKER"
 install_manager() { : >"$REPAIR_MARKER"; }
 managed_image_ids_configured() { :; }
 drift_count() {
-  [[ $scenario == pending_checkpoint ]] || die 'fixture-sensitive-value'
+  [[ $scenario == pending_checkpoint || $scenario == candidate_preparation ]] || die 'fixture-sensitive-value'
   DRIFT_COUNT=1
 }
 capture_current_pointer() { :; }
-compose() { :; }
+compose() { [[ $scenario != candidate_preparation ]] || die 'fixture-sensitive-value'; }
 pending_policy_checkpoint() { printf '%s\n' "$repo_root/checkpoint"; }
 repair_pending_checkpoint_authority() { : >"$REPAIR_MARKER"; return 1; }
 perform_converge

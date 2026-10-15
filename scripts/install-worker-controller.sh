@@ -2652,16 +2652,16 @@ perform_converge() {
     require_configuration_approval_capability "$manager_current/engine-capabilities.json" \
       || die 'enable approval only after the installed manager supports it'
   fi
+  # Preparation can repair shared runtime, manager, or recovery state before drain.
+  transaction_started=true
   if [[ -L "$current_link" ]]; then
     current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
       current_ref=${current_target##*/}
       if ! runtime_release_complete "$current_target" "$current_ref"; then
         [[ "$mode" == install ]] || die 'current release is incomplete; operator recovery or reinstall required'
-        transaction_started=true
         install_release "$current_ref" "$current_target" 0 0
       elif ! release_tree_permissions_trusted "$current_target"; then
-        transaction_started=true
         install_release "$current_ref" "$current_target" 0 0
       fi
     elif raw_pointer_target_exists "$current_link"; then
@@ -2673,18 +2673,15 @@ perform_converge() {
     [[ -n "$manager_target" ]] || die 'manager current pointer is invalid'
     manager_ref=${manager_target##*/}
     if [[ "$mode" == upgrade ]] && release_tree_permissions_trusted "$manager_target"; then
-      transaction_started=true
       CI_FLEET_INSTALLER_LOCK_FD=9 "$repo_root/scripts/repair-manager-bytecode-drift.py" --lock-file "$lock_file" "$manager_current" \
         || die 'manager current pointer is invalid'
     elif ! manager_release_complete "$manager_target" "$manager_ref"; then
       [[ "$mode" == install ]] || die 'manager current pointer is incomplete; operator recovery or reinstall required'
       manager_source=$releases_dir/$manager_ref
-      transaction_started=true
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
     elif ! release_tree_permissions_trusted "$manager_target"; then
       manager_source=$releases_dir/$manager_ref
-      transaction_started=true
       install_release "$manager_ref" "$manager_source" 0 0
       install_manager "$manager_ref" "$manager_source" "$manager_target" 0 0 false
     fi
@@ -2714,7 +2711,6 @@ perform_converge() {
   pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
   case "$pending_checkpoint_status" in
     0)
-      transaction_started=true
       repair_pending_checkpoint_authority "$pending_checkpoint" || die 'pending network-policy controller checkpoint is invalid'
       checkpoint_dir=$pending_checkpoint
       ;;
@@ -2724,7 +2720,6 @@ perform_converge() {
   build_candidate
   build_before_drain=true
   require_commands
-  transaction_started=true
   transaction_active=true
   if [[ "$DOCKER_NETWORK_POLICY_DRIFT" == true ]]; then
     policy_env=$(mktemp "$state_root/.policy-candidate-env.XXXXXX")
