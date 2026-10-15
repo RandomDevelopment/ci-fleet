@@ -2884,6 +2884,8 @@ if [[ "$mode" == policy-action ]]; then
 else
   require_commands
 fi
+# Later paths can write lock, adoption, runtime, manager, or recovery state.
+transaction_started=true
 if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
   [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
   [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'

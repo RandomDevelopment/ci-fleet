@@ -874,6 +874,23 @@ assert json.load(open(sys.argv[1], encoding="utf-8")) == {
 PY
 unset FAKE_DISK_USED_PERCENT
 
+# Adoption may extract host.env before discovering an unusable credential path.
+early_adopt_result=$tmp/early-adopt-result.json
+early_adopt_rendered=$root/etc/ci-fleet/ci-fleet.env
+early_adopt_etc_mode=$(stat -c %a "$root/etc/ci-fleet")
+mv "$host_config" "$tmp/early-adopt-host.env"
+printf '%s\n' \
+  'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
+  'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
+  "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$tmp/missing-adoption-key.pem" >"$early_adopt_rendered"
+chmod 600 "$early_adopt_rendered"
+expect_failure 'GitHub App PEM file is missing' env CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --adopt "${base_args[@]}" --ref "$ref_one" 7>"$early_adopt_result"
+[[ -s "$host_config" ]] || fail 'adoption regression did not extract host.env'
+[[ ! -s "$early_adopt_result" ]] || fail 'adoption emitted early rejection after writing host.env'
+mv "$tmp/early-adopt-host.env" "$host_config"
+rm -- "$early_adopt_rendered"
+chmod "$early_adopt_etc_mode" "$root/etc/ci-fleet"
+
 # The installed maintenance scripts must pin the local Docker daemon themselves,
 # not just inherit it from the installer.
 export FAKE_REQUIRE_LOCAL_DOCKER_ENDPOINT=1
