@@ -29,7 +29,7 @@ fi
 python3 "$validator" --config "$PWD/examples/multi-host/fleet.json" --tree-paths "$temporary_directory/tree-paths"
 
 
-engine_ref=$(python3 -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
+engine_ref=$(python3 -I -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
 if ./scripts/init.sh \
   --organization test-company \
   --project test-app \

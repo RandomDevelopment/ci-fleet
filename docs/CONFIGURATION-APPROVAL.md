@@ -181,6 +181,10 @@ and unattended bypass rejection require separately authorized live verification.
 
 ## Signed local validation
 
+The [operator walkthrough](LOCAL-VALIDATION-RUNBOOK.md) covers prerequisite setup,
+key/policy bootstrap, independently verified transfer, signing, protected evidence
+installation and read-only host acceptance checks.
+
 Policy version 1 retains its hosted-workflow requirement. Policy version 2
 requires signed full local validation and omits Actions calls when both
 `workflow_id` and `required_jobs` are absent. Adding both fields makes hosted

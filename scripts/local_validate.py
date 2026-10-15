@@ -129,7 +129,7 @@ def validate(args: argparse.Namespace) -> int:
                                        "--base", history_base, "--head", args.source, "--exclude-tag", args.tag]))
             report["history_base"] = history_base
             heads = list(dict.fromkeys((args.source, reviewed_head)))
-            checks.append(("commits", ["python3", "-c",
+            checks.append(("commits", ["python3", "-I", "-c",
                 "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--base', sys.argv[2], '--head', h], check=True) for h in sys.argv[3:]]",
                 validator, history_base, *heads]))
             commits = []
@@ -137,7 +137,7 @@ def validate(args: argparse.Namespace) -> int:
                 commits.extend(git(source, "rev-list", "--reverse", history_base + ".." + head if history_base else head).splitlines())
                 commits.append(head)
             commits = list(dict.fromkeys(commits))
-            checks.append(("history-secrets", ["python3", "-c",
+            checks.append(("history-secrets", ["python3", "-I", "-c",
                 "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--repository', sys.argv[2], '--commit', c], check=True) for c in sys.argv[3:]]",
                 scanner, str(source), *commits]))
             if args.kind == "engine":

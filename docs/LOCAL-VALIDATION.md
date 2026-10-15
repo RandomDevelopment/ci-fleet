@@ -8,6 +8,11 @@ the parity and rollback gates below pass. The engine hosted adapter calls the
 complete local entry point and retains its independent main-policy guards. This implementation does not claim
 that host adoption or the standalone template migration has occurred.
 
+Follow the [operator walkthrough](LOCAL-VALIDATION-RUNBOOK.md) for machine setup,
+commit selection, complete runs, separate signer bootstrap, evidence provisioning,
+acceptance checks and recovery. It keeps host activation and policy cutover
+separate from repository validation.
+
 ## Tools and execution boundary
 
 Use a disposable Debian 13 or Ubuntu 24.04 Linux execution machine. Engine
@@ -75,6 +80,8 @@ own child directory. Both temporary roots are removed on exit. It strips inherit
 configuration from check environments. It loads the commit validator, secret
 scanner and check plan from the pinned policy checkout. Source test programs
 remain proposed code and must receive independent review.
+Trusted inline Python drivers use isolated mode so candidate modules cannot
+replace the standard-library imports that dispatch commit and history checks.
 
 Each stage has a log, timestamps, result and SHA-256 log digest in `result.json`.
 The report records commit, tree, base, main, suite, profile, policy revision,

@@ -17,6 +17,8 @@ Use one shared pool of disposable CI workers across multiple trusted private rep
 Run the complete engine and embedded-configuration suites without Actions through
 [local validation](docs/LOCAL-VALIDATION.md). Signed local configuration evidence
 is opt-in; existing host and required-check policies need a reviewed migration.
+The [operator walkthrough](docs/LOCAL-VALIDATION-RUNBOOK.md) gives the setup,
+execution, signing and acceptance sequence.
 
 ## What problem does this solve?
 

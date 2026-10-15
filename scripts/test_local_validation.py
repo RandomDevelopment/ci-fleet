@@ -311,6 +311,19 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["results"][-1]["name"], "history-secrets")
         self.assertEqual(report["results"][-1]["status"], "failed")
 
+    def test_candidate_module_cannot_replace_trusted_history_drivers(self):
+        for invalid in ("commit", "secret"):
+            with self.subTest(invalid=invalid):
+                self.git("checkout", "--detach", self.source)
+                (self.repo / "subprocess.py").write_text("def run(*args, **kwargs): pass\n")
+                if invalid == "secret":
+                    (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
+                head = self.commit("invalid commit" if invalid == "commit" else "fix: candidate shadows subprocess")
+                result, report = self.validate(source=head)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(report["results"][-1]["name"], "commits" if invalid == "commit" else "history-secrets")
+                self.assertEqual(report["results"][-1]["status"], "failed")
+
     def test_integrated_squash_scans_removed_secrets_in_reviewed_history(self):
         (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
         self.commit("fix: add forbidden filename")
