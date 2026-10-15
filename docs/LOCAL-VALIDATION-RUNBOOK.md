@@ -92,6 +92,9 @@ Use the actual reviewed PR title. If the ancestry check fails, reconcile the PR
 with main and repeat review before testing; do not silently substitute an older
 base to hide the difference. The validator checkout remains at the selected
 policy revision while the harness creates a separate candidate checkout.
+Keep result paths outside every Git worktree and repository. The harness checks
+resolved paths before creating output or running candidates, including when a
+repository argument names a subdirectory or a result path uses a symlink.
 
 Inspect `result.json`, every named stage log, recorded identities, tool versions
 and exit status. Success requires `profile` equal to `full`, `status` equal to

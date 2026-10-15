@@ -53,7 +53,11 @@ They do not prove deployment on a real prepared host.
 
 Replace all uppercase values with full available commit SHAs or local paths.
 Choose the PR's exact head and final base. Use a new output directory outside
-both checkouts. Run as root only on the disposable execution machine.
+every Git worktree and repository, including source, policy and the executing
+validator checkout. The harness resolves symlinks and checks Git locations
+without inherited Git overrides. An unsafe or indeterminate location fails
+before creating directories, reports or logs, or executing candidates.
+Run as root only on the disposable execution machine.
 
 ```bash
 python3 /trusted/ci-fleet/scripts/local_validate.py \
@@ -129,10 +133,10 @@ incomplete execution. Never infer success from the last visible test line.
 
 Each stage has a 1,800-second timeout, configurable with `--timeout`. A separate
 Linux child-subreaper supervisor owns the stage's descendants, including children
-that create new sessions or double-fork. The orchestrator does not become a
-subreaper. On stage exit, timeout, SIGINT or SIGTERM, the supervisor signals owned
-descendants through pidfds and allows 60 seconds for cleanup before forced
-termination. It repeatedly discovers and reaps descendants until the kernel
+that create new sessions or double-fork. The orchestrator never enables or changes
+its own existing subreaper flag. On stage exit, timeout, SIGINT or SIGTERM, the
+supervisor signals owned descendants through pidfds and allows 60 seconds for
+cleanup before forced termination. It repeatedly discovers and reaps descendants until the kernel
 confirms that no children remain. A successful leader cannot hide descendants
 that require forced termination; that stage fails. The orchestrator waits for
 this cleanup before propagating cancellation. Helpers started by a process

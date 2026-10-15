@@ -616,6 +616,113 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
 
+    def test_output_inside_git_repositories_is_rejected_before_creating_files(self):
+        import argparse
+        import local_validate
+        policy = self.root / "policy"
+        subprocess.run(["git", "clone", "--quiet", str(self.repo), str(policy)], check=True)
+        unrelated = self.root / "other-worktree"
+        subprocess.run(["git", "init", "--quiet", str(unrelated)], check=True)
+        trusted = self.root / "trusted-worktree"
+        subprocess.run(["git", "init", "--quiet", str(trusted)], check=True)
+        (trusted / "scripts").mkdir()
+        executable = trusted / "scripts/local_validate.py"
+        executable.write_text("# independently selected validator\n")
+        alias = self.root / "source-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        linked = self.root / "linked-worktree"
+        self.git("worktree", "add", "--quiet", "--detach", str(linked), self.source)
+        broken = self.root / "broken-worktree"
+        broken.mkdir()
+        (broken / ".git").symlink_to(self.root / "missing-git-directory", target_is_directory=True)
+        separate = self.root / "separate-worktree"
+        storage = self.root / "git-storage"
+        subprocess.run(["git", "init", "--quiet", "--separate-git-dir", str(storage), str(separate)], check=True)
+        subprocess.run(["git", "-C", str(separate), "config", "core.worktree", str(separate)], check=True)
+        cases = (
+            ("source", self.repo / "private-results/run", self.repo),
+            ("git-metadata", self.repo / ".git/private-results/run", self.repo),
+            ("source-subdirectory", self.repo / "outside-scripts/run", self.repo / "scripts"),
+            ("policy", policy / "private-results/run", self.repo),
+            ("executing-checkout", trusted / "private-results/run", self.repo),
+            ("other-worktree", unrelated / "private-results/run", self.repo),
+            ("symlink-alias", alias / "aliased-results/run", self.repo),
+            ("linked-worktree", linked / "private-results/run", self.repo),
+            ("broken-git-marker", broken / "private-results/run", self.repo),
+            ("separate-git-storage", storage / "objects/private-results/run", self.repo),
+        )
+        before = local_validate.checkout_manifest(self.repo)
+        for name, output, repository in cases:
+            with self.subTest(location=name):
+                args = argparse.Namespace(repository=repository, policy_repository=policy, source=self.source,
+                    base=self.base, policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
+                    pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
+                with patch("local_validate.__file__", str(executable)), \
+                     patch("local_validate.checkout") as checkout, patch("local_validate.run") as stage, \
+                     self.assertRaisesRegex(ValueError, "--output must be outside Git worktrees"):
+                    local_validate.validate(args)
+                checkout.assert_not_called()
+                stage.assert_not_called()
+                self.assertFalse(output.parent.exists())
+                self.assertEqual(local_validate.checkout_manifest(self.repo), before)
+
+    def test_external_output_and_bare_origins_remain_supported(self):
+        import local_validate
+        bare = self.root / "origin.git"
+        subprocess.run(["git", "clone", "--quiet", "--bare", str(self.repo), str(bare)], check=True)
+        external = self.root / "external-results"
+        external.mkdir()
+        alias = self.root / "results-alias"
+        alias.symlink_to(external, target_is_directory=True)
+        output = alias / "new/run"
+        with patch("local_validate.__file__", str(external / "local_validate.py")):
+            self.assertEqual(local_validate.output_directory(output, self.repo, bare), output.resolve())
+        self.assertFalse(output.exists())
+        result, _ = self.validate("--repository", str(bare), "--policy-repository", str(bare), "--output", str(output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((output / "result.json").read_text())["status"], "passed")
+        self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+        rejected = bare / "private-results/run"
+        result, _ = self.validate("--output", str(rejected))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--output must be outside Git worktrees", result.stderr)
+        self.assertFalse(rejected.parent.exists())
+
+    def test_output_discovery_rejects_git_errors_without_creating_files(self):
+        import local_validate
+        bare = self.root / "unrelated.git"
+        subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True)
+        installed = self.root / "installed"
+        installed.mkdir()
+        output = bare / "objects/private-results/run"
+        execute = subprocess.run
+        def different_owner(command, *args, **kwargs):
+            kwargs["env"] = {**kwargs["env"], "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+            result = execute(command, *args, **kwargs)
+            if command[2] == str(bare / "objects"):
+                self.assertIn(b"detected dubious ownership", result.stderr)
+            return result
+        with patch("local_validate.__file__", str(installed / "local_validate.py")), \
+             patch("local_validate.subprocess.run", side_effect=different_owner), \
+             self.assertRaisesRegex(ValueError, "cannot determine Git location"):
+            local_validate.output_directory(output)
+        self.assertFalse(output.parent.exists())
+
+    def test_output_discovery_preserves_path_bytes_and_ignores_git_overrides(self):
+        import local_validate
+        for suffix in (" ", "\n", "\r\n"):
+            with self.subTest(suffix=repr(suffix)):
+                bare = self.root / ("unrelated.git" + suffix)
+                subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True)
+                output = bare / "objects/private-results/run"
+                for overrides in ({}, {"GIT_DIR": str(self.repo / ".git"), "GIT_WORK_TREE": str(self.repo)},
+                                  {"GIT_CEILING_DIRECTORIES": str(bare), "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0"}):
+                    with self.subTest(overrides=tuple(overrides)), patch.dict(os.environ, overrides), \
+                         self.assertRaisesRegex(ValueError, "--output must be outside Git worktrees"):
+                        local_validate.output_directory(output)
+                    self.assertFalse(output.parent.exists())
+
     def test_checkouts_contain_only_declared_identities_and_their_ancestors(self):
         import argparse
         import local_validate

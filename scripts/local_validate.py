@@ -28,6 +28,38 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
+def output_directory(path: Path, *repositories: Path) -> Path:
+    output = path.resolve()
+    ancestor = output
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        ancestor = ancestor.parent
+    message = "--output must be outside Git worktrees and repositories"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(LC_ALL="C", GIT_DISCOVERY_ACROSS_FILESYSTEM="1")
+    for repository in dict.fromkeys((*repositories, Path(__file__).resolve().parent, ancestor)):
+        for location in ("--show-toplevel", "--absolute-git-dir"):
+            result = subprocess.run(["git", "-C", str(repository), "rev-parse", location],
+                                    capture_output=True, env=env)
+            if result.returncode == 0:
+                root = Path(os.fsdecode(result.stdout.removesuffix(b"\n")))
+                if not root.is_absolute():
+                    raise ValueError(message + "; invalid Git location")
+                if output.is_relative_to(root.resolve()):
+                    raise ValueError(message)
+                continue
+            if result.stderr.startswith(b"fatal: not a git repository (or any"):
+                break
+            if location != "--show-toplevel" or result.stderr != b"fatal: this operation must be run in a work tree\n":
+                raise ValueError(message + "; cannot determine Git location")
+    # A broken Git marker must not make a checkout safe for private logs.
+    if any((parent / ".git").exists() or (parent / ".git").is_symlink()
+           for parent in (output, *output.parents)):
+        raise ValueError(message)
+    return output
+
+
 def fetch_tags(target: Path, tags: dict[str, dict[str, str]]) -> None:
     if tags:
         subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin",
@@ -130,7 +162,7 @@ def validate(args: argparse.Namespace) -> int:
             subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head], check=True)
         if git(repo, "rev-parse", args.source + "^{tree}") != git(repo, "rev-parse", reviewed_head + "^{tree}"):
             raise ValueError("integrated and reviewed source trees differ")
-    output = args.output.resolve()
+    output = output_directory(args.output, repo, policy_repo)
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {"schema_version": 1, "suite": SUITE if args.kind == "engine" else "ci-fleet-config-local-v1", "profile": args.profile,
               "source": args.source, "reviewed_head": reviewed_head, "tree": git(repo, "rev-parse", args.source + "^{tree}"),
