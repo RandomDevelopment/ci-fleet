@@ -9,6 +9,13 @@ grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lac
 grep -Fq 'export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1' "$repo_root/scripts/install-worker-controller.sh" || { printf 'FAIL: installer health check can submit monitoring reports\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Synthetic engine commits belong to the fixture, not the reviewed source checkout.
+fixture_repo=$tmp/core
+git init -q "$fixture_repo"
+git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" rev-parse HEAD)"
+git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
+git --no-optional-locks -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
+repo_root=$fixture_repo
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
 export REAL_STAT

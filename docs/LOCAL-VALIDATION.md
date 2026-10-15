@@ -41,7 +41,9 @@ For trusted acceptance, run the orchestrator itself from that trusted checkout.
 Git and image/package downloads require network access when not already cached.
 The suite never registers a runner and needs no fleet credential. Existing
 installer/systemd/recovery fixtures use fake services and isolated filesystem
-roots. They do not prove deployment on a real prepared host.
+roots. Installer fixtures that mutate Git history or reviewed files use their own
+repository copies, preserving the candidate checkout and its Git metadata.
+They do not prove deployment on a real prepared host.
 
 ## Complete engine command
 
