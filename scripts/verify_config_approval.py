@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import subprocess
+import tempfile
 from datetime import datetime
 import json
 import os
@@ -21,6 +25,7 @@ from typing import Any
 SHA = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workflow_id", "required_jobs", "reviewer_ids"}
+LOCAL_POLICY_KEYS = {"directory", "public_key", "validator_revision", "suite", "required_checks", "max_age_seconds"}
 CODEX_CLEAN = re.compile(
     r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
@@ -93,11 +98,36 @@ def read_policy(path: Path, owner: int = 0) -> dict[str, Any]:
                 "approval policy must be a root-owned regular file with mode 0600")
         require(metadata.st_size <= 16384, "approval policy exceeds size limit")
         policy = json.load(handle, object_pairs_hook=unique_object)
-    require(isinstance(policy, dict) and POLICY_KEYS <= set(policy)
-            and set(policy) <= POLICY_KEYS | {"codex_reviewer_ids"}, "invalid approval policy keys")
-    require(type(policy["schema_version"]) is int and policy["schema_version"] == 1, "unsupported approval policy version")
-    for key in ("configuration_repository_id", "workflow_id"):
-        require(positive_id(policy[key]), "approval policy IDs must be positive integers")
+    require(isinstance(policy, dict), "invalid approval policy")
+    version = policy.get("schema_version")
+    require(type(version) is int and version in {1, 2}, "unsupported approval policy version")
+    required = POLICY_KEYS if version == 1 else (POLICY_KEYS - {"workflow_id", "required_jobs"}) | {"local_validation"}
+    optional = {"codex_reviewer_ids"} | ({"workflow_id", "required_jobs"} if version == 2 else set())
+    require(required <= set(policy) and set(policy) <= required | optional, "invalid approval policy keys")
+    require(positive_id(policy["configuration_repository_id"]), "approval repository ID must be positive")
+    require(("workflow_id" in policy) == ("required_jobs" in policy), "hosted validation policy is incomplete")
+    if "workflow_id" in policy:
+        require(positive_id(policy["workflow_id"]), "workflow ID must be positive")
+    if version == 2:
+        local = policy["local_validation"]
+        require(isinstance(local, dict) and set(local) == LOCAL_POLICY_KEYS, "invalid local validation policy")
+        require(isinstance(local["directory"], str) and Path(local["directory"]).is_absolute(), "invalid evidence directory")
+        require(isinstance(local["public_key"], str) and len(local["public_key"]) <= 1024
+                and local["public_key"].startswith("-----BEGIN PUBLIC KEY-----\n"), "invalid local validation public key")
+        public = local["public_key"].splitlines()
+        require(len(public) == 3 and public[0] == "-----BEGIN PUBLIC KEY-----"
+                and public[2] == "-----END PUBLIC KEY-----", "invalid Ed25519 public key")
+        der = base64.b64decode(public[1], validate=True)
+        require(len(der) == 44 and der[:12] == bytes.fromhex("302a300506032b6570032100"), "key must be Ed25519")
+        require(isinstance(local["validator_revision"], str) and bool(SHA.fullmatch(local["validator_revision"])),
+                "local validator revision must be pinned")
+        require(isinstance(local["suite"], str) and bool(re.fullmatch(r"[a-z0-9-]{1,100}", local["suite"])), "invalid suite")
+        checks = local["required_checks"]
+        require(isinstance(checks, list) and 0 < len(checks) <= 100 and all(
+            isinstance(check, str) and bool(re.fullmatch(r"[a-z0-9-]{1,100}", check)) for check in checks)
+            and len(set(checks)) == len(checks), "invalid required local checks")
+        require(type(local["max_age_seconds"]) is int and 60 <= local["max_age_seconds"] <= 604800,
+                "invalid local validation maximum age")
     branch = policy["branch"]
     require(isinstance(branch, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]+", branch)), "unsupported approval policy branch")
     reviewers = policy["reviewer_ids"]
@@ -107,10 +137,11 @@ def read_policy(path: Path, owner: int = 0) -> dict[str, Any]:
     codex = policy.get("codex_reviewer_ids", [])
     require(isinstance(codex, list) and all(positive_id(item) and item in reviewers for item in codex)
             and len(set(codex)) == len(codex), "Codex reviewer IDs must be unique allowed reviewer IDs")
-    jobs = policy["required_jobs"]
-    require(isinstance(jobs, list) and 0 < len(jobs) <= 20
-            and all(isinstance(item, str) and 0 < len(item) <= 200 for item in jobs), "approval policy requires job names")
-    require(len(set(jobs)) == len(jobs), "duplicate required jobs")
+    if "required_jobs" in policy:
+        jobs = policy["required_jobs"]
+        require(isinstance(jobs, list) and 0 < len(jobs) <= 20
+                and all(isinstance(item, str) and 0 < len(item) <= 200 for item in jobs), "approval policy requires job names")
+        require(len(set(jobs)) == len(jobs), "duplicate required jobs")
     marker = path.with_name("config-review-required")
     descriptor = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, encoding="utf-8") as handle:
@@ -350,6 +381,75 @@ def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, num
     return False
 
 
+def policy_digest(policy: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def trusted_evidence(path: Path, owner: int = 0) -> bytes:
+    for parent in path.parents:
+        metadata = parent.lstat()
+        require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid in {0, owner} and not metadata.st_mode & 0o022,
+                "local evidence parent is not trusted")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as handle:
+        metadata = os.fstat(handle.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner
+                and stat.S_IMODE(metadata.st_mode) == 0o600 and metadata.st_nlink == 1
+                and metadata.st_size <= 1024 * 1024, "local evidence file is not trusted")
+        data = handle.read(1024 * 1024 + 1)
+        require(len(data) <= 1024 * 1024, "local evidence exceeds size limit")
+        return data
+
+
+def verify_local_evidence(policy: dict[str, Any], commit: str, tree: str, parent: str, head: str,
+                          number: int, owner: int = 0, now: int | None = None) -> None:
+    local = policy["local_validation"]
+    directory = Path(local["directory"])
+    # The fixed commit filename and protected path never come from the candidate.
+    envelope = json.loads(trusted_evidence(directory / (commit + ".json"), owner), object_pairs_hook=unique_object)
+    require(isinstance(envelope, dict) and set(envelope) == {"payload", "signature"}, "invalid evidence envelope")
+    payload = base64.b64decode(envelope["payload"], validate=True)
+    signature = base64.b64decode(envelope["signature"], validate=True)
+    require(len(signature) == 64, "invalid Ed25519 signature")
+    with tempfile.TemporaryDirectory(prefix="ci-fleet-evidence-") as temporary:
+        root = Path(temporary)
+        for name, data in (("key", local["public_key"].encode()), ("payload", payload), ("signature", signature)):
+            (root / name).write_bytes(data)
+        result = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(root / "key"),
+                                 "-in", str(root / "payload"), "-sigfile", str(root / "signature")],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                env={"PATH": "/usr/bin:/bin", "OPENSSL_CONF": "/dev/null"})
+        require(result.returncode == 0, "local evidence signature rejected")
+    value = json.loads(payload, object_pairs_hook=unique_object)
+    require(isinstance(value, dict) and set(value) == {"schema_version", "policy_sha256", "repository_id", "branch",
+            "pull_request", "reviewed_head", "result"} and type(value["schema_version"]) is int
+            and value["schema_version"] == 1, "invalid local evidence payload")
+    require(value["policy_sha256"] == policy_digest(policy)
+            and value["repository_id"] == policy["configuration_repository_id"] and value["branch"] == policy["branch"]
+            and value["pull_request"] == number and value["reviewed_head"] == head, "local evidence context differs")
+    report = value["result"]
+    require(isinstance(report, dict) and report.get("source") == commit and report.get("tree") == tree
+            and report.get("base") == parent and report.get("policy") == local["validator_revision"]
+            and report.get("suite") == local["suite"] and report.get("profile") == "full"
+            and report.get("status") == "passed" and report.get("expected_skips") == []
+            and type(report.get("schema_version")) is int and report["schema_version"] == 1, "local validation is incomplete or has different identities")
+    started, finished = report.get("started_at"), report.get("finished_at")
+    current = int(time.time()) if now is None else now
+    require(type(started) is int and type(finished) is int and 0 < started <= finished <= current
+            and current - started <= local["max_age_seconds"], "local evidence expired or clock is uncertain")
+    require(isinstance(report.get("tools"), dict) and bool(report["tools"])
+            and all(isinstance(v, str) and v for v in report["tools"].values()), "tool versions are missing")
+    checks = report.get("results")
+    require(isinstance(checks, list) and all(isinstance(item, dict) for item in checks), "local results missing")
+    names = [item.get("name") for item in checks]
+    require(len(names) == len(set(names)) and set(names) == set(local["required_checks"]), "local suite coverage differs")
+    for item in checks:
+        require(item.get("status") == "passed" and isinstance(item.get("sha256"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", item["sha256"])), "local check did not pass")
+        log = trusted_evidence(directory / (commit + ".logs") / (item["name"] + ".log"), owner)
+        require(hashlib.sha256(log).hexdigest() == item["sha256"], "local log was tampered with")
+
+
 def verify_one(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str) -> str:
     require(bool(REPOSITORY.fullmatch(repository)) and bool(SHA.fullmatch(commit)) and bool(SHA.fullmatch(tree)),
             "approval requires a repository, full commit SHA, and local tree SHA")
@@ -405,19 +505,22 @@ def verify_one(api: GitHub, policy: dict[str, Any], repository: str, commit: str
                  for reviewer, review in latest.items())
     require(formal or clean_codex_review(api, policy, repository, number, head, author_id, reviews, base_changed),
             "independent exact-head approval is missing")
-    runs = api.pages(f"{prefix}/actions/workflows/{policy['workflow_id']}/runs?head_sha={commit}&event=push", "workflow_runs")
-    require(bool(runs) and all(positive_id(run.get("id")) for run in runs), "exact-commit workflow is missing")
-    run = max(runs, key=run_order)
-    require(run.get("workflow_id") == policy["workflow_id"] and run.get("head_sha") == commit
-            and run.get("event") == "push" and run.get("head_branch") == policy["branch"]
-            and run.get("repository", {}).get("id") == policy["configuration_repository_id"]
-            and run.get("status") == "completed" and run.get("conclusion") == "success"
-            and positive_id(run.get("run_attempt")), "latest exact-commit workflow did not pass")
-    jobs = api.pages(f"{prefix}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
-    for required in policy["required_jobs"]:
-        matching = [job for job in jobs if job.get("name") == required]
-        require(len(matching) == 1 and matching[0].get("status") == "completed" and matching[0].get("conclusion") == "success",
-                "required workflow job did not pass")
+    if "local_validation" in policy:
+        verify_local_evidence(policy, commit, tree, parent, head, number)
+    if "workflow_id" in policy:
+        runs = api.pages(f"{prefix}/actions/workflows/{policy['workflow_id']}/runs?head_sha={commit}&event=push", "workflow_runs")
+        require(bool(runs) and all(positive_id(run.get("id")) for run in runs), "exact-commit workflow is missing")
+        run = max(runs, key=run_order)
+        require(run.get("workflow_id") == policy["workflow_id"] and run.get("head_sha") == commit
+                and run.get("event") == "push" and run.get("head_branch") == policy["branch"]
+                and run.get("repository", {}).get("id") == policy["configuration_repository_id"]
+                and run.get("status") == "completed" and run.get("conclusion") == "success"
+                and positive_id(run.get("run_attempt")), "latest exact-commit workflow did not pass")
+        jobs = api.pages(f"{prefix}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
+        for required in policy["required_jobs"]:
+            matching = [job for job in jobs if job.get("name") == required]
+            require(len(matching) == 1 and matching[0].get("status") == "completed" and matching[0].get("conclusion") == "success",
+                    "required workflow job did not pass")
     return parent
 
 
@@ -470,7 +573,7 @@ def main() -> int:
             previous = read_installed_commit(args.installed_state, args.repository)
             require(previous is not None, "configuration approval requires an installed trusted baseline")
             verify(GitHub(sys.stdin.read(8192).strip()), policy, args.repository, args.commit, args.tree, previous)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
         # API responses, policy contents, and authentication material are never logged.
         print("ERROR: configuration approval rejected or evidence unavailable", file=sys.stderr)
         return 2

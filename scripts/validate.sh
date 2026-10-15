@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=${CI_FLEET_VALIDATION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$repo_root"
+case ${1:-} in
+  ''|--quick|--containers) ;;
+  *) printf 'unknown validation profile\n' >&2; exit 2 ;;
+esac
 
+if [[ ${1:-} != --containers ]]; then
 for script in scripts/*.sh examples/project/scripts/ci/*.sh; do bash -n "$script"; done
 python3 -m py_compile \
   .github/actions/plan/plan.py \
@@ -39,6 +44,7 @@ python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
 python3 scripts/test_config_approval.py
+python3 scripts/test_local_validation.py
 python3 scripts/test_cleanup_networks.py
 python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
@@ -70,8 +76,32 @@ python3 scripts/test_deployer_adapter.py
 scripts/test-deployer-units.sh
 scripts/test-install-status-receiver.sh
 
+fi
+if [[ ${1:-} == --quick ]]; then exit 0; fi
+
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+cleanup_validation() {
+  result=$?
+  rm -f "$tmp"
+  if [[ -n ${CI_FLEET_VALIDATION_ID:-} ]]; then
+    if ! docker info >/dev/null 2>&1; then
+      result=1
+    else
+      if docker inspect "${CI_FLEET_VALIDATION_ID}-runner-inspect" >/dev/null 2>&1; then
+        docker rm -f "${CI_FLEET_VALIDATION_ID}-runner-inspect" >/dev/null || result=1
+      fi
+      for image in "$CI_FLEET_RUNNER_IMAGE" "$CI_FLEET_CONTROLLER_IMAGE"; do
+        if docker image inspect "$image" >/dev/null 2>&1; then
+          docker image rm "$image" >/dev/null || result=1
+        fi
+      done
+    fi
+  fi
+  return "$result"
+}
+trap cleanup_validation EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 printf '%s\n' 'validation-only-not-a-private-key' >"$tmp"
 export CI_FLEET_GITHUB_URL=https://github.com/EXAMPLE-ORG
 export CI_FLEET_INSTANCE=validation
@@ -91,8 +121,8 @@ docker compose -f deploy/compose.yaml config --quiet
 docker compose -f deploy/compose.yaml config --format json | python3 -c 'import json, os, sys; config = json.load(sys.stdin); assert config["services"]["controller"]["environment"]["CI_FLEET_RUNNER_IMAGE"] == os.environ["CI_FLEET_RUNNER_IMAGE_DIGEST"]'
 
 docker compose -f deploy/compose.yaml build runner-image controller
-docker run --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+docker run --name "${CI_FLEET_VALIDATION_ID:-ci-fleet-validation}-runner-inspect" --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
 bash scripts/test-cleanup-e2e.sh
-CI_FLEET_INSTANCE=validation scripts/cleanup.sh
+CI_FLEET_INSTANCE=${CI_FLEET_VALIDATION_ID:-validation} scripts/cleanup.sh
 
 python3 scripts/scan_committed_secrets.py

@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "configuration_repository_id": 101,
+  "branch": "main",
+  "reviewer_ids": [202],
+  "local_validation": {
+    "directory": "/var/lib/ci-fleet/local-validation",
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+    "validator_revision": "1111111111111111111111111111111111111111",
+    "suite": "ci-fleet-config-local-v1",
+    "required_checks": ["commits", "history-secrets", "configuration"],
+    "max_age_seconds": 86400
+  }
+}

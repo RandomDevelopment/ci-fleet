@@ -279,3 +279,22 @@ Adding workers reduces wall-clock time only while independent shards remain queu
 | Reusable engine interface | Required secret **names** | Secret values and application credentials |
 
 The public engine and this template use the [Unlicense](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before copying third-party material into a derived repository.
+
+## Complete local validation and optional hosted checks
+
+Use the reviewed engine's [complete configuration command](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/LOCAL-VALIDATION.md#configuration-repositories)
+with explicit source, first-parent base and trusted engine revision. The command
+includes policy tests, history secret scanning, transition checks and initializer
+checks. `scripts/validate.sh --strict` remains a useful individual validator.
+A complete trusted run and independent review remain separate requirements.
+
+Hosted validation is disabled by default. Set repository Actions variables
+`CI_FLEET_VALIDATOR_REVISION` to a full reviewed supporting engine commit and
+`CI_FLEET_HOSTED_VALIDATION` to `true` to enable the convenience workflow. Set the
+latter to `false`, delete it, or remove `.github/workflows/validate.yml` to disable
+hosted execution. Local validation still works with Actions disabled or quota
+blocked. Do not require this optional check merely because it is enabled.
+Existing required checks need a deliberate reviewed migration before disabling
+their workflow. Host policy-v1 keeps requiring hosted evidence until separately
+migrated to the compatible signed-local policy. No workflow variable changes
+host policy, and the public template receives no private runner access.

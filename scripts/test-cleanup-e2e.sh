@@ -14,6 +14,8 @@ cleanup_fixtures() {
   rm -rf "$temporary"
 }
 trap cleanup_fixtures EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$temporary/proc/sys/kernel/random" "$temporary/var/run"
 cat /proc/sys/kernel/random/boot_id >"$temporary/proc/sys/kernel/random/boot_id"
 ln -s /var/run/docker.sock "$temporary/var/run/docker.sock"

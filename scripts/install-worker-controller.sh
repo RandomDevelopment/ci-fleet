@@ -837,6 +837,13 @@ manager_release_complete() {
   if [[ -f "$path/engine-capabilities.json" ]] && python3 "$repo_root/scripts/desired_state.py" \
     validate-engine-capabilities --manifest "$path/engine-capabilities.json" --require-configuration-approval >/dev/null 2>&1; then
     [[ -f "$path/scripts/verify_config_approval.py" && -x "$path/scripts/github-app-token.sh" ]] || return 1
+    if python3 - "$path/engine-capabilities.json" <<'PY_CAPABILITY'
+import json, sys
+raise SystemExit(json.load(open(sys.argv[1])).get("capabilities", {}).get("configuration_local_validation") is not True)
+PY_CAPABILITY
+    then
+      command -v openssl >/dev/null || return 1
+    fi
   fi
   for unit in "${unit_names[@]}"; do [[ -f "$path/host/systemd/$unit" ]] || return 1; done
   if engine_has_capacity_telemetry "$path" || [[ -e "$path/scripts/capacity-sample.sh" || -e "$path/host/systemd/ci-fleet-capacity.service" || -e "$path/host/systemd/ci-fleet-capacity.timer" ]]; then

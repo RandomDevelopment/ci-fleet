@@ -82,3 +82,15 @@ Keep changes small and reversible. Existing project CI must continue operating u
 - Identify the source engine issue/PR, full reviewed commit, gap, affected template files, acceptance checks, capability staging, migration requirements, and documentation impact. Mark unmerged features pending and update the follow-up with the full merged commit when available.
 - Link the template issue in the engine PR description and completion report, or explain why no template change is needed. If issue lookup, creation, or update fails, report the missing tracking as outstanding rollout work; do not claim template synchronization.
 - A tracked issue is not a completed template change. Engine availability, a published template release, adopter engine promotion, and live-host acceptance require separate evidence and authorization. This workflow grants no template merge, release, private configuration change, or host activation authority. Keep ordinary CI read-only; no new automation credentials are required.
+
+## Local validation and evidence
+
+- Use `scripts/local_validate.py` for complete exact-source/base validation.
+  Follow `docs/LOCAL-VALIDATION.md` for tools, isolation, profiles and logs.
+- A quick run or `scripts/validate.sh` alone is incomplete full-suite evidence.
+  Missing tools and unexpected skips must fail. Privileged fixtures belong on
+  disposable isolated execution machines, never active fleet hosts.
+- Trusted local acceptance uses policy-v2 signed evidence from an independent
+  authority and a pinned validator. Keep signing keys off execution machines.
+- Preserve current required checks until coverage, recovery and a deliberate
+  policy migration pass. Optional hosted convenience never creates a host gate.

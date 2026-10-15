@@ -167,53 +167,25 @@ jobs:
       - name: Install static analysis tools
         run: sudo apt-get update && sudo apt-get install -y shellcheck python3-yaml
 
-      - name: Check shell scripts
-        run: shellcheck scripts/*.sh examples/project/scripts/ci/*.sh templates/config-repository/scripts/*.sh
-
-      - name: Check documentation links
-        run: python3 scripts/check_doc_links.py
-
-      - name: Build and inspect inert prototype
-        run: scripts/validate.sh
-
-      - name: Validate public configuration template
+      - name: Run the complete local suite
+        env:
+          SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          cmp -s scripts/scan_committed_secrets.py templates/config-repository/scripts/scan_committed_secrets.py
-          python3 templates/config-repository/scripts/test_policy.py
-          python3 templates/config-repository/scripts/scan_committed_secrets.py
-          templates/config-repository/scripts/validate.sh
-          templates/config-repository/scripts/validate.sh --config templates/config-repository/examples/multi-host/fleet.json
-          temporary_directory="$(mktemp -d)"
-          if templates/config-repository/scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --output "${temporary_directory}/missing-engine.json"; then
-            echo 'initializer accepted a missing engine revision' >&2
-            exit 1
-          fi
-          test ! -e "${temporary_directory}/missing-engine.json"
-          if templates/config-repository/scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --registry BAD \
-            --engine-ref "$(git rev-parse HEAD)" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
-            --output "${temporary_directory}/invalid.json"; then
-            echo 'initializer accepted an invalid registry' >&2
-            exit 1
-          fi
-          test ! -e "${temporary_directory}/invalid.json"
-          templates/config-repository/scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --engine-ref "$(git rev-parse HEAD)" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
-            --output "${temporary_directory}/fleet.json"
-          test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644
+          main=$(git rev-parse origin/main)
+          if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]]; then BASE=$(git merge-base "$SOURCE" "$main"); fi
+          args=()
+          if [[ "$EVENT_NAME" == pull_request ]]; then args+=(--pr-title "$PR_TITLE"); fi
+          if [[ "$REF_TYPE" == tag ]]; then args+=(--tag "$TAG_NAME" --tag-created); fi
+          # The convention job independently rejects moved tags. The trusted
+          # main scanner above remains a separate guard during migration.
+          sudo python3 scripts/local_validate.py --repository "$PWD" \
+            --source "$SOURCE" --base "$BASE" --policy "$(git rev-parse HEAD)" --main "$main" \
+            --disposable-host --output "$RUNNER_TEMP/local-validation" "${args[@]}"
 
       - name: Require successful convention validation
         env:

@@ -37,3 +37,13 @@ Before committing configuration changes, run:
 - When reviewing, report missing or inaccurate documentation as a finding.
 - Before declaring the work complete, check updated examples, commands, links, and configuration names. Run applicable documentation checks.
 - When creating or updating a PR, state the documentation impact in its description. In all cases, include the assessment in the completion summary. List updated documents, or explain why no documentation changes are needed. Report any remaining gaps.
+
+## Complete local validation
+
+Use the independently reviewed engine's `scripts/local_validate.py --kind
+configuration` with explicit source, base and policy identities for the complete
+embedded-configuration suite. Follow the engine's `docs/LOCAL-VALIDATION.md`.
+`scripts/validate.sh --strict` is one check, not the complete suite. Hosted
+validation is an optional default-off convenience controlled by repository
+variables `CI_FLEET_HOSTED_VALIDATION` and `CI_FLEET_VALIDATOR_REVISION`. It cannot
+replace independent review or silently add a required check or host gate.

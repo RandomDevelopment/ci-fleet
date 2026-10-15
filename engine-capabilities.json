@@ -10,6 +10,7 @@
     "status_reporting_config": true,
     "required_status_reporting": true,
     "configuration_approval_gate": true,
-    "configuration_codex_reviews": true
+    "configuration_codex_reviews": true,
+    "configuration_local_validation": true
   }
 }

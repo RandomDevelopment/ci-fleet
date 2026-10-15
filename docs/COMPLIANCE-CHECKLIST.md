@@ -60,3 +60,13 @@ A project MUST complete this checklist before its existing required CI is moved 
 - [ ] Existing required checks remained available during validation.
 - [ ] Rollback instructions were tested.
 - [ ] Project-specific runners were retained through the observation period.
+
+## Engine and configuration validation migration
+
+The [local validation contract](LOCAL-VALIDATION.md) governs replacement of
+engine and configuration hosted validation. It leaves application fleet jobs
+and their five-minute task contract unchanged. Preserve independent review,
+current required checks and recovery until complete local parity and deliberate
+policy cutover pass. Optional hosted convenience is separate from a policy
+requiring hosted success. Record template adoption and live-host acceptance
+separately from engine implementation.

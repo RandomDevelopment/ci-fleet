@@ -10,6 +10,10 @@ Use one shared pool of disposable CI workers across multiple trusted private rep
 
 > **Status:** Controlled migration. The isolated one-job pilot passed on 2026-07-15. Reviewed schema-v3 desired state now governs managed ordinary-CI controller lifecycle. Tester and deployer components remain under review, and production readiness remains gated. See [accepted design decisions](docs/DESIGN-DECISIONS.md).
 
+Run the complete engine and embedded-configuration suites without Actions through
+[local validation](docs/LOCAL-VALIDATION.md). Signed local configuration evidence
+is opt-in; existing host and required-check policies need a reviewed migration.
+
 ## What problem does this solve?
 
 Self-hosted CI often grows one project at a time:
