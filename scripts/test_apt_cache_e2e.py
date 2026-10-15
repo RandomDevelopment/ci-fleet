@@ -33,10 +33,10 @@ def fixture_failure_details(output: bytes, max_lines=10) -> str:
 def main():
     prefix = "ci-fleet-apt-test-" + uuid.uuid4().hex[:12]
     runner_image = os.environ.get("CI_FLEET_RUNNER_IMAGE", "ci-fleet-runner:dev")
-    controller_image = os.environ.get("CI_FLEET_CONTROLLER_IMAGE", "ci-fleet-controller:dev")
     runner_definition = (ROOT / "runner/Dockerfile").read_text().splitlines()
     base_image = next(line.split()[1] for line in runner_definition if line.startswith("FROM "))
     snapshot = next(line.split("=", 1)[1] for line in runner_definition if line.startswith("ARG DEBIAN_SNAPSHOT="))
+    epoch = next(line.split("=", 1)[1] for line in runner_definition if line.startswith("ARG SOURCE_DATE_EPOCH="))
     containers, images, builders = [], [], []
     build_client = cache = None
     measurements = []
@@ -196,11 +196,35 @@ def main():
                     if name.startswith(("controller/", "runner/", "scripts/")) and (ROOT / name).is_file():
                         tar.add(ROOT / name, arcname=name, recursive=False)
             run("docker", "cp", "-", client + ":/release", input=archive.getvalue())
-            revision = run("docker", "image", "inspect", "--format", '{{index .Config.Labels "org.opencontainers.image.revision"}}', runner_image)
-            settings = dict(CI_FLEET_ENGINE_REF=revision, CI_FLEET_COMMIT=revision, CI_FLEET_VERSION="dev",
+            step = "uncached managed reference images"
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+            reference_builder = prefix + "-reference"
+            builders.append((client, reference_builder))
+            containers.append("buildx_buildkit_" + reference_builder + "0")
+            reference_runner = prefix + "-reference-runner"
+            reference_controller = prefix + "-reference-controller"
+            images.extend([reference_runner, reference_controller])
+            run("docker", "exec", client, "docker", "buildx", "create", "--name", reference_builder,
+                "--driver", "docker-container", "--driver-opt", "image=" + BUILDKIT)
+            # Keep the reviewed toolchain and arguments identical; omit only the APT secret.
+            build = ["docker", "exec", client, "docker", "buildx", "build", "--builder", reference_builder,
+                     "--no-cache", "--load", "--provenance=false", "--sbom=false",
+                     "--build-arg", "CI_FLEET_COMMIT=" + revision, "--build-arg", "SOURCE_DATE_EPOCH=" + epoch]
+            before = totals(cache)
+            started = time.monotonic()
+            run(*build, "--tag", reference_runner, "/release/runner")
+            run(*build, "--build-arg", "CI_FLEET_VERSION=" + revision[:12], "--tag", reference_controller,
+                "--file", "/release/controller/Dockerfile", "/release")
+            if totals(cache) != before:
+                raise RuntimeError("APT_CACHE_E2E_FAILED step=uncached reference used the cache")
+            measurements.append(dict(path="managed-images-direct", served_package_bytes=0,
+                                     elapsed_seconds=round(time.monotonic() - started, 2)))
+            run("docker", "exec", client, "docker", "buildx", "rm", "--force", reference_builder)
+            step = "managed images preserve reviewed identities"
+            settings = dict(CI_FLEET_ENGINE_REF=revision, CI_FLEET_COMMIT=revision, CI_FLEET_VERSION=revision[:12],
                             CI_FLEET_RUNNER_IMAGE=prefix + "-managed-runner", CI_FLEET_CONTROLLER_IMAGE=prefix + "-managed-controller",
-                            CI_FLEET_RUNNER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", runner_image),
-                            CI_FLEET_CONTROLLER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", controller_image),
+                            CI_FLEET_RUNNER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", reference_runner),
+                            CI_FLEET_CONTROLLER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", reference_controller),
                             CI_FLEET_APT_HTTP_PROXY=proxy)
             images.extend([settings["CI_FLEET_RUNNER_IMAGE"], settings["CI_FLEET_CONTROLLER_IMAGE"]])
             environment = temporary / "managed.env"

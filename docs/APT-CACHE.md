@@ -158,8 +158,10 @@ python3 scripts/test_apt_cache_e2e.py
 The container test creates a disposable apt-cacher-ng instance. It measures
 package bytes and elapsed time for cold/warm and concurrent runners and
 Docker/Compose/Buildx builds. It verifies managed rebuilds against images built
-without a cache, checks project images for endpoint leakage, and tests outage
-failure and direct HTTPS. It removes only its own containers, images, and
+without a cache using the same pinned Buildx client, BuildKit backend, and build
+arguments. The cache-enabled rebuild must match those exact image IDs. The test
+also checks project images for endpoint leakage and tests outage failure and
+direct HTTPS. It removes only its own containers, images, and
 builders. It never clears or changes a production cache.
 
 Before live acceptance, repeat representative shards on the approved host.
