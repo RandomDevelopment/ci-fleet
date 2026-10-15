@@ -215,6 +215,14 @@ case "$1 $2" in
       printf '{"services":{"controller":{"environment":{"CI_FLEET_RUNNER_IMAGE":"%s"}}}}\\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST"
     fi ;;
   'info ') [[ $TEST_CLEANUP_FAILURE != info ]] || exit 1 ;;
+  'inspect '*) [[ $TEST_CLEANUP_FAILURE != container-query && $TEST_CLEANUP_FAILURE != absent ]] || exit 1 ;;
+  'image inspect') [[ $TEST_CLEANUP_FAILURE != image-query && $TEST_CLEANUP_FAILURE != absent ]] || exit 1 ;;
+  'container ls')
+    [[ $TEST_CLEANUP_FAILURE != container-query ]] || exit 1
+    [[ $TEST_CLEANUP_FAILURE == absent ]] || printf 'fixture-container\\n' ;;
+  'image ls')
+    [[ $TEST_CLEANUP_FAILURE != image-query ]] || exit 1
+    [[ $TEST_CLEANUP_FAILURE == absent ]] || printf 'fixture-image\\n' ;;
   'rm -f') [[ $TEST_CLEANUP_FAILURE != container ]] || exit 1 ;;
   'image rm') [[ $TEST_CLEANUP_FAILURE != image ]] || exit 1 ;;
 esac
@@ -227,20 +235,20 @@ exit 0
                    "CI_FLEET_RUNNER_IMAGE": "cleanup-fixture-runner:dev",
                    "CI_FLEET_CONTROLLER_IMAGE": "cleanup-fixture-controller:dev",
                    "TEST_DOCKER_LOG": str(log)}
-            for failure, stage_status in (("none", 0), ("info", 0), ("container", 0), ("image", 0),
+            for failure, stage_status in (("none", 0), ("absent", 0), ("info", 0), ("container", 0), ("image", 0),
+                                          ("container-query", 0), ("image-query", 0),
                                           ("none", 7), ("none", 130), ("none", 143)):
                 with self.subTest(failure=failure, stage_status=stage_status):
                     log.write_text("")
                     result = subprocess.run(["bash", str(ROOT / "scripts/validate.sh"), "--containers"],
                         env={**env, "TEST_CLEANUP_FAILURE": failure, "TEST_STAGE_STATUS": str(stage_status)},
                         capture_output=True, text=True)
-                    self.assertEqual(result.returncode, stage_status if failure == "none" else 1,
+                    self.assertEqual(result.returncode, stage_status if failure in {"none", "absent"} else 1,
                                      result.stdout + result.stderr)
-                    if failure != "info":
-                        for command in ("rm -f cleanup-fixture-runner-inspect",
-                                        "image rm cleanup-fixture-runner:dev",
-                                        "image rm cleanup-fixture-controller:dev"):
-                            self.assertIn(command, log.read_text())
+                    for command, omitted in (("rm -f cleanup-fixture-runner-inspect", "container-query"),
+                                             ("image rm cleanup-fixture-runner:dev", "image-query"),
+                                             ("image rm cleanup-fixture-controller:dev", "image-query")):
+                        self.assertEqual(command in log.read_text(), failure not in {"info", "absent", omitted})
 
     def test_failure_and_timeout_do_not_pass(self):
         with tempfile.TemporaryDirectory() as temp:

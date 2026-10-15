@@ -91,12 +91,20 @@ cleanup_validation() {
     if ! docker info >/dev/null 2>&1; then
       result=1
     else
-      if docker inspect "${CI_FLEET_VALIDATION_ID}-runner-inspect" >/dev/null 2>&1; then
-        docker rm -f "${CI_FLEET_VALIDATION_ID}-runner-inspect" >/dev/null || result=1
+      if remaining=$(docker container ls --all --quiet --filter "name=^/${CI_FLEET_VALIDATION_ID}-runner-inspect$"); then
+        if [[ -n $remaining ]]; then
+          docker rm -f "${CI_FLEET_VALIDATION_ID}-runner-inspect" >/dev/null || result=1
+        fi
+      else
+        result=1
       fi
       for image in "$CI_FLEET_RUNNER_IMAGE" "$CI_FLEET_CONTROLLER_IMAGE"; do
-        if docker image inspect "$image" >/dev/null 2>&1; then
-          docker image rm "$image" >/dev/null || result=1
+        if remaining=$(docker image ls --quiet "$image"); then
+          if [[ -n $remaining ]]; then
+            docker image rm "$image" >/dev/null || result=1
+          fi
+        else
+          result=1
         fi
       done
     fi
