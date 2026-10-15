@@ -772,7 +772,8 @@ class PolicyExecutionTests(unittest.TestCase):
         validator = self.repo / ".ci-fleet-validator"
         subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.repo), str(validator)], check=True)
         subprocess.run(["git", "-C", str(validator), "checkout", "--quiet", self.policy], check=True)
-        shutil.copyfile(ROOT / "scripts/local_validate.py", validator / "scripts/local_validate.py")
+        for name in ("local_validate.py", "local_validation_supervisor.py"):
+            shutil.copyfile(ROOT / "scripts" / name, validator / "scripts" / name)
         for event, title, base, main, accepted in (
                 ("pull_request", "invalid $(touch title-injected)", self.base, self.base, False),
                 ("pull_request", 'fix: keep "$(touch title-injected)"', self.base, self.base, True),
