@@ -404,8 +404,19 @@ class CodexApprovalTests(unittest.TestCase):
         self.data[f"{PREFIX}/commits/{'4' * 7}"] = {"sha": "4" * 40}
         self.check()
         body = summary["body"]
+        state = {"code_review": {"commit_sha": HEAD, "status": "completed", "has_any_findings": False,
+                                  "has_unresolved_findings": False},
+                 "security_review": {"commit_sha": None, "status": None, "has_any_findings": None,
+                                      "has_unresolved_findings": None}}
+        summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
+        self.check()
+        state["code_review"]["has_unresolved_findings"] = True
+        with self.assertRaises(Rejected):
+            summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
+            self.check()
         for changed in (body.replace("Completed", "Running"), body.replace("Completed", "Failed"),
                         body.replace(HEAD[:7], "4" * 7), body.replace("00:01:01", "00:00:59"),
+                        body + '\n<!-- codex-review-state:v2 {} -->',
                         body + '\n| Security review | Running | unknown | Manual request |'):
             with self.subTest(body=changed), self.assertRaises(Rejected):
                 summary["body"] = changed

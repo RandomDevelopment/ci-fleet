@@ -97,7 +97,9 @@ an older clean response. The activity dashboard may refresh after the decision
 only when its single recognized code-review row reports completion on the same
 resolved commit at or after the clean response. Running, failed, stale, and
 unrecognized dashboard updates block acceptance. The dashboard cannot approve
-without a separate clean response.
+without a separate clean response. When machine-readable activity state is
+present, it must also report completed code review on the full head with no
+findings and no security-review activity. Unknown state versions fail closed.
 Same-second conflicts reject acceptance. Edited responses cannot approve, and
 editing an older decision response after a clean result invalidates that result.
 Outstanding trusted formal change requests still block acceptance. All tree,

@@ -245,6 +245,17 @@ def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
 
 def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any], head: str,
                             submitted: datetime) -> bool:
+    state_lines = [line for line in comment["body"].splitlines() if line.startswith("<!-- codex-review-state:")]
+    if state_lines:
+        match = re.fullmatch(r"<!-- codex-review-state:v1 (.+) -->", state_lines[0])
+        if len(state_lines) != 1 or match is None:
+            return False
+        state = json.loads(match[1], object_pairs_hook=unique_object)
+        code, security = state["code_review"], state["security_review"]
+        if (code["commit_sha"] != head or code["status"] != "completed"
+                or code["has_any_findings"] is not False or code["has_unresolved_findings"] is not False
+                or any(value is not None for value in security.values())):
+            return False
     rows = [line for line in comment["body"].splitlines() if line.startswith("|")]
     if len(rows) != 3 or rows[:2] != ["| Review | Status | Commit | Review trigger |", "| --- | --- | --- | --- |"]:
         return False
