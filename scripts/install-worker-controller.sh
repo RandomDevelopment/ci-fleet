@@ -398,7 +398,7 @@ verify_configuration_approval() {
 require_configuration_approval_capability() {
   configuration_approval_required || return 0
   python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities --manifest "$1" \
-    --require-configuration-approval >/dev/null
+    --require-configuration-approval --configuration-approval-policy "$config_review_policy" >/dev/null
 }
 
 prepare_host_config() {

@@ -605,8 +605,17 @@ def command_engine(args: argparse.Namespace) -> None:
 
 def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
     capabilities = load_engine_capabilities(args.manifest)
-    if args.require_configuration_approval and "configuration_approval_gate" not in capabilities:
+    if ((args.require_configuration_approval or args.configuration_approval_policy)
+            and "configuration_approval_gate" not in capabilities):
         raise DesiredStateError("selected engine does not support the configuration approval gate")
+    if args.configuration_approval_policy:
+        from verify_config_approval import read_policy
+        try:
+            policy = read_policy(args.configuration_approval_policy)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise DesiredStateError("active configuration approval policy is invalid") from exc
+        if "codex_reviewer_ids" in policy and "configuration_codex_reviews" not in capabilities:
+            raise DesiredStateError("selected engine does not support the active Codex approval policy syntax")
     if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:
         raise DesiredStateError("selected engine does not support Docker network policy configuration")
     if args.require_docker_default_bridge_cidr_config and DOCKER_DEFAULT_BRIDGE_CIDR_CONFIG_CAPABILITY not in capabilities:
@@ -658,6 +667,7 @@ def parse_args() -> argparse.Namespace:
     capabilities.add_argument("--require-status-reporting", action="store_true")
     capabilities.add_argument("--require-capacity-telemetry", action="store_true")
     capabilities.add_argument("--require-configuration-approval", action="store_true")
+    capabilities.add_argument("--configuration-approval-policy", type=Path)
     capabilities.set_defaults(function=command_validate_engine_capabilities)
     return parser.parse_args()
 

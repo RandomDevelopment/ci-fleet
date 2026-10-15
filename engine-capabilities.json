@@ -9,6 +9,7 @@
     "docker_default_bridge_cidr_config": true,
     "status_reporting_config": true,
     "required_status_reporting": true,
-    "configuration_approval_gate": true
+    "configuration_approval_gate": true,
+    "configuration_codex_reviews": true
   }
 }

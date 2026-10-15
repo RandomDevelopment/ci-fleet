@@ -24,8 +24,18 @@ POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workf
 CODEX_CLEAN = re.compile(
     r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
-    r"(?:\n<details>[\s\S]*</details>\s*)?\Z"
+    r"(?:\n(<details>[\s\S]*</details>\s*))?\Z"
 )
+CODEX_HELP = '''<details> <summary>ℹ️ About Codex in GitHub</summary>
+<br/>
+[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general).
+Reviews are triggered when you
+- Open a pull request for review
+- Mark a draft as ready
+- Comment "@codex review".
+If Codex has suggestions, it will comment; otherwise it will react with 👍.
+Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".
+</details>'''
 CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 CODEX_COMPLETED_ROW = re.compile(
     r'\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="([^"]+)">'
@@ -245,7 +255,7 @@ def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
 
 def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any], head: str,
                             submitted: datetime) -> bool:
-    state_lines = [line for line in comment["body"].splitlines() if line.startswith("<!-- codex-review-state:")]
+    state_lines = [line.strip() for line in comment["body"].splitlines() if "codex-review-state" in line.lower()]
     if state_lines:
         match = re.fullmatch(r"<!-- codex-review-state:v1 (.+) -->", state_lines[0])
         if len(state_lines) != 1 or match is None:
@@ -266,17 +276,19 @@ def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any
 
 def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, number: int, head: str,
                        author_id: int, reviews: list[dict[str, Any]], base_changed: datetime | None) -> bool:
-    allowed = set(policy.get("codex_reviewer_ids", [])) - {author_id}
+    pinned = set(policy.get("codex_reviewer_ids", []))
+    allowed = pinned - {author_id}
     if not allowed:
         return False
     comments = api.pull_request_nodes(repository, number, "comments",
                                      "databaseId body createdAt lastEditedAt author { __typename ... on Bot { databaseId } }")
     threads = api.pull_request_nodes(repository, number, "reviewThreads", "isResolved")
     require(all(thread.get("isResolved") is True for thread in threads), "unresolved PR review threads")
+    bot_comments = [comment for comment in comments if isinstance(comment.get("author"), dict)
+                    and comment["author"].get("__typename") == "Bot"
+                    and comment["author"].get("databaseId") in pinned]
     for reviewer in allowed:
-        responses = [comment for comment in comments if isinstance(comment.get("author"), dict)
-                     and comment["author"].get("__typename") == "Bot"
-                     and comment["author"].get("databaseId") == reviewer]
+        responses = [comment for comment in bot_comments if comment["author"]["databaseId"] == reviewer]
         decisions = [comment for comment in responses if not comment["body"].startswith(CODEX_SUMMARY_MARKER)]
         if not decisions:
             continue
@@ -289,13 +301,15 @@ def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, num
         match = CODEX_CLEAN.fullmatch(response["body"])
         if response["lastEditedAt"] is not None or match is None or (base_changed is not None and submitted <= base_changed):
             continue
+        if match[2] is not None and match[2].split() != CODEX_HELP.split():
+            continue
         if any(comment is not response and comment_time(comment) >= submitted
-               and (comment in responses or re.search(r"(?i)@codex\s+(?:security\s+)?review\b", comment["body"]))
-               and not (comment in responses and comment["body"].startswith(CODEX_SUMMARY_MARKER)
+               and (comment in bot_comments or re.search(r"(?i)@codex\s+(?:security\s+)?review\b", comment["body"]))
+               and not (comment in bot_comments and comment["body"].startswith(CODEX_SUMMARY_MARKER)
                         and completed_codex_summary(api, repository, comment, head, submitted))
                for comment in comments):
             continue
-        if any(review.get("user", {}).get("id") == reviewer
+        if any(review.get("user", {}).get("id") in pinned
                and (review["state"] == "PENDING" or evidence_timestamp(review["submitted_at"]) >= submitted)
                for review in reviews):
             continue

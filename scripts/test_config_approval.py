@@ -29,6 +29,18 @@ POLICY = {
     "schema_version": 1, "configuration_repository_id": 101, "branch": "main",
     "workflow_id": 501, "required_jobs": ["validate"], "reviewer_ids": [202],
 }
+CODEX_HELP_FIXTURE = '''<details> <summary>ℹ️ About Codex in GitHub</summary>
+<br/>
+
+[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you
+- Open a pull request for review
+- Mark a draft as ready
+- Comment "@codex review".
+
+If Codex has suggestions, it will comment; otherwise it will react with 👍.
+
+Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".
+</details>'''
 
 
 def evidence(commit=COMMIT, head=HEAD, tree=TREE, parent=PARENT, number=8, run_id=700) -> dict:
@@ -366,7 +378,7 @@ class CodexApprovalTests(unittest.TestCase):
         self.comment = {
             "databaseId": 1000, "author": {"__typename": "Bot", "databaseId": 202},
             "body": "Codex Review: Didn't find any major issues. What shall we delve into next?\n\n"
-                    f"**Reviewed commit:** `{HEAD[:10]}`\n\n<details>GitHub integration help</details>",
+                    f"**Reviewed commit:** `{HEAD[:10]}`\n\n{CODEX_HELP_FIXTURE}",
             "createdAt": "2026-01-01T00:01:00Z", "lastEditedAt": None,
         }
         self.pr = self.data["/graphql"]["data"]["repository"]["pullRequest"]
@@ -411,9 +423,10 @@ class CodexApprovalTests(unittest.TestCase):
         summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
         self.check()
         state["code_review"]["has_unresolved_findings"] = True
-        with self.assertRaises(Rejected):
-            summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
-            self.check()
+        for prefix in ('', ' ', '\t', 'Text before '):
+            with self.subTest(prefix=prefix), self.assertRaises(Rejected):
+                summary["body"] = body + '\n' + prefix + '<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
+                self.check()
         for changed in (body.replace("Completed", "Running"), body.replace("Completed", "Failed"),
                         body.replace(HEAD[:7], "4" * 7), body.replace("00:01:01", "00:00:59"),
                         body + '\n<!-- codex-review-state:v2 {} -->',
@@ -460,6 +473,33 @@ class CodexApprovalTests(unittest.TestCase):
         self.data[f"{PREFIX}/commits/{HEAD[:10]}"] = Rejected("ambiguous commit")
         with self.assertRaises(Rejected):
             self.check()
+
+    def test_footer_accepts_only_known_help_text_or_no_footer(self):
+        body = self.comment["body"]
+        self.comment["body"] = body.split('\n\n<details>')[0] + '\n'
+        self.check()
+        for footer in ('<details>Warning: this commit has a finding.</details>',
+                       CODEX_HELP_FIXTURE.replace('otherwise it will react with 👍.', 'this commit is unsafe.'),
+                       CODEX_HELP_FIXTURE.replace('</details>', 'Additional finding</details>')):
+            self.comment["body"] = body.replace(CODEX_HELP_FIXTURE, footer)
+            with self.subTest(footer=footer), self.assertRaises(Rejected):
+                self.check()
+
+    def test_newer_conflicts_from_another_pinned_bot_block_clean_response(self):
+        self.policy.update(reviewer_ids=[202, 203], codex_reviewer_ids=[202, 203])
+        for timestamp in ('2026-01-01T00:01:00Z', '2026-01-01T00:02:00Z'):
+            other = dict(self.comment, databaseId=1001, author={"__typename": "Bot", "databaseId": 203},
+                         body='Review failed: candidate is unsafe', createdAt=timestamp)
+            self.pr["comments"]["nodes"] = [self.comment, other]
+            with self.subTest(timestamp=timestamp), self.assertRaises(Rejected):
+                self.check()
+        other['createdAt'] = '2026-01-01T00:00:59Z'
+        self.check()
+        for state in ('COMMENTED', 'PENDING', 'DISMISSED'):
+            self.reviews[:] = [{"id": 901, "user": {"id": 203}, "state": state, "commit_id": HEAD,
+                               "submitted_at": None if state == 'PENDING' else '2026-01-01T00:02:00Z'}]
+            with self.subTest(state=state), self.assertRaises(Rejected):
+                self.check()
 
     def test_newer_requests_bot_responses_and_same_second_conflicts_invalidate_clean_review(self):
         for author, body in (({"__typename": "User", "databaseId": 201}, "@codex review"),
@@ -608,6 +648,51 @@ class PolicyTests(unittest.TestCase):
 
     def test_trusted_policy_and_marker(self):
         self.assertEqual(read_policy(self.path, os.getuid()), POLICY)
+
+    def test_active_policy_syntax_blocks_incompatible_upgrade_and_checkpoint_rollback(self):
+        root = self.path.parent
+        manager = root / 'managers' / ('4' * 40)
+        manager.mkdir(parents=True)
+        manifest = manager / 'engine-capabilities.json'
+        manifest.write_text(json.dumps({'schema_version': 1, 'capabilities': {'configuration_approval_gate': True}}))
+        checkpoint = root / 'checkpoint'
+        checkpoint.mkdir()
+        (checkpoint / 'manager-target').write_text(str(manager) + '\n')
+        (checkpoint / 'manager-target').chmod(0o600)
+        shim = root / 'capability-check.py'
+        shim.write_text(f'''import os, sys
+sys.path.insert(0, {str(ROOT / 'scripts')!r})
+import desired_state, verify_config_approval
+read_policy = verify_config_approval.read_policy
+verify_config_approval.read_policy = lambda path: read_policy(path, os.getuid())
+raise SystemExit(desired_state.main())
+''')
+        setup = f'''
+set -eu
+repo_root={shlex.quote(str(ROOT))}
+config_review_policy={shlex.quote(str(self.path))}
+checkpoint_dir={shlex.quote(str(checkpoint))}
+manager_releases={shlex.quote(str(root / 'managers'))}
+rendered_env={shlex.quote(str(root / 'absent'))}
+testing=1
+configuration_approval_required() {{ return 0; }}
+note() {{ printf '%s\n' "$*"; }}
+'''
+        helper = installer_function('require_configuration_approval_capability').replace(
+            '"$repo_root/scripts/desired_state.py"', shlex.quote(str(shim)))
+        check = setup + helper + f'\nrequire_configuration_approval_capability {shlex.quote(str(manifest))}\n'
+        self.assertEqual(subprocess.run(['bash', '-c', check], capture_output=True).returncode, 0)
+        for ids in ([], [202]):
+            self.path.write_text(json.dumps(dict(POLICY, codex_reviewer_ids=ids)))
+            with self.subTest(ids=ids):
+                result = subprocess.run(['bash', '-c', check], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                rollback = setup + helper + installer_function('restore_checkpoint') + '\nrestore_checkpoint\n'
+                result = subprocess.run(['bash', '-c', rollback], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('would remove configuration approval enforcement', result.stdout)
+                supported = check.replace(str(manifest), str(ROOT / 'engine-capabilities.json'))
+                self.assertEqual(subprocess.run(['bash', '-c', supported], capture_output=True).returncode, 0)
 
     def test_codex_requires_explicit_allowed_numeric_id_opt_in(self):
         value = dict(POLICY, codex_reviewer_ids=[202])
