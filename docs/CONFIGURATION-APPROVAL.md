@@ -242,7 +242,14 @@ python3 /trusted/ci-fleet/scripts/attest_local_validation.py \
 
 The signing machine needs a protected copy of the policy and activation marker.
 The helper refuses quick or incomplete results, unexpected coverage, changed
-logs and the wrong validator revision. Before signing, it rejects a report, log,
+logs and the wrong validator revision. It also rejects already unusable report
+timestamps before signing or creating output. Both timestamps must be integers,
+excluding booleans, with a positive start no later than the finish and a finish
+no later than the signer's current time. Age from the original start must not
+exceed the protected policy's `local_validation.max_age_seconds`. Signing
+preserves the recorded timestamps and does not extend their expiry. A candidate
+report alone never establishes execution provenance.
+Before signing, it rejects a report, log,
 or encoded evidence envelope over the verifier's 1 MiB file limit.
 The signer must also check source, tree,
 base, metadata and tool versions against its independently observed run. The

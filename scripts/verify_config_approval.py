@@ -402,6 +402,13 @@ def trusted_evidence(path: Path, owner: int = 0) -> bytes:
         return data
 
 
+def require_local_evidence_freshness(report: dict[str, Any], max_age_seconds: int, now: int | None = None) -> None:
+    started, finished = report.get("started_at"), report.get("finished_at")
+    current = int(time.time()) if now is None else now
+    require(type(started) is int and type(finished) is int and 0 < started <= finished <= current
+            and current - started <= max_age_seconds, "local evidence expired or clock is uncertain")
+
+
 def verify_local_evidence(policy: dict[str, Any], commit: str, tree: str, parent: str, head: str,
                           number: int, owner: int = 0, now: int | None = None) -> None:
     local = policy["local_validation"]
@@ -434,10 +441,7 @@ def verify_local_evidence(policy: dict[str, Any], commit: str, tree: str, parent
             and report.get("suite") == local["suite"] and report.get("profile") == "full"
             and report.get("status") == "passed" and report.get("expected_skips") == []
             and type(report.get("schema_version")) is int and report["schema_version"] == 1, "local validation is incomplete or has different identities")
-    started, finished = report.get("started_at"), report.get("finished_at")
-    current = int(time.time()) if now is None else now
-    require(type(started) is int and type(finished) is int and 0 < started <= finished <= current
-            and current - started <= local["max_age_seconds"], "local evidence expired or clock is uncertain")
+    require_local_evidence_freshness(report, local["max_age_seconds"], now)
     require(isinstance(report.get("tools"), dict) and bool(report["tools"])
             and all(isinstance(v, str) and v for v in report["tools"].values()), "tool versions are missing")
     checks = report.get("results")

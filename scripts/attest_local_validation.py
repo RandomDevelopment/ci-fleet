@@ -11,7 +11,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from verify_config_approval import LOCAL_EVIDENCE_MAX_BYTES, policy_digest, read_policy, require, unique_object
+from verify_config_approval import (
+    LOCAL_EVIDENCE_MAX_BYTES, policy_digest, read_policy, require, require_local_evidence_freshness, unique_object,
+)
 
 
 def read_bounded(path: Path) -> bytes:
@@ -38,6 +40,7 @@ def main() -> int:
             and result.get("policy") == local["validator_revision"] and result.get("suite") == local["suite"],
             "a full run of the pinned validator is required")
     require(result.get("reviewed_head") == args.reviewed_head, "reviewed head differs from the executed suite")
+    require_local_evidence_freshness(result, local["max_age_seconds"])
     checks = result["results"]
     require(len(checks) == len(local["required_checks"]) and {c["name"] for c in checks} == set(local["required_checks"]),
             "local check coverage differs")

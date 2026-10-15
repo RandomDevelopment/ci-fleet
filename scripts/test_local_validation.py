@@ -158,6 +158,66 @@ class LocalEvidenceTests(unittest.TestCase):
             with self.assertRaises(Rejected): verify(api, policy, REPOSITORY, COMMIT, TREE)
 
     @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
+    def test_signer_and_verifier_reject_unusable_timestamps_before_signing(self):
+        import attest_local_validation
+        run_dir = self.root / "timestamp-run"; run_dir.mkdir()
+        (run_dir / "configuration.log").write_bytes(self.log.read_bytes())
+        output = self.root / "issued.json"
+        command = ["attest", "--policy", str(self.path), "--result", str(run_dir), "--key", str(self.key),
+                   "--reviewed-head", HEAD, "--pull-request", "8", "--output", str(output)]
+        cases = [
+            {"started_at": self.now - self.policy["local_validation"]["max_age_seconds"] - 1,
+             "finished_at": self.now},
+            {"started_at": self.now + 1, "finished_at": self.now + 2},
+            {"finished_at": self.now + 1},
+            {"started_at": self.now - 1, "finished_at": self.now - 2},
+            {"started_at": 0}, {"started_at": -1},
+        ]
+        for field in ("started_at", "finished_at"):
+            cases.extend({field: value} for value in (None, True, False, 1.5, "1", [], {}))
+            cases.append({field: "missing"})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                payload = copy.deepcopy(self.payload)
+                report = payload["result"]
+                report.update(changes)
+                for field, value in changes.items():
+                    if value == "missing":
+                        report.pop(field)
+                self.sign(payload)
+                with self.assertRaisesRegex(Rejected, "local evidence expired or clock is uncertain"):
+                    self.check()
+                (run_dir / "result.json").write_text(json.dumps(report))
+                with patch("sys.argv", command), patch("verify_config_approval.time.time", return_value=self.now), \
+                     patch("attest_local_validation.subprocess.run") as signing:
+                    with self.assertRaisesRegex(Rejected, "local evidence expired or clock is uncertain"):
+                        attest_local_validation.main()
+                    signing.assert_not_called()
+                self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
+    def test_signer_and_verifier_accept_exact_age_and_current_timestamps(self):
+        import attest_local_validation
+        run_dir = self.root / "boundary-run"; run_dir.mkdir()
+        (run_dir / "configuration.log").write_bytes(self.log.read_bytes())
+        output = self.root / "issued.json"
+        command = ["attest", "--policy", str(self.path), "--result", str(run_dir), "--key", str(self.key),
+                   "--reviewed-head", HEAD, "--pull-request", "8", "--output", str(output)]
+        for started in (self.now - self.policy["local_validation"]["max_age_seconds"], self.now):
+            with self.subTest(started=started):
+                report = dict(self.payload["result"], started_at=started, finished_at=self.now)
+                (run_dir / "result.json").write_text(json.dumps(report))
+                with patch("sys.argv", command), patch("verify_config_approval.time.time", return_value=self.now):
+                    self.assertEqual(attest_local_validation.main(), 0)
+                    issued = json.loads(output.read_text())
+                    self.assertEqual(json.loads(base64.b64decode(issued["payload"]))["result"], report)
+                    with self.assertRaises(FileExistsError):
+                        attest_local_validation.main()
+                    self.assertEqual(json.loads(output.read_text()), issued)
+                output.replace(self.root / (COMMIT + ".json"))
+                self.check()
+
+    @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
     def test_signer_enforces_verifier_log_and_envelope_limits(self):
         run_dir = self.root / "bounded-run"; run_dir.mkdir()
         output = self.root / "bounded.json"
