@@ -132,7 +132,11 @@ descendants through pidfds and allows 60 seconds for cleanup before forced
 termination. It repeatedly discovers and reaps descendants until the kernel
 confirms that no children remain. A successful leader cannot hide descendants
 that require forced termination; that stage fails. The orchestrator waits for
-this cleanup before propagating cancellation. Unkillable kernel tasks can prevent
+this cleanup before propagating cancellation. Helpers started by a process
+handling termination retain that grace period; adopted orphans are signalled.
+Supervisor code is captured before candidate execution and launched from those
+in-memory bytes, so later stages do not reload a writable helper file.
+Unkillable kernel tasks can prevent
 cleanup from completing; discard the disposable machine in that case. External
 daemon work remains outside process ancestry. The APT fixture handles termination through its resource
 cleanup block. The harness removes temporary checkouts. A hard kill or power

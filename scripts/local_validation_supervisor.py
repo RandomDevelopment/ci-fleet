@@ -12,6 +12,10 @@ import sys
 import threading
 import time
 
+if __name__ != "__main__":
+    # Later candidates can write files owned by this UID, so never reload this path.
+    _SUPERVISOR_PROGRAM = Path(__file__).read_text()
+
 
 def _identity(pid: int) -> tuple[int, int, str]:
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -72,11 +76,11 @@ def _descendants(owner: int, handles: dict) -> None:
         handles[pid] = (identity[1], descriptor)
 
 
-def _signal_descendants(handles: dict, sent: set, signum: int) -> bool:
+def _signal_descendants(handles: dict, sent: set, signum: int, adopted_only: bool = False) -> bool:
     signalled = False
     for pid, (start, descriptor) in list(handles.items()):
         try:
-            _, actual_start, state = _identity(pid)
+            parent, actual_start, state = _identity(pid)
         except (FileNotFoundError, ProcessLookupError):
             actual_start, state = None, "Z"
         if actual_start != start:
@@ -84,7 +88,7 @@ def _signal_descendants(handles: dict, sent: set, signum: int) -> bool:
             del handles[pid]
             continue
         identity = (pid, start)
-        if state == "Z" or identity in sent:
+        if state == "Z" or identity in sent or (adopted_only and parent != os.getpid()):
             continue
         try:
             signal.pidfd_send_signal(descriptor, signum)
@@ -117,6 +121,7 @@ def _supervise(request: dict, output) -> dict:
         result["launched"] = True
         deadline = time.monotonic() + request["timeout"]
         cleanup_deadline = None
+        initial_cleanup = True
         terminated, killed = set(), set()
         while True:
             empty = False
@@ -146,7 +151,9 @@ def _supervise(request: dict, output) -> dict:
                 if now >= cleanup_deadline:
                     result["forced"] |= _signal_descendants(handles, killed, signal.SIGKILL)
                 else:
-                    _signal_descendants(handles, terminated, signal.SIGTERM)
+                    # Let signalled parents run cleanup helpers during their grace.
+                    _signal_descendants(handles, terminated, signal.SIGTERM, adopted_only=not initial_cleanup)
+                    initial_cleanup = False
             time.sleep(0.01)
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"[:2000]
@@ -205,7 +212,7 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 if handler != signal.SIG_IGN:
                     previous[signum] = signal.signal(signum, cancel)
         with log.open("wb") as output:
-            process = subprocess.Popen([sys.executable, "-I", str(Path(__file__).resolve()), "--supervise"],
+            process = subprocess.Popen([sys.executable, "-I", "-c", _SUPERVISOR_PROGRAM, "--supervise"],
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=output,
                                        cwd="/", env={"PATH": os.defpath, "LANG": "C.UTF-8"},
                                        start_new_session=True)

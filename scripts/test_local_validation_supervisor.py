@@ -113,6 +113,24 @@ wait_ready()
 """)
         self.assert_reaped(3)
 
+    def test_term_handler_can_wait_for_delayed_cleanup_helper(self):
+        helper = PRELUDE + "time.sleep(.15); (root / 'cleaned').touch()"
+        self.execute(f"""
+import subprocess
+if os.fork() == 0:
+    os.setsid()
+    record()
+    def finish(*_):
+        subprocess.run([sys.executable, '-I', '-c', {helper!r}, str(root)], check=True)
+        os._exit(0)
+    signal.signal(signal.SIGTERM, finish)
+    ready()
+    while True: signal.pause()
+wait_ready()
+""", grace=1)
+        self.assertTrue((self.root / "cleaned").exists())
+        self.assert_reaped(3)
+
     def test_rediscover_children_forked_during_cleanup(self):
         self.execute("""
 if os.fork() == 0:
@@ -197,14 +215,31 @@ sys.exit(7)
         self.assert_reaped()
 
     def test_missing_or_incomplete_supervisor_result_fails_closed(self):
-        fake = self.root / "incomplete-supervisor.py"
         for response in ("", "{}", '{"version":1,"cleanup_complete":false}',
                          '{"version":1,"cleanup_complete":true,"forced":false,"timed_out":false}'):
             with self.subTest(response=response):
-                fake.write_text("import sys; sys.stdin.buffer.read(); print(" + repr(response) + ")")
-                with mock.patch.object(supervisor, "__file__", str(fake)):
+                program = "import sys; sys.stdin.buffer.read(); print(" + repr(response) + ")"
+                with mock.patch.object(supervisor, "_SUPERVISOR_PROGRAM", program):
                     with self.assertRaisesRegex(RuntimeError, "supervisor result"):
                         self.execute("raise RuntimeError('candidate must not run')")
+
+    def test_candidate_cannot_replace_supervisor_for_later_stage(self):
+        copied = self.root / "trusted-supervisor.py"
+        copied.write_text(MODULE_PATH.read_text())
+        spec = importlib.util.spec_from_file_location("copied_supervisor", copied)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        forged = {"version": 1, "launched": True, "leader": 0, "timed_out": False,
+                  "cancelled": None, "forced": False, "cleanup_complete": True, "error": None}
+        replacement = "import sys; sys.stdin.buffer.read(); print(" + repr(json.dumps(forged)) + ")"
+        command = [sys.executable, "-I", "-c",
+                   "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+                   str(copied), replacement]
+        module.run(command, self.root, self.env, self.log, 5, .2)
+        self.assertEqual(copied.read_text(), replacement)
+        with self.assertRaisesRegex(RuntimeError, "check exited 23"):
+            module.run([sys.executable, "-I", "-c", "raise SystemExit(23)"],
+                       self.root, self.env, self.log, 5, .2)
 
     def cancellation(self, signum, expected):
         source = """
