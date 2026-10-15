@@ -2,12 +2,18 @@
 set -Eeuo pipefail
 cd "${CI_FLEET_VALIDATION_ROOT:?source checkout is required}"
 BASE_SHA=${CI_FLEET_VALIDATION_BASE:?base commit is required}
+trusted_template=$(cd "$(dirname "${BASH_SOURCE[0]}")/../templates/config-repository" && pwd)
+validator=$trusted_template/scripts/validate.py
 temporary_directory=$(mktemp -d)
 trap 'rm -rf "$temporary_directory"' EXIT
 bash -n scripts/init.sh scripts/validate.sh
 python3 -m py_compile scripts/init.py scripts/validate.py scripts/test_policy.py scripts/scan_committed_secrets.py
 
-python3 scripts/test_policy.py
+# Policy tests use the pinned public fixtures, not an initialized adopter's fleet.
+python3 "$trusted_template/scripts/test_policy.py"
+git ls-tree -rz --name-only HEAD >"$temporary_directory/tree-paths"
+current=(--config "$PWD/fleet.json" --tree-paths "$temporary_directory/tree-paths")
+if [[ -f engine-rollout-evidence.json ]]; then current+=(--rollout-evidence "$PWD/engine-rollout-evidence.json"); fi
 
 if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:fleet.json" 2>/dev/null; then
   git show "$BASE_SHA:fleet.json" >"$temporary_directory/previous-fleet.json"
@@ -16,11 +22,11 @@ if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:f
     git show "$BASE_SHA:engine-rollout-evidence.json" >"$temporary_directory/previous-rollout-evidence.json"
     args+=(--previous-rollout-evidence "$temporary_directory/previous-rollout-evidence.json")
   fi
-  ./scripts/validate.sh --strict "${args[@]}"
+  python3 "$validator" --strict "${current[@]}" "${args[@]}"
 else
-  ./scripts/validate.sh --strict
+  python3 "$validator" --strict "${current[@]}"
 fi
-./scripts/validate.sh --config examples/multi-host/fleet.json
+python3 "$validator" --config "$PWD/examples/multi-host/fleet.json" --tree-paths "$temporary_directory/tree-paths"
 
 
 engine_ref=$(python3 -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
@@ -54,3 +60,4 @@ test ! -e "${temporary_directory}/invalid.json"
   --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
   --output "${temporary_directory}/fleet.json"
 test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644
+python3 "$validator" --config "${temporary_directory}/fleet.json" --skip-path-scan

@@ -100,9 +100,12 @@ python3 /trusted/ci-fleet/scripts/local_validate.py \
 ```
 
 This runs conventional-commit policy, trusted committed-history secret scanning,
-syntax checks, policy rejection tests, strict source validation against the
+syntax checks, pinned-policy rejection tests against public fixtures, strict source validation against the
 base's prior configuration and rollout evidence, reference configurations and
-initializer positive/negative checks. It reads prior files from Git blobs, not
+initializer positive/negative checks. The strict validator and its reference schema come from the independently
+pinned engine, so candidate validator changes cannot waive host policy. Source
+policy tests are exercised as engine/template development, while initialized
+configuration runs use the pinned public fixtures. It reads prior files from Git blobs, not
 from mutable temporary files belonging to another run. Initialized adopters
 must pass strict policy; public fictional fixtures remain non-strict in the
 engine's embedded-template tests.
