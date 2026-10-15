@@ -68,6 +68,43 @@ class APTCacheTests(unittest.TestCase):
             self.assertNotIn("cache.example.invalid", result.stdout + result.stderr)
             self.assertFalse(path.exists())
 
+    def test_installer_detects_runtime_cache_drift(self):
+        source = (ROOT / "scripts/install-worker-controller.sh").read_text()
+        function = "controller_environment_matches() {" + source.split("controller_environment_matches() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        capabilities = load_engine_capabilities(ROOT / "engine-capabilities.json")
+        environment, _ = build_rendered_env(config(), "example-ci-01", host_values(), config_repository="example/config",
+                                            config_ref=CONFIG_COMMIT, docker_gid=999, engine_capabilities=capabilities)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "deploy").mkdir()
+            (root / "deploy/compose.yaml").write_text((ROOT / "deploy/compose.yaml").read_text())
+            script = root / "check.sh"
+            script.write_text('set -euo pipefail\n' + function + '''
+current_runtime_release() { printf '%s\\n' "$APT_TEST_ROOT"; }
+docker() { cat "$APT_TEST_ROOT/live.env"; }
+controller_container=fixture
+candidate_env=$APT_TEST_ROOT/expected.env
+controller_environment_matches
+''')
+            for configured, stale, duplicate in ((False, False, False), (False, True, False),
+                                                  (True, False, False), (True, True, False), (False, False, True)):
+                expected = dict(environment)
+                if configured:
+                    expected['CI_FLEET_APT_HTTP_PROXY'] = 'http://cache.example.invalid:3142'
+                    expected['CI_FLEET_NO_PROXY'] = 'mirror.example.invalid'
+                live = dict(expected)
+                if 'CI_FLEET_RUNNER_IMAGE_DIGEST' in expected:
+                    live['CI_FLEET_RUNNER_IMAGE'] = expected['CI_FLEET_RUNNER_IMAGE_DIGEST']
+                if stale:
+                    live['CI_FLEET_APT_HTTP_PROXY'] = 'http://stale.example.invalid:3142'
+                for name, values in (('expected', expected), ('live', live)):
+                    text = ''.join(f'{key}={value}\n' for key, value in values.items())
+                    if duplicate and name == 'live':
+                        text += 'CI_FLEET_APT_HTTP_PROXY=\nCI_FLEET_APT_HTTP_PROXY=\n'
+                    (root / f'{name}.env').write_text(text)
+                result = subprocess.run(['bash', str(script)], env=os.environ | {'APT_TEST_ROOT': str(root)}, capture_output=True)
+                self.assertEqual(result.returncode == 0, not stale and not duplicate, (configured, stale, duplicate, result.stderr))
+
 
 if __name__ == "__main__":
     unittest.main()

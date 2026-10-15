@@ -627,6 +627,7 @@ controller_environment_matches() {
     CI_FLEET_RUNNER_IMAGE CI_FLEET_INSTANCE CI_FLEET_GITHUB_APP_CLIENT_ID \
     CI_FLEET_GITHUB_APP_INSTALLATION_ID CI_FLEET_MIN_RUNNERS CI_FLEET_MAX_RUNNERS \
     CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID \
+    CI_FLEET_APT_HTTP_PROXY CI_FLEET_NO_PROXY \
     CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
     expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
     # shellcheck disable=SC2016 # Match the literal Compose interpolation.
@@ -634,7 +635,7 @@ controller_environment_matches() {
       && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$(current_runtime_release)/deploy/compose.yaml"; then
       expected=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$candidate_env")
     fi
-    if [[ -z "$expected" && "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR ]]; then
+    if [[ -z "$expected" && ( "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR || "$key" == CI_FLEET_APT_HTTP_PROXY || "$key" == CI_FLEET_NO_PROXY ) ]]; then
       actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
       [[ -z "$actual" ]] || return 1
       continue
