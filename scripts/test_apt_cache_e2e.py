@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tarfile
@@ -18,6 +19,14 @@ from apt_cache import apt_config
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDKIT = "moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+
+
+def fixture_failure_details(output: bytes) -> str:
+    text = output.decode(errors="replace")[-4096:]
+    text = re.sub(r"https?://[^\s<>\"']+", "[URL]", text)
+    text = re.sub(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", "[IP]", text)
+    text = re.sub(r"(?<!\w)(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.%]*", "[IP]", text)
+    return "\n".join(text.splitlines()[-10:])
 
 
 def main():
@@ -39,7 +48,8 @@ def main():
             with (temporary / "commands.log").open("ab") as log:
                 log.write(result.stdout + result.stderr)
             if result.returncode:
-                raise RuntimeError(f"APT_CACHE_E2E_FAILED step={step}")
+                details = fixture_failure_details(result.stdout + result.stderr)
+                raise RuntimeError(f"APT_CACHE_E2E_FAILED step={step} exit={result.returncode}\n{details}")
             return result.stdout.decode().strip()
 
         def cleanup(*args):
@@ -59,6 +69,8 @@ def main():
             return incoming, outgoing
 
         def measure(cache, name, action, cold=False):
+            nonlocal step
+            step = name
             before = totals(cache)
             start = time.monotonic()
             action()
@@ -103,8 +115,10 @@ def main():
             for index in range(2):
                 client = prefix + f"-runner-{index}"
                 containers.append(client)
+                step = f"runner-{index} creation"
                 run("docker", "create", "--name", client, "--user", "0", "--entrypoint", "/bin/sh",
                     runner_image, "-ec", install)
+                step = f"runner-{index} APT configuration"
                 run("docker", "cp", str(secret), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
                 measure(cache, f"runner-{index}", lambda: run("docker", "start", "-a", client), cold=index == 0)
             concurrent = []

@@ -11,9 +11,20 @@ import unittest
 from apt_cache import apt_config
 from desired_state import DesiredStateError, build_rendered_env, load_engine_capabilities, validate_host_values
 from test_desired_state import config, host_values, CONFIG_COMMIT, ROOT
+from test_apt_cache_e2e import fixture_failure_details
 
 
 class APTCacheTests(unittest.TestCase):
+    def test_fixture_failure_details_omit_endpoints_and_bound_output(self):
+        details = fixture_failure_details(
+            b'Ignored earlier output\n' * 500 +
+            b'Could not connect to 192.0.2.1:3142 or [2001:db8::1]:3142\n'
+            b'Failed http://user:password@cache.example.invalid/path\nAPT exited 100\n')
+        for value in ('192.0.2.1', '2001:db8::1', 'password', 'cache.example.invalid'):
+            self.assertNotIn(value, details)
+        self.assertIn('APT exited 100', details)
+        self.assertLessEqual(len(details.splitlines()), 10)
+
     def test_shared_validation_cases(self):
         cases = json.loads((ROOT / "scripts/fixtures/apt-cache.json").read_text())
         for proxy, bypass in cases["valid"]:
