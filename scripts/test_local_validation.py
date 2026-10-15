@@ -600,8 +600,8 @@ class PolicyExecutionTests(unittest.TestCase):
         self.source = self.commit("fix: candidate has weaker policies")
         self.count = 0
 
-    def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], stderr=subprocess.DEVNULL, text=True).strip()
+    def git(self, *args, env=None):
+        return subprocess.check_output(["git", "-C", str(self.repo), *args], env=env, stderr=subprocess.DEVNULL, text=True).strip()
 
     def commit(self, message):
         self.git("add", "."); self.git("commit", "-m", message)
@@ -626,6 +626,85 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["profile"], "full")
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
+
+    def test_replacement_refs_cannot_bind_an_unreviewed_tree(self):
+        actual_tree = self.git("rev-parse", self.source + "^{tree}")
+        reviewed_tree = self.git("rev-parse", self.policy + "^{tree}")
+        self.assertNotEqual(actual_tree, reviewed_tree)
+        replacement = self.git("commit-tree", reviewed_tree, "-p", self.base, "-m", "fix: substituted source tree")
+        self.git("replace", self.source, replacement)
+        control_env = dict(os.environ)
+        control_env.pop("GIT_NO_REPLACE_OBJECTS", None)
+        self.assertEqual(self.git("rev-parse", self.source + "^{commit}", env=control_env), self.source)
+        self.assertEqual(self.git("rev-parse", self.source + "^{tree}", env=control_env), reviewed_tree)
+        result, report = self.validate("--reviewed-head", self.policy)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("integrated and reviewed source trees differ", result.stderr)
+        self.assertIsNone(report)
+        self.assertFalse((self.root / "run-1").exists())
+
+    def test_replacement_refs_and_grafts_cannot_invent_base_ancestry(self):
+        tree = self.git("rev-parse", self.source + "^{tree}")
+        unrelated = self.git("commit-tree", tree, "-m", "fix: unrelated source root")
+        replacement = self.git("commit-tree", tree, "-p", self.base, "-m", "fix: substituted source ancestry")
+        for kind in ("replacement", "graft"):
+            with self.subTest(kind=kind):
+                if kind == "replacement":
+                    self.git("replace", unrelated, replacement)
+                else:
+                    (self.repo / ".git/info/grafts").write_text(unrelated + " " + self.base + "\n")
+                control_env = {**os.environ, "GIT_GRAFT_FILE": str(self.repo / ".git/info/grafts")}
+                control_env.pop("GIT_NO_REPLACE_OBJECTS", None)
+                self.git("merge-base", "--is-ancestor", self.base, unrelated, env=control_env)
+                result, report = self.validate(source=unrelated)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(report)
+                self.assertFalse((self.root / ("run-" + str(self.count))).exists())
+                if kind == "replacement":
+                    self.git("replace", "-d", unrelated)
+
+    def test_report_and_stage_git_use_real_objects_without_host_overrides(self):
+        import argparse
+        import local_validate
+        actual_tree = self.git("rev-parse", self.source + "^{tree}")
+        replacement = self.git("commit-tree", self.git("rev-parse", self.policy + "^{tree}"),
+                               "-p", self.base, "-m", "fix: substituted source tree")
+        self.git("replace", self.source, replacement)
+        unrelated = self.root / "unrelated.git"
+        subprocess.run(["git", "init", "--quiet", "--bare", str(unrelated)], check=True)
+        overrides = {"GIT_DIR": str(unrelated), "GIT_WORK_TREE": str(self.root),
+                     "GIT_COMMON_DIR": str(unrelated), "GIT_CEILING_DIRECTORIES": str(self.repo.parent),
+                     "GIT_NO_REPLACE_OBJECTS": "0", "GIT_GRAFT_FILE": str(self.repo / ".git/info/grafts"),
+                     "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.bare", "GIT_CONFIG_VALUE_0": "true",
+                     "CI_FLEET_TEST_HOST_SECRET": "must not reach validation stages"}
+        expected_git = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null",
+                        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+                        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "advice.graftFileDeprecated", "GIT_CONFIG_VALUE_0": "false"}
+        observed = []
+        execute = local_validate.run
+        def stage(command, cwd, env, log, timeout):
+            self.assertEqual({key: value for key, value in env.items() if key.startswith("GIT_")}, expected_git)
+            self.assertNotIn("CI_FLEET_TEST_HOST_SECRET", env)
+            self.assertEqual(env["PATH"], "/usr/sbin:/usr/bin:/sbin:/bin")
+            self.assertNotEqual(env["HOME"], os.environ["HOME"])
+            tree = subprocess.check_output(["git", "-C", str(cwd), "rev-parse", "HEAD^{tree}"], env=env, text=True).strip()
+            self.assertEqual(tree, actual_tree)
+            observed.append(command)
+            execute(command, cwd, env, log, timeout)
+        output = self.root / "real-object-report"
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+            reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
+            kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
+        with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage):
+            self.assertEqual(local_validate.git_environment({"PATH": "fixture", "GIT_DIR": "untrusted"}),
+                             {"PATH": "fixture", **expected_git})
+            self.assertEqual(local_validate.git_environment({}), expected_git)
+            self.assertEqual(local_validate.validate(args), 0)
+        report = json.loads((output / "result.json").read_text())
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["tree"], actual_tree)
+        self.assertEqual(len(observed), 3)
 
     def test_output_inside_git_repositories_is_rejected_before_creating_files(self):
         import argparse

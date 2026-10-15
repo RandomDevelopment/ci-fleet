@@ -24,8 +24,18 @@ SUITE = "ci-fleet-local-v1"
 CLEANUP_GRACE_SECONDS = 60
 
 
+def git_environment(values: dict | None = None) -> dict:
+    env = {key: value for key, value in (os.environ if values is None else values).items()
+           if not key.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null",
+               GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
+               GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="advice.graftFileDeprecated", GIT_CONFIG_VALUE_0="false")
+    return env
+
+
 def git(repo: Path, *args: str) -> str:
-    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    return subprocess.check_output(["git", "-C", str(repo), *args], env=git_environment(), text=True).strip()
 
 
 def output_directory(path: Path, *repositories: Path) -> Path:
@@ -36,7 +46,7 @@ def output_directory(path: Path, *repositories: Path) -> Path:
     if not ancestor.is_dir():
         ancestor = ancestor.parent
     message = "--output must be outside Git worktrees and repositories"
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env = git_environment()
     env.update(LC_ALL="C", GIT_DISCOVERY_ACROSS_FILESYSTEM="1")
     for repository in dict.fromkeys((*repositories, Path(__file__).resolve().parent, ancestor)):
         for location in ("--show-toplevel", "--absolute-git-dir"):
@@ -63,7 +73,8 @@ def output_directory(path: Path, *repositories: Path) -> Path:
 def fetch_tags(target: Path, tags: dict[str, dict[str, str]]) -> None:
     if tags:
         subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin",
-                        *(value["object"] + ":refs/tags/" + name for name, value in tags.items())], check=True)
+                        *(value["object"] + ":refs/tags/" + name for name, value in tags.items())],
+                       env=git_environment(), check=True)
         for name, value in tags.items():
             ref = "refs/tags/" + name
             if git(target, "rev-parse", ref) != value["object"] or git(target, "rev-parse", ref + "^{commit}") != value["commit"]:
@@ -79,7 +90,8 @@ def release_tags(repo: Path, validator: str, source: str, main: str, excluded: s
             ref = "refs/tags/" + name
             value = {"object": git(repo, "rev-parse", "--verify", ref),
                      "commit": git(repo, "rev-parse", "--verify", ref + "^{commit}")}
-            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", value["commit"], identity], check=True)
+            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", value["commit"], identity],
+                           env=git_environment(), check=True)
             tags[name] = value
     return tags
 
@@ -88,11 +100,12 @@ def checkout(origin: Path, target: Path, commit: str, identities: list[str], tag
     if any(not SHA.fullmatch(value) or value == NO_PRIOR for value in identities):
         raise ValueError("checkout identities must be full nonzero commit SHAs")
     target.mkdir()
-    subprocess.run(["git", "init", "--quiet", str(target)], check=True)
-    subprocess.run(["git", "-C", str(target), "config", "remote.origin.url", str(origin)], check=True)
-    subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities], check=True)
+    subprocess.run(["git", "init", "--quiet", str(target)], env=git_environment(), check=True)
+    subprocess.run(["git", "-C", str(target), "config", "remote.origin.url", str(origin)], env=git_environment(), check=True)
+    subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities],
+                   env=git_environment(), check=True)
     fetch_tags(target, tags or {})
-    subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], check=True)
+    subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], env=git_environment(), check=True)
 
 
 def checkout_manifest(root: Path) -> dict:
@@ -156,10 +169,12 @@ def validate(args: argparse.Namespace) -> int:
         if git(origin, "rev-parse", "--is-shallow-repository") != "false":
             raise ValueError("complete Git history is required")
     if not no_prior:
-        subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source], check=True)
+        subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source],
+                       env=git_environment(), check=True)
     if reviewed_head != args.source:
         if not no_prior:
-            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head], check=True)
+            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head],
+                           env=git_environment(), check=True)
         if git(repo, "rev-parse", args.source + "^{tree}") != git(repo, "rev-parse", reviewed_head + "^{tree}"):
             raise ValueError("integrated and reviewed source trees differ")
     output = output_directory(args.output, repo, policy_repo)
@@ -184,14 +199,14 @@ def validate(args: argparse.Namespace) -> int:
                 identities = source_identities if target == source else [args.policy]
                 checkout(origin, target, commit, identities)
                 if target == source:
-                    subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main], check=True)
+                    subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main],
+                                   env=git_environment(), check=True)
             # Do not pass host credentials, Git overrides or language injection variables.
-            env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(root / "home"), "LANG": "C.UTF-8",
-                   "TMPDIR": fixture_temporary, "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
-                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
+            env = git_environment({"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(root / "home"), "LANG": "C.UTF-8",
+                   "TMPDIR": fixture_temporary, "PYTHONNOUSERSITE": "1",
                    "CI_FLEET_VALIDATION_ROOT": str(source), "CI_FLEET_VALIDATION_ID": root.name.lower(),
                    "CI_FLEET_RUNNER_IMAGE": "ci-fleet-runner:" + root.name.lower(),
-                   "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()}
+                   "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()})
             Path(env["HOME"]).mkdir()
             tools = {"git": ["git", "--version"], "python": ["python3", "--version"],
                      "bash": ["bash", "--version"], "openssl": ["openssl", "version"], "shellcheck": ["shellcheck", "--version"]}
@@ -273,7 +288,8 @@ def validate(args: argparse.Namespace) -> int:
                         verify_checkout(seed, expected)
                         checkout(seed, target, commit, identities, tags)
                         if target == source:
-                            subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main], check=True)
+                            subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main],
+                                           env=git_environment(), check=True)
                     stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _, _ in seeds]
                     run(command, source, env, output / entry["log"], args.timeout)
                     for target, expected in stage_trees:

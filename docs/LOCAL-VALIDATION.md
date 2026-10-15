@@ -42,6 +42,10 @@ Do not treat this profile as proof of those additional standalone tests.
 Populate complete repository history and tags before running. Policy is an
 independently reviewed engine commit, not a merge base chosen by the candidate.
 For trusted acceptance, run the orchestrator itself from that trusted checkout.
+All orchestrator Git commands discard inherited `GIT_*` overrides and ignore
+replacement objects, legacy graft files, and global or system Git configuration.
+Identity, tree and ancestry checks use the actual stored objects. Validation
+stages receive the same Git restrictions in their credential-free environment.
 Git and image/package downloads require network access when not already cached.
 The suite never registers a runner and needs no fleet credential. Existing
 installer/systemd/recovery fixtures use fake services and isolated filesystem
