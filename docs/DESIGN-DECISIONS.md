@@ -119,8 +119,15 @@ repository whose changes they accept. They are not application allowlists,
 capacity policy, credentials, or infrastructure inventory. See
 [the acceptance and recovery contract](CONFIGURATION-APPROVAL.md).
 
-This implementation requires independent exact-head formal review, exact-applied
+This implementation requires independent exact-head review, exact-applied
 commit workflow/job success, and equality of the reviewed and applied trees.
+Formal approval remains the default. A root-policy opt-in also accepts a verified
+clean Codex review from a pinned independent bot identity. It requires an unedited
+recognized response, full commit resolution, resolved review threads, and no
+newer conflicting review evidence or review request. This supports a bot that
+posts clean-review comments instead of formal approvals. Account takeover and
+incorrect conclusions by a trusted reviewer remain risks shared by both modes;
+format changes fail closed. Remove the opt-in to require formal approvals again.
 Existing root-owned installation/checkpoints remain the trusted recovery
 baseline; an enabled host cannot restore a manager that drops the gate.
 Host-root compromise, trusted-engine compromise, and account takeover of an

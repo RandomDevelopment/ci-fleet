@@ -4,5 +4,6 @@
   "branch": "main",
   "workflow_id": 501,
   "required_jobs": ["validate"],
-  "reviewer_ids": [202]
+  "reviewer_ids": [202],
+  "codex_reviewer_ids": []
 }

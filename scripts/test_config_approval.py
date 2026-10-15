@@ -357,6 +357,166 @@ def installer_function(name: str) -> str:
     return source[start:start + len(name) + 5 + following.start()]
 
 
+class CodexApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = dict(POLICY, codex_reviewer_ids=[202])
+        self.data = evidence()
+        self.reviews = self.data[f"{PREFIX}/pulls/8/reviews"]
+        self.reviews.clear()
+        self.comment = {
+            "databaseId": 1000, "author": {"__typename": "Bot", "databaseId": 202},
+            "body": "Codex Review: Didn't find any major issues. What shall we delve into next?\n\n"
+                    f"**Reviewed commit:** `{HEAD[:10]}`\n\n<details>GitHub integration help</details>",
+            "createdAt": "2026-01-01T00:01:00Z", "lastEditedAt": None,
+        }
+        self.pr = self.data["/graphql"]["data"]["repository"]["pullRequest"]
+        for key, nodes in (("comments", [self.comment]), ("reviewThreads", [{"isResolved": True}])):
+            self.pr[key] = {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}
+        self.data[f"{PREFIX}/commits/{HEAD[:10]}"] = {"sha": HEAD}
+
+    def check(self):
+        verify(FixtureAPI(self.data), self.policy, REPOSITORY, COMMIT, TREE)
+
+    def test_clean_review_requires_operator_opt_in_and_successful_exact_applied_checks(self):
+        self.check()
+        with self.assertRaises(Rejected):
+            verify(FixtureAPI(self.data), POLICY, REPOSITORY, COMMIT, TREE)
+        self.data[f"{PREFIX}/actions/workflows/501/runs"]["workflow_runs"][0]["conclusion"] = "failure"
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_known_clean_response_follow_up_sentences(self):
+        body = self.comment["body"]
+        for sentence in ("", " Keep it up!", " Nice work!"):
+            self.comment["body"] = body.replace(" What shall we delve into next?", sentence)
+            self.check()
+
+    def test_completed_activity_refresh_does_not_replace_clean_decision(self):
+        summary = dict(self.comment, databaseId=999, createdAt="2026-01-01T00:00:00Z",
+                       lastEditedAt="2026-01-01T00:01:02Z", body=(
+            '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n'
+            '| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n'
+            '| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-01-01T00:01:01Z">'
+            f'2026-01-01T00:01:01Z</relative-time> | `{HEAD[:7]}` | Manual request |\n\n'
+            '<details>Comment "@codex review" or "@codex security review".</details>'))
+        self.pr["comments"]["nodes"].append(summary)
+        self.data[f"{PREFIX}/commits/{HEAD[:7]}"] = {"sha": HEAD}
+        self.data[f"{PREFIX}/commits/{'4' * 7}"] = {"sha": "4" * 40}
+        self.check()
+        body = summary["body"]
+        for changed in (body.replace("Completed", "Running"), body.replace("Completed", "Failed"),
+                        body.replace(HEAD[:7], "4" * 7), body.replace("00:01:01", "00:00:59"),
+                        body + '\n| Security review | Running | unknown | Manual request |'):
+            with self.subTest(body=changed), self.assertRaises(Rejected):
+                summary["body"] = changed
+                self.check()
+        summary["body"] = body
+        self.data[f"{PREFIX}/commits/{HEAD[:7]}"] = {"sha": "4" * 40}
+        with self.assertRaises(Rejected):
+            self.check()
+        self.data[f"{PREFIX}/commits/{HEAD[:7]}"] = {"sha": HEAD}
+        self.pr["comments"]["nodes"] = [summary]
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_copied_summary_wrong_identity_or_author_cannot_approve(self):
+        for author in ({"__typename": "User", "databaseId": 202},
+                       {"__typename": "Bot", "databaseId": 999}, None):
+            with self.subTest(author=author), self.assertRaises(Rejected):
+                self.comment["author"] = author
+                self.check()
+        self.comment["author"] = {"__typename": "Bot", "databaseId": 202}
+        self.data[f"{PREFIX}/pulls/8"]["user"]["id"] = 202
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_edited_or_unrecognized_summaries_do_not_approve(self):
+        body = self.comment["body"]
+        for changed in (body.replace("Didn't find any major issues.", "Review completed."),
+                        "Quoted response:\n" + body, body + "\nAdditional finding", body.replace(HEAD[:10], HEAD[:7])):
+            with self.subTest(body=changed), self.assertRaises(Rejected):
+                self.comment["body"] = changed
+                self.check()
+        self.comment["body"] = body
+        self.comment["lastEditedAt"] = self.comment["createdAt"]
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_reported_abbreviation_must_resolve_to_exact_head(self):
+        self.data[f"{PREFIX}/commits/{HEAD[:10]}"] = {"sha": "4" * 40}
+        with self.assertRaises(Rejected):
+            self.check()
+        self.data[f"{PREFIX}/commits/{HEAD[:10]}"] = Rejected("ambiguous commit")
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_newer_requests_bot_responses_and_same_second_conflicts_invalidate_clean_review(self):
+        for author, body in (({"__typename": "User", "databaseId": 201}, "@codex review"),
+                             ({"__typename": "User", "databaseId": 201}, "Please @codex security review"),
+                             ({"__typename": "Bot", "databaseId": 202}, "Code review usage limit reached")):
+            for timestamp in ("2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z"):
+                with self.subTest(body=body, timestamp=timestamp), self.assertRaises(Rejected):
+                    self.pr["comments"]["nodes"] = [self.comment, dict(self.comment, databaseId=1001, author=author,
+                                                                  body=body, createdAt=timestamp)]
+                    self.check()
+        edited = dict(self.comment, databaseId=999, createdAt="2026-01-01T00:00:00Z",
+                      lastEditedAt="2026-01-01T00:02:00Z")
+        self.pr["comments"]["nodes"] = [self.comment, edited]
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_later_or_pending_formal_bot_review_invalidates_comment(self):
+        for state in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED", "DISMISSED", "PENDING"):
+            for timestamp in ("2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z"):
+                self.reviews[:] = [{"id": 901, "user": {"id": 202}, "state": state, "commit_id": "4" * 40,
+                                   "submitted_at": None if state == "PENDING" else timestamp}]
+                with self.subTest(state=state, timestamp=timestamp), self.assertRaises(Rejected):
+                    self.check()
+        self.reviews[:] = [{"id": 900, "user": {"id": 202}, "state": "COMMENTED", "commit_id": HEAD,
+                           "submitted_at": "2026-01-01T00:00:00Z"}]
+        self.check()
+
+    def test_unresolved_threads_and_trusted_change_requests_still_block(self):
+        self.pr["reviewThreads"]["nodes"] = [{"isResolved": False}]
+        with self.assertRaises(Rejected):
+            self.check()
+        self.pr["reviewThreads"]["nodes"] = [{"isResolved": True}]
+        self.policy["reviewer_ids"] = [202, 203]
+        self.reviews.append({"id": 900, "user": {"id": 203}, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                             "submitted_at": "2026-01-01T00:00:00Z"})
+        with self.assertRaises(Rejected):
+            self.check()
+
+    def test_retargeted_pr_requires_fresh_clean_review(self):
+        self.pr["timelineItems"]["nodes"] = [{"createdAt": "2026-01-01T00:01:00Z"}]
+        with self.assertRaises(Rejected):
+            self.check()
+        self.comment["createdAt"] = "2026-01-01T00:02:00Z"
+        self.check()
+
+    def test_missing_or_incomplete_comment_and_thread_evidence_fails_closed(self):
+        for connection in ("comments", "reviewThreads"):
+            collection = copy.deepcopy(self.pr[connection])
+            for changed in ({"nodes": [], "pageInfo": {}},
+                            {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}):
+                with self.subTest(connection=connection, changed=changed), self.assertRaises(Rejected):
+                    self.pr[connection] = changed
+                    self.check()
+            self.pr[connection] = collection
+
+    def test_bot_evidence_pagination_checks_every_page_and_rejects_cycles(self):
+        api = GitHub("fixture-authentication")
+        first, last = copy.deepcopy(self.data["/graphql"]), copy.deepcopy(self.data["/graphql"])
+        collection = first["data"]["repository"]["pullRequest"]["comments"]
+        collection["pageInfo"] = {"hasNextPage": True, "endCursor": "fixture-cursor"}
+        last["data"]["repository"]["pullRequest"]["comments"]["nodes"] = []
+        with patch.object(api, "get", side_effect=[first, last]) as getter:
+            self.assertEqual(len(api.pull_request_nodes(REPOSITORY, 8, "comments", "body")), 1)
+            self.assertIn('after: "fixture-cursor"', getter.call_args.args[1])
+        with patch.object(api, "get", return_value=first), self.assertRaises(Rejected):
+            api.pull_request_nodes(REPOSITORY, 8, "comments", "body")
+
+
 class InstallerGateTests(unittest.TestCase):
     def test_recovery_option_requires_an_inherited_upgrade_lock(self):
         result = subprocess.run(["bash", str(ROOT / "scripts" / "install-worker-controller.sh"),
@@ -437,6 +597,15 @@ class PolicyTests(unittest.TestCase):
 
     def test_trusted_policy_and_marker(self):
         self.assertEqual(read_policy(self.path, os.getuid()), POLICY)
+
+    def test_codex_requires_explicit_allowed_numeric_id_opt_in(self):
+        value = dict(POLICY, codex_reviewer_ids=[202])
+        self.path.write_text(json.dumps(value))
+        self.assertEqual(read_policy(self.path, os.getuid()), value)
+        for reviewers in (True, None, [True], [999], [202, 202]):
+            self.path.write_text(json.dumps(dict(POLICY, codex_reviewer_ids=reviewers)))
+            with self.subTest(reviewers=reviewers), self.assertRaises(Rejected):
+                read_policy(self.path, os.getuid())
 
     def test_invalid_policy_schema_is_rejected(self):
         for field, changed in (("schema_version", True), ("configuration_repository_id", True), ("workflow_id", 0),

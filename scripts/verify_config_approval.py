@@ -21,6 +21,16 @@ from typing import Any
 SHA = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workflow_id", "required_jobs", "reviewer_ids"}
+CODEX_CLEAN = re.compile(
+    r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!)?\n\n"
+    r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
+    r"(?:\n<details>[\s\S]*</details>\s*)?\Z"
+)
+CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+CODEX_COMPLETED_ROW = re.compile(
+    r'\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="([^"]+)">'
+    r'[^<]+</relative-time> \| `([0-9a-f]{7,40})` \| [^|\n]+ \|'
+)
 
 
 class Rejected(ValueError):
@@ -57,7 +67,8 @@ def read_policy(path: Path, owner: int = 0) -> dict[str, Any]:
                 "approval policy must be a root-owned regular file with mode 0600")
         require(metadata.st_size <= 16384, "approval policy exceeds size limit")
         policy = json.load(handle, object_pairs_hook=unique_object)
-    require(isinstance(policy, dict) and set(policy) == POLICY_KEYS, "invalid approval policy keys")
+    require(isinstance(policy, dict) and POLICY_KEYS <= set(policy)
+            and set(policy) <= POLICY_KEYS | {"codex_reviewer_ids"}, "invalid approval policy keys")
     require(type(policy["schema_version"]) is int and policy["schema_version"] == 1, "unsupported approval policy version")
     for key in ("configuration_repository_id", "workflow_id"):
         require(positive_id(policy[key]), "approval policy IDs must be positive integers")
@@ -67,6 +78,9 @@ def read_policy(path: Path, owner: int = 0) -> dict[str, Any]:
     require(isinstance(reviewers, list) and 0 < len(reviewers) <= 20 and all(positive_id(item) for item in reviewers),
             "approval policy requires reviewer IDs")
     require(len(set(reviewers)) == len(reviewers), "duplicate reviewer IDs")
+    codex = policy.get("codex_reviewer_ids", [])
+    require(isinstance(codex, list) and all(positive_id(item) and item in reviewers for item in codex)
+            and len(set(codex)) == len(codex), "Codex reviewer IDs must be unique allowed reviewer IDs")
     jobs = policy["required_jobs"]
     require(isinstance(jobs, list) and 0 < len(jobs) <= 20
             and all(isinstance(item, str) and 0 < len(item) <= 200 for item in jobs), "approval policy requires job names")
@@ -183,6 +197,29 @@ class GitHub:
             cursor = following
         raise Rejected("PR base history pagination limit reached")
 
+    def pull_request_nodes(self, repository: str, number: int, connection: str, fields: str) -> list[dict[str, Any]]:
+        owner, name = repository.split("/")
+        cursor = None
+        items = []
+        for _ in range(20):
+            query = '''query { repository(owner: %s, name: %s) { pullRequest(number: %d) {
+                %s(first: 100, after: %s) { nodes { %s } pageInfo { hasNextPage endCursor } }
+            } } }''' % (json.dumps(owner), json.dumps(name), number, connection, json.dumps(cursor), fields)
+            result = self.get("/graphql", query)
+            require(isinstance(result, dict) and not result.get("errors"), "PR review evidence is unavailable")
+            collection = result["data"]["repository"]["pullRequest"][connection]
+            nodes, page = collection["nodes"], collection["pageInfo"]
+            require(isinstance(nodes, list) and len(nodes) <= 100
+                    and all(isinstance(node, dict) for node in nodes), "invalid PR review evidence")
+            items.extend(nodes)
+            require(type(page.get("hasNextPage")) is bool, "incomplete PR review evidence")
+            if not page["hasNextPage"]:
+                return items
+            following = page.get("endCursor")
+            require(isinstance(following, str) and bool(following) and following != cursor, "invalid PR review cursor")
+            cursor = following
+        raise Rejected("PR review evidence pagination limit reached")
+
 
 def evidence_timestamp(timestamp: Any) -> datetime:
     require(isinstance(timestamp, str), "evidence timestamp is unavailable")
@@ -204,6 +241,58 @@ def run_order(run: dict[str, Any]) -> tuple[datetime, int]:
     if run.get("status") != "completed":
         timestamps.append(run.get("updated_at"))
     return max(evidence_timestamp(timestamp) for timestamp in timestamps), run["id"]
+
+
+def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any], head: str,
+                            submitted: datetime) -> bool:
+    rows = [line for line in comment["body"].splitlines() if line.startswith("|")]
+    if len(rows) != 3 or rows[:2] != ["| Review | Status | Commit | Review trigger |", "| --- | --- | --- | --- |"]:
+        return False
+    match = CODEX_COMPLETED_ROW.fullmatch(rows[2])
+    return (match is not None and evidence_timestamp(match[1]) >= submitted
+            and api.get(f"/repos/{repository}/commits/{match[2]}").get("sha") == head)
+
+
+def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, number: int, head: str,
+                       author_id: int, reviews: list[dict[str, Any]], base_changed: datetime | None) -> bool:
+    allowed = set(policy.get("codex_reviewer_ids", [])) - {author_id}
+    if not allowed:
+        return False
+    comments = api.pull_request_nodes(repository, number, "comments",
+                                     "databaseId body createdAt lastEditedAt author { __typename ... on Bot { databaseId } }")
+    threads = api.pull_request_nodes(repository, number, "reviewThreads", "isResolved")
+    require(all(thread.get("isResolved") is True for thread in threads), "unresolved PR review threads")
+    for reviewer in allowed:
+        responses = [comment for comment in comments if isinstance(comment.get("author"), dict)
+                     and comment["author"].get("__typename") == "Bot"
+                     and comment["author"].get("databaseId") == reviewer]
+        decisions = [comment for comment in responses if not comment["body"].startswith(CODEX_SUMMARY_MARKER)]
+        if not decisions:
+            continue
+        # An edited older response is newer evidence, but can never grant approval.
+        def comment_time(comment: dict[str, Any]) -> datetime:
+            return max(evidence_timestamp(comment["createdAt"]),
+                       evidence_timestamp(comment.get("lastEditedAt") or comment["createdAt"]))
+        response = max(decisions, key=lambda comment: (comment_time(comment), comment["databaseId"]))
+        submitted = evidence_timestamp(response["createdAt"])
+        match = CODEX_CLEAN.fullmatch(response["body"])
+        if response["lastEditedAt"] is not None or match is None or (base_changed is not None and submitted <= base_changed):
+            continue
+        if any(comment is not response and comment_time(comment) >= submitted
+               and (comment in responses or re.search(r"(?i)@codex\s+(?:security\s+)?review\b", comment["body"]))
+               and not (comment in responses and comment["body"].startswith(CODEX_SUMMARY_MARKER)
+                        and completed_codex_summary(api, repository, comment, head, submitted))
+               for comment in comments):
+            continue
+        if any(review.get("user", {}).get("id") == reviewer
+               and (review["state"] == "PENDING" or evidence_timestamp(review["submitted_at"]) >= submitted)
+               for review in reviews):
+            continue
+        # Resolve abbreviated GitHub output rather than accepting a textual prefix match.
+        reported = api.get(f"/repos/{repository}/commits/{match[1]}")
+        if reported.get("sha") == head:
+            return True
+    return False
 
 
 def verify_one(api: GitHub, policy: dict[str, Any], repository: str, commit: str, tree: str) -> str:
@@ -256,9 +345,11 @@ def verify_one(api: GitHub, policy: dict[str, Any], repository: str, commit: str
                 latest[reviewer] = review
     require(not any(review["state"] == "CHANGES_REQUESTED" for review in latest.values()), "trusted reviewer requested changes")
     base_changed = api.latest_base_change(repository, number)
-    require(any(reviewer != author_id and review["state"] == "APPROVED" and review.get("commit_id") == head
-                and (base_changed is None or evidence_timestamp(review.get("submitted_at")) > base_changed)
-                for reviewer, review in latest.items()), "independent exact-head approval is missing")
+    formal = any(reviewer != author_id and review["state"] == "APPROVED" and review.get("commit_id") == head
+                 and (base_changed is None or evidence_timestamp(review.get("submitted_at")) > base_changed)
+                 for reviewer, review in latest.items())
+    require(formal or clean_codex_review(api, policy, repository, number, head, author_id, reviews, base_changed),
+            "independent exact-head approval is missing")
     runs = api.pages(f"{prefix}/actions/workflows/{policy['workflow_id']}/runs?head_sha={commit}&event=push", "workflow_runs")
     require(bool(runs) and all(positive_id(run.get("id")) for run in runs), "exact-commit workflow is missing")
     run = max(runs, key=run_order)

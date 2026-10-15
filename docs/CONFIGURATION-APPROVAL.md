@@ -59,7 +59,8 @@ adapter's resume action, the trusted verifier requires all of the following:
 3. At least one allowed reviewer, other than the PR author, has an `APPROVED`
    formal review on that full head SHA. The reviewer's latest decision applies;
    dismissed or stale approvals do not count, and an outstanding trusted
-   `CHANGES_REQUESTED` decision blocks acceptance. Comments do not grant approval.
+   `CHANGES_REQUESTED` decision blocks acceptance. The optional Codex rule below
+   also accepts verified clean review evidence from an explicitly trusted bot.
    The review must follow any base-branch retargeting. Unavailable or incomplete
    PR base history rejects the candidate.
 4. The latest push run of the pinned workflow on the applied SHA completed
@@ -67,10 +68,42 @@ adapter's resume action, the trusted verifier requires all of the following:
    also completed successfully in that exact run attempt. Skipped, failed,
    cancelled, queued, and missing evidence is rejected.
 
-A Codex summary saying its review completed, a reaction, a status with a familiar
-name, or a successful PR merge-ref workflow is insufficient. Provision an
-independent reviewer or review service that submits a formal exact-head approval.
-The gate verifies those formal decisions; it does not interpret review prose.
+A reaction, a status with a familiar name, a generic review-completed comment,
+or a successful PR merge-ref workflow is insufficient.
+
+### Optional Codex clean reviews
+
+By default only formal reviews grant approval. To use Codex as the independent
+reviewer, an operator can add `"codex_reviewer_ids": [202]` to the root-owned
+policy. Here `202` is fictional; independently verify the actual bot's numeric
+GitHub ID. Each ID must also appear in `reviewer_ids`. Omitting the field or
+using an empty list preserves formal-only behavior. Older engines reject this
+field; install the reviewed supporting engine before provisioning it.
+
+This opt-in accepts the bot's unedited issue comment beginning exactly
+`Codex Review: Didn't find any major issues.` and containing the standard
+`Reviewed commit` field. The current optional follow-up sentence and integration
+help footer are recognized. Other wording fails closed and requires verifier
+support before it can count. The GitHub author must be a bot with the pinned
+numeric ID and must differ from the PR author. A copied summary from another
+account cannot grant approval.
+
+The reported commit must resolve through GitHub to the full current PR head.
+An abbreviated hash alone is insufficient; ambiguous or stale results reject
+the candidate. The clean response must follow any base retargeting. All review
+threads must be resolved. Newer bot comments, bot formal reviews, pending bot
+reviews, and later `@codex review` or `@codex security review` requests invalidate
+an older clean response. The activity dashboard may refresh after the decision
+only when its single recognized code-review row reports completion on the same
+resolved commit at or after the clean response. Running, failed, stale, and
+unrecognized dashboard updates block acceptance. The dashboard cannot approve
+without a separate clean response.
+Same-second conflicts reject acceptance. Edited responses cannot approve, and
+editing an older decision response after a clean result invalidates that result.
+Outstanding trusted formal change requests still block acceptance. All tree,
+ancestry, applied-commit workflow/job, recovery, API, and pagination checks remain
+required. This rule accepts a narrow bot response format; it does not infer
+approval from arbitrary prose or treat the owner's merge as independent review.
 
 Requests use only GitHub's HTTPS API, refuse redirects, and have a two-minute
 evidence budget, fifteen-second request timeout, four-MiB response limit, and
