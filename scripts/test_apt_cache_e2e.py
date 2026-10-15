@@ -25,6 +25,7 @@ def main():
     runner_image = os.environ.get("CI_FLEET_RUNNER_IMAGE", "ci-fleet-runner:dev")
     controller_image = os.environ.get("CI_FLEET_CONTROLLER_IMAGE", "ci-fleet-controller:dev")
     containers, images, builders = [], [], []
+    build_client = None
     measurements = []
     with tempfile.TemporaryDirectory(prefix=prefix) as directory:
         temporary = Path(directory)
@@ -37,6 +38,12 @@ def main():
             if result.returncode:
                 raise RuntimeError(f"APT_CACHE_E2E_FAILED step={step}")
             return result.stdout.decode().strip()
+
+        def cleanup(*args):
+            try:
+                return subprocess.run(args, capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
 
         def totals(cache):
             text = run("docker", "exec", cache, "cat", "/var/log/apt-cacher-ng/apt-cacher.log")
@@ -108,6 +115,7 @@ def main():
             run("docker", "run", "--rm", "--entrypoint", "/bin/sh", runner_image, "-ec",
                 'test ! -e /etc/apt/apt.conf.d/99-ci-fleet-cache; test -z "${CI_FLEET_APT_CONFIG:-}"')
             client = prefix + "-build-client"
+            build_client = client
             containers.append(client)
             run("docker", "run", "-d", "--name", client, "--entrypoint", "/bin/sh",
                 "--volume", "/var/run/docker.sock:/var/run/docker.sock", tools_image, "-c", "sleep 1800")
@@ -193,16 +201,30 @@ def main():
             run("docker", "cp", str(source), client + ":/https.list")
             run("docker", "exec", client, "apt-get", "-o", "Dir::Etc::sourcelist=/https.list",
                 "-o", "Dir::Etc::sourceparts=-", "update", timeout=120)
-            print("APT_CACHE_E2E_OK " + json.dumps(measurements, sort_keys=True))
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             raise SystemExit(str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout") from None
         finally:
+            if build_client:
+                # Builder registrations live in this fresh client, not in the host CLI.
+                registered = cleanup("docker", "exec", build_client, "docker", "buildx", "ls", "--format", "{{.Name}}")
+                for name in registered.stdout.splitlines():
+                    if name.startswith("ci-fleet-managed-"):
+                        builders.append((build_client, name))
+                        containers.append("buildx_buildkit_" + name + "0")
             for owner, builder in builders:
-                subprocess.run(["docker", "exec", owner, "docker", "buildx", "rm", "--force", builder], capture_output=True, timeout=60)
+                cleanup("docker", "exec", owner, "docker", "buildx", "rm", "--force", builder)
             for container in containers:
-                subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
+                cleanup("docker", "rm", "-f", "-v", container)
             for image in images:
-                subprocess.run(["docker", "image", "rm", image], capture_output=True)
+                cleanup("docker", "image", "rm", image)
+            remaining = cleanup("docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}")
+            for tag in remaining.stdout.splitlines():
+                if tag.startswith(prefix + "-"):
+                    cleanup("docker", "image", "rm", tag)
+            for name in containers:
+                if cleanup("docker", "container", "inspect", name).returncode == 0:
+                    raise SystemExit("APT_CACHE_E2E_FAILED step=owned container cleanup")
+        print("APT_CACHE_E2E_OK " + json.dumps(measurements, sort_keys=True))
 
 
 if __name__ == "__main__":

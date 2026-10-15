@@ -9,6 +9,9 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/apt_cache.py \
+  scripts/test_apt_cache.py \
+  scripts/test_apt_cache_e2e.py \
   scripts/bootstrap-github-callback.py \
   scripts/fixtures/fake-bootstrap-curl.py \
   scripts/verify_config_approval.py \
