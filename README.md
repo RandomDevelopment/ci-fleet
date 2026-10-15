@@ -1,5 +1,9 @@
 # ci-fleet
 
+Existing apt-cacher-ng servers can optionally cache APT downloads across runners
+and image builds. Support is disabled by default. See [APT cache setup and
+project integration](docs/APT-CACHE.md).
+
 [![Status: controlled migration](https://img.shields.io/badge/status-controlled%20migration-f59e0b)](#project-status)
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-2563eb.svg)](LICENSE)
 [![Platform: Linux + Docker](https://img.shields.io/badge/platform-Linux%20%2B%20Docker-2496ed)](#requirements)

@@ -627,6 +627,7 @@ controller_environment_matches() {
     CI_FLEET_RUNNER_IMAGE CI_FLEET_INSTANCE CI_FLEET_GITHUB_APP_CLIENT_ID \
     CI_FLEET_GITHUB_APP_INSTALLATION_ID CI_FLEET_MIN_RUNNERS CI_FLEET_MAX_RUNNERS \
     CI_FLEET_RUNNER_CPUS CI_FLEET_RUNNER_MEMORY_MIB CI_FLEET_RUNNER_TTL CI_FLEET_DOCKER_GID \
+    CI_FLEET_APT_HTTP_PROXY CI_FLEET_NO_PROXY \
     CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR CI_FLEET_DOCKER_NETWORKS_PER_RUNNER CI_FLEET_DOCKER_NETWORK_RESERVE_SUBNETS; do
     expected=$(awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1)}' "$candidate_env")
     # shellcheck disable=SC2016 # Match the literal Compose interpolation.
@@ -634,7 +635,7 @@ controller_environment_matches() {
       && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$(current_runtime_release)/deploy/compose.yaml"; then
       expected=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$candidate_env")
     fi
-    if [[ -z "$expected" && "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR ]]; then
+    if [[ -z "$expected" && ( "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR || "$key" == CI_FLEET_APT_HTTP_PROXY || "$key" == CI_FLEET_NO_PROXY ) ]]; then
       actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
       [[ -z "$actual" ]] || return 1
       continue
@@ -791,7 +792,7 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
-    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh; do
+    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh apt_cache:apt_cache.py; do
       policy_script=${required#*:}
       if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
 import json, sys
@@ -799,7 +800,8 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))
 raise SystemExit(value.get("capabilities", {}).get(sys.argv[2]) is not True)
 PY
       then
-        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" && -x "$path/scripts/$policy_script" ]] || return 1
+        [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" ]] || return 1
+        [[ "$policy_script" == *.py || -x "$path/scripts/$policy_script" ]] || return 1
       fi
     done
   fi

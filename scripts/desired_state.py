@@ -16,6 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from apt_cache import apt_config
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_VALIDATOR = ROOT / "templates" / "config-repository" / "scripts" / "validate.py"
@@ -29,7 +31,7 @@ HOST_REQUIRED = {
     "CI_FLEET_GITHUB_APP_INSTALLATION_ID",
     "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE",
 }
-HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL"}
+HOST_OPTIONAL = {"CI_FLEET_RUNNER_TTL", "CI_FLEET_APT_HTTP_PROXY", "CI_FLEET_NO_PROXY"}
 RENDERED_ENV_NAMES = HOST_REQUIRED | HOST_OPTIONAL | {
     "CI_FLEET_CAPACITY_BUDGET",
     "CI_FLEET_COMMIT",
@@ -183,12 +185,18 @@ def validate_host_values(values: dict[str, str]) -> dict[str, str]:
     multiplier = {"s": 1, "m": 60, "h": 3600}[ttl[-1]]
     if int(ttl[:-1]) * multiplier < 3600:
         raise DesiredStateError("runner TTL must be at least one hour")
-    return {
+    try:
+        apt_config(values.get("CI_FLEET_APT_HTTP_PROXY", ""), values.get("CI_FLEET_NO_PROXY", ""))
+    except ValueError as exc:
+        raise DesiredStateError(str(exc)) from None
+    result = {
         "CI_FLEET_GITHUB_APP_CLIENT_ID": client_id,
         "CI_FLEET_GITHUB_APP_INSTALLATION_ID": installation_id,
         "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": key_file,
         "CI_FLEET_RUNNER_TTL": ttl,
     }
+    result.update({name: values[name] for name in ("CI_FLEET_APT_HTTP_PROXY", "CI_FLEET_NO_PROXY") if values.get(name)})
+    return result
 
 
 def validate_docker_address_pools(pools: Any, *, path: str) -> list[dict[str, Any]]:
@@ -440,6 +448,8 @@ def build_rendered_env(
         ):
             raise DesiredStateError("selected engine does not support default bridge CIDR configuration")
     short_commit = engine_commit[:12]
+    if host_values.get("CI_FLEET_APT_HTTP_PROXY") and "apt_cache" not in (engine_capabilities or set()):
+        raise DesiredStateError("selected engine does not support optional APT cache configuration")
     architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine or platform.machine())
     if architecture is None:
         raise DesiredStateError("host architecture is unsupported for managed images")
@@ -511,6 +521,8 @@ def build_rendered_env(
     if set(rendered) - rendered_env_names(rendered):
         raise DesiredStateError("renderer produced unsupported environment fields")
     for name, value in rendered.items():
+        if name in {"CI_FLEET_APT_HTTP_PROXY", "CI_FLEET_NO_PROXY"}:
+            continue  # Validated separately, including bracketed IPv6 proxy origins.
         if not SAFE_ENV_VALUE.fullmatch(value):
             raise DesiredStateError(f"rendered value for {name} contains unsafe characters")
     metadata = {

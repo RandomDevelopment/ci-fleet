@@ -1,5 +1,20 @@
 # Accepted design decisions
 
+## Optional host-local APT cache
+
+Trusted private pools may opt into an existing apt-cacher-ng server through
+host-local configuration. The endpoint is excluded from Git-authored desired
+state. Routing, capacity, lifecycle, and engine revision remain desired-state
+authority. The selected engine must advertise `apt_cache` before its renderer
+accepts these settings. Support is disabled by default.
+
+Use APT-specific configuration and optional BuildKit secrets, preserving direct
+HTTPS traffic and image identity verification. Project builds and runtime
+containers require explicit integration. Jobs can inspect the runtime endpoint,
+so this does not grant network isolation or permit use in untrusted pools.
+Host APT and cache-server administration remain operator responsibilities.
+See [APT cache support](APT-CACHE.md) for activation, removal, and evidence.
+
 ## Opt-in pinned Chromium profile for the deployment broker
 
 The owner approved this repository capability on 2026-10-14 under [issue #130](https://github.com/RandomDevelopment/ci-fleet/issues/130).
@@ -209,3 +224,19 @@ The incumbent manager must not activate the new runtime before reviewed IDs exis
 Legacy checkpoint image IDs do not make their mutable build inputs reproducible. Retain these image objects or verified offline exports during bootstrap. Missing legacy objects block rollback and require separately authorized import or reinstall; reconstruction is limited to releases declaring reproducible managed-image support.
 
 The remaining risks are incorrect operator sequencing and inaccurate host evidence. Issue #36 retains the operational bootstrap, repeated-build and private image-ID proof. Remove this transitional exception after participating hosts have adopted image enforcement and the retained pre-enforcement rollback paths are retired through reviewed policy.
+
+## Engine integration validation budget
+
+Status: proposed in PR #136.
+
+The read-only hosted engine integration job has a 45-minute ceiling. Repository
+regressions measured about 24 minutes before image acceptance; optional APT cache
+acceptance adds clean reference and cache-enabled managed builds, measured at
+roughly five minutes together. Registry download delays exhausted the former
+30-minute budget after the complete cache acceptance test had passed.
+
+This budget retains every required check and bounds the aggregate engine suite.
+Ordinary fleet task jobs keep their five-minute hard timeout. Longer feedback
+and additional hosted runner time are the tradeoffs. Reduce this ceiling after
+optimization or independent validation jobs demonstrate reliable completion
+with full coverage under a shorter limit.

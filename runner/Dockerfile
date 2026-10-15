@@ -14,36 +14,42 @@ ARG DOCKER_CLI_SHA256_ARM64=6bb694f01789b9869e99e34df3492104c0150d12df93192034db
 ARG COMPOSE_VERSION=5.4.0-1~debian.13~trixie
 ARG COMPOSE_SHA256_AMD64=75391b38459edf75a975504903673fdb87a5a4016d689d9b198e2db1ae2796e0
 ARG COMPOSE_SHA256_ARM64=81261f286d48c1c9e586065bc52065bbbe3b023705ebdb72377ec465c216dcaf
+ARG BUILDX_VERSION=0.32.1-1~debian.13~trixie
+ARG BUILDX_SHA256_AMD64=c50835adb10d6e9fc16c877d37a7a651b0ef2bac165be3ec52f8f05666cbccc8
+ARG BUILDX_SHA256_ARM64=a9ebb845ba8c2a67a815329bba341e31596c1c1f02d49ffb5670d0222253154e
 LABEL org.opencontainers.image.revision="${CI_FLEET_COMMIT}" \
       io.randomdevelopment.ci-fleet.managed="true"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN rm -f /etc/apt/sources.list.d/debian.sources \
+RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \
+    rm -f /etc/apt/sources.list.d/debian.sources \
     && printf 'deb http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" >/etc/apt/sources.list \
     && printf 'Acquire::Check-Valid-Until "false";\n' >/etc/apt/apt.conf.d/99-ci-fleet-snapshot \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git jq sudo \
     && case "$TARGETARCH" in \
-      amd64) docker_sha="$DOCKER_CLI_SHA256_AMD64"; compose_sha="$COMPOSE_SHA256_AMD64" ;; \
-      arm64) docker_sha="$DOCKER_CLI_SHA256_ARM64"; compose_sha="$COMPOSE_SHA256_ARM64" ;; \
+      amd64) docker_sha="$DOCKER_CLI_SHA256_AMD64"; compose_sha="$COMPOSE_SHA256_AMD64"; buildx_sha="$BUILDX_SHA256_AMD64" ;; \
+      arm64) docker_sha="$DOCKER_CLI_SHA256_ARM64"; compose_sha="$COMPOSE_SHA256_ARM64"; buildx_sha="$BUILDX_SHA256_ARM64" ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
     && curl -fsSLo docker-cli.deb "https://download.docker.com/linux/debian/dists/trixie/pool/stable/${TARGETARCH}/docker-ce-cli_${DOCKER_CLI_VERSION#*:}_${TARGETARCH}.deb" \
     && curl -fsSLo compose.deb "https://download.docker.com/linux/debian/dists/trixie/pool/stable/${TARGETARCH}/docker-compose-plugin_${COMPOSE_VERSION#*:}_${TARGETARCH}.deb" \
-    && printf '%s  docker-cli.deb\n%s  compose.deb\n' "$docker_sha" "$compose_sha" | sha256sum -c - \
-    && apt-get install -y --no-install-recommends ./docker-cli.deb ./compose.deb \
-    && rm docker-cli.deb compose.deb \
+    && curl -fsSLo buildx.deb "https://download.docker.com/linux/debian/dists/trixie/pool/stable/${TARGETARCH}/docker-buildx-plugin_${BUILDX_VERSION#*:}_${TARGETARCH}.deb" \
+    && printf '%s  docker-cli.deb\n%s  compose.deb\n%s  buildx.deb\n' "$docker_sha" "$compose_sha" "$buildx_sha" | sha256sum -c - \
+    && apt-get install -y --no-install-recommends ./docker-cli.deb ./compose.deb ./buildx.deb \
+    && rm docker-cli.deb compose.deb buildx.deb \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 RUN useradd --create-home --no-log-init --uid 1001 --shell /bin/bash runner \
     && chage -d "$((SOURCE_DATE_EPOCH / 86400))" runner \
     && rm -f /etc/shadow- \
     && install -d -o runner -g runner /home/runner/_work \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 WORKDIR /home/runner
-RUN case "${TARGETARCH}" in \
+RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \
+    case "${TARGETARCH}" in \
       amd64) archive_arch=x64; expected="${RUNNER_SHA256_AMD64}" ;; \
       arm64) archive_arch=arm64; expected="${RUNNER_SHA256_ARM64}" ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
@@ -55,7 +61,7 @@ RUN case "${TARGETARCH}" in \
     && ./bin/installdependencies.sh \
     && chown -R runner:runner /home/runner \
     && rm -rf /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 ENV RUNNER_ALLOW_RUNASROOT=0
 USER runner
