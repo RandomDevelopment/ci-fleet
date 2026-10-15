@@ -21,12 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILDKIT = "moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 
 
-def fixture_failure_details(output: bytes) -> str:
+def fixture_failure_details(output: bytes, max_lines=10) -> str:
     text = output.decode(errors="replace")[-4096:]
     text = re.sub(r"https?://[^\s<>\"']+", "[URL]", text)
     text = re.sub(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", "[IP]", text)
     text = re.sub(r"(?<!\w)(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.%]*", "[IP]", text)
-    return "\n".join(text.splitlines()[-10:])
+    return "\n".join(text.splitlines()[-max_lines:])
 
 
 def main():
@@ -207,7 +207,9 @@ def main():
             run("docker", "cp", str(environment), client + ":/managed.env")
             before = totals(cache)
             started = time.monotonic()
-            run("docker", "exec", client, "bash", "/release/scripts/build-managed-images.sh", "/release", "/managed.env")
+            run("docker", "exec", "--env", "BASH_ENV=/release/scripts/fixtures/apt-cache/trace-builds.sh",
+                "--env", "CI_FLEET_BUILD_TRACE=/apt-build.log", client,
+                "bash", "/release/scripts/build-managed-images.sh", "/release", "/managed.env")
             after = totals(cache)
             if after[1] <= before[1]:
                 raise RuntimeError("APT_CACHE_E2E_FAILED step=managed image package traffic")
@@ -227,6 +229,10 @@ def main():
                 "-o", "Dir::Etc::sourceparts=-", "update", timeout=120)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             failure = str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout"
+            if build_client:
+                result = cleanup("docker", "exec", build_client, "tail", "-n", "40", "/apt-build.log")
+                details = fixture_failure_details((result.stdout + result.stderr).encode(), max_lines=40)
+                failure += f"\nAPT_CACHE_FIXTURE build\n{details}"
             if cache:
                 for name, command in (
                     ("state", ["docker", "inspect", "--format", "{{.State.Status}}/{{.State.ExitCode}}/oom={{.State.OOMKilled}}", cache]),

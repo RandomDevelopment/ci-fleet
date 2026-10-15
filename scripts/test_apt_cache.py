@@ -15,6 +15,31 @@ from test_apt_cache_e2e import fixture_failure_details
 
 
 class APTCacheTests(unittest.TestCase):
+    def test_fixture_build_trace_preserves_command_status_and_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mock = root / 'docker'
+            mock.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\nprintf "http://192.0.2.1:3142 failed\\n" >&2\nexit "$TRACE_EXIT"\n')
+            mock.chmod(0o755)
+            trace = root / 'build.log'
+            environment = os.environ | {
+                'PATH': str(root) + ':' + os.environ['PATH'],
+                'BASH_ENV': str(ROOT / 'scripts/fixtures/apt-cache/trace-builds.sh'),
+                'CI_FLEET_BUILD_TRACE': str(trace),
+            }
+            for command, status in (('buildx build --no-cache', 0), ('buildx build --no-cache', 47), ('version', 0)):
+                trace.unlink(missing_ok=True)
+                result = subprocess.run(['bash', '-c', 'docker ' + command],
+                                        env=environment | {'TRACE_EXIT': str(status)}, capture_output=True)
+                self.assertEqual(result.returncode, status)
+                self.assertIn(command.encode(), result.stdout)
+                self.assertIn(b'failed', result.stdout + result.stderr)
+                self.assertEqual(trace.exists(), command.startswith('buildx build'))
+                if trace.exists():
+                    self.assertEqual(trace.stat().st_mode & 0o777, 0o600)
+                    self.assertIn('failed', fixture_failure_details(trace.read_bytes(), max_lines=40))
+                    self.assertNotIn('192.0.2.1', fixture_failure_details(trace.read_bytes(), max_lines=40))
+
     def test_fixture_failure_details_omit_endpoints_and_bound_output(self):
         details = fixture_failure_details(
             b'Ignored earlier output\n' * 500 +
