@@ -30,7 +30,7 @@ class TestInstallerRejection(unittest.TestCase):
         content = INSTALLER.read_text()
         prefix = content.split("while (($#)); do", 1)[0]
         converge = "perform_converge() {" + content.split("perform_converge() {", 1)[1].split("\nlatest_checkpoint()", 1)[0]
-        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime"):
+        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime", "pending_checkpoint"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 (root / "scripts").mkdir()
@@ -47,6 +47,8 @@ mode=install
 [[ $scenario != bytecode ]] || mode=upgrade
 state_file=$repo_root/state
 rendered_env=$repo_root/env
+candidate_env=$rendered_env
+release_dir=$repo_root/candidate
 current_link=$repo_root/current
 manager_current=$repo_root/manager
 releases_dir=$repo_root/releases
@@ -54,10 +56,11 @@ manager_releases=$repo_root/managers
 lock_file=$repo_root/installer.lock
 controller_id=example-ci-01
 touch "$state_file" "$rendered_env"
+printf 'CI_FLEET_RUNNER_IMAGE=fixture-runner\nCI_FLEET_CONTROLLER_IMAGE=fixture-controller\n' >"$candidate_env"
 mkdir "$releases_dir" "$manager_releases"
 if [[ $scenario == *_runtime ]]; then
   ln -s "$releases_dir" "$current_link"
-else
+elif [[ $scenario != pending_checkpoint ]]; then
   ln -s "$manager_releases" "$manager_current"
 fi
 reject_isolated_host() { :; }
@@ -68,10 +71,17 @@ canonical_release_target_from_raw_pointer() { readlink -f "$1"; }
 runtime_release_complete() { [[ $scenario != incomplete_runtime ]]; }
 manager_release_complete() { [[ $scenario != incomplete_manager ]]; }
 release_tree_permissions_trusted() { [[ $scenario == bytecode ]]; }
-install_release() { : >"$REPAIR_MARKER"; }
+install_release() { [[ $scenario == pending_checkpoint ]] || : >"$REPAIR_MARKER"; }
 install_manager() { : >"$REPAIR_MARKER"; }
 managed_image_ids_configured() { :; }
-drift_count() { die 'fixture-sensitive-value'; }
+drift_count() {
+  [[ $scenario == pending_checkpoint ]] || die 'fixture-sensitive-value'
+  DRIFT_COUNT=1
+}
+capture_current_pointer() { :; }
+compose() { :; }
+pending_policy_checkpoint() { printf '%s\n' "$repo_root/checkpoint"; }
+repair_pending_checkpoint_authority() { : >"$REPAIR_MARKER"; return 1; }
 perform_converge
 '''
                 fixture = root / "installer.sh"

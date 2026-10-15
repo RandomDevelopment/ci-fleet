@@ -2714,6 +2714,7 @@ perform_converge() {
   pending_checkpoint=$(pending_policy_checkpoint) || pending_checkpoint_status=$?
   case "$pending_checkpoint_status" in
     0)
+      transaction_started=true
       repair_pending_checkpoint_authority "$pending_checkpoint" || die 'pending network-policy controller checkpoint is invalid'
       checkpoint_dir=$pending_checkpoint
       ;;
