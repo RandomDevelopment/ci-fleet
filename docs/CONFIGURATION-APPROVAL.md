@@ -100,15 +100,25 @@ An abbreviated hash alone is insufficient; ambiguous or stale results reject
 the candidate. The clean response must follow any base retargeting. All review
 threads must be resolved. Newer comments and formal reviews from any pinned
 Codex identity, pending reviews from any such bot, and later `@codex review` or
-`@codex security review` requests invalidate an older clean response.
-The activity dashboard may refresh after the decision
-only when its single recognized code-review row reports completion on the same
+`@codex security review` requests invalidate an older clean response. Any later
+comment-deletion event also invalidates it because the removed content can hide
+a request or adverse response. Later edits to other comments likewise require
+a fresh clean result; the verifier cannot recover an erased request's old text.
+Deletion history must be available and completely paginated. These checks
+conservatively cover all comment authors, including same-second changes.
+The activity dashboard may refresh after the decision only when its single
+recognized code-review row reports completion on the same
 resolved commit at or after the clean response. Running, failed, stale, and
-unrecognized dashboard updates block acceptance. The dashboard cannot approve
-without a separate clean response. When machine-readable activity state is
+unrecognized dashboard updates block acceptance. The complete known dashboard
+text, footer, trigger, and matching relative-time text and datetime are required;
+additional prose or a changed relative-time label rejects the update.
+The dashboard cannot approve without a separate clean response.
+When machine-readable activity state is
 present, including an indented marker, it must also report completed code review
 on the full head with no findings and no security-review activity. Unknown state
-versions fail closed.
+versions and unknown top-level or nested state fields fail closed. Both state
+objects must contain exactly `commit_sha`, `status`, `has_any_findings`, and
+`has_unresolved_findings` with the documented clean or absent values.
 Same-second conflicts reject acceptance. Edited responses cannot approve, and
 editing an older decision response after a clean result invalidates that result.
 Outstanding trusted formal change requests still block acceptance. All tree,

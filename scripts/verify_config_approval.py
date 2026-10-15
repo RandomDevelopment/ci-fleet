@@ -37,9 +37,25 @@ If Codex has suggestions, it will comment; otherwise it will react with 👍.
 Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".
 </details>'''
 CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+CODEX_SUMMARY_PREFIX = CODEX_SUMMARY_MARKER + '''
+## Codex Review Summary
+This comment shows the latest Codex review activity on this pull request.
+| Review | Status | Commit | Review trigger |
+| --- | --- | --- | --- |
+'''
+CODEX_SUMMARY_HELP = '''<details> <summary>ℹ️ About Codex in GitHub</summary>
+<br/>
+[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general).
+Reviews are triggered when you
+- Open a pull request for review
+- Mark a draft as ready
+- Comment "@codex review" or "@codex security review".
+Codex reacts with 👀 while any review is running, comments if it has suggestions,
+and reacts with 👍 once all reviews finish with no findings.
+</details>'''
 CODEX_COMPLETED_ROW = re.compile(
-    r'\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="([^"]+)">'
-    r'[^<]+</relative-time> \| `([0-9a-f]{7,40})` \| [^|\n]+ \|'
+    r'\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="(?P<time>[^"]+)">'
+    r'(?P=time)</relative-time> \| `(?P<commit>[0-9a-f]{7,40})` \| (?:Manual request|PR opened) \|'
 )
 
 
@@ -207,14 +223,16 @@ class GitHub:
             cursor = following
         raise Rejected("PR base history pagination limit reached")
 
-    def pull_request_nodes(self, repository: str, number: int, connection: str, fields: str) -> list[dict[str, Any]]:
+    def pull_request_nodes(self, repository: str, number: int, connection: str, fields: str,
+                           item_type: str | None = None) -> list[dict[str, Any]]:
         owner, name = repository.split("/")
         cursor = None
         items = []
         for _ in range(20):
             query = '''query { repository(owner: %s, name: %s) { pullRequest(number: %d) {
-                %s(first: 100, after: %s) { nodes { %s } pageInfo { hasNextPage endCursor } }
-            } } }''' % (json.dumps(owner), json.dumps(name), number, connection, json.dumps(cursor), fields)
+                %s(first: 100, after: %s%s) { nodes { %s } pageInfo { hasNextPage endCursor } }
+            } } }''' % (json.dumps(owner), json.dumps(name), number, connection, json.dumps(cursor),
+                        "" if item_type is None else ", itemTypes: [" + item_type + "]", fields)
             result = self.get("/graphql", query)
             require(isinstance(result, dict) and not result.get("errors"), "PR review evidence is unavailable")
             collection = result["data"]["repository"]["pullRequest"][connection]
@@ -261,6 +279,10 @@ def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any
         if len(state_lines) != 1 or match is None:
             return False
         state = json.loads(match[1], object_pairs_hook=unique_object)
+        keys = {"commit_sha", "status", "has_any_findings", "has_unresolved_findings"}
+        if (not isinstance(state, dict) or set(state) != {"code_review", "security_review"}
+                or not all(isinstance(value, dict) and set(value) == keys for value in state.values())):
+            return False
         code, security = state["code_review"], state["security_review"]
         if (code["commit_sha"] != head or code["status"] != "completed"
                 or code["has_any_findings"] is not False or code["has_unresolved_findings"] is not False
@@ -270,8 +292,10 @@ def completed_codex_summary(api: GitHub, repository: str, comment: dict[str, Any
     if len(rows) != 3 or rows[:2] != ["| Review | Status | Commit | Review trigger |", "| --- | --- | --- | --- |"]:
         return False
     match = CODEX_COMPLETED_ROW.fullmatch(rows[2])
-    return (match is not None and evidence_timestamp(match[1]) >= submitted
-            and api.get(f"/repos/{repository}/commits/{match[2]}").get("sha") == head)
+    body = '\n'.join(line for line in comment["body"].splitlines() if line.strip() not in state_lines)
+    return (match is not None and body.split() == (CODEX_SUMMARY_PREFIX + match[0] + '\n' + CODEX_SUMMARY_HELP).split()
+            and evidence_timestamp(match['time']) >= submitted
+            and api.get(f"/repos/{repository}/commits/{match['commit']}").get("sha") == head)
 
 
 def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, number: int, head: str,
@@ -284,6 +308,9 @@ def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, num
                                      "databaseId body createdAt lastEditedAt author { __typename ... on Bot { databaseId } }")
     threads = api.pull_request_nodes(repository, number, "reviewThreads", "isResolved")
     require(all(thread.get("isResolved") is True for thread in threads), "unresolved PR review threads")
+    deletions = api.pull_request_nodes(repository, number, "timelineItems", "... on CommentDeletedEvent { createdAt }",
+                                       "COMMENT_DELETED_EVENT")
+    latest_deletion = max((evidence_timestamp(event["createdAt"]) for event in deletions), default=None)
     bot_comments = [comment for comment in comments if isinstance(comment.get("author"), dict)
                     and comment["author"].get("__typename") == "Bot"
                     and comment["author"].get("databaseId") in pinned]
@@ -301,10 +328,13 @@ def clean_codex_review(api: GitHub, policy: dict[str, Any], repository: str, num
         match = CODEX_CLEAN.fullmatch(response["body"])
         if response["lastEditedAt"] is not None or match is None or (base_changed is not None and submitted <= base_changed):
             continue
+        if latest_deletion is not None and submitted <= latest_deletion:
+            continue
         if match[2] is not None and match[2].split() != CODEX_HELP.split():
             continue
         if any(comment is not response and comment_time(comment) >= submitted
-               and (comment in bot_comments or re.search(r"(?i)@codex\s+(?:security\s+)?review\b", comment["body"]))
+               and (comment in bot_comments or comment.get("lastEditedAt") is not None
+                    or re.search(r"(?i)@codex\s+(?:security\s+)?review\b", comment["body"]))
                and not (comment in bot_comments and comment["body"].startswith(CODEX_SUMMARY_MARKER)
                         and completed_codex_summary(api, repository, comment, head, submitted))
                for comment in comments):

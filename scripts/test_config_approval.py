@@ -41,6 +41,17 @@ If Codex has suggestions, it will comment; otherwise it will react with 👍.
 
 Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".
 </details>'''
+CODEX_SUMMARY_HELP_FIXTURE = '''<details> <summary>ℹ️ About Codex in GitHub</summary>
+<br/>
+
+[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you
+- Open a pull request for review
+- Mark a draft as ready
+- Comment "@codex review" or "@codex security review".
+
+Codex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.
+
+</details>'''
 
 
 def evidence(commit=COMMIT, head=HEAD, tree=TREE, parent=PARENT, number=8, run_id=700) -> dict:
@@ -75,11 +86,12 @@ class FixtureAPI(GitHub):
 
     def get(self, path: str, query: str | None = None):
         self.paths.append(path)
+        graphql_key = "/graphql-deletions" if query is not None and "COMMENT_DELETED_EVENT" in query else None
         url = urllib.parse.urlsplit(path)
         query = urllib.parse.parse_qs(url.query)
         if query.get("page", ["1"])[0] != "1":
             raise Rejected("unexpected fixture pagination")
-        key = url.path
+        key = graphql_key or url.path
         if "head_sha" in query:
             exact = key + "?head_sha=" + query["head_sha"][0]
             if exact in self.data:
@@ -382,6 +394,7 @@ class CodexApprovalTests(unittest.TestCase):
             "createdAt": "2026-01-01T00:01:00Z", "lastEditedAt": None,
         }
         self.pr = self.data["/graphql"]["data"]["repository"]["pullRequest"]
+        self.data["/graphql-deletions"] = copy.deepcopy(self.data["/graphql"])
         for key, nodes in (("comments", [self.comment]), ("reviewThreads", [{"isResolved": True}])):
             self.pr[key] = {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}
         self.data[f"{PREFIX}/commits/{HEAD[:10]}"] = {"sha": HEAD}
@@ -407,10 +420,11 @@ class CodexApprovalTests(unittest.TestCase):
         summary = dict(self.comment, databaseId=999, createdAt="2026-01-01T00:00:00Z",
                        lastEditedAt="2026-01-01T00:01:02Z", body=(
             '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n'
+            'This comment shows the latest Codex review activity on this pull request.\n\n'
             '| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n'
             '| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-01-01T00:01:01Z">'
             f'2026-01-01T00:01:01Z</relative-time> | `{HEAD[:7]}` | Manual request |\n\n'
-            '<details>Comment "@codex review" or "@codex security review".</details>'))
+            + CODEX_SUMMARY_HELP_FIXTURE))
         self.pr["comments"]["nodes"].append(summary)
         self.data[f"{PREFIX}/commits/{HEAD[:7]}"] = {"sha": HEAD}
         self.data[f"{PREFIX}/commits/{'4' * 7}"] = {"sha": "4" * 40}
@@ -422,6 +436,13 @@ class CodexApprovalTests(unittest.TestCase):
                                       "has_unresolved_findings": None}}
         summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
         self.check()
+        for changed in (dict(state, unexpected=True), dict(state, security_review={}),
+                        dict(state, code_review=dict(state['code_review'], blocking_findings=True)),
+                        dict(state, code_review=dict(state['code_review'], has_any_findings=0)),
+                        dict(state, security_review=dict(state['security_review'], has_any_findings=False))):
+            with self.subTest(state=changed), self.assertRaises(Rejected):
+                summary['body'] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(changed) + ' -->'
+                self.check()
         state["code_review"]["has_unresolved_findings"] = True
         for prefix in ('', ' ', '\t', 'Text before '):
             with self.subTest(prefix=prefix), self.assertRaises(Rejected):
@@ -430,6 +451,10 @@ class CodexApprovalTests(unittest.TestCase):
         for changed in (body.replace("Completed", "Running"), body.replace("Completed", "Failed"),
                         body.replace(HEAD[:7], "4" * 7), body.replace("00:01:01", "00:00:59"),
                         body + '\n<!-- codex-review-state:v2 {} -->',
+                        body + '\nCRITICAL: credential leak found',
+                        body.replace('2026-01-01T00:01:01Z</relative-time>', 'CRITICAL finding</relative-time>'),
+                        body.replace('Manual request', 'Unrecognized trigger'),
+                        body.replace('once all reviews finish with no findings.', 'despite unresolved findings.'),
                         body + '\n| Security review | Running | unknown | Manual request |'):
             with self.subTest(body=changed), self.assertRaises(Rejected):
                 summary["body"] = changed
@@ -442,6 +467,43 @@ class CodexApprovalTests(unittest.TestCase):
         self.pr["comments"]["nodes"] = [summary]
         with self.assertRaises(Rejected):
             self.check()
+
+    def test_deleted_or_edited_away_review_evidence_requires_a_fresh_clean_response(self):
+        timeline = self.data['/graphql-deletions']['data']['repository']['pullRequest']['timelineItems']
+        for timestamp in ('2026-01-01T00:01:00Z', '2026-01-01T00:02:00Z'):
+            timeline['nodes'] = [{'createdAt': timestamp}]
+            with self.subTest(timestamp=timestamp), self.assertRaises(Rejected):
+                self.check()
+        timeline['nodes'] = [{'createdAt': '2026-01-01T00:00:59Z'}]
+        self.check()
+        edited = dict(self.comment, databaseId=1001, author={'__typename': 'User', 'databaseId': 201},
+                      body='Request removed', createdAt='2026-01-01T00:00:59Z', lastEditedAt='2026-01-01T00:02:00Z')
+        self.pr['comments']['nodes'].append(edited)
+        with self.assertRaises(Rejected):
+            self.check()
+        self.comment['createdAt'] = '2026-01-01T00:02:01Z'
+        self.check()
+        for changed in ({'nodes': [], 'pageInfo': {}},
+                        {'nodes': [], 'pageInfo': {'hasNextPage': True, 'endCursor': None}}):
+            self.data['/graphql-deletions']['data']['repository']['pullRequest']['timelineItems'] = changed
+            with self.subTest(timeline=changed), self.assertRaises(Rejected):
+                self.check()
+
+    def test_deletion_history_reads_every_filtered_page(self):
+        api = GitHub('fixture-authentication')
+        first = copy.deepcopy(self.data['/graphql-deletions'])
+        last = copy.deepcopy(first)
+        timeline = first['data']['repository']['pullRequest']['timelineItems']
+        timeline['nodes'] = [{'createdAt': '2026-01-01T00:00:59Z'}]
+        timeline['pageInfo'] = {'hasNextPage': True, 'endCursor': 'deletion-cursor'}
+        last['data']['repository']['pullRequest']['timelineItems']['nodes'] = [{'createdAt': '2026-01-01T00:02:00Z'}]
+        with patch.object(api, 'get', side_effect=[first, last]) as getter:
+            events = api.pull_request_nodes(REPOSITORY, 8, 'timelineItems',
+                                            '... on CommentDeletedEvent { createdAt }', 'COMMENT_DELETED_EVENT')
+            self.assertEqual([event['createdAt'] for event in events],
+                             ['2026-01-01T00:00:59Z', '2026-01-01T00:02:00Z'])
+            self.assertTrue(all('itemTypes: [COMMENT_DELETED_EVENT]' in call.args[1] for call in getter.call_args_list))
+            self.assertIn('after: "deletion-cursor"', getter.call_args.args[1])
 
     def test_copied_summary_wrong_identity_or_author_cannot_approve(self):
         for author in ({"__typename": "User", "databaseId": 202},
