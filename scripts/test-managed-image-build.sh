@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory() as temporary:
                            FAKE_BUILDER_LOG=str(root / 'builders'),
                            FAKE_PARTIAL_RUNNER_IMAGE_ID=wrong_id)
     builder_names = set()
-    for case in ('create_failure', 'bootstrap_failure', 'partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
+    for case in ('create_failure', 'bootstrap_failure', 'wrong_backend', 'missing_backend', 'partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
         (root / 'builders').write_text('')
         (root / 'running').touch()
         (root / 'runner-state').write_text(old_revision + '\n')
@@ -48,6 +48,8 @@ with tempfile.TemporaryDirectory() as temporary:
         injected = dict(env)
         if case == 'create_failure': injected['FAKE_FAIL_BUILDER_CREATE'] = '1'
         if case == 'bootstrap_failure': injected['FAKE_FAIL_BUILDER_BOOTSTRAP'] = '1'
+        if case == 'wrong_backend': injected['FAKE_BUILDKIT_VERSION'] = 'v0.32.1'
+        if case == 'missing_backend': injected['FAKE_BUILDKIT_VERSION'] = ''
         if case == 'partial': injected['FAKE_PARTIAL_BUILD_FAIL'] = '1'
         if case == 'runner_mismatch': injected['FAKE_BUILT_RUNNER_IMAGE_ID'] = wrong_id
         if case == 'controller_mismatch': injected['FAKE_BUILT_CONTROLLER_IMAGE_ID'] = wrong_id

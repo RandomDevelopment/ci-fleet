@@ -47,7 +47,7 @@ build_image() {
 docker buildx create --name "$managed_builder" --driver docker-container \
   --driver-opt "image=$managed_buildkit" >/dev/null
 builder_created=true
-[[ $(docker buildx inspect --bootstrap "$managed_builder" | awk '$1 == "BuildKit:" {print $2; exit}') == v0.32.2 ]] \
+[[ $(docker buildx inspect --bootstrap "$managed_builder" | awk '$1 == "BuildKit" && $2 == "version:" {print $3}') == v0.32.2 ]] \
   || { printf 'reviewed BuildKit backend v0.32.2 is unavailable\n' >&2; exit 1; }
 build_image --builder "$managed_builder" --no-cache --load --provenance=false --sbom=false \
   --build-arg CI_FLEET_COMMIT --build-arg SOURCE_DATE_EPOCH=1786752000 \
