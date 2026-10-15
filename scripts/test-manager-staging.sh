@@ -24,7 +24,7 @@ for unit in "${unit_names[@]}"; do printf 'trusted %s\n' "$unit" >"$runtime/host
 : >"$state_file"
 printf 'CI_FLEET_ENGINE_REF=%040d\n' 1 >"$rendered_env"
 die() { printf '%s\n' "$*" >&2; exit 1; }
-install_release() { :; }
+install_release() { [[ $transaction_started == true ]]; }
 install_manager() { [[ $1 == "$engine_ref" && $2 == candidate-runtime ]]; printf '%s\n' "$engine_ref" >"$root/manager-ref"; }
 current_runtime_release() { printf '%s\n' "$runtime"; }
 install_systemd_units() { [[ $1 == "$runtime" ]]; cp "$runtime/host/systemd/"* "$systemd_dir/"; }

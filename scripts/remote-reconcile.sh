@@ -85,8 +85,9 @@ require_commands() {
 
 save_reconcile_state() {
   local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-} mark_success=${6:-false}
+  local transaction_phase=${7:-} failure_reason=${8:-}
   install -d -m 0700 "$reconcile_state_dir"
-  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" <<'PY' 2>/dev/null || true
+  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" "$transaction_phase" "$failure_reason" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile
 
 path = sys.argv[1]
@@ -110,6 +111,8 @@ state = {
     "message": sys.argv[6] or "",
     "checked_at": now,
     "last_success_at": last_success_at,
+    "transaction_phase": sys.argv[8],
+    "failure_reason": sys.argv[9],
 }
 fd, tmp = tempfile.mkstemp(prefix=".reconcile-state.", dir=os.path.dirname(path), text=True)
 try:
@@ -343,17 +346,31 @@ PY
 }
 
 transaction_outcome() {
-  python3 - "$transaction_result" <<'PY' 2>/dev/null || printf 'unknown\n'
+  python3 - "$transaction_result" "${1:-outcome}" <<'PY' 2>/dev/null || printf 'unknown\n'
 import json, sys
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+def unique_fields(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("duplicate result field")
+    return value
+
+raw = open(sys.argv[1], encoding="utf-8").read(4097)
+if len(raw) > 4096:
+    raise SystemExit(1)
+lines = raw.splitlines()
 if len(lines) != 1:
     raise SystemExit(1)
-value = json.loads(lines[0])
-if set(value) != {"schema_version", "outcome"} or value["schema_version"] != 1:
+value = json.loads(lines[0], object_pairs_hook=unique_fields)
+if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
     raise SystemExit(1)
-if value["outcome"] not in {"applied", "rollback_verified", "rollback_unverified"}:
+if value.get("outcome") == "rejected":
+    if (set(value) != {"schema_version", "outcome", "phase", "reason"}
+            or value["phase"] != "pre_transaction"
+            or value["reason"] not in {"docker_disk_capacity", "installer_precondition"}):
+        raise SystemExit(1)
+elif set(value) != {"schema_version", "outcome"} or value["outcome"] not in {"applied", "rollback_verified", "rollback_unverified"}:
     raise SystemExit(1)
-print(value["outcome"])
+print(value.get(sys.argv[2], "unknown"))
 PY
 }
 
@@ -572,6 +589,13 @@ else
   upg_err=$(<"$temp_dir/upgrade_err")
   note "RECONCILE_FAILED error=${upg_err:-unknown}"
   outcome=$(transaction_outcome)
+  if [[ "$upgrade_status" == 2 && "$outcome" == rejected ]]; then
+    rejection_reason=$(transaction_outcome reason)
+    save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" 'unknown' "reconcile rejected before transaction: ${rejection_reason}" false pre_transaction "$rejection_reason"
+    note "REJECTED phase=pre_transaction reason=${rejection_reason}"
+    exit 3
+  fi
+  [[ "$outcome" != rejected ]] || outcome=unknown
   if [[ "$outcome" == applied ]]; then
     save_reconcile_state 'failed' "$desired_commit" "$desired_commit" 'unknown' "reconcile failed after apply: ${upg_err:-unknown}"
     exit 3

@@ -16,6 +16,8 @@ policy_action=
 root_prefix=${CI_FLEET_ROOT_PREFIX:-}
 testing=${CI_FLEET_TESTING:-0}
 transaction_active=false
+# Never reset this after recovery or commit; late failures are not early rejections.
+transaction_started=false
 retained_installed_ref=false
 checkpoint_dir=
 staging_paths=()
@@ -64,6 +66,12 @@ die() {
         result=21
       fi
     fi
+  elif [[ "$transaction_started" == false ]] && transaction_result_enabled; then
+    local reason=installer_precondition
+    case "$*" in
+      'Docker filesystem must remain below 80% utilization') reason=docker_disk_capacity ;;
+    esac
+    printf '{"schema_version":1,"outcome":"rejected","phase":"pre_transaction","reason":"%s"}\n' "$reason" >&7
   fi
   trap - ERR
   exit "$result"
@@ -79,6 +87,7 @@ while (($#)); do
     --policy-action)
       [[ -z "$mode" && $# -ge 2 ]] || die '--policy-action requires one exclusive action'
       mode=policy-action
+      transaction_started=true
       policy_action=$2
       shift 2
       ;;
@@ -2540,6 +2549,7 @@ stage_manager_only() {
   [[ "$installed_engine" =~ ^[0-9a-f]{40}$ ]] \
     || die 'manager-only staging requires a valid installed engine revision'
   staged_runtime_matches || die 'manager-only staging requires a healthy installed runtime'
+  transaction_started=true
   install_release
   install_manager "$engine_ref" "$release_dir"
   install_systemd_units "$(current_runtime_release)"
@@ -2642,6 +2652,8 @@ perform_converge() {
     require_configuration_approval_capability "$manager_current/engine-capabilities.json" \
       || die 'enable approval only after the installed manager supports it'
   fi
+  # Preparation can repair shared runtime, manager, or recovery state before drain.
+  transaction_started=true
   if [[ -L "$current_link" ]]; then
     current_target=$(canonical_release_target_from_raw_pointer "$current_link" "$releases_dir" || true)
     if [[ -n "$current_target" ]]; then
@@ -2801,6 +2813,7 @@ perform_rollback() {
   fi
   candidate_env=$checkpoint_env
   docker_network_policy_matches || die 'rollback requires Docker network-policy reconciliation through --upgrade'
+  transaction_started=true
   restore_checkpoint || die 'checkpoint restoration failed'
   if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
@@ -2843,6 +2856,7 @@ perform_uninstall() {
   done
   [[ -n "$old_release" || -z "$status" ]] || die 'a trusted complete release is required to uninstall the controller'
   make_checkpoint "$old_release"
+  transaction_started=true
   transaction_active=true
   drain_current false "$rendered_env" "$old_release"
   remove_inactive_managed_runners
@@ -2870,6 +2884,8 @@ if [[ "$mode" == policy-action ]]; then
 else
   require_commands
 fi
+# Later paths can write lock, adoption, runtime, manager, or recovery state.
+transaction_started=true
 if [[ -n ${CI_FLEET_INSTALLER_LOCK_FD:-} ]]; then
   [[ "$CI_FLEET_INSTALLER_LOCK_FD" == 9 ]] || die 'inherited installer lock must use file descriptor 9'
   [[ $(readlink -f /proc/self/fd/9 2>/dev/null || true) == $(readlink -m "$lock_file") ]] || die 'inherited installer lock does not match the configured lock file'
@@ -2909,6 +2925,7 @@ case "$mode" in
       checkpoint_dir=$bootstrap_lkg_checkpoint
       candidate_env=$checkpoint_dir/ci-fleet.env
       docker_network_policy_matches || die 'last-known-good checkpoint requires Docker network-policy reconciliation'
+      transaction_started=true
       restore_checkpoint || die 'last-known-good checkpoint restoration failed'
       if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
       note "ROLLBACK_OK checkpoint=$checkpoint_dir"

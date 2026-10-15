@@ -863,8 +863,33 @@ printf 'ID=example\nVERSION_ID="1"\n' >"$root/etc/os-release"
 expect_failure 'supported Linux is Debian 12 or newer' "$installer" --check "${base_args[@]}" --ref "$ref_one"
 printf 'ID=debian\nVERSION_ID="12"\n' >"$root/etc/os-release"
 export FAKE_DISK_USED_PERCENT=80
-expect_failure 'Docker filesystem must remain below 80% utilization' "$installer" --check "${base_args[@]}" --ref "$ref_one"
+disk_rejection_result=$tmp/disk-rejection-result.json
+expect_failure 'Docker filesystem must remain below 80% utilization' env CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --check "${base_args[@]}" --ref "$ref_one" 7>"$disk_rejection_result"
+python3 - "$disk_rejection_result" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1], encoding="utf-8")) == {
+    "schema_version": 1, "outcome": "rejected", "phase": "pre_transaction",
+    "reason": "docker_disk_capacity",
+}
+PY
 unset FAKE_DISK_USED_PERCENT
+
+# Adoption may extract host.env before discovering an unusable credential path.
+early_adopt_result=$tmp/early-adopt-result.json
+early_adopt_rendered=$root/etc/ci-fleet/ci-fleet.env
+early_adopt_etc_mode=$(stat -c %a "$root/etc/ci-fleet")
+mv "$host_config" "$tmp/early-adopt-host.env"
+printf '%s\n' \
+  'CI_FLEET_GITHUB_APP_CLIENT_ID=Iv1.EXAMPLE' \
+  'CI_FLEET_GITHUB_APP_INSTALLATION_ID=123456' \
+  "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE=$tmp/missing-adoption-key.pem" >"$early_adopt_rendered"
+chmod 600 "$early_adopt_rendered"
+expect_failure 'GitHub App PEM file is missing' env CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --adopt "${base_args[@]}" --ref "$ref_one" 7>"$early_adopt_result"
+[[ -s "$host_config" ]] || fail 'adoption regression did not extract host.env'
+[[ ! -s "$early_adopt_result" ]] || fail 'adoption emitted early rejection after writing host.env'
+mv "$tmp/early-adopt-host.env" "$host_config"
+rm -- "$early_adopt_rendered"
+chmod "$early_adopt_etc_mode" "$root/etc/ci-fleet"
 
 # The installed maintenance scripts must pin the local Docker daemon themselves,
 # not just inherit it from the installer.

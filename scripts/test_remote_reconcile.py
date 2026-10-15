@@ -25,6 +25,99 @@ RECONCILE_SCRIPT.chmod(0o755)
 INSTALLER = SCRIPTS / "install-worker-controller.sh"
 
 
+class TestInstallerRejection(unittest.TestCase):
+    def test_shared_preparation_cannot_report_early_rejection(self):
+        content = INSTALLER.read_text()
+        prefix = content.split("while (($#)); do", 1)[0]
+        converge = "perform_converge() {" + content.split("perform_converge() {", 1)[1].split("\nlatest_checkpoint()", 1)[0]
+        for scenario in ("bytecode", "incomplete_manager", "untrusted_manager", "incomplete_runtime", "untrusted_runtime", "pending_checkpoint", "candidate_preparation"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "scripts").mkdir()
+                repair = root / "scripts" / "repair-manager-bytecode-drift.py"
+                repair.write_text('#!/usr/bin/env bash\n: >"$REPAIR_MARKER"\n')
+                repair.chmod(0o755)
+                script = prefix + converge + r'''
+repo_root=$1
+scenario=$2
+exec 7>"$repo_root/result.json"
+CI_FLEET_TRANSACTION_RESULT_FD=7
+export REPAIR_MARKER=$repo_root/repaired
+mode=install
+[[ $scenario != bytecode ]] || mode=upgrade
+state_file=$repo_root/state
+rendered_env=$repo_root/env
+candidate_env=$rendered_env
+release_dir=$repo_root/candidate
+current_link=$repo_root/current
+manager_current=$repo_root/manager
+releases_dir=$repo_root/releases
+manager_releases=$repo_root/managers
+lock_file=$repo_root/installer.lock
+controller_id=example-ci-01
+touch "$state_file" "$rendered_env"
+printf 'CI_FLEET_RUNNER_IMAGE=fixture-runner\nCI_FLEET_CONTROLLER_IMAGE=fixture-controller\n' >"$candidate_env"
+mkdir "$releases_dir" "$manager_releases"
+if [[ $scenario == *_runtime ]]; then
+  ln -s "$releases_dir" "$current_link"
+elif [[ $scenario != pending_checkpoint && $scenario != candidate_preparation ]]; then
+  ln -s "$manager_releases" "$manager_current"
+fi
+reject_isolated_host() { :; }
+docker_network_policy_matches() { :; }
+controller_status() { :; }
+configuration_approval_required() { return 1; }
+canonical_release_target_from_raw_pointer() { readlink -f "$1"; }
+runtime_release_complete() { [[ $scenario != incomplete_runtime ]]; }
+manager_release_complete() { [[ $scenario != incomplete_manager ]]; }
+release_tree_permissions_trusted() { [[ $scenario == bytecode ]]; }
+install_release() { [[ $scenario == pending_checkpoint ]] || : >"$REPAIR_MARKER"; }
+install_manager() { : >"$REPAIR_MARKER"; }
+managed_image_ids_configured() { :; }
+drift_count() {
+  [[ $scenario == pending_checkpoint || $scenario == candidate_preparation ]] || die 'fixture-sensitive-value'
+  DRIFT_COUNT=1
+}
+capture_current_pointer() { :; }
+compose() { [[ $scenario != candidate_preparation ]] || die 'fixture-sensitive-value'; }
+pending_policy_checkpoint() { printf '%s\n' "$repo_root/checkpoint"; }
+repair_pending_checkpoint_authority() { : >"$REPAIR_MARKER"; return 1; }
+perform_converge
+'''
+                fixture = root / "installer.sh"
+                fixture.write_text(script)
+                result = subprocess.run(["bash", str(fixture), str(root), scenario],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue((root / "repaired").exists(), result.stdout + result.stderr)
+                self.assertEqual((root / "result.json").read_text(), "")
+
+    def test_only_explicit_pre_transaction_failures_report_rejection(self):
+        prefix = INSTALLER.read_text().split("while (($#)); do", 1)[0]
+        for started, message, expected in (
+            ("false", "Docker filesystem must remain below 80% utilization", "docker_disk_capacity"),
+            ("false", "unapproved error with fixture-sensitive-value", "installer_precondition"),
+            ("true", "Docker filesystem must remain below 80% utilization", None),
+        ):
+            with self.subTest(started=started, expected=expected), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "result.json"
+                script = prefix + '\nexec 7>"$1"\nCI_FLEET_TRANSACTION_RESULT_FD=7\n'
+                script += f'transaction_started={started}\ndie "$2"\n'
+                fixture = Path(td) / "installer.sh"
+                fixture.write_text(script)
+                result = subprocess.run(["bash", str(fixture), str(path), message],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                if expected is None:
+                    self.assertEqual(path.read_text(), "")
+                else:
+                    self.assertEqual(json.loads(path.read_text()), {
+                        "schema_version": 1, "outcome": "rejected", "phase": "pre_transaction",
+                        "reason": expected,
+                    })
+                    self.assertNotIn("fixture-sensitive-value", path.read_text())
+
+
 def git(*args: str, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git"] + list(args),
@@ -320,6 +413,11 @@ PY
 if [[ ${1:-} == --check && ${FAKE_POLICY_STATE:-healthy} != healthy ]]; then
   exit 3
 fi
+if [[ ${1:-} == --upgrade && -n ${FAKE_TRANSACTION_RECORD:-} ]]; then
+  printf '%s\\n' "$FAKE_TRANSACTION_RECORD" >&7
+  printf 'ERROR: fixture-sensitive-value\\n' >&2
+  exit "${FAKE_TRANSACTION_EXIT:-2}"
+fi
 if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == unverified ]]; then
   printf 'ERROR: network-policy rollback verification failed\\n' >&2
   exit 2
@@ -443,6 +541,8 @@ exec {shlex.quote(real_git or 'git')} "$@"
         rollback_desired_state: str | None = None,
         installer_result: str = "success",
         policy_state: str = "healthy",
+        transaction_record: str = "",
+        transaction_exit: str = "2",
     ):
         env = dict(self.env)
         env.update(
@@ -452,6 +552,8 @@ exec {shlex.quote(real_git or 'git')} "$@"
             FAKE_ROLLBACK_HEALTH_DESIRED_STATE=rollback_desired_state or desired_state,
             FAKE_INSTALLER_RESULT=installer_result,
             FAKE_POLICY_STATE=policy_state,
+            FAKE_TRANSACTION_RECORD=transaction_record,
+            FAKE_TRANSACTION_EXIT=transaction_exit,
         )
         return subprocess.run(
             [str(self.root / "scripts" / "remote-reconcile.sh")],
@@ -615,6 +717,77 @@ exec {shlex.quote(real_git or 'git')} "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self._installer_calls()), 1)
         self.assertEqual(self._lkg_ref(), self.prior_ref)
+
+    def test_pre_transaction_rejection_preserves_applied_state_and_reason(self):
+        record = json.dumps({"schema_version": 1, "outcome": "rejected",
+                             "phase": "pre_transaction", "reason": "docker_disk_capacity"})
+        result = self._run("healthy", transaction_record=record)
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(len(self._installer_calls()), 1)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertEqual(json.loads(self.state_file.read_text())["config_ref"], self.prior_ref)
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["applied_commit"], self.prior_ref)
+        self.assertEqual(state["desired_commit"], self.desired_ref)
+        self.assertEqual(state["health"], "unknown")
+        self.assertEqual(state["transaction_phase"], "pre_transaction")
+        self.assertEqual(state["failure_reason"], "docker_disk_capacity")
+        self.assertIn("docker_disk_capacity", state["message"])
+        self.assertIn("REJECTED phase=pre_transaction reason=docker_disk_capacity", result.stdout)
+        self.assertNotIn("ROLLBACK_UNVERIFIED", result.stdout)
+        self.assertNotIn("fixture-sensitive-value", json.dumps(state))
+
+    def test_missing_or_invalid_outcomes_remain_unknown(self):
+        valid = {"schema_version": 1, "outcome": "rejected",
+                 "phase": "pre_transaction", "reason": "docker_disk_capacity"}
+        records = [
+            "", "{", "[]", json.dumps({**valid, "schema_version": True}),
+            json.dumps({**valid, "phase": "after_activation"}),
+            json.dumps({**valid, "reason": "fixture-sensitive-value"}),
+            json.dumps(valid) + "\n" + json.dumps(valid),
+            '{"schema_version":1,"outcome":"applied","outcome":"rejected",'
+            '"phase":"pre_transaction","reason":"docker_disk_capacity"}',
+        ]
+        for record in records:
+            with self.subTest(record=record):
+                self._reset(self.prior_ref)
+                result = self._run("healthy", installer_result="unverified", transaction_record=record)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(len(self._installer_calls()), 1)
+                state = self._reconcile_state()
+                self.assertEqual(state["applied_commit"], self.prior_ref)
+                self.assertEqual(state["health"], "unknown")
+                self.assertIn("ROLLBACK_UNVERIFIED outcome=unknown", result.stdout)
+                self.assertNotIn("fixture-sensitive-value", json.dumps(state))
+
+    def test_rejection_with_conflicting_exit_status_remains_unknown(self):
+        record = json.dumps({"schema_version": 1, "outcome": "rejected",
+                             "phase": "pre_transaction", "reason": "docker_disk_capacity"})
+        result = self._run("healthy", transaction_record=record, transaction_exit="20")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("ROLLBACK_UNVERIFIED outcome=unknown", result.stdout)
+        self.assertEqual(self._reconcile_state()["health"], "unknown")
+        self.assertNotEqual(self._reconcile_state().get("transaction_phase"), "pre_transaction")
+
+    def test_rollback_outcomes_keep_existing_recovery_behavior(self):
+        for outcome, exit_code in (("rollback_verified", "20"), ("rollback_unverified", "21")):
+            with self.subTest(outcome=outcome):
+                self._reset(self.prior_ref)
+                record = json.dumps({"schema_version": 1, "outcome": outcome})
+                result = self._run("healthy", transaction_record=record, transaction_exit=exit_code)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(len(self._installer_calls()), 1)
+                state = self._reconcile_state()
+                self.assertEqual(state["applied_commit"], self.prior_ref)
+                if outcome == "rollback_verified":
+                    self.assertEqual(state["status"], "rolled_back")
+                    self.assertEqual(state["health"], "healthy")
+                    self.assertIn("ROLLBACK_OK", result.stdout)
+                else:
+                    self.assertEqual(state["health"], "unknown")
+                    self.assertIn("ROLLBACK_UNVERIFIED", result.stdout)
 
     def test_applied_cleanup_failure_records_failed_applied_state(self):
         result = self._run("healthy", installer_result="cleanup_failure")
