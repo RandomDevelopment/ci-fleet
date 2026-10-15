@@ -100,6 +100,8 @@ run identity and the invocation-specific image tags to inspect leftovers, or
 discard the disposable machine. Do not run global Docker prune. Container tests
 remove their named inspection container and invocation-specific image tags;
 the cleanup fixture tests scoped success, failure, cancellation and timeout.
+Failed final daemon checks or resource removal fail the container stage even
+when its preceding tests passed.
 Build cache can remain on the disposable daemon.
 
 ## Configuration repositories

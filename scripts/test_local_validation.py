@@ -195,6 +195,53 @@ class LocalEvidenceTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_container_stage_propagates_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"; scripts.mkdir()
+            (scripts / "test_apt_cache_e2e.py").write_text(
+                "import os, sys\nsys.exit(int(os.environ['TEST_STAGE_STATUS']))\n")
+            (scripts / "scan_committed_secrets.py").write_text("")
+            for name in ("test-cleanup-e2e.sh", "cleanup.sh"):
+                path = scripts / name
+                path.write_text("#!/bin/bash\nexit 0\n"); path.chmod(0o755)
+            docker = root / "docker"
+            docker.write_text('''#!/bin/bash
+printf '%s\\n' "$*" >> "$TEST_DOCKER_LOG"
+case "$1 $2" in
+  'compose -f')
+    [[ -n ${CI_FLEET_RUNNER_IMAGE_DIGEST:-} ]] || exit 1
+    if [[ "$*" == *'--format json' ]]; then
+      printf '{"services":{"controller":{"environment":{"CI_FLEET_RUNNER_IMAGE":"%s"}}}}\\n' "$CI_FLEET_RUNNER_IMAGE_DIGEST"
+    fi ;;
+  'info ') [[ $TEST_CLEANUP_FAILURE != info ]] || exit 1 ;;
+  'rm -f') [[ $TEST_CLEANUP_FAILURE != container ]] || exit 1 ;;
+  'image rm') [[ $TEST_CLEANUP_FAILURE != image ]] || exit 1 ;;
+esac
+exit 0
+''')
+            docker.chmod(0o755)
+            log = root / "docker.log"
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                   "CI_FLEET_VALIDATION_ROOT": str(root), "CI_FLEET_VALIDATION_ID": "cleanup-fixture",
+                   "CI_FLEET_RUNNER_IMAGE": "cleanup-fixture-runner:dev",
+                   "CI_FLEET_CONTROLLER_IMAGE": "cleanup-fixture-controller:dev",
+                   "TEST_DOCKER_LOG": str(log)}
+            for failure, stage_status in (("none", 0), ("info", 0), ("container", 0), ("image", 0),
+                                          ("none", 7), ("none", 130), ("none", 143)):
+                with self.subTest(failure=failure, stage_status=stage_status):
+                    log.write_text("")
+                    result = subprocess.run(["bash", str(ROOT / "scripts/validate.sh"), "--containers"],
+                        env={**env, "TEST_CLEANUP_FAILURE": failure, "TEST_STAGE_STATUS": str(stage_status)},
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, stage_status if failure == "none" else 1,
+                                     result.stdout + result.stderr)
+                    if failure != "info":
+                        for command in ("rm -f cleanup-fixture-runner-inspect",
+                                        "image rm cleanup-fixture-runner:dev",
+                                        "image rm cleanup-fixture-controller:dev"):
+                            self.assertIn(command, log.read_text())
+
     def test_failure_and_timeout_do_not_pass(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
