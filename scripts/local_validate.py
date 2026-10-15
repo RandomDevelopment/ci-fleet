@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,36 +18,95 @@ import time
 
 SHA = re.compile(r"[0-9a-f]{40}")
 SUITE = "ci-fleet-local-v1"
+CLEANUP_GRACE_SECONDS = 60
 
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
+def checkout(origin: Path, target: Path, commit: str, identities: list[str]) -> None:
+    subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-checkout", str(origin), str(target)], check=True)
+    subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities], check=True)
+    subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], check=True)
+
+
+def checkout_manifest(root: Path) -> dict:
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("checkout changed: " + str(root))
+    entries = {}
+    for path in [root, *root.rglob("*")]:
+        mode = path.lstat().st_mode
+        if stat.S_ISREG(mode):
+            with path.open("rb") as handle:
+                value = hashlib.file_digest(handle, "sha256").hexdigest()
+        elif stat.S_ISLNK(mode):
+            value = os.readlink(path)
+        elif stat.S_ISDIR(mode):
+            value = None
+        else:
+            raise RuntimeError("unsupported checkout entry: " + str(path))
+        entries[str(path.relative_to(root))] = (stat.S_IFMT(mode), stat.S_IMODE(mode), value)
+    return entries
+
+
+def verify_checkout(root: Path, expected: dict) -> None:
+    actual = checkout_manifest(root)
+    if any(actual.get(name) != value for name, value in expected.items()):
+        raise RuntimeError("checkout changed: " + str(root))
+    for name in actual.keys() - expected.keys():
+        path = Path(name)
+        generated = ("__pycache__" in path.parts or path.suffix == ".pyc") and path.parts[0] != ".git"
+        if not generated or actual[name][0] not in {stat.S_IFDIR, stat.S_IFREG}:
+            raise RuntimeError("checkout changed: unexpected " + str(root / path))
+
+
+def process_group_running(group: int) -> bool:
+    # Linux zombies have completed cleanup and cannot respond to another signal.
+    for path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = path.read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields[2]) == group and fields[0] != "Z":
+            return True
+    return False
+
+
 def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> None:
+    if not Path("/proc/self/stat").is_file():
+        raise RuntimeError("Linux /proc is required for process cleanup")
     with log.open("wb") as output:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=True)
+        succeeded = False
+        forced = False
         try:
             code = process.wait(timeout=timeout)
             if code:
                 raise RuntimeError(f"check exited {code}; see {log}")
+            succeeded = True
         finally:
             # Descendants must not outlive a failed or cancelled check.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
                     # The shell can exit before its descendants finish cleanup.
-                    deadline = time.monotonic() + 60
+                    deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
                     while time.monotonic() < deadline:
                         process.poll()
-                        os.killpg(process.pid, 0)
+                        if not process_group_running(process.pid):
+                            break
                         time.sleep(0.05)
                 finally:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if process_group_running(process.pid):
+                        os.killpg(process.pid, signal.SIGKILL)
+                        forced = True
             except ProcessLookupError:
                 pass
             process.wait()
+            if succeeded and forced:
+                raise RuntimeError("check required forced termination; cleanup is incomplete")
 
 
 def validate(args: argparse.Namespace) -> int:
@@ -80,15 +141,14 @@ def validate(args: argparse.Namespace) -> int:
             report["run_id"] = root.name.lower()
             source, policy = root / "source", root / "policy"
             for target, commit, origin in ((source, args.source, repo), (policy, args.policy, policy_repo)):
-                subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-checkout", str(origin), str(target)], check=True)
                 identities = [args.source, args.base, args.main, reviewed_head] if target == source else [args.policy]
-                subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities], check=True)
-                subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], check=True)
+                checkout(origin, target, commit, identities)
                 if target == source:
                     subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main], check=True)
             # Do not pass host credentials, Git overrides or language injection variables.
             env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(root / "home"), "LANG": "C.UTF-8",
                    "TMPDIR": fixture_temporary, "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_OPTIONAL_LOCKS": "0",
                    "CI_FLEET_VALIDATION_ROOT": str(source), "CI_FLEET_VALIDATION_ID": root.name.lower(),
                    "CI_FLEET_RUNNER_IMAGE": "ci-fleet-runner:" + root.name.lower(),
                    "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()}
@@ -152,12 +212,28 @@ def validate(args: argparse.Namespace) -> int:
             else:
                 env["CI_FLEET_VALIDATION_BASE"] = args.base
                 checks.append(("configuration", ["bash", str(policy / "scripts/validate-configuration.sh")]))
+            seeds = []
+            for target, commit, identities in ((source, args.source, [args.source, args.base, args.main, reviewed_head]),
+                                               (policy, args.policy, [args.policy])):
+                seed = root / (target.name + "-seed")
+                target.rename(seed)
+                seeds.append((seed, checkout_manifest(seed), target, commit, identities))
             for name, command in checks:
                 entry = {"name": name, "status": "incomplete", "log": name + ".log", "started_at": int(time.time())}
                 report["results"].append(entry)
                 print("Running " + name, flush=True)
                 try:
+                    for seed, expected, target, commit, identities in seeds:
+                        verify_checkout(seed, expected)
+                        checkout(seed, target, commit, identities)
+                        if target == source:
+                            subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main], check=True)
+                    stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _ in seeds]
                     run(command, source, env, output / entry["log"], args.timeout)
+                    for target, expected in stage_trees:
+                        verify_checkout(target, expected)
+                    for seed, expected, _, _, _ in seeds:
+                        verify_checkout(seed, expected)
                     if re.search(rb"(?:skipped=[1-9][0-9]*|\.\.\. skipped )", (output / entry["log"]).read_bytes()):
                         raise RuntimeError("unexpected skipped tests; see " + entry["log"])
                     entry["status"] = "passed"
@@ -171,6 +247,11 @@ def validate(args: argparse.Namespace) -> int:
                     entry["finished_at"] = int(time.time())
                     if (output / entry["log"]).exists():
                         entry["sha256"] = hashlib.sha256((output / entry["log"]).read_bytes()).hexdigest()
+                    for _, _, target, _, _ in seeds:
+                        if target.is_symlink():
+                            target.unlink()
+                        elif target.exists():
+                            shutil.rmtree(target)
             report["status"] = "passed"
     except (Exception, KeyboardInterrupt) as error:
         report["status"] = "failed"

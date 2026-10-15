@@ -62,6 +62,7 @@ def main() -> int:
                         "-out", str(root / "signature")], check=True, timeout=10,
                        env={"PATH": "/usr/bin:/bin", "OPENSSL_CONF": "/dev/null"})
         envelope["signature"] = base64.b64encode((root / "signature").read_bytes()).decode()
+    require_local_evidence_freshness(result, local["max_age_seconds"])
     descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         json.dump(envelope, handle, sort_keys=True)

@@ -36,7 +36,8 @@ need network access unless Git objects, packages and images are already present.
 
 Run the following engine preparation and validation commands in a root shell on
 the disposable machine. The harness needs a protected home directory, `/dev/shm`
-and local Docker access. Do not forward an SSH agent or install production Git
+and local Docker access. Linux `/proc` must also be mounted so cleanup can verify
+live process groups. Do not forward an SSH agent or install production Git
 credentials; use an operator-controlled read-only fetch method where needed.
 
 ```bash
@@ -91,6 +92,12 @@ and exit status. Success requires `profile` equal to `full`, `status` equal to
 `passed`, no expected skips and all stages passed. Retain the entire result
 directory privately. A quick run, missing report, interrupted run or unexpected
 skip does not establish full acceptance.
+
+The harness refreshes and verifies source and policy checkouts for every stage.
+Treat a checkout-mutation or forced-cleanup failure as failed validation and
+investigate it before rerunning. These checks do not isolate hostile root code
+or detect edits restored within a stage. Independently review the source and
+supervise the disposable machine; never run candidate tests on the signer.
 
 For Actions-independent acceptance, launch the full run from the operator's
 shell on this machine without an Actions job, event or runner. Record the actual

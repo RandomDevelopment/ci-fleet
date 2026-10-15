@@ -16,7 +16,7 @@ separate from repository validation.
 ## Tools and execution boundary
 
 Use a disposable Debian 13 or Ubuntu 24.04 Linux execution machine. Engine
-fixtures require root, `runuser`, `/dev/shm`, Bash, Git with complete history,
+fixtures require root, `runuser`, mounted `/proc` and `/dev/shm`, Bash, Git with complete history,
 Python 3.11 or later, PyYAML, ShellCheck, OpenSSL with Ed25519 support,
 coreutils, util-linux, curl and standard systemd utilities. The full engine run
 also requires Docker Engine, Compose v2 and access to its local Unix socket.
@@ -28,9 +28,9 @@ status-receiver installation paths, installer metadata, and systemd unit markers
 including partial or dangling installations. That check cannot detect an unusually
 installed service, so the operator must verify the machine's role.
 
-Configuration runs need Bash, Git, Python, ShellCheck and OpenSSL and do not
-require root or Docker. The core configuration profile covers the embedded
-configuration contract. A standalone-template suite must additionally preserve
+Configuration runs need Linux with mounted `/proc`, Bash, Git, Python 3.11 or
+later, ShellCheck and OpenSSL. They do not require root or Docker. The core
+configuration profile covers the embedded configuration contract. A standalone-template suite must additionally preserve
 its updater, compatibility and release tests under template issue
 [#32](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/32).
 Do not treat this profile as proof of those additional standalone tests.
@@ -71,15 +71,25 @@ Stable tags must be reachable from the explicitly supplied main commit;
 prereleases must be branch-local. The tag validator also enforces the version
 bump. Keep release review and production approval separate from these tests.
 
-The runner clones independent source and policy checkouts, excludes working-tree
+The runner creates independent source and policy seeds, excludes working-tree
 edits, resets the main reference to the supplied identity, and uses a unique
 private temporary directory under the operator's protected home. Permission
 fixtures use a separate uniquely named directory under `/tmp` with read and traversal
 permission for their deliberate UID changes. Each fixture controls access to its
 own child directory. Both temporary roots are removed on exit. It strips inherited credentials and Git/Python
-configuration from check environments. It loads the commit validator, secret
-scanner and check plan from the pinned policy checkout. Source test programs
-remain proposed code and must receive independent review.
+configuration from check environments. Each stage gets fresh source and policy
+checkouts from the verified seeds. In-memory manifests compare filesystem bytes,
+types, modes, symlink targets and Git metadata before recording success, including
+the index and config. Changing either checkout or a seed fails the stage, even
+if a Git index flag would hide the edit from `git status`. Generated regular
+Python caches are allowed within a stage and discarded before the next one.
+The commit validator, secret scanner and check plan come from the pinned policy.
+
+These checks prevent persistent substitution between stages. They do not
+sandbox candidate code with root or Docker access, detect a file changed and
+restored within one stage, or protect the orchestrator and system tools from a
+hostile root process. Source programs require independent review and supervised
+execution on the disposable machine. Keep the signing authority elsewhere.
 Trusted inline Python drivers use isolated mode so candidate modules cannot
 replace the standard-library imports that dispatch commit and history checks.
 
@@ -93,7 +103,9 @@ incomplete execution. Never infer success from the last visible test line.
 Each stage has a 1,800-second timeout, configurable with `--timeout`. SIGINT and
 SIGTERM fail the current stage and signal its process group. Descendants have up
 to 60 seconds to finish cleanup before forced termination, even if the stage's
-shell exits first. The APT fixture handles termination through its resource
+shell exits first. A successful stage leader cannot hide descendants that require
+forced termination; that stage fails. Linux process checks ignore zombies that
+have already exited. The APT fixture handles termination through its resource
 cleanup block. The harness removes temporary checkouts. A hard kill or power
 loss cannot guarantee cleanup. Use the report's
 run identity and the invocation-specific image tags to inspect leftovers, or

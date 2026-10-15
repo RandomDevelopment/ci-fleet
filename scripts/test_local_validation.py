@@ -218,6 +218,22 @@ class LocalEvidenceTests(unittest.TestCase):
                 self.check()
 
     @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
+    def test_report_expiring_during_signing_creates_no_output(self):
+        import attest_local_validation
+        run_dir = self.root / "expiring-run"; run_dir.mkdir()
+        (run_dir / "configuration.log").write_bytes(self.log.read_bytes())
+        report = dict(self.payload["result"], started_at=self.now - 3599)
+        (run_dir / "result.json").write_text(json.dumps(report))
+        output = self.root / "expired.json"
+        command = ["attest", "--policy", str(self.path), "--result", str(run_dir), "--key", str(self.key),
+                   "--reviewed-head", HEAD, "--pull-request", "8", "--output", str(output)]
+        with patch("sys.argv", command), \
+             patch("verify_config_approval.time.time", side_effect=[self.now, self.now + 2]), \
+             self.assertRaisesRegex(Rejected, "local evidence expired"):
+            attest_local_validation.main()
+        self.assertFalse(output.exists())
+
+    @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
     def test_signer_enforces_verifier_log_and_envelope_limits(self):
         run_dir = self.root / "bounded-run"; run_dir.mkdir()
         output = self.root / "bounded.json"
@@ -255,6 +271,44 @@ class LocalEvidenceTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_missing_procfs_fails_before_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("local_validate.Path.is_file", return_value=False), \
+                 patch("local_validate.subprocess.Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "Linux /proc"):
+                run(["true"], root, os.environ.copy(), root / "test.log", 5)
+            launch.assert_not_called()
+
+    def test_successful_leader_cannot_hide_forced_descendant_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "child.py"
+            child.write_text("import signal, time\nfrom pathlib import Path\n"
+                             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                             "Path('ready').write_text('ready')\ntime.sleep(60)\n")
+            leader = "import subprocess,sys,time; from pathlib import Path; " \
+                     "subprocess.Popen([sys.executable, 'child.py']); " \
+                     "exec(\"while not Path('ready').exists(): time.sleep(0.01)\")"
+            with patch("local_validate.CLEANUP_GRACE_SECONDS", 0.2), \
+                 self.assertRaisesRegex(RuntimeError, "forced termination"):
+                run(["python3", "-c", leader], root, os.environ.copy(), root / "test.log", 5)
+
+    def test_successful_leader_allows_descendant_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "child.py"
+            child.write_text("import signal, sys, time\nfrom pathlib import Path\n"
+                             "def cleanup(*args):\n    Path('cleaned').write_text('done')\n    sys.exit(0)\n"
+                             "signal.signal(signal.SIGTERM, cleanup)\n"
+                             "Path('ready').write_text('ready')\ntime.sleep(60)\n")
+            leader = "import subprocess,sys,time; from pathlib import Path; " \
+                     "subprocess.Popen([sys.executable, 'child.py']); " \
+                     "exec(\"while not Path('ready').exists(): time.sleep(0.01)\")"
+            with patch("local_validate.CLEANUP_GRACE_SECONDS", 2):
+                run(["python3", "-c", leader], root, os.environ.copy(), root / "test.log", 5)
+            self.assertEqual((root / "cleaned").read_text(), "done")
+
     def test_container_stage_propagates_cleanup_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -407,6 +461,36 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
 
+    @unittest.skipUnless(os.geteuid() == 0, "engine fixtures require root")
+    def test_each_stage_gets_fresh_checkouts_and_allows_generated_caches(self):
+        import argparse
+        import local_validate
+        calls = []
+        def stage(command, cwd, env, log, timeout):
+            for target in (cwd, cwd.parent / "policy"):
+                cache = target / "__pycache__/generated.pyc"
+                self.assertFalse(cache.exists(), calls)
+                cache.parent.mkdir()
+                cache.write_bytes(b"fixture cache")
+            log.write_text("fixture stage\n")
+            calls.append(command)
+        output = self.root / "fresh-stages"
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+            base=self.base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
+            pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
+        with patch("local_validate.run", side_effect=stage):
+            self.assertEqual(local_validate.validate(args), 0)
+        self.assertGreater(len(calls), 1)
+
+    def test_candidate_cannot_mutate_verification_seeds(self):
+        self.git("checkout", "main")
+        (self.repo / "scripts/validate-configuration.sh").write_text(
+            "#!/bin/bash\npython3 -c \"from pathlib import Path; (Path.cwd().parent / 'source-seed/payload').write_text('changed')\"\n")
+        self.policy = self.commit("test: attempt verification seed mutation")
+        result, report = self.validate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checkout changed", report["error"])
+
     def test_bad_commit_and_pr_title_cannot_use_candidate_policy(self):
         result, _ = self.validate("--pr-title", "invalid title")
         self.assertNotEqual(result.returncode, 0)
@@ -438,6 +522,29 @@ class PolicyExecutionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(report["results"][-1]["name"], "commits" if invalid == "commit" else "history-secrets")
                 self.assertEqual(report["results"][-1]["status"], "failed")
+
+    def test_candidate_cannot_mutate_policy_source_or_git_metadata(self):
+        self.git("checkout", "main")
+        (self.repo / "scripts/validate-configuration.sh").write_text("#!/bin/bash\nset -e\npython3 attack.py\n")
+        self.policy = self.commit("test: execute candidate mutation fixture")
+        attacks = {
+            "policy": "(root.parent / 'policy/scripts/validate-configuration.sh').write_text('#!/bin/bash\\nexit 0\\n')",
+            "source": "(root / 'runner/Dockerfile').write_text('FROM changed\\n')",
+            "hidden-source": "(root / 'runner/Dockerfile').write_text('FROM changed\\n'); subprocess.run(['git', 'update-index', '--assume-unchanged', 'runner/Dockerfile'], check=True)",
+            "index": "subprocess.run(['git', 'update-index', '--assume-unchanged', 'runner/Dockerfile'], check=True)",
+            "config": "subprocess.run(['git', 'config', 'core.hooksPath', '/unused-fixture-hooks'], check=True)",
+        }
+        for name, attack in attacks.items():
+            with self.subTest(attack=name):
+                self.git("checkout", "--detach", self.source)
+                (self.repo / "runner").mkdir()
+                (self.repo / "runner/Dockerfile").write_text("FROM scratch\n")
+                (self.repo / "attack.py").write_text("from pathlib import Path\nimport subprocess\nroot = Path.cwd()\n" + attack + "\n")
+                head = self.commit("test: attempt " + name + " mutation")
+                result, report = self.validate(source=head)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(report["results"][-1]["status"], "failed")
+                self.assertIn("checkout changed", report["error"])
 
     def test_integrated_squash_scans_removed_secrets_in_reviewed_history(self):
         (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
