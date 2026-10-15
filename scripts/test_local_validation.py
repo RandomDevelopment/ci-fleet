@@ -293,6 +293,72 @@ class LocalEvidenceTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_checkout_mutation_diagnostics_identify_paths_and_kinds_without_contents(self):
+        from local_validate import checkout_manifest, verify_checkout
+        for change in ("content", "mode", "type", "removed"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / ".git").mkdir()
+                path = root / ".git/config"
+                path.write_text("original private contents")
+                path.chmod(0o600)
+                expected = checkout_manifest(root)
+                if change == "content":
+                    path.write_text("replacement private contents")
+                elif change == "mode":
+                    path.chmod(0o644)
+                else:
+                    path.unlink()
+                    if change == "type":
+                        path.symlink_to("private-target")
+                with self.assertRaises(RuntimeError) as failure:
+                    verify_checkout(root, expected)
+                message = str(failure.exception)
+                self.assertIn("'.git/config' (file " + change, message)
+                for private in ("original private contents", "replacement private contents", "private-target"):
+                    self.assertNotIn(private, message)
+
+    def test_mutable_installer_fixture_setup_preserves_source_git_and_tracked_edits(self):
+        from local_validate import checkout_manifest
+        for script in ("test-install-worker-controller.sh", "test-install-deployer.sh"):
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as temporary:
+                text = (ROOT / "scripts" / script).read_text()
+                start = text.index("fixture_repo=$tmp/core\n")
+                end = text.index("repo_root=$fixture_repo\n", start) + len("repo_root=$fixture_repo\n")
+                setup = text[start:end]
+                root = Path(temporary)
+                source = root / "source"; source.mkdir()
+                fixture_root = root / "fixture"; fixture_root.mkdir()
+                def git(repo, *args):
+                    return subprocess.check_output(["git", "-C", str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
+                git(source, "init", "-q")
+                git(source, "config", "user.name", "Validation test")
+                git(source, "config", "user.email", "test@example.invalid")
+                (source / "tracked").write_text("initial\n")
+                (source / "binary").write_bytes(b"initial\x00bytes")
+                git(source, "add", "."); git(source, "commit", "-qm", "feat: initial source")
+                (source / "tracked").write_text("committed\n")
+                git(source, "add", "."); git(source, "commit", "-qm", "fix: second source commit")
+                head = git(source, "rev-parse", "HEAD")
+                (source / "tracked").write_text("staged\n")
+                git(source, "add", "tracked")
+                (source / "tracked").write_text("staged and unstaged\n")
+                (source / "binary").write_bytes(b"changed\x00bytes")
+                expected = checkout_manifest(source)
+                subprocess.run(["bash", "-euo", "pipefail", "-c", setup], check=True, capture_output=True,
+                               env={**os.environ, "repo_root": str(source), "tmp": str(fixture_root)})
+                fixture = fixture_root / "core"
+                self.assertEqual(git(fixture, "rev-parse", "HEAD"), head)
+                self.assertEqual(git(fixture, "rev-list", "--count", "HEAD"), "2")
+                for name in ("tracked", "binary"):
+                    self.assertEqual((fixture / name).read_bytes(), (source / name).read_bytes())
+                replacement = git(fixture, "-c", "user.name=Validation test", "-c", "user.email=test@example.invalid",
+                                  "commit-tree", "HEAD^{tree}", "-m", "test: synthetic fixture commit")
+                git(fixture, "replace", head, replacement)
+                self.assertEqual(checkout_manifest(source), expected)
+                git(fixture, "replace", "-d", head)
+                self.assertEqual(checkout_manifest(source), expected)
+
     def test_missing_procfs_fails_before_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -460,6 +526,8 @@ exit 0
     def test_optional_hosted_job_cannot_emit_the_required_validate_context(self):
         import yaml
         workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertEqual(set(triggers["pull_request"]["types"]), {"opened", "synchronize", "reopened", "edited"})
         jobs = workflow["jobs"]
         self.assertEqual(set(jobs), {"hosted-validation"})
         self.assertNotIn("validate", {job.get("name", key) for key, job in jobs.items()})
@@ -531,6 +599,117 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["profile"], "full")
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
+
+    def test_checkouts_contain_only_declared_identities_and_their_ancestors(self):
+        import argparse
+        import local_validate
+        (self.repo / "payload").write_text("reviewed tree")
+        reviewed = self.commit("fix: prepare reviewed source")
+        self.git("checkout", "-b", "integrated", self.base)
+        self.git("read-tree", "--reset", "-u", reviewed)
+        integrated = self.commit("fix: integrate reviewed source")
+        self.git("checkout", "-b", "unrelated", self.base)
+        (self.repo / "private-unrelated").write_text("unrelated branch data")
+        unrelated = self.commit("fix: unrelated private branch")
+        blob = self.git("rev-parse", unrelated + ":private-unrelated")
+        self.git("tag", "-a", "v99.0.0", "-m", "unrelated release")
+        tag = self.git("rev-parse", "refs/tags/v99.0.0")
+        self.git("repack", "-ad")
+        calls = []
+        def stage(command, cwd, env, log, timeout):
+            for target, present, absent in (
+                    (cwd, (integrated, reviewed, self.source, self.base, self.policy), (unrelated, blob, tag)),
+                    (cwd.parent / "policy", (self.policy, self.base), (integrated, reviewed, self.source, unrelated, blob, tag))):
+                for identity in present:
+                    subprocess.run(["git", "-C", str(target), "cat-file", "-e", identity], check=True)
+                for identity in absent:
+                    result = subprocess.run(["git", "-C", str(target), "cat-file", "-e", identity], capture_output=True)
+                    self.assertNotEqual(result.returncode, 0, (target, identity))
+                refs = local_validate.git(target, "for-each-ref", "--format=%(refname)").splitlines()
+                self.assertEqual(refs, ["refs/remotes/origin/main"] if target == cwd else [])
+                self.assertNotEqual(subprocess.run(["git", "-C", str(target), "config", "--get", "remote.origin.fetch"],
+                                                  capture_output=True).returncode, 0)
+            self.assertEqual(local_validate.git(cwd, "rev-parse", "origin/main"), self.policy)
+            calls.append(command)
+            log.write_text("fixture stage\n")
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=integrated,
+            reviewed_head=reviewed, base=self.base, policy=self.policy, main=self.policy, output=self.root / "bounded-checkouts",
+            kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
+        with patch("local_validate.run", side_effect=stage):
+            self.assertEqual(local_validate.validate(args), 0)
+        self.assertEqual(len(calls), 3)
+
+    def test_shallow_policy_repository_cannot_supply_incomplete_ancestry(self):
+        shallow = self.root / "shallow-policy"
+        subprocess.run(["git", "clone", "--quiet", "--no-local", "--depth", "1", "--branch", "main",
+                        str(self.repo), str(shallow)], check=True)
+        result, report = self.validate("--policy-repository", str(shallow))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("complete Git history is required", result.stderr)
+        self.assertIsNone(report)
+
+    def test_release_tags_preserve_annotations_frozen_provenance_and_required_bumps(self):
+        import argparse
+        import local_validate
+        self.git("tag", "-a", "v0.1.0", self.base, "-m", "reviewed release")
+        selected = self.git("rev-parse", "refs/tags/v0.1.0")
+        self.git("tag", "-a", "v0.0.9", self.base, "-m", "older release")
+        older = self.git("rev-parse", "refs/tags/v0.0.9")
+        self.git("tag", "-a", "v9.0.0-rc.1", self.base, "-m", "prerelease")
+        prerelease = self.git("rev-parse", "refs/tags/v9.0.0-rc.1")
+        (self.repo / "payload").write_text("release feature")
+        head = self.commit("feat: add release behavior")
+        self.git("checkout", "-b", "unrelated", self.base)
+        (self.repo / "payload").write_text("unrelated release")
+        unrelated = self.commit("fix: unrelated release history")
+        self.git("tag", "-a", "v99.0.0", "-m", "unrelated release")
+        unrelated_tag = self.git("rev-parse", "refs/tags/v99.0.0")
+        observed = []
+        execute = local_validate.run
+        def stage(command, cwd, env, log, timeout):
+            self.assertEqual(local_validate.git(cwd, "tag", "--list"), "v0.1.0")
+            self.assertEqual(local_validate.git(cwd, "rev-parse", "v0.1.0"), selected)
+            self.assertEqual(local_validate.git(cwd, "cat-file", "-t", selected), "tag")
+            for target in (cwd, cwd.parent / "policy"):
+                for identity in (older, prerelease, unrelated, unrelated_tag):
+                    self.assertNotEqual(subprocess.run(["git", "-C", str(target), "cat-file", "-e", identity],
+                                                       capture_output=True).returncode, 0, (target, identity))
+            self.assertEqual(local_validate.git(cwd.parent / "policy", "tag", "--list"), "")
+            self.assertNotEqual(subprocess.run(["git", "-C", str(cwd.parent / "policy"), "cat-file", "-e", selected],
+                                              capture_output=True).returncode, 0)
+            if not observed:
+                self.git("update-ref", "refs/tags/v0.1.0", unrelated)
+            observed.append(command)
+            execute(command, cwd, env, log, timeout)
+        output = self.root / "release-checkouts"
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
+            base=self.base, policy=self.policy, main=head, output=output, kind="configuration", profile="full",
+            pr_title=None, tag="v0.2.0", tag_created=True, disposable_host=False, timeout=30)
+        with patch("local_validate.run", side_effect=stage):
+            self.assertEqual(local_validate.validate(args), 0)
+        report = json.loads((output / "result.json").read_text())
+        self.assertEqual(report["release_tags"], {"v0.1.0": {"object": selected, "commit": self.base}})
+        self.assertEqual(report["history_base"], "v0.1.0")
+        self.assertEqual(len(observed), 4)
+        self.git("update-ref", "refs/tags/v0.1.0", selected)
+        result, report = self.validate("--main", head, "--tag", "v0.1.1", "--tag-created", source=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(report["results"][-1]["name"], "tag")
+        self.assertIn("required MINOR", (self.root / ("run-" + str(self.count)) / "tag.log").read_text())
+
+    def test_release_checks_include_the_latest_tag_on_declared_main(self):
+        self.git("tag", "-a", "v0.1.0", self.base, "-m", "source baseline")
+        self.git("checkout", "-b", "declared-main", self.policy)
+        (self.repo / "payload").write_text("new declared main")
+        main = self.commit("fix: advance declared main")
+        self.git("tag", "-a", "v0.2.0", main, "-m", "newer main release")
+        self.git("update-ref", "refs/remotes/origin/main", self.base)
+        result, report = self.validate("--main", main, "--tag", "v0.1.1-rc.1", "--tag-created")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(set(report["release_tags"]), {"v0.1.0", "v0.2.0"})
+        self.assertEqual(report["results"][-1]["name"], "tag")
+        self.assertIn("release target must follow latest released commit",
+                      (self.root / ("run-" + str(self.count)) / "tag.log").read_text())
 
     def test_no_prior_base_accepts_root_and_imported_history_without_fallback(self):
         for source in (self.source, self.base):

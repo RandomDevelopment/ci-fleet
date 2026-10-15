@@ -95,8 +95,17 @@ directory privately. A quick run, missing report, interrupted run or unexpected
 skip does not establish full acceptance.
 
 The harness refreshes and verifies source and policy checkouts for every stage.
+Those checkouts fetch only declared commit identities and ancestors. Release
+runs also freeze the needed stable tag objects from declared source/main in
+`result.json`; fresh source stages preserve those exact annotated or lightweight
+tags. Other branches and tags remain unavailable, including their unrelated
+objects. The policy checkout receives no release tags. Keep the original
+operator checkout's complete history and release tags available for selection.
 Treat a checkout-mutation or forced-cleanup failure as failed validation and
-investigate it before rerunning. These checks do not isolate hostile root code
+investigate it before rerunning. Mutation diagnostics identify the first changed
+relative paths and change kinds without exposing file contents. Mutable test
+fixtures must create commits and replacement refs in their own repositories;
+never waive source Git-metadata changes. These checks do not isolate hostile root code
 or detect edits restored within a stage. Independently review the source and
 supervise the disposable machine; never run candidate tests on the signer.
 

@@ -28,9 +28,38 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
-def checkout(origin: Path, target: Path, commit: str, identities: list[str]) -> None:
-    subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-checkout", str(origin), str(target)], check=True)
+def fetch_tags(target: Path, tags: dict[str, dict[str, str]]) -> None:
+    if tags:
+        subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin",
+                        *(value["object"] + ":refs/tags/" + name for name, value in tags.items())], check=True)
+        for name, value in tags.items():
+            ref = "refs/tags/" + name
+            if git(target, "rev-parse", ref) != value["object"] or git(target, "rev-parse", ref + "^{commit}") != value["commit"]:
+                raise ValueError("release tag differs from frozen provenance: " + name)
+
+
+def release_tags(repo: Path, validator: str, source: str, main: str, excluded: str, env: dict) -> dict[str, dict[str, str]]:
+    tags = {}
+    for identity in dict.fromkeys((source, main)):
+        name = subprocess.check_output(["python3", validator, "--release-base-for", identity, "--exclude-tag", excluded],
+                                       cwd=repo, env=env, text=True).strip()
+        if name:
+            ref = "refs/tags/" + name
+            value = {"object": git(repo, "rev-parse", "--verify", ref),
+                     "commit": git(repo, "rev-parse", "--verify", ref + "^{commit}")}
+            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", value["commit"], identity], check=True)
+            tags[name] = value
+    return tags
+
+
+def checkout(origin: Path, target: Path, commit: str, identities: list[str], tags: dict[str, dict[str, str]] | None = None) -> None:
+    if any(not SHA.fullmatch(value) or value == NO_PRIOR for value in identities):
+        raise ValueError("checkout identities must be full nonzero commit SHAs")
+    target.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(target)], check=True)
+    subprocess.run(["git", "-C", str(target), "config", "remote.origin.url", str(origin)], check=True)
     subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities], check=True)
+    fetch_tags(target, tags or {})
     subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], check=True)
 
 
@@ -55,8 +84,18 @@ def checkout_manifest(root: Path) -> dict:
 
 def verify_checkout(root: Path, expected: dict) -> None:
     actual = checkout_manifest(root)
-    if any(actual.get(name) != value for name, value in expected.items()):
-        raise RuntimeError("checkout changed: " + str(root))
+    changes = []
+    for name, previous in expected.items():
+        current = actual.get(name)
+        if current != previous:
+            kind = {stat.S_IFREG: "file", stat.S_IFDIR: "directory", stat.S_IFLNK: "symlink"}[previous[0]]
+            reason = "removed" if current is None else "type changed" if current[0] != previous[0] else \
+                     "mode changed" if current[1] != previous[1] else "content changed"
+            changes.append(f"{name!r} ({kind} {reason})")
+            if len(changes) == 3:
+                break
+    if changes:
+        raise RuntimeError("checkout changed: " + str(root) + ": " + ", ".join(changes))
     for name in actual.keys() - expected.keys():
         path = Path(name)
         generated = ("__pycache__" in path.parts or path.suffix == ".pyc") and path.parts[0] != ".git"
@@ -81,8 +120,9 @@ def validate(args: argparse.Namespace) -> int:
     for origin, value in identities:
         if not SHA.fullmatch(value) or git(origin, "rev-parse", value + "^{commit}") != value:
             raise ValueError("source, base, policy and main must be full available commit SHAs")
-    if git(repo, "rev-parse", "--is-shallow-repository") != "false":
-        raise ValueError("complete Git history is required")
+    for origin in {repo, policy_repo}:
+        if git(origin, "rev-parse", "--is-shallow-repository") != "false":
+            raise ValueError("complete Git history is required")
     if not no_prior:
         subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source], check=True)
     if reviewed_head != args.source:
@@ -144,6 +184,9 @@ def validate(args: argparse.Namespace) -> int:
                 report["tools"][name] = subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT).strip()
             validator = str(policy / "scripts/validate_commits.py")
             scanner = str(policy / "scripts/scan_committed_secrets.py")
+            selected_tags = release_tags(repo, validator, args.source, args.main, args.tag, env) if args.tag else {}
+            report["release_tags"] = selected_tags
+            fetch_tags(source, selected_tags)
             checks = []
             if args.pr_title is not None:
                 checks.append(("pr-title", ["python3", validator, "--pr-title", args.pr_title]))
@@ -183,26 +226,26 @@ def validate(args: argparse.Namespace) -> int:
                 env["CI_FLEET_VALIDATION_BASE"] = args.base
                 checks.append(("configuration", ["bash", str(policy / "scripts/validate-configuration.sh")]))
             seeds = []
-            for target, commit, identities in ((source, args.source, source_identities),
-                                               (policy, args.policy, [args.policy])):
+            for target, commit, identities, tags in ((source, args.source, source_identities, selected_tags),
+                                                     (policy, args.policy, [args.policy], {})):
                 seed = root / (target.name + "-seed")
                 target.rename(seed)
-                seeds.append((seed, checkout_manifest(seed), target, commit, identities))
+                seeds.append((seed, checkout_manifest(seed), target, commit, identities, tags))
             for name, command in checks:
                 entry = {"name": name, "status": "incomplete", "log": name + ".log", "started_at": int(time.time())}
                 report["results"].append(entry)
                 print("Running " + name, flush=True)
                 try:
-                    for seed, expected, target, commit, identities in seeds:
+                    for seed, expected, target, commit, identities, tags in seeds:
                         verify_checkout(seed, expected)
-                        checkout(seed, target, commit, identities)
+                        checkout(seed, target, commit, identities, tags)
                         if target == source:
                             subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main], check=True)
-                    stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _ in seeds]
+                    stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _, _ in seeds]
                     run(command, source, env, output / entry["log"], args.timeout)
                     for target, expected in stage_trees:
                         verify_checkout(target, expected)
-                    for seed, expected, _, _, _ in seeds:
+                    for seed, expected, _, _, _, _ in seeds:
                         verify_checkout(seed, expected)
                     if re.search(rb"(?:skipped=[1-9][0-9]*|\.\.\. skipped )", (output / entry["log"]).read_bytes()):
                         raise RuntimeError("unexpected skipped tests; see " + entry["log"])
@@ -217,7 +260,7 @@ def validate(args: argparse.Namespace) -> int:
                     entry["finished_at"] = int(time.time())
                     if (output / entry["log"]).exists():
                         entry["sha256"] = hashlib.sha256((output / entry["log"]).read_bytes()).hexdigest()
-                    for _, _, target, _, _ in seeds:
+                    for _, _, target, _, _, _ in seeds:
                         if target.is_symlink():
                             target.unlink()
                         elif target.exists():

@@ -96,6 +96,18 @@ the index and config. Changing either checkout or a seed fails the stage, even
 if a Git index flag would hide the edit from `git status`. Generated regular
 Python caches are allowed within a stage and discarded before the next one.
 The commit validator, secret scanner and check plan come from the pinned policy.
+Failure diagnostics identify up to three changed relative paths and whether their
+type, mode or contents changed. They never include file contents or symlink targets.
+
+Checkouts start from empty Git repositories. Source fetches include only the
+declared source, reviewed head, nonzero base and main commits with their complete
+ancestry. Policy fetches include only the pinned policy commit and its ancestors.
+Neither checkout imports unrelated branches or tags. Release runs select the
+highest valid prior stable tag reachable from source and the highest reachable
+from declared main, excluding the candidate tag. The report freezes each selected
+tag's name, object ID and peeled commit in `release_tags`. Fresh source stages
+fetch those exact objects and refs, preserving annotated tags and release-bump
+policy. Policy stages receive no tags.
 
 These checks prevent persistent substitution between stages. They do not
 sandbox candidate code with root or Docker access, detect a file changed and
@@ -195,7 +207,8 @@ convenience job is named `hosted-validation` and is default-off. Set repository
 variable `CI_FLEET_HOSTED_VALIDATION=true` and set `CI_FLEET_VALIDATOR_REVISION`
 to an independently reviewed full supporting engine commit to enable it. Its PR
 runs use the target base SHA as both base and main, and validate the PR title
-passed as a quoted argument. Push runs use the source SHA as main and retain the
+passed as a quoted argument. PR edits rerun validation after title or target-base
+changes. Push runs use the source SHA as main and retain the
 event's base, including the zero sentinel for an initial push. The standalone
 template must adopt the same behavior under #32.
 
