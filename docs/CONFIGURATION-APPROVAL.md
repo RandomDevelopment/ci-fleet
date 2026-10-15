@@ -59,7 +59,8 @@ adapter's resume action, the trusted verifier requires all of the following:
 3. At least one allowed reviewer, other than the PR author, has an `APPROVED`
    formal review on that full head SHA. The reviewer's latest decision applies;
    dismissed or stale approvals do not count, and an outstanding trusted
-   `CHANGES_REQUESTED` decision blocks acceptance. Comments do not grant approval.
+   `CHANGES_REQUESTED` decision blocks acceptance. The optional Codex rule below
+   also accepts verified clean review evidence from an explicitly trusted bot.
    The review must follow any base-branch retargeting. Unavailable or incomplete
    PR base history rejects the candidate.
 4. The latest push run of the pinned workflow on the applied SHA completed
@@ -67,10 +68,63 @@ adapter's resume action, the trusted verifier requires all of the following:
    also completed successfully in that exact run attempt. Skipped, failed,
    cancelled, queued, and missing evidence is rejected.
 
-A Codex summary saying its review completed, a reaction, a status with a familiar
-name, or a successful PR merge-ref workflow is insufficient. Provision an
-independent reviewer or review service that submits a formal exact-head approval.
-The gate verifies those formal decisions; it does not interpret review prose.
+A reaction, a status with a familiar name, a generic review-completed comment,
+or a successful PR merge-ref workflow is insufficient.
+
+### Optional Codex clean reviews
+
+By default only formal reviews grant approval. To use Codex as the independent
+reviewer, an operator can add `"codex_reviewer_ids": [202]` to the root-owned
+policy. Here `202` is fictional; independently verify the actual bot's numeric
+GitHub ID. Each ID must also appear in `reviewer_ids`. Omitting the field or
+using an empty list preserves formal-only review behavior. Engines and managers
+must advertise `configuration_codex_reviews` to parse this field, including an
+empty list. Install the reviewed supporting engine and manager before provisioning
+it. With the field present, candidate and checkpoint-manager capability checks
+reject older formal-only engines before mutation or rollback restoration. Verify
+compatible checkpoints and last-known-good recovery before activating the opt-in.
+Remove the field before a separately authorized downgrade to a formal-only engine.
+
+This opt-in accepts the bot's unedited issue comment beginning exactly
+`Codex Review: Didn't find any major issues.` and containing the standard
+`Reviewed commit` field. The current optional follow-up sentence and integration
+help footer are recognized. The footer must contain the known integration-help
+text; arbitrary details, warnings, and added findings reject acceptance. Other
+wording fails closed and requires verifier support before it can count.
+The GitHub author must be a bot with the pinned
+numeric ID and must differ from the PR author. A copied summary from another
+account cannot grant approval.
+
+The reported commit must resolve through GitHub to the full current PR head.
+An abbreviated hash alone is insufficient; ambiguous or stale results reject
+the candidate. The clean response must follow any base retargeting. All review
+threads must be resolved. Newer comments and formal reviews from any pinned
+Codex identity, pending reviews from any such bot, and later `@codex review` or
+`@codex security review` requests invalidate an older clean response. Any later
+comment-deletion event also invalidates it because the removed content can hide
+a request or adverse response. Later edits to other comments likewise require
+a fresh clean result; the verifier cannot recover an erased request's old text.
+Deletion history must be available and completely paginated. These checks
+conservatively cover all comment authors, including same-second changes.
+The activity dashboard may refresh after the decision only when its single
+recognized code-review row reports completion on the same
+resolved commit at or after the clean response. Running, failed, stale, and
+unrecognized dashboard updates block acceptance. The complete known dashboard
+text, footer, trigger, and matching relative-time text and datetime are required;
+additional prose or a changed relative-time label rejects the update.
+The dashboard cannot approve without a separate clean response.
+When machine-readable activity state is
+present, including an indented marker, it must also report completed code review
+on the full head with no findings and no security-review activity. Unknown state
+versions and unknown top-level or nested state fields fail closed. Both state
+objects must contain exactly `commit_sha`, `status`, `has_any_findings`, and
+`has_unresolved_findings` with the documented clean or absent values.
+Same-second conflicts reject acceptance. Edited responses cannot approve, and
+editing an older decision response after a clean result invalidates that result.
+Outstanding trusted formal change requests still block acceptance. All tree,
+ancestry, applied-commit workflow/job, recovery, API, and pagination checks remain
+required. This rule accepts a narrow bot response format; it does not infer
+approval from arbitrary prose or treat the owner's merge as independent review.
 
 Requests use only GitHub's HTTPS API, refuse redirects, and have a two-minute
 evidence budget, fifteen-second request timeout, four-MiB response limit, and
