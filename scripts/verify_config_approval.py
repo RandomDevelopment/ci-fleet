@@ -26,6 +26,7 @@ SHA = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workflow_id", "required_jobs", "reviewer_ids"}
 LOCAL_POLICY_KEYS = {"directory", "public_key", "validator_revision", "suite", "required_checks", "max_age_seconds"}
+LOCAL_EVIDENCE_MAX_BYTES = 1024 * 1024
 CODEX_CLEAN = re.compile(
     r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
@@ -395,9 +396,9 @@ def trusted_evidence(path: Path, owner: int = 0) -> bytes:
         metadata = os.fstat(handle.fileno())
         require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == owner
                 and stat.S_IMODE(metadata.st_mode) == 0o600 and metadata.st_nlink == 1
-                and metadata.st_size <= 1024 * 1024, "local evidence file is not trusted")
-        data = handle.read(1024 * 1024 + 1)
-        require(len(data) <= 1024 * 1024, "local evidence exceeds size limit")
+                and metadata.st_size <= LOCAL_EVIDENCE_MAX_BYTES, "local evidence file is not trusted")
+        data = handle.read(LOCAL_EVIDENCE_MAX_BYTES + 1)
+        require(len(data) <= LOCAL_EVIDENCE_MAX_BYTES, "local evidence exceeds size limit")
         return data
 
 

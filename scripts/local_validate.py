@@ -35,11 +35,17 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> No
             try:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
-                    process.wait(timeout=5)
+                    # The shell can exit before its descendants finish cleanup.
+                    deadline = time.monotonic() + 60
+                    while time.monotonic() < deadline:
+                        process.poll()
+                        os.killpg(process.pid, 0)
+                        time.sleep(0.05)
                 finally:
                     os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            process.wait()
 
 
 def validate(args: argparse.Namespace) -> int:
@@ -96,8 +102,13 @@ def validate(args: argparse.Namespace) -> int:
                     tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
             # Neither profile may execute candidate code on an installed fleet role.
             installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status")
-            if any(Path(parent, role).exists() or Path(parent, role).is_symlink()
-                   for parent in ("/etc", "/var/lib", "/opt") for role in installed):
+            markers = [Path(parent, role) for parent in ("/etc", "/var/lib", "/opt") for role in installed]
+            markers.extend((Path("/var/lib/ci-fleet-status-installer"),
+                            Path("/var/lib/ci-fleet-deployer-container-credentials")))
+            for parent in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"):
+                for pattern in ("ci-fleet-*", "actions.runner*"):
+                    markers.extend(Path(parent).rglob(pattern))
+            if any(path.exists() or path.is_symlink() for path in markers):
                 raise ValueError("validation refuses an installed fleet host")
             if args.kind == "engine" and (os.geteuid() != 0 or not Path("/dev/shm").is_dir()):
                 raise ValueError("complete fixture coverage requires root and /dev/shm on an isolated execution host")

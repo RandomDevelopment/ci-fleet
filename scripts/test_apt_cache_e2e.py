@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -31,6 +32,9 @@ def fixture_failure_details(output: bytes, max_lines=10) -> str:
 
 
 def main():
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
     prefix = "ci-fleet-apt-test-" + uuid.uuid4().hex[:12]
     runner_image = os.environ.get("CI_FLEET_RUNNER_IMAGE", "ci-fleet-runner:dev")
     runner_definition = (ROOT / "runner/Dockerfile").read_text().splitlines()

@@ -157,6 +157,33 @@ class LocalEvidenceTests(unittest.TestCase):
             api.data[f"/repos/{REPOSITORY}/actions/workflows/501/runs"] = {"workflow_runs": []}
             with self.assertRaises(Rejected): verify(api, policy, REPOSITORY, COMMIT, TREE)
 
+    @unittest.skipUnless(os.getuid() == 0, "signer requires root-owned policy")
+    def test_signer_enforces_verifier_log_and_envelope_limits(self):
+        run_dir = self.root / "bounded-run"; run_dir.mkdir()
+        output = self.root / "bounded.json"
+        command = ["python3", str(ROOT / "scripts/attest_local_validation.py"), "--policy", str(self.path),
+                   "--result", str(run_dir), "--key", str(self.key), "--reviewed-head", HEAD,
+                   "--pull-request", "8", "--output", str(output)]
+        for log_size, tool_size, accepted in ((1024 * 1024, 0, True), (1024 * 1024 + 1, 0, False),
+                                               (0, 800 * 1024, False)):
+            with self.subTest(log_size=log_size, tool_size=tool_size):
+                report = copy.deepcopy(self.payload["result"])
+                data = b"x" * log_size
+                report["results"][0]["sha256"] = hashlib.sha256(data).hexdigest()
+                if tool_size:
+                    report["tools"]["large"] = "x" * tool_size
+                (run_dir / "result.json").write_text(json.dumps(report))
+                (run_dir / "configuration.log").write_bytes(data)
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                if accepted:
+                    output.replace(self.root / (COMMIT + ".json"))
+                    self.log.write_bytes(data)
+                    self.check()
+                else:
+                    self.assertIn("size limit", result.stderr)
+                    self.assertFalse(output.exists())
+
     def test_policy_v2_requires_new_capability_for_candidate_and_checkpoint(self):
         from argparse import Namespace
         from desired_state import command_validate_engine_capabilities, DesiredStateError
@@ -347,6 +374,33 @@ class PolicyExecutionTests(unittest.TestCase):
                     report = json.loads((output / "result.json").read_text())
                     self.assertIn("installed fleet host", report["error"])
                     self.assertEqual(report["results"], [])
+
+    def test_both_profiles_reject_partial_role_metadata_and_units(self):
+        import argparse
+        import local_validate
+        exists, is_symlink = Path.exists, Path.is_symlink
+        markers = ("/var/lib/ci-fleet-status-installer", "/var/lib/ci-fleet-deployer-container-credentials",
+                   "/etc/systemd/system/ci-fleet-status-receiver.service",
+                   "/etc/systemd/system/timers.target.wants/ci-fleet-tester-health.timer",
+                   "/run/systemd/system/actions.runner.example.service")
+        for kind in ("engine", "configuration"):
+            for marker in markers:
+                for dangling in (False, True):
+                    with self.subTest(kind=kind, marker=marker, dangling=dangling):
+                        output = self.root / (kind + marker.replace("/", "-") + str(dangling))
+                        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                            base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
+                            pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
+                        with patch("local_validate.Path.exists", autospec=True,
+                                   side_effect=lambda p: not dangling if str(p) == marker else exists(p)), \
+                             patch("local_validate.Path.is_symlink", autospec=True,
+                                   side_effect=lambda p: dangling if str(p) == marker else is_symlink(p)), \
+                             patch("local_validate.Path.rglob", return_value=iter([Path(marker)])), \
+                             patch("sys.stderr", io.StringIO()):
+                            self.assertEqual(local_validate.validate(args), 1)
+                        report = json.loads((output / "result.json").read_text())
+                        self.assertIn("installed fleet host", report["error"])
+                        self.assertEqual(report["results"], [])
 
     def test_missing_tool_records_incomplete_failure(self):
         import argparse

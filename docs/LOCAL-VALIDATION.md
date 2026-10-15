@@ -19,8 +19,9 @@ The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem
 check in both profiles also rejects standard controller, tester, deployer and
-status-receiver installation paths, including partial or dangling installations. That check cannot detect an
-unusually installed service, so the operator must verify the machine's role.
+status-receiver installation paths, installer metadata, and systemd unit markers,
+including partial or dangling installations. That check cannot detect an unusually
+installed service, so the operator must verify the machine's role.
 
 Configuration runs need Bash, Git, Python, ShellCheck and OpenSSL and do not
 require root or Docker. The core configuration profile covers the embedded
@@ -83,8 +84,11 @@ Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
 Each stage has a 1,800-second timeout, configurable with `--timeout`. SIGINT and
-SIGTERM fail the current stage, terminate its process group and remove temporary
-checkouts. A hard kill or power loss cannot guarantee cleanup. Use the report's
+SIGTERM fail the current stage and signal its process group. Descendants have up
+to 60 seconds to finish cleanup before forced termination, even if the stage's
+shell exits first. The APT fixture handles termination through its resource
+cleanup block. The harness removes temporary checkouts. A hard kill or power
+loss cannot guarantee cleanup. Use the report's
 run identity and the invocation-specific image tags to inspect leftovers, or
 discard the disposable machine. Do not run global Docker prune. Container tests
 remove their named inspection container and invocation-specific image tags;

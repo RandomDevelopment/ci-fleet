@@ -238,7 +238,9 @@ python3 /trusted/ci-fleet/scripts/attest_local_validation.py \
 
 The signing machine needs a protected copy of the policy and activation marker.
 The helper refuses quick or incomplete results, unexpected coverage, changed
-logs and the wrong validator revision. The signer must also check source, tree,
+logs and the wrong validator revision. Before signing, it rejects a report, log,
+or encoded evidence envelope over the verifier's 1 MiB file limit.
+The signer must also check source, tree,
 base, metadata and tool versions against its independently observed run. The
 host verifier repeats context, freshness, policy, signature and coverage checks.
 
