@@ -130,7 +130,7 @@ def main():
                 "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nUSER root\n"
                 "RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache "
                 "rm -f /etc/apt/sources.list.d/debian.sources "
-                f"&& printf 'deb http://snapshot.debian.org/archive/debian/{snapshot} trixie main\\n' >/etc/apt/sources.list "
+                f"&& echo 'deb http://snapshot.debian.org/archive/debian/{snapshot} trixie main' >/etc/apt/sources.list "
                 "&& " + install + "\n")
             run("docker", "cp", str(context), client + ":/context")
             args = ["--no-cache", "--build-arg", "BASE_IMAGE=" + base_image,
@@ -202,7 +202,7 @@ def main():
             run("docker", "cp", str(unreachable), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
             run("docker", "exec", client, "sh", "-ec", "if apt-get update >/dev/null 2>&1; then exit 1; fi", timeout=60)
             source = temporary / "https.list"
-            source.write_text("deb https://snapshot.debian.org/archive/debian/20261012T000000Z trixie main\n")
+            source.write_text(f"deb https://snapshot.debian.org/archive/debian/{snapshot} trixie main\n")
             run("docker", "cp", str(source), client + ":/https.list")
             run("docker", "exec", client, "apt-get", "-o", "Dir::Etc::sourcelist=/https.list",
                 "-o", "Dir::Etc::sourceparts=-", "update", timeout=120)
