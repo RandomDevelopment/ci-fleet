@@ -66,7 +66,10 @@ bump. Keep release review and production approval separate from these tests.
 
 The runner clones independent source and policy checkouts, excludes working-tree
 edits, resets the main reference to the supplied identity, and uses a unique
-private temporary directory. It strips inherited credentials and Git/Python
+private temporary directory under the operator's protected home. Permission
+fixtures use a separate uniquely named directory under `/tmp` with traversal
+permission for their deliberate UID changes. Each fixture controls access to its
+own child directory. Both temporary roots are removed on exit. It strips inherited credentials and Git/Python
 configuration from check environments. It loads the commit validator, secret
 scanner and check plan from the pinned policy checkout. Source test programs
 remain proposed code and must receive independent review.

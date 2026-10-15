@@ -316,6 +316,20 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
+    def test_execution_tempdir_allows_existing_unprivileged_fixture(self):
+        if os.geteuid() != 0:
+            self.skipTest("permission fixture requires root")
+        self.git("checkout", "main")
+        script = "#!/bin/bash\npython3 " + str(ROOT / "scripts/test_apply_docker_network_policy.py") + \
+            " ApplyScriptTests.test_testing_mode_accepts_default_tmp_as_non_root\n"
+        script += "python3 " + str(ROOT / "scripts/test_endpoint_snapshot.py") + \
+            " SnapshotReadbackTests.test_unprivileged_observer_reads_export_but_cannot_read_private_sources\n"
+        (self.repo / "scripts/validate-configuration.sh").write_text(script)
+        self.policy = self.commit("test: run unprivileged permission fixture")
+        result, report = self.validate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report["status"], "passed")
+
     def test_missing_tool_records_incomplete_failure(self):
         import argparse
         import local_validate

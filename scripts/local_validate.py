@@ -66,8 +66,11 @@ def validate(args: argparse.Namespace) -> int:
     if args.profile == "quick" and args.kind == "engine":
         report["expected_skips"] = ["container-build-and-cleanup"]
     try:
-        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home()) as temporary:
+        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home()) as temporary, \
+                tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
             root = Path(temporary)
+            # Permission fixtures deliberately drop UID and chmod their own directories.
+            Path(fixture_temporary).chmod(0o711)
             report["run_id"] = root.name.lower()
             source, policy = root / "source", root / "policy"
             for target, commit, origin in ((source, args.source, repo), (policy, args.policy, policy_repo)):
@@ -79,7 +82,7 @@ def validate(args: argparse.Namespace) -> int:
                     subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main], check=True)
             # Do not pass host credentials, Git overrides or language injection variables.
             env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(root / "home"), "LANG": "C.UTF-8",
-                   "TMPDIR": str(root), "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
+                   "TMPDIR": fixture_temporary, "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
                    "CI_FLEET_VALIDATION_ROOT": str(source), "CI_FLEET_VALIDATION_ID": root.name.lower(),
                    "CI_FLEET_RUNNER_IMAGE": "ci-fleet-runner:" + root.name.lower(),
                    "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()}
