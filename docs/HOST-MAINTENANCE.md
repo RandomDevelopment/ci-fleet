@@ -1,5 +1,7 @@
 # Host maintenance standard
 
+An existing apt-cacher-ng server can optionally cache runner and image-build package downloads. See [APT cache setup, removal, and troubleshooting](APT-CACHE.md). Support is disabled by default and leaves operator-managed host APT settings unchanged.
+
 Fleet hosts are generic Docker infrastructure. They must receive operating-system security fixes automatically, report health, and clean expired fleet resources and empty job networks in their configured Docker address pools. Admitted hosts also reclaim disposable image and default-builder cache storage.
 
 ## Policy

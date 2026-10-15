@@ -74,7 +74,7 @@ case "${1:-}" in
   buildx)
     case "${2:-}" in
       version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-v0.32.1}" ;;
-      inspect) [[ ${FAKE_FAIL_BUILDER_BOOTSTRAP:-0} == 0 ]] || exit 1; printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit: v0.32.2\n' ;;
+      inspect) [[ ${FAKE_FAIL_BUILDER_BOOTSTRAP:-0} == 0 ]] || exit 1; printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: %s\n' "${FAKE_BUILDKIT_VERSION-v0.32.2}" ;;
       create|rm)
         [[ -z ${FAKE_BUILDER_LOG:-} ]] || printf '%s|%s\n' "$2" "$*" >>"$FAKE_BUILDER_LOG"
         [[ "$2" != create || ${FAKE_FAIL_BUILDER_CREATE:-0} == 0 ]] || exit 1 ;;
@@ -86,6 +86,10 @@ case "${1:-}" in
         previous=''
         for argument in "$@"; do
           [[ "$previous" != --tag ]] || image=$argument
+          if [[ "$previous" == --secret && -n ${FAKE_APT_SECRET_CONFIG:-} ]]; then
+            [[ "$argument" == id=ci_fleet_apt,src=* ]] || exit 95
+            cp -- "${argument#*src=}" "$FAKE_APT_SECRET_CONFIG"
+          fi
           previous=$argument
         done
         image_paths || exit 1

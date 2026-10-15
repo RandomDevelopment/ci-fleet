@@ -1,5 +1,13 @@
 # ci-fleet configuration template
 
+Optional host-local APT caching is available only after promoting an engine and
+manager that support the `apt_cache` capability. It is disabled by default and
+adds no desired-state schema field or endpoint to this repository. Configure it
+locally using the engine's [APT cache guide](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/APT-CACHE.md).
+Use reviewed image IDs for the selected engine, explicitly opt project builds
+into secret mounts, and keep live acceptance separate from engine promotion.
+Remove host cache settings before downgrading to an incompatible engine or manager.
+
 Optional controller policy `docker_storage_retention: {"exclusive_fleet_daemon": true}`
 admits image/default-builder cache reclamation on an isolated disposable-CI daemon.
 Leave it absent until a compatible engine is active and existing storage has been

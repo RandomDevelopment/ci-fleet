@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "capabilities": {
+    "apt_cache": true,
     "capacity_telemetry": true,
     "reproducible_managed_images": true,
     "docker_storage_retention": true,
