@@ -36,8 +36,9 @@ need network access unless Git objects, packages and images are already present.
 
 Run the following engine preparation and validation commands in a root shell on
 the disposable machine. The harness needs a protected home directory, `/dev/shm`
-and local Docker access. Linux `/proc` must also be mounted so cleanup can verify
-live process groups. Do not forward an SSH agent or install production Git
+and local Docker access. Linux `/proc`, child subreapers and pidfds are required
+so the per-stage supervisor can own, signal and reap escaped descendants.
+Do not forward an SSH agent or install production Git
 credentials; use an operator-controlled read-only fetch method where needed.
 
 ```bash

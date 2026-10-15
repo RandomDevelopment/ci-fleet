@@ -16,6 +16,8 @@ import sys
 import tempfile
 import time
 
+from local_validation_supervisor import run as supervise_stage
+
 SHA = re.compile(r"[0-9a-f]{40}")
 NO_PRIOR = "0" * 40
 SUITE = "ci-fleet-local-v1"
@@ -62,52 +64,10 @@ def verify_checkout(root: Path, expected: dict) -> None:
             raise RuntimeError("checkout changed: unexpected " + str(root / path))
 
 
-def process_group_running(group: int) -> bool:
-    # Linux zombies have completed cleanup and cannot respond to another signal.
-    for path in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            fields = path.read_text().rsplit(")", 1)[1].split()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        if int(fields[2]) == group and fields[0] != "Z":
-            return True
-    return False
-
-
 def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> None:
     if not Path("/proc/self/stat").is_file():
         raise RuntimeError("Linux /proc is required for process cleanup")
-    with log.open("wb") as output:
-        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-        succeeded = False
-        forced = False
-        try:
-            code = process.wait(timeout=timeout)
-            if code:
-                raise RuntimeError(f"check exited {code}; see {log}")
-            succeeded = True
-        finally:
-            # Descendants must not outlive a failed or cancelled check.
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    # The shell can exit before its descendants finish cleanup.
-                    deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
-                    while time.monotonic() < deadline:
-                        process.poll()
-                        if not process_group_running(process.pid):
-                            break
-                        time.sleep(0.05)
-                finally:
-                    if process_group_running(process.pid):
-                        os.killpg(process.pid, signal.SIGKILL)
-                        forced = True
-            except ProcessLookupError:
-                pass
-            process.wait()
-            if succeeded and forced:
-                raise RuntimeError("check required forced termination; cleanup is incomplete")
+    supervise_stage(command, cwd, env, log, timeout, grace=CLEANUP_GRACE_SECONDS)
 
 
 def validate(args: argparse.Namespace) -> int:

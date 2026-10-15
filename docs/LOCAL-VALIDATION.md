@@ -28,8 +28,9 @@ status-receiver installation paths, installer metadata, and systemd unit markers
 including partial or dangling installations. That check cannot detect an unusually
 installed service, so the operator must verify the machine's role.
 
-Configuration runs need Linux with mounted `/proc`, Bash, Git, Python 3.11 or
-later, ShellCheck and OpenSSL. They do not require root or Docker. The core
+Configuration runs need Linux with mounted `/proc`, kernel support for child
+subreapers and pidfds, Bash, Git, Python 3.11 or later, ShellCheck and OpenSSL.
+They do not require root or Docker. The core
 configuration profile covers the embedded configuration contract. A standalone-template suite must additionally preserve
 its updater, compatibility and release tests under template issue
 [#32](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/32).
@@ -111,12 +112,17 @@ outside Git. A changed source, base, title, tag or policy requires a new run.
 Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
-Each stage has a 1,800-second timeout, configurable with `--timeout`. SIGINT and
-SIGTERM fail the current stage and signal its process group. Descendants have up
-to 60 seconds to finish cleanup before forced termination, even if the stage's
-shell exits first. A successful stage leader cannot hide descendants that require
-forced termination; that stage fails. Linux process checks ignore zombies that
-have already exited. The APT fixture handles termination through its resource
+Each stage has a 1,800-second timeout, configurable with `--timeout`. A separate
+Linux child-subreaper supervisor owns the stage's descendants, including children
+that create new sessions or double-fork. The orchestrator does not become a
+subreaper. On stage exit, timeout, SIGINT or SIGTERM, the supervisor signals owned
+descendants through pidfds and allows 60 seconds for cleanup before forced
+termination. It repeatedly discovers and reaps descendants until the kernel
+confirms that no children remain. A successful leader cannot hide descendants
+that require forced termination; that stage fails. The orchestrator waits for
+this cleanup before propagating cancellation. Unkillable kernel tasks can prevent
+cleanup from completing; discard the disposable machine in that case. External
+daemon work remains outside process ancestry. The APT fixture handles termination through its resource
 cleanup block. The harness removes temporary checkouts. A hard kill or power
 loss cannot guarantee cleanup. Use the report's
 run identity and the invocation-specific image tags to inspect leftovers, or

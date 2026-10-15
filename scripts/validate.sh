@@ -21,6 +21,8 @@ python3 -m py_compile \
   scripts/fixtures/fake-bootstrap-curl.py \
   scripts/verify_config_approval.py \
   scripts/test_config_approval.py \
+  scripts/local_validation_supervisor.py \
+  scripts/test_local_validation_supervisor.py \
   scripts/cleanup_networks.py \
   scripts/cleanup_storage.py \
   scripts/test_cleanup_storage.py \
@@ -49,6 +51,7 @@ python3 scripts/test_desired_state.py
 python3 scripts/test_apt_cache.py
 python3 scripts/test_config_approval.py
 python3 scripts/test_local_validation.py
+python3 scripts/test_local_validation_supervisor.py
 python3 scripts/test_cleanup_networks.py
 python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
