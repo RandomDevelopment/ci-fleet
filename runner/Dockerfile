@@ -39,13 +39,13 @@ RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-c
     && apt-get install -y --no-install-recommends ./docker-cli.deb ./compose.deb ./buildx.deb \
     && rm docker-cli.deb compose.deb buildx.deb \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 RUN useradd --create-home --no-log-init --uid 1001 --shell /bin/bash runner \
     && chage -d "$((SOURCE_DATE_EPOCH / 86400))" runner \
     && rm -f /etc/shadow- \
     && install -d -o runner -g runner /home/runner/_work \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 WORKDIR /home/runner
 RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \
@@ -61,7 +61,7 @@ RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-c
     && ./bin/installdependencies.sh \
     && chown -R runner:runner /home/runner \
     && rm -rf /var/log/apt/* /var/log/dpkg.log /var/cache/ldconfig/aux-cache \
-    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+    && find /etc /home /run /usr /var -xdev ! -path /etc/hostname ! -path /etc/hosts ! -path /etc/resolv.conf -newermt "@${SOURCE_DATE_EPOCH}" ! -path /etc/apt/apt.conf.d/99-ci-fleet-cache -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 ENV RUNNER_ALLOW_RUNASROOT=0
 USER runner

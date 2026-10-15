@@ -22,7 +22,8 @@ BUILDKIT = "moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd95
 
 
 def fixture_failure_details(output: bytes, max_lines=10) -> str:
-    text = output.decode(errors="replace")[-4096:]
+    # BuildKit repeats the Dockerfile after the useful failing instruction output.
+    text = output.decode(errors="replace").split("\nDockerfile:", 1)[0][-4096:]
     text = re.sub(r"https?://[^\s<>\"']+", "[URL]", text)
     text = re.sub(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", "[IP]", text)
     text = re.sub(r"(?<!\w)(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.%]*", "[IP]", text)
@@ -230,7 +231,7 @@ def main():
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             failure = str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout"
             if build_client:
-                result = cleanup("docker", "exec", build_client, "tail", "-n", "40", "/apt-build.log")
+                result = cleanup("docker", "exec", build_client, "tail", "-n", "200", "/apt-build.log")
                 details = fixture_failure_details((result.stdout + result.stderr).encode(), max_lines=40)
                 failure += f"\nAPT_CACHE_FIXTURE build\n{details}"
             if cache:

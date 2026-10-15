@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,34 @@ from test_apt_cache_e2e import fixture_failure_details
 
 
 class APTCacheTests(unittest.TestCase):
+    def test_image_timestamp_normalization_preserves_optional_secret(self):
+        epoch = 1786752000
+        for dockerfile, count in (('runner/Dockerfile', 3), ('controller/Dockerfile', 1)):
+            commands = [line.split('&& ', 1)[1] for line in (ROOT / dockerfile).read_text().splitlines()
+                        if '&& find /etc ' in line]
+            self.assertEqual(len(commands), count)
+            for command in commands:
+                for enabled in (False, True):
+                    with self.subTest(dockerfile=dockerfile, command=command, enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        for name in ('etc/apt/apt.conf.d', 'home', 'run', 'usr', 'var'):
+                            (root / name).mkdir(parents=True)
+                        ordinary = root / 'etc/apt/apt.conf.d/ordinary'
+                        ordinary.write_text('normalize this file')
+                        secret = root / 'etc/apt/apt.conf.d/99-ci-fleet-cache'
+                        if enabled:
+                            secret.write_text('temporary BuildKit secret')
+                            secret.chmod(0o400)
+                            original = secret.stat().st_mtime_ns
+                        arguments = shlex.split(command.replace('${SOURCE_DATE_EPOCH}', str(epoch)))
+                        arguments = [str(root / value.lstrip('/')) if value.startswith('/') else value for value in arguments]
+                        subprocess.run(arguments, check=True, capture_output=True)
+                        self.assertEqual(ordinary.stat().st_mtime, epoch)
+                        if enabled:
+                            self.assertEqual(secret.stat().st_mtime_ns, original)
+                        else:
+                            self.assertFalse(secret.exists())
+
     def test_fixture_build_trace_preserves_command_status_and_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -49,6 +78,13 @@ class APTCacheTests(unittest.TestCase):
             self.assertNotIn(value, details)
         self.assertIn('APT exited 100', details)
         self.assertLessEqual(len(details.splitlines()), 10)
+        details = fixture_failure_details(
+            b'#18 touch: read-only file system at http://192.0.2.1:3142\n'
+            b'Dockerfile:24\n' + b'Long repeated Dockerfile instruction\n' * 200,
+            max_lines=40)
+        self.assertIn('read-only file system', details)
+        self.assertNotIn('192.0.2.1', details)
+        self.assertNotIn('Long repeated', details)
 
     def test_shared_validation_cases(self):
         cases = json.loads((ROOT / "scripts/fixtures/apt-cache.json").read_text())
