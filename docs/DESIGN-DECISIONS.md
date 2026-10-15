@@ -1,5 +1,34 @@
 # Accepted design decisions
 
+## Opt-in pinned Chromium profile for the deployment broker
+
+The owner approved this repository capability on 2026-10-14 under [issue #130](https://github.com/RandomDevelopment/ci-fleet/issues/130).
+It becomes available only after this implementation passes exact-head review and
+CI and merges. The decision does not authorize host installation or production
+activation.
+
+Rootless application adapters may opt into the generic `chromium-v1` profile.
+The broker accepts only its canonical JSON digest, recorded in the
+[deployer contract](DEPLOYER-HOST.md#pinned-chromium-seccomp-profile), through the
+inline Docker API option. It never accepts an arbitrary profile, host filename,
+unconfined seccomp, additional capabilities or removal of no-new-privileges.
+Existing requests continue to use Docker's default seccomp policy.
+
+The reviewed profile derives from Playwright's Apache-2.0 Docker profile with
+`chroot` allowed for Chromium's sandbox. It permits `clone`, `setns` and `unshare`
+for user namespaces. This exposes more namespace-related kernel operations than
+the default Docker profile. Rootless Docker, private namespaces, no-new-privileges,
+cap-drop ALL, read-only root, scoped resources and network restrictions remain
+mandatory; they do not eliminate kernel vulnerabilities in those added calls.
+Keep Chromium's own sandbox enabled and verify actual execution in the adopter's
+disposable image checks before enabling the capability in an application adapter.
+
+There is no project-specific allowlist or host routing change. Each profile
+revision requires a separately reviewed digest and a new immutable core revision.
+Remove or narrow this capability when supported Chromium versions no longer need
+these additional calls, or when an equally functional profile with fewer permitted
+operations has passed the same review and real browser verification.
+
 The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) has an explicit [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) under [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It is proposed while PR #126 is open and accepted after that reviewed PR merges into `main`. It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. Implementation remains planned; it adds no runtime, schema field, or host activation and preserves the decisions below.
 
 ## Managed controller desired state after the isolated proof

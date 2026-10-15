@@ -34,6 +34,7 @@ CONTAINER_LIMITS = {"Memory": 2 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 2
 LABEL = "io.randomdevelopment.ci-fleet."
 IMAGE = re.compile(r"^[a-z0-9][a-z0-9.:-]*/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$")
 UNIT = re.compile(r"^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$")
+CHROMIUM_SECCOMP_V1_SHA256 = "f8f5cbe84f4135431d920e43e676b641d538ea24be76ddef4656a86015bac6e7"
 
 
 def require(condition: bool, message: str) -> None:
@@ -54,6 +55,22 @@ def decode(body: bytes) -> dict:
                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON number")))
     require(isinstance(value, dict), "request must be a JSON object")
     return value
+
+
+def security_options(value: object) -> bool:
+    if value in (["no-new-privileges"], ["no-new-privileges:true"]):
+        return True
+    if not isinstance(value, list) or len(value) != 2 or value[0] not in ("no-new-privileges", "no-new-privileges:true"):
+        return False
+    option = value[1]
+    if not isinstance(option, str) or not option.startswith("seccomp="):
+        return False
+    try:
+        profile = decode(option[len("seccomp="):].encode())
+        canonical = json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
+    except (ValueError, UnicodeError, RecursionError):
+        return False
+    return hashlib.sha256(canonical).hexdigest() == CHROMIUM_SECCOMP_V1_SHA256
 
 
 def protected_file(path: Path, uid: int = 0, *, adapter_fd: bool = False) -> bytes:
@@ -332,7 +349,7 @@ class Policy:
         require(host.get("GroupAdd") in (None, [], ["0"]), "only the rootless credential group may be added")
         require(host.get("Privileged", False) is False and not host.get("CapAdd")
                 and host.get("CapDrop") == ["ALL"] and host.get("ReadonlyRootfs") is True
-                and host.get("SecurityOpt") in (["no-new-privileges"], ["no-new-privileges:true"]),
+                and security_options(host.get("SecurityOpt")),
                 "container privilege restrictions are required")
         require(all(host.get(k, "") in ("", "private") for k in ("PidMode", "IpcMode", "UTSMode", "UsernsMode"))
                 and host.get("CgroupnsMode") == "private", "shared host namespaces are forbidden")
@@ -361,6 +378,14 @@ class Policy:
         image = self.backend.inspect("images", self.image)
         config = image.get("Config")
         require(isinstance(config, dict), "approved image configuration is unavailable")
+        if len(host["SecurityOpt"]) == 2:
+            user = value.get("User", "")
+            if user == "":
+                user = config.get("User", "")
+            user_id = user.split(":")[0] if isinstance(user, str) else ""
+            require(user_id not in ("", "root")
+                    and (not re.fullmatch(r"[+-]?[0-9]+", user_id) or int(user_id) > 0),
+                    "the Chromium profile requires a declared non-root container user")
         declared = config.get("Volumes") or {}
         require(isinstance(declared, dict), "invalid image volume declarations")
         mounted = {mount["Target"] for mount in host.get("Mounts", []) if mount["Type"] == "volume"}

@@ -75,7 +75,38 @@ Every Docker resource must carry four labels from the active policy: `io.randomd
 
 Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes. Scheduled health allows four minutes for prerequisite checks, the two-minute adapter and verified teardown; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
-The Docker API permits only the approved digest-pinned artifact, scoped internal bridge networks, local named volumes without driver options, and containers with positive limits capped at 2 GiB memory, two CPUs and 256 PIDs, private cgroups/namespaces, `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`. Host ports must bind loopback above port 1023. Build, exec, archive access, global pruning, arbitrary binds and alternate network attachments are rejected. Every image-declared volume destination must use a pre-created scoped labelled volume, so Docker cannot create anonymous volumes during container creation. The broker drops adapter-supplied registry authentication headers. Pulls use anonymous registry access; private artifacts must be preloaded by a separately authorized operator process. Adapters must use this contract rather than unrestricted Compose or host administration. Validation and health can only read; cleanup can only inspect and delete scoped resources.
+The Docker API permits only the approved digest-pinned artifact, scoped internal bridge networks, local named volumes without driver options, and containers with positive limits capped at 2 GiB memory, two CPUs and 256 PIDs, private cgroups/namespaces, `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`. The opt-in Chromium profile below is the only custom seccomp capability. Host ports must bind loopback above port 1023. Build, exec, archive access, global pruning, arbitrary binds and alternate network attachments are rejected. Every image-declared volume destination must use a pre-created scoped labelled volume, so Docker cannot create anonymous volumes during container creation. The broker drops adapter-supplied registry authentication headers. Pulls use anonymous registry access; private artifacts must be preloaded by a separately authorized operator process. Adapters must use this contract rather than unrestricted Compose or host administration. Validation and health can only read; cleanup can only inspect and delete scoped resources.
+
+### Pinned Chromium seccomp profile
+
+The default Docker seccomp policy remains unchanged when an adapter sends only
+`no-new-privileges`. An adapter may explicitly select `chromium-v1` by loading
+the reviewed [profile](../deploy/seccomp/chromium-v1.json) and supplying exactly:
+
+```python
+profile = json.loads(profile_path.read_text())
+security_options = ["no-new-privileges", "seccomp=" + json.dumps(profile)]
+```
+
+This is Docker's inline JSON seccomp option, not a daemon-side filename. The
+broker parses with duplicate-key and non-finite-number rejection, canonicalizes
+with `json.dumps(profile, sort_keys=True, separators=(",", ":"))`, and requires
+SHA-256 `f8f5cbe84f4135431d920e43e676b641d538ea24be76ddef4656a86015bac6e7`.
+Whitespace and JSON key order may vary; any changed policy content fails closed.
+No broker or installer file lookup is added. Host paths, `unconfined`, missing
+no-new-privileges and additional security options remain forbidden.
+
+The profile requires an explicit non-root `User` in the container request or
+the approved image configuration. An absent or empty request `User` inherits
+the image's declaration, as Docker does. An empty resulting user, `root` and zero
+UID declarations are rejected. Review named users in the approved image and verify the actual runtime
+UID; a username declaration alone does not attest the image's passwd contents.
+The profile permits Chromium's user-namespace sandbox operations while retaining
+the profile's default deny action and the broker's other containment limits.
+Chromium must remain non-root and launch with its sandbox enabled. Actual browser
+execution must pass on the intended kernel/rootless Docker combination; accepting
+a profile does not prove kernel or AppArmor compatibility. See the
+[security decision and risks](DESIGN-DECISIONS.md#opt-in-pinned-chromium-profile-for-the-deployment-broker).
 
 Core supplies `CI_FLEET_DEPLOYER_CONFIG` and optional `CI_FLEET_DEPLOYER_REQUEST` as private credential copies. `CREDENTIAL_REF` in that config names the adapter-readable application credential. To bind it into a container, use `CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL` as the source and a read-only destination below `/run/secrets/`. Core materializes a durable copy under `/var/lib/ci-fleet-deployer-container-credentials`, keyed by target, daemon identity and credential contents. Credential stores and bind sources reject access/default ACLs so inherited entries cannot grant another principal secret access. The directory and file remain root-owned; only the dedicated daemon group can traverse the entry and read its mode-0440 credential. Containers with a non-root image user can add numeric group zero in the rootless namespace. These sources survive adapter completion and reboot. Rotation creates a new immutable source and preserves earlier sources for existing containers and rollback. Before consuming approval, deployment validates credential references from both the deployed snapshot and retained last-known-good policy. Retain their protected credential files while either policy needs them. Uninstall retains them. An operator may retire a source only after proving no container or retained recovery point references it. External providers must materialize the approved credential into the protected host-local file before invocation; direct external-provider access is unsupported by the private-network sandbox.
 

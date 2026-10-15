@@ -16,3 +16,11 @@ The project interoperates with:
 
 The original code in this repository is released under the Unlicense as stated
 in `LICENSE`. The Unlicense does not replace third-party license notices.
+
+`deploy/seccomp/chromium-v1.json` is derived from Playwright's
+`utils/docker/seccomp_profile.json` at commit
+`39e3553a4f283a41134d75d7e404484bd9e6865a`, with `chroot` added to the allowed
+system calls for Chromium's sandbox. Copyright Microsoft Corporation and
+contributors. The source is licensed under Apache License 2.0; the license is
+preserved in `deploy/seccomp/LICENSE`. This third-party profile remains under
+that license rather than the Unlicense.
