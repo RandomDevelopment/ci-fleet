@@ -24,6 +24,9 @@ def main():
     prefix = "ci-fleet-apt-test-" + uuid.uuid4().hex[:12]
     runner_image = os.environ.get("CI_FLEET_RUNNER_IMAGE", "ci-fleet-runner:dev")
     controller_image = os.environ.get("CI_FLEET_CONTROLLER_IMAGE", "ci-fleet-controller:dev")
+    runner_definition = (ROOT / "runner/Dockerfile").read_text().splitlines()
+    base_image = next(line.split()[1] for line in runner_definition if line.startswith("FROM "))
+    snapshot = next(line.split("=", 1)[1] for line in runner_definition if line.startswith("ARG DEBIAN_SNAPSHOT="))
     containers, images, builders = [], [], []
     build_client = None
     measurements = []
@@ -75,7 +78,7 @@ def main():
             cache = prefix + "-cache"
             containers.append(cache)
             run("docker", "run", "-d", "--name", cache, tools_image)
-            address = run("docker", "inspect", "--format", "{{.NetworkSettings.IPAddress}}", cache)
+            address = run("docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", cache)
             proxy = f"http://{address}:3142"
             secret = temporary / "apt.conf"
             secret.write_text(apt_config(proxy))
@@ -91,7 +94,7 @@ def main():
             # Readiness may not create a transfer log until the first APT request.
             run("docker", "exec", cache, "touch", "/var/log/apt-cacher-ng/apt-cacher.log")
             step = "fresh runner package installs"
-            install = "apt-get update && apt-get install -y --no-install-recommends hello"
+            install = "apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends hello"
             for index in range(2):
                 client = prefix + f"-runner-{index}"
                 containers.append(client)
@@ -126,9 +129,11 @@ def main():
                 "# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf\n"
                 "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nUSER root\n"
                 "RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache "
-                + install + "\n")
+                "rm -f /etc/apt/sources.list.d/debian.sources "
+                f"&& printf 'deb http://snapshot.debian.org/archive/debian/{snapshot} trixie main\\n' >/etc/apt/sources.list "
+                "&& " + install + "\n")
             run("docker", "cp", str(context), client + ":/context")
-            args = ["--no-cache", "--build-arg", "BASE_IMAGE=" + runner_image,
+            args = ["--no-cache", "--build-arg", "BASE_IMAGE=" + base_image,
                     "--secret", "id=ci_fleet_apt,src=/etc/apt/apt.conf.d/99-ci-fleet-cache"]
             for path in ("docker", "compose", "buildx"):
                 step = path + " build"
@@ -136,7 +141,7 @@ def main():
                 images.append(tag)
                 if path == "compose":
                     compose = dict(services={"test": dict(image=tag, build=dict(context="/context",
-                                   args=dict(BASE_IMAGE=runner_image), secrets=["ci_fleet_apt"]))},
+                                   args=dict(BASE_IMAGE=base_image), secrets=["ci_fleet_apt"]))},
                                    secrets={"ci_fleet_apt": dict(file="/etc/apt/apt.conf.d/99-ci-fleet-cache")})
                     compose_file = temporary / "compose.json"
                     compose_file.write_text(json.dumps(compose))
