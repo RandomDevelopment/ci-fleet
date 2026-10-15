@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-runtime=$repo_root/scripts/tester-runtime.sh
-installer=$repo_root/scripts/install-tester.sh
 tmp=$(mktemp -d)
 cleanup() { chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf "$tmp"; }
 trap cleanup EXIT
+# Installer clean-tree checks may refresh the Git index under a private umask.
+fixture_repo=$tmp/core
+git init -q "$fixture_repo"
+git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" rev-parse HEAD)"
+git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
+git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
+repo_root=$fixture_repo
+runtime=$repo_root/scripts/tester-runtime.sh
+installer=$repo_root/scripts/install-tester.sh
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 root=$tmp/root
 fake_bin=$tmp/bin

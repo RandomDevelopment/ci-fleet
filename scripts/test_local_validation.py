@@ -336,7 +336,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_mutable_installer_fixture_setup_preserves_source_git_and_tracked_edits(self):
         from local_validate import checkout_manifest
-        for script in ("test-install-worker-controller.sh", "test-install-deployer.sh"):
+        for script in ("test-install-worker-controller.sh", "test-install-deployer.sh", "test-install-tester.sh"):
             with self.subTest(script=script), tempfile.TemporaryDirectory() as temporary:
                 text = (ROOT / "scripts" / script).read_text()
                 start = text.index("fixture_repo=$tmp/core\n")
@@ -352,6 +352,8 @@ class RunnerTests(unittest.TestCase):
                 git(source, "config", "user.email", "test@example.invalid")
                 (source / "tracked").write_text("initial\n")
                 (source / "binary").write_bytes(b"initial\x00bytes")
+                cached = source / "stat-cache-only"
+                cached.write_text("unchanged\n")
                 git(source, "add", "."); git(source, "commit", "-qm", "feat: initial source")
                 (source / "tracked").write_text("committed\n")
                 git(source, "add", "."); git(source, "commit", "-qm", "fix: second source commit")
@@ -360,9 +362,11 @@ class RunnerTests(unittest.TestCase):
                 git(source, "add", "tracked")
                 (source / "tracked").write_text("staged and unstaged\n")
                 (source / "binary").write_bytes(b"changed\x00bytes")
+                previous = cached.stat()
+                os.utime(cached, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
                 expected = checkout_manifest(source)
-                subprocess.run(["bash", "-euo", "pipefail", "-c", setup], check=True, capture_output=True,
-                               env={**os.environ, "repo_root": str(source), "tmp": str(fixture_root)})
+                subprocess.run(["bash", "-euo", "pipefail", "-c", "umask 077\n" + setup], check=True, capture_output=True,
+                               env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "repo_root": str(source), "tmp": str(fixture_root)})
                 fixture = fixture_root / "core"
                 self.assertEqual(git(fixture, "rev-parse", "HEAD"), head)
                 self.assertEqual(git(fixture, "rev-list", "--count", "HEAD"), "2")
@@ -373,6 +377,13 @@ class RunnerTests(unittest.TestCase):
                 git(fixture, "replace", head, replacement)
                 self.assertEqual(checkout_manifest(source), expected)
                 git(fixture, "replace", "-d", head)
+                self.assertEqual(checkout_manifest(source), expected)
+                git(fixture, "reset", "--hard", head)
+                cached = fixture / "stat-cache-only"
+                previous = cached.stat()
+                os.utime(cached, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+                subprocess.run(["bash", "-euc", 'umask 077; git -C "$1" diff --quiet', "fixture", str(fixture)],
+                               check=True, capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
                 self.assertEqual(checkout_manifest(source), expected)
 
     def test_missing_procfs_fails_before_execution(self):
