@@ -14,6 +14,9 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/apt_cache.py \
+  scripts/test_apt_cache.py \
+  scripts/test_apt_cache_e2e.py \
   scripts/bootstrap-github-callback.py \
   scripts/fixtures/fake-bootstrap-curl.py \
   scripts/verify_config_approval.py \
@@ -43,6 +46,7 @@ python3 -m py_compile \
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
+python3 scripts/test_apt_cache.py
 python3 scripts/test_config_approval.py
 python3 scripts/test_local_validation.py
 python3 scripts/test_cleanup_networks.py
@@ -122,6 +126,7 @@ docker compose -f deploy/compose.yaml config --format json | python3 -c 'import 
 
 docker compose -f deploy/compose.yaml build runner-image controller
 docker run --name "${CI_FLEET_VALIDATION_ID:-ci-fleet-validation}-runner-inspect" --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+python3 scripts/test_apt_cache_e2e.py
 bash scripts/test-cleanup-e2e.sh
 CI_FLEET_INSTANCE=${CI_FLEET_VALIDATION_ID:-validation} scripts/cleanup.sh
 

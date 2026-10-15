@@ -110,6 +110,8 @@ The configuration repository credential, when required, must be read-only and ho
 
 ## 7. Prove one job
 
+Hosts with an existing apt-cacher-ng server may opt into [APT cache support](APT-CACHE.md) after selecting a compatible engine and manager. Keep the endpoint in root-owned host configuration. Support is disabled by default and leaves host APT settings unchanged.
+
 Confirm no runner exists while idle. Dispatch one manual, read-only job from an authorized private project and verify:
 
 - one ephemeral runner appears;

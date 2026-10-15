@@ -132,7 +132,7 @@ when a base change changes the proposed tree.
 | Secret scan of every proposed committed blob | Pinned `scan_committed_secrets.py`, including removed intermediate secrets |
 | ShellCheck and documentation links | Local stages against the source checkout |
 | Python, task-plan, installer, systemd, recovery and security tests | Pinned `validate.sh --quick`, with named tests in its log |
-| Compose validation, image builds, inert runner and cleanup outcomes | Pinned `validate.sh --containers` |
+| Compose validation, image builds, APT cache reuse/image-ID parity, inert runner and cleanup outcomes | Pinned `validate.sh --containers` |
 | Embedded schema, policy, multi-host and initializer checks | Pinned `validate-template.sh` |
 
 The engine workflow calls the full local entry point and preserves the

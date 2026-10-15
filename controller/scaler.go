@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -134,6 +133,10 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("generate JIT config: %w", err)
 	}
 	now := time.Now().UTC()
+	environment := []string{"ACTIONS_RUNNER_INPUT_JITCONFIG=" + jit.EncodedJITConfig, "DOCKER_HOST=unix:///run/ci-fleet/locks/docker.sock"}
+	if s.config.APTHTTPProxy != "" {
+		environment = append(environment, "CI_FLEET_APT_CONFIG="+runnerAPTConfig)
+	}
 	labels := map[string]string{
 		labelPrefix + "managed":    "true",
 		labelPrefix + "kind":       "runner",
@@ -145,7 +148,7 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 	created, err := s.dockerClient.ContainerCreate(ctx,
 		&container.Config{
 			Image: s.config.RunnerImage, User: "runner", Cmd: []string{"/home/runner/run.sh"},
-			Env: []string{"ACTIONS_RUNNER_INPUT_JITCONFIG=" + jit.EncodedJITConfig, "DOCKER_HOST=unix:///run/ci-fleet/locks/docker.sock"}, Labels: labels,
+			Env: environment, Labels: labels,
 		},
 		&container.HostConfig{
 			Binds:       []string{"/run/lock/ci-fleet:/run/ci-fleet/locks", hostDockerProxySocket + ":/var/run/docker.sock"},
@@ -156,6 +159,10 @@ func (s *Scaler) startRunner(ctx context.Context) (string, error) {
 		}, nil, nil, name)
 	if err != nil {
 		return "", fmt.Errorf("create runner container: %w", err)
+	}
+	if err := s.configureRunnerAPT(ctx, created.ID); err != nil {
+		_ = s.dockerClient.ContainerRemove(context.WithoutCancel(ctx), created.ID, container.RemoveOptions{Force: true})
+		return "", err
 	}
 	if err := s.dockerClient.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
 		_ = s.dockerClient.ContainerRemove(context.WithoutCancel(ctx), created.ID, container.RemoveOptions{Force: true})
@@ -275,7 +282,9 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string, force bool) 
 	logs, err := s.dockerClient.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true, Timestamps: true, Tail: "2000"})
 	if err == nil {
 		_, _ = fmt.Fprintf(os.Stdout, "--- runner log: %s ---\n", name)
-		_, _ = io.Copy(os.Stdout, logs)
+		if err := s.copyRunnerLogs(os.Stdout, logs); err != nil {
+			s.logger.Warn("runner log collection incomplete", "runner", name)
+		}
 		_ = logs.Close()
 	} else {
 		s.logger.Warn("could not collect runner logs", "runner", name, "error", err)
