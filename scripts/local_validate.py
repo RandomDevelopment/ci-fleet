@@ -45,16 +45,21 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> No
 def validate(args: argparse.Namespace) -> int:
     repo = args.repository.resolve()
     policy_repo = (args.policy_repository or repo).resolve()
-    for origin, value in ((repo, args.source), (repo, args.base), (policy_repo, args.policy), (repo, args.main)):
+    reviewed_head = args.reviewed_head or args.source
+    for origin, value in ((repo, args.source), (repo, reviewed_head), (repo, args.base), (policy_repo, args.policy), (repo, args.main)):
         if not SHA.fullmatch(value) or git(origin, "rev-parse", value + "^{commit}") != value:
             raise ValueError("source, base, policy and main must be full available commit SHAs")
     if git(repo, "rev-parse", "--is-shallow-repository") != "false":
         raise ValueError("complete Git history is required")
     subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, args.source], check=True)
+    if reviewed_head != args.source:
+        subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", args.base, reviewed_head], check=True)
+        if git(repo, "rev-parse", args.source + "^{tree}") != git(repo, "rev-parse", reviewed_head + "^{tree}"):
+            raise ValueError("integrated and reviewed source trees differ")
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     report = {"schema_version": 1, "suite": SUITE if args.kind == "engine" else "ci-fleet-config-local-v1", "profile": args.profile,
-              "source": args.source, "tree": git(repo, "rev-parse", args.source + "^{tree}"),
+              "source": args.source, "reviewed_head": reviewed_head, "tree": git(repo, "rev-parse", args.source + "^{tree}"),
               "base": args.base, "policy": args.policy, "main": args.main,
               "pr_title": args.pr_title, "tag": args.tag, "tag_created": args.tag_created,
               "started_at": int(time.time()), "expected_skips": [], "tools": {}, "results": [], "status": "incomplete"}
@@ -67,6 +72,8 @@ def validate(args: argparse.Namespace) -> int:
             source, policy = root / "source", root / "policy"
             for target, commit, origin in ((source, args.source, repo), (policy, args.policy, policy_repo)):
                 subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-checkout", str(origin), str(target)], check=True)
+                identities = [args.source, args.base, args.main, reviewed_head] if target == source else [args.policy]
+                subprocess.run(["git", "-C", str(target), "fetch", "--quiet", "--no-tags", "origin", *identities], check=True)
                 subprocess.run(["git", "-C", str(target), "checkout", "--quiet", "--detach", commit], check=True)
                 if target == source:
                     subprocess.run(["git", "-C", str(target), "update-ref", "refs/remotes/origin/main", args.main], check=True)
@@ -105,10 +112,15 @@ def validate(args: argparse.Namespace) -> int:
                 checks.append(("tag", ["python3", validator, "--version", args.tag, "--tag-commit", args.source,
                                        "--base", history_base, "--head", args.source, "--exclude-tag", args.tag]))
             report["history_base"] = history_base
-            checks.append(("commits", ["python3", validator, "--base", history_base, "--head", args.source]))
-            commits = git(source, "rev-list", "--reverse", history_base + ".." + args.source if history_base else args.source).splitlines()
-            if args.source not in commits:
-                commits.append(args.source)
+            heads = list(dict.fromkeys((args.source, reviewed_head)))
+            checks.append(("commits", ["python3", "-c",
+                "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--base', sys.argv[2], '--head', h], check=True) for h in sys.argv[3:]]",
+                validator, history_base, *heads]))
+            commits = []
+            for head in heads:
+                commits.extend(git(source, "rev-list", "--reverse", history_base + ".." + head if history_base else head).splitlines())
+                commits.append(head)
+            commits = list(dict.fromkeys(commits))
             checks.append(("history-secrets", ["python3", "-c",
                 "import subprocess, sys; [subprocess.run([sys.executable, sys.argv[1], '--repository', sys.argv[2], '--commit', c], check=True) for c in sys.argv[3:]]",
                 scanner, str(source), *commits]))
@@ -161,6 +173,7 @@ def main() -> int:
     parser.add_argument("--repository", type=Path, default=Path.cwd())
     for name in ("source", "base", "policy", "main"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--reviewed-head", help="original reviewed head when validating an integrated merge or squash commit")
     parser.add_argument("--pr-title")
     parser.add_argument("--tag")
     parser.add_argument("--tag-created", action="store_true")

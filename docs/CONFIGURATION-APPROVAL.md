@@ -203,7 +203,7 @@ names, Ed25519 public key, protected evidence directory and maximum age. Its
 canonical JSON SHA-256 binds every policy field into the signed evidence. Key
 rotation, reviewer changes, a different suite or any other policy change
 invalidates earlier evidence. A result must name the exact integrated commit,
-its tree and first parent, the PR number and current reviewed head. All stages
+its tree and first parent, the original reviewed history, the PR number and current reviewed head. All stages
 must pass with no skips. Future timestamps and evidence older than the policy
 limit reject acceptance. The installed-baseline ancestry rules continue to
 reject rollback replay; rechecking the same installed commit for drift remains

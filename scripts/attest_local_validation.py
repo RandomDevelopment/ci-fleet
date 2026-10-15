@@ -30,6 +30,7 @@ def main() -> int:
     require(result.get("profile") == "full" and result.get("status") == "passed" and result.get("expected_skips") == []
             and result.get("policy") == local["validator_revision"] and result.get("suite") == local["suite"],
             "a full run of the pinned validator is required")
+    require(result.get("reviewed_head") == args.reviewed_head, "reviewed head differs from the executed suite")
     checks = result["results"]
     require(len(checks) == len(local["required_checks"]) and {c["name"] for c in checks} == set(local["required_checks"]),
             "local check coverage differs")

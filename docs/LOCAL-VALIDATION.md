@@ -94,24 +94,27 @@ Use the same trusted engine orchestrator with a separate source repository:
 ```bash
 python3 /trusted/ci-fleet/scripts/local_validate.py \
   --kind configuration --repository /work/private-config \
-  --source APPLIED_SHA --base FIRST_PARENT_SHA --main APPLIED_SHA \
+  --source APPLIED_SHA --reviewed-head REVIEWED_HEAD_SHA \
+  --base FIRST_PARENT_SHA --main APPLIED_SHA \
   --policy-repository /trusted/ci-fleet --policy REVIEWED_ENGINE_SHA \
   --output /results/config-run
 ```
 
 This runs conventional-commit policy, trusted committed-history secret scanning,
-syntax checks, pinned-policy rejection tests against public fixtures, strict source validation against the
-base's prior configuration and rollout evidence, reference configurations and
-initializer positive/negative checks. The strict validator and its reference schema come from the independently
-pinned engine, so candidate validator changes cannot waive host policy. Source
+syntax checks, pinned-policy rejection tests against public fixtures, strict
+source validation against the base's prior configuration and rollout evidence,
+reference configurations and initializer positive/negative checks. The strict
+validator and its reference schema come from the independently pinned engine, so candidate validator changes cannot waive host policy. Source
 policy tests are exercised as engine/template development, while initialized
-configuration runs use the pinned public fixtures. It reads prior files from Git blobs, not
-from mutable temporary files belonging to another run. Initialized adopters
+configuration runs use the pinned public fixtures. It reads prior files from Git
+blobs, not from mutable temporary files belonging to another run. Initialized adopters
 must pass strict policy; public fictional fixtures remain non-strict in the
 engine's embedded-template tests.
 
 A merged or squash commit must obtain its own full configuration result with
-its first parent as base. Reviewed-head results alone do not authorize the new
+its first parent as base and `--reviewed-head` naming the original reviewed head.
+The trees must match. Commit policy and secret scanning cover both histories,
+including a secret removed before a squash. Reviewed-head results alone do not authorize the new
 commit, even when its tree matches. Every integrated commit after the installed
 baseline needs its own result and review evidence. Reconcile and repeat review
 when a base change changes the proposed tree.

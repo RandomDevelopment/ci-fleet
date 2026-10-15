@@ -429,7 +429,7 @@ def verify_local_evidence(policy: dict[str, Any], commit: str, tree: str, parent
             and value["pull_request"] == number and value["reviewed_head"] == head, "local evidence context differs")
     report = value["result"]
     require(isinstance(report, dict) and report.get("source") == commit and report.get("tree") == tree
-            and report.get("base") == parent and report.get("policy") == local["validator_revision"]
+            and report.get("base") == parent and report.get("reviewed_head") == head and report.get("policy") == local["validator_revision"]
             and report.get("suite") == local["suite"] and report.get("profile") == "full"
             and report.get("status") == "passed" and report.get("expected_skips") == []
             and type(report.get("schema_version")) is int and report["schema_version"] == 1, "local validation is incomplete or has different identities")

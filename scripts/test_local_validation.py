@@ -45,7 +45,7 @@ class LocalEvidenceTests(unittest.TestCase):
         self.now = int(time.time())
         self.payload = {"schema_version": 1, "policy_sha256": policy_digest(self.policy), "repository_id": 101,
             "branch": "main", "pull_request": 8, "reviewed_head": HEAD,
-            "result": {"schema_version": 1, "source": COMMIT, "tree": TREE, "base": PARENT, "policy": "9" * 40,
+            "result": {"schema_version": 1, "source": COMMIT, "reviewed_head": HEAD, "tree": TREE, "base": PARENT, "policy": "9" * 40,
                 "suite": "ci-fleet-config-local-v1", "profile": "full", "status": "passed", "expected_skips": [],
                 "started_at": self.now - 20, "finished_at": self.now - 1, "tools": {"python": "Python fixture"},
                 "results": [{"name": "configuration", "status": "passed", "sha256": hashlib.sha256(self.log.read_bytes()).hexdigest()}]}}
@@ -93,7 +93,7 @@ class LocalEvidenceTests(unittest.TestCase):
     def test_every_identity_and_incomplete_result_fails_even_with_valid_signature(self):
         changes = [((), "repository_id", 999), ((), "branch", "other"), ((), "pull_request", 99),
                    ((), "reviewed_head", PARENT), ((), "policy_sha256", "0" * 64)]
-        for field, value in (("source", HEAD), ("tree", HEAD), ("base", HEAD), ("policy", HEAD),
+        for field, value in (("source", HEAD), ("reviewed_head", PARENT), ("tree", HEAD), ("base", HEAD), ("policy", HEAD),
                              ("suite", "other"), ("profile", "quick"), ("status", "failed"),
                              ("expected_skips", ["configuration"]), ("tools", {}), ("results", []),
                              ("started_at", self.now - 4000), ("finished_at", self.now + 1)):
@@ -284,6 +284,19 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["results"][-1]["name"], "history-secrets")
         self.assertEqual(report["results"][-1]["status"], "failed")
 
+    def test_integrated_squash_scans_removed_secrets_in_reviewed_history(self):
+        (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden filename")
+        (self.repo / ".env").unlink()
+        reviewed = self.commit("fix: remove forbidden filename")
+        self.git("checkout", "-b", "integrated", self.base)
+        self.git("read-tree", "--reset", "-u", reviewed)
+        integrated = self.commit("fix: integrate reviewed source tree")
+        result, report = self.validate("--reviewed-head", reviewed, source=integrated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(report["reviewed_head"], reviewed)
+        self.assertEqual(report["results"][-1]["name"], "history-secrets")
+
     def test_tag_update_invalid_version_and_stable_branch_policy(self):
         for args in (("--tag", "v0.1.0"), ("--tag", "v0.1.0-01", "--tag-created"),
                      ("--tag", "v0.1.0", "--tag-created")):
@@ -314,7 +327,7 @@ class PolicyExecutionTests(unittest.TestCase):
         output = self.root / "missing-tool-run"
         args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source, base=self.base,
             policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
-            pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
+            pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
         with patch("local_validate.subprocess.check_output", side_effect=missing_tool), patch("sys.stderr", io.StringIO()):
             self.assertEqual(local_validate.validate(args), 1)
         report = json.loads((output / "result.json").read_text())
