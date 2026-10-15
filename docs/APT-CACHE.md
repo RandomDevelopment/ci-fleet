@@ -141,7 +141,9 @@ environment, which may still have a cache enabled.
 Platform validation errors and status metadata omit endpoints. Cache-enabled
 managed builds suppress raw build output because package tools may print
 connection addresses. Controller runner-log forwarding redacts the configured
-origin, hostname, and exact bypass hosts, and stops on lines larger than 1 MiB.
+origin, hostname, and exact bypass hosts after decoding Docker log frames. This
+also covers a hostname split across frames. Forwarding stops on lines larger
+than 1 MiB.
 Arbitrary job commands, APT error output, and cache server logs can still reveal
 network details. Keep those records private and share only safe aggregate evidence.
 
