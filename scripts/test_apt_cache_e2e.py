@@ -37,7 +37,7 @@ def main():
     base_image = next(line.split()[1] for line in runner_definition if line.startswith("FROM "))
     snapshot = next(line.split("=", 1)[1] for line in runner_definition if line.startswith("ARG DEBIAN_SNAPSHOT="))
     containers, images, builders = [], [], []
-    build_client = None
+    build_client = cache = None
     measurements = []
     with tempfile.TemporaryDirectory(prefix=prefix) as directory:
         temporary = Path(directory)
@@ -226,7 +226,17 @@ def main():
             run("docker", "exec", client, "apt-get", "-o", "Dir::Etc::sourcelist=/https.list",
                 "-o", "Dir::Etc::sourceparts=-", "update", timeout=120)
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
-            raise SystemExit(str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout") from None
+            failure = str(exc) if isinstance(exc, RuntimeError) else f"APT_CACHE_E2E_FAILED step={step} timeout"
+            if cache:
+                for name, command in (
+                    ("state", ["docker", "inspect", "--format", "{{.State.Status}}/{{.State.ExitCode}}/oom={{.State.OOMKilled}}", cache]),
+                    ("server", ["docker", "logs", "--tail", "10", cache]),
+                    ("errors", ["docker", "exec", cache, "tail", "-n", "10", "/var/log/apt-cacher-ng/apt-cacher.err"]),
+                ):
+                    result = cleanup(*command)
+                    details = fixture_failure_details((result.stdout + result.stderr).encode())
+                    failure += f"\nAPT_CACHE_FIXTURE {name}\n{details}"
+            raise SystemExit(failure) from None
         finally:
             if build_client:
                 # Builder registrations live in this fresh client, not in the host CLI.

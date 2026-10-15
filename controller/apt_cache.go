@@ -71,7 +71,7 @@ func aptCacheConfig(proxy, noProxy string) (string, error) {
 			return "", fmt.Errorf("CI_FLEET_NO_PROXY must contain at most 64 comma-separated DNS names or IPv4 addresses")
 		}
 	}
-	content := fmt.Sprintf("Acquire::http::Proxy %q;\nAcquire::https::Proxy \"DIRECT\";\nAcquire::http::Timeout \"10\";\nAcquire::Retries \"0\";\nAPT::Update::Error-Mode \"any\";\n", proxy)
+	content := fmt.Sprintf("Acquire::http::Proxy %q;\nAcquire::https::Proxy \"DIRECT\";\nAcquire::http::Timeout \"10\";\nAcquire::Retries \"2\";\nAPT::Update::Error-Mode \"any\";\n", proxy)
 	for _, host := range hosts {
 		content += fmt.Sprintf("Acquire::http::Proxy::%s \"DIRECT\";\n", host)
 	}

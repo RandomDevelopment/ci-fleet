@@ -46,7 +46,7 @@ def apt_config(proxy: str, no_proxy: str = "") -> str:
     if len(hosts) > 64 or any(not valid_host(host) or ":" in host for host in hosts):
         raise ValueError("CI_FLEET_NO_PROXY must contain at most 64 comma-separated DNS names or IPv4 addresses")
     lines = [f'Acquire::http::Proxy "{proxy}";', 'Acquire::https::Proxy "DIRECT";',
-             'Acquire::http::Timeout "10";', 'Acquire::Retries "0";',
+             'Acquire::http::Timeout "10";', 'Acquire::Retries "2";',
              'APT::Update::Error-Mode "any";']
     lines += [f'Acquire::http::Proxy::{host} "DIRECT";' for host in hosts]
     return "\n".join(lines) + "\n"

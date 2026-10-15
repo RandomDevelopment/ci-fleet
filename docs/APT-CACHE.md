@@ -124,10 +124,12 @@ provide shared package caching. The fleet does not rewrite sources, downgrade
 HTTPS, intercept TLS, or disable signatures. Cache-specific repository URL
 mechanisms require separately reviewed project configuration and tests.
 
-Enabled configurations set a ten-second HTTP connection/data timeout, zero APT
-retries, and make `apt-get update` fail when an index fails. This bounds individual
-operations, not total time across many repositories. Jobs retain their five-minute
-timeout. An outage fails the APT operation. There is no automatic direct fallback.
+Enabled configurations set a ten-second HTTP connection/data timeout and two APT
+retries. Retries allow recovery from transient disconnects during concurrent
+apt-cacher-ng metadata requests. `apt-get update` fails if an index still cannot
+be fetched. These limits bound individual attempts, not total time across many
+repositories. Jobs retain their five-minute timeout. A persistent outage fails
+the APT operation. There is no automatic direct fallback.
 
 To disable, remove both variables and apply the normal upgrade procedure. New
 runners have no generated cache file or path variable, and new managed builds
