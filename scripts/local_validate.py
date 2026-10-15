@@ -94,9 +94,11 @@ def validate(args: argparse.Namespace) -> int:
                     raise ValueError("engine validation requires --disposable-host on an isolated disposable Docker host")
                 if args.profile == "full":
                     tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
-                # Fixtures and Docker access must never reach an active installed fleet.
-                if any(Path(p).exists() for p in ("/etc/ci-fleet", "/var/lib/ci-fleet/install-state.json")):
-                    raise ValueError("validation refuses an installed fleet host")
+            # Neither profile may execute candidate code on an installed fleet role.
+            installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status")
+            if any(Path(parent, role).exists() or Path(parent, role).is_symlink()
+                   for parent in ("/etc", "/var/lib", "/opt") for role in installed):
+                raise ValueError("validation refuses an installed fleet host")
             if args.kind == "engine" and (os.geteuid() != 0 or not Path("/dev/shm").is_dir()):
                 raise ValueError("complete fixture coverage requires root and /dev/shm on an isolated execution host")
             for name, command in tools.items():

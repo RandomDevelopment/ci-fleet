@@ -18,7 +18,8 @@ also requires Docker Engine, Compose v2 and access to its local Unix socket.
 The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem
-check also rejects standard installed fleet paths. That check cannot detect an
+check in both profiles also rejects standard controller, tester, deployer and
+status-receiver installation paths, including partial or dangling installations. That check cannot detect an
 unusually installed service, so the operator must verify the machine's role.
 
 Configuration runs need Bash, Git, Python, ShellCheck and OpenSSL and do not

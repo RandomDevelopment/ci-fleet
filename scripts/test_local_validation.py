@@ -330,6 +330,24 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
+    def test_both_profiles_reject_installed_controller_tester_and_deployer_hosts(self):
+        import argparse
+        import local_validate
+        exists = Path.exists
+        for kind in ("engine", "configuration"):
+            for marker in ("/etc/ci-fleet", "/etc/ci-fleet-deployer", "/var/lib/ci-fleet-tester", "/opt/ci-fleet-status"):
+                with self.subTest(kind=kind, marker=marker):
+                    output = self.root / ("installed-" + kind + marker.replace("/", "-"))
+                    args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                        base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
+                        pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
+                    with patch("local_validate.Path.exists", side_effect=lambda path: str(path) == marker or exists(path), autospec=True), \
+                         patch("sys.stderr", io.StringIO()):
+                        self.assertEqual(local_validate.validate(args), 1)
+                    report = json.loads((output / "result.json").read_text())
+                    self.assertIn("installed fleet host", report["error"])
+                    self.assertEqual(report["results"], [])
+
     def test_missing_tool_records_incomplete_failure(self):
         import argparse
         import local_validate
