@@ -31,7 +31,7 @@ package repositories:
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
   bash git python3 python3-yaml shellcheck openssl coreutils util-linux \
-  curl ca-certificates systemd
+  curl jq ca-certificates systemd
 ```
 
 Install Docker Engine and Compose v2 through your reviewed Linux host procedure,

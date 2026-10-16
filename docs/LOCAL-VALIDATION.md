@@ -18,8 +18,10 @@ separate from repository validation.
 Use a disposable Debian 13 or Ubuntu 24.04 Linux execution machine. Engine
 fixtures require root, `runuser`, mounted `/proc` and `/dev/shm`, Bash, Git with complete history,
 Python 3.11 or later, PyYAML, ShellCheck, OpenSSL with Ed25519 support,
-coreutils, util-linux, curl and standard systemd utilities. The full engine run
-also requires Docker Engine, Compose v2 and access to its local Unix socket.
+coreutils, util-linux, curl, jq and standard systemd utilities. Both engine profiles
+check for jq before running stages because the installer fixtures require it.
+The full engine run also requires Docker Engine, Compose v2 and access to its local
+Unix socket.
 The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem

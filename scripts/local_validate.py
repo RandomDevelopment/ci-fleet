@@ -213,6 +213,7 @@ def validate(args: argparse.Namespace) -> int:
             if args.kind == "engine":
                 if not args.disposable_host:
                     raise ValueError("engine validation requires --disposable-host on an isolated disposable Docker host")
+                tools["jq"] = ["jq", "--version"]
                 if args.profile == "full":
                     tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
             # Neither profile may execute candidate code on a fleet or signing role.
