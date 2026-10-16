@@ -1143,6 +1143,26 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
+    def test_reconcile_fixtures_preserve_restrictive_checkout_permissions(self):
+        for name in ("test_remote_reconcile.py", "github-app-token.sh", "remote-reconcile.sh"):
+            target = self.repo / "scripts" / name
+            target.write_bytes((ROOT / "scripts" / name).read_bytes())
+            if name.endswith(".sh"):
+                target.chmod(0o700)
+        self.source = self.commit("test: include actual reconciliation fixtures")
+        self.git("checkout", "main")
+        (self.repo / "scripts/validate-configuration.sh").write_text(
+            "#!/bin/bash\nset -eu\npython3 scripts/test_remote_reconcile.py "
+            "TestGitHubAppToken.test_requires_args TestRemoteReconcile.test_help_exits_0\n")
+        self.policy = self.commit("test: run reconciliation permission fixtures")
+        previous_umask = os.umask(0o077)
+        try:
+            result, report = self.validate()
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report["status"], "passed")
+
     def test_both_profiles_reject_installed_controller_tester_and_deployer_hosts(self):
         import argparse
         import local_validate

@@ -20,8 +20,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
 TOKEN_SCRIPT = SCRIPTS / "github-app-token.sh"
 RECONCILE_SCRIPT = SCRIPTS / "remote-reconcile.sh"
-TOKEN_SCRIPT.chmod(0o755)
-RECONCILE_SCRIPT.chmod(0o755)
 INSTALLER = SCRIPTS / "install-worker-controller.sh"
 
 
