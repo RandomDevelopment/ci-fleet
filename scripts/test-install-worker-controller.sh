@@ -3285,6 +3285,7 @@ rm -rf "$format_two_checkpoint"
 unset FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_CHECKPOINT_COMPAT:-0} != 1 ]] || { printf 'CHECKPOINT_COMPAT_REGRESSIONS_OK\n'; exit 0; }
 [[ ${CI_FLEET_TEST_STOP_AFTER_IMAGE_ROLLBACK:-0} != 1 ]] || { printf 'IMAGE_ROLLBACK_REGRESSION_OK\n'; exit 0; }
+# Match the other readiness probes while slower hosts verify release trees.
 terminate_upgrade() {
   local output=$1 marker=$2 second_term_marker=${3:-} pid status=0 attempt
   export CI_FLEET_TEST_PAUSE_AFTER_DRAIN_FILE=$marker
@@ -3294,7 +3295,7 @@ terminate_upgrade() {
   fi
   "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$output" 2>&1 &
   pid=$!
-  for ((attempt = 0; attempt < 200; attempt++)); do
+  for ((attempt = 0; attempt < 1200; attempt++)); do
     [[ ! -f "$marker" ]] || break
     sleep 0.05
   done
@@ -3305,7 +3306,7 @@ terminate_upgrade() {
   fi
   kill -TERM "$pid"
   if [[ -n "$second_term_marker" ]]; then
-    for ((attempt = 0; attempt < 200; attempt++)); do
+    for ((attempt = 0; attempt < 1200; attempt++)); do
       [[ ! -f "${second_term_marker}.entered" ]] || break
       sleep 0.05
     done
@@ -3323,7 +3324,7 @@ export FAKE_KEEP_RUNNER_ON_PAUSE=1
 rm -f "$FAKE_PAUSED_STATE"
 "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$paused_term_output" 2>&1 &
 paused_term_pid=$!
-for ((attempt = 0; attempt < 200; attempt++)); do
+for ((attempt = 0; attempt < 1200; attempt++)); do
   [[ ! -f "$FAKE_PAUSED_STATE" ]] || break
   sleep 0.05
 done
