@@ -14,13 +14,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: validate-${{ github.ref }}
+  group: validate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   commit-convention:
     name: Enforce conventional commits and pull-request title
-    if: ${{ github.event_name != 'push' || github.event.deleted == false }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -109,7 +109,7 @@ jobs:
   validate:
     name: Build without registering a runner
     needs: commit-convention
-    if: ${{ !cancelled() && (github.event_name != 'push' || github.event.deleted == false) }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

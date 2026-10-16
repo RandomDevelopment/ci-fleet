@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the tag-validation step in .github/workflows/validate.yml.
+"""Regression tests for event admission and tag policy in the validation workflow.
 
 Finding 3861004945: the release-tag step must run the validator extracted from
 current trusted main, never the tagged-tree
@@ -97,6 +97,58 @@ class TrustedTagValidatorTests(unittest.TestCase):
     def test_repository_validation_runs_this_suite(self) -> None:
         validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/test_workflow_tag_validation.py", validation)
+
+
+class WorkflowEventTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = WORKFLOW.read_text(encoding="utf-8")
+
+    def assert_jobs_enabled(self, expected: bool, *, event: str = "pull_request",
+                            state: str = "open", deleted: bool = False,
+                            cancelled: bool = False) -> None:
+        for job in ("commit-convention", "validate"):
+            header = self.text.split(f"\n  {job}:\n", 1)[1].split("    steps:", 1)[0]
+            expression = header.split("if: ${{ ", 1)[1].split(" }}", 1)[0]
+            for name, value in (("github.event_name", event),
+                                ("github.event.pull_request.state", state),
+                                ("github.event.deleted", deleted),
+                                ("cancelled()", cancelled)):
+                expression = expression.replace(name, repr(value))
+            expression = expression.replace("false", "False")
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            expression = re.sub(r"!(?!=)", "not ", expression).strip()
+            with self.subTest(job=job, event=event, state=state, deleted=deleted):
+                self.assertEqual(eval(expression, {"__builtins__": {}}, {}), expected)
+
+    def test_open_prs_validate_and_closed_pr_edits_skip_both_jobs(self) -> None:
+        triggers = self.text.split("  pull_request:\n", 1)[1].split("  push:\n", 1)[0]
+        types = re.search(r"types: \[(.*?)\]", triggers).group(1).split(", ")
+        self.assertEqual(set(types), {"opened", "synchronize", "reopened", "edited"})
+        self.assert_jobs_enabled(True)
+        # Both merged and unmerged closed PRs have state "closed" on edits.
+        self.assert_jobs_enabled(False, state="closed")
+        self.assert_jobs_enabled(False, state="")
+
+    def test_push_and_manual_events_keep_validation_except_deleted_pushes(self) -> None:
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assert_jobs_enabled(True, event=event, state="")
+        self.assert_jobs_enabled(False, event="push", state="", deleted=True)
+
+    def test_pr_concurrency_never_collides_with_main_after_merge(self) -> None:
+        group = re.search(r"  group: (.+)", self.text).group(1)
+        template = re.search(r"\$\{\{ (.*?) \}\}", group).group(1)
+        cases = ((137, "refs/pull/137/merge", "validate-137"),
+                 (137, "refs/heads/main", "validate-137"),
+                 (138, "refs/heads/main", "validate-138"),
+                 (None, "refs/heads/main", "validate-refs/heads/main"),
+                 (None, "refs/tags/v0.1.0", "validate-refs/tags/v0.1.0"))
+        for number, ref, expected in cases:
+            with self.subTest(number=number, ref=ref):
+                expression = template.replace("github.event.pull_request.number", repr(number))
+                expression = expression.replace("github.ref", repr(ref)).replace("||", " or ")
+                identity = eval(expression, {"__builtins__": {}}, {})
+                self.assertEqual(re.sub(r"\$\{\{ .*? \}\}", str(identity), group), expected)
 
 
 def step_script(name: str) -> str:
