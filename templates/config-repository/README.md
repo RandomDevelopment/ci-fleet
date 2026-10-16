@@ -321,7 +321,11 @@ The optional job is named `hosted-validation`; it never emits the old `validate`
 check context, even when disabled. Keep any existing required `validate`
 protection until a deliberate reviewed migration reconciles it. A skipped
 convenience job cannot substitute for that required check. PR runs use the
-target base SHA as base and main and pass the title as a quoted argument. Push
+target base SHA as base and main and pass the title as a quoted argument. For PR
+events, the job requires an open PR. Title or target-base edits rerun validation
+while the PR is open. Closed PR edits skip the job. Concurrency groups include
+the event name and PR number or ref, so a
+merged PR edit reporting the main ref cannot cancel main push validation. Push
 runs use the source SHA as main and retain the event's base, including an
 initial push's zero sentinel. Host policy-v1 keeps requiring hosted evidence
 until separately migrated to the compatible signed-local policy. No workflow variable changes

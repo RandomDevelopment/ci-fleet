@@ -8,6 +8,7 @@ import io
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -559,7 +560,6 @@ exit 0
         self.assertEqual(set(jobs), {"hosted-validation"})
         self.assertNotIn("validate", {job.get("name", key) for key, job in jobs.items()})
         job = jobs["hosted-validation"]
-        self.assertEqual(job["if"], "${{ vars.CI_FLEET_HOSTED_VALIDATION == 'true' }}")
         self.assertEqual(job["timeout-minutes"], 5)
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         for step in job["steps"]:
@@ -568,6 +568,45 @@ exit 0
                 self.assertIs(step["with"]["persist-credentials"], False)
         engine = (ROOT / ".github/workflows/validate.yml").read_text()
         self.assertIn("name: Build without registering a runner", engine)
+
+    def test_embedded_hosted_admission_requires_opt_in_and_open_prs(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertEqual(set(triggers["pull_request"]["types"]), {"opened", "synchronize", "reopened", "edited"})
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        guard = workflow["jobs"]["hosted-validation"]["if"]
+        for enabled in ("", "false", "true"):
+            for event, state in (("pull_request", "open"), ("pull_request", "closed"),
+                                 ("pull_request", ""), ("push", "")):
+                with self.subTest(enabled=enabled, event=event, state=state):
+                    expression = guard.removeprefix("${{ ").removesuffix(" }}")
+                    for name, value in (("vars.CI_FLEET_HOSTED_VALIDATION", enabled),
+                                        ("github.event_name", event),
+                                        ("github.event.pull_request.state", state)):
+                        expression = expression.replace(name, repr(value))
+                    expression = expression.replace("&&", " and ").replace("||", " or ")
+                    self.assertEqual(eval(expression, {"__builtins__": {}}, {}),
+                                     enabled == "true" and (event != "pull_request" or state == "open"))
+
+    def test_embedded_pr_concurrency_cannot_cancel_main_after_merge(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], True)
+        group = workflow["concurrency"]["group"]
+        for event, number, ref, expected in (
+                ("pull_request", 135, "refs/pull/135/merge", "config-validation-pull_request-135"),
+                ("pull_request", 135, "refs/heads/main", "config-validation-pull_request-135"),
+                ("pull_request", 136, "refs/heads/main", "config-validation-pull_request-136"),
+                ("push", None, "refs/heads/main", "config-validation-push-refs/heads/main")):
+            with self.subTest(event=event, number=number, ref=ref):
+                def expand(match):
+                    expression = match.group(1)
+                    for name, value in (("github.event_name", event),
+                                        ("github.event.pull_request.number", number), ("github.ref", ref)):
+                        expression = expression.replace(name, repr(value))
+                    return str(eval(expression.replace("||", " or "), {"__builtins__": {}}, {}))
+                self.assertEqual(re.sub(r"\$\{\{ (.*?) \}\}", expand, group), expected)
 
     def test_source_requires_full_resolvable_identities(self):
         result = subprocess.run(["python3", str(ROOT / "scripts/local_validate.py"), "--source", "HEAD",
