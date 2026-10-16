@@ -227,10 +227,13 @@ convenience job is named `hosted-validation` and is default-off. Set repository
 variable `CI_FLEET_HOSTED_VALIDATION=true` and set `CI_FLEET_VALIDATOR_REVISION`
 to an independently reviewed full supporting engine commit to enable it. Its PR
 runs use the target base SHA as both base and main, and validate the PR title
-passed as a quoted argument. PR edits rerun validation after title or target-base
-changes. Push runs use the source SHA as main and retain the
-event's base, including the zero sentinel for an initial push. The standalone
-template must adopt the same behavior under #32.
+passed as a quoted argument. For PR events, the optional job requires an open PR.
+Title or target-base edits rerun validation while the PR is open. Closed PR edits
+skip the job. Concurrency groups include the event name and PR number or ref, so
+a merged PR edit reporting the main ref cannot cancel main push validation. Push
+runs use the source SHA as main and retain the event's base, including the zero
+sentinel for an initial push. The standalone template must adopt the same
+behavior under #32.
 
 The optional job never emits the old `validate` check context, including when
 disabled. A skipped optional job must not satisfy a required `validate` check.
