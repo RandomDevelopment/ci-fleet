@@ -216,7 +216,10 @@ and the existing signed-evidence checks.
 
 The engine workflow calls the full local entry point and preserves the
 `Build without registering a runner` check identity. Its existing trusted-main
-commit and secret policy guards remain separate during staging. Hosted PR jobs
+commit and secret policy guards remain separate during staging. Engine PR runs
+use a per-PR concurrency group, and both jobs skip events for closed PRs. Open
+PR title and target-base edits still rerun validation without cancelling main
+push validation. Hosted PR jobs
 execute the proposed suite from the checked-out revision, as before; trusted
 local acceptance instead pins an independently reviewed suite outside the
 candidate. Protection migration remains separately gated. The embedded template
