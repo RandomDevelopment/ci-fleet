@@ -25,6 +25,15 @@ bash "$repo_root/scripts/test-deployer-replay-ledger.sh"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Checkout tampering and replacement refs must stay inside the disposable fixture.
+fixture_repo=$tmp/core
+git init -q "$fixture_repo"
+git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" rev-parse HEAD)"
+git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
+git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
+repo_root=$fixture_repo
+installer=$repo_root/scripts/install-deployer.sh
+runtime=$repo_root/scripts/deployer-runtime.sh
 export TMPDIR=$tmp
 root=$tmp/root
 fake_bin=$tmp/bin

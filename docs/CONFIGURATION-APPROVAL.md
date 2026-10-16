@@ -24,14 +24,16 @@ Rollback and uninstall preserve both. Only a trusted root operator can remove
 the gate; it does not defend against a compromised host root or trusted engine.
 
 The policy pins the configuration repository's numeric GitHub ID, a simple
-branch name such as `main`, the validation workflow's numeric ID, required job
-names, and allowed reviewer numeric IDs. These are trust anchors, not application
+branch name such as `main`, allowed reviewer numeric IDs and validation evidence
+requirements. Version 1 pins the workflow ID and required job names. Version 2
+pins signed local evidence and can additionally require hosted results. These are trust anchors, not application
 allowlists or host inventory. Account renames do not substitute a different
 reviewer identity. The verifier checks the requested repository against its
 numeric ID and default branch, and checks the local Git tree against GitHub.
 
-The existing host-side App needs read-only Contents, Pull requests, and Actions
-permissions on the configuration repository. It receives no approval or write
+The existing host-side App needs read-only Contents and Pull requests
+permissions on the configuration repository. Policies requiring hosted results
+also need read-only Actions permission. It receives no approval or write
 authority. Long-lived credentials remain on the controller, outside ordinary CI.
 Tokens travel to the verifier through stdin, never command arguments, policy,
 or logs. Errors do not print API responses, policy values, or credentials.
@@ -63,7 +65,9 @@ adapter's resume action, the trusted verifier requires all of the following:
    also accepts verified clean review evidence from an explicitly trusted bot.
    The review must follow any base-branch retargeting. Unavailable or incomplete
    PR base history rejects the candidate.
-4. The latest push run of the pinned workflow on the applied SHA completed
+4. The policy's validation evidence must pass. Version 2 requires the signed
+   local result described below. Policies with hosted requirements also require
+   the latest push run of the pinned workflow on the applied SHA to complete
    successfully for the trusted repository and branch. Each required named job
    also completed successfully in that exact run attempt. Skipped, failed,
    cancelled, queued, and missing evidence is rejected.
@@ -174,3 +178,106 @@ Deterministic tests cover review/check rejection, tree identity, API failures,
 pagination, policy permissions, direct installer modes, remote reconciliation,
 resume, and rollback. Real permissions, reviewer provisioning, systemd execution,
 and unattended bypass rejection require separately authorized live verification.
+
+## Signed local validation
+
+The [operator walkthrough](LOCAL-VALIDATION-RUNBOOK.md) covers prerequisite setup,
+key/policy bootstrap, independently verified transfer, signing, protected evidence
+installation and read-only host acceptance checks.
+
+Policy version 1 retains its hosted-workflow requirement. Policy version 2
+requires signed full local validation and omits Actions calls when both
+`workflow_id` and `required_jobs` are absent. Adding both fields makes hosted
+success an explicit additional operator requirement. An optional convenience
+workflow alone never adds this requirement. Use the
+[local policy example](../host/config-review-policy-local.json.example) only
+after replacing every fictional identity, revision and the public test key.
+The example key is a published test vector and must never authorize a host.
+
+Version 2 requires `configuration_local_validation` on the executing engine,
+candidate engine and checkpoint manager. Existing capability checks enforce
+this before activation and rollback restoration. Stage compatible managers,
+verify recovery, then provision the root-owned policy in a separate authorized
+host change. Policy and marker ownership rules remain unchanged. Downgrade
+requires a deliberate compatible policy migration, never ignoring an unknown
+policy or silently falling back to hosted results.
+
+The local policy pins the suite name, validator revision, exact required stage
+names, Ed25519 public key, protected evidence directory and maximum age. Its
+canonical JSON SHA-256 binds every policy field into the signed evidence. Key
+rotation, reviewer changes, a different suite or any other policy change
+invalidates earlier evidence. A result must name the exact integrated commit,
+its tree and first parent, the original reviewed history, the PR number and current reviewed head. All stages
+must pass with no skips. Future timestamps and evidence older than the policy
+limit reject acceptance. The installed-baseline ancestry rules continue to
+reject rollback replay; rechecking the same installed commit for drift remains
+idempotent and still requires fresh, valid evidence.
+
+The signer is a separately trusted operator authority. The signature attests
+that this authority independently verified execution of the pinned full suite
+with the recorded inputs and logs. It is not hardware attestation. The signer
+must obtain results through its own supervised execution or an authenticated
+execution channel outside candidate control. A candidate upload, success file,
+PR comment or an unverified copy of a report is insufficient. The signing helper
+checks report structure and log hashes; it cannot establish how an arbitrary
+uploaded report was produced. Never expose it as a blind upload-signing service.
+
+Keep the private signing key on a separate trusted machine or isolated signing
+service. Never place it in a checkout, workflow, test environment, Docker host,
+container or ordinary job. Docker access is host-root-equivalent. A second Unix
+user on the execution machine does not protect the signer. Use a fresh disposable
+execution machine without controller credentials, then independently verify and
+transfer its results through the authorized operator channel.
+
+After that independent verification, the trusted operator can sign on the
+separate signing machine using the reviewed helper:
+
+```bash
+python3 /trusted/ci-fleet/scripts/attest_local_validation.py \
+  --policy /etc/ci-fleet/config-review-policy.json \
+  --result /verified/config-run --key /protected/local-validation.key \
+  --reviewed-head REVIEWED_HEAD_SHA --pull-request 42 \
+  --output /verified/APPLIED_SHA.json
+```
+
+The signing machine needs a protected copy of the policy and activation marker.
+The helper refuses quick or incomplete results, unexpected coverage, changed
+logs and the wrong validator revision. It also rejects already unusable report
+timestamps before signing or creating output. Both timestamps must be integers,
+excluding booleans, with a positive start no later than the finish and a finish
+no later than the signer's current time. Age from the original start must not
+exceed the protected policy's `local_validation.max_age_seconds`. Signing
+preserves the recorded timestamps and does not extend their expiry. A candidate
+report alone never establishes execution provenance.
+Before publishing evidence, the helper verifies the generated signature with
+the protected policy's public key. A wrong private key fails without creating
+the exclusive output file; correct the key or reviewed rotation policy first.
+The pull-request number must be positive. Zero and negative values are rejected
+before the helper reads policy, uses the signing key or creates output.
+Before signing, it rejects a report, log,
+or encoded evidence envelope over the verifier's 1 MiB file limit.
+The signer must also check source, tree,
+base, metadata and tool versions against its independently observed run. The
+host verifier repeats context, freshness, policy, signature and coverage checks.
+
+Provision `APPLIED_SHA.json` and the stage logs as root-owned regular files with
+mode `0600` under the fixed policy directory. Put the logs at
+`APPLIED_SHA.logs/CHECK_NAME.log`. Parent directories must be root-owned and
+not group- or other-writable. Symlinks, hard-linked files, unsafe permissions,
+invalid JSON, missing logs and changed log digests reject acceptance. Each file
+has a 1 MiB limit. Keep larger diagnostic archives separately; reduce noisy
+output deliberately rather than truncating accepted logs after signing.
+Neither evidence nor keys belong in Git or runner configuration. The verifier
+uses bounded protected reads, invokes OpenSSL without a shell and never prints
+API bodies or evidence contents.
+
+GitHub remains required for repository identity, commits, PR association,
+ancestry comparisons, independent reviews, base-change history and optional
+Codex evidence. App token issuance and Git fetch also remain GitHub dependencies.
+Version 2 removes the Actions API dependency only when hosted fields are absent.
+GitHub review/API outages still reject new application. Trusted last-known-good
+recovery uses the existing protected recovery record and needs neither Actions
+nor a newly signed local result. It preserves the policy and credentials.
+
+See [local validation and cutover](LOCAL-VALIDATION.md) for execution commands,
+coverage, merge/squash evidence, remaining template work and migration gates.

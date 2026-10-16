@@ -626,6 +626,8 @@ def command_validate_engine_capabilities(args: argparse.Namespace) -> None:
             policy = read_policy(args.configuration_approval_policy)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             raise DesiredStateError("active configuration approval policy is invalid") from exc
+        if policy["schema_version"] == 2 and "configuration_local_validation" not in capabilities:
+            raise DesiredStateError("selected engine does not support the active local validation policy syntax")
         if "codex_reviewer_ids" in policy and "configuration_codex_reviews" not in capabilities:
             raise DesiredStateError("selected engine does not support the active Codex approval policy syntax")
     if args.require_docker_network_policy_config and DOCKER_NETWORK_POLICY_CONFIG_CAPABILITY not in capabilities:

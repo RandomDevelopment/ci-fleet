@@ -132,3 +132,13 @@ Successful migration of read-only CI does not authorize moving privileged jobs.
 ## Rollback rule
 
 Every migration pull request MUST state exactly how to restore the previous workflow and runner selection. Until retirement, rollback should require changing only workflow routing, not rebuilding a host.
+
+## Engine and configuration validation migration
+
+The [local validation contract](LOCAL-VALIDATION.md) governs replacement of
+engine and configuration hosted validation. It leaves application fleet jobs
+and their five-minute task contract unchanged. Preserve independent review,
+current required checks and recovery until complete local parity and deliberate
+policy cutover pass. Optional hosted convenience is separate from a policy
+requiring hosted success. Record template adoption and live-host acceptance
+separately from engine implementation.

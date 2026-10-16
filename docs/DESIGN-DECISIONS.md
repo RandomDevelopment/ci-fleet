@@ -225,9 +225,26 @@ Legacy checkpoint image IDs do not make their mutable build inputs reproducible.
 
 The remaining risks are incorrect operator sequencing and inaccurate host evidence. Issue #36 retains the operational bootstrap, repeated-build and private image-ID proof. Remove this transitional exception after participating hosts have adopted image enforcement and the retained pre-enforcement rollback paths are retired through reviewed policy.
 
+## Local engine and configuration validation
+
+Status: implementation proposed under issue #135. Operational cutover pending.
+
+The [complete local suite](LOCAL-VALIDATION.md) removes Actions scheduling from
+test execution. Policy-v2 [signed local evidence](CONFIGURATION-APPROVAL.md#signed-local-validation)
+can replace Actions results while retaining independent GitHub review and
+ancestry checks. An independently trusted signer attests supervised execution;
+this is not hardware attestation or an automatic candidate-upload signing path.
+Signing authority must remain outside the Docker execution boundary.
+
+Existing root-owned policies and required-check settings retain their behavior.
+Full isolated Docker proof, compatible manager/checkpoint recovery, template
+adoption and reviewed policy cutover remain required. No host, credential,
+branch-protection, auto-merge, engine promotion or production change is authorized
+by this implementation.
+
 ## Engine integration validation budget
 
-Status: proposed in PR #136.
+Status: accepted in merged PR #136.
 
 The read-only hosted engine integration job has a 45-minute ceiling. Repository
 regressions measured about 24 minutes before image acceptance; optional APT cache

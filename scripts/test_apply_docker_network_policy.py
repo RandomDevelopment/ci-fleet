@@ -1175,7 +1175,7 @@ class ApplyScriptTests(unittest.TestCase):
         self._write_success_commands()
         test_scripts = Path(self.tmp) / "repo" / "scripts"
         test_scripts.mkdir(parents=True)
-        for name in ("apply-docker-network-policy.sh", "desired_state.py"):
+        for name in ("apply-docker-network-policy.sh", "desired_state.py", "apt_cache.py"):
             shutil.copy2(SCRIPTS / name, test_scripts / name)
         nobody = pwd.getpwnam("nobody")
         for path in [Path(self.tmp), *Path(self.tmp).rglob("*")]:
@@ -2112,6 +2112,7 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "unsafe-checkpoint"
         checkpoint.mkdir(mode=0o755)
+        checkpoint.chmod(0o755)
         drain_marker = Path(self.tmp) / "unsafe-checkpoint-drain.marker"
         self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
         self._write_success_commands()
@@ -2727,7 +2728,7 @@ class ApplyScriptTests(unittest.TestCase):
         env_file = self._write_env_file(self._rendered_with_policy())
         release_scripts = Path(self.tmp) / "release" / "scripts"
         release_scripts.mkdir(parents=True)
-        for name in ("healthcheck.sh", "docker-local-env.sh", "desired_state.py"):
+        for name in ("healthcheck.sh", "docker-local-env.sh", "desired_state.py", "apt_cache.py"):
             shutil.copy2(SCRIPTS / name, release_scripts / name)
 
         result = subprocess.run(

@@ -1183,7 +1183,7 @@ class PolicyTests(unittest.TestCase):
         scanner = ROOT / "scripts" / "scan_committed_secrets.py"
         self.assertTrue(scanner.is_file())
         workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
-        self.assertIn('python3 "$scanner" --repository "$GITHUB_WORKSPACE" --commit "$commit"', workflow)
+        self.assertIn("--kind configuration", workflow)
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
             subprocess.run(["git", "init", "-q", str(repository)], check=True)
@@ -1318,14 +1318,15 @@ class PolicyTests(unittest.TestCase):
     def test_workflow_uses_trusted_scanner_for_complete_history(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
         for required in (
-            "fetch-depth: 0",
-            'git show "$BASE_SHA:$scanner"',
-            'git rev-list --reverse "$HEAD_SHA"',
-            'git rev-list --reverse "$BASE_SHA..$HEAD_SHA"',
-            'commits+=("$HEAD_SHA")',
-            '--commit "$commit"',
+            "vars.CI_FLEET_HOSTED_VALIDATION == 'true'",
+            "vars.CI_FLEET_VALIDATOR_REVISION",
+            "--kind configuration", '--source "$SOURCE" --base "$BASE"',
+            '--policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR"',
+            "contents: read", "persist-credentials: false",
         ):
             self.assertIn(required, workflow)
+        self.assertNotIn("self-hosted", workflow)
+
 
     def test_duplicate_json_controller_id_is_rejected(self) -> None:
         validation = Validation()

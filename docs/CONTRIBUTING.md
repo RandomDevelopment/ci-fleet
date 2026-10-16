@@ -206,7 +206,8 @@ credentials; ordinary CI keeps read-only permissions. See the
 
 A version is released (tagged on `main`) only when:
 
-- the tagged commit passes all CI checks;
+- the tagged commit passes the complete [local suite](LOCAL-VALIDATION.md), and
+  all established required hosted checks until their deliberate migration;
 - the change set is reviewed and the SemVer bump matches the Conventional
   Commits classification;
 - an operator has confirmed the live pilot evidence for any engine rollout
@@ -252,3 +253,10 @@ python3 scripts/test_validate_commits.py
 python3 scripts/validate_commits.py --message - <<< 'feat: local example'
 python3 scripts/validate_commits.py --version 0.1.0
 ```
+
+The complete validation command and evidence contract are documented in
+[local validation](LOCAL-VALIDATION.md). Local execution needs no Actions event,
+`gh`, hosted allowance or Actions API. The current required check remains active
+while parity and rollback are pending. Issue #114 must reconcile auto-merge with
+the selected evidence policy before a required check is removed. A locally
+passing subset never permits a release or bypasses review.

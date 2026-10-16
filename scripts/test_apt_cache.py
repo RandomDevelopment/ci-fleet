@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import unittest
 
+from local_validate import run
+
 from apt_cache import apt_config
 from desired_state import DesiredStateError, build_rendered_env, load_engine_capabilities, validate_host_values
 from test_desired_state import config, host_values, CONFIG_COMMIT, ROOT
@@ -16,6 +18,32 @@ from test_apt_cache_e2e import fixture_failure_details
 
 
 class APTCacheTests(unittest.TestCase):
+    def test_timeout_unwinds_owned_fixture_resources_through_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docker = root / "docker"
+            docker.write_text('''#!/usr/bin/python3
+import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["APT_COMMANDS"]).open("a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["inspect", "--format"]:
+    time.sleep(60)
+if args[:2] == ["container", "inspect"]:
+    sys.exit(1)
+''')
+            docker.chmod(0o755)
+            commands = root / "commands.jsonl"
+            env = os.environ | {"PATH": str(root) + ":" + os.environ["PATH"], "APT_COMMANDS": str(commands)}
+            command = ["bash", "-c", 'python3 "$1"; exit "$?"', "bash", str(ROOT / "scripts/test_apt_cache_e2e.py")]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run(command, ROOT, env, root / "fixture.log", 2)
+            recorded = [json.loads(line) for line in commands.read_text().splitlines()]
+            created = next(args[args.index("--name") + 1] for args in recorded if args[:2] == ["run", "-d"])
+            self.assertIn(["rm", "-f", "-v", created], recorded)
+            self.assertTrue(any(args[:2] == ["image", "rm"] for args in recorded))
+
     def test_image_timestamp_normalization_preserves_optional_secret(self):
         epoch = 1786752000
         for dockerfile, count in (('runner/Dockerfile', 3), ('controller/Dockerfile', 1)):

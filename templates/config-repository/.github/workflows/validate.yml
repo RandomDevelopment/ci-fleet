@@ -2,6 +2,7 @@ name: Validate configuration
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -13,8 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
-    # This public template must never receive access to self-hosted runners.
+  hosted-validation:
+    # Convenience only. Enabling this never changes host or required-check policy.
+    if: ${{ vars.CI_FLEET_HOSTED_VALIDATION == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -23,86 +25,37 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Validate shell and Python syntax
-        run: |
-          bash -n scripts/init.sh scripts/validate.sh
-          python3 -m py_compile scripts/init.py scripts/validate.py scripts/test_policy.py scripts/scan_committed_secrets.py
-
-      - name: Prove forbidden configurations fail closed
-        run: python3 scripts/test_policy.py
-
-      - name: Scan committed file contents for secrets
+      - name: Require independently pinned validator
         env:
+          VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
+        run: '[[ "$VALIDATOR" =~ ^[0-9a-f]{40}$ ]]'
+
+      - name: Check out trusted engine
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: RandomDevelopment/ci-fleet
+          ref: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
+          path: .ci-fleet-validator
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run complete local configuration validation
+        env:
+          SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MAIN: ${{ github.event.pull_request.base.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
         run: |
-          scanner=scripts/scan_committed_secrets.py
-          if [[ "$EVENT_NAME" == pull_request ]] && git cat-file -e "$BASE_SHA:$scanner" 2>/dev/null; then
-            git show "$BASE_SHA:$scanner" >"$RUNNER_TEMP/trusted-secret-scanner.py"
-            scanner="$RUNNER_TEMP/trusted-secret-scanner.py"
-          fi
-          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
-            mapfile -t commits < <(git rev-list --reverse "$HEAD_SHA")
-          else
-            mapfile -t commits < <(git rev-list --reverse "$BASE_SHA..$HEAD_SHA")
-          fi
-          if [[ ! " ${commits[*]} " == *" $HEAD_SHA "* ]]; then
-            commits+=("$HEAD_SHA")
-          fi
-          for commit in "${commits[@]}"; do
-            python3 "$scanner" --repository "$GITHUB_WORKSPACE" --commit "$commit"
-          done
-
-      - name: Validate reference configurations
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:fleet.json" 2>/dev/null; then
-            git show "$BASE_SHA:fleet.json" >"$RUNNER_TEMP/previous-fleet.json"
-            args=(--previous-config "$RUNNER_TEMP/previous-fleet.json")
-            if git cat-file -e "$BASE_SHA:engine-rollout-evidence.json" 2>/dev/null; then
-              git show "$BASE_SHA:engine-rollout-evidence.json" >"$RUNNER_TEMP/previous-rollout-evidence.json"
-              args+=(--previous-rollout-evidence "$RUNNER_TEMP/previous-rollout-evidence.json")
-            fi
-            ./scripts/validate.sh --strict "${args[@]}"
-          else
-            ./scripts/validate.sh --strict
-          fi
-          ./scripts/validate.sh --config examples/multi-host/fleet.json
-
-      - name: Prove initialized configurations pass strict policy
-        run: |
-          temporary_directory="$(mktemp -d)"
-          engine_ref=$(python3 -c 'import json; value = json.load(open("fleet.json", encoding="utf-8")); print(next(iter(value["controllers"].values()))["engine_ref"])')
-          if ./scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --output "${temporary_directory}/missing-engine.json"; then
-            echo 'initializer accepted a missing engine revision' >&2
-            exit 1
-          fi
-          test ! -e "${temporary_directory}/missing-engine.json"
-          if ./scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --registry BAD \
-            --engine-ref "${engine_ref}" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
-            --output "${temporary_directory}/invalid.json"; then
-            echo 'initializer accepted an invalid registry' >&2
-            exit 1
-          fi
-          test ! -e "${temporary_directory}/invalid.json"
-          ./scripts/init.sh \
-            --organization test-company \
-            --project test-app \
-            --engine-ref "${engine_ref}" \
-            --architecture amd64 \
-            --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" \
-            --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" \
-            --output "${temporary_directory}/fleet.json"
-          test "$(stat -c '%a' "${temporary_directory}/fleet.json")" = 644
+          args=()
+          if [[ "$EVENT_NAME" == pull_request ]]; then args+=(--pr-title "$PR_TITLE"); fi
+          python3 .ci-fleet-validator/scripts/local_validate.py \
+            --kind configuration --repository "$PWD" --source "$SOURCE" --base "$BASE" --main "$MAIN" \
+            --policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR" \
+            --output "$RUNNER_TEMP/local-validation" "${args[@]}"

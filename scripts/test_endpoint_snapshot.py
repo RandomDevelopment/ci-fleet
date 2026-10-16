@@ -680,7 +680,8 @@ class SnapshotReadbackTests(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "requires isolated root-owned permission fixture")
     def test_unprivileged_observer_reads_export_but_cannot_read_private_sources(self):
-        self.root.chmod(0o755)
+        for directory in (self.root, self.root / "var", self.root / "var/lib"):
+            directory.chmod(0o755)
         observer_gid = 65532
         for directory in (self.base, self.exports):
             os.chown(directory, 0, observer_gid)
