@@ -2112,6 +2112,7 @@ class ApplyScriptTests(unittest.TestCase):
         daemon = self._write_daemon("{}\n")
         checkpoint = Path(self.tmp) / "unsafe-checkpoint"
         checkpoint.mkdir(mode=0o755)
+        checkpoint.chmod(0o755)
         drain_marker = Path(self.tmp) / "unsafe-checkpoint-drain.marker"
         self.drain_command.write_text(f"#!/usr/bin/env bash\ntouch {drain_marker}\n", encoding="utf-8")
         self._write_success_commands()
