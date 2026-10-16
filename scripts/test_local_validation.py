@@ -1135,7 +1135,11 @@ class PolicyExecutionTests(unittest.TestCase):
             " SnapshotReadbackTests.test_unprivileged_observer_reads_export_but_cannot_read_private_sources\n"
         (self.repo / "scripts/validate-configuration.sh").write_text(script)
         self.policy = self.commit("test: run unprivileged permission fixture")
-        result, report = self.validate()
+        previous_umask = os.umask(0o077)
+        try:
+            result, report = self.validate()
+        finally:
+            os.umask(previous_umask)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
