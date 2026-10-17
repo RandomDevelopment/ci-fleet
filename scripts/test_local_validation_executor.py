@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).with_name("local_validation_executor.py")
@@ -39,6 +40,28 @@ record()
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_prepare_accepts_the_explicit_operator_checkout_after_sudo(self):
+        with tempfile.TemporaryDirectory(dir="/run") as temporary:
+            root = Path(temporary)
+            repository = root / "operator-checkout"
+            (repository / "scripts").mkdir(parents=True)
+            script = repository / "scripts/local_validation_executor.py"
+            script.write_bytes(MODULE_PATH.read_bytes())
+            for command in (("init", "-q"), ("add", "."),
+                            ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                             "commit", "-qm", "test: reviewed executor")):
+                subprocess.run(["git", "-C", str(repository), *command], check=True)
+            revision = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+            os.chown(repository, 1000, 1000)
+            install = root / "installed"
+            with patch.object(executor, "__file__", str(script)), patch.object(executor, "INSTALL", install), \
+                    patch.object(executor, "WORK", root / "work"), patch.object(executor, "require_worker"), \
+                    patch.object(executor.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_shell="/usr/sbin/nologin")), \
+                    patch.object(sys, "argv", [str(script), "--prepare", "--disposable-host"]):
+                executor.main()
+            self.assertEqual((install / "executor.py").read_bytes(), script.read_bytes())
+            self.assertEqual(json.loads((install / "revision.json").read_text())["revision"], revision)
+
     def test_installed_revision_and_bytes_must_match_in_a_protected_directory(self):
         with tempfile.TemporaryDirectory(dir="/run") as temporary:
             install = Path(temporary)

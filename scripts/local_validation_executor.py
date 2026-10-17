@@ -198,8 +198,9 @@ def main() -> None:
     repository = source.parents[1]
     git_env = {**HOST_ENV, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"}
-    revision = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], env=git_env, text=True).strip()
-    program = subprocess.check_output(["git", "-C", str(repository), "show", revision + ":scripts/" + source.name], env=git_env)
+    git = ["git", "-c", "safe.directory=" + str(repository), "-C", str(repository)]
+    revision = subprocess.check_output([*git, "rev-parse", "HEAD"], env=git_env, text=True).strip()
+    program = subprocess.check_output([*git, "show", revision + ":scripts/" + source.name], env=git_env)
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or program != source.read_bytes():
         raise RuntimeError("prepare from a clean, committed, independently reviewed engine checkout")
     WORK.mkdir(mode=0o711, parents=True, exist_ok=True)
