@@ -156,6 +156,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 raise RuntimeError("stage cgroup is not empty; discard the worker")
             if cancelled:
                 raise RuntimeError("check cancelled by signal " + str(cancelled[0]) + "; see " + str(log))
+            if result.get("EXIT_CODE") == "exited" and result.get("EXIT_STATUS") not in (None, "0"):
+                raise RuntimeError("check exited " + str(result["EXIT_STATUS"]) + "; see " + str(log))
             if result["SERVICE_RESULT"] == "timeout":
                 if time.monotonic() - started >= timeout:
                     raise subprocess.TimeoutExpired(command, timeout)
