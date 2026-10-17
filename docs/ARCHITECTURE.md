@@ -146,6 +146,12 @@ flowchart TD
 
 Host-wide pruning must not run as an uncoordinated per-job operation. Hard cancellation and host failure may bypass project traps, so resources must remain identifiable by run and age.
 
+Job completion and the runner exit watcher can request removal of the same
+container concurrently. If Docker reports that removal is already in progress,
+the controller waits up to 30 seconds for that container's removal. Confirmed
+removal or an already absent container lets processing continue. Other Docker
+errors, cancellation and an expired wait remain cleanup failures.
+
 The existing host cleanup timer also reclaims empty networks at least ten
 minutes old whose allocations
 lie entirely inside rendered Docker default address pools. This includes
