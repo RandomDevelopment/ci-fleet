@@ -183,6 +183,7 @@ jobs:
           if [[ "$REF_TYPE" == tag ]]; then args+=(--tag "$TAG_NAME" --tag-created); fi
           # The convention job independently rejects moved tags. The trusted
           # main scanner above remains a separate guard during migration.
+          sudo python3 -I scripts/local_validation_executor.py --prepare --disposable-host
           sudo python3 scripts/local_validate.py --repository "$PWD" \
             --source "$SOURCE" --base "$BASE" --policy "$(git rev-parse HEAD)" --main "$main" \
             --disposable-host --output "$RUNNER_TEMP/local-validation" "${args[@]}"

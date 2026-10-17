@@ -257,3 +257,30 @@ Ordinary fleet task jobs keep their five-minute hard timeout. Longer feedback
 and additional hosted runner time are the tradeoffs. Reduce this ceiling after
 optimization or independent validation jobs demonstrate reliable completion
 with full coverage under a shorter limit.
+
+## System-manager execution for local validation
+
+Issue [#135](https://github.com/RandomDevelopment/ci-fleet/issues/135) uses one
+shared systemd executor for complete engine, standalone-template and private
+adopter validation. The owner selected this simplification on 2026-10-17.
+Implementation availability requires reviewed merge and disposable-host proof.
+
+Require a provisioned Linux worker with systemd 255 or newer as PID 1, cgroup v2
+and a root trusted launcher. Systemd owns each stage's process lifetime,
+deadline and cgroup cleanup. Remove the duplicated custom child-subreaper,
+pidfd and process-discovery implementations. There is no fallback backend.
+Ordinary configuration stages run under a locked unprivileged account; suite
+selection, source identities, independent policy and signing remain separate
+trust checks. An OS timeout alone never substitutes for complete test coverage.
+
+The portability cost is explicit worker preparation instead of arbitrary
+unprivileged Linux execution. The worker may be temporary and stores no unique
+fleet state or signing authority. Export its complete result bundle before
+destruction; interrupted runs fail closed. Root/Docker engine fixtures remain
+host-root-equivalent and require a disposable machine, independent review and
+scoped external-resource cleanup. Cgroups do not sandbox hostile root.
+
+Keep this prerequisite until an equally small alternative provides the same
+verified lifetime and trust guarantees on the supported hosts. This decision
+changes no ordinary application Actions scheduling, fleet capacity, runtime pin,
+credential, required check or installed acceptance policy.

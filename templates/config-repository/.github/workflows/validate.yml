@@ -42,7 +42,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          sudo python3 -I .ci-fleet-validator/scripts/local_validation_executor.py --prepare --disposable-host
 
       - name: Run complete local configuration validation
         env:
@@ -55,7 +57,7 @@ jobs:
         run: |
           args=()
           if [[ "$EVENT_NAME" == pull_request ]]; then args+=(--pr-title "$PR_TITLE"); fi
-          python3 .ci-fleet-validator/scripts/local_validate.py \
+          sudo python3 .ci-fleet-validator/scripts/local_validate.py \
             --kind configuration --repository "$PWD" --source "$SOURCE" --base "$BASE" --main "$MAIN" \
             --policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR" \
             --output "$RUNNER_TEMP/local-validation" "${args[@]}"

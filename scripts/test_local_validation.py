@@ -387,12 +387,12 @@ class RunnerTests(unittest.TestCase):
                                check=True, capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
                 self.assertEqual(checkout_manifest(source), expected)
 
-    def test_missing_procfs_fails_before_execution(self):
+    def test_missing_system_manager_fails_before_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch("local_validate.Path.is_file", return_value=False), \
-                 patch("local_validate.subprocess.Popen") as launch, \
-                 self.assertRaisesRegex(RuntimeError, "Linux /proc"):
+            with patch("local_validation_executor.require_worker", side_effect=RuntimeError("system systemd manager required")), \
+                 patch("local_validation_executor.subprocess.Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "system systemd manager"):
                 run(["true"], root, os.environ.copy(), root / "test.log", 5)
             launch.assert_not_called()
 
@@ -722,7 +722,7 @@ class PolicyExecutionTests(unittest.TestCase):
                         "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "advice.graftFileDeprecated", "GIT_CONFIG_VALUE_0": "false"}
         observed = []
         execute = local_validate.run
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             self.assertEqual({key: value for key, value in env.items() if key.startswith("GIT_")}, expected_git)
             self.assertNotIn("CI_FLEET_TEST_HOST_SECRET", env)
             self.assertEqual(env["PATH"], "/usr/sbin:/usr/bin:/sbin:/bin")
@@ -868,7 +868,7 @@ class PolicyExecutionTests(unittest.TestCase):
         tag = self.git("rev-parse", "refs/tags/v99.0.0")
         self.git("repack", "-ad")
         calls = []
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             for target, present, absent in (
                     (cwd, (integrated, reviewed, self.source, self.base, self.policy), (unrelated, blob, tag)),
                     (cwd.parent / "policy", (self.policy, self.base), (integrated, reviewed, self.source, unrelated, blob, tag))):
@@ -918,7 +918,7 @@ class PolicyExecutionTests(unittest.TestCase):
         unrelated_tag = self.git("rev-parse", "refs/tags/v99.0.0")
         observed = []
         execute = local_validate.run
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             self.assertEqual(local_validate.git(cwd, "tag", "--list"), "v0.1.0")
             self.assertEqual(local_validate.git(cwd, "rev-parse", "v0.1.0"), selected)
             self.assertEqual(local_validate.git(cwd, "cat-file", "-t", selected), "tag")
@@ -1024,7 +1024,7 @@ class PolicyExecutionTests(unittest.TestCase):
         validator = self.repo / ".ci-fleet-validator"
         subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.repo), str(validator)], check=True)
         subprocess.run(["git", "-C", str(validator), "checkout", "--quiet", self.policy], check=True)
-        for name in ("local_validate.py", "local_validation_supervisor.py"):
+        for name in ("local_validate.py", "local_validation_executor.py"):
             shutil.copyfile(ROOT / "scripts" / name, validator / "scripts" / name)
         for event, title, base, main, accepted in (
                 ("pull_request", "invalid $(touch title-injected)", self.base, self.base, False),
@@ -1049,7 +1049,7 @@ class PolicyExecutionTests(unittest.TestCase):
         import argparse
         import local_validate
         calls = []
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             for target in (cwd, cwd.parent / "policy"):
                 cache = target / "__pycache__/generated.pyc"
                 self.assertFalse(cache.exists(), calls)
@@ -1164,21 +1164,13 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
-    def test_execution_tempdir_allows_existing_unprivileged_fixture(self):
-        if os.geteuid() != 0:
-            self.skipTest("permission fixture requires root")
+    def test_configuration_stage_is_unprivileged_with_private_scratch(self):
         self.git("checkout", "main")
-        script = "#!/bin/bash\npython3 " + str(ROOT / "scripts/test_apply_docker_network_policy.py") + \
-            " ApplyScriptTests.test_testing_mode_accepts_default_tmp_as_non_root\n"
-        script += "python3 " + str(ROOT / "scripts/test_endpoint_snapshot.py") + \
-            " SnapshotReadbackTests.test_unprivileged_observer_reads_export_but_cannot_read_private_sources\n"
-        (self.repo / "scripts/validate-configuration.sh").write_text(script)
-        self.policy = self.commit("test: run unprivileged permission fixture")
-        previous_umask = os.umask(0o077)
-        try:
-            result, report = self.validate()
-        finally:
-            os.umask(previous_umask)
+        (self.repo / "scripts/validate-configuration.sh").write_text(
+            "#!/bin/bash\npython3 -c 'import os; from pathlib import Path; "
+            "assert os.geteuid() != 0; p=Path(os.environ[\"TMPDIR\"])/\"owned\"; p.write_text(\"ok\")'\n")
+        self.policy = self.commit("test: require an unprivileged configuration stage")
+        result, report = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
@@ -1267,7 +1259,7 @@ class PolicyExecutionTests(unittest.TestCase):
                                  patch("local_validate.Path.is_symlink", autospec=True,
                                        side_effect=lambda p: dangling if str(p) == marker else is_symlink(p)), \
                                  patch("local_validate.run") as stage, \
-                                 patch("local_validate.supervise_stage") as supervisor, \
+                                 patch("local_validate.execute_stage") as supervisor, \
                                  patch("sys.stderr", io.StringIO()):
                                 self.assertEqual(local_validate.validate(args), 1)
                             stage.assert_not_called()

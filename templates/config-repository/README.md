@@ -297,7 +297,10 @@ checks. `scripts/validate.sh --strict` remains a useful individual validator.
 A complete trusted run and independent review remain separate requirements.
 
 Use Linux with mounted `/proc`, Bash, Git, Python 3.11 or later, ShellCheck and
-OpenSSL. Configuration validation requires neither root nor Docker. Missing
+OpenSSL. The trusted launcher requires a prepared disposable Linux worker with systemd
+255 or newer and cgroup v2. Run its account-preparation command from the selected
+trusted engine checkout, then launch validation as root. Configuration stages
+run as the locked unprivileged job account without Docker access. Missing
 tools, unexpected skipped tests and interrupted checks fail a complete run.
 
 For a root commit or initial push with no prior integrated state, pass

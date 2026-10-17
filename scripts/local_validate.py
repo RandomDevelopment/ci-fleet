@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from local_validation_supervisor import run as supervise_stage
+from local_validation_executor import prepare_stage, run as execute_stage
 
 SHA = re.compile(r"[0-9a-f]{40}")
 NO_PRIOR = "0" * 40
@@ -148,10 +148,8 @@ def verify_checkout(root: Path, expected: dict) -> None:
             raise RuntimeError("checkout changed: unexpected " + str(root / path))
 
 
-def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> None:
-    if not Path("/proc/self/stat").is_file():
-        raise RuntimeError("Linux /proc is required for process cleanup")
-    supervise_stage(command, cwd, env, log, timeout, grace=CLEANUP_GRACE_SECONDS)
+def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int, *, user: str = "root") -> None:
+    execute_stage(command, cwd, env, log, timeout, grace=CLEANUP_GRACE_SECONDS, user=user)
 
 
 def validate(args: argparse.Namespace) -> int:
@@ -187,9 +185,11 @@ def validate(args: argparse.Namespace) -> int:
     if args.profile == "quick" and args.kind == "engine":
         report["expected_skips"] = ["container-build-and-cleanup"]
     try:
-        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home()) as temporary, \
+        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home() if args.kind == "engine" else "/run") as temporary, \
                 tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
             root = Path(temporary)
+            if args.kind == "configuration":
+                root.chmod(0o711)
             # Permission fixtures deliberately drop UID and chmod their own directories.
             Path(fixture_temporary).chmod(0o755)
             report["run_id"] = root.name.lower()
@@ -209,6 +209,7 @@ def validate(args: argparse.Namespace) -> int:
                    "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()})
             Path(env["HOME"]).mkdir()
             tools = {"git": ["git", "--version"], "python": ["python3", "--version"],
+                     "systemd": ["systemd-run", "--version"],
                      "bash": ["bash", "--version"], "openssl": ["openssl", "version"], "shellcheck": ["shellcheck", "--version"]}
             if args.kind == "engine":
                 if not args.disposable_host:
@@ -291,8 +292,13 @@ def validate(args: argparse.Namespace) -> int:
                         if target == source:
                             subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main],
                                            env=git_environment(), check=True)
+                    if args.kind == "configuration":
+                        prepare_stage([source, Path(env["HOME"]), Path(env["TMPDIR"])], [policy])
                     stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _, _ in seeds]
-                    run(command, source, env, output / entry["log"], args.timeout)
+                    if args.kind == "configuration":
+                        run(command, source, env, output / entry["log"], args.timeout, user="ci-fleet-validation")
+                    else:
+                        run(command, source, env, output / entry["log"], args.timeout)
                     for target, expected in stage_trees:
                         verify_checkout(target, expected)
                     for seed, expected, _, _, _, _ in seeds:
