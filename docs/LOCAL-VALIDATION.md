@@ -173,6 +173,11 @@ child's resource-cleanup helpers. Systemd sends TERM, allows 60 seconds for clea
 uses KILL if necessary. A leader exiting zero cannot hide forced cleanup.
 Cancellation stops only that invocation's unit and waits for cleanup.
 
+The launcher loads the protected installed executor and requires its exact
+revision to match `--policy`, or an independently selected `--executor-revision`
+when configuration policy intentionally retains an older baseline. The report
+records that executor revision. An unrelated sibling helper cannot execute
+stages, and a mismatched installation fails before launching any service.
 The executor reads a root-protected `ExecStopPost` receipt and verifies the
 service cgroup is empty before recording success or starting another stage.
 Missing receipts, unsuccessful service results, forced termination and incomplete

@@ -388,13 +388,25 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(checkout_manifest(source), expected)
 
     def test_missing_system_manager_fails_before_execution(self):
+        from unittest.mock import Mock
+        backend = Mock()
+        backend.run.side_effect = RuntimeError("system systemd manager required")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch("local_validation_executor.require_worker", side_effect=RuntimeError("system systemd manager required")), \
-                 patch("local_validation_executor.subprocess.Popen") as launch, \
+            with patch("local_validate.load_executor", return_value=backend), \
+                 patch("local_validate.subprocess.Popen") as launch, \
                  self.assertRaisesRegex(RuntimeError, "system systemd manager"):
                 run(["true"], root, os.environ.copy(), root / "test.log", 5)
             launch.assert_not_called()
+
+    def test_wrong_executor_revision_refuses_before_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("local_validate.subprocess.Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "exact reviewed"):
+                run(["true"], root, {}, root / "test.log", 5, executor_revision="0" * 40)
+            launch.assert_not_called()
+            self.assertFalse((root / "test.log").exists())
 
     def test_successful_leader_cannot_hide_forced_descendant_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -638,6 +650,7 @@ class PolicyExecutionTests(unittest.TestCase):
             (self.repo / "scripts" / script).write_text("raise SystemExit(0)\n")
         self.source = self.commit("fix: candidate has weaker policies")
         self.count = 0
+        self.executor_revision = json.loads(Path("/usr/local/lib/ci-fleet-validation/revision.json").read_text())["revision"]
 
     def git(self, *args, env=None):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], env=env, stderr=subprocess.DEVNULL, text=True).strip()
@@ -651,7 +664,7 @@ class PolicyExecutionTests(unittest.TestCase):
         output = self.root / ("run-" + str(self.count))
         result = subprocess.run(["python3", str(ROOT / "scripts/local_validate.py"), "--kind", "configuration",
             "--repository", str(self.repo), "--source", source or self.source, "--base", self.base,
-            "--policy", self.policy, "--main", self.policy, "--output", str(output), *extra], capture_output=True, text=True)
+            "--policy", self.policy, "--main", self.policy, "--executor-revision", self.executor_revision, "--output", str(output), *extra], capture_output=True, text=True)
         report = json.loads((output / "result.json").read_text()) if (output / "result.json").exists() else None
         return result, report
 
@@ -665,6 +678,23 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["profile"], "full")
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
+
+    def test_default_executor_must_match_the_selected_policy_before_any_stage(self):
+        import argparse
+        import local_validate
+        output = self.root / "wrong-installed-executor"
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+            reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
+            executor_revision=None, kind="configuration", profile="full", pr_title=None,
+            tag=None, tag_created=False, disposable_host=False, timeout=5)
+        with patch("local_validate.run") as stage:
+            self.assertEqual(local_validate.validate(args), 1)
+            stage.assert_not_called()
+        report = json.loads((output / "result.json").read_text())
+        self.assertEqual(report["executor_revision"], self.policy)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["results"], [])
+        self.assertIn("exact reviewed executor revision", report["error"])
 
     def test_replacement_refs_cannot_bind_an_unreviewed_tree(self):
         actual_tree = self.git("rev-parse", self.source + "^{tree}")
@@ -732,7 +762,7 @@ class PolicyExecutionTests(unittest.TestCase):
             observed.append(command)
             execute(command, cwd, env, log, timeout)
         output = self.root / "real-object-report"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
             reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
         with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
@@ -783,7 +813,7 @@ class PolicyExecutionTests(unittest.TestCase):
         before = local_validate.checkout_manifest(self.repo)
         for name, output, repository in cases:
             with self.subTest(location=name):
-                args = argparse.Namespace(repository=repository, policy_repository=policy, source=self.source,
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=repository, policy_repository=policy, source=self.source,
                     base=self.base, policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
                 with patch("local_validate.__file__", str(executable)), \
@@ -884,7 +914,7 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(local_validate.git(cwd, "rev-parse", "origin/main"), self.policy)
             calls.append(command)
             log.write_text("fixture stage\n")
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=integrated,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=integrated,
             reviewed_head=reviewed, base=self.base, policy=self.policy, main=self.policy, output=self.root / "bounded-checkouts",
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
         with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
@@ -934,7 +964,7 @@ class PolicyExecutionTests(unittest.TestCase):
             observed.append(command)
             execute(command, cwd, env, log, timeout)
         output = self.root / "release-checkouts"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
             base=self.base, policy=self.policy, main=head, output=output, kind="configuration", profile="full",
             pr_title=None, tag="v0.2.0", tag_created=True, disposable_host=False, timeout=30)
         with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
@@ -1034,7 +1064,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 runtime = self.root / ("workflow-" + str(self.count)); self.count += 1
                 runtime.mkdir()
                 env = {**os.environ, "RUNNER_TEMP": str(runtime), "SOURCE": self.source, "BASE": base, "MAIN": main,
-                       "PR_TITLE": title, "EVENT_NAME": event, "VALIDATOR": self.policy}
+                       "PR_TITLE": title, "EVENT_NAME": event, "VALIDATOR": self.policy, "EXECUTOR": self.executor_revision}
                 result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.repo, env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
                 report = json.loads((runtime / "local-validation/result.json").read_text())
@@ -1061,7 +1091,7 @@ class PolicyExecutionTests(unittest.TestCase):
             with self.subTest(base=base):
                 calls.clear()
                 output = self.root / ("fresh-stages-" + base)
-                args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                     base=base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                 with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
@@ -1207,7 +1237,7 @@ class PolicyExecutionTests(unittest.TestCase):
             for marker in ("/etc/ci-fleet", "/etc/ci-fleet-deployer", "/var/lib/ci-fleet-tester", "/opt/ci-fleet-status"):
                 with self.subTest(kind=kind, marker=marker):
                     output = self.root / ("installed-" + kind + marker.replace("/", "-"))
-                    args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                    args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                         base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
                         pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                     with patch("local_validate.Path.exists", side_effect=lambda path: str(path) == marker or exists(path), autospec=True), \
@@ -1230,7 +1260,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 for dangling in (False, True):
                     with self.subTest(kind=kind, marker=marker, dangling=dangling):
                         output = self.root / (kind + marker.replace("/", "-") + str(dangling))
-                        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                             base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
                             pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                         with patch("local_validate.Path.exists", autospec=True,
@@ -1256,7 +1286,7 @@ class PolicyExecutionTests(unittest.TestCase):
                     for dangling in (False, True):
                         with self.subTest(kind=kind, profile=profile, marker=marker, dangling=dangling):
                             output = self.root / (kind + profile + marker.replace("/", "-") + str(dangling))
-                            args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                            args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                                 base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile=profile,
                                 pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                             with patch("local_validate.Path.exists", autospec=True,
@@ -1264,7 +1294,7 @@ class PolicyExecutionTests(unittest.TestCase):
                                  patch("local_validate.Path.is_symlink", autospec=True,
                                        side_effect=lambda p: dangling if str(p) == marker else is_symlink(p)), \
                                  patch("local_validate.run") as stage, \
-                                 patch("local_validate.execute_stage") as supervisor, \
+                                 patch("local_validate.load_executor") as supervisor, \
                                  patch("sys.stderr", io.StringIO()):
                                 self.assertEqual(local_validate.validate(args), 1)
                             stage.assert_not_called()
@@ -1283,7 +1313,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 raise FileNotFoundError("shellcheck missing")
             return original(command, *args, **kwargs)
         output = self.root / "missing-tool-run"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source, base=self.base,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source, base=self.base,
             policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
             pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
         with patch("local_validate.subprocess.check_output", side_effect=missing_tool), patch("sys.stderr", io.StringIO()):
@@ -1304,7 +1334,7 @@ class PolicyExecutionTests(unittest.TestCase):
         for profile in ("quick", "full"):
             with self.subTest(profile=profile):
                 output = self.root / ("missing-jq-" + profile)
-                args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                     base=self.base, policy=self.policy, main=self.policy, output=output, kind="engine", profile=profile,
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                 with patch("local_validate.subprocess.check_output", side_effect=missing_jq), \

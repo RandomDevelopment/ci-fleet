@@ -30,6 +30,7 @@ jobs:
       - name: Require independently pinned validator
         env:
           VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
+          EXECUTOR: ${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}
         run: '[[ "$VALIDATOR" =~ ^[0-9a-f]{40}$ ]]'
 
       - name: Check out trusted engine
@@ -54,10 +55,11 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           EVENT_NAME: ${{ github.event_name }}
           VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
+          EXECUTOR: ${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}
         run: |
           args=()
           if [[ "$EVENT_NAME" == pull_request ]]; then args+=(--pr-title "$PR_TITLE"); fi
           sudo python3 .ci-fleet-validator/scripts/local_validate.py \
             --kind configuration --repository "$PWD" --source "$SOURCE" --base "$BASE" --main "$MAIN" \
-            --policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR" \
+            --policy-repository "$PWD/.ci-fleet-validator" --policy "$VALIDATOR" --executor-revision "$EXECUTOR" \
             --output "$RUNNER_TEMP/local-validation" "${args[@]}"
