@@ -1076,7 +1076,7 @@ class PolicyExecutionTests(unittest.TestCase):
         result, report = self.validate()
         self.assertNotEqual(result.returncode, 0)
         log = self.root / ("run-" + str(self.count)) / "configuration.log"
-        self.assertIn("Permission denied", log.read_text())
+        self.assertRegex(log.read_text(), "Permission denied|Read-only file system")
 
     def test_bad_commit_and_pr_title_cannot_use_candidate_policy(self):
         result, _ = self.validate("--pr-title", "invalid title")
@@ -1133,7 +1133,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 self.assertEqual(report["results"][-1]["status"], "failed")
                 if name == "policy":
                     log = self.root / ("run-" + str(self.count)) / "configuration.log"
-                    self.assertIn("Permission denied", log.read_text())
+                    self.assertRegex(log.read_text(), "Permission denied|Read-only file system")
                 else:
                     self.assertIn("checkout changed", report["error"])
 

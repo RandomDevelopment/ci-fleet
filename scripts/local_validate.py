@@ -186,7 +186,7 @@ def validate(args: argparse.Namespace) -> int:
         report["expected_skips"] = ["container-build-and-cleanup"]
     try:
         with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home() if args.kind == "engine" else WORK) as temporary, \
-                tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
+                tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp" if args.kind == "engine" else WORK) as fixture_temporary:
             root = Path(temporary)
             if args.kind == "configuration":
                 root.chmod(0o711)

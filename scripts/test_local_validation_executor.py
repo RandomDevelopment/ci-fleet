@@ -173,6 +173,26 @@ else:
         self.assertTrue((self.root / "cleaned").exists())
         self.assert_empty()
 
+    def test_exited_shell_does_not_cut_short_descendant_cleanup_helpers(self):
+        child = PRELUDE + '''
+def clean(*_):
+    subprocess.run([sys.executable, '-I', '-c', "import time; time.sleep(.2)"] , check=True)
+    (root / 'cleaned').touch()
+    sys.exit(0)
+import subprocess
+signal.signal(signal.SIGTERM, clean)
+ready()
+time.sleep(60)
+'''
+        program = PRELUDE + '''import subprocess
+subprocess.Popen([sys.executable, '-I', '-c', sys.argv[2], str(root)])
+wait_ready()
+'''
+        executor.run([sys.executable, "-I", "-c", program, str(self.root), child],
+                     self.root, self.env, self.log, 5, 2)
+        self.assertTrue((self.root / "cleaned").exists())
+        self.assert_empty()
+
     def test_double_fork_requiring_kill_fails(self):
         with self.assertRaisesRegex(RuntimeError, "forced termination"):
             self.execute('''
@@ -252,14 +272,18 @@ time.sleep(.15)
 from pathlib import Path
 assert os.geteuid() != 0
 try: Path(sys.argv[1]).write_text('changed')
-except PermissionError: pass
+except OSError as error:
+    assert error.errno in (1, 13, 30)
 else: raise AssertionError('trusted input writable')
 for args in (['systemctl','--system','show-environment'],['systemctl','--user','show-environment']):
     assert subprocess.run(args,capture_output=True).returncode != 0
 assert not os.access('/run/docker.sock', os.R_OK | os.W_OK)
 Path('scratch-result').write_text('ok')
 '''
-        executor.run([sys.executable, "-I", "-c", code, str(trusted)], scratch, self.env, self.log, 5, user=executor.USER)
+        try:
+            executor.run([sys.executable, "-I", "-c", code, str(trusted)], scratch, self.env, self.log, 5, user=executor.USER)
+        except RuntimeError as error:
+            self.fail(str(error) + "\n" + self.log.read_text())
         self.assertEqual(trusted.read_text(), "preserved")
         self.assertEqual((scratch / "scratch-result").read_text(), "ok")
         self.assert_empty()

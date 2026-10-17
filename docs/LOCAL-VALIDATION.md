@@ -121,8 +121,9 @@ private temporary directory under the operator's protected home for engine
 runs, or under root-owned `/var/lib/ci-validation-work` for unprivileged
 configuration stages. `/run` is often mounted noexec, so candidate executables
 do not live there. The latter
-receive their own writable source and scratch copies; trusted policy stays
-root-owned and cannot be modified by the job account. Permission
+receive their own writable source and scratch copies; trusted policy copies
+are read-only mounts inside the job. Only its source, home and scratch paths
+are writable. Seeds, completion receipts and reports remain root-owned. Permission
 fixtures use a separate uniquely named directory under `/tmp` with read and traversal
 permission for their deliberate UID changes. Each fixture controls access to its
 own child directory. Both temporary roots are removed on exit. It strips inherited credentials and Git/Python
@@ -164,8 +165,11 @@ incomplete execution. Never infer success from the last visible test line.
 Each stage has a 1,800-second timeout, configurable with `--timeout`. The shared
 `scripts/local_validation_executor.py` creates a unique system-manager transient
 service per stage. `RuntimeMaxSec` enforces its deadline; `KillMode=control-group`
-includes descendants that detach or double-fork. `ExitType=main` starts cleanup
-when the leader exits. Systemd sends TERM, allows 60 seconds for cleanup, and
+includes descendants that detach or double-fork. `ExitType=cgroup` keeps the
+service alive through descendant cleanup. The client asks the manager to stop
+the unit when its recorded main process exits; it reads manager state, never
+walks or signals a process tree. A shell exiting on TERM cannot cut short its
+child's resource-cleanup helpers. Systemd sends TERM, allows 60 seconds for cleanup, and
 uses KILL if necessary. A leader exiting zero cannot hide forced cleanup.
 Cancellation stops only that invocation's unit and waits for cleanup.
 

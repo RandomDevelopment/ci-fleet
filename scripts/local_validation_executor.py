@@ -11,7 +11,6 @@ import pwd
 import re
 import shutil
 import signal
-import stat
 import subprocess
 import tempfile
 import threading
@@ -60,23 +59,16 @@ def require_worker() -> None:
 
 
 def prepare_stage(writable: list[Path], readonly: list[Path]) -> None:
-    """Give the job UID its scratch copies, keeping trusted inputs root-owned."""
+    """Prepare job-owned copies; the service mounts trusted inputs read-only."""
     try:
         account = pwd.getpwnam(USER)
     except KeyError as error:
         raise RuntimeError("prepare the disposable worker before running configuration tests") from error
     if account.pw_uid == 0 or account.pw_gid == 0:
         raise RuntimeError("validation job account must be unprivileged")
-    for roots, mutable in ((readonly, False), (writable, True)):
-        for root in roots:
-            for path in (root, *root.rglob("*")):
-                mode = path.lstat().st_mode
-                if mutable:
-                    os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
-                elif not stat.S_ISLNK(mode):
-                    os.chown(path, 0, 0)
-                    access = 0o005 if stat.S_ISDIR(mode) or mode & 0o111 else 0o004
-                    path.chmod((stat.S_IMODE(mode) & ~0o022) | access)
+    for root in (*readonly, *writable):
+        for path in (root, *root.rglob("*")):
+            os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
 
 
 def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
@@ -107,12 +99,17 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
         root = Path(temporary)
         finish = root / "finish.py"
         finish.write_text(FINISH)
-        properties = ["Type=exec", "ExitType=main", "Slice=system.slice", "Restart=no", "Delegate=no",
+        properties = ["Type=exec", "ExitType=cgroup", "Slice=system.slice", "Restart=no", "Delegate=no",
                       "KillMode=control-group", "SendSIGKILL=yes", "RuntimeMaxSec=" + str(timeout) + "s",
                       "TimeoutStopSec=" + str(max(grace, .001)) + "s", "TasksMax=512",
                       "User=" + user, "ExecStopPost=+/usr/bin/python3 -I " + str(finish)]
         if user != "root":
+            writable = list(dict.fromkeys([str(cwd), *(env[key] for key in ("HOME", "TMPDIR") if key in env)]))
+            if any(not Path(path).is_absolute() for path in writable):
+                raise ValueError("job writable paths must be absolute")
             properties += ["NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=",
+                           "ProtectSystem=strict", "ReadOnlyPaths=/run", "PrivateTmp=yes",
+                           "ReadWritePaths=" + " ".join(json.dumps(path, ensure_ascii=False) for path in writable),
                            "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "RestrictNamespaces=yes",
                            "InaccessiblePaths=-/run/systemd/private -/run/dbus/system_bus_socket -/run/user -/run/docker.sock -/var/run/docker.sock"]
         launch = ["systemd-run", "--system", "--quiet", "--wait", "--pipe", "--expand-environment=no",
@@ -128,11 +125,25 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 process = subprocess.Popen(launch, env=HOST_ENV, stdin=subprocess.DEVNULL,
                                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 stopping = False
+                last_probe = started - 1
                 while process.poll() is None:
                     if cancelled and not stopping:
                         stopping = True
                         stop()
-                    if time.monotonic() - started > timeout + grace + 30:
+                    now = time.monotonic()
+                    if not stopping and now - last_probe >= .5:
+                        last_probe = now
+                        state = subprocess.run(["systemctl", "--system", "show", unit, "--property=MainPID",
+                                                "--property=ExecMainCode", "--property=ActiveState"], env=HOST_ENV,
+                                               capture_output=True, text=True, timeout=5)
+                        fields = dict(line.split("=", 1) for line in state.stdout.splitlines() if "=" in line)
+                        # PID 1 owns the cgroup even after its original main exits.
+                        # Request cleanup then, without killing a child's cleanup helper early.
+                        if (fields.get("ActiveState") == "active" and fields.get("MainPID") == "0"
+                                and fields.get("ExecMainCode") not in (None, "0")):
+                            stopping = True
+                            stop()
+                    if now - started > timeout + grace + 30:
                         raise RuntimeError("system manager did not complete stage cleanup; discard the worker")
                     try:
                         process.wait(timeout=.1)
