@@ -167,14 +167,14 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 process.kill()
                 process.wait()
         try:
-            result = json.loads((root / "result.json").read_text())
-            if not isinstance(result, dict):
-                raise RuntimeError("invalid system manager receipt")
             events = (cgroup / "cgroup.events").read_text() if cgroup.exists() else "populated 0\n"
             if "populated 0" not in events.splitlines():
                 raise RuntimeError("stage cgroup is not empty; discard the worker")
             if cancelled:
                 raise RuntimeError("check cancelled by signal " + str(cancelled[0]) + "; see " + str(log))
+            result = json.loads((root / "result.json").read_text())
+            if not isinstance(result, dict):
+                raise RuntimeError("invalid system manager receipt")
             if result.get("EXIT_CODE") == "exited" and result.get("EXIT_STATUS") not in (None, "0"):
                 raise RuntimeError("check exited " + str(result["EXIT_STATUS"]) + "; see " + str(log))
             if result["SERVICE_RESULT"] == "timeout":

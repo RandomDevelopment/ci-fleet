@@ -177,6 +177,9 @@ child's resource-cleanup helpers. Systemd sends TERM, allows 60 seconds for clea
 uses KILL if necessary. A leader exiting zero cannot hide forced cleanup.
 Cancellation stops only that invocation's unit and waits for cleanup.
 An early cancellation retries the stop request until the new unit is visible.
+Cancellation before service startup may prevent the completion hook from running.
+It still reports cancellation after the empty-cgroup check and never accepts a
+result; successful validation always requires the completion receipt.
 
 The launcher loads the protected installed executor and requires its exact
 revision to match `--policy`, or an independently selected `--executor-revision`

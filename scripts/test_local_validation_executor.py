@@ -133,6 +133,24 @@ class AdmissionTests(unittest.TestCase):
                         patch.object(executor.subprocess, "run"), self.assertRaises(RuntimeError):
                     executor.run(["true"], Path(temporary), {}, Path(temporary) / "stage.log", 1)
 
+    def test_cancellation_without_a_receipt_requires_an_empty_cgroup_and_never_passes(self):
+        exists, read_text = Path.exists, Path.read_text
+        def cancelled_launch(*_, **__):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return type("Process", (), {"returncode": 1, "poll": lambda _: 1})()
+        for populated in (False, True):
+            with self.subTest(populated=populated), tempfile.TemporaryDirectory() as temporary:
+                def is_group(path):
+                    return path.parent == Path("/sys/fs/cgroup/system.slice") and path.name.startswith("ci-validation-")
+                with patch.object(executor, "require_worker"), \
+                        patch.object(executor.subprocess, "Popen", side_effect=cancelled_launch), \
+                        patch.object(executor.subprocess, "run"), \
+                        patch.object(Path, "exists", autospec=True, side_effect=lambda p: True if is_group(p) else exists(p)), \
+                        patch.object(Path, "read_text", autospec=True,
+                                     side_effect=lambda p: "populated " + str(int(populated)) + "\n" if is_group(p.parent) else read_text(p)), \
+                        self.assertRaisesRegex(RuntimeError, "cgroup is not empty" if populated else "cancelled"):
+                    executor.run(["true"], Path(temporary), {}, Path(temporary) / "stage.log", 1)
+
 
 class ExecutorTests(unittest.TestCase):
     @classmethod
