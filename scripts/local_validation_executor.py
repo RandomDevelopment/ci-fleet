@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import hashlib
 import json
 import os
@@ -58,14 +59,23 @@ def require_worker() -> None:
         raise RuntimeError("validation requires systemd 255 or newer")
 
 
-def prepare_stage(writable: list[Path], readonly: list[Path]) -> None:
-    """Prepare job-owned copies; the service mounts trusted inputs read-only."""
+def job_account():
+    """Refuse inherited host privileges on the dedicated validation account."""
     try:
         account = pwd.getpwnam(USER)
+        group = grp.getgrgid(account.pw_gid)
     except KeyError as error:
         raise RuntimeError("prepare the disposable worker before running configuration tests") from error
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise RuntimeError("validation job account must be unprivileged")
+    if (account.pw_uid == 0 or account.pw_gid == 0 or account.pw_shell != "/usr/sbin/nologin"
+            or group.gr_name != USER or set(group.gr_mem) - {USER}
+            or set(os.getgrouplist(USER, account.pw_gid)) != {account.pw_gid}):
+        raise RuntimeError("validation job account requires its private group and no supplementary groups")
+    return account
+
+
+def prepare_stage(writable: list[Path], readonly: list[Path]) -> None:
+    """Prepare job-owned copies; the service mounts trusted inputs read-only."""
+    account = job_account()
     for root in (*readonly, *writable):
         for path in (root, *root.rglob("*")):
             os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
@@ -79,8 +89,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
     if not command or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in env):
         raise ValueError("invalid stage command or environment")
     require_worker()
-    if user == USER and pwd.getpwnam(USER).pw_uid == 0:
-        raise RuntimeError("validation job account must be unprivileged")
+    if user == USER:
+        job_account()
     unit = "ci-validation-" + uuid.uuid4().hex + ".service"
     cgroup = Path("/sys/fs/cgroup/system.slice") / unit
     previous, cancelled = {}, []
@@ -92,8 +102,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
             cancelled.append(signum)
 
     def stop():
-        subprocess.run(["systemctl", "--system", "stop", unit], env=HOST_ENV,
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=grace + 15)
+        return subprocess.run(["systemctl", "--system", "stop", unit], env=HOST_ENV,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=grace + 15).returncode == 0
 
     with tempfile.TemporaryDirectory(prefix=unit.removesuffix(".service") + "-", dir="/run") as temporary:
         root = Path(temporary)
@@ -128,8 +138,7 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 last_probe = started - 1
                 while process.poll() is None:
                     if cancelled and not stopping:
-                        stopping = True
-                        stop()
+                        stopping = stop()
                     now = time.monotonic()
                     if not stopping and now - last_probe >= .5:
                         last_probe = now
@@ -141,8 +150,7 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                         # Request cleanup then, without killing a child's cleanup helper early.
                         if (fields.get("ActiveState") == "active" and fields.get("MainPID") == "0"
                                 and fields.get("ExecMainCode") not in (None, "0")):
-                            stopping = True
-                            stop()
+                            stopping = stop()
                     if now - started > timeout + grace + 30:
                         raise RuntimeError("system manager did not complete stage cleanup; discard the worker")
                     try:
@@ -198,13 +206,11 @@ def main() -> None:
     if any(path.exists() or path.is_symlink() for path in markers):
         raise RuntimeError("worker preparation refuses an installed fleet, application role or signing authority")
     try:
-        account = pwd.getpwnam(USER)
+        pwd.getpwnam(USER)
     except KeyError:
         subprocess.run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", USER],
                        env=HOST_ENV, check=True)
-        account = pwd.getpwnam(USER)
-    if account.pw_uid == 0 or account.pw_gid == 0 or account.pw_shell != "/usr/sbin/nologin":
-        raise RuntimeError("unsafe existing validation job account")
+    job_account()
     source = Path(__file__).resolve()
     repository = source.parents[1]
     git_env = {**HOST_ENV, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",

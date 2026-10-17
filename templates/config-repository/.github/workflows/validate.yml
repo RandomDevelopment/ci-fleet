@@ -31,7 +31,7 @@ jobs:
         env:
           VALIDATOR: ${{ vars.CI_FLEET_VALIDATOR_REVISION }}
           EXECUTOR: ${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}
-        run: '[[ "$VALIDATOR" =~ ^[0-9a-f]{40}$ ]]'
+        run: '[[ "$VALIDATOR" =~ ^[0-9a-f]{40}$ && "$EXECUTOR" =~ ^[0-9a-f]{40}$ ]]'
 
       - name: Check out trusted engine
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -42,10 +42,19 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Check out trusted executor
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: RandomDevelopment/ci-fleet
+          ref: ${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}
+          path: .ci-fleet-executor
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Install validation tools
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          sudo python3 -I .ci-fleet-validator/scripts/local_validation_executor.py --prepare --disposable-host
+          sudo python3 -I .ci-fleet-executor/scripts/local_validation_executor.py --prepare --disposable-host
 
       - name: Run complete local configuration validation
         env:

@@ -51,6 +51,8 @@ sudo python3 -I /trusted/ci-fleet/scripts/local_validation_executor.py \
 
 Preparation installs the committed executor and its revision/hash manifest under
 `/usr/local/lib/ci-fleet-validation` and creates a locked job account. It refuses
+an existing job account with a shared primary group or supplementary group
+memberships. Ordinary stages recheck that restriction before execution. It refuses
 uncommitted executor code. Consumers require the exact independently reviewed
 installed revision. There is no daemon, timer, fleet registration or signing
 credential. The entire worker remains disposable;
@@ -172,6 +174,7 @@ walks or signals a process tree. A shell exiting on TERM cannot cut short its
 child's resource-cleanup helpers. Systemd sends TERM, allows 60 seconds for cleanup, and
 uses KILL if necessary. A leader exiting zero cannot hide forced cleanup.
 Cancellation stops only that invocation's unit and waits for cleanup.
+An early cancellation retries the stop request until the new unit is visible.
 
 The launcher loads the protected installed executor and requires its exact
 revision to match `--policy`, or an independently selected `--executor-revision`

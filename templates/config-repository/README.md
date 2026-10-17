@@ -316,8 +316,12 @@ signed evidence.
 
 Hosted validation is disabled by default. Set repository Actions variables
 `CI_FLEET_VALIDATOR_REVISION` to a full reviewed supporting engine commit and
-`CI_FLEET_HOSTED_VALIDATION` to `true` to enable the convenience workflow. Set the
-latter to `false`, delete it, or remove `.github/workflows/validate.yml` to disable
+`CI_FLEET_HOSTED_VALIDATION` to `true` to enable the convenience workflow. Set
+`CI_FLEET_EXECUTOR_REVISION` to a different full reviewed executor commit
+when the configuration validator retains an older baseline. The workflow checks
+out and prepares that executor separately; otherwise it uses the validator revision.
+Set `CI_FLEET_HOSTED_VALIDATION` to `false`, delete it, or remove
+`.github/workflows/validate.yml` to disable
 hosted execution. Local validation still works with Actions disabled or quota
 blocked. Do not require this optional check merely because it is enabled.
 The optional job is named `hosted-validation`; it never emits the old `validate`

@@ -40,6 +40,25 @@ record()
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_job_account_rejects_privileged_primary_and_supplementary_groups_before_launch(self):
+        account = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_shell="/usr/sbin/nologin")
+        for group_name, members, groups, accepted in (
+                (executor.USER, [], [1001], True),
+                ("disk", [], [1001], False),
+                (executor.USER, ["other-user"], [1001], False),
+                (executor.USER, [], [1001, 6], False)):
+            with self.subTest(group_name=group_name, groups=groups), \
+                    patch.object(executor.pwd, "getpwnam", return_value=account), \
+                    patch.object(executor.grp, "getgrgid", return_value=SimpleNamespace(gr_name=group_name, gr_mem=members)), \
+                    patch.object(executor.os, "getgrouplist", return_value=groups), \
+                    patch.object(executor, "require_worker"), patch.object(executor.subprocess, "Popen") as launch:
+                if accepted:
+                    self.assertIs(executor.job_account(), account)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "private group"):
+                        executor.run(["true"], Path("/"), {}, Path("/unused"), 1, user=executor.USER)
+                launch.assert_not_called()
+
     def test_prepare_accepts_the_explicit_operator_checkout_after_sudo(self):
         with tempfile.TemporaryDirectory(dir="/run") as temporary:
             root = Path(temporary)
@@ -56,7 +75,7 @@ class AdmissionTests(unittest.TestCase):
             install = root / "installed"
             with patch.object(executor, "__file__", str(script)), patch.object(executor, "INSTALL", install), \
                     patch.object(executor, "WORK", root / "work"), patch.object(executor, "require_worker"), \
-                    patch.object(executor.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_shell="/usr/sbin/nologin")), \
+                    patch.object(executor.pwd, "getpwnam"), patch.object(executor, "job_account"), \
                     patch.object(sys, "argv", [str(script), "--prepare", "--disposable-host"]):
                 executor.main()
             self.assertEqual((install / "executor.py").read_bytes(), script.read_bytes())
@@ -252,6 +271,24 @@ time.sleep(.15)
                 self.assertNotEqual(process.returncode, 0)
                 self.assertFalse((self.root / "accepted").exists())
                 self.assert_empty()
+
+    def test_cancellation_before_transient_unit_creation_retries_stop(self):
+        launch = subprocess.Popen
+
+        def delayed_launch(command, **kwargs):
+            if command[0] != "systemd-run" or not any(arg.startswith("--unit=") for arg in command):
+                return launch(command, **kwargs)
+            process = launch(["/bin/bash", "-c", 'sleep .3; exec "$@"', "delayed-unit", *command], **kwargs)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return process
+
+        started = time.monotonic()
+        with patch.object(executor.subprocess, "Popen", side_effect=delayed_launch), \
+                self.assertRaisesRegex(RuntimeError, "cancelled"):
+            executor.run([sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+                         self.root, self.env, self.log, 10, .3)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_empty()
 
     def test_killed_launcher_leaves_manager_deadline_and_no_acceptance(self):
         process = self.driver(1)

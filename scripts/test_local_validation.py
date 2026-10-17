@@ -601,6 +601,21 @@ exit 0
                     self.assertEqual(eval(expression, {"__builtins__": {}}, {}),
                                      enabled == "true" and (event != "pull_request" or state == "open"))
 
+    def test_embedded_workflow_prepares_the_independently_selected_executor(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        steps = workflow["jobs"]["hosted-validation"]["steps"]
+        checkout = next(step for step in steps if step["name"] == "Check out trusted executor")
+        self.assertEqual(checkout["with"]["ref"], "${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}")
+        prepare = next(step for step in steps if step["name"] == "Install validation tools")
+        self.assertIn(checkout["with"]["path"] + "/scripts/local_validation_executor.py --prepare", prepare["run"])
+        admission = next(step for step in steps if step["name"] == "Require independently pinned validator")
+        for validator, executor, accepted in (("a" * 40, "b" * 40, True),
+                                                ("a" * 40, "HEAD", False), ("HEAD", "b" * 40, False)):
+            with self.subTest(validator=validator, executor=executor):
+                result = subprocess.run(["bash", "-c", admission["run"]], env={"VALIDATOR": validator, "EXECUTOR": executor})
+                self.assertEqual(result.returncode == 0, accepted)
+
     def test_embedded_pr_concurrency_cannot_cancel_main_after_merge(self):
         import yaml
         workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
