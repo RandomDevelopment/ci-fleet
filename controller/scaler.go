@@ -290,7 +290,23 @@ func (s *Scaler) logAndRemove(ctx context.Context, name, id string, force bool) 
 		s.logger.Warn("could not collect runner logs", "runner", name, "error", err)
 	}
 	if err := s.dockerClient.ContainerRemove(ctx, id, container.RemoveOptions{Force: force, RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("remove runner %s: %w", name, err)
+		if !errdefs.IsConflict(err) || !strings.Contains(err.Error(), "removal of container "+id+" is already in progress") {
+			return fmt.Errorf("remove runner %s: %w", name, err)
+		}
+		// Completion and exit cleanup can overlap; confirm the other removal finishes.
+		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		removed, errors := s.dockerClient.ContainerWait(waitCtx, id, container.WaitConditionRemoved)
+		select {
+		case result := <-removed:
+			if result.Error != nil {
+				return fmt.Errorf("wait for runner %s removal: %s", name, result.Error.Message)
+			}
+		case err := <-errors:
+			if !errdefs.IsNotFound(err) {
+				return fmt.Errorf("wait for runner %s removal: %w", name, err)
+			}
+		}
 	}
 	return nil
 }
