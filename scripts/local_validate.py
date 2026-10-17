@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,8 @@ import sys
 import tempfile
 import time
 
-from local_validation_supervisor import run as supervise_stage
+WORK = Path("/var/lib/ci-validation-work")
+EXECUTOR_PATH = Path("/usr/local/lib/ci-fleet-validation/executor.py")
 
 SHA = re.compile(r"[0-9a-f]{40}")
 NO_PRIOR = "0" * 40
@@ -148,10 +150,27 @@ def verify_checkout(root: Path, expected: dict) -> None:
             raise RuntimeError("checkout changed: unexpected " + str(root / path))
 
 
-def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int) -> None:
-    if not Path("/proc/self/stat").is_file():
-        raise RuntimeError("Linux /proc is required for process cleanup")
-    supervise_stage(command, cwd, env, log, timeout, grace=CLEANUP_GRACE_SECONDS)
+def load_executor(revision: str | None = None):
+    for path in (EXECUTOR_PATH, EXECUTOR_PATH.with_name("revision.json"), *EXECUTOR_PATH.parents):
+        mode = path.lstat()
+        if path.is_symlink() or mode.st_uid != 0 or mode.st_mode & 0o022:
+            raise RuntimeError("unsafe installed executor; prepare the disposable worker")
+    if revision is None:
+        revision = json.loads(EXECUTOR_PATH.with_name("revision.json").read_text())["revision"]
+    specification = importlib.util.spec_from_file_location("ci_fleet_executor", EXECUTOR_PATH)
+    module = importlib.util.module_from_spec(specification)
+    exec(compile(EXECUTOR_PATH.read_bytes(), str(EXECUTOR_PATH), "exec"), module.__dict__)
+    module.require_revision(revision)
+    return module
+
+
+def prepare_stage(writable: list[Path], readonly: list[Path], *, executor_revision: str | None = None) -> None:
+    load_executor(executor_revision).prepare_stage(writable, readonly)
+
+
+def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int, *, user: str = "root",
+        executor_revision: str | None = None) -> None:
+    load_executor(executor_revision).run(command, cwd, env, log, timeout, grace=CLEANUP_GRACE_SECONDS, user=user)
 
 
 def validate(args: argparse.Namespace) -> int:
@@ -179,17 +198,20 @@ def validate(args: argparse.Namespace) -> int:
             raise ValueError("integrated and reviewed source trees differ")
     output = output_directory(args.output, repo, policy_repo)
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    executor_revision = getattr(args, "executor_revision", None) or args.policy
     report = {"schema_version": 1, "suite": SUITE if args.kind == "engine" else "ci-fleet-config-local-v1", "profile": args.profile,
               "source": args.source, "reviewed_head": reviewed_head, "tree": git(repo, "rev-parse", args.source + "^{tree}"),
               "base": args.base, "prior_integrated_state": not no_prior, "policy": args.policy, "main": args.main,
-              "pr_title": args.pr_title, "tag": args.tag, "tag_created": args.tag_created,
+              "executor_revision": executor_revision, "pr_title": args.pr_title, "tag": args.tag, "tag_created": args.tag_created,
               "started_at": int(time.time()), "expected_skips": [], "tools": {}, "results": [], "status": "incomplete"}
     if args.profile == "quick" and args.kind == "engine":
         report["expected_skips"] = ["container-build-and-cleanup"]
     try:
-        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home()) as temporary, \
-                tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
+        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home() if args.kind == "engine" else WORK) as temporary, \
+                tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp" if args.kind == "engine" else WORK) as fixture_temporary:
             root = Path(temporary)
+            if args.kind == "configuration":
+                root.chmod(0o711)
             # Permission fixtures deliberately drop UID and chmod their own directories.
             Path(fixture_temporary).chmod(0o755)
             report["run_id"] = root.name.lower()
@@ -209,13 +231,15 @@ def validate(args: argparse.Namespace) -> int:
                    "CI_FLEET_CONTROLLER_IMAGE": "ci-fleet-controller:" + root.name.lower()})
             Path(env["HOME"]).mkdir()
             tools = {"git": ["git", "--version"], "python": ["python3", "--version"],
+                     "systemd": ["systemd-run", "--version"],
                      "bash": ["bash", "--version"], "openssl": ["openssl", "version"], "shellcheck": ["shellcheck", "--version"]}
             if args.kind == "engine":
                 if not args.disposable_host:
                     raise ValueError("engine validation requires --disposable-host on an isolated disposable Docker host")
                 tools["jq"] = ["jq", "--version"]
                 if args.profile == "full":
-                    tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
+                    tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"],
+                                 buildx=["docker", "buildx", "version"])
             # Neither profile may execute candidate code on a fleet or signing role.
             installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status", "ci-fleet-signing")
             markers = [Path(parent, role) for parent in ("/etc", "/var/lib", "/opt") for role in installed]
@@ -229,6 +253,7 @@ def validate(args: argparse.Namespace) -> int:
                 raise ValueError("validation refuses an installed fleet host or signing authority")
             if args.kind == "engine" and (os.geteuid() != 0 or not Path("/dev/shm").is_dir()):
                 raise ValueError("complete fixture coverage requires root and /dev/shm on an isolated execution host")
+            load_executor(executor_revision).require_worker()
             for name, command in tools.items():
                 report["tools"][name] = subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT).strip()
             validator = str(policy / "scripts/validate_commits.py")
@@ -291,8 +316,13 @@ def validate(args: argparse.Namespace) -> int:
                         if target == source:
                             subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", args.main],
                                            env=git_environment(), check=True)
+                    if args.kind == "configuration":
+                        prepare_stage([source, Path(env["HOME"]), Path(env["TMPDIR"])], [policy], executor_revision=executor_revision)
                     stage_trees = [(target, checkout_manifest(target)) for _, _, target, _, _, _ in seeds]
-                    run(command, source, env, output / entry["log"], args.timeout)
+                    if args.kind == "configuration":
+                        run(command, source, env, output / entry["log"], args.timeout, user="ci-fleet-validation", executor_revision=executor_revision)
+                    else:
+                        run(command, source, env, output / entry["log"], args.timeout, executor_revision=executor_revision)
                     for target, expected in stage_trees:
                         verify_checkout(target, expected)
                     for seed, expected, _, _, _, _ in seeds:
@@ -334,6 +364,7 @@ def main() -> int:
     for name in ("source", "policy", "main"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--base", required=True, help="previous integrated commit SHA, or 40 zeros for a root or initial push")
+    parser.add_argument("--executor-revision", help="reviewed installed executor commit; defaults to --policy")
     parser.add_argument("--reviewed-head", help="original reviewed head when validating an integrated merge or squash commit")
     parser.add_argument("--pr-title")
     parser.add_argument("--tag")

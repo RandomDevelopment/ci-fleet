@@ -387,14 +387,26 @@ class RunnerTests(unittest.TestCase):
                                check=True, capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
                 self.assertEqual(checkout_manifest(source), expected)
 
-    def test_missing_procfs_fails_before_execution(self):
+    def test_missing_system_manager_fails_before_execution(self):
+        from unittest.mock import Mock
+        backend = Mock()
+        backend.run.side_effect = RuntimeError("system systemd manager required")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch("local_validate.Path.is_file", return_value=False), \
+            with patch("local_validate.load_executor", return_value=backend), \
                  patch("local_validate.subprocess.Popen") as launch, \
-                 self.assertRaisesRegex(RuntimeError, "Linux /proc"):
+                 self.assertRaisesRegex(RuntimeError, "system systemd manager"):
                 run(["true"], root, os.environ.copy(), root / "test.log", 5)
             launch.assert_not_called()
+
+    def test_wrong_executor_revision_refuses_before_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("local_validate.subprocess.Popen") as launch, \
+                 self.assertRaisesRegex(RuntimeError, "exact reviewed"):
+                run(["true"], root, {}, root / "test.log", 5, executor_revision="0" * 40)
+            launch.assert_not_called()
+            self.assertFalse((root / "test.log").exists())
 
     def test_successful_leader_cannot_hide_forced_descendant_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -589,6 +601,21 @@ exit 0
                     self.assertEqual(eval(expression, {"__builtins__": {}}, {}),
                                      enabled == "true" and (event != "pull_request" or state == "open"))
 
+    def test_embedded_workflow_prepares_the_independently_selected_executor(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
+        steps = workflow["jobs"]["hosted-validation"]["steps"]
+        checkout = next(step for step in steps if step["name"] == "Check out trusted executor")
+        self.assertEqual(checkout["with"]["ref"], "${{ vars.CI_FLEET_EXECUTOR_REVISION || vars.CI_FLEET_VALIDATOR_REVISION }}")
+        prepare = next(step for step in steps if step["name"] == "Install validation tools")
+        self.assertIn(checkout["with"]["path"] + "/scripts/local_validation_executor.py --prepare", prepare["run"])
+        admission = next(step for step in steps if step["name"] == "Require independently pinned validator")
+        for validator, executor, accepted in (("a" * 40, "b" * 40, True),
+                                                ("a" * 40, "HEAD", False), ("HEAD", "b" * 40, False)):
+            with self.subTest(validator=validator, executor=executor):
+                result = subprocess.run(["bash", "-c", admission["run"]], env={"VALIDATOR": validator, "EXECUTOR": executor})
+                self.assertEqual(result.returncode == 0, accepted)
+
     def test_embedded_pr_concurrency_cannot_cancel_main_after_merge(self):
         import yaml
         workflow = yaml.safe_load((ROOT / "templates/config-repository/.github/workflows/validate.yml").read_text())
@@ -638,6 +665,7 @@ class PolicyExecutionTests(unittest.TestCase):
             (self.repo / "scripts" / script).write_text("raise SystemExit(0)\n")
         self.source = self.commit("fix: candidate has weaker policies")
         self.count = 0
+        self.executor_revision = json.loads(Path("/usr/local/lib/ci-fleet-validation/revision.json").read_text())["revision"]
 
     def git(self, *args, env=None):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], env=env, stderr=subprocess.DEVNULL, text=True).strip()
@@ -651,7 +679,7 @@ class PolicyExecutionTests(unittest.TestCase):
         output = self.root / ("run-" + str(self.count))
         result = subprocess.run(["python3", str(ROOT / "scripts/local_validate.py"), "--kind", "configuration",
             "--repository", str(self.repo), "--source", source or self.source, "--base", self.base,
-            "--policy", self.policy, "--main", self.policy, "--output", str(output), *extra], capture_output=True, text=True)
+            "--policy", self.policy, "--main", self.policy, "--executor-revision", self.executor_revision, "--output", str(output), *extra], capture_output=True, text=True)
         report = json.loads((output / "result.json").read_text()) if (output / "result.json").exists() else None
         return result, report
 
@@ -665,6 +693,23 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(report["profile"], "full")
             self.assertEqual(report["expected_skips"], [])
         self.assertEqual(self.git("status", "--porcelain"), before)
+
+    def test_default_executor_must_match_the_selected_policy_before_any_stage(self):
+        import argparse
+        import local_validate
+        output = self.root / "wrong-installed-executor"
+        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+            reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
+            executor_revision=None, kind="configuration", profile="full", pr_title=None,
+            tag=None, tag_created=False, disposable_host=False, timeout=5)
+        with patch("local_validate.run") as stage:
+            self.assertEqual(local_validate.validate(args), 1)
+            stage.assert_not_called()
+        report = json.loads((output / "result.json").read_text())
+        self.assertEqual(report["executor_revision"], self.policy)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["results"], [])
+        self.assertIn("exact reviewed executor revision", report["error"])
 
     def test_replacement_refs_cannot_bind_an_unreviewed_tree(self):
         actual_tree = self.git("rev-parse", self.source + "^{tree}")
@@ -722,7 +767,7 @@ class PolicyExecutionTests(unittest.TestCase):
                         "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "advice.graftFileDeprecated", "GIT_CONFIG_VALUE_0": "false"}
         observed = []
         execute = local_validate.run
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             self.assertEqual({key: value for key, value in env.items() if key.startswith("GIT_")}, expected_git)
             self.assertNotIn("CI_FLEET_TEST_HOST_SECRET", env)
             self.assertEqual(env["PATH"], "/usr/sbin:/usr/bin:/sbin:/bin")
@@ -732,10 +777,10 @@ class PolicyExecutionTests(unittest.TestCase):
             observed.append(command)
             execute(command, cwd, env, log, timeout)
         output = self.root / "real-object-report"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
             reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
-        with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage):
+        with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.git_environment({"PATH": "fixture", "GIT_DIR": "untrusted"}),
                              {"PATH": "fixture", **expected_git})
             self.assertEqual(local_validate.git_environment({}), expected_git)
@@ -783,7 +828,7 @@ class PolicyExecutionTests(unittest.TestCase):
         before = local_validate.checkout_manifest(self.repo)
         for name, output, repository in cases:
             with self.subTest(location=name):
-                args = argparse.Namespace(repository=repository, policy_repository=policy, source=self.source,
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=repository, policy_repository=policy, source=self.source,
                     base=self.base, policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
                 with patch("local_validate.__file__", str(executable)), \
@@ -868,7 +913,7 @@ class PolicyExecutionTests(unittest.TestCase):
         tag = self.git("rev-parse", "refs/tags/v99.0.0")
         self.git("repack", "-ad")
         calls = []
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             for target, present, absent in (
                     (cwd, (integrated, reviewed, self.source, self.base, self.policy), (unrelated, blob, tag)),
                     (cwd.parent / "policy", (self.policy, self.base), (integrated, reviewed, self.source, unrelated, blob, tag))):
@@ -884,10 +929,10 @@ class PolicyExecutionTests(unittest.TestCase):
             self.assertEqual(local_validate.git(cwd, "rev-parse", "origin/main"), self.policy)
             calls.append(command)
             log.write_text("fixture stage\n")
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=integrated,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=integrated,
             reviewed_head=reviewed, base=self.base, policy=self.policy, main=self.policy, output=self.root / "bounded-checkouts",
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
-        with patch("local_validate.run", side_effect=stage):
+        with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.validate(args), 0)
         self.assertEqual(len(calls), 3)
 
@@ -918,7 +963,7 @@ class PolicyExecutionTests(unittest.TestCase):
         unrelated_tag = self.git("rev-parse", "refs/tags/v99.0.0")
         observed = []
         execute = local_validate.run
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             self.assertEqual(local_validate.git(cwd, "tag", "--list"), "v0.1.0")
             self.assertEqual(local_validate.git(cwd, "rev-parse", "v0.1.0"), selected)
             self.assertEqual(local_validate.git(cwd, "cat-file", "-t", selected), "tag")
@@ -934,10 +979,10 @@ class PolicyExecutionTests(unittest.TestCase):
             observed.append(command)
             execute(command, cwd, env, log, timeout)
         output = self.root / "release-checkouts"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
             base=self.base, policy=self.policy, main=head, output=output, kind="configuration", profile="full",
             pr_title=None, tag="v0.2.0", tag_created=True, disposable_host=False, timeout=30)
-        with patch("local_validate.run", side_effect=stage):
+        with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.validate(args), 0)
         report = json.loads((output / "result.json").read_text())
         self.assertEqual(report["release_tags"], {"v0.1.0": {"object": selected, "commit": self.base}})
@@ -1024,7 +1069,7 @@ class PolicyExecutionTests(unittest.TestCase):
         validator = self.repo / ".ci-fleet-validator"
         subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.repo), str(validator)], check=True)
         subprocess.run(["git", "-C", str(validator), "checkout", "--quiet", self.policy], check=True)
-        for name in ("local_validate.py", "local_validation_supervisor.py"):
+        for name in ("local_validate.py", "local_validation_executor.py"):
             shutil.copyfile(ROOT / "scripts" / name, validator / "scripts" / name)
         for event, title, base, main, accepted in (
                 ("pull_request", "invalid $(touch title-injected)", self.base, self.base, False),
@@ -1034,7 +1079,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 runtime = self.root / ("workflow-" + str(self.count)); self.count += 1
                 runtime.mkdir()
                 env = {**os.environ, "RUNNER_TEMP": str(runtime), "SOURCE": self.source, "BASE": base, "MAIN": main,
-                       "PR_TITLE": title, "EVENT_NAME": event, "VALIDATOR": self.policy}
+                       "PR_TITLE": title, "EVENT_NAME": event, "VALIDATOR": self.policy, "EXECUTOR": self.executor_revision}
                 result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.repo, env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
                 report = json.loads((runtime / "local-validation/result.json").read_text())
@@ -1049,7 +1094,7 @@ class PolicyExecutionTests(unittest.TestCase):
         import argparse
         import local_validate
         calls = []
-        def stage(command, cwd, env, log, timeout):
+        def stage(command, cwd, env, log, timeout, **kwargs):
             for target in (cwd, cwd.parent / "policy"):
                 cache = target / "__pycache__/generated.pyc"
                 self.assertFalse(cache.exists(), calls)
@@ -1061,10 +1106,10 @@ class PolicyExecutionTests(unittest.TestCase):
             with self.subTest(base=base):
                 calls.clear()
                 output = self.root / ("fresh-stages-" + base)
-                args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                     base=base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
-                with patch("local_validate.run", side_effect=stage):
+                with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
                     self.assertEqual(local_validate.validate(args), 0)
                 self.assertGreater(len(calls), 1)
 
@@ -1075,7 +1120,8 @@ class PolicyExecutionTests(unittest.TestCase):
         self.policy = self.commit("test: attempt verification seed mutation")
         result, report = self.validate()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkout changed", report["error"])
+        log = self.root / ("run-" + str(self.count)) / "configuration.log"
+        self.assertRegex(log.read_text(), "Permission denied|Read-only file system")
 
     def test_bad_commit_and_pr_title_cannot_use_candidate_policy(self):
         result, _ = self.validate("--pr-title", "invalid title")
@@ -1130,7 +1176,11 @@ class PolicyExecutionTests(unittest.TestCase):
                 result, report = self.validate(source=head)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(report["results"][-1]["status"], "failed")
-                self.assertIn("checkout changed", report["error"])
+                if name == "policy":
+                    log = self.root / ("run-" + str(self.count)) / "configuration.log"
+                    self.assertRegex(log.read_text(), "Permission denied|Read-only file system")
+                else:
+                    self.assertIn("checkout changed", report["error"])
 
     def test_integrated_squash_scans_removed_secrets_in_reviewed_history(self):
         (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
@@ -1164,21 +1214,13 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
-    def test_execution_tempdir_allows_existing_unprivileged_fixture(self):
-        if os.geteuid() != 0:
-            self.skipTest("permission fixture requires root")
+    def test_configuration_stage_is_unprivileged_with_private_scratch(self):
         self.git("checkout", "main")
-        script = "#!/bin/bash\npython3 " + str(ROOT / "scripts/test_apply_docker_network_policy.py") + \
-            " ApplyScriptTests.test_testing_mode_accepts_default_tmp_as_non_root\n"
-        script += "python3 " + str(ROOT / "scripts/test_endpoint_snapshot.py") + \
-            " SnapshotReadbackTests.test_unprivileged_observer_reads_export_but_cannot_read_private_sources\n"
-        (self.repo / "scripts/validate-configuration.sh").write_text(script)
-        self.policy = self.commit("test: run unprivileged permission fixture")
-        previous_umask = os.umask(0o077)
-        try:
-            result, report = self.validate()
-        finally:
-            os.umask(previous_umask)
+        (self.repo / "scripts/validate-configuration.sh").write_text(
+            "#!/bin/bash\npython3 -c 'import os; from pathlib import Path; "
+            "assert os.geteuid() != 0; p=Path(os.environ[\"TMPDIR\"])/\"owned\"; p.write_text(\"ok\")'\n")
+        self.policy = self.commit("test: require an unprivileged configuration stage")
+        result, report = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(report["status"], "passed")
 
@@ -1210,7 +1252,7 @@ class PolicyExecutionTests(unittest.TestCase):
             for marker in ("/etc/ci-fleet", "/etc/ci-fleet-deployer", "/var/lib/ci-fleet-tester", "/opt/ci-fleet-status"):
                 with self.subTest(kind=kind, marker=marker):
                     output = self.root / ("installed-" + kind + marker.replace("/", "-"))
-                    args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                    args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                         base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
                         pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                     with patch("local_validate.Path.exists", side_effect=lambda path: str(path) == marker or exists(path), autospec=True), \
@@ -1233,7 +1275,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 for dangling in (False, True):
                     with self.subTest(kind=kind, marker=marker, dangling=dangling):
                         output = self.root / (kind + marker.replace("/", "-") + str(dangling))
-                        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                             base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile="quick",
                             pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                         with patch("local_validate.Path.exists", autospec=True,
@@ -1259,7 +1301,7 @@ class PolicyExecutionTests(unittest.TestCase):
                     for dangling in (False, True):
                         with self.subTest(kind=kind, profile=profile, marker=marker, dangling=dangling):
                             output = self.root / (kind + profile + marker.replace("/", "-") + str(dangling))
-                            args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+                            args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                                 base=self.base, policy=self.policy, main=self.policy, output=output, kind=kind, profile=profile,
                                 pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
                             with patch("local_validate.Path.exists", autospec=True,
@@ -1267,7 +1309,7 @@ class PolicyExecutionTests(unittest.TestCase):
                                  patch("local_validate.Path.is_symlink", autospec=True,
                                        side_effect=lambda p: dangling if str(p) == marker else is_symlink(p)), \
                                  patch("local_validate.run") as stage, \
-                                 patch("local_validate.supervise_stage") as supervisor, \
+                                 patch("local_validate.load_executor") as supervisor, \
                                  patch("sys.stderr", io.StringIO()):
                                 self.assertEqual(local_validate.validate(args), 1)
                             stage.assert_not_called()
@@ -1286,7 +1328,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 raise FileNotFoundError("shellcheck missing")
             return original(command, *args, **kwargs)
         output = self.root / "missing-tool-run"
-        args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source, base=self.base,
+        args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source, base=self.base,
             policy=self.policy, main=self.policy, output=output, kind="configuration", profile="full",
             pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
         with patch("local_validate.subprocess.check_output", side_effect=missing_tool), patch("sys.stderr", io.StringIO()):
@@ -1296,27 +1338,31 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["results"], [])
 
     @unittest.skipUnless(os.geteuid() == 0, "engine fixtures require root")
-    def test_engine_requires_jq_before_running_stages(self):
+    def test_engine_requires_jq_and_full_profile_buildx_before_running_stages(self):
         import argparse
         import local_validate
         original = subprocess.check_output
-        def missing_jq(command, *args, **kwargs):
-            if command[:1] == ["jq"]:
-                raise FileNotFoundError("jq missing")
+        def missing_tool(command, *args, **kwargs):
+            if command == missing:
+                raise FileNotFoundError(message)
+            if command[:1] == ["docker"]:
+                return "Docker fixture"
             return original(command, *args, **kwargs)
-        for profile in ("quick", "full"):
-            with self.subTest(profile=profile):
-                output = self.root / ("missing-jq-" + profile)
-                args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
+        for profile, missing, message in (("quick", ["jq", "--version"], "jq missing"),
+                                          ("full", ["jq", "--version"], "jq missing"),
+                                          ("full", ["docker", "buildx", "version"], "Docker Buildx missing")):
+            with self.subTest(profile=profile, tool=missing):
+                output = self.root / ("missing-tool-" + missing[0] + "-" + profile)
+                args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                     base=self.base, policy=self.policy, main=self.policy, output=output, kind="engine", profile=profile,
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
-                with patch("local_validate.subprocess.check_output", side_effect=missing_jq), \
+                with patch("local_validate.subprocess.check_output", side_effect=missing_tool), \
                      patch("local_validate.run") as stage, patch("sys.stderr", io.StringIO()):
                     self.assertEqual(local_validate.validate(args), 1)
                 stage.assert_not_called()
                 report = json.loads((output / "result.json").read_text())
                 self.assertEqual(report["status"], "failed")
-                self.assertEqual(report["error"], "jq missing")
+                self.assertEqual(report["error"], message)
                 self.assertEqual(report["results"], [])
 
     def test_unexpected_skip_and_missing_tools_are_failures(self):

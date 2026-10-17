@@ -34,15 +34,21 @@ sudo apt-get install --no-install-recommends \
   curl jq ca-certificates systemd
 ```
 
-Install Docker Engine and Compose v2 through your reviewed Linux host procedure,
-then check `docker version` and `docker compose version`. Do not install Docker
+Install Docker Engine, Compose v2 and the Docker Buildx plugin through your
+reviewed Linux host procedure, then check `docker version`, `docker compose version`
+and `docker buildx version`. Do not install Docker
 or run privileged fixtures on an existing fleet or application host. Downloads
 need network access unless Git objects, packages and images are already present.
+Verify outbound DNS and HTTPS from Docker build containers under the worker's
+firewall rules. Working host DNS alone is insufficient. If private-network
+isolation blocks the host's LAN resolver, configure an approved reachable DNS
+resolver for the disposable Docker daemon while preserving that isolation.
 
 Run the following engine preparation and validation commands in a root shell on
 the disposable machine. The harness needs a protected home directory, `/dev/shm`
-and local Docker access. Linux `/proc`, child subreapers and pidfds are required
-so the per-stage supervisor can own, signal and reap escaped descendants.
+and local Docker access. Require systemd 255 or newer as PID 1 with cgroup v2.
+The system manager owns each stage and its descendants, deadline and cleanup.
+There is no custom supervisor or unprivileged fallback backend.
 Do not forward an SSH agent or install production Git
 credentials; use an operator-controlled read-only fetch method where needed.
 
@@ -55,6 +61,7 @@ git -C "$engine_repo" fetch --tags origin
 engine_policy_sha=FULL_REVIEWED_VALIDATOR_SHA
 test "$(git -C "$engine_repo" rev-parse "$engine_policy_sha^{commit}")" = "$engine_policy_sha"
 git -C "$engine_repo" checkout --detach "$engine_policy_sha"
+python3 -I "$engine_repo/scripts/local_validation_executor.py" --prepare --disposable-host
 ```
 
 Choose the validator revision independently from the proposed source. For
@@ -98,8 +105,9 @@ repository argument names a subdirectory or a result path uses a symlink.
 
 Inspect `result.json`, every named stage log, recorded identities, tool versions
 and exit status. Success requires `profile` equal to `full`, `status` equal to
-`passed`, no expected skips and all stages passed. Retain the entire result
-directory privately. A quick run, missing report, interrupted run or unexpected
+`passed`, no expected skips and all stages passed. Export the entire result directory once to private durable storage, verify its
+recorded hashes there, and reference that bundle for review and signing.
+Partial exports and lost-worker runs cannot authorize acceptance. A quick run, missing report, interrupted run or unexpected
 skip does not establish full acceptance.
 
 The harness refreshes and verifies source and policy checkouts for every stage.
@@ -128,9 +136,11 @@ requirement; do not disable the repository's existing required checks here.
 ## 3. Test an integrated configuration commit
 
 Use a separate clean execution machine with the configuration prerequisites and
-the same independently reviewed engine checkout. Configuration execution needs
-neither root nor Docker. Its protected home and working directories must belong
-to the operator and must not be group- or other-writable.
+the same independently reviewed engine checkout. Prepare it with the account
+setup command above and run the trusted launcher as root. It creates fresh
+unprivileged source/scratch copies and keeps policy and completion metadata
+protected. Configuration stages need no Docker access. Do not use the signer or
+an active fleet host as the execution worker.
 
 The core profile covers the embedded configuration contract. The standalone
 template and private adopters have additional updater, compatibility, release

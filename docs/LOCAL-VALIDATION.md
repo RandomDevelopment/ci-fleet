@@ -18,10 +18,13 @@ separate from repository validation.
 Use a disposable Debian 13 or Ubuntu 24.04 Linux execution machine. Engine
 fixtures require root, `runuser`, mounted `/proc` and `/dev/shm`, Bash, Git with complete history,
 Python 3.11 or later, PyYAML, ShellCheck, OpenSSL with Ed25519 support,
-coreutils, util-linux, curl, jq and standard systemd utilities. Both engine profiles
+coreutils, util-linux, curl, jq, systemd 255 or newer and cgroup v2.
+The system systemd manager must be PID 1 on the execution machine. Both engine profiles
 check for jq before running stages because the installer fixtures require it.
-The full engine run also requires Docker Engine, Compose v2 and access to its local
-Unix socket.
+The full engine run also requires Docker Engine, Compose v2, the Docker Buildx
+plugin and access to its local Unix socket. The tool preflight checks Buildx
+before any validation stage so Docker cannot silently use its legacy builder
+for the APT-cache fixture image.
 The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem
@@ -33,13 +36,33 @@ file or dangling symlink blocks candidate execution, including partial bootstrap
 or removal. That check cannot detect an unusually installed role, so the operator
 must verify the machine's role.
 
-Configuration runs need Linux with mounted `/proc`, kernel support for child
-subreapers and pidfds, Bash, Git, Python 3.11 or later, ShellCheck and OpenSSL.
-They do not require root or Docker. The core
-configuration profile covers the embedded configuration contract. A standalone-template suite must additionally preserve
-its updater, compatibility and release tests under template issue
-[#32](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/32).
-Do not treat this profile as proof of those additional standalone tests.
+Configuration runs need the same prepared Linux/systemd worker, Bash, Git,
+Python 3.11 or later, ShellCheck and OpenSSL. The trusted launcher requires root;
+configuration stages execute as the locked, unprivileged `ci-fleet-validation`
+account without Docker, manager-bus or cgroup-control access. This is an explicit
+execution-host prerequisite, replacing the previous arbitrary unprivileged-Linux
+supervisor. There is no alternate process-tracking backend. macOS and Windows
+operators use a disposable Linux VM or a remote prepared execution worker.
+
+After selecting the trusted engine checkout, prepare each fresh worker once:
+
+```bash
+sudo python3 -I /trusted/ci-fleet/scripts/local_validation_executor.py \
+  --prepare --disposable-host
+```
+
+Preparation installs the committed executor and its revision/hash manifest under
+`/usr/local/lib/ci-fleet-validation` and creates a locked job account. It refuses
+an existing job account with a shared primary group or supplementary group
+memberships. Ordinary stages recheck that restriction before execution. It refuses
+uncommitted executor code. Consumers require the exact independently reviewed
+installed revision. There is no daemon, timer, fleet registration or signing
+credential. The entire worker remains disposable;
+rebuild it with the same reviewed prerequisites when lost. Do not run this setup
+on a fleet, application or signing host. The core configuration profile covers
+only the embedded configuration contract. Standalone-template and private-adopter
+suites additionally retain their own policy, updater, compatibility and release
+checks. Do not substitute the smaller core profile for those suites.
 
 Populate complete repository history and tags before running. Policy is an
 independently reviewed engine commit, not a merge base chosen by the candidate.
@@ -66,7 +89,7 @@ before creating directories, reports or logs, or executing candidates.
 Run as root only on the disposable execution machine.
 
 ```bash
-python3 /trusted/ci-fleet/scripts/local_validate.py \
+sudo python3 /trusted/ci-fleet/scripts/local_validate.py \
   --repository /work/ci-fleet \
   --source SOURCE_SHA --base BASE_SHA \
   --policy POLICY_SHA --main MAIN_SHA \
@@ -98,7 +121,13 @@ bump. Keep release review and production approval separate from these tests.
 
 The runner creates independent source and policy seeds, excludes working-tree
 edits, resets the main reference to the supplied identity, and uses a unique
-private temporary directory under the operator's protected home. Permission
+private temporary directory under the operator's protected home for engine
+runs, or under root-owned `/var/lib/ci-validation-work` for unprivileged
+configuration stages. `/run` is often mounted noexec, so candidate executables
+do not live there. The latter
+receive their own writable source and scratch copies; trusted policy copies
+are read-only mounts inside the job. Only its source, home and scratch paths
+are writable. Seeds, completion receipts and reports remain root-owned. Permission
 fixtures use a separate uniquely named directory under `/tmp` with read and traversal
 permission for their deliberate UID changes. Each fixture controls access to its
 own child directory. Both temporary roots are removed on exit. It strips inherited credentials and Git/Python
@@ -137,38 +166,56 @@ outside Git. A changed source, base, title, tag or policy requires a new run.
 Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
-Each stage has a 1,800-second timeout, configurable with `--timeout`. A separate
-Linux child-subreaper supervisor owns the stage's descendants, including children
-that create new sessions or double-fork. The orchestrator never enables or changes
-its own existing subreaper flag. On stage exit, timeout, SIGINT or SIGTERM, the
-supervisor signals owned descendants through pidfds and allows 60 seconds for
-cleanup before forced termination. It repeatedly discovers and reaps descendants until the kernel
-confirms that no children remain. A successful leader cannot hide descendants
-that require forced termination; that stage fails. The orchestrator waits for
-this cleanup before propagating cancellation. Helpers started by a process
-handling termination retain that grace period; adopted orphans are signalled.
-Supervisor code is captured before candidate execution and launched from those
-in-memory bytes, so later stages do not reload a writable helper file.
-Unkillable kernel tasks can prevent
-cleanup from completing; discard the disposable machine in that case. External
-daemon work remains outside process ancestry. The APT fixture handles termination through its resource
-cleanup block. The harness removes temporary checkouts. A hard kill or power
-loss cannot guarantee cleanup. Use the report's
-run identity and the invocation-specific image tags to inspect leftovers, or
-discard the disposable machine. Do not run global Docker prune. Container tests
-remove their named inspection container and invocation-specific image tags;
-the cleanup fixture tests scoped success, failure, cancellation and timeout.
-Failed final daemon checks, resource queries or removals fail the container stage
-even when its preceding tests passed. Successful empty queries confirm that
-invocation-owned resources are already absent.
-Build cache can remain on the disposable daemon.
+Each stage has a 1,800-second timeout, configurable with `--timeout`. The shared
+`scripts/local_validation_executor.py` creates a unique system-manager transient
+service per stage. `RuntimeMaxSec` enforces its deadline; `KillMode=control-group`
+includes descendants that detach or double-fork. `ExitType=cgroup` keeps the
+service alive through descendant cleanup. The client asks the manager to stop
+the unit when its recorded main process exits; it reads manager state, never
+walks or signals a process tree. A shell exiting on TERM cannot cut short its
+child's resource-cleanup helpers. Systemd sends TERM, allows 60 seconds for cleanup, and
+uses KILL if necessary. A leader exiting zero cannot hide forced cleanup.
+Cancellation stops only that invocation's unit and waits for cleanup.
+An early cancellation retries the stop request until the new unit is visible.
+Cancellation before service startup may prevent the completion hook from running.
+It still reports cancellation after the empty-cgroup check and never accepts a
+result; successful validation always requires the completion receipt.
+
+The launcher loads the protected installed executor and requires its exact
+revision to match `--policy`, or an independently selected `--executor-revision`
+when configuration policy intentionally retains an older baseline. The report
+records that executor revision. An unrelated sibling helper cannot execute
+stages, and a mismatched installation fails before launching any service.
+The executor reads a root-protected `ExecStopPost` receipt and verifies the
+service cgroup is empty before recording success or starting another stage.
+Missing receipts, unsuccessful service results, forced termination and incomplete
+cleanup fail validation. There is no `/proc` walk, pidfd table or child-subreaper
+in the executor. Ordinary configuration stages cannot write the trusted policy,
+completion receipt or report, and do not receive a manager bus or Docker socket.
+
+If the launcher is killed, PID 1 still enforces the stage deadline, but the run
+has no accepted completion report. A lost worker invalidates an unfinished run;
+rebuild and rerun against the same pinned inputs. Unkillable kernel tasks,
+manager failure or uncertain cleanup require discarding the execution worker.
+Systemd does not contain hostile root or clean external Docker-daemon resources.
+Privileged engine fixtures still require independent review and disposable-VM
+execution. Use run-scoped Docker cleanup and never global Docker prune. Failed
+final daemon queries or removals fail the container stage; build cache can remain
+on the disposable daemon.
+
+Keep one result directory per run. Export that directory once through an
+authenticated operator channel to durable storage outside the worker. Verify
+`result.json` and every recorded log digest at the destination before destroying
+the worker. Review and signing use that same bundle. GitHub artifact uploads and
+an additional storage service are not required. An incomplete transfer cannot
+satisfy the signer because its report or required log hashes are missing.
 
 ## Configuration repositories
 
 Use the same trusted engine orchestrator with a separate source repository:
 
 ```bash
-python3 /trusted/ci-fleet/scripts/local_validate.py \
+sudo python3 /trusted/ci-fleet/scripts/local_validate.py \
   --kind configuration --repository /work/private-config \
   --source APPLIED_SHA --reviewed-head REVIEWED_HEAD_SHA \
   --base FIRST_PARENT_SHA --main APPLIED_SHA \
