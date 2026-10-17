@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,8 @@ import time
 import uuid
 
 USER = "ci-fleet-validation"
+INSTALL = Path("/usr/local/lib/ci-fleet-validation")
+WORK = Path("/var/lib/ci-validation-work")
 HOST_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 # ExecStopPost runs after systemd has terminated the stage's remaining processes.
 # Its receipt lives in a root-only directory, outside candidate-writable paths.
@@ -27,6 +30,20 @@ result = {key: os.environ.get(key) for key in ("SERVICE_RESULT", "EXIT_CODE", "E
 with Path(__file__).with_name("result.json").open("x") as output:
     json.dump(result, output)
 '''
+
+
+def require_revision(revision: str) -> None:
+    """Bind consumers to the reviewed executor installed by worker preparation."""
+    program = INSTALL / "executor.py"
+    manifest = INSTALL / "revision.json"
+    for path in (program, manifest, INSTALL, *INSTALL.parents):
+        mode = path.lstat()
+        if path.is_symlink() or mode.st_uid != 0 or mode.st_mode & 0o022:
+            raise RuntimeError("unsafe installed validation executor")
+    identity = json.loads(manifest.read_text())
+    if (Path(__file__) != program or not re.fullmatch(r"[0-9a-f]{40}", revision)
+            or identity != {"revision": revision, "sha256": hashlib.sha256(program.read_bytes()).hexdigest()}):
+        raise RuntimeError("prepare the worker with the exact reviewed executor revision " + revision)
 
 
 def require_worker() -> None:
@@ -48,7 +65,7 @@ def prepare_stage(writable: list[Path], readonly: list[Path]) -> None:
         account = pwd.getpwnam(USER)
     except KeyError as error:
         raise RuntimeError("prepare the disposable worker before running configuration tests") from error
-    if account.pw_uid == 0:
+    if account.pw_uid == 0 or account.pw_gid == 0:
         raise RuntimeError("validation job account must be unprivileged")
     for roots, mutable in ((readonly, False), (writable, True)):
         for root in roots:
@@ -132,6 +149,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 process.wait()
         try:
             result = json.loads((root / "result.json").read_text())
+            if not isinstance(result, dict):
+                raise RuntimeError("invalid system manager receipt")
             events = (cgroup / "cgroup.events").read_text() if cgroup.exists() else "populated 0\n"
             if "populated 0" not in events.splitlines():
                 raise RuntimeError("stage cgroup is not empty; discard the worker")
@@ -171,9 +190,38 @@ def main() -> None:
         subprocess.run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", USER],
                        env=HOST_ENV, check=True)
         account = pwd.getpwnam(USER)
-    if account.pw_uid == 0 or account.pw_shell != "/usr/sbin/nologin":
+    if account.pw_uid == 0 or account.pw_gid == 0 or account.pw_shell != "/usr/sbin/nologin":
         raise RuntimeError("unsafe existing validation job account")
-    print("Validation worker ready. This adds no persistent service or fleet credentials.")
+    source = Path(__file__).resolve()
+    repository = source.parents[1]
+    git_env = {**HOST_ENV, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+               "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/dev/null"}
+    revision = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], env=git_env, text=True).strip()
+    program = subprocess.check_output(["git", "-C", str(repository), "show", revision + ":scripts/" + source.name], env=git_env)
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or program != source.read_bytes():
+        raise RuntimeError("prepare from a clean, committed, independently reviewed engine checkout")
+    WORK.mkdir(mode=0o711, parents=True, exist_ok=True)
+    if WORK.is_symlink() or WORK.stat().st_uid != 0 or WORK.stat().st_mode & 0o022:
+        raise RuntimeError("unsafe validation workspace parent")
+    WORK.chmod(0o711)
+    INSTALL.mkdir(mode=0o755, parents=True, exist_ok=True)
+    for path in (INSTALL, *INSTALL.parents):
+        mode = path.lstat()
+        if path.is_symlink() or mode.st_uid != 0 or mode.st_mode & 0o022:
+            raise RuntimeError("unsafe executor installation directory")
+    identity = json.dumps({"revision": revision, "sha256": hashlib.sha256(program).hexdigest()}).encode()
+    for name, data in (("executor.py", program), ("revision.json", identity)):
+        with tempfile.NamedTemporaryFile(dir=INSTALL, delete=False) as output:
+            temporary = Path(output.name)
+            try:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+                temporary.chmod(0o644)
+                temporary.replace(INSTALL / name)
+            finally:
+                temporary.unlink(missing_ok=True)
+    print("Validation worker prepared at executor " + revision + ". No service or fleet credentials installed.")
 
 
 if __name__ == "__main__":

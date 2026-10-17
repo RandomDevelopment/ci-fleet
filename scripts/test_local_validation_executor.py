@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,28 @@ record()
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_installed_revision_and_bytes_must_match_in_a_protected_directory(self):
+        with tempfile.TemporaryDirectory(dir="/run") as temporary:
+            install = Path(temporary)
+            program = install / "executor.py"
+            manifest = install / "revision.json"
+            program.write_bytes(b"reviewed executor bytes")
+            manifest.write_text(json.dumps({"revision": "a" * 40, "sha256": hashlib.sha256(program.read_bytes()).hexdigest()}))
+            with patch.object(executor, "INSTALL", install), patch.object(executor, "__file__", str(program)):
+                executor.require_revision("a" * 40)
+                with self.assertRaisesRegex(RuntimeError, "exact reviewed"):
+                    executor.require_revision("b" * 40)
+                program.write_bytes(b"substituted executor")
+                with self.assertRaisesRegex(RuntimeError, "exact reviewed"):
+                    executor.require_revision("a" * 40)
+                program.chmod(0o666)
+                with self.assertRaisesRegex(RuntimeError, "unsafe installed"):
+                    executor.require_revision("a" * 40)
+                program.unlink()
+                program.symlink_to(manifest)
+                with self.assertRaisesRegex(RuntimeError, "unsafe installed"):
+                    executor.require_revision("a" * 40)
+
     def test_no_system_manager_never_launches_candidate(self):
         with patch.object(executor, "require_worker", side_effect=RuntimeError("system manager required")), \
                 patch.object(executor.subprocess, "Popen") as launch:
@@ -54,6 +77,19 @@ class AdmissionTests(unittest.TestCase):
                 with self.subTest(command=command, timeout=timeout, grace=grace, user=user), self.assertRaises(ValueError):
                     executor.run(command, Path("/"), environment, Path("/unused"), timeout, grace, user=user)
             admission.assert_not_called()
+
+    def test_missing_failed_or_malformed_manager_receipts_cannot_pass(self):
+        for outcome in (None, [], {"SERVICE_RESULT": "success"},
+                        {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "7"}):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                def launch(command, **_):
+                    finish = Path(next(value for value in command if value.startswith("--property=ExecStopPost=")).split()[-1])
+                    if outcome is not None:
+                        finish.with_name("result.json").write_text(json.dumps(outcome))
+                    return type("Process", (), {"returncode": 0, "poll": lambda _: 0})()
+                with patch.object(executor, "require_worker"), patch.object(executor.subprocess, "Popen", side_effect=launch), \
+                        patch.object(executor.subprocess, "run"), self.assertRaises(RuntimeError):
+                    executor.run(["true"], Path(temporary), {}, Path(temporary) / "stage.log", 1)
 
 
 class ExecutorTests(unittest.TestCase):

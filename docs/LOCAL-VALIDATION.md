@@ -49,8 +49,11 @@ sudo python3 -I /trusted/ci-fleet/scripts/local_validation_executor.py \
   --prepare --disposable-host
 ```
 
-Preparation creates only a locked job account. It installs no daemon, timer,
-fleet registration or signing credential. The entire worker remains disposable;
+Preparation installs the committed executor and its revision/hash manifest under
+`/usr/local/lib/ci-fleet-validation` and creates a locked job account. It refuses
+uncommitted executor code. Consumers require the exact independently reviewed
+installed revision. There is no daemon, timer, fleet registration or signing
+credential. The entire worker remains disposable;
 rebuild it with the same reviewed prerequisites when lost. Do not run this setup
 on a fleet, application or signing host. The core configuration profile covers
 only the embedded configuration contract. Standalone-template and private-adopter
@@ -115,7 +118,9 @@ bump. Keep release review and production approval separate from these tests.
 The runner creates independent source and policy seeds, excludes working-tree
 edits, resets the main reference to the supplied identity, and uses a unique
 private temporary directory under the operator's protected home for engine
-runs, or under root-owned `/run` for unprivileged configuration stages. The latter
+runs, or under root-owned `/var/lib/ci-validation-work` for unprivileged
+configuration stages. `/run` is often mounted noexec, so candidate executables
+do not live there. The latter
 receive their own writable source and scratch copies; trusted policy stays
 root-owned and cannot be modified by the job account. Permission
 fixtures use a separate uniquely named directory under `/tmp` with read and traversal

@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from local_validation_executor import prepare_stage, run as execute_stage
+from local_validation_executor import WORK, prepare_stage, run as execute_stage
 
 SHA = re.compile(r"[0-9a-f]{40}")
 NO_PRIOR = "0" * 40
@@ -185,7 +185,7 @@ def validate(args: argparse.Namespace) -> int:
     if args.profile == "quick" and args.kind == "engine":
         report["expected_skips"] = ["container-build-and-cleanup"]
     try:
-        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home() if args.kind == "engine" else "/run") as temporary, \
+        with tempfile.TemporaryDirectory(prefix="ci-fleet-validation-", dir=Path.home() if args.kind == "engine" else WORK) as temporary, \
                 tempfile.TemporaryDirectory(prefix="ci-fleet-fixtures-", dir="/tmp") as fixture_temporary:
             root = Path(temporary)
             if args.kind == "configuration":

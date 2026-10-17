@@ -735,7 +735,7 @@ class PolicyExecutionTests(unittest.TestCase):
         args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
             reviewed_head=None, base=self.base, policy=self.policy, main=self.policy, output=output,
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
-        with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage):
+        with patch.dict(os.environ, overrides), patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.git_environment({"PATH": "fixture", "GIT_DIR": "untrusted"}),
                              {"PATH": "fixture", **expected_git})
             self.assertEqual(local_validate.git_environment({}), expected_git)
@@ -887,7 +887,7 @@ class PolicyExecutionTests(unittest.TestCase):
         args = argparse.Namespace(repository=self.repo, policy_repository=None, source=integrated,
             reviewed_head=reviewed, base=self.base, policy=self.policy, main=self.policy, output=self.root / "bounded-checkouts",
             kind="configuration", profile="full", pr_title=None, tag=None, tag_created=False, disposable_host=False, timeout=30)
-        with patch("local_validate.run", side_effect=stage):
+        with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.validate(args), 0)
         self.assertEqual(len(calls), 3)
 
@@ -937,7 +937,7 @@ class PolicyExecutionTests(unittest.TestCase):
         args = argparse.Namespace(repository=self.repo, policy_repository=None, source=head, reviewed_head=None,
             base=self.base, policy=self.policy, main=head, output=output, kind="configuration", profile="full",
             pr_title=None, tag="v0.2.0", tag_created=True, disposable_host=False, timeout=30)
-        with patch("local_validate.run", side_effect=stage):
+        with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
             self.assertEqual(local_validate.validate(args), 0)
         report = json.loads((output / "result.json").read_text())
         self.assertEqual(report["release_tags"], {"v0.1.0": {"object": selected, "commit": self.base}})
@@ -1064,7 +1064,7 @@ class PolicyExecutionTests(unittest.TestCase):
                 args = argparse.Namespace(repository=self.repo, policy_repository=None, source=self.source,
                     base=base, policy=self.policy, main=self.policy, output=output, kind="engine", profile="quick",
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
-                with patch("local_validate.run", side_effect=stage):
+                with patch("local_validate.run", side_effect=stage), patch("local_validate.prepare_stage"):
                     self.assertEqual(local_validate.validate(args), 0)
                 self.assertGreater(len(calls), 1)
 
@@ -1075,7 +1075,8 @@ class PolicyExecutionTests(unittest.TestCase):
         self.policy = self.commit("test: attempt verification seed mutation")
         result, report = self.validate()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checkout changed", report["error"])
+        log = self.root / ("run-" + str(self.count)) / "configuration.log"
+        self.assertIn("Permission denied", log.read_text())
 
     def test_bad_commit_and_pr_title_cannot_use_candidate_policy(self):
         result, _ = self.validate("--pr-title", "invalid title")
@@ -1130,7 +1131,11 @@ class PolicyExecutionTests(unittest.TestCase):
                 result, report = self.validate(source=head)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(report["results"][-1]["status"], "failed")
-                self.assertIn("checkout changed", report["error"])
+                if name == "policy":
+                    log = self.root / ("run-" + str(self.count)) / "configuration.log"
+                    self.assertIn("Permission denied", log.read_text())
+                else:
+                    self.assertIn("checkout changed", report["error"])
 
     def test_integrated_squash_scans_removed_secrets_in_reviewed_history(self):
         (self.repo / ".env").write_text("EXAMPLE=placeholder\n")
