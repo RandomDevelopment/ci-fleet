@@ -34,10 +34,15 @@ sudo apt-get install --no-install-recommends \
   curl jq ca-certificates systemd
 ```
 
-Install Docker Engine and Compose v2 through your reviewed Linux host procedure,
-then check `docker version` and `docker compose version`. Do not install Docker
+Install Docker Engine, Compose v2 and the Docker Buildx plugin through your
+reviewed Linux host procedure, then check `docker version`, `docker compose version`
+and `docker buildx version`. Do not install Docker
 or run privileged fixtures on an existing fleet or application host. Downloads
 need network access unless Git objects, packages and images are already present.
+Verify outbound DNS and HTTPS from Docker build containers under the worker's
+firewall rules. Working host DNS alone is insufficient. If private-network
+isolation blocks the host's LAN resolver, configure an approved reachable DNS
+resolver for the disposable Docker daemon while preserving that isolation.
 
 Run the following engine preparation and validation commands in a root shell on
 the disposable machine. The harness needs a protected home directory, `/dev/shm`

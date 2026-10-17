@@ -1338,27 +1338,31 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["results"], [])
 
     @unittest.skipUnless(os.geteuid() == 0, "engine fixtures require root")
-    def test_engine_requires_jq_before_running_stages(self):
+    def test_engine_requires_jq_and_full_profile_buildx_before_running_stages(self):
         import argparse
         import local_validate
         original = subprocess.check_output
-        def missing_jq(command, *args, **kwargs):
-            if command[:1] == ["jq"]:
-                raise FileNotFoundError("jq missing")
+        def missing_tool(command, *args, **kwargs):
+            if command == missing:
+                raise FileNotFoundError(message)
+            if command[:1] == ["docker"]:
+                return "Docker fixture"
             return original(command, *args, **kwargs)
-        for profile in ("quick", "full"):
-            with self.subTest(profile=profile):
-                output = self.root / ("missing-jq-" + profile)
+        for profile, missing, message in (("quick", ["jq", "--version"], "jq missing"),
+                                          ("full", ["jq", "--version"], "jq missing"),
+                                          ("full", ["docker", "buildx", "version"], "Docker Buildx missing")):
+            with self.subTest(profile=profile, tool=missing):
+                output = self.root / ("missing-tool-" + missing[0] + "-" + profile)
                 args = argparse.Namespace(executor_revision=self.executor_revision, repository=self.repo, policy_repository=None, source=self.source,
                     base=self.base, policy=self.policy, main=self.policy, output=output, kind="engine", profile=profile,
                     pr_title=None, reviewed_head=None, tag=None, tag_created=False, disposable_host=True, timeout=30)
-                with patch("local_validate.subprocess.check_output", side_effect=missing_jq), \
+                with patch("local_validate.subprocess.check_output", side_effect=missing_tool), \
                      patch("local_validate.run") as stage, patch("sys.stderr", io.StringIO()):
                     self.assertEqual(local_validate.validate(args), 1)
                 stage.assert_not_called()
                 report = json.loads((output / "result.json").read_text())
                 self.assertEqual(report["status"], "failed")
-                self.assertEqual(report["error"], "jq missing")
+                self.assertEqual(report["error"], message)
                 self.assertEqual(report["results"], [])
 
     def test_unexpected_skip_and_missing_tools_are_failures(self):

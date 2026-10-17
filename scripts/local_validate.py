@@ -238,7 +238,8 @@ def validate(args: argparse.Namespace) -> int:
                     raise ValueError("engine validation requires --disposable-host on an isolated disposable Docker host")
                 tools["jq"] = ["jq", "--version"]
                 if args.profile == "full":
-                    tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"])
+                    tools.update(docker=["docker", "version"], compose=["docker", "compose", "version"],
+                                 buildx=["docker", "buildx", "version"])
             # Neither profile may execute candidate code on a fleet or signing role.
             installed = ("ci-fleet", "ci-fleet-tester", "ci-fleet-deployer", "ci-fleet-status", "ci-fleet-signing")
             markers = [Path(parent, role) for parent in ("/etc", "/var/lib", "/opt") for role in installed]
