@@ -58,7 +58,13 @@ an accepted LKG. Unknown or unverified installer outcomes remain failures: do no
 infer safe rollback from a nonzero exit alone. Final health rejection restores
 only the verified same-engine drained baseline through the existing installer
 LKG path. LKG write failure is not suppressed or reported as success; explicit
-recovery attempts drained-baseline restoration and returns failure. A rollback
+recovery attempts drained-baseline restoration and returns failure. If candidate
+metadata was written before readback failed, the manager atomically restores the
+retained verified baseline record **before** the installer's live approval and
+checkpoint checks; it never synthesizes a replacement recovery identity. A fresh
+health report and matching process exit are required for each probe (0 for
+healthy/maintenance, 1 for warning, 2 for unhealthy). Missing output, stale output,
+execution failure or inconsistent exit/status cannot verify rollback. A rollback
 whose health is not drained maintenance/warning is not reported verified.
 Inspect the protected reconcile state and installer diagnostics after every
 nonzero exit. Failed recovery must remain held; admission needs separate review
@@ -69,7 +75,11 @@ isolation proof or permission to publish otherwise unapproved images.
 
 This feature requires a new reviewed supporting engine/manager pin and complete
 isolated Linux validation, independent review and authorized staging. It is not
-a drop-in flag for older pinned managers. Updating public source does not change
+a drop-in flag for older pinned managers, including the old `312` manager. This
+feature is only for an already-installed drained controller; adding reviewed image
+identities does **not** prove bootstrapability. An image-free baseline requires a
+matching protected activation checkpoint for the existing installer recovery path.
+Updating public source does not change
 an installed manager, runtime, checkpoint or private configuration pin. Preserve
 compatible checkpoint recovery and stage manager support before using the flag;
 never patch pinned guest source or fabricate LKG/approval records. Engine merge,

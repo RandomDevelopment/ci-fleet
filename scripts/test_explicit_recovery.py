@@ -7,7 +7,9 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("reconcile_tests", Path(__file__).with_name("test_remote_reconcile.py"))
 assert spec is not None and spec.loader is not None
@@ -18,7 +20,12 @@ spec.loader.exec_module(fixtures)
 class ExplicitRecovery(fixtures.TestRemoteReconcileTransaction):
     # Reuse fixture construction, not the parent regression cases.
     def setUp(self):
-        super().setUp()
+        # The real approval reader rejects world-writable ancestors (e.g. /tmp).
+        # Keep this suite's isolated roots under a private home directory.
+        private = tempfile.TemporaryDirectory(prefix="ci-fleet-recovery-", dir=Path.home())
+        self.addCleanup(private.cleanup)
+        with patch.object(tempfile, "tempdir", private.name):
+            super().setUp()
         self.engine = "a" * 40
         self.config = {"organization": {"delivery_engine": "RandomDevelopment/ci-fleet"},
                        "runner_pools": {"ordinary": {"capacity_budget": 1}},
@@ -269,6 +276,131 @@ exec {shlex.quote(real_python)} "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
         self.assertNotIn("ROLLBACK_OK", result.stdout)
+
+    def install_live_recovery_guards(self):
+        """Exercise the installer's actual approval and image-free checkpoint guards."""
+        source = Path(__file__).with_name("install-worker-controller.sh").read_text()
+        guards = source.split("find_bootstrap_lkg_checkpoint() {", 1)[1].split("\nvalidate_candidate_config_commit()", 1)[0]
+        approval = source.split("verify_configuration_approval() {", 1)[1].split("\nrequire_configuration_approval_capability()", 1)[0]
+        scripts = self.root / "scripts"
+        for name in ("verify_config_approval.py", "desired_state.py", "apt_cache.py"):
+            shutil.copy2(Path(__file__).with_name(name), scripts / name)
+        # Candidate network evidence remains doubled; recovery uses the real CLI.
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == */verify_config_approval.py && " $* " != *" --recovery-record "* ]]; then
+  exit 0
+fi
+if [[ ${{1:-}} == */desired_state.py && ${{2:-}} == validate ]]; then exit 0; fi
+exec {shlex.quote(real_python)} "$@"
+''')
+        policy = self.td / "etc/ci-fleet"
+        policy.mkdir(parents=True)
+        (policy / "config-review-required").write_text("1\n")
+        (policy / "config-review-policy.json").write_text(json.dumps({
+            "schema_version": 1, "configuration_repository_id": 1, "branch": "main",
+            "workflow_id": 1, "required_jobs": ["validate"], "reviewer_ids": [1]}))
+        for path in policy.iterdir():
+            path.chmod(0o600)
+        checkpoints = self.td / "checkpoints"
+        checkpoint = checkpoints / "baseline"
+        checkpoint.mkdir(parents=True, mode=0o700)
+        checkpoints.chmod(0o700)
+        (checkpoint / ".complete").write_text("1\n")
+        (checkpoint / "install-state.json").write_text(self.state_file.read_text())
+        (checkpoint / "ci-fleet.env").write_text(
+            f"CI_FLEET_CONFIG_REPOSITORY=example-org/private-config\nCI_FLEET_CONFIG_REF={self.baseline}\nCI_FLEET_INSTANCE=example-ci-01\n")
+        for path in checkpoint.iterdir():
+            path.chmod(0o600)
+        installer = scripts / "install-worker-controller.sh"
+        preamble = '''set -e
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+config_review_policy=$CI_FLEET_ROOT_PREFIX/etc/ci-fleet/config-review-policy.json
+config_review_required=$CI_FLEET_ROOT_PREFIX/etc/ci-fleet/config-review-required
+state_file=$CI_FLEET_REMOTE_STATE_FILE
+state_root=$(dirname "$state_file")
+checkpoints_dir=$CI_FLEET_ROOT_PREFIX/checkpoints
+testing=1
+die() { echo "$*" >&2; exit 2; }
+configuration_approval_required() { return 0; }
+'''
+        guard_call = '''if [[ ${2:-} == --restore-last-known-good ]]; then
+  restore_lkg=true
+  args=("$@")
+  for ((i=0; i<$#; i++)); do
+    case ${args[i]} in
+      --ref) config_ref=${args[i+1]} ;;
+      --config-identity) config_identity=${args[i+1]} ;;
+      --controller) controller_id=${args[i+1]} ;;
+    esac
+  done
+  config_tree=$(git -C "$REMOTE_FIXTURE_REPO" rev-parse "$config_ref^{tree}")
+  verify_configuration_approval
+  find_bootstrap_lkg_checkpoint > "$CI_FLEET_ROOT_PREFIX/checkpoint-used"
+fi
+'''
+        installer.write_text(installer.read_text().replace("python3 - ", preamble +
+            "find_bootstrap_lkg_checkpoint() {" + guards + "\nverify_configuration_approval() {" + approval +
+            "\n" + guard_call + "python3 - ", 1))
+
+    def test_candidate_written_then_readback_failure_restores_live_trusted_baseline(self):
+        self.install_live_recovery_guards()
+        wrapper = self.td / "bin/python3"
+        wrapper.write_text(wrapper.read_text().replace("exec ", '''if [[ ${1:-} == -c && ${3:-} == "$CI_FLEET_LKG_DIR/metadata.json" && ${5:-} == "$DENY_LKG_REF" ]]; then
+  exit 1
+fi
+exec ''', 1))
+        self.env["DENY_LKG_REF"] = self.candidate
+        result = self.run_ref("--ref", self.candidate)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self._reconcile_state()["status"], "rolled_back")
+        self.assertEqual(json.loads(self.state_file.read_text())["config_ref"], self.baseline)
+        self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
+        self.assertTrue((self.td / "checkpoint-used").read_text().strip())
+
+    def test_live_recovery_guard_still_rejects_missing_checkpoint(self):
+        self.install_live_recovery_guards()
+        shutil.rmtree(self.td / "checkpoints")
+        self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
+
+    def test_live_recovery_guard_still_rejects_untrusted_policy(self):
+        self.install_live_recovery_guards()
+        (self.td / "etc/ci-fleet/config-review-policy.json").chmod(0o666)
+        self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
+
+    def test_rollback_probe_failure_without_output_cannot_reuse_candidate_report(self):
+        health = self.root / "scripts/health.py"
+        health.write_text(health.read_text().replace('with open(output, "w",',
+            'if rollback:\n    raise SystemExit(1)\nwith open(output, "w",'))
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then exit 1; fi
+exec {shlex.quote(real_python)} "$@"
+''')
+        self.env["DENY_LKG_REF"] = self.candidate
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back", result.stdout + result.stderr)
+
+    def test_fresh_accepted_report_with_failed_process_is_rejected(self):
+        health = self.root / "scripts/health.py"
+        health.write_text(health.read_text().replace('raise SystemExit({"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}.get(status, 2))', 'raise SystemExit(1)'))
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
+
+    def test_warning_probe_exit_one_remains_accepted(self):
+        self.env["FAKE_HEALTH_STATUS"] = "warning"
+        result = self.run_ref("--ref", self.candidate)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_lkg_write_failure_never_reports_success(self):
         real_python = shutil.which("python3")

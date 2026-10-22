@@ -453,6 +453,7 @@ with open(output, "w", encoding="utf-8") as handle:
         handle.write("{")
     else:
         json.dump({"status": status, "desired_state": desired_state}, handle)
+raise SystemExit({"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}.get(status, 2))
 """,
             encoding="utf-8",
         )

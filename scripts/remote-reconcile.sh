@@ -420,7 +420,12 @@ PY
 # --- Health (with rendered env) ---
 
 run_health_check() {
-  local output=$1
+  local output=$1 probe_status=0
+  # Every invocation must produce its own report, including rollback probes.
+  if ! rm -f -- "$output"; then
+    printf 'unknown\n'
+    return
+  fi
   (
     set -a
     # shellcheck disable=SC1090
@@ -428,12 +433,23 @@ run_health_check() {
     set +a
     export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1
     python3 "$repo_root/scripts/health.py" local --output "$output" >/dev/null 2>&1
-  ) || true
-  python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
+  ) || probe_status=$?
+  # health.py uses 0 for healthy/maintenance, 1 for warning, 2 for
+  # unhealthy. A nonzero warning is valid only with its fresh warning report.
+  python3 - "$output" "$probe_status" <<'PY' 2>/dev/null || printf 'unknown\n'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+status = value["status"]
+expected = {"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}[status]
+if int(sys.argv[2]) != expected:
+    raise SystemExit(1)
+print(status)
+PY
 }
 
 verify_explicit_rollback_health() {
   if [[ -n "$explicit_ref" ]]; then
+    [[ ${1:-unknown} == maintenance || ${1:-unknown} == warning ]] || return 1
     load_installed_state || return 1
     [[ "$installed_config_ref" == "$restored_config_ref" && "$installed_controller_state" == drained ]] || return 1
     python3 "$script_dir/explicit_recovery.py" "$temp_dir/recovery-baseline.json" "$temp_dir/recovery-baseline.json" \
@@ -636,7 +652,7 @@ PY
       save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
       apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
-      verify_explicit_rollback_health || die 'drained rollback health unverified'
+      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
       save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
       note "ROLLBACK_OK controller=${installed_controller} restored=${restored_config_ref}"
       exit 3
@@ -646,11 +662,32 @@ PY
   if ! { save_lkg "$desired_commit" true && lkg_readback_matches "$desired_commit"; }; then
     save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" 'candidate LKG persistence failed'
     if [[ -n "$explicit_ref" ]]; then
+      # Candidate promotion may already have replaced the live record before a
+      # readback failure. Restore the retained, verified record atomically before
+      # the installer consults it for approval AND image-free checkpoint lookup.
+      python3 - "$temp_dir/recovery-lkg.json" "$lkg_dir/metadata.json" <<'PY' || die 'baseline metadata restoration failed'
+import os, sys, tempfile
+source, target = sys.argv[1:]
+original = open(source, "rb").read()
+fd, temporary = tempfile.mkstemp(prefix=".lkg-restore.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(original)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+    if open(target, "rb").read() != original:
+        raise OSError("baseline restoration readback mismatch")
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+      lkg_readback_matches "$restored_config_ref" || die 'baseline metadata restoration readback rejected'
       apply_lkg || die 'LKG persistence failed; drained baseline rollback failed'
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
-      verify_explicit_rollback_health || die 'drained rollback health unverified'
+      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
       [[ "$rollback_health_status" == maintenance || "$rollback_health_status" == warning ]] || die 'LKG persistence failed; rollback health unverified'
-      cp "$temp_dir/recovery-lkg.json" "$lkg_dir/metadata.json" || die 'baseline metadata restoration failed'
       save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" 'LKG persistence failed; restored drained baseline'
     fi
     exit 3
@@ -676,7 +713,7 @@ else
   fi
   if [[ "$upgrade_status" == 20 && "$outcome" == rollback_verified ]]; then
     health_status=$(run_health_check "$temp_dir/health.json")
-    verify_explicit_rollback_health || die 'installer drained rollback readback unverified'
+    verify_explicit_rollback_health "$health_status" || die 'installer drained rollback readback unverified'
     save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconcile failed; installer verified rollback to ${installed_config_ref}"
     note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
     exit 3
