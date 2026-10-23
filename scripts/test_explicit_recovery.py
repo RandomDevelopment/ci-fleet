@@ -342,7 +342,10 @@ exec {shlex.quote(real_python)} "$@"
         result = self.run_ref("--ref", self.candidate)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("ROLLBACK_OK", result.stdout)
-        self.assertEqual(self._reconcile_state()["status"], "failed")
+        record = self._reconcile_state()
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["applied_commit"], self.baseline)
+        self.assertEqual(record["last_success_at"], 1)
         observations = [json.loads(line) for line in
                         Path(self.env["EVALUATED_HEALTH_LOG"]).read_text().splitlines()]
         self.assertTrue(observations[-1]["rollback"])
