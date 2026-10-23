@@ -73,7 +73,14 @@ current transaction's failure from that probe without suppressing independent
 host-health checks or advancing the last-success timestamp. A missing or
 unverified record cannot authorize rollback success. The final transaction still
 reports failure or `rolled_back`; ordinary health continues to treat those
-terminal outcomes as critical, even after a healthy restoration.
+terminal outcomes as critical, even after a healthy restoration. Terminal
+`rolled_back` publication must itself pass write/readback verification before
+any rollback completion indication. If it fails, the manager attempts one
+checked `failed` record retaining the attempted and restored identities. If that
+fallback is also unverified, it stops explicitly for operator intervention and
+emits no completion indication. Storage failure can leave a nonterminal record;
+this is unverified state, not a claim that ordinary health is durably critical.
+Write/readback verification is not a power-loss durability guarantee.
 Inspect the protected reconcile state and installer diagnostics after every
 nonzero exit. Failed recovery must remain held; admission needs separate review
 and authorization. This command does not establish active-pilot evidence,

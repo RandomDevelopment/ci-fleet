@@ -147,6 +147,20 @@ if not isinstance(value, dict) or any(value.get(key) != item for key, item in ex
 ' "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$transaction_phase" "$failure_reason" 2>/dev/null
 }
 
+finalize_rollback_state() {
+  local health=$1 message=$2
+  if save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$health" "$message" false '' '' true; then
+    return 0
+  fi
+  if save_reconcile_state 'failed' "$desired_commit" "$restored_config_ref" "$health" 'terminal rollback state persistence rejected' false '' '' true; then
+    printf 'RECONCILE_ERROR: terminal rollback state persistence rejected; failure record verified\n' >&2
+  else
+    printf 'STOP: reconciliation state persistence unverified; operator intervention required\n' >&2
+  fi
+  # Never use die here: another unchecked write cannot establish the outcome.
+  return 1
+}
+
 load_installed_state() {
   if [[ ! -f "$state_file" ]]; then
     return 1
@@ -667,7 +681,7 @@ PY
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
       verify_explicit_rollback_health "$rollback_health_status" \
         || die 'drained rollback health unverified' "$desired_commit" "$restored_config_ref" "$rollback_health_status"
-      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
+      finalize_rollback_state "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}" || exit 2
       note "ROLLBACK_OK controller=${installed_controller} restored=${restored_config_ref}"
       exit 3
       ;;
@@ -705,7 +719,7 @@ PY
       verify_explicit_rollback_health "$rollback_health_status" \
         || die 'drained rollback health unverified' "$desired_commit" "$restored_config_ref" "$rollback_health_status"
       [[ "$rollback_health_status" == maintenance || "$rollback_health_status" == warning ]] || die 'LKG persistence failed; rollback health unverified'
-      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" 'LKG persistence failed; restored drained baseline'
+      finalize_rollback_state "$rollback_health_status" 'LKG persistence failed; restored drained baseline' || exit 2
     fi
     exit 3
   fi
