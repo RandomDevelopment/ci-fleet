@@ -267,6 +267,57 @@ raise SystemExit(report["exit_code"])
         self.assertEqual(observations[-1]["report"]["status"], "warning")
         self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
 
+    def test_lkg_failure_rollback_uses_production_reconciliation_evaluator(self):
+        for failure in ("write", "missing_write", "readback"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.install_evaluated_health()
+                self.env["DENY_LKG_REF"] = self.candidate
+                real_python = shutil.which("python3")
+                assert real_python is not None
+                write_outcome = "exit 1" if failure == "write" else "exit 0"
+                if failure == "readback":
+                    condition = '${1:-} == -c && ${3:-} == "$CI_FLEET_LKG_DIR/metadata.json" && ${5:-} == "$DENY_LKG_REF"'
+                    write_outcome = "exit 1"
+                else:
+                    condition = '${1:-} == - && ${2:-} == "$CI_FLEET_LKG_DIR/metadata.json" && ${4:-} == "$DENY_LKG_REF"'
+                self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ {condition} ]]; then {write_outcome}; fi
+exec {shlex.quote(real_python)} "$@"
+''')
+                result = self.run_ref("--ref", self.candidate)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                state = self._reconcile_state()
+                self.assertEqual(state["status"], "rolled_back", result.stdout + result.stderr)
+                self.assertEqual(state["applied_commit"], self.baseline)
+                self.assertEqual(state["last_success_at"], 1)
+                self.assertNotIn("RECONCILE_OK", result.stdout)
+                self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
+                observations = [json.loads(line) for line in
+                                Path(self.env["EVALUATED_HEALTH_LOG"]).read_text().splitlines()]
+                self.assertTrue(observations[-1]["rollback"])
+                self.assertEqual(observations[-1]["record"]["status"], "reconciling")
+                self.assertEqual(observations[-1]["record"]["applied_commit"], self.baseline)
+                self.assertEqual(observations[-1]["report"]["status"], "warning")
+
+    def test_missing_rollback_state_persistence_cannot_verify_recovery(self):
+        self.install_evaluated_health()
+        self.env["REJECT_CANDIDATE_HEALTH"] = "1"
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" && ${{3:-}} == reconciling ]] && \
+   [[ $(wc -l < "$FAKE_INSTALLER_LOG") -gt 1 ]]; then
+  rm -f -- "$CI_FLEET_RECONCILE_STATE_DIR/state.json"
+  exit 1
+fi
+exec {shlex.quote(real_python)} "$@"
+''')
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ROLLBACK_OK", result.stdout, result.stdout + result.stderr)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
+
     def test_final_health_failure_rolls_back_to_drained_baseline(self):
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
