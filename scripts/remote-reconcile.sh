@@ -651,6 +651,7 @@ PY
     *)
       save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
       apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
+      save_reconcile_state 'reconciling' "$desired_commit" "$restored_config_ref" 'unknown' 'restored last-known-good; checking rollback health'
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
       verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
       save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
