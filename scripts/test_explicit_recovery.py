@@ -207,6 +207,66 @@ exec {shlex.quote(real_git)} "$@"
         self.assertEqual(self._reconcile_state()["transaction_phase"], "pre_transaction")
         self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
 
+    def install_evaluated_health(self):
+        """Keep host collection doubled, but evaluate the live reconcile record."""
+        scripts = self.root / "scripts"
+        for source, destination in (("health.py", "production_health.py"),
+                                    ("status_auth.py", "status_auth.py")):
+            shutil.copy2(Path(__file__).with_name(source), scripts / destination)
+        (scripts / "health.py").write_text('''import json, os, sys
+from pathlib import Path
+from production_health import Thresholds, evaluate, _reconcile_state
+
+calls = Path(os.environ["FAKE_INSTALLER_LOG"]).read_text().splitlines()
+rollback = len(calls) > 1
+record = _reconcile_state(Path(os.environ["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json")
+snapshot = {
+    "controller_id": "example-ci-01", "desired_state": "drained",
+    "disks": {"root": {"used_percent": 20, "inode_used_percent": 10},
+              "docker": {"used_percent": 30, "inode_used_percent": 15}},
+    "memory_available_percent": 75, "swap_used_percent": 0, "recent_oom": False,
+    "docker_available": rollback or os.environ.get("REJECT_CANDIDATE_HEALTH") != "1",
+    "controller": {"state": "missing", "restart_count": 0, "oom_killed": False},
+    "configured_capacity": {"min": 0, "max": 1}, "effective_capacity": {"min": 0, "max": 0},
+    "managed": {"running": 0, "inactive": 0, "unhealthy": 0, "restarting": 0},
+    "stale": {"images": 0, "networks": 0, "volumes": 0, "build_cache_bytes": 0},
+    "services": {"cleanup": "ok", "drift": "ok"},
+    "timers": {"health": "ok", "cleanup": "ok", "drift": "ok", "updates": "ok"},
+    "pending_reboot": False, "failed_packages": False, "clock_synchronized": True,
+    "backup": "not_configured", "reconciliation": record,
+}
+if rollback and os.environ.get("REJECT_ROLLBACK_HEALTH") == "1":
+    snapshot["docker_available"] = False
+report = evaluate(snapshot, Thresholds())
+with open(os.environ["EVALUATED_HEALTH_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"rollback": rollback, "record": record, "report": report}) + "\\n")
+Path(sys.argv[sys.argv.index("--output") + 1]).write_text(json.dumps(report), encoding="utf-8")
+raise SystemExit(report["exit_code"])
+''', encoding="utf-8")
+        self.env["EVALUATED_HEALTH_LOG"] = str(self.td / "evaluated-health.jsonl")
+        directory = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"])
+        directory.mkdir(mode=0o700, exist_ok=True)
+        (directory / "state.json").write_text(json.dumps({"last_success_at": 1}))
+
+    def test_final_health_rollback_uses_production_reconciliation_evaluator(self):
+        self.install_evaluated_health()
+        self.env["REJECT_CANDIDATE_HEALTH"] = "1"
+        result = self.run_ref("--ref", self.candidate)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("ROLLBACK_OK", result.stdout, result.stdout + result.stderr)
+        state = self._reconcile_state()
+        self.assertEqual(state["status"], "rolled_back")
+        self.assertEqual(state["applied_commit"], self.baseline)
+        self.assertEqual(state["last_success_at"], 1)
+        observations = [json.loads(line) for line in
+                        Path(self.env["EVALUATED_HEALTH_LOG"]).read_text().splitlines()]
+        self.assertEqual(len(observations), 2)
+        self.assertTrue(observations[-1]["rollback"])
+        self.assertEqual(observations[-1]["record"]["status"], "reconciling")
+        self.assertEqual(observations[-1]["record"]["applied_commit"], self.baseline)
+        self.assertEqual(observations[-1]["report"]["status"], "warning")
+        self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
+
     def test_final_health_failure_rolls_back_to_drained_baseline(self):
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
