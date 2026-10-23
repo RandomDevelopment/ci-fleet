@@ -41,6 +41,8 @@ python3 -m py_compile \
   scripts/test_cleanup_networks.py \
   scripts/test_apply_docker_network_policy.py \
   scripts/test_remote_reconcile.py \
+  scripts/explicit_recovery.py \
+  scripts/test_explicit_recovery.py \
   scripts/test_health.py \
   scripts/test_status_receiver.py \
   scripts/test_quickstart.py \
@@ -56,6 +58,7 @@ python3 scripts/test_cleanup_networks.py
 python3 scripts/test_cleanup_storage.py
 python3 scripts/test_apply_docker_network_policy.py
 python3 scripts/test_remote_reconcile.py
+python3 -I -B scripts/test_explicit_recovery.py
 python3 scripts/test_health.py
 python3 scripts/test_endpoint_snapshot.py
 python3 scripts/test_endpoint_snapshot_sources.py

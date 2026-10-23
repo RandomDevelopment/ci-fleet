@@ -139,6 +139,10 @@ Use another host or location when it improves failure tolerance. Give every adde
 
 ## 10. Drain, replace, or remove a host
 
+For a held drained controller whose recovery commit is not default-branch HEAD,
+see [explicit drained recovery](EXPLICIT-DRAINED-RECOVERY.md). It requires a
+reviewed supporting manager and cannot admit capacity or change engine/policy.
+
 1. Merge a private configuration change setting the controller to `drained`.
 2. Apply that exact commit with `install-worker-controller.sh --upgrade`.
 3. Confirm zero managed runners and run scoped cleanup.

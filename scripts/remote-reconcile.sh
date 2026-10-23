@@ -25,18 +25,11 @@ token_script=$script_dir/github-app-token.sh
 reconcile_state_dir=${CI_FLEET_RECONCILE_STATE_DIR:-/var/lib/ci-fleet/reconcile}
 reconcile_state_file=$reconcile_state_dir/state.json
 lkg_dir=${CI_FLEET_LKG_DIR:-/var/lib/ci-fleet/last-known-good}
-temp_dir=$(mktemp -d) || exit 2
-transaction_result=$temp_dir/transaction-result.json
-: >"$transaction_result"
-chmod 0600 "$transaction_result"
-exec 7>"$transaction_result"
-# shellcheck disable=SC2317 # cleanup_temp is invoked indirectly via trap
-cleanup_temp() { rm -rf "$temp_dir"; }
-trap cleanup_temp EXIT
 
 mode=reconcile  # reconcile or check-only
 no_op=false
 installed_ref=false
+explicit_ref=
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
 # ponytail: one-hour queue cap; align with any future installer transaction timeout.
 lock_wait_seconds=3600
@@ -49,6 +42,9 @@ usage:
   Fetches the desired-state repository at the current default-branch HEAD,
   validates it, and reconciles the controller if a newer commit is available.
 
+  --ref SHA     Mutating opt-in drained recovery at one full lowercase 40-hex
+                commit; unchanged controller/fleet policy and runtime engine only.
+                Incompatible with --check-only, --installed-ref and --no-op.
   --check-only  Validate and report without reconciling.
   --installed-ref Check the locked installation's commit (check-only only).
   --no-op       Log what would be done without side effects.
@@ -57,6 +53,9 @@ EOF
 
 while (($#)); do
   case "$1" in
+    --ref)
+      [[ $# -ge 2 && -z "$explicit_ref" && "$2" =~ ^[0-9a-f]{40}$ ]] || { echo 'ERROR: --ref requires one full lowercase commit SHA' >&2; exit 2; }
+      explicit_ref=$2; shift ;;
     --check-only) mode=check-only ;;
     --installed-ref) installed_ref=true ;;
     --no-op) no_op=true ;;
@@ -65,7 +64,17 @@ while (($#)); do
   esac
   shift
 done
+[[ -z "$explicit_ref" || ( "$installed_ref" == false && "$no_op" == false && "$mode" == reconcile ) ]] || { echo 'ERROR: --ref is incompatible with --installed-ref, --check-only and --no-op' >&2; exit 2; }
 [[ "$installed_ref" == false || "$mode" == check-only ]] || { echo 'ERROR: --installed-ref requires --check-only' >&2; exit 2; }
+
+temp_dir=$(mktemp -d) || exit 2
+transaction_result=$temp_dir/transaction-result.json
+: >"$transaction_result"
+chmod 0600 "$transaction_result"
+exec 7>"$transaction_result"
+# shellcheck disable=SC2317 # cleanup_temp is invoked indirectly via trap
+cleanup_temp() { rm -rf "$temp_dir"; }
+trap cleanup_temp EXIT
 
 note() { printf 'RECONCILE %s\n' "$*"; }
 die() {
@@ -243,7 +252,9 @@ apply_lkg() {
   fi
 
   local lkg_ref lkg_repo lkg_controller lkg_status=0 outcome
-  mapfile -t lkg_vals <<<"$(python3 - "$lkg_dir/metadata.json" <<'PY' 2>/dev/null || true
+  local rollback_metadata=$lkg_dir/metadata.json
+  [[ -z "$explicit_ref" ]] || rollback_metadata=$temp_dir/recovery-lkg.json
+  mapfile -t lkg_vals <<<"$(python3 - "$rollback_metadata" <<'PY' 2>/dev/null || true
 import json, sys
 d = json.load(open(sys.argv[1]))
 for k in ("config_ref", "config_repository", "controller"):
@@ -297,8 +308,8 @@ PY
 
 save_lkg() {
   local commit=$1 replace=${2:-false}
-  install -d -m 0700 "$lkg_dir"
-  python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" "$replace" <<'PY' 2>/dev/null || true
+  install -d -m 0700 "$lkg_dir" || return 1
+  python3 - "$lkg_dir/metadata.json" "$installed_config_repo" "$commit" "$installed_controller" "$replace" <<'PY' 2>/dev/null
 import json, os, stat, sys, tempfile
 
 path = sys.argv[1]
@@ -337,12 +348,26 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    with open(path, encoding="utf-8") as handle:
+        if json.load(handle) != meta:
+            raise OSError("LKG persistence readback mismatch")
 except:
     os.unlink(tmp, missing_ok=True)
     raise
 PY
+}
+
+lkg_readback_matches() {
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if [value.get(key) for key in ("config_repository", "config_ref", "controller")] != sys.argv[2:]:
+    raise SystemExit(1)
+' "$lkg_dir/metadata.json" "$installed_config_repo" "$1" "$installed_controller"
 }
 
 transaction_outcome() {
@@ -395,7 +420,12 @@ PY
 # --- Health (with rendered env) ---
 
 run_health_check() {
-  local output=$1
+  local output=$1 probe_status=0
+  # Every invocation must produce its own report, including rollback probes.
+  if ! rm -f -- "$output"; then
+    printf 'unknown\n'
+    return
+  fi
   (
     set -a
     # shellcheck disable=SC1090
@@ -403,8 +433,34 @@ run_health_check() {
     set +a
     export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1
     python3 "$repo_root/scripts/health.py" local --output "$output" >/dev/null 2>&1
-  ) || true
-  python3 -c "import json; print(json.load(open('$output'))['status'])" 2>/dev/null || echo "unknown"
+  ) || probe_status=$?
+  # health.py uses 0 for healthy/maintenance, 1 for warning, 2 for
+  # unhealthy. A nonzero warning is valid only with its fresh warning report.
+  python3 - "$output" "$probe_status" <<'PY' 2>/dev/null || printf 'unknown\n'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+status = value["status"]
+expected = {"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}[status]
+if int(sys.argv[2]) != expected:
+    raise SystemExit(1)
+print(status)
+PY
+}
+
+verify_explicit_rollback_health() {
+  if [[ -n "$explicit_ref" ]]; then
+    [[ ${1:-unknown} == maintenance || ${1:-unknown} == warning ]] || return 1
+    load_installed_state || return 1
+    [[ "$installed_config_ref" == "$restored_config_ref" && "$installed_controller_state" == drained ]] || return 1
+    python3 "$script_dir/explicit_recovery.py" "$temp_dir/recovery-baseline.json" "$temp_dir/recovery-baseline.json" \
+      "$state_file" "$config_review_root/opt/ci-fleet/current" "$temp_dir/nonexistent-lkg" || return 1
+  fi
+  [[ -z "$explicit_ref" ]] || python3 - "$temp_dir/health.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("desired_state") != "drained" or value.get("status") not in {"maintenance", "warning"}:
+    raise SystemExit(1)
+PY
 }
 
 # --- Main ---
@@ -421,6 +477,10 @@ flock -w "$lock_wait_seconds" 9 || die "timed out waiting for another reconcile 
 load_installed_state || die "no installed state found at $state_file"
 [[ "$installed_config_ref" =~ ^[0-9a-f]{40}$ ]] || die "installed config ref is not a full lowercase commit SHA"
 fetch_ref=HEAD
+if [[ -n "$explicit_ref" ]]; then
+  [[ "$installed_controller_state" == drained ]] || die 'explicit recovery requires a drained installation'
+  fetch_ref=$explicit_ref
+fi
 [[ "$installed_ref" == false ]] || fetch_ref=$installed_config_ref
 note "INSTALLED controller=${installed_controller} config_repo=${installed_config_repo} config_ref=${installed_config_ref}"
 
@@ -459,6 +519,14 @@ while ((attempt < max_attempts)); do
 done
 
 note "RESOLVED desired_ref=${desired_commit}"
+if [[ -n "$explicit_ref" ]]; then
+  [[ "$desired_commit" == "$explicit_ref" ]] || die 'explicit ref fetch identity mismatch'
+  git -C "$temp_dir/config-repo" show "$desired_commit:fleet.json" >"$temp_dir/recovery-candidate.json" || die 'candidate unavailable'
+  fetch_remote_config "$installed_config_repo" "$token" "$installed_config_ref" >/dev/null || die 'drained baseline unavailable'
+  git -C "$temp_dir/config-repo" show "$installed_config_ref:fleet.json" >"$temp_dir/recovery-baseline.json" || die 'baseline unavailable'
+  python3 "$script_dir/explicit_recovery.py" "$temp_dir/recovery-candidate.json" "$temp_dir/recovery-baseline.json" \
+    "$state_file" "$config_review_root/opt/ci-fleet/current" "$lkg_dir/metadata.json" || die 'explicit recovery policy rejected'
+fi
 
 if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_review_required" || -L "$config_review_required" ]]; then
   desired_tree=$(git -C "$temp_dir/config-repo" rev-parse "$desired_commit^{tree}") || die 'configuration tree is unavailable'
@@ -470,7 +538,7 @@ if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_re
 fi
 
 # Compare with installed
-if [[ "$desired_commit" == "$installed_config_ref" ]]; then
+if [[ "$desired_commit" == "$installed_config_ref" && -z "$explicit_ref" ]]; then
   # Same commit — just verify convergence
   note "NO_CHANGE desired=${desired_commit}"
   if [[ "$no_op" == true ]]; then
@@ -527,7 +595,11 @@ if [[ "$no_op" == true ]]; then
 fi
 
 # Preserve an existing accepted LKG; bootstrap it only when absent or invalid.
-save_lkg "$installed_config_ref"
+save_lkg "$installed_config_ref" || die 'cannot persist baseline LKG'
+if [[ -n "$explicit_ref" ]]; then
+  lkg_readback_matches "$installed_config_ref" || die 'drained baseline LKG readback rejected'
+  cp "$lkg_dir/metadata.json" "$temp_dir/recovery-lkg.json" || die 'cannot retain verified recovery baseline'
+fi
 restored_config_ref=$(python3 - "$lkg_dir/metadata.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -554,10 +626,16 @@ if CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
   note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
+  [[ -z "$explicit_ref" || $(transaction_outcome) == applied ]] || die 'explicit recovery apply outcome unverified'
 
   # Run health check
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
   load_installed_state || installed_controller_state=unknown
+  if [[ -n "$explicit_ref" ]]; then
+    [[ "$installed_config_ref" == "$desired_commit" && "$installed_controller_state" == drained ]] || die 'explicit recovery installed state readback rejected'
+    python3 "$script_dir/explicit_recovery.py" "$temp_dir/recovery-candidate.json" "$temp_dir/recovery-candidate.json" \
+      "$state_file" "$config_review_root/opt/ci-fleet/current" "$temp_dir/nonexistent-lkg" || die 'explicit recovery runtime readback rejected'
+  fi
   health_status=$(run_health_check "$temp_dir/health.json")
   health_desired_state=$(python3 - "$temp_dir/health.json" <<'PY' 2>/dev/null || echo unknown
 import json, sys
@@ -574,13 +652,46 @@ PY
       save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
       apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
+      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
       save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
       note "ROLLBACK_OK controller=${installed_controller} restored=${restored_config_ref}"
       exit 3
       ;;
   esac
 
-  save_lkg "$desired_commit" true
+  if ! { save_lkg "$desired_commit" true && lkg_readback_matches "$desired_commit"; }; then
+    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" 'candidate LKG persistence failed'
+    if [[ -n "$explicit_ref" ]]; then
+      # Candidate promotion may already have replaced the live record before a
+      # readback failure. Restore the retained, verified record atomically before
+      # the installer consults it for approval AND image-free checkpoint lookup.
+      python3 - "$temp_dir/recovery-lkg.json" "$lkg_dir/metadata.json" <<'PY' || die 'baseline metadata restoration failed'
+import os, sys, tempfile
+source, target = sys.argv[1:]
+original = open(source, "rb").read()
+fd, temporary = tempfile.mkstemp(prefix=".lkg-restore.", dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(original)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+    if open(target, "rb").read() != original:
+        raise OSError("baseline restoration readback mismatch")
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+      lkg_readback_matches "$restored_config_ref" || die 'baseline metadata restoration readback rejected'
+      apply_lkg || die 'LKG persistence failed; drained baseline rollback failed'
+      rollback_health_status=$(run_health_check "$temp_dir/health.json")
+      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
+      [[ "$rollback_health_status" == maintenance || "$rollback_health_status" == warning ]] || die 'LKG persistence failed; rollback health unverified'
+      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" 'LKG persistence failed; restored drained baseline'
+    fi
+    exit 3
+  fi
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
@@ -602,6 +713,7 @@ else
   fi
   if [[ "$upgrade_status" == 20 && "$outcome" == rollback_verified ]]; then
     health_status=$(run_health_check "$temp_dir/health.json")
+    verify_explicit_rollback_health "$health_status" || die 'installer drained rollback readback unverified'
     save_reconcile_state 'rolled_back' "$desired_commit" "$installed_config_ref" "$health_status" "reconcile failed; installer verified rollback to ${installed_config_ref}"
     note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
     exit 3

@@ -453,6 +453,7 @@ with open(output, "w", encoding="utf-8") as handle:
         handle.write("{")
     else:
         json.dump({"status": status, "desired_state": desired_state}, handle)
+raise SystemExit({"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}.get(status, 2))
 """,
             encoding="utf-8",
         )
@@ -863,7 +864,7 @@ class TestSystemdUnits(unittest.TestCase):
     def test_same_commit_drift_is_reconciled(self):
         """Any failed same-commit check falls through to repair."""
         content = RECONCILE_SCRIPT.read_text()
-        same_commit = content.split('if [[ "$desired_commit" == "$installed_config_ref" ]]', 1)[1]
+        same_commit = content.split('# Compare with installed', 1)[1]
         same_commit = same_commit.split("# New commit or drift", 1)[0]
         self.assertNotIn("controller_running", same_commit)
         self.assertNotIn("internal drift tracked by drift timer", same_commit)
