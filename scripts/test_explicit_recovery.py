@@ -353,6 +353,55 @@ exec {shlex.quote(real_python)} "$@"
         self.assertIn("docker", {check["id"] for check in observations[-1]["report"]["checks"]
                                  if check["status"] == "critical"})
 
+    def assert_terminal_rollback_failure_is_recorded(self, *, lkg_failure):
+        for failure in ("write", "missing_write", "readback"):
+            with self.subTest(failure=failure, lkg_failure=lkg_failure):
+                self.setUp()
+                self.install_evaluated_health()
+                if not lkg_failure:
+                    self.env["REJECT_CANDIDATE_HEALTH"] = "1"
+                self.env.update(TERMINAL_FAILURE=failure,
+                                DENY_LKG_REF=self.candidate if lkg_failure else "")
+                real_python = shutil.which("python3")
+                assert real_python is not None
+                self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
+  exit 1
+fi
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" && ${{3:-}} == rolled_back ]]; then
+  case "$TERMINAL_FAILURE" in
+    write) exit 1 ;;
+    missing_write) exit 0 ;;
+  esac
+fi
+if [[ ${{1:-}} == -c && ${{3:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" && ${{4:-}} == rolled_back && "$TERMINAL_FAILURE" == readback ]]; then
+  exit 1
+fi
+exec {shlex.quote(real_python)} "$@"
+''')
+                result = self.run_ref("--ref", self.candidate)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("ROLLBACK_OK", result.stdout, result.stdout + result.stderr)
+                self.assertNotIn("RECONCILE_OK", result.stdout)
+                record = self._reconcile_state()
+                self.assertEqual(record["status"], "failed", result.stdout + result.stderr)
+                self.assertEqual(record["desired_commit"], self.candidate)
+                self.assertEqual(record["applied_commit"], self.baseline)
+                self.assertEqual(record["last_success_at"], 1)
+                self.assertEqual((self.lkg_dir / "metadata.json").read_text(), self.old_lkg)
+                report = self.td / "ordinary-health.json"
+                ordinary = subprocess.run([real_python, str(self.root / "scripts/health.py"),
+                                           "--output", str(report)], env=self.env,
+                                          capture_output=True, text=True, timeout=10)
+                self.assertEqual(ordinary.returncode, 2, ordinary.stdout + ordinary.stderr)
+                self.assertEqual(json.loads(report.read_text())["status"], "unhealthy")
+
+    def test_final_health_terminal_persistence_failure_stays_critical(self):
+        self.assert_terminal_rollback_failure_is_recorded(lkg_failure=False)
+
+    def test_lkg_terminal_persistence_failure_stays_critical(self):
+        self.assert_terminal_rollback_failure_is_recorded(lkg_failure=True)
+
     def test_final_health_failure_rolls_back_to_drained_baseline(self):
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
