@@ -365,7 +365,7 @@ exec {shlex.quote(real_python)} "$@"
                 real_python = shutil.which("python3")
                 assert real_python is not None
                 self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
-if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
+if [[ -n "$DENY_LKG_REF" && ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
   exit 1
 fi
 if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" && ${{3:-}} == rolled_back ]]; then
@@ -414,7 +414,7 @@ exec {shlex.quote(real_python)} "$@"
                 real_python = shutil.which("python3")
                 assert real_python is not None
                 self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
-if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
+if [[ -n "$DENY_LKG_REF" && ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
   exit 1
 fi
 if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" ]]; then
