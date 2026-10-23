@@ -402,6 +402,43 @@ exec {shlex.quote(real_python)} "$@"
     def test_lkg_terminal_persistence_failure_stays_critical(self):
         self.assert_terminal_rollback_failure_is_recorded(lkg_failure=True)
 
+    def test_terminal_and_fallback_persistence_failure_requires_operator(self):
+        for lkg_failure in (False, True):
+            with self.subTest(lkg_failure=lkg_failure):
+                self.setUp()
+                self.install_evaluated_health()
+                if not lkg_failure:
+                    self.env["REJECT_CANDIDATE_HEALTH"] = "1"
+                self.env.update(DENY_LKG_REF=self.candidate if lkg_failure else "",
+                                TERMINAL_ATTEMPT=str(self.td / "terminal-attempt"))
+                real_python = shutil.which("python3")
+                assert real_python is not None
+                self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{4:-}} == "$DENY_LKG_REF" ]]; then
+  exit 1
+fi
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" ]]; then
+  if [[ ${{3:-}} == rolled_back ]]; then
+    : > "$TERMINAL_ATTEMPT"
+    exit 1
+  fi
+  if [[ ${{3:-}} == failed && -f "$TERMINAL_ATTEMPT" ]]; then exit 1; fi
+fi
+exec {shlex.quote(real_python)} "$@"
+''')
+                result = self.run_ref("--ref", self.candidate)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("STOP: reconciliation state persistence unverified; operator intervention required",
+                              result.stderr)
+                self.assertNotIn("ROLLBACK_OK", result.stdout)
+                self.assertNotIn("RECONCILE_OK", result.stdout)
+                record = self._reconcile_state()
+                self.assertEqual(record["status"], "reconciling")
+                self.assertEqual(record["desired_commit"], self.candidate)
+                self.assertEqual(record["applied_commit"], self.baseline)
+                self.assertEqual(record["last_success_at"], 1)
+                self.assertTrue(Path(self.env["TERMINAL_ATTEMPT"]).is_file())
+
     def test_final_health_failure_rolls_back_to_drained_baseline(self):
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
