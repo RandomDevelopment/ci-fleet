@@ -66,6 +66,14 @@ health report and matching process exit are required for each probe (0 for
 healthy/maintenance, 1 for warning, 2 for unhealthy). Missing output, stale output,
 execution failure or inconsistent exit/status cannot verify rollback. A rollback
 whose health is not drained maintenance/warning is not reported verified.
+After a confirmed LKG restoration, the manager must persist and read back a
+nonterminal reconciliation record identifying the rejected desired commit and
+the restored applied commit before the fresh rollback probe. This isolates the
+current transaction's failure from that probe without suppressing independent
+host-health checks or advancing the last-success timestamp. A missing or
+unverified record cannot authorize rollback success. The final transaction still
+reports failure or `rolled_back`; ordinary health continues to treat those
+terminal outcomes as critical, even after a healthy restoration.
 Inspect the protected reconcile state and installer diagnostics after every
 nonzero exit. Failed recovery must remain held; admission needs separate review
 and authorization. This command does not establish active-pilot evidence,
@@ -88,7 +96,10 @@ template publication, private adoption and live-host acceptance are separate gat
 ## Local regression boundary
 
 `python3 -I -B scripts/test_explicit_recovery.py` uses temporary repositories and
-command doubles for authentication, installer, health and policy. It needs Linux
+command doubles for authentication, installer, host collection and policy. The
+rollback-state regressions use the production reconciliation-state reader and
+health evaluator against persisted fixture records, including independent
+critical host-health and state-persistence failures. The suite needs Linux
 Bash, Git, Python and flock, but no fleet credentials, Docker or live host. It
 proves orchestration and fail-closed routing, not actual image builds, installer
 transactions, systemd behavior or host acceptance. Complete exact-source/base
