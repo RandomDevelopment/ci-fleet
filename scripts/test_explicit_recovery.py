@@ -318,6 +318,38 @@ exec {shlex.quote(real_python)} "$@"
         self.assertNotIn("ROLLBACK_OK", result.stdout, result.stdout + result.stderr)
         self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
 
+    def test_stale_rollback_state_readback_cannot_verify_recovery(self):
+        self.install_evaluated_health()
+        self.env["REJECT_CANDIDATE_HEALTH"] = "1"
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        self._write_executable(self.td / "bin/python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == - && ${{2:-}} == "$CI_FLEET_RECONCILE_STATE_DIR/state.json" && ${{3:-}} == reconciling ]] && \
+   [[ $(wc -l < "$FAKE_INSTALLER_LOG") -gt 1 ]]; then
+  rm -f -- "$CI_FLEET_RECONCILE_STATE_DIR/state.json"
+  exit 0
+fi
+exec {shlex.quote(real_python)} "$@"
+''')
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ROLLBACK_OK", result.stdout, result.stdout + result.stderr)
+        self.assertNotEqual(self._reconcile_state()["status"], "rolled_back")
+
+    def test_production_rollback_health_still_rejects_independent_failure(self):
+        self.install_evaluated_health()
+        self.env.update(REJECT_CANDIDATE_HEALTH="1", REJECT_ROLLBACK_HEALTH="1")
+        result = self.run_ref("--ref", self.candidate)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ROLLBACK_OK", result.stdout)
+        self.assertEqual(self._reconcile_state()["status"], "failed")
+        observations = [json.loads(line) for line in
+                        Path(self.env["EVALUATED_HEALTH_LOG"]).read_text().splitlines()]
+        self.assertTrue(observations[-1]["rollback"])
+        self.assertEqual(observations[-1]["report"]["status"], "unhealthy")
+        self.assertIn("docker", {check["id"] for check in observations[-1]["report"]["checks"]
+                                 if check["status"] == "critical"})
+
     def test_final_health_failure_rolls_back_to_drained_baseline(self):
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
