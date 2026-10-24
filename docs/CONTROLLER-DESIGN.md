@@ -36,6 +36,10 @@ On restart, it recovers only managed runners carrying the same fleet-instance an
 
 The listener ignores late authenticated events for this instance's generated runner names only after Docker confirms their containers are gone; unrelated names and inspection errors still fail.
 
+The pinned SDK also documents canceled scale-set assignments that never reach a runner. The controller ignores such a completion only when `result` is exactly `canceled`, `runnerName` is empty, `runnerId` is zero, `runnerAssignTime` is unset, the job ID is nonempty, and the runner request ID is positive. This conservative exception does not complete or remove any managed runner. Scaling continues to use the scale-set statistics. A blank runner name alone does not prove assignment cancellation.
+
+Before handling a completion, the controller logs its result, runner name and ID, runner assignment time, job ID, runner request ID, and workflow run ID. Unknown or contradictory events and Docker inspection or cleanup errors still fail. The pinned listener acknowledges a batch before invoking callbacks, so a callback failure can stop the rest of that batch; do not assume the failed event will be replayed or that restarting fixes its cause.
+
 ## Security boundary
 
 Docker socket access is host-root-equivalent. This pool is therefore limited to trusted repositories and trusted workflow revisions. Containers provide repeatability and cleanup; they do not make hostile workflow code safe.
