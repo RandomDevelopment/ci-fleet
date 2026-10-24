@@ -389,7 +389,8 @@ class CodexApprovalTests(unittest.TestCase):
         self.reviews.clear()
         self.comment = {
             "databaseId": 1000, "author": {"__typename": "Bot", "databaseId": 202},
-            "body": "Codex Review: Didn't find any major issues. What shall we delve into next?\n\n"
+            "body": "<!-- codex-review-receipt:v1 -->\n\n"
+                    "Codex Review: Didn't find any major issues. What shall we delve into next?\n\n"
                     f"**Reviewed commit:** `{HEAD[:10]}`\n\n{CODEX_HELP_FIXTURE}",
             "createdAt": "2026-01-01T00:01:00Z", "lastEditedAt": None,
         }
@@ -411,10 +412,37 @@ class CodexApprovalTests(unittest.TestCase):
             self.check()
 
     def test_known_clean_response_follow_up_sentences(self):
-        body = self.comment["body"]
-        for sentence in ("", " Keep it up!", " Nice work!", " :tada:"):
-            self.comment["body"] = body.replace(" What shall we delve into next?", sentence)
+        body = self.comment["body"].removeprefix("<!-- codex-review-receipt:v1 -->\n\n")
+        for prefix in ("", "<!-- codex-review-receipt:v1 -->\n\n"):
+            for sentence in ("", " What shall we delve into next?", " Keep it up!", " Nice work!", " :tada:",
+                             " :rocket:", " Another round soon, please!"):
+                with self.subTest(prefix=prefix, sentence=sentence):
+                    self.comment["body"] = prefix + body.replace(" What shall we delve into next?", sentence)
+                    self.check()
+                    match = verify_config_approval.CODEX_CLEAN.fullmatch(self.comment["body"])
+                    self.assertEqual(match[1], HEAD[:10])
+                    self.assertEqual(match[2], CODEX_HELP_FIXTURE)
+            self.comment["body"] = prefix + body.split('\n\n<details>')[0] + '\n'
             self.check()
+            self.assertEqual(verify_config_approval.CODEX_CLEAN.fullmatch(self.comment["body"]).groups(),
+                             (HEAD[:10], None))
+
+    def test_receipt_marker_and_follow_up_are_exact(self):
+        body = self.comment["body"].removeprefix("<!-- codex-review-receipt:v1 -->\n\n")
+        for prefix in ("<!-- codex-review-receipt:v2 -->\n\n", "<!-- codex-review-receipt:v01 -->\n\n",
+                       "<!-- arbitrary-marker -->\n\n", "<!-- codex-review-receipt:v1 -->\n",
+                       "<!-- codex-review-receipt:v1 -->\n\n\n", " <!-- codex-review-receipt:v1 -->\n\n",
+                       "<!-- codex-review-receipt:v1 -->\r\n\r\n", "Leading text\n",
+                       "<!-- codex-review-receipt:v1 -->\n\n" * 2):
+            with self.subTest(prefix=prefix), self.assertRaises(Rejected):
+                self.comment["body"] = prefix + body
+                self.check()
+        for sentence in (" Arbitrary text.", " :rocket: Warning: unresolved finding.",
+                         " Another round soon, please! Warning: unresolved finding."):
+            with self.subTest(sentence=sentence), self.assertRaises(Rejected):
+                self.comment["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + body.replace(
+                    " What shall we delve into next?", sentence)
+                self.check()
 
     def test_completed_activity_refresh_does_not_replace_clean_decision(self):
         summary = dict(self.comment, databaseId=999, createdAt="2026-01-01T00:00:00Z",
@@ -423,7 +451,7 @@ class CodexApprovalTests(unittest.TestCase):
             'This comment shows the latest Codex review activity on this pull request.\n\n'
             '| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n'
             '| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-01-01T00:01:01Z">'
-            f'2026-01-01T00:01:01Z</relative-time> | `{HEAD[:7]}` | Manual request |\n\n'
+            f'2026-01-01T00:01:01Z</relative-time> | `{HEAD[:7]}` | Draft marked ready |\n\n'
             + CODEX_SUMMARY_HELP_FIXTURE))
         self.pr["comments"]["nodes"].append(summary)
         self.data[f"{PREFIX}/commits/{HEAD[:7]}"] = {"sha": HEAD}
@@ -436,13 +464,31 @@ class CodexApprovalTests(unittest.TestCase):
                                       "has_unresolved_findings": None}}
         summary["body"] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'
         self.check()
+        summary['body'] = body.replace('<!-- codex-pull-request-review-summary -->',
+                                      '<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 '
+                                      + json.dumps(state) + ' -->')
+        self.check()
+        for trigger in ('Manual request', 'PR opened', 'Draft marked ready'):
+            for metadata in ('', '\n<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->'):
+                with self.subTest(trigger=trigger, metadata=metadata):
+                    summary['body'] = body.replace('Draft marked ready', trigger) + metadata
+                    self.check()
         for changed in (dict(state, unexpected=True), dict(state, security_review={}),
                         dict(state, code_review=dict(state['code_review'], blocking_findings=True)),
-                        dict(state, code_review=dict(state['code_review'], has_any_findings=0)),
+                        dict(state, code_review=dict(state['code_review'], commit_sha='4' * 40)),
+                        dict(state, code_review=dict(state['code_review'], status='running')),
+                        dict(state, code_review=dict(state['code_review'], has_any_findings=None,
+                                                    has_unresolved_findings=None)),
                         dict(state, security_review=dict(state['security_review'], has_any_findings=False))):
             with self.subTest(state=changed), self.assertRaises(Rejected):
                 summary['body'] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(changed) + ' -->'
                 self.check()
+        for field in ('has_any_findings', 'has_unresolved_findings'):
+            for value in (None, True, 0, 1, 'false'):
+                changed = dict(state, code_review=dict(state['code_review'], **{field: value}))
+                with self.subTest(field=field, value=value), self.assertRaises(Rejected):
+                    summary['body'] = body + '\n<!-- codex-review-state:v1 ' + json.dumps(changed) + ' -->'
+                    self.check()
         state["code_review"]["has_unresolved_findings"] = True
         for prefix in ('', ' ', '\t', 'Text before '):
             with self.subTest(prefix=prefix), self.assertRaises(Rejected):
@@ -453,7 +499,7 @@ class CodexApprovalTests(unittest.TestCase):
                         body + '\n<!-- codex-review-state:v2 {} -->',
                         body + '\nCRITICAL: credential leak found',
                         body.replace('2026-01-01T00:01:01Z</relative-time>', 'CRITICAL finding</relative-time>'),
-                        body.replace('Manual request', 'Unrecognized trigger'),
+                        body.replace('Draft marked ready', 'Unrecognized trigger'),
                         body.replace('once all reviews finish with no findings.', 'despite unresolved findings.'),
                         body + '\n| Security review | Running | unknown | Manual request |'):
             with self.subTest(body=changed), self.assertRaises(Rejected):

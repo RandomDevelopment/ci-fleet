@@ -89,12 +89,24 @@ reject older formal-only engines before mutation or rollback restoration. Verify
 compatible checkpoints and last-known-good recovery before activating the opt-in.
 Remove the field before a separately authorized downgrade to a formal-only engine.
 
-This opt-in accepts the bot's unedited issue comment beginning exactly
+This opt-in accepts the bot's unedited issue comment with the opening sentence
 `Codex Review: Didn't find any major issues.` and containing the standard
-`Reviewed commit` field. The current optional follow-up sentence and integration
-help footer are recognized. The footer must contain the known integration-help
-text; arbitrary details, warnings, and added findings reject acceptance. Other
-wording fails closed and requires verifier support before it can count.
+`Reviewed commit` field. The comment may begin with the exact header
+`<!-- codex-review-receipt:v1 -->` followed by exactly two newline characters.
+Unversioned comments remain supported. Leading text, other markers and unknown
+versions reject acceptance. The opening sentence may have no suffix or exactly
+one of these suffixes, separated by one space:
+
+- `What shall we delve into next?`
+- `Keep it up!`
+- `Nice work!`
+- `:tada:`
+- `:rocket:`
+- `Another round soon, please!`
+
+The optional footer must contain the known integration-help text. Arbitrary
+suffixes, details, warnings, and added findings reject acceptance. Other wording
+fails closed and requires verifier support before it can count.
 The GitHub author must be a bot with the pinned
 numeric ID and must differ from the PR author. A copied summary from another
 account cannot grant approval.
@@ -116,11 +128,16 @@ resolved commit at or after the clean response. Running, failed, stale, and
 unrecognized dashboard updates block acceptance. The complete known dashboard
 text, footer, trigger, and matching relative-time text and datetime are required;
 additional prose or a changed relative-time label rejects the update.
+The recognized triggers are exactly `Manual request`, `PR opened`, and
+`Draft marked ready`.
 The dashboard cannot approve without a separate clean response.
 When machine-readable activity state is
 present, including an indented marker, it must also report completed code review
-on the full head with no findings and no security-review activity. Unknown state
-versions and unknown top-level or nested state fields fail closed. Both state
+on the full head. Its `status` must be exactly `completed`, and both finding flags
+must be exactly `false`; `null` flags reject acceptance even with a completed
+status. Every security-review value must be `null`. The visible row must agree
+with the state. Unknown state versions and unknown top-level or nested state
+fields fail closed. Both state
 objects must contain exactly `commit_sha`, `status`, `has_any_findings`, and
 `has_unresolved_findings` with the documented clean or absent values.
 Same-second conflicts reject acceptance. Edited responses cannot approve, and
