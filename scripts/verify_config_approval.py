@@ -28,7 +28,11 @@ POLICY_KEYS = {"schema_version", "configuration_repository_id", "branch", "workf
 LOCAL_POLICY_KEYS = {"directory", "public_key", "validator_revision", "suite", "required_checks", "max_age_seconds"}
 LOCAL_EVIDENCE_MAX_BYTES = 1024 * 1024
 CODEX_CLEAN = re.compile(
-    r"\ACodex Review: Didn't find any major issues\.(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:)?\n\n"
+    r"\A(?:<!-- codex-review-receipt:v1 -->\n\n)?"
+    r"Codex Review: Didn't find any major issues\."
+    r"(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:| :rocket:| Another round soon, please!"
+    r"| Chef's kiss\.| Breezy!| Already looking forward to the next diff\.| Delightful!"
+    r"| You're on a roll\.| Can't wait for the next one!)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
     r"(?:\n(<details>[\s\S]*</details>\s*))?\Z"
 )
@@ -61,7 +65,7 @@ and reacts with 👍 once all reviews finish with no findings.
 </details>'''
 CODEX_COMPLETED_ROW = re.compile(
     r'\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* <relative-time datetime="(?P<time>[^"]+)">'
-    r'(?P=time)</relative-time> \| `(?P<commit>[0-9a-f]{7,40})` \| (?:Manual request|PR opened) \|'
+    r'(?P=time)</relative-time> \| `(?P<commit>[0-9a-f]{7,40})` \| (?:Manual request|PR opened|Draft marked ready) \|'
 )
 
 
