@@ -94,9 +94,9 @@ require_commands() {
 
 save_reconcile_state() {
   local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-} mark_success=${6:-false}
-  local transaction_phase=${7:-} failure_reason=${8:-}
+  local transaction_phase=${7:-} failure_reason=${8:-} strict=${9:-false} write_status=0
   install -d -m 0700 "$reconcile_state_dir"
-  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" "$transaction_phase" "$failure_reason" <<'PY' 2>/dev/null || true
+  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" "$transaction_phase" "$failure_reason" <<'PY' 2>/dev/null || write_status=$?
 import json, os, sys, tempfile
 
 path = sys.argv[1]
@@ -134,6 +134,31 @@ except:
     os.unlink(tmp, missing_ok=True)
     raise
 PY
+  [[ "$strict" == true ]] || return 0
+  ((write_status == 0)) || return 1
+  python3 -c '
+import json, sys
+path, status, desired, applied, health, message, phase, reason = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+expected = {"status": status, "desired_commit": desired, "applied_commit": applied,
+            "health": health, "message": message, "transaction_phase": phase, "failure_reason": reason}
+if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit(1)
+' "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$transaction_phase" "$failure_reason" 2>/dev/null
+}
+
+finalize_rollback_state() {
+  local health=$1 message=$2
+  if save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$health" "$message" false '' '' true; then
+    return 0
+  fi
+  if save_reconcile_state 'failed' "$desired_commit" "$restored_config_ref" "$health" 'terminal rollback state persistence rejected' false '' '' true; then
+    printf 'RECONCILE_ERROR: terminal rollback state persistence rejected; failure record verified\n' >&2
+  else
+    printf 'STOP: reconciliation state persistence unverified; operator intervention required\n' >&2
+  fi
+  # Never use die here: another unchecked write cannot establish the outcome.
+  return 1
 }
 
 load_installed_state() {
@@ -651,9 +676,12 @@ PY
     *)
       save_reconcile_state 'failed' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}; final health rejected"
       apply_lkg || die "final health was ${health_status}; rollback to last-known-good also failed"
+      save_reconcile_state 'reconciling' "$desired_commit" "$restored_config_ref" 'unknown' 'restored last-known-good; checking rollback health' false '' '' true \
+        || die 'rollback verification state persistence unverified' "$desired_commit" "$restored_config_ref" 'unknown'
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
-      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
-      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}"
+      verify_explicit_rollback_health "$rollback_health_status" \
+        || die 'drained rollback health unverified' "$desired_commit" "$restored_config_ref" "$rollback_health_status"
+      finalize_rollback_state "$rollback_health_status" "final health ${health_status} for ${health_desired_state} rejected for applied state ${installed_controller_state}; rolled back to ${restored_config_ref}" || exit 2
       note "ROLLBACK_OK controller=${installed_controller} restored=${restored_config_ref}"
       exit 3
       ;;
@@ -685,10 +713,13 @@ finally:
 PY
       lkg_readback_matches "$restored_config_ref" || die 'baseline metadata restoration readback rejected'
       apply_lkg || die 'LKG persistence failed; drained baseline rollback failed'
+      save_reconcile_state 'reconciling' "$desired_commit" "$restored_config_ref" 'unknown' 'restored last-known-good after LKG persistence failure; checking rollback health' false '' '' true \
+        || die 'rollback verification state persistence unverified' "$desired_commit" "$restored_config_ref" 'unknown'
       rollback_health_status=$(run_health_check "$temp_dir/health.json")
-      verify_explicit_rollback_health "$rollback_health_status" || die 'drained rollback health unverified'
+      verify_explicit_rollback_health "$rollback_health_status" \
+        || die 'drained rollback health unverified' "$desired_commit" "$restored_config_ref" "$rollback_health_status"
       [[ "$rollback_health_status" == maintenance || "$rollback_health_status" == warning ]] || die 'LKG persistence failed; rollback health unverified'
-      save_reconcile_state 'rolled_back' "$desired_commit" "$restored_config_ref" "$rollback_health_status" 'LKG persistence failed; restored drained baseline'
+      finalize_rollback_state "$rollback_health_status" 'LKG persistence failed; restored drained baseline' || exit 2
     fi
     exit 3
   fi
