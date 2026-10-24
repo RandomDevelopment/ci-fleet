@@ -87,6 +87,15 @@ func (s *Scaler) HandleJobStarted(ctx context.Context, job *scaleset.JobStarted)
 }
 
 func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobCompleted) error {
+	s.logger.Info("job completion received", "runner", job.RunnerName, "runnerID", job.RunnerID,
+		"result", job.Result, "runnerAssignTime", job.RunnerAssignTime, "jobID", job.JobID,
+		"runnerRequestID", job.RunnerRequestID, "workflowRunID", job.WorkflowRunID)
+	// The pinned SDK documents cancellation of an assignment before a runner acquires it.
+	if job.RunnerName == "" && job.Result == "canceled" && job.RunnerID == 0 && job.RunnerAssignTime.IsZero() &&
+		job.JobID != "" && job.RunnerRequestID > 0 {
+		s.logger.Info("ignored unassigned canceled job completion", "jobID", job.JobID, "runnerRequestID", job.RunnerRequestID)
+		return nil
+	}
 	id, cleanup, ok := s.runners.markDone(job.RunnerName)
 	if !ok {
 		missing, err := s.missingPriorRunner(ctx, job.RunnerName)

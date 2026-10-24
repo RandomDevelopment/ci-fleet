@@ -173,6 +173,7 @@ func TestUntrackedRunnerEventsRetainUnrelatedAndDockerErrors(t *testing.T) {
 			for _, err := range []error{
 				scaler.HandleJobStarted(ctx, &scaleset.JobStarted{RunnerName: test.name}),
 				scaler.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: test.name}),
+				scaler.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: test.name, Result: "canceled"}),
 			} {
 				if err == nil || !strings.Contains(err.Error(), test.want) {
 					t.Errorf("untracked runner error was suppressed: %v", err)
@@ -180,7 +181,7 @@ func TestUntrackedRunnerEventsRetainUnrelatedAndDockerErrors(t *testing.T) {
 			}
 			wantInspections := int32(0)
 			if test.status != 0 {
-				wantInspections = 2
+				wantInspections = 3
 			}
 			if inspections.Load() != wantInspections {
 				t.Errorf("inspections=%d, want %d", inspections.Load(), wantInspections)
