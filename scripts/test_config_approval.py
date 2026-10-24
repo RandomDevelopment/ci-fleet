@@ -415,7 +415,9 @@ class CodexApprovalTests(unittest.TestCase):
         body = self.comment["body"].removeprefix("<!-- codex-review-receipt:v1 -->\n\n")
         for prefix in ("", "<!-- codex-review-receipt:v1 -->\n\n"):
             for sentence in ("", " What shall we delve into next?", " Keep it up!", " Nice work!", " :tada:",
-                             " :rocket:", " Another round soon, please!"):
+                             " :rocket:", " Another round soon, please!", " Chef's kiss.", " Breezy!",
+                             " Already looking forward to the next diff.", " Delightful!", " You're on a roll.",
+                             " Can't wait for the next one!"):
                 with self.subTest(prefix=prefix, sentence=sentence):
                     self.comment["body"] = prefix + body.replace(" What shall we delve into next?", sentence)
                     self.check()
@@ -438,7 +440,11 @@ class CodexApprovalTests(unittest.TestCase):
                 self.comment["body"] = prefix + body
                 self.check()
         for sentence in (" Arbitrary text.", " :rocket: Warning: unresolved finding.",
-                         " Another round soon, please! Warning: unresolved finding."):
+                         " Another round soon, please! Warning: unresolved finding.",
+                         " Chef's kiss. Warning: unresolved finding.", " Breezy! Warning: unresolved finding.",
+                         " Already looking forward to the next diff. Warning: unresolved finding.",
+                         " Delightful! Warning: unresolved finding.", " You're on a roll. Warning: unresolved finding.",
+                         " Can't wait for the next one! Warning: unresolved finding."):
             with self.subTest(sentence=sentence), self.assertRaises(Rejected):
                 self.comment["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + body.replace(
                     " What shall we delve into next?", sentence)

@@ -103,6 +103,12 @@ one of these suffixes, separated by one space:
 - `:tada:`
 - `:rocket:`
 - `Another round soon, please!`
+- `Chef's kiss.`
+- `Breezy!`
+- `Already looking forward to the next diff.`
+- `Delightful!`
+- `You're on a roll.`
+- `Can't wait for the next one!`
 
 The optional footer must contain the known integration-help text. Arbitrary
 suffixes, details, warnings, and added findings reject acceptance. Other wording

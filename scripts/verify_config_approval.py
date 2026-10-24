@@ -30,7 +30,9 @@ LOCAL_EVIDENCE_MAX_BYTES = 1024 * 1024
 CODEX_CLEAN = re.compile(
     r"\A(?:<!-- codex-review-receipt:v1 -->\n\n)?"
     r"Codex Review: Didn't find any major issues\."
-    r"(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:| :rocket:| Another round soon, please!)?\n\n"
+    r"(?: What shall we delve into next\?| Keep it up!| Nice work!| :tada:| :rocket:| Another round soon, please!"
+    r"| Chef's kiss\.| Breezy!| Already looking forward to the next diff\.| Delightful!"
+    r"| You're on a roll\.| Can't wait for the next one!)?\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n"
     r"(?:\n(<details>[\s\S]*</details>\s*))?\Z"
 )
