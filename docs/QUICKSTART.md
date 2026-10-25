@@ -105,6 +105,21 @@ jobs through the Docker socket.
    # Choose amd64 or arm64 for YOUR-HOST-ARCHITECTURE and supply the
    # corresponding reviewed scalars for that host architecture. Portable runtime
    # sources require original config digests, as described in MANAGED-IMAGES.md.
+   ```
+
+   Replace the generated RFC 5737 Docker network values in `fleet.json` with
+   reviewed operational values. Before strict validation, prepare the new
+   controller's [first-install capability evidence](../templates/config-repository/README.md#first-install-capability-evidence)
+   in `engine-rollout-evidence.json`. Review the exact merged selected engine's
+   `engine-capabilities.json` for network policy support and its adapter, plus
+   default bridge support if configured. Historical example pins may lack these
+   declarations. The initializer's SHA input does not prove support. Bind the
+   record to the selected full engine SHA and approved controller ID, using only
+   reviewed capability booleans. This is selected-source evidence before install;
+   verify runtime activation after install before enabling later optional features.
+   Existing installations follow the staged upgrade contract instead.
+
+   ```bash
    # Validate before committing so a rejected file or accidental value
    # never enters branch history, then commit the initialized result:
    ./scripts/validate.sh --strict

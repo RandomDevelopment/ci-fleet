@@ -91,6 +91,9 @@ matching pending records through manager staging and image-policy introduction.
 After runtime verification, promote evidence alone without changing fleet state.
 Every staged controller needs matching predecessor pending evidence, even with
 no optional status/network block and all-false capability flags.
+Record explicit incumbent runtime evidence before manager staging and retain it
+through image introduction. An absent record is insufficient; the staged manager
+pin cannot identify the incumbent runtime.
 
 Transition validation requires prior integrated active capability evidence when
 introducing network policy or `default_bridge_cidr`. Retained fields need matching

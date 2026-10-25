@@ -146,6 +146,9 @@ Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upg
    in a later integrated staging commit. Keep incumbent runtime evidence and the
    pending records unchanged. Apply the approved staging ref with the reviewed
    candidate installer. It installs the manager and leaves runtime unchanged.
+   Every controller needs an explicit incumbent runtime capability record before
+   staging, even when all capability flags are false and optional blocks are absent.
+   Empty active evidence cannot identify the runtime after its manager pin changes.
    Image-enforced hosts skip this image-free stage.
 3. After manager staging, introduce reviewed image policy while retaining every
    other fleet setting and both evidence files. Only this step activates the

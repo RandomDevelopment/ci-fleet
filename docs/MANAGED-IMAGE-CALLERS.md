@@ -58,8 +58,10 @@ on supervised disposable workers. This document does not record their acceptance
 The standalone configuration template needs the matching generic active/pending
 validator contract and caller flags, scalar descriptions, initializer help,
 capability evidence, policy tests and adoption/recovery guidance. Preserve its
-historical release/compatibility records and published fixture identities. Stage
-`portable_managed_image_ids` evidence against the actual reviewed merged engine,
+historical release/compatibility records and published fixture identities. Document
+first-install source capability prerequisites separately from runtime activation
+evidence. Require explicit incumbent records for image-free manager staging.
+Stage `portable_managed_image_ids` evidence against the actual reviewed merged engine,
 retain old catalogs, and validate ordinary upgrades plus image-free bootstrap and
 final evidence-only promotion. Required checks include its complete policy,
 compatibility, initializer/updater/release checks and exact source/base suite.

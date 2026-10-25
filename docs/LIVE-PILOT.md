@@ -95,14 +95,18 @@ publication and activation transaction.
 
 ## 6. Install at zero idle runners and observe
 
-From the reviewed engine checkout, use the exact approved configuration commit:
+From the reviewed engine checkout, use the exact approved configuration commit.
+Replace `home-ci-01` in every command below with the approved logical controller
+identity from that configuration.
 
 ```bash
 sudo ./scripts/install-worker-controller.sh --install \
   --config-repo example-org/fleet-config --ref APPROVED_FULL_CONFIG_COMMIT \
-  --controller example-ci-01
+  --controller home-ci-01
 sudo docker logs --tail=100 ci-fleet-controller-1
-sudo docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true
+sudo docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true \
+  --filter label=io.randomdevelopment.ci-fleet.instance=home-ci-01
+sudo /opt/ci-fleet/manager/current/scripts/healthcheck.sh --json
 ```
 
 Use the separately reviewed adoption or upgrade path for an existing installation.
@@ -117,20 +121,56 @@ Copy `examples/workflows/live-pilot.yml.example` into the selected private repos
 Observe one runner container appear. After the job completes, confirm:
 
 ```bash
-docker ps -a --filter label=io.randomdevelopment.ci-fleet.managed=true
-CI_FLEET_INSTANCE="$CI_FLEET_INSTANCE" scripts/cleanup.sh
-scripts/healthcheck.sh
+sudo docker ps -a --filter label=io.randomdevelopment.ci-fleet.managed=true \
+  --filter label=io.randomdevelopment.ci-fleet.instance=home-ci-01
+sudo systemd-run --wait --pipe --collect \
+  --property=User=root \
+  --property=EnvironmentFile=/etc/ci-fleet/ci-fleet.env \
+  --property=WorkingDirectory=/opt/ci-fleet/current \
+  /opt/ci-fleet/current/scripts/cleanup.sh --instance home-ci-01
+sudo /opt/ci-fleet/manager/current/scripts/healthcheck.sh --json
 ```
 
 Expected results: no runner container, no expired resource candidate, and healthy Docker/controller/disk checks.
+The cleanup command is the managed [maintenance dry-run](HOST-MAINTENANCE.md#fleet-timers).
+Systemd loads the protected rendered environment for that root process. Keep the
+file root-owned mode `0600`; do not source it or credentials into the operator's
+shell. Check cleanup's own successful result, since health alone does not prove
+usable image bindings.
 
 ## 8. Roll back the pilot
 
+Follow [managed retirement](DESIRED-STATE.md#drain-and-retirement). Merge a reviewed
+configuration setting this controller to `drained`, then apply that exact commit
+with the installed trusted manager:
+
 ```bash
-docker compose -f deploy/compose.yaml stop controller
-CI_FLEET_INSTANCE="$CI_FLEET_INSTANCE" scripts/cleanup.sh
+sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh --upgrade \
+  --config-repo example-org/fleet-config --ref APPROVED_FULL_DRAIN_CONFIG_COMMIT \
+  --controller home-ci-01
+sudo /opt/ci-fleet/manager/current/scripts/healthcheck.sh --json
+sudo docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true \
+  --filter label=io.randomdevelopment.ci-fleet.instance=home-ci-01
 ```
 
-Inspect the dry-run before using `--apply`. Verify the host's uniquely named scale set is absent from GitHub. Remove the pilot workflow from the private repository and revoke its runner-group access. If abandoning ci-fleet, uninstall the App and securely delete the host PEM.
+Confirm the health report names the approved controller in `drained` state with
+zero effective capacity and no active runner. Stop on a mismatch. Repeat Step 7's
+cleanup dry-run while the rendered environment is still installed. Review its
+output before authorizing the same cleanup command with `--apply`.
+
+Then [uninstall the managed controller](DESIRED-STATE.md#check-upgrade-roll-back-and-remove):
+
+```bash
+sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh --uninstall
+```
+
+Uninstall reads the protected installed identity, drains, and removes controller
+services and rendered state. Require `UNINSTALL_OK`, then verify the controller
+and proxy are absent and the host's uniquely named scale set is absent from
+GitHub before revoking credentials. Disable or remove the controller declaration
+in a later reviewed configuration change. Remove the pilot workflow from the
+private repository and revoke its runner-group access. Uninstall preserves host
+identity, secrets and checkpoints for explicit disposition. If abandoning
+ci-fleet, uninstall the App and securely delete the host PEM.
 
 Existing downstream-consumer runner services remain unchanged throughout this pilot.

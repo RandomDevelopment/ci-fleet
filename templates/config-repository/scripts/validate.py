@@ -775,7 +775,12 @@ def validate_transition(
             validation.require(old.get("engine_ref") == new.get("engine_ref"), f"$.controllers.{name}.docker_storage_retention", "must be removed in an earlier commit before changing engine_ref")
         current_evidence = compatible_engine_refs.get(name, {})
         if manager_bootstrap:
-            runtime_ref = current_evidence.get("engine_ref", old.get("engine_ref"))
+            runtime_ref = current_evidence.get("engine_ref")
+            validation.require(
+                runtime_ref is not None,
+                f"$.controllers.{name}.engine_ref",
+                "requires explicit incumbent runtime capability evidence during manager bootstrap",
+            )
             if runtime_ref != new.get("engine_ref"):
                 next_engine = (previous_next_engine_refs or {}).get(name, {})
                 validation.require(
@@ -955,7 +960,7 @@ def main(*, retained_configuration: bool = False) -> int:
             for name, controller in current_controllers.items():
                 old = previous["controllers"].get(name)
                 if isinstance(controller, dict) and isinstance(old, dict):
-                    runtime_ref = current_compatible_engine_refs.get(name, {}).get("engine_ref", old.get("engine_ref"))
+                    runtime_ref = current_compatible_engine_refs.get(name, {}).get("engine_ref")
                     current_controllers[name] = {**controller, "engine_ref": runtime_ref}
         for controller, evidence in current_compatible_engine_refs.items():
             current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None

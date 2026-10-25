@@ -208,6 +208,38 @@ drift_count
                 with self.assertRaises(DesiredStateError):
                     parse_env(path, allow_unknown=False)
 
+    def test_pilot_commands_use_managed_identity_and_protected_environment(self):
+        pilot = (ROOT / "docs/LIVE-PILOT.md").read_text()
+        instance = re.search(r"^CI_FLEET_INSTANCE=(.+)$", pilot, re.M).group(1)
+        commands = [shlex.split(line) for block in re.findall(r"```bash\n(.*?)```", pilot.split("## 6.", 1)[1], re.S)
+                    for line in block.replace("\\\n", " ").splitlines() if line.strip()]
+        manager = "/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh"
+        self.assertIn(["sudo", manager, "--uninstall"], commands)
+        for mode in ("--install", "--upgrade"):
+            command = next(command for command in commands if mode in command)
+            self.assertEqual(command[0], "sudo")
+            self.assertEqual(command[command.index("--controller") + 1], instance)
+        self.assertEqual(next(command for command in commands if "--upgrade" in command)[1], manager)
+        cleanups = [command for command in commands if any(token.endswith("/scripts/cleanup.sh") for token in command)]
+        self.assertEqual(len(cleanups), 1)
+        cleanup = cleanups[0]
+        self.assertEqual(cleanup[:2], ["sudo", "systemd-run"])
+        self.assertIn("--property=User=root", cleanup)
+        self.assertIn("--property=EnvironmentFile=/etc/ci-fleet/ci-fleet.env", cleanup)
+        self.assertIn("--property=WorkingDirectory=/opt/ci-fleet/current", cleanup)
+        self.assertEqual(cleanup[-3:], ["/opt/ci-fleet/current/scripts/cleanup.sh", "--instance", instance])
+        self.assertNotIn("--apply", cleanup)
+        health = [command for command in commands if any(token.endswith("/scripts/healthcheck.sh") for token in command)]
+        self.assertTrue(health)
+        self.assertTrue(all(command == ["sudo", "/opt/ci-fleet/manager/current/scripts/healthcheck.sh", "--json"] for command in health))
+        for command in commands:
+            self.assertEqual(command[0], "sudo")
+            self.assertNotIn("compose", command)
+            for token in command:
+                self.assertNotIn("$", token)
+                if token.startswith("/opt/ci-fleet/") and "/scripts/" in token:
+                    self.assertTrue((ROOT / "scripts" / token.rsplit("/scripts/", 1)[1]).is_file(), token)
+
     def test_portable_retained_objects_compare_without_cmp(self):
         self.shell(("image_metadata_path", "portable_image_objects_match"), """
 printf '{}' >"$candidate_metadata"

@@ -115,6 +115,8 @@ The bootstrap:
 Inspect the argument format without local writes or GitHub calls. Dry-run does
 not validate a configuration checkout; live mode validates the pinned commit
 before mutation.
+Complete the [first-install configuration prerequisites](../templates/config-repository/README.md#first-install-capability-evidence),
+including reviewed selected-source capability evidence, before live bootstrap.
 
 ```bash
 sudo ./scripts/bootstrap-github.sh --dry-run \

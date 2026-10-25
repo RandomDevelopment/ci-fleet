@@ -80,6 +80,8 @@ flowchart LR
 
 3. Edit `fleet.json` to add the organization's real logical mappings and replace
    the generated RFC 5737 Docker network values with reviewed operational values.
+   Prepare matching [first-install capability evidence](#first-install-capability-evidence)
+   for every new controller before strict validation or live bootstrap.
 4. Run the strict policy check:
 
    ```bash
@@ -89,6 +91,31 @@ flowchart LR
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
 The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation network values are intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, bridge, resource, and output options.
+
+### First-install capability evidence
+
+For a new controller, review the exact merged engine selected by `engine_ref`.
+Its `engine-capabilities.json` must advertise `docker_network_policy_config` and
+`docker_network_policy_adapter` for the initialized network policy. If configuring
+`default_bridge_cidr`, also require `docker_default_bridge_cidr_config`. Historical
+example pins may lack this manifest or these capabilities. Stop and select a
+reviewed compatible engine instead of inventing support for that pin.
+
+In `engine-rollout-evidence.json`, add a record under
+`status_reporting_engine_capabilities` for the new controller ID. Bind its
+`engine_ref` to that full reviewed commit and declare the reviewed network
+capabilities required by its fields. Include explicit `status_reporting_config`
+and `required_status_reporting` booleans, false when unproven, and leave
+`status_reporting` omitted for first installation. Declare
+`portable_managed_image_ids` only from the reviewed runtime source. Retain the
+supporting source review separately. The initializer does not inspect that source;
+its arbitrary input SHA and image scalars cannot establish capability evidence.
+
+This first-install record describes selected-source capabilities. It does not
+prove that the runtime has been installed or activated. Verify runtime activation
+after installation before enabling later optional features. Existing controllers
+must retain observed incumbent runtime evidence and follow the pending-record
+upgrade or image-free bootstrap sequence below.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -117,6 +144,9 @@ previous integrated active record.
 
 For image-free manager bootstrap, retain incumbent active evidence and the
 matching pending records through manager staging and image-policy introduction.
+Each controller needs an explicit incumbent runtime record before staging, even
+without optional blocks. All-false capability records are valid; absent records
+cannot identify the runtime after the manager pin changes.
 Only after runtime verification promote evidence unchanged in an evidence-only
 commit. This applies even when optional status/network fields are absent and all
 capability flags are false. See [portable managed images and pending evidence](#portable-managed-images-and-pending-evidence).
@@ -130,8 +160,9 @@ require current evidence for the selected engine, and the selected engine
 manifest must advertise the matching capabilities plus
 `docker_network_policy_adapter`. Remove unsupported fields while retaining the
 current engine, reconcile that release, and select an older engine only in a
-later commit. A complete record has this shape after an operator has verified
-the named engine is active:
+later commit. A record has the following shape. For a new controller its values
+need the selected-source review above. For an incumbent, retain its verified
+runtime record until the applicable upgrade sequence permits promotion:
 
 ```json
 {
