@@ -210,6 +210,26 @@ the worker. Review and signing use that same bundle. GitHub artifact uploads and
 an additional storage service are not required. An incomplete transfer cannot
 satisfy the signer because its report or required log hashes are missing.
 
+## Hosted result artifacts
+
+The existing engine workflow's `validate` job exports the entire
+`$RUNNER_TEMP/local-validation/` output directory on success or failure as
+`local-validation-RUN_ID-RUN_ATTEMPT`. Download it from the workflow run's
+Artifacts section within seven days. The upload includes hidden files and fails
+when output is missing. The preceding step makes only that result directory
+readable by the runner account; the workflow permissions, trusted checks and
+45-minute infrastructure job budget remain unchanged.
+
+Retain `result.json` and every recorded log and verify their hashes after download
+before disposing of the worker. Artifact archives do not preserve protected Unix
+ownership and modes; restore those protections through the existing operator
+procedure before treating a downloaded bundle as protected local evidence.
+An artifact upload is unsigned developer evidence. It does not replace required
+checks, independent review, signing or native/host acceptance. Early admission
+refusal may produce no output. Cancellation, job timeout or a lost worker can
+prevent export, and missing reports/logs remain incomplete validation. Local
+runs still use the operator export procedure above and need no GitHub artifact.
+
 ## Configuration repositories
 
 Use the same trusted engine orchestrator with a separate source repository:

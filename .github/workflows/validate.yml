@@ -188,6 +188,22 @@ jobs:
             --source "$SOURCE" --base "$BASE" --policy "$(git rev-parse HEAD)" --main "$main" \
             --disposable-host --output "$RUNNER_TEMP/local-validation" "${args[@]}"
 
+      - name: Make validation evidence readable
+        if: ${{ always() }}
+        run: |
+          sudo chown -R --no-dereference "$(id -u):$(id -g)" "$RUNNER_TEMP/local-validation"
+
+      - name: Export complete validation evidence
+        id: validation-artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: local-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/local-validation/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Require successful convention validation
         env:
           CONVENTION_RESULT: ${{ needs.commit-convention.result }}
