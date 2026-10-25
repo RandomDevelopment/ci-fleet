@@ -865,6 +865,142 @@ release_tree_permissions_trusted "$stale_checkpoint_manager"
 [[ -z $(find "$interrupted_checkpoint" -name '.current-link.*' -print -quit) ]]
 """)
 
+    def test_no_release_fixture_reestablishes_absence_after_each_rollback(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        first = fixture[fixture.index('unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG'):
+                        fixture.index('export FAKE_ALL_RUNNER_STATE=$tmp/no-release-inactive-runner')]
+        retry = fixture[fixture.index('[[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail \'no-release'):
+                        fixture.index('no_release_output=$(expect_success')]
+        uninstall = functions("perform_uninstall")
+        preparation = uninstall[uninstall.index("  local candidate"):uninstall.index('  if [[ -n "$old_release" && -f "$rendered_env" ]]; then')]
+        self.shell(("current_runtime_release", "runtime_release_for_environment", "release_tree_permissions_trusted",
+                    "controller_status", "capture_current_pointer", "capture_legacy_image_ids", "load_checkpoint_images",
+                    "make_checkpoint", "latest_checkpoint", "canonical_release_target", "raw_pointer_target_exists",
+                    "raw_link_target_path", "portable_managed_images", "preflight_checkpoint_images",
+                    "checkpoint_images_reproducible", "managed_image_objects_match", "restore_reviewed_image_tags",
+                    "retag_checkpoint_image", "managed_images_match", "restore_checkpoint", "try_drain_current",
+                    "drain_current", "managed_runner_count", "remove_inactive_managed_runners"),
+                   "uninstall_preparation() {\n" + preparation + "}\n" + r"""
+root=$temporary/host
+tmp=$temporary
+install_root=$root/opt/ci-fleet
+releases_dir=$install_root/releases
+mkdir -p "$releases_dir"
+mv "$release_dir" "$releases_dir/$engine_ref"
+release_dir=$releases_dir/$engine_ref
+manager_releases=$install_root/manager/releases
+manager_current=$install_root/manager/current
+current_link=$install_root/current
+rendered_env=$root/etc/ci-fleet/ci-fleet.env
+state_file=$root/var/lib/ci-fleet/install-state.json
+checkpoints_dir=$root/var/lib/ci-fleet/checkpoints
+systemd_dir=$root/etc/systemd/system
+mkdir -p "$manager_releases" "$(dirname "$rendered_env")" "$(dirname "$state_file")" "$systemd_dir"
+cp "$candidate_env" "$rendered_env"
+printf 'CI_FLEET_CONTROLLER_STATE=active\nCI_FLEET_INSTANCE=example-ci-01\n' >>"$rendered_env"
+printf '{"fixture":"installed"}\n' >"$state_file"
+printf 'fixture health unit\n' >"$systemd_dir/ci-fleet-health.service"
+chmod 600 "$rendered_env" "$state_file"
+unit_names=(ci-fleet-health.service)
+capacity_unit_names=()
+optional_unit_names=()
+timer_names=()
+staging_paths=()
+captured_current_state=''
+testing=1
+root_prefix=$root
+mode=uninstall
+controller_id=example-ci-01
+export FAKE_DOCKER_STATE=$temporary/controller
+export FAKE_CONTROLLER_STATUS_FILE=$temporary/controller-status
+export FAKE_ALL_RUNNER_STATE=$tmp/no-release-inactive-runner
+export FAKE_FAIL_CONTAINER_RM_ONCE=$tmp/no-release-fail-container-rm
+CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN=0
+printf '0' >"$temporary/counter"
+date() { local n; n=$(<"$temporary/counter"); printf '%s' "$n"; printf '%s' "$((n+1))" >"$temporary/counter"; }
+note() { printf '%s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+die() { printf '%s\n' "$*" >&2; exit 7; }
+on_error() { exit "$?"; }
+# Source completeness, identity loading, Docker and services are local models.
+# Capture, source selection, pointer absence, image checks and restore run unchanged.
+runtime_release_complete() { [[ $1 == "$releases_dir/$engine_ref" && $2 == "$engine_ref" && $(<"$1/.ci-fleet-engine-ref") == "$engine_ref" ]]; }
+manager_release_from_raw_pointer() { return 1; }
+load_installed_controller_identity() { controller_id=example-ci-01; }
+configuration_approval_required() { return 1; }
+systemctl() { return 1; }
+restore_systemd_snapshot() { cp "$checkpoint_dir/systemd/ci-fleet-health.service" "$systemd_dir/ci-fleet-health.service"; }
+run_health_check() { [[ $1 == "$release_dir" && $2 == "$rendered_env" && -f $FAKE_DOCKER_STATE ]]; }
+compose() {
+  case $3 in
+    up) : >"$FAKE_DOCKER_STATE" ;;
+    kill|stop|down) rm -f "$FAKE_DOCKER_STATE" ;;
+    pause|unpause) ;;
+    *) return 98 ;;
+  esac
+}
+docker() {
+  case "$1 ${2:-}" in
+    'image inspect')
+      if [[ $4 == *'{{eq '* ]]; then printf true
+      elif [[ $4 == *'org.opencontainers.image.revision'* ]]; then printf '%s' "$engine_ref"
+      elif [[ ${!#} == controller:reviewed ]]; then printf '%s' """ + CONTROLLER_CONFIG + r"""
+      elif [[ ${!#} == runner:reviewed ]]; then printf '%s' """ + RUNNER_CONFIG + r"""
+      else printf '%s' "${!#}"; fi ;;
+    'image tag'|'info ') ;;
+    'inspect --format')
+      [[ -f $FAKE_DOCKER_STATE ]] || return 1
+      if [[ $3 == '{{.Image}}' ]]; then printf '%s' """ + CONTROLLER_CONFIG + r"""
+      elif [[ $3 == '{{.State.Status}}' ]]; then printf running
+      elif [[ $3 == '{{.State.Paused}}' ]]; then printf false
+      else printf '%s' "$engine_ref"; fi ;;
+    'ps --all') [[ ! -f $FAKE_ALL_RUNNER_STATE ]] || printf 'managed-runner\n' ;;
+    'ps -q') ;;
+    'rm managed-runner')
+      if [[ -f $FAKE_FAIL_CONTAINER_RM_ONCE ]]; then rm "$FAKE_FAIL_CONTAINER_RM_ONCE"; return 43; fi
+      rm -f "$FAKE_ALL_RUNNER_STATE" ;;
+    *) return 98 ;;
+  esac
+}
+# A no-pointer checkpoint still retains authenticated recovery source.
+make_checkpoint ''
+grep -Fxq "$release_dir" "$checkpoint_dir/release-target"
+[[ -f $checkpoint_dir/.complete && -f $checkpoint_dir/current-absent && ! -e $checkpoint_dir/manager-target ]]
+restore_checkpoint
+for boundary in first retry; do
+  [[ -f $FAKE_DOCKER_STATE && ! -L $current_link && ! -L $manager_current ]]
+  : >"$FAKE_ALL_RUNNER_STATE"
+  : >"$FAKE_FAIL_CONTAINER_RM_ONCE"
+  trap - ERR
+  set +e
+  (set -Eeuo pipefail; trap - ERR; captured_current_state=''; uninstall_preparation) >"$tmp/early" 2>&1
+  status=$?
+  set -e
+  [[ $status == 7 && -f $FAKE_FAIL_CONTAINER_RM_ONCE ]]
+  grep -Fq 'a trusted complete canonical manager release is required to uninstall the running controller' "$tmp/early"
+  if grep -Fq CHECKPOINT_CREATED "$tmp/early"; then exit 1; fi
+  if [[ $boundary == first ]]; then
+""" + first + r"""
+  else
+""" + retry + r"""
+  fi
+  trap - ERR
+  set +e
+  (set -Eeuo pipefail; trap - ERR; captured_current_state=''; uninstall_preparation) >"$tmp/removal" 2>&1
+  status=$?
+  set -e
+  [[ $status == 43 ]] || { cat "$tmp/removal"; exit 1; }
+  grep -Fq CHECKPOINT_CREATED "$tmp/removal"
+  grep -Fq DRAIN_OK "$tmp/removal"
+  [[ ! -f $FAKE_FAIL_CONTAINER_RM_ONCE ]]
+  checkpoint_dir=$(latest_checkpoint)
+  [[ -f $checkpoint_dir/.complete && -f $checkpoint_dir/current-absent && ! -e $checkpoint_dir/manager-target ]]
+  grep -Fxq "$release_dir" "$checkpoint_dir/release-target"
+  restore_checkpoint
+  [[ -f $state_file && -f $systemd_dir/ci-fleet-health.service ]]
+done
+""", portable=False)
+
     def test_policy_rollback_fixtures_preserve_the_captured_incumbent_baseline(self):
         fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
         write = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()

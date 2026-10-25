@@ -2637,6 +2637,8 @@ if grep -Fq 'container-rm-blocked-running|' "$FAKE_COMPOSE_LOG"; then fail 'no-r
 expect_success "$installer" --rollback >/dev/null
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN:-0} != 1 ]] || { printf 'NO_RELEASE_ACTIVE_ORPHAN_REGRESSION_OK\n'; exit 0; }
+# Rollback can restart retained active source; restore absence for the next case.
+rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_ALL_RUNNER_STATE=$tmp/no-release-inactive-runner
 export FAKE_FAIL_CONTAINER_RM_ONCE=$tmp/no-release-fail-container-rm
 : >"$FAKE_ALL_RUNNER_STATE"
@@ -2645,12 +2647,13 @@ no_release_failure_output=$tmp/no-release-uninstall-failure.out
 if "$installer" --uninstall >"$no_release_failure_output" 2>&1; then
   fail 'no-release uninstall ignored inactive runner removal failure'
 fi
-grep -Fq 'CHECKPOINT_CREATED' "$no_release_failure_output" || fail 'no-release runner removal failure omitted checkpoint evidence'
+grep -Fq 'CHECKPOINT_CREATED' "$no_release_failure_output" || fail "no-release runner removal failure omitted checkpoint evidence: $(<"$no_release_failure_output")"
 grep -Fq 'ROLLBACK_RESTORED' "$no_release_failure_output" || fail "no-release runner removal failure did not roll back: $(<"$no_release_failure_output")"
 if grep -Fq 'UNINSTALL_OK' "$no_release_failure_output"; then fail 'no-release runner removal failure reported successful uninstall'; fi
 no_release_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$no_release_failure_output")
 [[ -f "$no_release_failure_checkpoint/.complete" ]] || fail 'no-release runner removal failure did not preserve its complete checkpoint'
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'no-release runner removal failure deleted managed state before rollback'
+rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 : >"$FAKE_ALL_RUNNER_STATE"
 no_release_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$no_release_output" || fail 'no-release uninstall did not complete'
