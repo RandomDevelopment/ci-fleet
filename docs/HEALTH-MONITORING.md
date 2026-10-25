@@ -24,6 +24,15 @@ The check covers:
 - an optional host-local backup check;
 - optional authenticated outbound status delivery.
 
+Portable managed-image proof failures make direct admitted cleanup accounting
+fail closed. The inherited health stale-resource helper returns zero counts when
+its cleanup command fails, so those counts cannot establish usable proof. Health
+and cleanup cannot repair that proof. Installed drift reports
+`managed_image_bindings` when candidate hydration cannot reuse protected proof.
+Use separately authorized installer preparation for fresh proof, then rerun the
+checks. Health success alone does not establish image content or native acceptance.
+See [managed image verification](MANAGED-IMAGES.md).
+
 It reports but never prunes, restarts, or repairs resources. Project source, logs, environment values, tokens, and private keys are never included.
 
 Docker network inspection is read-only. Healthy headroom is reported when free

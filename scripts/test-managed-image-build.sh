@@ -36,6 +36,10 @@ with tempfile.TemporaryDirectory() as temporary:
                            FAKE_AVAILABLE_IMAGE_IDS=str(root / 'available'),
                            FAKE_BUILDER_LOG=str(root / 'builders'),
                            FAKE_PARTIAL_RUNNER_IMAGE_ID=wrong_id)
+    release = root / 'opaque-release'
+    release.mkdir()
+    (release / 'scripts').symlink_to(repo / 'scripts', target_is_directory=True)
+    (release / 'engine-capabilities.json').write_text('{"schema_version":1,"capabilities":{"portable_managed_image_ids":false}}')
     builder_names = set()
     for case in ('create_failure', 'bootstrap_failure', 'wrong_backend', 'missing_backend', 'partial', 'runner_mismatch', 'controller_mismatch', 'prepare', 'success'):
         (root / 'builders').write_text('')
@@ -53,7 +57,7 @@ with tempfile.TemporaryDirectory() as temporary:
         if case == 'partial': injected['FAKE_PARTIAL_BUILD_FAIL'] = '1'
         if case == 'runner_mismatch': injected['FAKE_BUILT_RUNNER_IMAGE_ID'] = wrong_id
         if case == 'controller_mismatch': injected['FAKE_BUILT_CONTROLLER_IMAGE_ID'] = wrong_id
-        command = ['bash', str(repo / 'scripts/build-managed-images.sh'), str(repo), str(environment)]
+        command = ['bash', str(repo / 'scripts/build-managed-images.sh'), str(release), str(environment)]
         if case == 'prepare': command.append(str(root / 'manifest'))
         result = subprocess.run(command,
                                 env=injected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -88,7 +92,7 @@ with tempfile.TemporaryDirectory() as temporary:
         injected = dict(env, FAKE_APT_SECRET_CONFIG=str(secret_copy))
         if case == 'ambient': injected['CI_FLEET_APT_HTTP_PROXY'] = proxy
         if case == 'failure': injected['FAKE_FAIL_BUILD'] = '1'
-        result = subprocess.run(['bash', str(repo / 'scripts/build-managed-images.sh'), str(repo), str(environment)],
+        result = subprocess.run(['bash', str(repo / 'scripts/build-managed-images.sh'), str(release), str(environment)],
                                 env=injected, capture_output=True, text=True)
         assert (result.returncode == 0) == (case in ('enabled', 'removed', 'ambient')), (case, result.stderr)
         assert secret_copy.exists() == (case == 'enabled'), case

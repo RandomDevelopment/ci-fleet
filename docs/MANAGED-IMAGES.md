@@ -1,21 +1,138 @@
 # Reproducible managed images
 
-Managed controller and runner images have two independent pins:
+Managed controller and runner images have two independent pins. The engine
+checkout fixes build instructions and module hashes. Reviewed desired state maps
+that full engine commit and architecture to scalar `sha256:...` values.
 
-1. the engine checkout fixes all build instructions and checked module hashes;
-2. the reviewed private desired state maps that full engine commit to exact local Docker image IDs (`sha256:...`).
+The selected runtime source declares their meaning through
+`portable_managed_image_ids` in `engine-capabilities.json`. With that capability,
+each scalar is the SHA-256 of the original image config bytes, called C here.
+Without it, each scalar remains an exact opaque local Docker image ID. A newer
+manager does not reinterpret an older engine's values. Digest syntax, API version
+and backend names never choose policy semantics. Keep historical entries and
+checkpoint IDs unchanged.
 
-Convergence captures the incumbent checkpoint, then prepares and verifies images before draining. Builds use private temporary tags and publish canonical tags only after both image IDs and revision labels match reviewed state and post-build host checks and drain succeed, within checkpoint recovery coverage. Matching reviewed image objects are reused even when canonical tags drift. A failed preparation preserves the incumbent runtime and tags. Fresh-install checkpoints retain any original canonical image IDs, protect those objects from storage cleanup, and verify their availability before rollback drains the installed controller. Reverting to a no-install checkpoint tears down the scoped candidate Compose project, including its socket proxy and networks, before restoring original tags and removing installed state. Convergence rejects an image whose revision label is correct but whose image ID differs. A missing image is rebuilt only from the pinned engine release and accepted only when its rebuilt ID equals the reviewed value. Rollback applies the same check before it starts the restored controller.
+## Portable content verification
 
-The controller launches runners by the reviewed image ID. Canonical tags remain build and rollback references.
+For portable sources, the root installer proves both roles before publishing
+any tag, installing runtime environment, draining or activating a controller.
+It inspects a candidate tag once, obtains immutable full Docker ID R, and exports
+by full R without a platform filter. Classic R equals C. A containerd R can be an
+original manifest or singleton index whose selected manifest binds C. The export's
+`index.json` is a generated wrapper. Its hash is not the original root identity.
+The verifier hashes original config bytes and authenticates the original
+R-to-manifest-to-C descriptor chain, source revision and exact Linux architecture.
+Inspect JSON serialization and config-ID lookups are not content proof.
 
-Legacy checkpoint image evidence is stored separately from the environment restored to the host. An image-free bootstrap last-known-good configuration can be restored only through a complete protected checkpoint matching its repository, configuration commit and controller. Recovery verifies the checkpoint images, runtime and units before replacing installed state. It does not treat an arbitrary image-free configuration as a new installation.
+The first protocol supports one runnable platform per role, a direct manifest or
+one original singleton index, and regular tar entries. It consumes the complete
+bounded response, validates tar checksums and ending, hashes digest-addressed
+blobs and checks selected layer closure. Duplicate JSON keys or archive names,
+links, unsafe paths, extensions, incomplete descriptors, corruption, truncation,
+HTTP framing failures and trailing daemon errors fail preparation. Layers are
+streamed without spooling. The proof does not claim root-filesystem replay.
 
-Reconstruction requires the checkpoint release to declare `reproducible_managed_images` and runs its own `scripts/build-managed-images.sh`, retaining that release's client, backend and timestamp pins. Checkpoint image availability, any required reconstruction and exact-ID verification all complete before draining or replacing active state. Retained objects are retagged without invoking Buildx.
+`CI_FLEET_CONTROLLER_IMAGE_DIGEST` and `CI_FLEET_RUNNER_IMAGE_DIGEST` retain C.
+The installer derives `CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID` and
+`CI_FLEET_RUNNER_RUNTIME_IMAGE_ID` only after both roles pass. These are rendered
+fields, never host configuration inputs. Canonical tags, Compose controller and
+proxy startup, controller runner inspection and runner creation use R. Reviewed
+labels retain C. The controller receives no root proof, store socket or new secret.
+It checks that R resolves exactly with its own source revision and Linux platform.
 
-Pre-enforcement images have mutable inputs and must remain retained or be restored by separately authorized offline import with exact-ID verification. If a legacy object is lost, rollback fails closed with `ROLLBACK_IMAGE_REINSTALL_REQUIRED`; restore a verified saved image or separately authorize reinstall from an image-enforced configuration. Do not rebuild a legacy Dockerfile and assume its captured ID is reproducible.
+Versioned `managed_image_bindings` in protected `install-state.json` binds the
+engine, architecture, role, C/R/manifest, daemon ID, store and software identity.
+It retains authenticated small original descriptor bytes, config hash and approved
+source/platform metadata. It saves no raw config or image Env. Checkpoints copy
+that metadata with their original environment and raw tag/live image maps.
+Warm checks rehash retained descriptors and inspect exact R without exporting
+layers. They may reuse the same proof for a separately approved configuration
+commit selecting identical content. Candidate fields and metadata are hydrated
+before exact environment/state comparisons.
 
-Older checkpoints without a versioned image map do not retag or rebuild images. Their canonical tags must already match the checkpoint's recorded image IDs and revision before rollback drains; missing or mismatched evidence requires operator recovery.
+Missing, untrusted or stale proof fails read-only checks and defers storage
+removal. Controlled `--upgrade` preparation can create fresh proof before mutation.
+Daemon/store/software changes require reproof. A restart alone does not if all
+bound identities and immutable objects remain unchanged. Warm proof trusts the
+daemon's content-addressed store. It cannot detect hostile root/store replacement
+that copies all bound identities.
+
+Preparation captures the incumbent checkpoint before required builds.
+Opaque runtime sources validate candidate Compose before checkpoint capture.
+Portable sources validate Compose after both image bindings pass, following any
+required builds under checkpoint coverage. Neither source drains or publishes
+canonical tags after failed Compose validation. Builds use
+private temporary tags. Both roles must pass before publication; post-build host
+checks and drain still precede canonical tags. Matching verified objects are
+reused despite tag drift. Failed preparation preserves incumbent runtime and tags.
+Activation publishes environment and binding metadata inside the existing recovery
+transaction before runtime health checks. Independent file renames are not a
+crash-atomic pair; interrupted or mismatched state fails subsequent checks and
+requires checkpoint recovery. Completion markers still follow complete checkpoint
+capture.
+
+## Recovery and retained images
+
+Image-free bootstrap recovery uses that host's protected captured old IDs. It
+does not substitute another host's image catalog. An image-enforced host cannot
+enter image-free staging by removing fields. Bootstrap LKG recovery still requires
+a complete protected checkpoint matching repository, configuration ref and
+controller. Formats 2/3 and unversioned checkpoints retain their original raw tag,
+live-image and absence distinctions. Portable checkpoint creation authenticates original metadata and environment before copying.
+It reuses warm proof, or performs controlled fresh proof of the same captured R
+into the new checkpoint when stale. It never repairs incumbent state during
+capture. Portable restoration requires its protected proof and exact retained
+runtime and raw rollback objects before drain. Missing
+portable objects require a controlled verified offline import and reproof or
+separately authorized reinstall. Restoration does not rewrite a checkpoint to a
+different runtime root.
+
+Manual opaque adoption requires a complete trusted source for the incumbent's own
+engine revision. Source selection checks the installed runtime, that revision's
+canonical release, and retained manager source context. A portable candidate is
+never a recovery or drain source for a different opaque incumbent. Historical
+in-place sources are preserved as canonical pinned source before installing a
+candidate beneath them. Checkpoints retain the selected `release-target`.
+Preflight, drain and restoration use that source's Compose and image semantics,
+so an opaque environment needs no invented portable runtime fields or proof.
+A missing, mismatched or unsafe compatible source refuses before drain. Establish
+trusted source through controlled preparation or use reviewed reinstall recovery;
+retained image objects alone do not supply executable recovery source.
+
+Storage protection reads a checkpoint's authenticated `release-target` when
+present, including historical manager source locations. It does not require a
+never-installed canonical release for that checkpoint. Current source lookup also
+supports protected historical runtime context. Pointer paths, ownership,
+permissions, source revision and capability declarations must agree. Portable
+sources still require protected bindings; absent raw tags stay absent and opaque
+IDs remain exact. Unavailable or untrusted source/proof defers removal.
+
+Old opaque-ID reconstruction still requires the checkpoint release's
+`reproducible_managed_images` capability and its own build helper and tool pins.
+It completes before drain and is attempted at most once. Pre-enforcement images
+have mutable inputs and must never be rebuilt as an alleged match. Lost legacy
+objects fail with `ROLLBACK_IMAGE_REINSTALL_REQUIRED`. Retained objects are
+retagged without Buildx. Unversioned checkpoints require matching existing tags;
+they do not retag or rebuild. Captured raw tag and live IDs remain exact identities for preflight. Inherited
+installed restoration later republishes reviewed tags, so it does not guarantee
+every final raw tag mapping or absence. Fresh no-install restoration and deferred
+prior controller-tag restoration retain their specific exact-ID checks.
+
+The [caller coverage audit](MANAGED-IMAGE-CALLERS.md) records all lifecycle and
+retention dispositions and the standalone template follow-up.
+
+## Native acceptance remains separate
+
+Initial protocol limits are 128 KiB reads, 1 MiB per metadata/config object,
+8 MiB retained metadata, 4096 members, 8 GiB per role, JSON depth 32 and 1 MiB final
+zero padding. The local transport uses API 1.52, 30-second inactivity limits and
+a 180-second overall pair budget. These are bounds, not measured native capacity.
+Cold export transfers every layer and classic Docker may need temporary disk.
+Measure both-role duration and peak disk on supervised disposable classic and
+containerd workers, with empty and populated stores. Prove native export ending,
+import, actual container IDs, source/platform, tag races, cache invalidation,
+cleanup and every recovery format before host acceptance. No backend migration,
+host resize, SDK upgrade or containerd socket access is required by this protocol.
 
 ## Reviewed upstream inputs
 
@@ -41,15 +158,45 @@ Compose selections are unchanged.
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.
 
-## Two-step desired-state rollout
+## Staged desired-state rollout
 
 Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
 
-1. Separately authorize the bootstrap on each host and stop its reconciliation timer before publishing the staging revision. The incumbent installer cannot stage the new manager. Its attempt to load the new Compose release fails closed when reviewed image IDs are missing.
-2. Merge a staging desired-state revision that changes only `engine_ref` and omits `managed_images`. Upgrade mode installs and activates only the new manager; it leaves the running controller and image unchanged. Apply it with the reviewed candidate checkout's `scripts/install-worker-controller.sh --upgrade` and the approved staging configuration ref. Preserve the incumbent runtime capability evidence and all controller settings during this revision.
-3. After every activation target reports `MANAGER_STAGED` for the new engine revision, merge a second reviewed revision that adds `managed_images` and its exact IDs; only this revision may build and activate the new runtime. Preserve the incumbent capability evidence for this activation commit, then update it to the verified new runtime in a follow-up revision. Restart reconciliation using the staged manager. A staging rollback may select the retained runtime engine for one controller through the same candidate installer while other controllers retain their staged refs. If unit or timer setup fails after the manager pointer moves, retry the same staging revision to reconcile it; the installer validates the retained runtime and manager tree before re-entry.
+1. For an established image-free fleet, first integrate missing incumbent active
+   evidence in an evidence-only commit with `fleet.json` unchanged. It must describe
+   the already observed runtime and exact source capabilities, even when every flag
+   is false. Source review alone cannot establish activation. Retain existing
+   records unchanged. In a later evidence-only commit, add matching target pending
+   records, again keeping the entire fleet and existing evidence unchanged.
+   Review and merge the actual target engine before image production. Stage its
+   capability records in `next-engine-rollout-evidence.json` while the incumbent
+   engine and active evidence remain unchanged. Include the runtime source's
+   `portable_managed_image_ids: true` declaration in its reviewed record.
+2. For an existing managed image-free host, change only controller engine refs
+   in a later integrated staging commit. Keep incumbent runtime evidence and the
+   pending records unchanged. Apply the approved staging ref with the reviewed
+   candidate installer. It installs the manager and leaves runtime unchanged.
+   Every controller needs an explicit incumbent runtime capability record before
+   staging, even when all capability flags are false and optional blocks are absent.
+   Empty active evidence cannot identify the runtime after its manager pin changes.
+   Image-enforced hosts skip this image-free stage.
+3. After manager staging, introduce reviewed image policy while retaining every
+   other fleet setting and both evidence files. Only this step activates the
+   portable runtime. After verified runtime activation, promote matching pending
+   evidence unchanged in an evidence-only commit and remove the empty sidecar.
+4. For ordinary image-enforced engine upgrades, select the engine and promote its
+   matching previously integrated pending record unchanged, then remove its pending
+   record. Never stage and select a record in the same commit.
 
-Fresh installation, field removal after enforcement, unrelated staging changes, and runtime activation without reviewed IDs all fail closed. Initial strict configuration validation requires image IDs. Image-free staging requires a complete previous configuration and an engine-ref-only transition changing at least one controller. The installer and reconciler supply predecessor context for both staging and image-policy introduction, including retained capability evidence. Configuration fetches include the immediate parent. Drift checks of the exact protected installed ref validate the retained runtime without demanding another staging transition or changing the manager pointer. They report `CHECK_RETAINED` only after the manager tree, runtime and mandatory timers pass verification.
+Installer and reconciler validation use the selected commit's immediate first
+parent. Missing history, changed pending records, early evidence promotion,
+image-field removal, unrelated bootstrap edits and no-change image-free staging
+fail. Evidence preparation permits additions to established active/pending maps,
+with all prior records and the entire fleet unchanged. A true no-op, same-commit
+preparation and selection, or fresh image-free installation remains invalid. A suite base chosen elsewhere does not replace this predecessor. The
+protected exact installed-ref drift exception and protected bootstrap LKG recovery
+remain separate; neither admits a new image-free installation. Keep approval,
+compatible-manager recovery and runtime verification gates in force.
 
 ## Record image IDs for an engine commit
 
@@ -76,27 +223,42 @@ docker buildx build --builder "$BUILDER" --no-cache --load \
   --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION \
   --build-arg SOURCE_DATE_EPOCH \
   --tag "ci-fleet-controller:$CI_FLEET_VERSION" --file controller/Dockerfile .
-docker image inspect --format '{{.Id}}' \
-  "ci-fleet-controller:$CI_FLEET_VERSION" \
-  "ci-fleet-runner:$CI_FLEET_VERSION"
+# Use a root-owned private evidence directory outside Git.
+ARCHITECTURE=amd64 # Select the actual build host architecture, or arm64.
+EVIDENCE_DIR=/results/managed-image-review
+install -d -m 0700 "$EVIDENCE_DIR"
+for role in controller runner; do
+  python3 scripts/managed_image_identity.py describe \
+    --reference "ci-fleet-$role:$CI_FLEET_VERSION" \
+    --engine "$CI_FLEET_COMMIT" --architecture "$ARCHITECTURE" \
+    >"$EVIDENCE_DIR/$role.json"
+done
 ```
 
 Managed builds require the reviewed Docker Buildx client v0.32.1. Read-only checks, manager staging, maintenance that reuses matching images, uninstall and retained-image rollback do not require that plugin. Rollback that must rebuild requires the reviewed client. Host tool installation or upgrade remains separately authorized.
 
 Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes only its own temporary builder afterward. Builder and staging names include a per-invocation UUID; an existing operator builder is never removed.
 
-Repeat the build on every supported host architecture. After each architecture's repeated IDs match, add them to one private desired-state entry:
+`describe` produces prospective build evidence, not host authorization. On
+containerd it uses a discovery export for R/manifest, then a second full-R export
+for the discovered C. Host `prepare` always requires reviewed C and uses one cold
+export per role. Compare `config_digest` across the two clean builds, retain full
+source/tree/tool identities and private stream evidence outside Git, then review
+both roles into policy. Do not choose backend R as the new scalar.
+
+Repeat the build on every supported host architecture. After each architecture's
+repeated config digests match, add them to one private desired-state entry:
 
 ```json
 "managed_images": {
   "FULL_ENGINE_COMMIT": {
     "amd64": {
-      "controller": "sha256:REVIEWED_AMD64_CONTROLLER_IMAGE_ID",
-      "runner": "sha256:REVIEWED_AMD64_RUNNER_IMAGE_ID"
+      "controller": "sha256:REVIEWED_AMD64_CONTROLLER_CONFIG_DIGEST",
+      "runner": "sha256:REVIEWED_AMD64_RUNNER_CONFIG_DIGEST"
     },
     "arm64": {
-      "controller": "sha256:REVIEWED_ARM64_CONTROLLER_IMAGE_ID",
-      "runner": "sha256:REVIEWED_ARM64_RUNNER_IMAGE_ID"
+      "controller": "sha256:REVIEWED_ARM64_CONTROLLER_CONFIG_DIGEST",
+      "runner": "sha256:REVIEWED_ARM64_RUNNER_CONFIG_DIGEST"
     }
   }
 }

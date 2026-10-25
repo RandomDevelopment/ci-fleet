@@ -222,7 +222,8 @@ fetch_remote_config() {
 }
 
 validate_config() {
-  local checkout_dir=$1 commit=$2
+  local checkout_dir=$1 commit=$2 parent_ref
+  parent_ref=$(git -C "$checkout_dir" cat-file -p "$commit" | awk '$1 == "parent" {print $2; exit}') || return 1
   local args=(--config "$temp_dir/fleet.json" --strict --tree-paths "$temp_dir/tree-paths")
   git -C "$checkout_dir" show "$commit:fleet.json" >"$temp_dir/fleet.json" 2>/dev/null || return 1
   git -C "$checkout_dir" ls-tree -rz --name-only "$commit" >"$temp_dir/tree-paths" 2>/dev/null || return 1
@@ -239,11 +240,20 @@ validate_config() {
   if git -C "$checkout_dir" show "$commit:engine-rollout-evidence.json" >"$temp_dir/rollout-evidence.json" 2>/dev/null; then
     args+=(--rollout-evidence "$temp_dir/rollout-evidence.json")
   fi
-  if git -C "$checkout_dir" show "$commit^:fleet.json" >"$temp_dir/previous-fleet.json" 2>/dev/null \
-    && python3 -c 'import json, sys; current, previous=(json.load(open(path)) for path in sys.argv[1:]); sys.exit(0 if isinstance(current, dict) and isinstance(previous, dict) and ("managed_images" not in current or "managed_images" not in previous) else 1)' "$temp_dir/fleet.json" "$temp_dir/previous-fleet.json"; then
+  if git -C "$checkout_dir" cat-file -e "$commit:next-engine-rollout-evidence.json" 2>/dev/null; then
+    git -C "$checkout_dir" show "$commit:next-engine-rollout-evidence.json" >"$temp_dir/next-evidence.json" || return 1
+    args+=(--next-engine-rollout-evidence "$temp_dir/next-evidence.json")
+  fi
+  if [[ -n "$parent_ref" ]]; then
+    git -C "$checkout_dir" cat-file -e "$parent_ref^{commit}" 2>/dev/null || return 1
+    git -C "$checkout_dir" show "$commit^:fleet.json" >"$temp_dir/previous-fleet.json" 2>/dev/null || return 1
     args+=(--previous-config "$temp_dir/previous-fleet.json")
     if git -C "$checkout_dir" show "$commit^:engine-rollout-evidence.json" >"$temp_dir/previous-evidence.json" 2>/dev/null; then
       args+=(--previous-rollout-evidence "$temp_dir/previous-evidence.json")
+    fi
+    if git -C "$checkout_dir" cat-file -e "$commit^:next-engine-rollout-evidence.json" 2>/dev/null; then
+      git -C "$checkout_dir" show "$commit^:next-engine-rollout-evidence.json" >"$temp_dir/previous-next-evidence.json" || return 1
+      args+=(--previous-next-engine-rollout-evidence "$temp_dir/previous-next-evidence.json")
     fi
   fi
   python3 "$repo_root/templates/config-repository/scripts/validate.py" "${args[@]}" 2>"$temp_dir/strict_err" || {
@@ -300,13 +310,13 @@ PY
   local lkg_token
   lkg_token=$(cat "$temp_dir/reconcile-token" 2>/dev/null || echo "")
   if [[ -n "$lkg_token" ]]; then
-    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 \
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=2 \
       "https://x-access-token:${lkg_token}@github.com/${lkg_repo}.git" "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
       log_json "ERROR" "rollback" "LKG fetch failed"
       return 1
     }
   else
-    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=2 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
       log_json "ERROR" "rollback" "LKG fetch failed"
       return 1
     }

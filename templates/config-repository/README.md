@@ -78,8 +78,11 @@ flowchart LR
      --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID
    ```
 
-3. Edit `fleet.json` to add the organization's real logical mappings and replace
-   the generated RFC 5737 Docker network values with reviewed operational values.
+3. Edit `fleet.json` to add the organization's real logical mappings. For a new
+   controller, remove the generated `docker_network_policy` block, including any
+   bridge field. Keep `managed_images` present, optional status/storage blocks
+   absent, and the active evidence map empty. Follow the
+   [first-install stages](#first-install-capability-evidence) below.
 4. Run the strict policy check:
 
    ```bash
@@ -89,6 +92,38 @@ flowchart LR
 5. Configure secret **values** in GitHub Environments, root-owned host files, or an external secret manager. The repository stores only names such as `DEPLOY_AUTH`.
 
 The initializer refuses to replace a configured file unless `--force` is explicit. The product of `--max-runners` and `--networks-per-runner` cannot exceed 30, so its fictional `/24` pool never produces networks smaller than `/29` after reserving the controller and operator headroom. It runs non-strict validation because the generated documentation network values are intentionally not deployable. Run `./scripts/init.sh --help` for repository, registry, runner-group, controller, location, capacity, network, bridge, resource, and output options.
+
+### First-install capability evidence
+
+1. Initialize with an actual reviewed merged engine and its reviewed image
+   scalars for the host architecture. Before the first configuration commit,
+   remove generated `docker_network_policy`, including `default_bridge_cidr`.
+   Omit `status_reporting` and `docker_storage_retention`. Keep `managed_images`
+   and an empty `status_reporting_engine_capabilities` map in
+   `engine-rollout-evidence.json`. There is no incumbent for a new controller;
+   do not invent active or pending evidence. Validate against the actual prior
+   integrated state, then review and merge.
+2. Install that exact configuration. Run the installer's `--check` with the same
+   repository, configuration commit and controller ID. Require `CHECK_OK` for
+   the active runtime. `CHECK_STAGED` describes retained incumbent runtime during
+   manager staging and cannot establish a first installation.
+3. After observed runtime activation, review source capabilities at that exact
+   engine SHA and integrate the controller's active record in an evidence-only
+   commit. Keep `fleet.json` unchanged. Review `engine-capabilities.json` and the
+   implementation for network configuration and its adapter, plus bridge support
+   if needed. Source declarations alone do not prove runtime activation. Historical
+   example pins may lack the manifest; never invent support from initializer input.
+   Include the record's required status booleans without attesting unproven or
+   unused status capabilities.
+4. Only in a later reviewed commit, add operational network policy and optional
+   bridge values while retaining the engine and previously integrated active
+   record. Validate with the real predecessor, merge and use approved reconciliation.
+
+These stages apply to a new controller. Existing installations retain their
+actual history and incumbent evidence and follow the upgrade or image-free
+bootstrap sequence below. Do not reinitialize an existing host to bypass it.
+When adding a controller to an existing fleet, preserve every other controller's
+evidence and the actual predecessor; omit only the new controller's active record.
 
 ## Schema v3: Git-authored controller desired state
 
@@ -101,22 +136,29 @@ The initializer refuses to replace a configured file unless `--force` is explici
 - the full reviewed ci-fleet commit SHA it runs;
 - a zero managed minimum and reviewed maximum runner capacity;
 - CPU and memory available to each ephemeral runner;
-- Docker default-address pools, a positive reviewed maximum number of Compose
+- optional Docker default-address pools, a positive reviewed maximum number of Compose
   networks per runner, and a reserved subnet count for health inspection.
 
 `status_reporting` is deliberately omitted from initialized and reference
-configurations. For an existing controller, roll out schema support in three
-separately reviewed, integrated changes: first update only `engine_ref` and prove
-routine reconciliation has activated that engine; then record the controller ID,
-proven active ref, and reviewed `status_reporting_config` and
-`required_status_reporting` capability booleans in
-`engine-rollout-evidence.json`; only then add the optional `status_reporting`
-object without changing `engine_ref`. Enabling required delivery also requires the
-prior evidence to record both capabilities as `true`. Transition validation
-rejects introducing or enabling the property without the corresponding evidence.
-This staging prevents an older active manager from rejecting the new property before it
-can upgrade itself. Endpoint and key values remain host-local and never enter
-Git.
+configurations. For an image-enforced controller, integrate the target engine's
+reviewed capability record in `next-engine-rollout-evidence.json` before changing
+`engine_ref`. In a later commit, select that engine and promote the matching
+pending record unchanged into `engine-rollout-evidence.json`. Remove its pending
+record, and remove the sidecar when empty. After routine reconciliation verifies
+the selected runtime, add `status_reporting` in a later commit while retaining
+the engine and active evidence. Enabling required delivery requires both
+`status_reporting_config` and `required_status_reporting` to be `true` in the
+previous integrated active record.
+
+For image-free manager bootstrap, retain incumbent active evidence and the
+matching pending records through manager staging and image-policy introduction.
+Each controller needs an explicit incumbent runtime record before staging, even
+without optional blocks. All-false capability records are valid; absent records
+cannot identify the runtime after the manager pin changes.
+Only after runtime verification promote evidence unchanged in an evidence-only
+commit. This applies even when optional status/network fields are absent and all
+capability flags are false. See [portable managed images and pending evidence](#portable-managed-images-and-pending-evidence).
+Endpoint and key values remain host-local and never enter Git.
 
 The same per-controller evidence record may declare
 `docker_network_policy_config` and `docker_default_bridge_cidr_config`. A
@@ -126,8 +168,9 @@ require current evidence for the selected engine, and the selected engine
 manifest must advertise the matching capabilities plus
 `docker_network_policy_adapter`. Remove unsupported fields while retaining the
 current engine, reconcile that release, and select an older engine only in a
-later commit. A complete record has this shape after an operator has verified
-the named engine is active:
+later commit. A record has the following shape after source review and observed
+runtime activation. Retain an incumbent's verified runtime record until the
+applicable upgrade sequence permits promotion:
 
 ```json
 {
@@ -169,19 +212,21 @@ Strict validation rejects them until the private configuration uses a reviewed
 operational Docker pool CIDR. This is the narrow capacity-policy exception
 described above, not permission to commit host or service addresses.
 
-The field is optional solely for staged upgrades from older schema-v3 engines.
-First pin and activate a compatible engine without adding the field. In a second
-reviewed desired-state commit, record the active ref and
-`docker_network_policy_config: true` in `engine-rollout-evidence.json`. Add the
-reviewed policy in a third commit, retaining the same ref and evidence. The older
-engine rejects the new key, so skipped commits must not satisfy the gate.
-Transition validation requires the activation evidence to exist in the previous
-integrated state when introducing the policy. It also requires matching current
-evidence whenever a controller retains the policy, including across engine
-changes or rollbacks. Adding `default_bridge_cidr` later repeats the prior-state
-gate with `docker_default_bridge_cidr_config: true`.
+The field is optional for first-install staging and for staged upgrades from
+older schema-v3 engines. New controllers follow the first-install stages above.
+For an image-enforced controller, first integrate matching target-engine pending
+evidence with `docker_network_policy_config: true`. In a later commit, select the
+compatible engine, promote that record unchanged into active evidence, and remove
+the promoted pending record. After runtime verification, add the reviewed policy
+in a later commit with the same ref and active evidence. The older engine rejects
+the new key, so skipped commits must not satisfy the gate. Image-free bootstrap
+uses the separate retention and evidence-only promotion sequence above.
+Transition validation requires active evidence from the previous integrated state
+when introducing policy. Retained policy also needs matching current evidence.
+Adding `default_bridge_cidr` repeats the prior-state capability gate with
+`docker_default_bridge_cidr_config: true`.
 
-After the three-commit engine activation gate above, the pinned public engine
+After the staged engine activation gate above, the pinned public engine
 can apply or remove a validated policy with at most 64 pools. The executable
 stage holds the installer lock, drains the controller and managed runners, and
 changes Docker's `default-address-pools` key plus `bip` only when
@@ -337,3 +382,41 @@ runs use the source SHA as main and retain the event's base, including an
 initial push's zero sentinel. Host policy-v1 keeps requiring hosted evidence
 until separately migrated to the compatible signed-local policy. No workflow variable changes
 host policy, and the public template receives no private runner access.
+
+
+## Portable managed images and pending evidence
+
+The scalar `managed_images` shape is unchanged. A selected runtime source with
+`portable_managed_image_ids` requires original config digests from two clean builds
+of the same reviewed merged source and architecture. Older engines keep exact
+opaque Docker IDs. Never infer the kind from `sha256:` or rewrite historical
+entries. Initializer digest flags accept the scalar appropriate to the selected
+source. The public fixture catalog remains illustrative historical data.
+
+For an established image-free fleet, prepare evidence before changing any manager
+pin. If incumbent active records are missing, integrate them in an evidence-only
+commit with the entire fleet unchanged. Each record describes the observed active
+runtime and reviewed exact source, including all-false capability flags where
+appropriate. Source review alone cannot establish activation. Keep existing active
+and pending records unchanged. Then add target pending records in a separate
+evidence-only commit, still without fleet changes. Strict validation admits these
+preparatory additions and rejects a true no-op or preparation combined with staging.
+This is separate from the new-controller first-install sequence above.
+
+Before engine selection, integrate a nonempty
+`next-engine-rollout-evidence.json` with the same schema and controller map as
+active evidence. Its engine refs must differ from incumbent runtime evidence.
+Records may include boolean `portable_managed_image_ids` capability evidence.
+Ordinary upgrades promote matching prior records unchanged and remove the empty
+sidecar. Image-free manager bootstrap retains incumbent active evidence and
+pending records through manager staging and image-policy introduction, then
+promotes evidence alone after verified runtime activation. A no-change staging
+commit remains invalid. Pass current and previous active/pending files together
+with `--previous-config`; the engine callers use the immediate first parent.
+
+The root installer derives runtime IDs and protected proof. Do not add them to
+fleet policy or host inputs. See the engine's
+[managed-image guide](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/MANAGED-IMAGES.md)
+for build evidence, limits, cache refresh, cleanup and recovery. A published engine
+or template does not establish native import or host acceptance. Standalone
+template publication, adopter promotion and live rollout remain separate gates.

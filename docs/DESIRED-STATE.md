@@ -74,23 +74,41 @@ under the narrow exception above. Public examples use RFC 5737 documentation
 ranges, which strict validation rejects until the operator supplies reviewed
 operational CIDRs.
 
-`docker_network_policy` is optional only to preserve a staged upgrade path from
-older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
-an existing controller in three reviewed desired-state commits. First change
-only `engine_ref`. After routine reconciliation shows that exact engine is active,
-record `docker_network_policy_config: true` for that controller and ref in
-`engine-rollout-evidence.json`. Only then add the reviewed network policy without
-changing the engine or evidence. Transition validation reads the evidence from
-the previous integrated state, so a commit that adds evidence and policy together
-cannot satisfy the gate. Do not add the field while the old engine still performs
-reconciliation. Once present, the policy requires current evidence naming the
-selected engine and declaring `docker_network_policy_config: true`. Adding
-`default_bridge_cidr` to an existing policy has the same prior-state gate with
-`docker_default_bridge_cidr_config: true`. A retained bridge field requires
-matching current evidence. The selected engine manifest must advertise
-`docker_network_policy_config`, `docker_network_policy_adapter`, and, when the
-bridge field is present, `docker_default_bridge_cidr_config`. Remove unsupported
-fields before selecting an older engine.
+`docker_network_policy` is optional for first-install staging and for upgrades
+from older schema-v3 engines whose exact-key validator does not recognize it.
+New controllers first install without policy, then establish active runtime
+evidence as described below. Upgrade an existing image-enforced controller
+through separately integrated changes.
+First stage the compatible target engine's record with
+`docker_network_policy_config: true` in `next-engine-rollout-evidence.json`, while
+keeping the incumbent engine and active evidence. Later select that engine and
+promote the matching pending record unchanged into `engine-rollout-evidence.json`.
+Remove the promoted pending record and remove the sidecar when empty. After
+routine reconciliation verifies the selected runtime, add the network policy in
+a later commit without changing the engine or active evidence. A record staged
+in the selection commit cannot satisfy this predecessor gate.
+
+Image-free manager bootstrap instead retains incumbent active evidence and the
+matching pending records through manager staging and image-policy introduction.
+After runtime verification, promote evidence alone without changing fleet state.
+Every staged controller needs matching predecessor pending evidence, even with
+no optional status/network block and all-false capability flags.
+For an established image-free fleet, integrate missing explicit incumbent runtime
+evidence first in an evidence-only commit, with the entire fleet unchanged and all
+existing records retained. Base it on observed activation and exact source review,
+including an explicit all-false record when appropriate. Next add reviewed target
+pending records in a separate evidence-only commit, retaining the fleet and prior
+records. Strict validation distinguishes these additions from manager staging.
+Stage manager pins only after that pending evidence is integrated, then retain both
+maps through image introduction. An absent record is insufficient; the staged manager
+pin cannot identify the incumbent runtime.
+
+Transition validation requires prior integrated active capability evidence when
+introducing network policy or `default_bridge_cidr`. Retained fields need matching
+current evidence. The selected engine must advertise `docker_network_policy_config`,
+`docker_network_policy_adapter`, and, when the bridge field is present,
+`docker_default_bridge_cidr_config`. Remove unsupported fields before selecting
+an older engine through its own reviewed pending-evidence sequence.
 
 This accepted phase permits the executable policy stage to own Docker's
 `default-address-pools` key and, only when configured, its `bip` key. The stage
@@ -141,7 +159,18 @@ GitHub App and runner-group creation remain the bootstrap responsibility tracked
 
 The managed installer supports Debian 12 or newer. Before reading configuration or changing the host, it verifies Docker Engine and Compose v2, Git, curl, jq, the system CA bundle, direct Docker-socket access, and that the Docker filesystem is below the documented 80% warning threshold. It rejects alternate Docker endpoints and contexts, then pins every lifecycle command to the verified local Unix socket. Rollback and uninstall require only their recovery tools, not Git, tar, cmp, host-release metadata, CA bootstrap, or capacity checks.
 
-Run the command from a reviewed checkout of ci-fleet on the target Linux Docker machine:
+Use a reviewed checkout of ci-fleet on the target Linux Docker machine.
+
+For a new controller, initialize with a reviewed merged engine and its reviewed
+images, then remove generated `docker_network_policy`, including any bridge
+field, before the initial configuration commit. Omit optional status reporting
+and storage retention. Keep `managed_images` present. A new installation starts
+with an empty active evidence map; an existing fleet retains other controllers'
+records and omits only this new controller's record. Validate, review and merge
+against the actual prior integrated state.
+Source capability declarations cannot establish activation before an instance
+exists. This first-install sequence does not permit an existing installation to
+discard its history or incumbent evidence.
 
 ```bash
 sudo ./scripts/install-worker-controller.sh \
@@ -153,6 +182,25 @@ sudo ./scripts/install-worker-controller.sh \
 
 `--ref` must be a full configuration commit SHA. The installer never follows a moving branch. For a private remote repository, configure a narrowly scoped read-only Git credential on the host before running the command. Do not embed credentials in the URL or command line. A local pinned Git checkout is also accepted.
 
+Verify the exact same initial configuration and active runtime:
+
+```bash
+sudo ./scripts/install-worker-controller.sh --check \
+  --config-repo example-org/example-fleet-config \
+  --ref 1111111111111111111111111111111111111111 \
+  --controller example-ci-01
+```
+
+Require `CHECK_OK`. `CHECK_STAGED` only verifies an incumbent during manager
+staging. After actual runtime verification, review capability declarations and
+implementation at the exact selected engine SHA and integrate this controller's
+active record in a separate evidence-only commit, leaving `fleet.json` unchanged.
+In a later commit, add reviewed operational network policy and optional bridge
+values using the previously integrated active record and the same engine. Review,
+validate and merge each commit against its real predecessor before approved
+reconciliation. Source review alone is insufficient, and historical example
+pins without the required capabilities cannot support a capability claim.
+
 The installer:
 
 1. fetches only the requested configuration commit;
@@ -160,8 +208,8 @@ The installer:
 3. selects exactly one logical controller;
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
-6. validates the candidate Compose configuration;
-7. creates a root-only controller checkpoint, prepares and verifies images under temporary tags, and passes post-build host checks;
+6. validates candidate Compose before checkpoint capture for opaque runtime sources;
+7. creates a root-only controller checkpoint and prepares and verifies images under temporary tags. Portable sources then validate Compose using both verified image bindings. Post-build host checks must pass;
 8. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
 9. runs managed workload-quiescence preflight, then publishes verified canonical tags within checkpoint recovery coverage;
 10. installs health, cleanup, and pinned-state drift unit definitions;
@@ -182,7 +230,7 @@ sudo ./scripts/install-worker-controller.sh \
   --controller example-ci-01
 ```
 
-If `/etc/ci-fleet/host.env` does not exist, adoption extracts only the approved host identity fields from the existing root-owned `/etc/ci-fleet/ci-fleet.env`. It never copies project settings or secret values into Git. The running controller is paused, existing managed runners are allowed to finish, and activation proceeds only after the host is idle.
+If `/etc/ci-fleet/host.env` does not exist, adoption extracts only the approved host identity fields from the existing root-owned `/etc/ci-fleet/ci-fleet.env`. It never copies project settings or secret values into Git. The running controller is paused, existing managed runners are allowed to finish, and activation proceeds only after the host is idle. Adoption also requires trusted complete source matching the incumbent's engine revision. It preserves historical in-place source before candidate installation and uses incumbent-compatible Compose for drain and recovery. A different portable candidate cannot supply missing opaque recovery context. Missing, mismatched or unsafe source refuses before drain; prepare trusted pinned source or follow reviewed reinstall recovery.
 
 ## Check, upgrade, roll back, and remove
 
@@ -309,7 +357,7 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Compose validation happens before the checkpoint. Required builds use temporary tags after checkpoint creation and before drain. Both exact image IDs and revision labels must match, and post-build host checks must pass, before drain; canonical tags are published only after a successful drain within checkpoint recovery coverage. Failed preparation or drain preserves incumbent tags and the active controller; scoped candidate image or layer artifacts may remain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Portable preparation hydrates verified runtime IDs before candidate Compose validation. Required builds use temporary tags after checkpoint creation and before drain. Both roles must pass the runtime source's managed-image identity contract, source and platform checks, and post-build host checks must pass, before drain; canonical tags are published only after a successful drain within checkpoint recovery coverage. Failed preparation or drain preserves incumbent tags and the active controller; scoped candidate image or layer artifacts may remain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
 
 Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy. Rollback is a bounded convenience, not a guarantee that every catastrophic or major-version interruption leaves the controller operational. The installer repairs only canonical, digest-valid artifacts from their pinned revisions; otherwise it fails closed and reports that an operator must recover or reinstall from reviewed desired state rather than executing untrusted rollback material.
 
@@ -326,3 +374,20 @@ completion after process death or reboot is not guaranteed.
 Monitoring thresholds, heartbeat endpoints, and backup hooks are host-local operational facts, not fleet desired state. Keep them in the protected file documented by [Fleet health monitoring](HEALTH-MONITORING.md); the installer preserves that file across upgrades and rollback.
 
 This contract implements the engine portions of [issue #32](https://github.com/RandomDevelopment/ci-fleet/issues/32) and integrates the installer, documentation, phone-first bootstrap, and capacity work tracked by [#21](https://github.com/RandomDevelopment/ci-fleet/issues/21), [#24](https://github.com/RandomDevelopment/ci-fleet/issues/24), [#27](https://github.com/RandomDevelopment/ci-fleet/issues/27), and [#30](https://github.com/RandomDevelopment/ci-fleet/issues/30).
+
+
+## Managed image scalar semantics and predecessor evidence
+
+The runtime source's `portable_managed_image_ids` capability makes existing
+`managed_images[engine][architecture][role]` scalars original config digests.
+Older source entries remain opaque Docker IDs, even under a newer manager.
+The shape stays unchanged. Root preparation derives the two rendered runtime
+IDs and protected proof described in [managed images](MANAGED-IMAGES.md).
+
+Stage a nonempty `next-engine-rollout-evidence.json` in an earlier integrated
+commit. Ordinary selection promotes its matching record unchanged. Image-free
+manager bootstrap retains active and pending evidence through image introduction,
+then promotes evidence alone after runtime verification. Both installer and
+reconciler read the committed current and immediate first-parent fleet/evidence.
+Missing history fails. Keep protected installed-ref and bootstrap LKG exceptions
+limited to their retained identity checks.

@@ -88,7 +88,17 @@ days old. This is creation age, not a claim about their last use. Referenced ima
 including references from stopped or created containers, remain protected.
 Installed controller/runner tags and every retained checkpoint's image tags and
 immutable IDs remain protected, including a checkpoint's live controller image.
-Untrusted or unreadable protection files stop cleanup. Multiple tags on one
+Portable releases also protect authenticated config, manifest and runtime IDs
+from current and checkpoint binding metadata. Cleanup uses warm proof and exact
+runtime inspection, never a layer export in the removal loop. Missing, stale,
+untrusted or unreadable proof stops image/cache removal. An older opaque rollback ID absent from complete storage accounting
+also defers removal instead of guessing a config/root alias. Refresh proof only through
+controlled installer preparation. Cleanup uses authenticated captured
+`release-target` context for historical opaque checkpoints, including retained
+manager source when the old canonical release never existed. Installed historical
+source lookup also requires the exact captured engine revision. Missing, unsafe or
+mismatched source stops removal; do not delete checkpoints or rebuild mutable old
+images to bypass it. See [recovery source requirements](MANAGED-IMAGES.md#recovery-and-retained-images). Untrusted or unreadable protection files stop cleanup. Multiple tags on one
 eligible image are removed together without force or parent-image pruning.
 
 Default-builder cache removal uses Engine's unused-cache selection with

@@ -103,7 +103,20 @@ jobs through the Docker socket.
      --controller-image-digest sha256:REVIEWED_CONTROLLER_IMAGE_ID_FOR_HOST_ARCHITECTURE \
      --runner-image-digest sha256:REVIEWED_RUNNER_IMAGE_ID_FOR_HOST_ARCHITECTURE
    # Choose amd64 or arm64 for YOUR-HOST-ARCHITECTURE and supply the
-   # corresponding reviewed image IDs for that host architecture.
+   # corresponding reviewed scalars for that host architecture. Portable runtime
+   # sources require original config digests, as described in MANAGED-IMAGES.md.
+   ```
+
+   For this new controller, remove generated `docker_network_policy` from
+   `fleet.json`, including any bridge field. Keep `managed_images` present and
+   `engine-rollout-evidence.json`'s active map empty. Omit optional status
+   reporting and storage retention. A reviewed source manifest alone cannot
+   establish active runtime evidence before the controller exists. Follow the
+   [first-install stages](../templates/config-repository/README.md#first-install-capability-evidence);
+   validate against the actual prior integrated state. Existing installations
+   preserve their history and use the staged upgrade contract instead.
+
+   ```bash
    # Validate before committing so a rejected file or accidental value
    # never enters branch history, then commit the initialized result:
    ./scripts/validate.sh --strict
@@ -144,6 +157,14 @@ jobs through the Docker socket.
 
 7. Verify: the same command with `--check` reports `CHECK_OK`, and the
    GitHub runner group shows the scale set idle at zero runners.
+   Use the exact same configuration commit and controller ID. `CHECK_STAGED`
+   cannot prove a new controller activated its runtime. After this verification,
+   review capabilities at the exact selected engine source and integrate the
+   controller's active record in a separate evidence-only configuration commit,
+   with `fleet.json` unchanged. Add reviewed operational network policy and
+   optional bridge values only in a later commit using that previously integrated
+   evidence and the same engine. Source support and runtime activation are both
+   required. Merge and apply each through the approved configuration procedure.
 
 ## Step 2: Connect one repository
 

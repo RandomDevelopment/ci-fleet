@@ -68,6 +68,276 @@ def docker_network_policy() -> dict:
 
 
 class PolicyTests(unittest.TestCase):
+    def pending_rollout(self):
+        previous = reference_config()
+        previous["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+        project = first_project(previous)
+        previous["runner_pools"][project["ci_pool"]]["allowed_repositories"] = ["sample-org/sample-app"]
+        project.update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+        name = next(iter(previous["controllers"]))
+        first_controller(previous)["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+        incumbent = first_controller(previous)["engine_ref"]
+        record = dict(engine_ref=incumbent, status_reporting_config=True, required_status_reporting=True,
+                      docker_network_policy_config=True, docker_default_bridge_cidr_config=True)
+        active = {name: record}
+        pending = {name: {**record, "engine_ref": "a" * 40, "portable_managed_image_ids": True}}
+        return previous, name, active, pending
+
+    def rollout_cli(self, previous, current, active, current_active, pending=None, current_pending=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = [sys.executable, str(ROOT / "scripts/validate.py"), "--strict", "--skip-path-scan"]
+            for option, value in (("previous-config", previous), ("config", current),
+                                  ("previous-rollout-evidence", {"schema_version": 1, "status_reporting_engine_capabilities": active}),
+                                  ("rollout-evidence", {"schema_version": 1, "status_reporting_engine_capabilities": current_active})):
+                path = root / option
+                path.write_text(json.dumps(value))
+                command.extend(("--" + option, str(path)))
+            for option, value in (("previous-next-engine-rollout-evidence", pending), ("next-engine-rollout-evidence", current_pending)):
+                if value is not None:
+                    path = root / option
+                    path.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": value}))
+                    command.extend(("--" + option, str(path)))
+            return subprocess.run(command, capture_output=True, text=True)
+
+    def test_pending_record_must_be_integrated_before_ordinary_selection(self):
+        previous, name, active, pending = self.pending_rollout()
+        current = copy.deepcopy(previous)
+        current["controllers"][name]["engine_ref"] = "a" * 40
+        current["managed_images"]["a" * 40] = copy.deepcopy(next(iter(current["managed_images"].values())))
+        result = self.rollout_cli(previous, current, active, pending, pending)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for prior in (None, {name: {**pending[name], "engine_ref": "b" * 40}},
+                      {name: {**pending[name], "required_status_reporting": False}}):
+            result = self.rollout_cli(previous, current, active, pending, prior, pending)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_manager_bootstrap_retains_active_and_pending_through_image_introduction(self):
+        previous, name, active, pending = self.pending_rollout()
+        images = previous.pop("managed_images")
+        staged = copy.deepcopy(previous)
+        staged["controllers"][name]["engine_ref"] = "a" * 40
+        result = self.rollout_cli(previous, staged, active, active, pending, pending)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for prior, next_record, evidence in ((None, pending, active), (pending, None, active),
+                                             (pending, {name: {**pending[name], "required_status_reporting": False}}, active),
+                                             (pending, None, pending)):
+            result = self.rollout_cli(previous, staged, active, evidence, prior, next_record)
+            self.assertNotEqual(result.returncode, 0)
+        introduced = copy.deepcopy(staged)
+        introduced["managed_images"] = {"a" * 40: next(iter(images.values()))}
+        result = self.rollout_cli(staged, introduced, active, active, pending, pending)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        promoted = self.rollout_cli(introduced, introduced, active, pending, pending)
+        self.assertEqual(promoted.returncode, 0, promoted.stderr)
+        changed = copy.deepcopy(introduced)
+        changed["controllers"][name]["state"] = "drained"
+        result = self.rollout_cli(introduced, changed, active, pending, pending)
+        self.assertNotEqual(result.returncode, 0)
+        result = self.rollout_cli(staged, introduced, active, pending, pending)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_pending_contract_preserves_no_change_image_free_rejection(self):
+        previous, _, active, pending = self.pending_rollout()
+        previous.pop("managed_images")
+        result = self.rollout_cli(previous, previous, active, active, pending, pending)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("at least one engine_ref change", result.stderr)
+
+    def test_cli_pending_contract_with_and_without_optional_features(self):
+        for optional in (False, True):
+            with self.subTest(optional=optional):
+                previous, name, active, pending = self.pending_rollout()
+                if optional:
+                    previous["controllers"][name]["status_reporting"] = {
+                        "enabled": True, "config_file": "/etc/ci-fleet/monitoring.env"}
+                else:
+                    previous["controllers"][name].pop("docker_network_policy")
+                    previous["controllers"][name].pop("status_reporting", None)
+                    for records in (active, pending):
+                        for key in records[name]:
+                            if key != "engine_ref":
+                                records[name][key] = False
+                ordinary = copy.deepcopy(previous)
+                ordinary["controllers"][name]["engine_ref"] = "a" * 40
+                ordinary["managed_images"]["a" * 40] = copy.deepcopy(next(iter(previous["managed_images"].values())))
+                result = self.rollout_cli(previous, ordinary, active, pending, pending)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                wrong = {name: {**pending[name], "engine_ref": "b" * 40}}
+                changed = {name: {**pending[name], "required_status_reporting": not pending[name]["required_status_reporting"]}}
+                for prior, selected, current_pending in ((None, pending, pending), (wrong, pending, None),
+                                                          (pending, changed, None)):
+                    self.assertNotEqual(self.rollout_cli(previous, ordinary, active, selected, prior, current_pending).returncode, 0)
+                images = previous.pop("managed_images")
+                staged = copy.deepcopy(previous)
+                staged["controllers"][name]["engine_ref"] = "a" * 40
+                introduced = copy.deepcopy(staged)
+                introduced["managed_images"] = {"a" * 40: next(iter(images.values()))}
+                for before, after in ((previous, staged), (staged, introduced)):
+                    result = self.rollout_cli(before, after, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for prior, current in ((None, None), (None, pending), (wrong, wrong), (pending, changed)):
+                        self.assertNotEqual(self.rollout_cli(before, after, active, active, prior, current).returncode, 0)
+                    self.assertNotEqual(self.rollout_cli(before, after, active, pending, pending).returncode, 0)
+                result = self.rollout_cli(introduced, introduced, active, pending, pending)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cli_image_free_evidence_preparation_uses_each_immediate_predecessor(self):
+        for missing_incumbent in (False, True):
+            for portable in (False, True):
+                with self.subTest(missing_incumbent=missing_incumbent, portable=portable):
+                    fleet, name, active, pending = self.pending_rollout()
+                    images = fleet.pop("managed_images")
+                    fleet["controllers"][name].pop("docker_network_policy")
+                    for records in (active, pending):
+                        for key in records[name]:
+                            if key != "engine_ref":
+                                records[name][key] = False
+                    pending[name]["portable_managed_image_ids"] = portable
+                    before_active = {} if missing_incumbent else active
+                    if missing_incumbent:
+                        result = self.rollout_cli(fleet, fleet, {}, active)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    result = self.rollout_cli(fleet, fleet, active, active, None, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    staged = copy.deepcopy(fleet)
+                    staged["controllers"][name]["engine_ref"] = pending[name]["engine_ref"]
+                    result = self.rollout_cli(fleet, staged, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    introduced = copy.deepcopy(staged)
+                    introduced["managed_images"] = {pending[name]["engine_ref"]: next(iter(images.values()))}
+                    result = self.rollout_cli(staged, introduced, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Configuration-only proof of the final transition. Real activation is external.
+                    result = self.rollout_cli(introduced, introduced, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    changed = copy.deepcopy(fleet)
+                    changed["controllers"][name]["state"] = "drained"
+                    wrong = {name: {**pending[name], "engine_ref": "b" * 40}}
+                    cases = (
+                        (fleet, fleet, active, active, None, None),  # true no-op
+                        (fleet, changed, active, active, None, pending),
+                        (fleet, staged, before_active, active, None, pending),
+                        (fleet, staged, active, pending, pending, None),
+                        (fleet, fleet, before_active, pending, None, pending),
+                        (fleet, staged, active, active, wrong, pending),
+                        (staged, staged, active, pending, pending, None),
+                        (staged, introduced, active, pending, pending, None),
+                        (introduced, staged, pending, pending, None, None),
+                    )
+                    for case in cases:
+                        result = self.rollout_cli(*case)
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                    empty = copy.deepcopy(fleet)
+                    empty["controllers"] = {}
+                    self.assertNotEqual(self.rollout_cli(empty, fleet, {}, active, None, pending).returncode, 0)
+
+    def test_empty_pending_sidecar_is_rejected(self):
+        validation = Validation()
+        validate_rollout_evidence({"schema_version": 1, "status_reporting_engine_capabilities": {}},
+                                  validation, "next-engine-rollout-evidence.json")
+        self.assertTrue(any("remove the sidecar" in error for error in validation.errors))
+
+    def test_cli_image_free_bootstrap_requires_explicit_incumbent_records(self):
+        for portable in (False, True):
+            previous, name, _, pending = self.pending_rollout()
+            previous["controllers"][name].pop("docker_network_policy")
+            previous["controllers"][name].pop("status_reporting", None)
+            for key in pending[name]:
+                if key != "engine_ref":
+                    pending[name][key] = False
+            pending[name]["portable_managed_image_ids"] = portable
+            images = previous.pop("managed_images")
+            staged = copy.deepcopy(previous)
+            staged["controllers"][name]["engine_ref"] = "a" * 40
+            introduced = copy.deepcopy(staged)
+            introduced["managed_images"] = {"a" * 40: next(iter(images.values()))}
+            wrong = {name: {**pending[name], "engine_ref": "b" * 40}}
+            changed = {name: {**pending[name], "status_reporting_config": True}}
+            for before, after in ((previous, staged), (staged, introduced)):
+                for prior, current in ((pending, pending), (None, None), (wrong, wrong), (pending, changed)):
+                    with self.subTest(portable=portable, introducing=after is introduced, pending=prior):
+                        result = self.rollout_cli(before, after, {}, {}, prior, current)
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("requires explicit incumbent runtime capability evidence", result.stderr)
+
+    def test_cli_all_false_incumbent_bootstrap_retains_pending_until_promotion(self):
+        for portable in (False, True):
+            previous, name, active, pending = self.pending_rollout()
+            previous["controllers"][name].pop("docker_network_policy")
+            previous["controllers"][name].pop("status_reporting", None)
+            for records in (active, pending):
+                for key in records[name]:
+                    if key != "engine_ref":
+                        records[name][key] = False
+            pending[name]["portable_managed_image_ids"] = portable
+            images = previous.pop("managed_images")
+            staged = copy.deepcopy(previous)
+            staged["controllers"][name]["engine_ref"] = "a" * 40
+            introduced = copy.deepcopy(staged)
+            introduced["managed_images"] = {"a" * 40: next(iter(images.values()))}
+            wrong = {name: {**pending[name], "engine_ref": "b" * 40}}
+            changed = {name: {**pending[name], "status_reporting_config": True}}
+            for before, after in ((previous, staged), (staged, introduced)):
+                with self.subTest(portable=portable, introducing=after is introduced):
+                    result = self.rollout_cli(before, after, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for prior, current in ((None, None), (None, pending), (wrong, wrong),
+                                           (pending, changed), (pending, None)):
+                        self.assertNotEqual(self.rollout_cli(before, after, active, active, prior, current).returncode, 0)
+                    self.assertNotEqual(self.rollout_cli(before, after, active, pending, pending).returncode, 0)
+            result = self.rollout_cli(introduced, introduced, active, pending, pending)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for selected, prior, current in ((pending, None, None), (pending, wrong, None),
+                                              (changed, pending, None), (pending, pending, pending)):
+                self.assertNotEqual(self.rollout_cli(introduced, introduced, active, selected, prior, current).returncode, 0)
+
+    def test_cli_first_install_integrates_runtime_evidence_before_network_policy(self):
+        previous = reference_config()
+        engine_ref = first_controller(previous)["engine_ref"]
+        name = "new-ci-01"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/init.py"),
+                "--organization", "sample-org", "--project", "sample-app", "--controller", name,
+                "--engine-ref", engine_ref, "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
+                "--default-bridge-cidr", "192.0.2.1/24", "--output", str(output),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            initial = json.loads(output.read_text())
+        self.assertIn("remove generated docker_network_policy", result.stdout)
+        self.assertIn("CHECK_OK", result.stdout)
+        self.assertIn("evidence-only commit", result.stdout)
+        initial["controllers"][name].pop("docker_network_policy")
+        self.assertIn("managed_images", initial)
+        self.assertNotIn("status_reporting", initial["controllers"][name])
+        self.assertNotIn("docker_storage_retention", initial["controllers"][name])
+        result = self.rollout_cli(previous, initial, {}, {})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # This synthetic record models evidence after separately verified runtime activation.
+        active = {name: dict(engine_ref=engine_ref, status_reporting_config=False, required_status_reporting=False,
+                             docker_network_policy_config=True, docker_default_bridge_cidr_config=True)}
+        result = self.rollout_cli(previous, initial, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must already be selected", result.stderr)
+        result = self.rollout_cli(initial, initial, {}, active)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        policy = copy.deepcopy(initial)
+        policy["controllers"][name]["docker_network_policy"] = docker_network_policy()
+        policy["controllers"][name]["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+        policy["controllers"][name]["docker_network_policy"]["default_bridge_cidr"] = "10.65.0.1/24"
+        result = self.rollout_cli(initial, policy, active, active)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.rollout_cli(initial, policy, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous integrated state", result.stderr)
+        result = self.rollout_cli(previous, policy, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be omitted from a new controller", result.stderr)
+
     def assert_rejected(self, config: dict, expected: str, *, strict: bool = False) -> None:
         errors = errors_for(config, strict=strict)
         self.assertTrue(any(expected in error for error in errors), errors)
@@ -105,8 +375,9 @@ class PolicyTests(unittest.TestCase):
                            "docker_default_bridge_cidr_config": True}}
         current = copy.deepcopy(previous)
         first_controller(current)["engine_ref"] = "3" * 40
+        pending = {name: {**evidence[name], "engine_ref": "3" * 40}}
         validation = Validation()
-        validate_transition(previous, current, evidence, validation, evidence)
+        validate_transition(previous, current, evidence, validation, evidence, pending)
         self.assertEqual(validation.errors, [])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -116,16 +387,20 @@ class PolicyTests(unittest.TestCase):
             old.write_text(json.dumps(previous))
             new.write_text(json.dumps(current))
             proof.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": evidence}))
+            next_proof = root / "next.json"
+            next_proof.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": pending}))
             result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
                                      "--previous-config", str(old), "--rollout-evidence", str(proof),
-                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+                                     "--previous-rollout-evidence", str(proof), "--next-engine-rollout-evidence", str(next_proof),
+                                     "--previous-next-engine-rollout-evidence", str(next_proof), "--skip-path-scan"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             # Reverting the staged manager keeps the same runtime and evidence.
             old.write_text(json.dumps(current))
             new.write_text(json.dumps(previous))
             result = subprocess.run([sys.executable, str(ROOT / "scripts/validate.py"), "--config", str(new),
                                      "--previous-config", str(old), "--rollout-evidence", str(proof),
-                                     "--previous-rollout-evidence", str(proof), "--skip-path-scan"], capture_output=True, text=True)
+                                     "--previous-rollout-evidence", str(proof), "--next-engine-rollout-evidence", str(next_proof),
+                                     "--previous-next-engine-rollout-evidence", str(next_proof), "--skip-path-scan"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_managed_images_may_be_omitted_for_staged_engine_upgrade(self) -> None:
@@ -141,13 +416,17 @@ class PolicyTests(unittest.TestCase):
             controller.pop("docker_network_policy", None)
         current = copy.deepcopy(previous)
         first_controller(current)["engine_ref"] = "3" * 40
+        pending = {next(iter(current["controllers"])): {"engine_ref": "3" * 40,
+                   "status_reporting_config": False, "required_status_reporting": False}}
+        active = {name: {"engine_ref": record["engine_ref"], "status_reporting_config": False,
+                         "required_status_reporting": False} for name, record in previous["controllers"].items()}
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation, previous_next_engine_refs=pending)
         self.assertEqual(validation.errors, [])
 
         current["organization"]["slug"] = "other-org"
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation, previous_next_engine_refs=pending)
         self.assertTrue(any("may change only" in error for error in validation.errors), validation.errors)
 
         enforced = copy.deepcopy(reference_config())
@@ -161,17 +440,19 @@ class PolicyTests(unittest.TestCase):
             controller.pop("docker_network_policy", None)
         previous = copy.deepcopy(current)
         previous.pop("managed_images")
+        active = {name: {"engine_ref": record["engine_ref"], "status_reporting_config": False,
+                         "required_status_reporting": False} for name, record in previous["controllers"].items()}
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation)
         self.assertEqual(validation.errors, [])
         first_controller(current)["engine_ref"] = "3" * 40
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation)
         self.assertTrue(any("same compatible engine_ref" in error for error in validation.errors), validation.errors)
         current = reference_config()
         current["controllers"]["another-controller"] = copy.deepcopy(first_controller(current))
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation)
         self.assertTrue(any("cannot add or remove" in error for error in validation.errors), validation.errors)
 
     def test_staging_rollback_can_change_one_controller(self) -> None:
@@ -186,14 +467,18 @@ class PolicyTests(unittest.TestCase):
         current = copy.deepcopy(previous)
         first_controller(current)["engine_ref"] = "3" * 40
         self.assertEqual(errors_for(current), [])
+        active = {name: {"engine_ref": record["engine_ref"], "status_reporting_config": False,
+                         "required_status_reporting": False} for name, record in previous["controllers"].items()}
+        pending = {next(iter(current["controllers"])): {"engine_ref": "3" * 40,
+                   "status_reporting_config": False, "required_status_reporting": False}}
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        validate_transition(previous, current, active, validation, active, pending)
         self.assertEqual(validation.errors, [])
         validation = Validation()
-        validate_transition(current, previous, {}, validation)
+        validate_transition(current, previous, active, validation, active, pending)
         self.assertEqual(validation.errors, [])
         validation = Validation()
-        validate_transition(current, current, {}, validation)
+        validate_transition(current, current, active, validation, active, pending)
         self.assertTrue(any("at least one engine_ref" in error for error in validation.errors))
 
     def test_strict_validation_rejects_fixture_image_ids(self) -> None:
@@ -217,15 +502,24 @@ class PolicyTests(unittest.TestCase):
             candidate, baseline = (Path(directory) / name for name in ("current.json", "previous.json"))
             candidate.write_text(json.dumps(current))
             baseline.write_text(json.dumps(previous))
+            pending = {name: {"engine_ref": record["engine_ref"], "status_reporting_config": False,
+                              "required_status_reporting": False} for name, record in current["controllers"].items()}
+            sidecar = Path(directory) / "pending.json"
+            sidecar.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": pending}))
             command = [sys.executable, str(ROOT / "scripts/validate.py"), "--strict", "--skip-path-scan", "--config", str(candidate)]
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("initial strict configuration requires reviewed image IDs", result.stderr)
-            result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+            active = {name: {"engine_ref": record["engine_ref"], "status_reporting_config": False,
+                             "required_status_reporting": False} for name, record in previous["controllers"].items()}
+            evidence = Path(directory) / "active.json"
+            evidence.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": active}))
+            command += ["--rollout-evidence", str(evidence), "--previous-rollout-evidence", str(evidence)]
+            result = subprocess.run(command + ["--previous-config", str(baseline), "--next-engine-rollout-evidence", str(sidecar), "--previous-next-engine-rollout-evidence", str(sidecar)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             for invalid_previous in ({}, None, current):
                 baseline.write_text(json.dumps(invalid_previous))
-                result = subprocess.run(command + ["--previous-config", str(baseline)], capture_output=True, text=True)
+                result = subprocess.run(command + ["--previous-config", str(baseline), "--next-engine-rollout-evidence", str(sidecar), "--previous-next-engine-rollout-evidence", str(sidecar)], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, (invalid_previous, result.stdout, result.stderr))
             candidate.write_text("null")
             result = subprocess.run(command, capture_output=True, text=True)
@@ -678,7 +972,7 @@ class PolicyTests(unittest.TestCase):
             }
         }
         validation = Validation()
-        validate_transition(previous, current, compatible, validation)
+        validate_transition(previous, current, compatible, validation, previous_next_engine_refs=compatible)
         self.assertEqual(validation.errors, [])
 
         for evidence in (
@@ -687,17 +981,17 @@ class PolicyTests(unittest.TestCase):
             {controller: {**compatible[controller], "status_reporting_config": False}},
         ):
             validation = Validation()
-            validate_transition(previous, current, evidence, validation)
+            validate_transition(previous, current, evidence, validation, previous_next_engine_refs=evidence)
             self.assertTrue(any("configuration capability evidence" in error for error in validation.errors), validation.errors)
 
         first_controller(previous)["status_reporting"]["enabled"] = True
         first_controller(current)["status_reporting"]["enabled"] = True
         validation = Validation()
-        validate_transition(previous, current, compatible, validation)
+        validate_transition(previous, current, compatible, validation, previous_next_engine_refs=compatible)
         self.assertTrue(any("required status-reporting" in error for error in validation.errors), validation.errors)
         compatible[controller]["required_status_reporting"] = True
         validation = Validation()
-        validate_transition(previous, current, compatible, validation)
+        validate_transition(previous, current, compatible, validation, previous_next_engine_refs=compatible)
         self.assertEqual(validation.errors, [])
 
     def test_retained_network_policy_requires_target_engine_capability(self) -> None:
@@ -715,7 +1009,7 @@ class PolicyTests(unittest.TestCase):
         }
 
         validation = Validation()
-        validate_transition(previous, current, compatible, validation)
+        validate_transition(previous, current, compatible, validation, previous_next_engine_refs=compatible)
         self.assertEqual(validation.errors, [])
 
         for evidence in (
@@ -725,7 +1019,7 @@ class PolicyTests(unittest.TestCase):
         ):
             with self.subTest(evidence=evidence):
                 validation = Validation()
-                validate_transition(previous, current, evidence, validation)
+                validate_transition(previous, current, evidence, validation, previous_next_engine_refs=evidence)
                 self.assertTrue(any("Docker network policy configuration capability" in error for error in validation.errors), validation.errors)
 
     def test_network_policy_removal_needs_no_capability_evidence(self) -> None:
@@ -734,7 +1028,9 @@ class PolicyTests(unittest.TestCase):
         first_controller(current).pop("docker_network_policy")
         first_controller(current)["engine_ref"] = "2" * 40
         validation = Validation()
-        validate_transition(previous, current, {}, validation)
+        pending = {next(iter(current["controllers"])): {"engine_ref": "2" * 40,
+                   "status_reporting_config": False, "required_status_reporting": False}}
+        validate_transition(previous, current, pending, validation, previous_next_engine_refs=pending)
         self.assertEqual(validation.errors, [])
 
     def test_cli_retained_network_policy_uses_current_rollout_evidence(self) -> None:
@@ -791,7 +1087,9 @@ class PolicyTests(unittest.TestCase):
         changed = copy.deepcopy(removed)
         first_controller(changed)["engine_ref"] = "2" * 40
         validation = Validation()
-        validate_transition(removed, changed, {}, validation)
+        pending = {next(iter(changed["controllers"])): {"engine_ref": "2" * 40,
+                   "status_reporting_config": False, "required_status_reporting": False}}
+        validate_transition(removed, changed, pending, validation, previous_next_engine_refs=pending)
         self.assertEqual(validation.errors, [])
 
     def test_rollout_evidence_requires_explicit_capability_booleans(self) -> None:

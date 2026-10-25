@@ -359,6 +359,19 @@ class RunnerTests(unittest.TestCase):
                 (source / "tracked").write_text("committed\n")
                 git(source, "add", "."); git(source, "commit", "-qm", "fix: second source commit")
                 head = git(source, "rev-parse", "HEAD")
+                historical_inputs = []
+                if script == "test-install-worker-controller.sh":
+                    helper = re.search(r"^prepare_historical_engine_inputs\(\) \{.*?^\}", text, re.M | re.S)
+                    self.assertIsNotNone(helper)
+                    setup = helper.group() + "\n" + setup
+                    pins = re.findall(r"\b[0-9a-f]{40}\b", setup)
+                    self.assertEqual(len(pins), 3)
+                    # Local orphan commits exercise real preparation without historical code or network.
+                    for index, pin in enumerate(pins):
+                        revision = git(source, "commit-tree", "HEAD^{tree}", "-m", f"test: historical input {index}")
+                        git(source, "update-ref", f"refs/heads/historical-{index}", revision)
+                        historical_inputs.append(revision)
+                        setup = setup.replace(pin, revision)
                 (source / "tracked").write_text("staged\n")
                 git(source, "add", "tracked")
                 (source / "tracked").write_text("staged and unstaged\n")
@@ -367,10 +380,12 @@ class RunnerTests(unittest.TestCase):
                 os.utime(cached, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
                 expected = checkout_manifest(source)
                 subprocess.run(["bash", "-euo", "pipefail", "-c", "umask 077\n" + setup], check=True, capture_output=True,
-                               env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "repo_root": str(source), "tmp": str(fixture_root)})
+                               env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_ALLOW_PROTOCOL": "file", "repo_root": str(source), "tmp": str(fixture_root)})
                 fixture = fixture_root / "core"
                 self.assertEqual(git(fixture, "rev-parse", "HEAD"), head)
                 self.assertEqual(git(fixture, "rev-list", "--count", "HEAD"), "2")
+                for revision in historical_inputs:
+                    self.assertEqual(git(fixture, "rev-parse", revision + "^{commit}"), revision)
                 for name in ("tracked", "binary"):
                     self.assertEqual((fixture / name).read_bytes(), (source / name).read_bytes())
                 replacement = git(fixture, "-c", "user.name=Validation test", "-c", "user.email=test@example.invalid",

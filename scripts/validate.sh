@@ -14,6 +14,8 @@ python3 -m py_compile \
   .github/actions/plan/plan.py \
   .github/actions/plan/test_plan.py \
   scripts/desired_state.py \
+  scripts/managed_image_identity.py \
+  tests/test_managed_image_identity.py \
   scripts/apt_cache.py \
   scripts/test_apt_cache.py \
   scripts/test_apt_cache_e2e.py \
@@ -50,6 +52,8 @@ python3 -m py_compile \
 python3 .github/actions/plan/test_plan.py
 python3 scripts/test_update_actions_runner.py
 python3 scripts/test_desired_state.py
+python3 tests/test_managed_image_identity.py
+python3 scripts/test_portable_image_lifecycle.py
 python3 scripts/test_apt_cache.py
 python3 scripts/test_config_approval.py
 python3 scripts/test_local_validation.py
@@ -135,10 +139,14 @@ if env -u CI_FLEET_RUNNER_IMAGE_DIGEST -u CI_FLEET_CONTROLLER_IMAGE_DIGEST docke
 fi
 export CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:4444444444444444444444444444444444444444444444444444444444444444
 export CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:3333333333333333333333333333333333333333333333333333333333333333
+export CI_FLEET_RUNNER_RUNTIME_IMAGE_ID=$CI_FLEET_RUNNER_IMAGE_DIGEST
+export CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID=$CI_FLEET_CONTROLLER_IMAGE_DIGEST
 docker compose -f deploy/compose.yaml config --quiet
 docker compose -f deploy/compose.yaml config --format json | python3 -I -c 'import json, os, sys; config = json.load(sys.stdin); assert config["services"]["controller"]["environment"]["CI_FLEET_RUNNER_IMAGE"] == os.environ["CI_FLEET_RUNNER_IMAGE_DIGEST"]'
 
-docker compose -f deploy/compose.yaml build runner-image controller
+docker compose -f deploy/compose.yaml build runner-image
+docker buildx build --load --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION \
+  --tag "$CI_FLEET_CONTROLLER_IMAGE" --file controller/Dockerfile .
 docker run --name "${CI_FLEET_VALIDATION_ID:-ci-fleet-validation}-runner-inspect" --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
 python3 scripts/test_apt_cache_e2e.py
 bash scripts/test-cleanup-e2e.sh

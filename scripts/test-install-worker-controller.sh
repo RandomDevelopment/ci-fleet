@@ -9,13 +9,54 @@ grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lac
 grep -Fq 'export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1' "$repo_root/scripts/install-worker-controller.sh" || { printf 'FAIL: installer health check can submit monitoring reports\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Historical inputs are fetched before the fake Git transport. Never fall back
+# to a live remote from an installed synthetic engine during a fixture phase.
+prepare_historical_engine_inputs() {
+  local source=$1 target=$2 revision origin
+  shift 2
+  for revision in "$@"; do
+    origin=$source
+    if ! git -C "$source" cat-file -e "$revision^{commit}" 2>/dev/null; then
+      origin=https://github.com/RandomDevelopment/ci-fleet.git
+    fi
+    git -C "$target" fetch -q --no-tags --update-shallow "$origin" "$revision" || {
+      printf 'FAIL historical engine fixture input unavailable: %s\n' "$revision" >&2
+      return 1
+    }
+    [[ $(git -C "$target" rev-parse 'FETCH_HEAD^{commit}') == "$revision" ]] || {
+      printf 'FAIL historical engine fixture input identity mismatch: %s\n' "$revision" >&2
+      return 1
+    }
+  done
+}
 # Synthetic engine commits belong to the fixture, not the reviewed source checkout.
 fixture_repo=$tmp/core
 git init -q "$fixture_repo"
 git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" rev-parse HEAD)"
 git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
 git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
+prepare_historical_engine_inputs "$repo_root" "$fixture_repo" \
+  af9c0c13cd12866ce75dd6c43a4cda01915507e1 \
+  8bd27a2e7451806a1e37f79a15eeb7c677a12c3e \
+  003de44f7e27d7bfe5bb753098efb6eb5f9712f1
 repo_root=$fixture_repo
+# Existing transaction regressions model historical opaque-ID runtime sources.
+# Portable content proofs have separate parser and lifecycle regressions.
+python3 - "$repo_root" <<'PYTHON'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+manifest = root / "engine-capabilities.json"
+value = json.loads(manifest.read_text())
+value["capabilities"]["portable_managed_image_ids"] = False
+manifest.write_text(json.dumps(value, indent=2) + "\n")
+compose = root / "deploy/compose.yaml"
+text = compose.read_text().replace("${CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID:?verified controller runtime image ID is required}", "${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}")
+text = text.replace("${CI_FLEET_RUNNER_RUNTIME_IMAGE_ID:?verified runner runtime image ID is required}", "${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}")
+compose.write_text(text)
+PYTHON
+git -C "$fixture_repo" add -A
+git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@invalid.example commit -qm 'test: model opaque runtime sources'
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
 export REAL_STAT
@@ -24,6 +65,7 @@ export REAL_TAR
 REAL_TAR=$(command -v tar)
 export REAL_GIT
 REAL_GIT=$(command -v git)
+export FAKE_ENGINE_GIT_SOURCE=$fixture_repo
 export REAL_DF
 REAL_DF=$(command -v df)
 export REAL_MV
@@ -525,6 +567,10 @@ fi
 if [[ -n ${FAKE_FAIL_GIT_FETCH:-} && " $* " == *" fetch "* ]]; then
   exit 90
 fi
+if [[ " $* " == *" fetch "* ]]; then
+  # Installed copies have no Git metadata; keep synthetic engine fetches local.
+  exec "$REAL_GIT" -c "url.${FAKE_ENGINE_GIT_SOURCE:?}.insteadOf=https://github.com/RandomDevelopment/ci-fleet.git" "$@"
+fi
 exec "$REAL_GIT" "$@"
 EOF
 chmod 700 "$fake_bin/git"
@@ -666,7 +712,7 @@ expect_success() {
 expect_failure() {
   local expected=$1 output
   shift
-  if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+  if output=$("$@" 2>&1); then fail "expected failure [$expected] at line ${BASH_LINENO[0]}: $*; output: $output"; fi
   grep -Fq -- "$expected" <<<"$output" || fail "missing failure [$expected]: $output"
 }
 expect_command_failure() {
@@ -783,11 +829,11 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present} images=${7:-present}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" "$images" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present} images=${7:-present} pool_size=${8:-}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" "$images" "$pool_size" <<'PY'
 import json
 import sys
-source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy, images = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy, images, pool_size = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
@@ -797,6 +843,8 @@ if images == "omit":
     value.pop("managed_images", None)
 controller = value["controllers"]["example-ci-01"]
 controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+if pool_size:
+    controller["docker_network_policy"]["default_address_pools"][0]["size"] = int(pool_size)
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)
@@ -810,6 +858,40 @@ else:
         "config_file": "/etc/ci-fleet/monitoring.env",
     }
 value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
+from pathlib import Path
+import subprocess
+prior_path = Path(target)
+prior = json.loads(prior_path.read_text()) if prior_path.exists() else None
+proof = {"engine_ref": engine_ref, "status_reporting_config": True,
+         "required_status_reporting": True, "docker_network_policy_config": network_policy != "omit"}
+if (prior and "managed_images" in prior
+        and prior["controllers"]["example-ci-01"]["engine_ref"] == engine_ref
+        and "docker_network_policy" not in prior["controllers"]["example-ci-01"]
+        and network_policy != "omit"):
+    # These callers model the same already-verified runtime before adding policy.
+    evidence_path = Path(evidence_target)
+    evidence = json.loads(evidence_path.read_text())
+    incumbent = evidence["status_reporting_engine_capabilities"].get("example-ci-01", {})
+    if incumbent.get("engine_ref") == engine_ref and incumbent != proof:
+        evidence["status_reporting_engine_capabilities"]["example-ci-01"] = proof
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n")
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(evidence_path)], check=True)
+        subprocess.run(["git", "-C", str(prior_path.parent), "commit", "-qm", "fixture verified runtime capabilities", "--", str(evidence_path)], check=True)
+pending_path = prior_path.parent / "next-engine-rollout-evidence.json"
+if prior and "managed_images" in prior and prior["controllers"]["example-ci-01"]["engine_ref"] == engine_ref and pending_path.exists():
+    pending_record = json.loads(pending_path.read_text())["status_reporting_engine_capabilities"].get("example-ci-01")
+    if pending_record == proof:
+        pending_path.unlink()
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending_path)], check=True)
+if prior and prior["controllers"]["example-ci-01"]["engine_ref"] != engine_ref:
+    pending = prior_path.parent / "next-engine-rollout-evidence.json"
+    existing = json.loads(pending.read_text())["status_reporting_engine_capabilities"].get("example-ci-01") if pending.exists() else None
+    if existing != proof:
+        pending.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": {"example-ci-01": proof}}))
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending)], check=True)
+        subprocess.run(["git", "-C", str(prior_path.parent), "commit", "-qm", "fixture pending engine"], check=True)
+    pending.unlink()
+    subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending)], check=True)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)
     handle.write("\n")
@@ -817,12 +899,7 @@ with open(evidence_target, "w", encoding="utf-8") as handle:
     json.dump({
         "schema_version": 1,
         "status_reporting_engine_capabilities": {
-            "example-ci-01": {
-                "engine_ref": engine_ref,
-                "status_reporting_config": True,
-                "required_status_reporting": True,
-                "docker_network_policy_config": network_policy != "omit",
-            },
+            "example-ci-01": proof,
         },
     }, handle, indent=2)
     handle.write("\n")
@@ -1440,6 +1517,14 @@ import json
 import sys
 path, engine = sys.argv[1:]
 value = json.load(open(path))
+from pathlib import Path
+import subprocess
+pending = Path(path).parent / "next-engine-rollout-evidence.json"
+pending.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": {
+    "example-ci-01": {"engine_ref": engine, "status_reporting_config": True,
+                      "required_status_reporting": True, "docker_network_policy_config": False}}}))
+subprocess.run(["git", "-C", str(pending.parent), "add", str(pending)], check=True)
+subprocess.run(["git", "-C", str(pending.parent), "commit", "-qm", "fixture pending manager"], check=True)
 value["controllers"]["example-ci-01"]["engine_ref"] = engine
 with open(path, "w") as output:
     json.dump(value, output)
@@ -1599,9 +1684,38 @@ cp "$tmp/pre-adapter-current-tags/runner-state" "$tmp/pre-adapter-runner-image-p
 cp "$tmp/pre-adapter-current-tags/runner-id" "$tmp/pre-adapter-runner-image-id"
 cp "$tmp/pre-adapter-current-tags/controller-state" "$tmp/pre-adapter-controller-image-present"
 cp "$tmp/pre-adapter-current-tags/controller-id" "$tmp/pre-adapter-controller-image-id-state"
+# Verify the target runtime without policy before recording its policy capability.
+pre_adapter_reactivation_ref=$(write_config active 1 1 "$engine_ref" false omit)
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_reactivation_ref" >/dev/null
 ref_one=$(write_config active 1 1)
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
+
+activate_cross_ref_incumbent() {
+  local original_tags=$tmp/cross-ref-original-tags old_tags=$tmp/cross-ref-old-tags old_ref
+  mkdir -p "$original_tags" "$old_tags"
+  cp "$FAKE_RUNNER_IMAGE_STATE" "$original_tags/runner-state"
+  cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$original_tags/runner-id"
+  cp "$FAKE_CONTROLLER_IMAGE_STATE" "$original_tags/controller-state"
+  cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$original_tags/controller-id"
+  old_ref=$(write_config active 1 1 "$cross_ref_old")
+  local -a old_context=(env
+    "FAKE_ENGINE_REF=$cross_ref_old"
+    "FAKE_RUNNER_IMAGE=ci-fleet-runner:${cross_ref_old:0:12}"
+    "FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${cross_ref_old:0:12}"
+    "FAKE_RUNNER_IMAGE_STATE=$old_tags/runner-state"
+    "FAKE_RUNNER_IMAGE_ID_STATE=$old_tags/runner-id"
+    "FAKE_CONTROLLER_IMAGE_STATE=$old_tags/controller-state"
+    "FAKE_CONTROLLER_IMAGE_ID_STATE=$old_tags/controller-id"
+    "FAKE_PRIOR_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE"
+    "FAKE_PRIOR_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE"
+    "FAKE_PRIOR_IMAGE_STATES=$original_tags")
+  expect_success "${old_context[@]}" "$installer" --upgrade "${base_args[@]}" --ref "$old_ref" >/dev/null
+  expect_success "${old_context[@]}" "$installer" --check "${base_args[@]}" --ref "$old_ref" >/dev/null
+  export FAKE_PRIOR_RUNNER_IMAGE=ci-fleet-runner:${cross_ref_old:0:12}
+  export FAKE_PRIOR_CONTROLLER_IMAGE=ci-fleet-controller:${cross_ref_old:0:12}
+  export FAKE_PRIOR_IMAGE_STATES=$old_tags
+}
 
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
 authority_active_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
@@ -1634,6 +1748,8 @@ expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one"
 [[ $(<"$cross_ref_manager/.ci-fleet-tree-sha256") != invalid ]] || fail 'explicit reinstall did not restage the incomplete manager release'
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
+# Model the running environment, source and image revision together.
+activate_cross_ref_incumbent
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
 cp -a "$authority_active_release" "$cross_ref_runtime"
 printf '%s\n' "$cross_ref_old" >"$cross_ref_runtime/.ci-fleet-engine-ref"
@@ -1666,10 +1782,12 @@ if find "$cross_ref_runtime" "$cross_ref_manager" \( -type d -o -type f \) -perm
   fail 'cross-ref repair retained group/world-writable release content'
 fi
 [[ ! -e "$cross_ref_manager/scripts/__pycache__" && ! -L "$cross_ref_manager/scripts/__pycache__" ]] || fail 'cross-ref manager was not securely restaged before bytecode handling'
+# Restore the original runtime while the old checkpoint source is still retained.
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 git -C "$config_repo" reset -q --hard "$ref_one"
 [[ ${CI_FLEET_TEST_STOP_AFTER_CROSS_REF_RESTAGE:-0} != 1 ]] || { printf 'CROSS_REF_RESTAGE_REGRESSION_OK\n'; exit 0; }
 
@@ -1724,7 +1842,9 @@ unset FAKE_PAUSE_SYSTEMCTL_ONCE CI_FLEET_COMMAND_TIMEOUT_SECONDS FAKE_TIMEOUT_LO
 export CI_FLEET_DRAIN_TIMEOUT_SECONDS=2
 
 # Preserve A's durable recovery if B is hard-stopped after nested activation.
-interrupted_ref=$(write_config active 3 3)
+activate_cross_ref_incumbent
+# Change B's reviewed policy while preserving A's exact verified rollback baseline.
+interrupted_ref=$(write_config active 3 3 "$engine_ref" false present present 27)
 interrupted_env=$tmp/interrupted-a.env
 interrupted_state=$tmp/interrupted-a-state.json
 interrupted_daemon=$tmp/interrupted-a-daemon.json
@@ -1735,7 +1855,6 @@ cp "$daemon_config" "$interrupted_daemon"
 cp "$policy_marker" "$interrupted_marker"
 interrupted_current=$(readlink "$root/opt/ci-fleet/current")
 interrupted_manager=$(readlink "$root/opt/ci-fleet/manager/current")
-drift_policy
 interrupted_pause=$tmp/interrupted-policy-pause
 : >"$interrupted_pause"
 export FAKE_PAUSE_SYSTEMCTL_ONCE=$interrupted_pause
@@ -1768,6 +1887,7 @@ grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'ha
 interrupted_checkpoint=$(<"$interrupted_recovery/controller-checkpoint")
 stale_checkpoint_release=$root/opt/ci-fleet/releases/$cross_ref_old
 stale_checkpoint_manager=$root/opt/ci-fleet/manager/releases/$cross_ref_old
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 cp -a "$(readlink -f "$root/opt/ci-fleet/current")" "$stale_checkpoint_release"
 printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_release/.ci-fleet-engine-ref"
 chmod g+w "$stale_checkpoint_release/scripts" "$stale_checkpoint_release/scripts/docker-network-policy-adapter.sh"
@@ -1786,6 +1906,11 @@ printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-targ
 [[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_release" ]] || fail 'stale checkpoint release was still live'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") != "$stale_checkpoint_manager" ]] || fail 'stale checkpoint manager was still live'
 
+# The alias refusal already repaired these sources; rearm the restage failure.
+for pending_target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
+  chmod g+w "$pending_target/scripts" "$pending_target/scripts/docker-network-policy-adapter.sh"
+  refresh_release_digest "$pending_target"
+done
 pending_fsync_daemon=$tmp/pending-fsync-daemon.json
 pending_fsync_marker=$tmp/pending-fsync-marker.json
 cp "$daemon_config" "$pending_fsync_daemon"
@@ -1831,12 +1956,14 @@ cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollba
 [[ $(readlink "$root/opt/ci-fleet/current") == "$stale_checkpoint_release" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore normalized checkpoint pointers'
 ln -sfn "$interrupted_current" "$root/opt/ci-fleet/current"
 ln -sfn "$interrupted_manager" "$root/opt/ci-fleet/manager/current"
-rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 unset FAKE_PAUSE_SYSTEMCTL_ONCE
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 [[ ${CI_FLEET_TEST_STOP_AFTER_PENDING_CHECKPOINT_REPAIR:-0} != 1 ]] || { printf 'PENDING_CHECKPOINT_REPAIR_REGRESSION_OK\n'; exit 0; }
 
 # TERM only the outer installer while its nested resume is paused.
-term_ref=$(write_config active 4 4)
+term_ref=$(write_config active 4 4 "$engine_ref" false present present 27)
 term_daemon=$tmp/parent-term-daemon.json
 term_marker=$tmp/parent-term-marker.json
 term_env=$tmp/parent-term.env
@@ -1847,7 +1974,6 @@ cp "$root/etc/ci-fleet/ci-fleet.env" "$term_env"
 cp "$root/var/lib/ci-fleet/install-state.json" "$term_state"
 term_current=$(readlink "$root/opt/ci-fleet/current")
 term_manager=$(readlink "$root/opt/ci-fleet/manager/current")
-drift_policy
 parent_term_pause=$tmp/parent-only-term-pause
 parent_term_result=$tmp/parent-only-term-result.json
 : >"$parent_term_pause"
@@ -2511,6 +2637,8 @@ if grep -Fq 'container-rm-blocked-running|' "$FAKE_COMPOSE_LOG"; then fail 'no-r
 expect_success "$installer" --rollback >/dev/null
 unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_NO_RELEASE_ACTIVE_ORPHAN:-0} != 1 ]] || { printf 'NO_RELEASE_ACTIVE_ORPHAN_REGRESSION_OK\n'; exit 0; }
+# Rollback can restart retained active source; restore absence for the next case.
+rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 export FAKE_ALL_RUNNER_STATE=$tmp/no-release-inactive-runner
 export FAKE_FAIL_CONTAINER_RM_ONCE=$tmp/no-release-fail-container-rm
 : >"$FAKE_ALL_RUNNER_STATE"
@@ -2519,12 +2647,13 @@ no_release_failure_output=$tmp/no-release-uninstall-failure.out
 if "$installer" --uninstall >"$no_release_failure_output" 2>&1; then
   fail 'no-release uninstall ignored inactive runner removal failure'
 fi
-grep -Fq 'CHECKPOINT_CREATED' "$no_release_failure_output" || fail 'no-release runner removal failure omitted checkpoint evidence'
+grep -Fq 'CHECKPOINT_CREATED' "$no_release_failure_output" || fail "no-release runner removal failure omitted checkpoint evidence: $(<"$no_release_failure_output")"
 grep -Fq 'ROLLBACK_RESTORED' "$no_release_failure_output" || fail "no-release runner removal failure did not roll back: $(<"$no_release_failure_output")"
 if grep -Fq 'UNINSTALL_OK' "$no_release_failure_output"; then fail 'no-release runner removal failure reported successful uninstall'; fi
 no_release_failure_checkpoint=$(awk '$1 == "CHECKPOINT_CREATED" {sub(/^path=/, "", $2); value=$2} END {print value}' "$no_release_failure_output")
 [[ -f "$no_release_failure_checkpoint/.complete" ]] || fail 'no-release runner removal failure did not preserve its complete checkpoint'
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'no-release runner removal failure deleted managed state before rollback'
+rm -f "$FAKE_DOCKER_STATE" "$FAKE_CONTROLLER_STATUS_FILE"
 : >"$FAKE_ALL_RUNNER_STATE"
 no_release_output=$(expect_success "$installer" --uninstall)
 grep -Fq 'UNINSTALL_OK' <<<"$no_release_output" || fail 'no-release uninstall did not complete'
@@ -3037,7 +3166,7 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$config_failure_o
   fail 'candidate Compose validation failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_CONFIG
-if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail 'candidate Compose validation failure entered the transaction'; fi
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail "candidate Compose validation failure entered the transaction: $(<"$config_failure_output")"; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate Compose validation failure stopped the installed controller'
 invalid_image_output=$tmp/invalid-image-id.out
 export FAKE_COMPOSE_LOG=$tmp/invalid-image-id-compose.log
@@ -3525,12 +3654,15 @@ expect_failure 'a trusted complete canonical manager release is required to unin
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'untrusted present-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'untrusted present-controller uninstall invoked Compose'; fi
 rm -f "$FAKE_DOCKER_STATE"
+# Withhold rendered source identity so the dangling pointers have no authority.
+mv "$root/etc/ci-fleet/ci-fleet.env" "$tmp/damaged-uninstall.env"
 export FAKE_ALL_RUNNER_STATE=$tmp/damaged-no-controller-inactive-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 expect_failure 'a trusted complete runtime release is required before controller mutation' "$installer" --uninstall
 [[ -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'damaged no-controller uninstall removed a runner before validating runtime authority'
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'damaged no-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'damaged no-controller uninstall invoked Compose'; fi
+mv "$tmp/damaged-uninstall.env" "$root/etc/ci-fleet/ci-fleet.env"
 unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_DAMAGED_UNINSTALL:-0} != 1 ]] || { printf 'DAMAGED_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 [[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_LINK_FALLBACK:-0} != 1 ]] || { printf 'CURRENT_LINK_FALLBACK_REGRESSIONS_OK\n'; exit 0; }
@@ -3648,6 +3780,8 @@ legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
 legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
+# Rejected fixture candidates are separate from the verified incumbent's history.
+git -C "$config_repo" reset -q --hard "$ref_one"
 # Exercise telemetry removal without changing the existing Docker network policy.
 legacy_engine_ref=8bd27a2e7451806a1e37f79a15eeb7c677a12c3e
 legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
@@ -3695,6 +3829,8 @@ export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
 expect_success "$retained_installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'upgrade back from legacy did not restore capacity units'
 grep -Fq 'CI_FLEET_POOL=trusted-ci' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade back from legacy did not restore the telemetry pool'
+# Continue configuration history from the exact commit just verified above.
+git -C "$config_repo" reset -q --hard "$ref_one"
 rollback_stop_ref=$(write_config active 2 2)
 export FAKE_FAIL_UP_ONCE=$tmp/rollback-stop-fail-up
 export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/rollback-stop-failure

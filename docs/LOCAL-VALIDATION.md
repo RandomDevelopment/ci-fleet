@@ -78,6 +78,18 @@ roots. Installer fixtures that mutate Git history or reviewed files use their ow
 repository copies, preserving the candidate checkout and its Git metadata.
 They do not prove deployment on a real prepared host.
 
+Installer fixture preparation seeds its three hard-pinned historical engine inputs
+before installing synthetic Git transport: pre-health
+`af9c0c13cd12866ce75dd6c43a4cda01915507e1`, pre-telemetry
+`8bd27a2e7451806a1e37f79a15eeb7c677a12c3e`, and pre-adapter
+`003de44f7e27d7bfe5bb753098efb6eb5f9712f1`. It prefers available original-source
+objects; a missing object requires a canonical pinned fetch during that admitted
+preparation phase. It verifies each requested commit without changing the selected
+HEAD. Subsequent installed synthetic-engine fetches use only the prepared local
+fixture repository, retaining canonical origin metadata. There is no runtime
+network fallback. These historical inputs test compatibility refusals and removal;
+they are not rollout engine selections or evidence of native image acceptance.
+
 ## Complete engine command
 
 Replace all uppercase values with full available commit SHAs or local paths.
@@ -209,6 +221,26 @@ authenticated operator channel to durable storage outside the worker. Verify
 the worker. Review and signing use that same bundle. GitHub artifact uploads and
 an additional storage service are not required. An incomplete transfer cannot
 satisfy the signer because its report or required log hashes are missing.
+
+## Hosted result artifacts
+
+The existing engine workflow's `validate` job exports the entire
+`$RUNNER_TEMP/local-validation/` output directory on success or failure as
+`local-validation-RUN_ID-RUN_ATTEMPT`. Download it from the workflow run's
+Artifacts section within seven days. The upload includes hidden files and fails
+when output is missing. The preceding step makes only that result directory
+readable by the runner account; the workflow permissions, trusted checks and
+45-minute infrastructure job budget remain unchanged.
+
+Retain `result.json` and every recorded log and verify their hashes after download
+before disposing of the worker. Artifact archives do not preserve protected Unix
+ownership and modes; restore those protections through the existing operator
+procedure before treating a downloaded bundle as protected local evidence.
+An artifact upload is unsigned developer evidence. It does not replace required
+checks, independent review, signing or native/host acceptance. Early admission
+refusal may produce no output. Cancellation, job timeout or a lost worker can
+prevent export, and missing reports/logs remain incomplete validation. Local
+runs still use the operator export procedure above and need no GitHub artifact.
 
 ## Configuration repositories
 

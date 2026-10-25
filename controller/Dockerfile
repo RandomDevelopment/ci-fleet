@@ -11,7 +11,7 @@ WORKDIR /src
 COPY controller/go.mod controller/go.sum ./
 RUN go mod download && go mod verify
 COPY controller/*.go ./
-COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/cleanup_storage.py scripts/desired_state.py scripts/apt_cache.py /scripts/
+COPY scripts/cleanup.sh scripts/docker-local-env.sh scripts/cleanup_networks.py scripts/cleanup_storage.py scripts/managed_image_identity.py scripts/desired_state.py scripts/apt_cache.py /scripts/
 COPY scripts/fixtures/apt-cache.json /scripts/fixtures/apt-cache.json
 RUN go test ./...
 ARG CI_FLEET_VERSION=dev

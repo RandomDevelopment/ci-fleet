@@ -45,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-memory-mib", type=positive_integer, default=4096, help="memory available to each runner")
     parser.add_argument("--engine-ref", required=True, help="reviewed full ci-fleet commit SHA")
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"), help="architecture of the reviewed image IDs")
-    parser.add_argument("--controller-image-digest", required=True, help="reviewed controller image ID (sha256:...)")
-    parser.add_argument("--runner-image-digest", required=True, help="reviewed runner image ID (sha256:...)")
+    parser.add_argument("--controller-image-digest", required=True, help="reviewed controller scalar, config digest for portable-capable runtime sources, opaque Docker ID otherwise (sha256:...)")
+    parser.add_argument("--runner-image-digest", required=True, help="reviewed runner scalar, config digest for portable-capable runtime sources, opaque Docker ID otherwise (sha256:...)")
     parser.add_argument("--output", type=Path, default=ROOT / "fleet.json", help="output configuration path")
     parser.add_argument("--force", action="store_true", help="replace an existing non-example output file")
     return parser.parse_args()
@@ -201,7 +201,9 @@ def main() -> int:
     finally:
         temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
-    print("Next: replace RFC 5737 Docker network values, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
+    print("New controller: remove generated docker_network_policy, including bridge; keep managed_images and an empty active evidence map, omit optional status/storage, then validate against actual prior state and review/merge. Keep secrets outside Git.")
+    print("After install, require --check at that exact config to report CHECK_OK. Review selected-source capabilities and observed runtime activation, then integrate active evidence in an evidence-only commit. Add network policy only in a later commit. See README.md.")
+    print("Existing installations must retain actual history and incumbent evidence through the documented upgrade path; do not reinitialize them.")
     print("Storage retention remains disabled. After activating a compatible engine and inventorying an exclusive fleet daemon, add docker_storage_retention in a separate reviewed change. See README.md.")
     return 0
 

@@ -6,6 +6,7 @@ from datetime import datetime
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import socket
@@ -14,7 +15,8 @@ import time
 import urllib.request
 
 import cleanup_networks as coordination
-from desired_state import parse_env
+from desired_state import load_engine_capabilities, parse_env
+from managed_image_identity import read_bindings
 
 PREFIX = coordination.LABEL_PREFIX
 ADMISSION = "exclusive-fleet-daemon-v1"
@@ -62,7 +64,51 @@ def disk_percent() -> int:
     return (used * 100 + total - 1) // total
 
 
-def protected_images() -> set[str]:
+def retained_image_release(environment: Path, revision: str, *, current: bool) -> Path:
+    install_root = coordination.host_path("/opt/ci-fleet")
+    canonical = install_root / "releases" / revision
+    pointer = environment.parent / "release-target"
+    release = canonical
+    captured = not current and (pointer.exists() or pointer.is_symlink())
+    if captured:
+        coordination.trusted_path(pointer, directory=False)
+        raw = pointer.read_bytes()
+        if not 2 <= len(raw) <= 4096 or raw.count(b"\n") != 1 or not raw.endswith(b"\n") or b"\0" in raw:
+            raise ValueError("retained image source pointer is invalid")
+        release = Path(os.fsdecode(raw[:-1]))
+    elif current and not canonical.exists():
+        for link in (install_root / "current", install_root / "manager/current"):
+            if link.is_symlink():
+                if link.lstat().st_uid != os.geteuid():
+                    raise ValueError("retained image source pointer owner is invalid")
+                release = Path(os.readlink(link))
+                break
+            if link.exists():
+                raise ValueError("retained image source pointer is invalid")
+        else:
+            if (install_root / ".ci-fleet-engine-ref").exists():
+                release = install_root
+    if (not release.is_absolute() or str(release) != os.path.normpath(str(release))
+            or (release != canonical and release != install_root
+                and release.parent != install_root / "manager/releases")):
+        raise ValueError("retained image source path is invalid")
+    # Authenticate the captured context as well as the manifest, including ancestors.
+    boundary = coordination.host_path("/")
+    for directory in (release, *release.parents):
+        coordination.trusted_path(directory, directory=True)
+        if directory == boundary:
+            break
+    else:
+        raise ValueError("retained image source is outside the host root")
+    marker = release / ".ci-fleet-engine-ref"
+    if captured or release != canonical or marker.exists() or marker.is_symlink():
+        coordination.trusted_path(marker, directory=False)
+        if marker.read_bytes() != (revision + "\n").encode("ascii"):
+            raise ValueError("retained image source revision does not match the captured engine")
+    return release
+
+
+def protected_images(usage: dict | None = None) -> set[str]:
     current = coordination.host_path("/etc/ci-fleet/ci-fleet.env")
     checkpoints = coordination.host_path("/var/lib/ci-fleet/checkpoints")
     files = [current]
@@ -76,21 +122,68 @@ def protected_images() -> set[str]:
                     files.append(path)
     protected = set()
     current_values = None
+    portable_references = set()
     for path in files:
         coordination.trusted_path(path.parent, directory=True)
         coordination.trusted_path(path, directory=False)
         values = parse_env(path, allow_unknown=True)
         if path == current:
             current_values = values
+        if path.name == "fresh-image-env":
+            original = path.parent / "fresh-image-ids"
+            coordination.trusted_path(original, directory=False)
+            captured = parse_env(original, allow_unknown=True)
+            if set(captured) != {"CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID"} or any(
+                value != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in captured.values()
+            ):
+                raise ValueError("fresh checkpoint original image mappings are missing or invalid")
         for name in ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE",
                      "CI_FLEET_RUNNER_IMAGE_DIGEST", "CI_FLEET_CONTROLLER_IMAGE_DIGEST",
                      "CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID",
-                     "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID"):
+                     "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID",
+                     "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID", "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID"):
+            if path.name == "fresh-image-env" and name.endswith(("_IMAGE_DIGEST", "_RUNTIME_IMAGE_ID")):
+                continue  # Prospective policy is not an original captured image.
             reference = values.get(name)
             if reference and reference != "absent":
                 protected.add(reference)
+    # Resolve policy semantics from the retained runtime source, never digest syntax.
+    for path in files:
+        if path.name not in {"ci-fleet.env", "image-env"}:
+            continue
+        values = parse_env(path, allow_unknown=True)
+        revision = values.get("CI_FLEET_ENGINE_REF", "")
+        state = (coordination.host_path("/var/lib/ci-fleet/install-state.json")
+                 if path == current else path.parent / "install-state.json")
+        has_runtime = any(name.endswith("_RUNTIME_IMAGE_ID") for name in values)
+        portable = has_runtime
+        if revision:
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise ValueError("retained image engine is invalid")
+            release = retained_image_release(path, revision, current=path == current)
+            manifest = release / "engine-capabilities.json"
+            if manifest.exists() or manifest.is_symlink():
+                coordination.trusted_path(manifest, directory=False)
+                portable = "portable_managed_image_ids" in load_engine_capabilities(manifest)
+                if has_runtime and not portable:
+                    raise ValueError("runtime binding conflicts with retained source capability")
+        if portable:
+            binding = read_bindings(state, values)
+            for role in binding["roles"].values():
+                references = {value for key in ("config_digest", "runtime_image_id", "manifest_digest")
+                              if (value := role.get(key))}
+                protected.update(references)
+                portable_references.update(references)
     if not {"CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE"} <= current_values.keys():
         raise ValueError("installed environment omitted rollback image references")
+    if usage is not None:
+        aliases = set()
+        for image in usage["Images"]:
+            aliases.update({image["Id"], *(image.get("RepoTags") or []), *(image.get("RepoDigests") or [])})
+        opaque = {reference for reference in protected - portable_references
+                  if re.fullmatch(r"sha256:[0-9a-f]{64}", reference)}
+        if opaque - aliases:
+            raise ValueError("opaque rollback image identities are unresolved in Docker accounting; storage removal deferred")
     return protected
 
 
@@ -269,7 +362,7 @@ def cleanup_storage(*, apply: bool, usage: dict | None = None) -> None:
     admission = os.environ.get("CI_FLEET_DOCKER_STORAGE_RETENTION", "")
     if admission not in {"", ADMISSION}:
         raise ValueError("unknown Docker storage retention admission")
-    protected = protected_images() if admission else set()
+    protected = protected_images(usage) if admission else set()
     references = {item["ImageID"] for item in usage["Containers"]}
     now = int(time.time())
     eligible = []

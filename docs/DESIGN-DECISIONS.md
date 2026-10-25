@@ -1,5 +1,18 @@
 # Accepted design decisions
 
+## Portable managed-image config identity
+
+A runtime source declaring `portable_managed_image_ids` interprets the existing
+scalar image catalog as original config digests. Older sources keep opaque local
+Docker ID semantics. Root preparation binds config bytes to an immutable local
+runtime ID through full-ID export and retained authenticated descriptor proof.
+Launch uses that ID; policy retains the config digest. Keep classic and containerd
+stores, capacity, historical catalogs and raw recovery IDs unchanged.
+
+This is an implementation contract. Native compatibility, transfer time, temporary
+disk, image production, host activation and final acceptance need separate evidence.
+See [managed images](MANAGED-IMAGES.md).
+
 ## Optional host-local APT cache
 
 Trusted private pools may opt into an existing apt-cacher-ng server through

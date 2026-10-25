@@ -16,7 +16,7 @@ services:
       replicas: 0
 
   docker-socket-proxy:
-    image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    image: ${CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID:?verified controller runtime image ID is required}
     labels:
       io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     command: ["--docker-socket-proxy"]
@@ -44,7 +44,7 @@ services:
         max-file: "3"
 
   controller:
-    image: ${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}
+    image: ${CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID:?verified controller runtime image ID is required}
     labels:
       io.randomdevelopment.ci-fleet.reviewed-image: ${CI_FLEET_CONTROLLER_IMAGE_DIGEST:?reviewed controller image ID is required}
     build:
@@ -67,7 +67,7 @@ services:
       CI_FLEET_SCALE_SET_NAME: ${CI_FLEET_SCALE_SET_NAME:-}
       CI_FLEET_LABELS: ${CI_FLEET_LABELS:-docker-ci-experimental}
       CI_FLEET_RUNNER_GROUP: ${CI_FLEET_RUNNER_GROUP:-Default}
-      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}
+      CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_RUNTIME_IMAGE_ID:?verified runner runtime image ID is required}
       CI_FLEET_INSTANCE: ${CI_FLEET_INSTANCE:?set a unique stable host identifier}
       CI_FLEET_GITHUB_APP_CLIENT_ID: ${CI_FLEET_GITHUB_APP_CLIENT_ID:?set the GitHub App client ID}
       CI_FLEET_GITHUB_APP_INSTALLATION_ID: ${CI_FLEET_GITHUB_APP_INSTALLATION_ID:?set the installation ID}

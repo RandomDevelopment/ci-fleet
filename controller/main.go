@@ -9,6 +9,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"regexp"
+	"runtime"
+
+	"github.com/docker/docker/api/types/image"
 	"syscall"
 	"time"
 
@@ -76,8 +80,13 @@ func run(ctx context.Context) error {
 	if _, err := docker.Ping(ctx); err != nil {
 		return fmt.Errorf("ping Docker: %w", err)
 	}
-	if _, err := docker.ImageInspect(ctx, cfg.RunnerImage); err != nil {
+	runnerImage, err := docker.ImageInspect(ctx, cfg.RunnerImage)
+	if err != nil {
 		return fmt.Errorf("inspect runner image %q (build it before starting the controller): %w", cfg.RunnerImage, err)
+	}
+
+	if err := verifiedRunnerImage(cfg.RunnerImage, runnerImage, commitSHA, runtime.GOARCH); err != nil {
+		return err
 	}
 
 	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, scalesetClient: client, logger: logger, config: cfg, scaleSetID: set.ID}
@@ -107,5 +116,17 @@ func run(ctx context.Context) error {
 	}
 	scaler.shutdown(context.WithoutCancel(ctx))
 	stoppedNormally = true
+	return nil
+}
+
+// The installer proves content once. Startup only checks that immutable target.
+func verifiedRunnerImage(reference string, inspected image.InspectResponse, revision, architecture string) error {
+	if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(reference) || inspected.ID != reference {
+		return fmt.Errorf("runner image must resolve to its verified immutable runtime ID")
+	}
+	if inspected.Config == nil || inspected.Config.Labels["org.opencontainers.image.revision"] != revision ||
+		inspected.Os != "linux" || inspected.Architecture != architecture {
+		return fmt.Errorf("runner image source or platform differs from the verified runtime")
+	}
 	return nil
 }

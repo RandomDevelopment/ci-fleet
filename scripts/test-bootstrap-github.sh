@@ -107,6 +107,17 @@ cp -a "$repo_root/templates/config-repository/." "$config_checkout/"
 fixture_engine_ref=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["controllers"]["example-ci-01"]["engine_ref"])' "$config_checkout/fleet.json")
 python3 "$repo_root/templates/config-repository/scripts/init.py" --organization acme-org --project example-repo --repository acme-org/example-repo --runner-group example-ci-experimental --controller example-ci-01 --location example-site --engine-ref "$fixture_engine_ref" \
   --architecture amd64 --controller-image-digest "sha256:$(printf '3%.0s' {1..64})" --runner-image-digest "sha256:$(printf '4%.0s' {1..64})" --output "$config_checkout/fleet.json" --force
+# Synthetic evidence tests policy wiring, not this historical fixture engine's capabilities.
+python3 - "$config_checkout/engine-rollout-evidence.json" "$fixture_engine_ref" <<'PY'
+import json,sys
+from pathlib import Path
+path=Path(sys.argv[1]); value=json.loads(path.read_text())
+value['status_reporting_engine_capabilities']['example-ci-01']={
+    'engine_ref':sys.argv[2], 'docker_network_policy_config':True,
+    'status_reporting_config':False, 'required_status_reporting':False,
+}
+path.write_text(json.dumps(value,indent=2)+'\n')
+PY
 if python3 "$config_checkout/scripts/validate.py" --config "$config_checkout/fleet.json" --strict >/dev/null 2>&1; then fail 'unreviewed initializer network placeholder passed strict validation'; fi
 python3 - "$config_checkout/fleet.json" <<'PY'
 import json,sys
@@ -115,6 +126,8 @@ path=Path(sys.argv[1]); value=json.loads(path.read_text())
 value['controllers']['example-ci-01']['docker_network_policy']['default_address_pools'][0]['base']='10.64.0.0/24'
 path.write_text(json.dumps(value,indent=2)+'\n')
 PY
+python3 "$config_checkout/scripts/validate.py" --config "$config_checkout/fleet.json" --strict \
+  || fail 'bootstrap routing fixture failed strict validation'
 git init -q "$config_checkout"
 git -C "$config_checkout" add -A
 git -C "$config_checkout" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture

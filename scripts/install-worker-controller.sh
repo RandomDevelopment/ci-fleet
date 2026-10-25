@@ -304,11 +304,17 @@ validate_candidate_config_commit() {
   retained_installed_ref=false
   local tree_paths=$temporary/config-tree-paths evidence=$temporary/engine-rollout-evidence.json
   local previous=$temporary/staging-previous.json previous_evidence=$temporary/staging-previous-evidence.json
+  local parent_ref
+  parent_ref=$(git -C "$config_source_checkout" cat-file -p "$config_ref" | awk '$1 == "parent" {print $2; exit}')
   local args=(--config "$candidate_config" --strict --tree-paths "$tree_paths")
   git -C "$config_source_checkout" ls-tree -rz --name-only "$config_ref" >"$tree_paths" || die 'cannot inspect the configuration commit tree'
   if git -C "$config_source_checkout" cat-file -e "$config_ref:engine-rollout-evidence.json" 2>/dev/null; then
     git -C "$config_source_checkout" show "$config_ref:engine-rollout-evidence.json" >"$evidence" || die 'cannot read engine rollout evidence'
     args+=(--rollout-evidence "$evidence")
+  fi
+  if git -C "$config_source_checkout" cat-file -e "$config_ref:next-engine-rollout-evidence.json" 2>/dev/null; then
+    git -C "$config_source_checkout" show "$config_ref:next-engine-rollout-evidence.json" >"$temporary/next-evidence.json" || die 'cannot read pending engine evidence'
+    args+=(--next-engine-rollout-evidence "$temporary/next-evidence.json")
   fi
   bootstrap_lkg_checkpoint=''
   if [[ "$restore_lkg" == true ]] && python3 -c 'import json, sys; sys.exit(0 if "managed_images" not in json.load(open(sys.argv[1])) else 1)' "$candidate_config"; then
@@ -343,13 +349,20 @@ raise SystemExit(0 if valid else 1)
 PY
   then
     retained_installed_ref=true
-  elif [[ -f "$state_file" && -f "$rendered_env" ]] && git -C "$config_source_checkout" show "$config_ref^:fleet.json" >"$previous" 2>/dev/null \
-    && python3 -c 'import json, sys; current, previous=(json.load(open(path)) for path in sys.argv[1:]); sys.exit(0 if isinstance(current, dict) and isinstance(previous, dict) and ("managed_images" not in current or "managed_images" not in previous) else 1)' "$candidate_config" "$previous"; then
+  elif [[ "$mode" == install ]] && python3 -c 'import json, sys; sys.exit(0 if "managed_images" not in json.load(open(sys.argv[1])) else 1)' "$candidate_config"; then
+    : # Strict initial validation rejects image-free installation without a staging exception.
+  elif [[ -n "$parent_ref" ]]; then
+    git -C "$config_source_checkout" cat-file -e "$parent_ref^{commit}" 2>/dev/null || die 'previous integrated configuration history is unavailable'
+    git -C "$config_source_checkout" show "$config_ref^:fleet.json" >"$previous" || die 'previous integrated configuration is unavailable'
     args+=(--previous-config "$previous")
     if git -C "$config_source_checkout" cat-file -e "$config_ref^:engine-rollout-evidence.json" 2>/dev/null; then
       git -C "$config_source_checkout" show "$config_ref^:engine-rollout-evidence.json" >"$previous_evidence" \
         || die 'cannot read previous manager-staging evidence'
       args+=(--previous-rollout-evidence "$previous_evidence")
+    fi
+    if git -C "$config_source_checkout" cat-file -e "$config_ref^:next-engine-rollout-evidence.json" 2>/dev/null; then
+      git -C "$config_source_checkout" show "$config_ref^:next-engine-rollout-evidence.json" >"$temporary/previous-next-evidence.json" || die 'cannot read previous pending evidence'
+      args+=(--previous-next-engine-rollout-evidence "$temporary/previous-next-evidence.json")
     fi
   fi
   if $retained_installed_ref; then
@@ -569,7 +582,7 @@ build_managed_images() {
     return 0
   fi
   manifest=$(mktemp "$temporary/prepared-image-tags.XXXXXX")
-  bash "$release/scripts/build-managed-images.sh" "$release" "$environment" "$manifest" || return 1
+  bash "$release/scripts/build-managed-images.sh" "$release" "$environment" "$manifest" "$(image_metadata_path "$environment")" || return 1
   mapfile -t tags <"$manifest"
   runner=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {print $2}' "$environment")
   controller=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print $2}' "$environment")
@@ -594,6 +607,29 @@ current_runtime_release() {
   [[ "$marker" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$target" "$marker" \
     && release_tree_permissions_trusted "$target" || return 0
   printf '%s' "$target"
+}
+
+# An incumbent's environment and source must agree before any stop or recovery.
+runtime_release_for_environment() {
+  local environment=$1 fallback=${2:-} revision='' target current
+  if [[ -f "$environment" ]]; then
+    revision=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  fi
+  if [[ -z "$revision" ]]; then
+    revision=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_container" 2>/dev/null) || return 1
+  fi
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+  current=$(current_runtime_release)
+  for target in "$current" "$releases_dir/$revision" "$manager_releases/$revision" \
+    "$(readlink -f "$manager_current" 2>/dev/null || true)" "$fallback"; do
+    [[ -n "$target" && "$target" == "$(realpath -ms -- "$target")" ]] || continue
+    if [[ "$target" != "$install_root" && "$target" != "$releases_dir/$revision" \
+      && $(dirname "$target") != "$manager_releases" ]]; then continue; fi
+    if ! runtime_release_complete "$target" "$revision" || ! release_tree_permissions_trusted "$target"; then continue; fi
+    printf '%s' "$target"
+    return 0
+  done
+  return 1
 }
 
 managed_runner_count() {
@@ -635,6 +671,9 @@ controller_environment_matches() {
       && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$(current_runtime_release)/deploy/compose.yaml"; then
       expected=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$candidate_env")
     fi
+    if [[ "$key" == CI_FLEET_RUNNER_IMAGE ]] && portable_managed_images "$candidate_env"; then
+      expected=$(awk -F= '$1 == "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID" {print $2}' "$candidate_env")
+    fi
     if [[ -z "$expected" && ( "$key" == CI_FLEET_DOCKER_DEFAULT_BRIDGE_CIDR || "$key" == CI_FLEET_APT_HTTP_PROXY || "$key" == CI_FLEET_NO_PROXY ) ]]; then
       actual=$(awk -F= -v key="$key" '$1 == key {count++; value=substr($0, index($0, "=") + 1)} END {if (count > 1) exit 1; print value}' <<<"$live") || return 1
       [[ -z "$actual" ]] || return 1
@@ -657,6 +696,9 @@ runtime_matches() {
   if [[ "$expected" == active ]]; then
     [[ "$status" == running ]] || return 1
     expected_image_ref=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$candidate_env")
+    if portable_managed_images "$candidate_env"; then
+      expected_image_ref=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID" {print $2}' "$candidate_env")
+    fi
     [[ -n "$expected_image_ref" ]] || return 1
     live_image=$(docker inspect --format '{{.Image}}' "$controller_container" 2>/dev/null) || return 1
     expected_image=$(docker image inspect --format '{{.Id}}' "$expected_image_ref" 2>/dev/null) || return 1
@@ -792,7 +834,7 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
-    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh apt_cache:apt_cache.py; do
+    for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh portable_managed_image_ids:managed_image_identity.py apt_cache:apt_cache.py; do
       policy_script=${required#*:}
       if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
 import json, sys
@@ -921,8 +963,82 @@ release_matches() {
   [[ "$target" == "$release_dir" ]]
 }
 
+# The selected runtime source owns scalar semantics, including during recovery.
+portable_managed_images() {
+  local environment=$1 release=${2:-} revision manifest
+  revision=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ -n "$release" ]] || release=$releases_dir/$revision
+  manifest=$release/engine-capabilities.json
+  if [[ ! -f "$manifest" && "$environment" == "${candidate_env:-}" && "$revision" == "${engine_ref:-}" ]]; then
+    manifest=${engine_capabilities:-$manifest}
+  fi
+  [[ -f "$manifest" ]] || return 1
+  python3 - "$repo_root/scripts" "$manifest" <<'PYTHON'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from desired_state import load_engine_capabilities
+raise SystemExit("portable_managed_image_ids" not in load_engine_capabilities(Path(sys.argv[2])))
+PYTHON
+}
+
+image_metadata_path() {
+  local environment=$1
+  if [[ "$environment" == "${candidate_env:-}" && -n "${candidate_metadata:-}" ]]; then
+    printf '%s' "$candidate_metadata"
+  elif [[ "$environment" == "$rendered_env" ]]; then
+    printf '%s' "$state_file"
+  else
+    printf '%s/install-state.json' "$(dirname "$environment")"
+  fi
+}
+
+prepare_portable_images() {
+  local environment=$1 metadata=$2 release=$3 state=${4:-} check_only=${5:-false}
+  local -a arguments=(prepare --environment "$environment" --metadata "$metadata" --release "$release")
+  [[ -z "$state" || ! -e "$state" ]] || arguments+=(--state "$state")
+  [[ "$check_only" != true ]] || arguments+=(--check-only)
+  python3 "$repo_root/scripts/managed_image_identity.py" "${arguments[@]}"
+}
+
+portable_image_objects_match() {
+  local environment=$1 release=${2:-} metadata scratch revision
+  revision=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+  [[ -n "$release" ]] || release=$releases_dir/$revision
+  metadata=$(image_metadata_path "$environment")
+  [[ -f "$metadata" && -f "$release/engine-capabilities.json" ]] || return 1
+  scratch=$(mktemp -d "$temporary/image-check.XXXXXX") || return 1
+  install -m 0600 "$environment" "$scratch/environment" || return 1
+  install -m 0600 "$metadata" "$scratch/metadata" || return 1
+  prepare_portable_images "$scratch/environment" "$scratch/metadata" "$release" "$metadata" true || return 1
+  # A check must not silently replace a captured runtime identity.
+  python3 - "$environment" "$scratch/environment" <<'PYTHON'
+from pathlib import Path
+import sys
+raise SystemExit(0 if Path(sys.argv[1]).read_bytes() == Path(sys.argv[2]).read_bytes() else 1)
+PYTHON
+}
+
+hydrate_candidate_images() {
+  portable_managed_images "$candidate_env" || return 0
+  managed_image_ids_configured || return 0
+  [[ -f "$release_dir/engine-capabilities.json" ]] || return 1
+  prepare_portable_images "$candidate_env" "$candidate_metadata" "$release_dir" "$state_file" true
+}
+
 managed_images_match() {
-  local environment=${1:-$candidate_env} digest expected_engine image provenance
+  local environment=${1:-$candidate_env} release=${2:-} digest expected_engine image provenance
+  if portable_managed_images "$environment" "$release"; then
+    portable_image_objects_match "$environment" "$release" || return 1
+    local role runtime
+    for role in CONTROLLER RUNNER; do
+      image=$(awk -F= -v key="CI_FLEET_${role}_IMAGE" '$1 == key {print $2}' "$environment")
+      runtime=$(awk -F= -v key="CI_FLEET_${role}_RUNTIME_IMAGE_ID" '$1 == key {print $2}' "$environment")
+      [[ $(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) == "$runtime" ]] || return 1
+    done
+    return 0
+  fi
   local -a expected_images=()
   expected_engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
   [[ "$expected_engine" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -1155,6 +1271,7 @@ PY
 
 drift_count() {
   local count=0 expected_owner=0
+  hydrate_candidate_images >/dev/null 2>&1 || { note 'DRIFT managed_image_bindings'; count=$((count + 1)); }
   [[ "$testing" != 1 ]] || expected_owner=$(id -u)
   if [[ ! -f "$rendered_env" ]] \
     || [[ $(stat -c %u "$rendered_env") != "$expected_owner" ]] \
@@ -1298,9 +1415,48 @@ run_candidate_preflight() {
 
 build_candidate() {
   # Quiescence is enforced after drain, not while preparing validated image inputs.
+  if portable_managed_images "$candidate_env" "$release_dir"; then
+    local prior_proof=$state_file
+    [[ ! -f "$checkpoint_dir/install-state.json" ]] || prior_proof=$checkpoint_dir/install-state.json
+    if ! prepare_portable_images "$candidate_env" "$candidate_metadata" "$release_dir" "$prior_proof"; then
+      build_managed_images "$release_dir" "$candidate_env" true || return 1
+    fi
+    portable_image_objects_match "$candidate_env" "$release_dir" || return 1
+    compose "$release_dir" "$candidate_env" config --quiet
+    return
+  fi
   compose "$release_dir" "$candidate_env" config --quiet
   if ! managed_images_match "$candidate_env" && ! managed_image_objects_match "$candidate_env"; then
     build_managed_images "$release_dir" "$candidate_env" true
+  fi
+}
+
+prepare_checkpoint_image_binding() {
+  local environment=$1 directory=$2 release=${3:-} installed_ref runner_runtime controller_runtime
+  # Authenticate the source before copying can confer checkpoint ownership.
+  python3 - "$repo_root/scripts" "$state_file" "$directory/install-state.json" "$environment" "$directory/ci-fleet.env" <<'PYTHON' || die 'portable checkpoint metadata is unavailable or untrusted'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from managed_image_identity import protected_read, require
+from desired_state import write_private
+require(protected_read(Path(sys.argv[4]), private=True) == protected_read(Path(sys.argv[5]), private=True), "checkpoint environment source changed")
+write_private(Path(sys.argv[3]), protected_read(Path(sys.argv[2]), private=True).decode("utf-8"))
+PYTHON
+  if ! portable_image_objects_match "$directory/image-env" "$release"; then
+    installed_ref=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
+    runner_runtime=$(awk -F= '$1 == "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID" {print $2}' "$environment")
+    controller_runtime=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID" {print $2}' "$environment")
+    python3 "$repo_root/scripts/managed_image_identity.py" prepare \
+      --environment "$directory/image-env" --metadata "$directory/install-state.json" \
+      --release "${release:-$releases_dir/$installed_ref}" \
+      --runner-reference "$runner_runtime" --controller-reference "$controller_runtime" \
+      || die 'portable checkpoint requires fresh proof of the original runtime IDs'
+    python3 - "$directory/ci-fleet.env" "$directory/image-env" <<'PYTHON' || die 'portable checkpoint preparation changed original runtime fields'
+from pathlib import Path
+import sys
+raise SystemExit(0 if Path(sys.argv[1]).read_bytes() == Path(sys.argv[2]).read_bytes() else 1)
+PYTHON
   fi
 }
 
@@ -1565,13 +1721,18 @@ make_checkpoint() {
   elif [[ -e "$manager_current" ]]; then
     die 'manager current pointer is invalid'
   fi
-  target=$(current_runtime_release)
-  if [[ -z "$target" && -n "$fallback_release" ]]; then
-    fallback_candidate=$(canonical_release_target "$fallback_release" "$releases_dir" || true)
-    if [[ -n "$fallback_candidate" && -f "$fallback_candidate/.ci-fleet-engine-ref" ]]; then
-      fallback_ref=$(<"$fallback_candidate/.ci-fleet-engine-ref")
-      if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_candidate" "$fallback_ref" \
-        && release_tree_permissions_trusted "$fallback_candidate"; then target=$fallback_candidate; fi
+  if [[ -f "$rendered_env" || -n "$status" ]]; then
+    target=$(runtime_release_for_environment "$rendered_env" "$fallback_release") \
+      || die 'incumbent recovery requires a trusted complete source matching its engine revision before drain'
+  else
+    target=$(current_runtime_release)
+    if [[ -z "$target" && -n "$fallback_release" ]]; then
+      fallback_candidate=$(canonical_release_target "$fallback_release" "$releases_dir" || true)
+      if [[ -n "$fallback_candidate" && -f "$fallback_candidate/.ci-fleet-engine-ref" ]]; then
+        fallback_ref=$(<"$fallback_candidate/.ci-fleet-engine-ref")
+        if [[ "$fallback_ref" =~ ^[0-9a-f]{40}$ ]] && runtime_release_complete "$fallback_candidate" "$fallback_ref" \
+          && release_tree_permissions_trusted "$fallback_candidate"; then target=$fallback_candidate; fi
+      fi
     fi
   fi
   [[ -n "$target" || ( -z "$status" && "$captured_current_state" != link ) ]] || die 'a trusted complete runtime release is required before controller mutation'
@@ -1596,6 +1757,9 @@ make_checkpoint() {
     install -m 0600 "$rendered_env" "$checkpoint_dir/ci-fleet.env"
     install -m 0600 "$rendered_env" "$checkpoint_dir/image-env"
     capture_legacy_image_ids "$checkpoint_dir/image-env"
+    if portable_managed_images "$rendered_env" "$target"; then
+      prepare_checkpoint_image_binding "$rendered_env" "$checkpoint_dir" "$target"
+    fi
     load_checkpoint_images "$checkpoint_dir/ci-fleet.env" || die 'installed image tags are invalid'
     if ! runner_id=$(docker image inspect --format '{{.Id}}' "${checkpoint_images[0]}" 2>/dev/null); then
       docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
@@ -1634,7 +1798,7 @@ make_checkpoint() {
     printf 'CI_FLEET_RUNNER_IMAGE_ID=%s\nCI_FLEET_CONTROLLER_IMAGE_ID=%s\n' "$runner_id" "$controller_id" >"$checkpoint_dir/fresh-image-ids"
     chmod 0600 "$checkpoint_dir/fresh-image-ids"
   fi
-  [[ ! -f "$state_file" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
+  [[ ! -f "$state_file" || -f "$checkpoint_dir/install-state.json" ]] || install -m 0600 "$state_file" "$checkpoint_dir/install-state.json"
   if [[ -n "$target" ]]; then
     printf '%s\n' "$target" >"$checkpoint_dir/release-target"
     chmod 0600 "$checkpoint_dir/release-target"
@@ -1674,12 +1838,16 @@ try_drain_current() {
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
+  if [[ -n "$status" ]]; then
+    old_release=$(runtime_release_for_environment "$drain_env" "$fallback_release") || {
+      drain_error='cannot drain without a trusted complete source matching the incumbent engine revision'
+      return 1
+    }
+  fi
   case "$status" in
     running|'') ;;
     exited|created|dead)
       [[ -f "$drain_env" ]] || { drain_error="cannot stop restartable controller state without its rendered environment: $status"; return 1; }
-      old_release=$(current_runtime_release)
-      [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error="cannot stop restartable controller state without its runtime release: $status"; return 1; }
       compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop restartable controller state: $status"; return 1; }
       status=
@@ -1690,8 +1858,6 @@ try_drain_current() {
         return 1
       fi
       [[ -f "$drain_env" ]] || { drain_error='cannot stop a non-terminal candidate without its rendered environment'; return 1; }
-      old_release=$(current_runtime_release)
-      [[ -n "$old_release" ]] || old_release=$fallback_release
       [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
       if [[ "$status" == paused ]]; then
         compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || { drain_error="failed to unpause non-terminal candidate state: $status"; return 1; }
@@ -1702,8 +1868,6 @@ try_drain_current() {
   esac
   if [[ "$status" == running ]]; then
     if [[ ! -f "$drain_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
-    old_release=$(current_runtime_release)
-    [[ -n "$old_release" ]] || old_release=$fallback_release
     if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
     if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
       paused=true
@@ -1860,6 +2024,19 @@ activate_candidate() {
   mv -Tf "$temporary/current" "$current_link"
   install_manager
   install_systemd_units "$release_dir"
+  staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
+  staging_paths+=("$staged_state")
+  python3 - "$candidate_metadata" "$staged_state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["installed_at"] = sys.argv[3]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  chmod 0600 "$staged_state"
+  mv -f "$staged_state" "$state_file"
   if [[ "$target_state" == active ]]; then
     compose "$release_dir" "$rendered_env" up -d --remove-orphans controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
@@ -1874,19 +2051,6 @@ activate_candidate() {
   if [[ "$check_health" == true ]] && ! run_health_check "$release_dir" "$rendered_env" true; then
     die 'post-activation health check failed'
   fi
-  staged_state=$(mktemp "$state_root/.install-state.XXXXXX")
-  staging_paths+=("$staged_state")
-  python3 - "$candidate_metadata" "$staged_state" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
-import json
-import sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-value["installed_at"] = sys.argv[3]
-with open(sys.argv[2], "w", encoding="utf-8") as handle:
-    json.dump(value, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
-  chmod 0600 "$staged_state"
-  mv -f "$staged_state" "$state_file"
   systemctl enable --now "${timer_names[@]}" >/dev/null
   if [[ -f "$systemd_dir/ci-fleet-capacity.timer" ]]; then systemctl enable --now ci-fleet-capacity.timer >/dev/null; fi
   local opt_timer
@@ -1977,7 +2141,11 @@ PYTHON
 }
 
 managed_image_objects_match() {
-  local environment=$1 engine identifier expression
+  local environment=$1 release=${2:-} engine identifier expression
+  if portable_managed_images "$environment" "$release"; then
+    portable_image_objects_match "$environment" "$release"
+    return
+  fi
   local -a identifiers=()
   engine=$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")
   [[ "$engine" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -1992,7 +2160,8 @@ managed_image_objects_match() {
 }
 
 restore_reviewed_image_tags() {
-  local environment=$1 image identifier mapping
+  local environment=$1 release=${2:-} image identifier mapping
+  managed_image_objects_match "$environment" "$release" || return 1
   local -a mappings=()
   mapfile -t mappings < <(awk -F= '
     $1 == "CI_FLEET_CONTROLLER_IMAGE" {controller=$2}
@@ -2001,6 +2170,15 @@ restore_reviewed_image_tags() {
     $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {runner_digest=$2}
     END {if (controller && controller_digest && runner && runner_digest) {print controller " " controller_digest; print runner " " runner_digest}}
   ' "$environment")
+  if portable_managed_images "$environment" "$release"; then
+    mapfile -t mappings < <(awk -F= '
+      $1 == "CI_FLEET_CONTROLLER_IMAGE" {controller=$2}
+      $1 == "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID" {controller_id=$2}
+      $1 == "CI_FLEET_RUNNER_IMAGE" {runner=$2}
+      $1 == "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID" {runner_id=$2}
+      END {if (controller && controller_id && runner && runner_id) {print controller " " controller_id; print runner " " runner_id}}
+    ' "$environment")
+  fi
   [[ ${#mappings[@]} == 2 ]] || return 1
   for mapping in "${mappings[@]}"; do
     read -r image identifier <<<"$mapping"
@@ -2010,9 +2188,21 @@ restore_reviewed_image_tags() {
 
 preflight_checkpoint_images() {
   local release=$1 environment=$2 identifier error reproducible=false rebuilt=false
-  checkpoint_images_reproducible "$release" && reproducible=true
   local -a identifiers=()
-  mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" || $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  [[ -f "$release/.ci-fleet-engine-ref" && $(<"$release/.ci-fleet-engine-ref") == "$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$environment")" ]] || {
+    note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=checkpoint source does not match its captured engine revision'
+    return 1
+  }
+  if portable_managed_images "$environment" "$release"; then
+    portable_image_objects_match "$environment" "$release" || {
+      note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=portable checkpoint requires its protected binding and retained runtime objects'
+      return 1
+    }
+    mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID" || $1 == "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID" {print $2}' "$environment")
+  else
+    checkpoint_images_reproducible "$release" && reproducible=true
+    mapfile -t identifiers < <(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" || $1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$environment")
+  fi
   [[ ${#identifiers[@]} == 2 ]] || return 1
   identifiers+=("${checkpoint_images[@]:2}")
   for identifier in "${identifiers[@]}"; do
@@ -2031,7 +2221,7 @@ preflight_checkpoint_images() {
       [[ $(docker image inspect --format '{{.Id}}' "$identifier" 2>/dev/null) == "$identifier" ]] || return 1
     fi
   done
-  managed_image_objects_match "$environment"
+  managed_image_objects_match "$environment" "$release"
 }
 
 rebuild_checkpoint_images() {
@@ -2041,7 +2231,7 @@ rebuild_checkpoint_images() {
     return 1
   fi
   build_managed_images "$release" "$environment" true || return 1
-  managed_image_objects_match "$environment"
+  managed_image_objects_match "$environment" "$release"
 }
 
 retag_checkpoint_image() {
@@ -2153,7 +2343,7 @@ PY
     fi
     runtime_target=$(canonical_release_target "$checkpoint_release" "$releases_dir" || true)
     if [[ -z "$runtime_target" ]]; then
-      if [[ "$checkpoint_release" != "$manager_releases/"* || -L "$checkpoint_release" ]]; then
+      if [[ ( $(dirname "$checkpoint_release") != "$manager_releases" && "$checkpoint_release" != "$install_root" ) || -L "$checkpoint_release" ]]; then
         note 'ROLLBACK_FAILED reason=checkpoint release target is invalid'
         return 1
       fi
@@ -2265,7 +2455,9 @@ PYTHON
     note 'ROLLBACK_FAILED reason=checkpoint image mappings are invalid'
     return 1
   elif ! $new_format && [[ -f "$checkpoint_dir/ci-fleet.env" ]]; then
-    if ! managed_images_match "$checkpoint_dir/ci-fleet.env"; then
+    if [[ ! -f "$checkpoint_release/.ci-fleet-engine-ref" \
+      || $(<"$checkpoint_release/.ci-fleet-engine-ref") != "$(awk -F= '$1 == "CI_FLEET_ENGINE_REF" {print $2}' "$checkpoint_dir/ci-fleet.env")" ]] \
+      || ! managed_images_match "$checkpoint_dir/ci-fleet.env" "$checkpoint_release"; then
       note 'ROLLBACK_IMAGE_REINSTALL_REQUIRED reason=legacy checkpoint requires matching reviewed image tags'
       return 1
     fi
@@ -2383,8 +2575,8 @@ PY
     restored_state=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_STATE" {print $2}' "$rendered_env") || failed=1
     [[ "$restored_state" == active || "$restored_state" == drained || "$restored_state" == disabled ]] || failed=1
     if ((failed == 0)) && grep -Eq '^CI_FLEET_(CONTROLLER|RUNNER)_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$image_environment"; then
-      if $new_format; then restore_reviewed_image_tags "$image_environment" || failed=1; fi
-      if ((failed == 0)); then managed_images_match "$image_environment" || failed=1; fi
+      if $new_format; then restore_reviewed_image_tags "$image_environment" "$checkpoint_release" || failed=1; fi
+      if ((failed == 0)); then managed_images_match "$image_environment" "$checkpoint_release" || failed=1; fi
     else
       note 'ROLLBACK_IMAGE_DIGEST_UNAVAILABLE legacy_checkpoint=true'
       failed=1
@@ -2711,8 +2903,16 @@ perform_converge() {
     return
   fi
   capture_current_pointer
+  # Canonical release installation would invalidate a historical in-place tree.
+  current_target=$(current_runtime_release)
+  if [[ "$current_target" == "$install_root" ]]; then
+    current_ref=$(<"$current_target/.ci-fleet-engine-ref")
+    install_release "$current_ref" "$releases_dir/$current_ref" 0 0
+  fi
   install_release
-  compose "$release_dir" "$candidate_env" config --quiet
+  if ! portable_managed_images "$candidate_env" "$release_dir"; then
+    compose "$release_dir" "$candidate_env" config --quiet
+  fi
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
   candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
   [[ -n "$candidate_runner_image" && -n "$candidate_controller_image" ]] || die 'rendered candidate image name is missing'
@@ -2917,6 +3117,12 @@ else
 fi
 export CI_FLEET_ROLE_ADMISSION_LOCK_FD=6
 export CI_FLEET_INSTALLER_LOCK_FD=9
+if [[ "$mode" == policy-action || "$mode" == rollback || "$mode" == uninstall ]]; then
+  reject_isolated_host
+  private_temporary=$(mktemp -d /run/ci-fleet-prepare.XXXXXX)
+  rmdir "$temporary"
+  temporary=$private_temporary
+fi
 if [[ "$mode" == policy-action ]]; then
   perform_policy_action
   exit 0
@@ -2925,6 +3131,9 @@ case "$mode" in
   check|install|adopt|upgrade)
     reject_isolated_host
     validate_common_arguments
+    private_temporary=$(mktemp -d /run/ci-fleet-prepare.XXXXXX)
+    rmdir "$temporary"
+    temporary=$private_temporary
     resolve_config
     validate_candidate_config_commit
     config_tree=$(git -C "$config_source_checkout" rev-parse "$config_ref^{tree}") || die 'configuration tree is unavailable'

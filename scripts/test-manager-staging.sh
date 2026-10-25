@@ -104,7 +104,9 @@ bash "$temporary/recovery.sh"
   cat <<'TEST'
 repo_root=$1
 root=$2
+portable_managed_images() { return 1; }
 mkdir -p "$root/legacy" "$root/reviewed"
+for release in "$root/legacy" "$root/reviewed"; do printf '0000000000000000000000000000000000000001\n' >"$release/.ci-fleet-engine-ref"; done
 printf '{"schema_version":1,"capabilities":{"reproducible_managed_images":false}}\n' >"$root/legacy/engine-capabilities.json"
 cp "$repo_root/engine-capabilities.json" "$root/reviewed/engine-capabilities.json"
 build_managed_images() { [[ ${build_available:-true} == true ]] || return 1; printf 'build\n' >>"$root/rebuild.log"; image_present=true; }
@@ -190,6 +192,10 @@ evidence = {"schema_version": 1, "status_reporting_engine_capabilities": {
     name: dict(engine_ref="1" * 40, docker_network_policy_config=True, docker_default_bridge_cidr_config=True, status_reporting_config=False, required_status_reporting=False)
     for name in value["controllers"]}}
 (configuration / "engine-rollout-evidence.json").write_text(json.dumps(evidence))
+pending = copy.deepcopy(evidence)
+for record in pending["status_reporting_engine_capabilities"].values():
+    record["engine_ref"] = "2" * 40
+(configuration / "next-engine-rollout-evidence.json").write_text(json.dumps(pending))
 subprocess.run(["git", "init", "-q", str(configuration)], check=True)
 for index in range(2):
     candidate = copy.deepcopy(value)

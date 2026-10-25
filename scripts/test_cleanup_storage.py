@@ -41,6 +41,122 @@ def usage():
 
 
 class StorageTests(unittest.TestCase):
+    def test_failed_fresh_policy_is_prospective_but_original_ids_remain_protected(self):
+        for portable in (False, True):
+            with self.subTest(portable=portable), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+                root = Path(directory)
+                current = root / "etc/ci-fleet/ci-fleet.env"
+                current.parent.mkdir(parents=True)
+                revision = "a" * 40
+                values = f"CI_FLEET_ENGINE_REF={revision}\nCI_FLEET_RUNNER_IMAGE=runner:B\nCI_FLEET_CONTROLLER_IMAGE=controller:B\nCI_FLEET_RUNNER_IMAGE_DIGEST={IMAGE}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={OTHER}\n"
+                if portable:
+                    values += f"CI_FLEET_RUNNER_RUNTIME_IMAGE_ID={IMAGE}\nCI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID={OTHER}\n"
+                current.write_text(values)
+                release = root / "opt/ci-fleet/releases" / revision
+                release.mkdir(parents=True)
+                (release / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": portable}}))
+                fresh = root / "var/lib/ci-fleet/checkpoints/failed-A"
+                fresh.mkdir(parents=True)
+                prospective = "sha256:" + "c" * 64
+                retained = "sha256:" + "d" * 64
+                (fresh / "fresh-image-env").write_text(f"CI_FLEET_ENGINE_REF={'b' * 40}\nCI_FLEET_RUNNER_IMAGE=runner:A\nCI_FLEET_CONTROLLER_IMAGE=controller:A\nCI_FLEET_RUNNER_IMAGE_DIGEST={prospective}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={prospective}\nCI_FLEET_RUNNER_RUNTIME_IMAGE_ID={prospective}\n")
+                captured = fresh / "fresh-image-ids"
+                captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                binding = {"roles": {name: {"config_digest": value, "runtime_image_id": value, "manifest_digest": None}
+                                     for name, value in (("runner", IMAGE), ("controller", OTHER))}}
+                accounting = {"Images": [image(IMAGE), image(OTHER)]}
+                with patch.object(cleanup, "read_bindings", return_value=binding) as read:
+                    protected = cleanup.protected_images(accounting)
+                    self.assertNotIn(prospective, protected)
+                    self.assertEqual(read.call_count, int(portable))
+                    captured.write_text(f"CI_FLEET_RUNNER_IMAGE_ID={retained}\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                    with self.assertRaisesRegex(ValueError, "unresolved"):
+                        cleanup.protected_images(accounting)
+                    accounting["Images"].append(image(retained))
+                    self.assertIn(retained, cleanup.protected_images(accounting))
+                    captured.unlink()
+                    with self.assertRaises((OSError, ValueError)):
+                        cleanup.protected_images(accounting)
+                    captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\n")
+                    with self.assertRaisesRegex(ValueError, "mappings"):
+                        cleanup.protected_images(accounting)
+                    if portable:
+                        captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                        read.side_effect = ValueError("unknown current proof")
+                        with self.assertRaisesRegex(ValueError, "unknown current proof"):
+                            cleanup.protected_images(accounting)
+
+    def test_retained_historical_source_protects_distinct_opaque_and_portable_ids(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+            root = Path(directory)
+            current = root / "etc/ci-fleet/ci-fleet.env"
+            current.parent.mkdir(parents=True)
+            checkpoint = root / "var/lib/ci-fleet/checkpoints/legacy"
+            checkpoint.mkdir(parents=True)
+            old_ref, new_ref = "a" * 40, "b" * 40
+            old_runner, old_controller, runner_c, controller_c, runner_r, controller_r = (
+                "sha256:" + character * 64 for character in "123456")
+            legacy = (f"CI_FLEET_ENGINE_REF={old_ref}\nCI_FLEET_RUNNER_IMAGE=runner:legacy\nCI_FLEET_CONTROLLER_IMAGE=controller:legacy\n"
+                      f"CI_FLEET_RUNNER_IMAGE_DIGEST={old_runner}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={old_controller}\n")
+            (checkpoint / "ci-fleet.env").write_text(legacy)
+            (checkpoint / "image-env").write_text(legacy)
+            (checkpoint / "image-ids.env").write_text(f"CI_FLEET_RUNNER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_IMAGE_ID={old_controller}\n")
+            current.write_text(f"CI_FLEET_ENGINE_REF={new_ref}\nCI_FLEET_RUNNER_IMAGE=runner:current\nCI_FLEET_CONTROLLER_IMAGE=controller:current\n"
+                               f"CI_FLEET_RUNNER_IMAGE_DIGEST={runner_c}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={controller_c}\n"
+                               f"CI_FLEET_RUNNER_RUNTIME_IMAGE_ID={runner_r}\nCI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID={controller_r}\n")
+            install_root = root / "opt/ci-fleet"
+            new = install_root / "releases" / new_ref
+            new.mkdir(parents=True)
+            (new / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": True}}))
+            old = install_root / "manager/releases/historical-runtime"
+            old.mkdir(parents=True)
+            marker = old / ".ci-fleet-engine-ref"
+            marker.write_text(old_ref + "\n")
+            manifest = old / "engine-capabilities.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": False}}))
+            pointer = checkpoint / "release-target"
+            pointer.write_text(str(old) + "\n")
+            bound = {"roles": {role: {"config_digest": config, "runtime_image_id": runtime, "manifest_digest": None}
+                               for role, config, runtime in (("runner", runner_c, runner_r), ("controller", controller_c, controller_r))}}
+            accounting = {"Images": [image(identity=value, RepoTags=[]) for value in (old_runner, old_controller, runner_r, controller_r)]}
+            with patch.object(cleanup, "read_bindings", return_value=bound) as read:
+                protected = cleanup.protected_images(accounting)
+                self.assertTrue({old_runner, old_controller, runner_c, controller_c, runner_r, controller_r} <= protected)
+                self.assertEqual(read.call_count, 1)
+                self.assertNotIn("absent", protected)
+                for change in ("missing", "wrong-revision", "writable-parent", "symlink", "outside", "mismatched-source", "missing-pointer"):
+                    with self.subTest(change=change):
+                        saved = pointer.read_bytes()
+                        if change == "missing": marker.unlink()
+                        elif change == "wrong-revision": marker.write_text(new_ref + "\n")
+                        elif change == "writable-parent": old.parent.chmod(0o777)
+                        elif change == "symlink": marker.unlink(); marker.symlink_to(new / "engine-capabilities.json")
+                        elif change == "outside": pointer.write_text(str(root) + "\n")
+                        elif change == "mismatched-source": pointer.write_text(str(new) + "\n")
+                        else: pointer.unlink()
+                        with self.assertRaises((ValueError, OSError)):
+                            cleanup.protected_images(accounting)
+                        if marker.is_symlink(): marker.unlink()
+                        marker.write_text(old_ref + "\n")
+                        old.parent.chmod(0o755)
+                        pointer.write_bytes(saved)
+                read.side_effect = ValueError("unknown portable binding")
+                with self.assertRaisesRegex(ValueError, "unknown portable binding"):
+                    cleanup.protected_images(accounting)
+                read.side_effect = None
+                manifest.write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": True}}))
+                read.side_effect = lambda path, values: bound if path.parent != checkpoint else (_ for _ in ()).throw(ValueError("missing checkpoint proof"))
+                with self.assertRaisesRegex(ValueError, "missing checkpoint proof"):
+                    cleanup.protected_images(accounting)
+            # Current historical manual installations can retain the same protected source.
+            current.write_text(legacy)
+            (install_root / ".ci-fleet-engine-ref").write_text(old_ref + "\n")
+            (install_root / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": False}}))
+            manifest.write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": False}}))
+            with patch.object(cleanup, "read_bindings", side_effect=AssertionError("opaque source must not use portable proof")):
+                self.assertTrue({old_runner, old_controller} <= cleanup.protected_images(accounting))
+
     def test_docker_usage_reads_detailed_lists_on_old_and_new_daemons(self):
         for modern_daemon in (False, True):
             with self.subTest(modern_daemon=modern_daemon):
@@ -304,6 +420,10 @@ class StorageTests(unittest.TestCase):
             fresh_ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={OTHER}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
             protected = cleanup.protected_images()
             self.assertEqual(protected, {"runner:current", "controller:current", "runner:previous", "runner:original", IMAGE, OTHER, reviewed})
+            complete = {"Images": [image(identity=value, RepoTags=[]) for value in (IMAGE, OTHER, reviewed)]}
+            self.assertEqual(cleanup.protected_images(complete), protected)
+            with self.assertRaisesRegex(ValueError, "opaque rollback image identities are unresolved"):
+                cleanup.protected_images({"Images": [image(identity=OTHER, RepoTags=[])]})
             self.assertEqual(cleanup.image_reason(image(OTHER, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
             self.assertEqual(cleanup.image_reason(image(reviewed, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
             for path in (ids, fresh_ids, checkpoint / "image-env"):
