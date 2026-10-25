@@ -396,6 +396,69 @@ log_json() {{ :; }}
             self.assertEqual(result.returncode, 7, result.stderr)
             self.assertIn("history is unavailable", result.stderr)
 
+    def test_installer_fixture_stages_runtime_evidence_before_policy_reintroduction(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        helper = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "configuration"
+            def git(*arguments):
+                return subprocess.check_output(["git", "-C", str(repository), *arguments], text=True).strip()
+            repository.mkdir()
+            git("init", "-q")
+            git("config", "user.name", "fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            # Model an existing verified runtime, then a verified no-policy engine upgrade.
+            script = f"set -Eeuo pipefail\nrepo_root={shlex.quote(str(ROOT))}\nconfig_repo={shlex.quote(str(repository))}\nengine_ref={ENGINE}\n" + helper + f"""
+write_config active 1 1
+write_config active 1 1 "$engine_ref" false omit
+write_config active 1 1
+write_config active 1 1 {'b' * 40} false omit
+write_config active 1 1 {'b' * 40}
+"""
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                    env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            refs = result.stdout.splitlines()
+            self.assertEqual(len(refs), 5)
+            for before, selected in ((refs[1], refs[2]), (refs[3], refs[4])):
+                staged = git("rev-parse", selected + "^")
+                self.assertNotEqual(staged, before)
+                self.assertEqual(git("diff", "--name-only", before, staged), "engine-rollout-evidence.json")
+                self.assertEqual(git("rev-parse", before + ":fleet.json"), git("rev-parse", staged + ":fleet.json"))
+
+            def read(ref, name):
+                result = subprocess.run(["git", "-C", str(repository), "show", ref + ":" + name], capture_output=True, text=True)
+                return json.loads(result.stdout) if result.returncode == 0 else None
+
+            def validate(previous, current, prior_evidence, evidence, prior_pending=None, pending=None):
+                command = ["python3", str(ROOT / "templates/config-repository/scripts/validate.py"), "--strict", "--skip-path-scan"]
+                for option, value in (("previous-config", previous), ("config", current),
+                                      ("previous-rollout-evidence", prior_evidence), ("rollout-evidence", evidence),
+                                      ("previous-next-engine-rollout-evidence", prior_pending), ("next-engine-rollout-evidence", pending)):
+                    if value is not None:
+                        path = root / option
+                        path.write_text(json.dumps(value))
+                        command.extend(("--" + option, str(path)))
+                return subprocess.run(command, capture_output=True, text=True,
+                                      env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"})
+
+            for ref in git("rev-list", "--reverse", refs[0] + ".." + refs[-1]).splitlines():
+                before = git("rev-parse", ref + "^")
+                result = validate(read(before, "fleet.json"), read(ref, "fleet.json"),
+                                  read(before, "engine-rollout-evidence.json"), read(ref, "engine-rollout-evidence.json"),
+                                  read(before, "next-engine-rollout-evidence.json"), read(ref, "next-engine-rollout-evidence.json"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+            omitted, policy = read(refs[1], "fleet.json"), read(refs[2], "fleet.json")
+            unproven, proven = read(refs[1], "engine-rollout-evidence.json"), read(refs[2], "engine-rollout-evidence.json")
+            wrong = json.loads(json.dumps(proven))
+            wrong["status_reporting_engine_capabilities"]["example-ci-01"]["engine_ref"] = "b" * 40
+            for previous_proof, current_proof in ((unproven, proven), (None, proven), (wrong, proven),
+                                                  (proven, unproven), (proven, wrong)):
+                result = validate(omitted, policy, previous_proof, current_proof)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("capability evidence", result.stderr)
+
     def test_cleanup_protects_current_and_checkpoint_c_r_m_without_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

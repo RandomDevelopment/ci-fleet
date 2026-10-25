@@ -833,6 +833,19 @@ prior_path = Path(target)
 prior = json.loads(prior_path.read_text()) if prior_path.exists() else None
 proof = {"engine_ref": engine_ref, "status_reporting_config": True,
          "required_status_reporting": True, "docker_network_policy_config": network_policy != "omit"}
+if (prior and "managed_images" in prior
+        and prior["controllers"]["example-ci-01"]["engine_ref"] == engine_ref
+        and "docker_network_policy" not in prior["controllers"]["example-ci-01"]
+        and network_policy != "omit"):
+    # These callers model the same already-verified runtime before adding policy.
+    evidence_path = Path(evidence_target)
+    evidence = json.loads(evidence_path.read_text())
+    incumbent = evidence["status_reporting_engine_capabilities"].get("example-ci-01", {})
+    if incumbent.get("engine_ref") == engine_ref and incumbent != proof:
+        evidence["status_reporting_engine_capabilities"]["example-ci-01"] = proof
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n")
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(evidence_path)], check=True)
+        subprocess.run(["git", "-C", str(prior_path.parent), "commit", "-qm", "fixture verified runtime capabilities", "--", str(evidence_path)], check=True)
 pending_path = prior_path.parent / "next-engine-rollout-evidence.json"
 if prior and "managed_images" in prior and prior["controllers"]["example-ci-01"]["engine_ref"] == engine_ref and pending_path.exists():
     pending_record = json.loads(pending_path.read_text())["status_reporting_engine_capabilities"].get("example-ci-01")
@@ -855,12 +868,7 @@ with open(evidence_target, "w", encoding="utf-8") as handle:
     json.dump({
         "schema_version": 1,
         "status_reporting_engine_capabilities": {
-            "example-ci-01": {
-                "engine_ref": engine_ref,
-                "status_reporting_config": True,
-                "required_status_reporting": True,
-                "docker_network_policy_config": network_policy != "omit",
-            },
+            "example-ci-01": proof,
         },
     }, handle, indent=2)
     handle.write("\n")
@@ -1645,6 +1653,9 @@ cp "$tmp/pre-adapter-current-tags/runner-state" "$tmp/pre-adapter-runner-image-p
 cp "$tmp/pre-adapter-current-tags/runner-id" "$tmp/pre-adapter-runner-image-id"
 cp "$tmp/pre-adapter-current-tags/controller-state" "$tmp/pre-adapter-controller-image-present"
 cp "$tmp/pre-adapter-current-tags/controller-id" "$tmp/pre-adapter-controller-image-id-state"
+# Verify the target runtime without policy before recording its policy capability.
+pre_adapter_reactivation_ref=$(write_config active 1 1 "$engine_ref" false omit)
+expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_reactivation_ref" >/dev/null
 ref_one=$(write_config active 1 1)
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
@@ -3694,6 +3705,8 @@ legacy_disabled_ref=$(write_config active 1 1 "$legacy_engine_ref" false omit)
 expect_failure 'selected engine does not support status reporting configuration' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_disabled_ref"
 legacy_required_ref=$(write_config active 1 1 "$legacy_engine_ref" true omit)
 expect_failure 'selected engine does not advertise required status reporting' "$installer" --upgrade "${base_args[@]}" --ref "$legacy_required_ref"
+# Rejected fixture candidates are separate from the verified incumbent's history.
+git -C "$config_repo" reset -q --hard "$ref_one"
 # Exercise telemetry removal without changing the existing Docker network policy.
 legacy_engine_ref=8bd27a2e7451806a1e37f79a15eeb7c677a12c3e
 legacy_ref=$(write_config active 1 1 "$legacy_engine_ref" omit)
@@ -3741,6 +3754,8 @@ export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
 expect_success "$retained_installer" --upgrade "${base_args[@]}" --ref "$ref_one" >/dev/null
 [[ -f "$adopt_root/etc/systemd/system/ci-fleet-capacity.timer" ]] || fail 'upgrade back from legacy did not restore capacity units'
 grep -Fq 'CI_FLEET_POOL=trusted-ci' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'upgrade back from legacy did not restore the telemetry pool'
+# Continue configuration history from the exact commit just verified above.
+git -C "$config_repo" reset -q --hard "$ref_one"
 rollback_stop_ref=$(write_config active 2 2)
 export FAKE_FAIL_UP_ONCE=$tmp/rollback-stop-fail-up
 export FAKE_FAIL_CAPACITY_STOP_ONCE=$tmp/rollback-stop-failure
