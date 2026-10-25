@@ -131,6 +131,13 @@ For detailed errors and recovery commands, use the runbook linked from the selec
 Follow [managed images](MANAGED-IMAGES.md) for runtime-source scalar semantics,
 producer evidence, protected warm proof and exact-ID recovery. Keep the existing
 Docker backend and capacity. Stage matching pending capability evidence before
-selection, preserve image-free bootstrap predecessor rules, and obtain independent
+selection. Established image-free fleets first integrate any missing observed
+incumbent evidence, then target pending records, with fleet state unchanged in
+both preparatory commits. Preserve those records through manager staging and image
+introduction. For manual adoption, confirm that trusted complete incumbent source
+and exact original objects remain available. A candidate with a different revision
+cannot substitute its Compose or identity semantics for recovery. Preserve captured
+historical source paths for maintenance. Missing or untrusted source/proof requires
+controlled preparation or reviewed recovery before retrying. Obtain independent
 native classic/containerd evidence before host activation. Do not repair drift by
 editing rendered runtime IDs or replacing historical image catalogs.

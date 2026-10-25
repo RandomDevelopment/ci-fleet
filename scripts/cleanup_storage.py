@@ -6,6 +6,7 @@ from datetime import datetime
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import socket
@@ -63,6 +64,50 @@ def disk_percent() -> int:
     return (used * 100 + total - 1) // total
 
 
+def retained_image_release(environment: Path, revision: str, *, current: bool) -> Path:
+    install_root = coordination.host_path("/opt/ci-fleet")
+    canonical = install_root / "releases" / revision
+    pointer = environment.parent / "release-target"
+    release = canonical
+    captured = not current and (pointer.exists() or pointer.is_symlink())
+    if captured:
+        coordination.trusted_path(pointer, directory=False)
+        raw = pointer.read_bytes()
+        if not 2 <= len(raw) <= 4096 or raw.count(b"\n") != 1 or not raw.endswith(b"\n") or b"\0" in raw:
+            raise ValueError("retained image source pointer is invalid")
+        release = Path(os.fsdecode(raw[:-1]))
+    elif current and not canonical.exists():
+        for link in (install_root / "current", install_root / "manager/current"):
+            if link.is_symlink():
+                if link.lstat().st_uid != os.geteuid():
+                    raise ValueError("retained image source pointer owner is invalid")
+                release = Path(os.readlink(link))
+                break
+            if link.exists():
+                raise ValueError("retained image source pointer is invalid")
+        else:
+            if (install_root / ".ci-fleet-engine-ref").exists():
+                release = install_root
+    if (not release.is_absolute() or str(release) != os.path.normpath(str(release))
+            or (release != canonical and release != install_root
+                and release.parent != install_root / "manager/releases")):
+        raise ValueError("retained image source path is invalid")
+    # Authenticate the captured context as well as the manifest, including ancestors.
+    boundary = coordination.host_path("/")
+    for directory in (release, *release.parents):
+        coordination.trusted_path(directory, directory=True)
+        if directory == boundary:
+            break
+    else:
+        raise ValueError("retained image source is outside the host root")
+    marker = release / ".ci-fleet-engine-ref"
+    if captured or release != canonical or marker.exists() or marker.is_symlink():
+        coordination.trusted_path(marker, directory=False)
+        if marker.read_bytes() != (revision + "\n").encode("ascii"):
+            raise ValueError("retained image source revision does not match the captured engine")
+    return release
+
+
 def protected_images(usage: dict | None = None) -> set[str]:
     current = coordination.host_path("/etc/ci-fleet/ci-fleet.env")
     checkpoints = coordination.host_path("/var/lib/ci-fleet/checkpoints")
@@ -115,8 +160,7 @@ def protected_images(usage: dict | None = None) -> set[str]:
         if revision:
             if not re.fullmatch(r"[0-9a-f]{40}", revision):
                 raise ValueError("retained image engine is invalid")
-            release = coordination.host_path("/opt/ci-fleet/releases") / revision
-            coordination.trusted_path(release, directory=True)
+            release = retained_image_release(path, revision, current=path == current)
             manifest = release / "engine-capabilities.json"
             if manifest.exists() or manifest.is_symlink():
                 coordination.trusted_path(manifest, directory=False)

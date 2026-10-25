@@ -939,8 +939,46 @@ def main(*, retained_configuration: bool = False) -> int:
         scan_secret_material(config, validation)
         previous = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
         current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
+        previous_evidence = (
+            load_json(args.previous_rollout_evidence.absolute(), validation)
+            if args.previous_rollout_evidence
+            else None
+        )
+        previous_compatible_engine_refs = (
+            validate_rollout_evidence(previous_evidence, validation)
+            if previous_evidence is not None
+            else {}
+        )
+        previous_next_evidence = (
+            load_json(args.previous_next_engine_rollout_evidence.absolute(), validation)
+            if args.previous_next_engine_rollout_evidence
+            else None
+        )
+        previous_next_engine_refs = (
+            validate_rollout_evidence(
+                previous_next_evidence,
+                validation,
+                "previous next-engine-rollout-evidence.json",
+            )
+            if previous_next_evidence is not None
+            else {}
+        )
+        # Preparation adds reviewed evidence without selecting a manager or runtime.
+        evidence_preparation = (
+            isinstance(previous, dict) and isinstance(current_controllers, dict) and config == previous
+            and bool(previous.get("controllers")) and "managed_images" not in previous
+            and (current_compatible_engine_refs != previous_compatible_engine_refs
+                 or current_next_engine_refs != previous_next_engine_refs)
+            and all(current_compatible_engine_refs.get(name) == record
+                    for name, record in previous_compatible_engine_refs.items())
+            and all(current_next_engine_refs.get(name) == record
+                    for name, record in previous_next_engine_refs.items())
+            and all(isinstance(current_controllers.get(name), dict)
+                    and current_controllers[name].get("engine_ref") == record["engine_ref"]
+                    for name, record in current_compatible_engine_refs.items())
+        )
         manager_bootstrap = (
-            isinstance(config, dict) and isinstance(previous, dict)
+            not evidence_preparation and isinstance(config, dict) and isinstance(previous, dict)
             and isinstance(previous.get("controllers"), dict) and bool(previous["controllers"])
             and isinstance(current_controllers, dict)
             and ("managed_images" not in config or "managed_images" not in previous)
@@ -953,7 +991,7 @@ def main(*, retained_configuration: bool = False) -> int:
                        for name, record in current_compatible_engine_refs.items())
             )
         )
-        validate_config(config, validation, args.strict, allow_manager_staging=manager_bootstrap or retained_configuration)
+        validate_config(config, validation, args.strict, allow_manager_staging=manager_bootstrap or evidence_preparation or retained_configuration)
         if manager_bootstrap:
             validate_config(previous, validation, False)
             current_controllers = dict(current_controllers)
@@ -995,30 +1033,6 @@ def main(*, retained_configuration: bool = False) -> int:
             validation.require(
                 isinstance(previous, dict) and isinstance(previous.get("controllers"), dict),
                 "--previous-config", "must contain a controllers object for rollout validation",
-            )
-            previous_evidence = (
-                load_json(args.previous_rollout_evidence.absolute(), validation)
-                if args.previous_rollout_evidence
-                else None
-            )
-            previous_compatible_engine_refs = (
-                validate_rollout_evidence(previous_evidence, validation)
-                if previous_evidence is not None
-                else {}
-            )
-            previous_next_evidence = (
-                load_json(args.previous_next_engine_rollout_evidence.absolute(), validation)
-                if args.previous_next_engine_rollout_evidence
-                else None
-            )
-            previous_next_engine_refs = (
-                validate_rollout_evidence(
-                    previous_next_evidence,
-                    validation,
-                    "previous next-engine-rollout-evidence.json",
-                )
-                if previous_next_evidence is not None
-                else {}
             )
             if manager_bootstrap:
                 validation.require(current_compatible_engine_refs == previous_compatible_engine_refs,
@@ -1081,7 +1095,7 @@ def main(*, retained_configuration: bool = False) -> int:
                     previous_compatible_engine_refs,
                     previous_next_engine_refs,
                     manager_bootstrap=manager_bootstrap,
-                    enforce_managed_images=args.strict,
+                    enforce_managed_images=args.strict and not evidence_preparation,
                 )
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)

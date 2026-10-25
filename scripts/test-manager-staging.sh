@@ -106,6 +106,7 @@ repo_root=$1
 root=$2
 portable_managed_images() { return 1; }
 mkdir -p "$root/legacy" "$root/reviewed"
+for release in "$root/legacy" "$root/reviewed"; do printf '0000000000000000000000000000000000000001\n' >"$release/.ci-fleet-engine-ref"; done
 printf '{"schema_version":1,"capabilities":{"reproducible_managed_images":false}}\n' >"$root/legacy/engine-capabilities.json"
 cp "$repo_root/engine-capabilities.json" "$root/reviewed/engine-capabilities.json"
 build_managed_images() { [[ ${build_available:-true} == true ]] || return 1; printf 'build\n' >>"$root/rebuild.log"; image_present=true; }

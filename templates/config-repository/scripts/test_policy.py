@@ -182,6 +182,56 @@ class PolicyTests(unittest.TestCase):
                 result = self.rollout_cli(introduced, introduced, active, pending, pending)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_cli_image_free_evidence_preparation_uses_each_immediate_predecessor(self):
+        for missing_incumbent in (False, True):
+            for portable in (False, True):
+                with self.subTest(missing_incumbent=missing_incumbent, portable=portable):
+                    fleet, name, active, pending = self.pending_rollout()
+                    images = fleet.pop("managed_images")
+                    fleet["controllers"][name].pop("docker_network_policy")
+                    for records in (active, pending):
+                        for key in records[name]:
+                            if key != "engine_ref":
+                                records[name][key] = False
+                    pending[name]["portable_managed_image_ids"] = portable
+                    before_active = {} if missing_incumbent else active
+                    if missing_incumbent:
+                        result = self.rollout_cli(fleet, fleet, {}, active)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    result = self.rollout_cli(fleet, fleet, active, active, None, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    staged = copy.deepcopy(fleet)
+                    staged["controllers"][name]["engine_ref"] = pending[name]["engine_ref"]
+                    result = self.rollout_cli(fleet, staged, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    introduced = copy.deepcopy(staged)
+                    introduced["managed_images"] = {pending[name]["engine_ref"]: next(iter(images.values()))}
+                    result = self.rollout_cli(staged, introduced, active, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Configuration-only proof of the final transition. Real activation is external.
+                    result = self.rollout_cli(introduced, introduced, active, pending, pending)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    changed = copy.deepcopy(fleet)
+                    changed["controllers"][name]["state"] = "drained"
+                    wrong = {name: {**pending[name], "engine_ref": "b" * 40}}
+                    cases = (
+                        (fleet, fleet, active, active, None, None),  # true no-op
+                        (fleet, changed, active, active, None, pending),
+                        (fleet, staged, before_active, active, None, pending),
+                        (fleet, staged, active, pending, pending, None),
+                        (fleet, fleet, before_active, pending, None, pending),
+                        (fleet, staged, active, active, wrong, pending),
+                        (staged, staged, active, pending, pending, None),
+                        (staged, introduced, active, pending, pending, None),
+                        (introduced, staged, pending, pending, None, None),
+                    )
+                    for case in cases:
+                        result = self.rollout_cli(*case)
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                    empty = copy.deepcopy(fleet)
+                    empty["controllers"] = {}
+                    self.assertNotEqual(self.rollout_cli(empty, fleet, {}, active, None, pending).returncode, 0)
+
     def test_empty_pending_sidecar_is_rejected(self):
         validation = Validation()
         validate_rollout_evidence({"schema_version": 1, "status_reporting_engine_capabilities": {}},

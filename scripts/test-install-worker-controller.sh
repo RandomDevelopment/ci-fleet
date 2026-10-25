@@ -9,12 +9,36 @@ grep -Fqx 'OnActiveSec=2min' "$health_timer" || { printf 'FAIL: health timer lac
 grep -Fq 'export CI_FLEET_HEALTH_SUPPRESS_DELIVERY=1' "$repo_root/scripts/install-worker-controller.sh" || { printf 'FAIL: installer health check can submit monitoring reports\n' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Historical inputs are fetched before the fake Git transport. Never fall back
+# to a live remote from an installed synthetic engine during a fixture phase.
+prepare_historical_engine_inputs() {
+  local source=$1 target=$2 revision origin
+  shift 2
+  for revision in "$@"; do
+    origin=$source
+    if ! git -C "$source" cat-file -e "$revision^{commit}" 2>/dev/null; then
+      origin=https://github.com/RandomDevelopment/ci-fleet.git
+    fi
+    git -C "$target" fetch -q --no-tags --update-shallow "$origin" "$revision" || {
+      printf 'FAIL historical engine fixture input unavailable: %s\n' "$revision" >&2
+      return 1
+    }
+    [[ $(git -C "$target" rev-parse 'FETCH_HEAD^{commit}') == "$revision" ]] || {
+      printf 'FAIL historical engine fixture input identity mismatch: %s\n' "$revision" >&2
+      return 1
+    }
+  done
+}
 # Synthetic engine commits belong to the fixture, not the reviewed source checkout.
 fixture_repo=$tmp/core
 git init -q "$fixture_repo"
 git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" rev-parse HEAD)"
 git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
 git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
+prepare_historical_engine_inputs "$repo_root" "$fixture_repo" \
+  af9c0c13cd12866ce75dd6c43a4cda01915507e1 \
+  8bd27a2e7451806a1e37f79a15eeb7c677a12c3e \
+  003de44f7e27d7bfe5bb753098efb6eb5f9712f1
 repo_root=$fixture_repo
 # Existing transaction regressions model historical opaque-ID runtime sources.
 # Portable content proofs have separate parser and lifecycle regressions.

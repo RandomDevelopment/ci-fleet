@@ -78,7 +78,7 @@ does not substitute another host's image catalog. An image-enforced host cannot
 enter image-free staging by removing fields. Bootstrap LKG recovery still requires
 a complete protected checkpoint matching repository, configuration ref and
 controller. Formats 2/3 and unversioned checkpoints retain their original raw tag,
-live-image and absence distinctions. Checkpoint creation authenticates original metadata and environment before copying.
+live-image and absence distinctions. Portable checkpoint creation authenticates original metadata and environment before copying.
 It reuses warm proof, or performs controlled fresh proof of the same captured R
 into the new checkpoint when stale. It never repairs incumbent state during
 capture. Portable restoration requires its protected proof and exact retained
@@ -86,6 +86,26 @@ runtime and raw rollback objects before drain. Missing
 portable objects require a controlled verified offline import and reproof or
 separately authorized reinstall. Restoration does not rewrite a checkpoint to a
 different runtime root.
+
+Manual opaque adoption requires a complete trusted source for the incumbent's own
+engine revision. Source selection checks the installed runtime, that revision's
+canonical release, and retained manager source context. A portable candidate is
+never a recovery or drain source for a different opaque incumbent. Historical
+in-place sources are preserved as canonical pinned source before installing a
+candidate beneath them. Checkpoints retain the selected `release-target`.
+Preflight, drain and restoration use that source's Compose and image semantics,
+so an opaque environment needs no invented portable runtime fields or proof.
+A missing, mismatched or unsafe compatible source refuses before drain. Establish
+trusted source through controlled preparation or use reviewed reinstall recovery;
+retained image objects alone do not supply executable recovery source.
+
+Storage protection reads a checkpoint's authenticated `release-target` when
+present, including historical manager source locations. It does not require a
+never-installed canonical release for that checkpoint. Current source lookup also
+supports protected historical runtime context. Pointer paths, ownership,
+permissions, source revision and capability declarations must agree. Portable
+sources still require protected bindings; absent raw tags stay absent and opaque
+IDs remain exact. Unavailable or untrusted source/proof defers removal.
 
 Old opaque-ID reconstruction still requires the checkpoint release's
 `reproducible_managed_images` capability and its own build helper and tool pins.
@@ -142,7 +162,13 @@ The Dockerfiles fail closed if an upstream artifact no longer matches. Updating 
 
 Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upgrade without deadlocking reconciliation:
 
-1. Review and merge the actual engine before image production. Stage matching
+1. For an established image-free fleet, first integrate missing incumbent active
+   evidence in an evidence-only commit with `fleet.json` unchanged. It must describe
+   the already observed runtime and exact source capabilities, even when every flag
+   is false. Source review alone cannot establish activation. Retain existing
+   records unchanged. In a later evidence-only commit, add matching target pending
+   records, again keeping the entire fleet and existing evidence unchanged.
+   Review and merge the actual target engine before image production. Stage its
    capability records in `next-engine-rollout-evidence.json` while the incumbent
    engine and active evidence remain unchanged. Include the runtime source's
    `portable_managed_image_ids: true` declaration in its reviewed record.
@@ -165,7 +191,9 @@ Older schema-v3 engines reject `managed_images` as an unknown top-level key. Upg
 Installer and reconciler validation use the selected commit's immediate first
 parent. Missing history, changed pending records, early evidence promotion,
 image-field removal, unrelated bootstrap edits and no-change image-free staging
-fail. A suite base chosen elsewhere does not replace this predecessor. The
+fail. Evidence preparation permits additions to established active/pending maps,
+with all prior records and the entire fleet unchanged. A true no-op, same-commit
+preparation and selection, or fresh image-free installation remains invalid. A suite base chosen elsewhere does not replace this predecessor. The
 protected exact installed-ref drift exception and protected bootstrap LKG recovery
 remain separate; neither admits a new image-free installation. Keep approval,
 compatible-manager recovery and runtime verification gates in force.

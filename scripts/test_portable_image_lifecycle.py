@@ -33,6 +33,7 @@ class LifecycleTests(unittest.TestCase):
             root = Path(directory)
             release = root / "releases" / ENGINE
             release.mkdir(parents=True)
+            (release / ".ci-fleet-engine-ref").write_text(ENGINE + "\n")
             (release / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": portable}}))
             values = dict(CI_FLEET_ENGINE_REF=ENGINE, CI_FLEET_CONTROLLER_IMAGE="controller:reviewed",
                           CI_FLEET_RUNNER_IMAGE="runner:reviewed", CI_FLEET_CONTROLLER_IMAGE_DIGEST=CONTROLLER_CONFIG,
@@ -44,6 +45,7 @@ class LifecycleTests(unittest.TestCase):
             script = "set -Eeuo pipefail\n" + functions(*names) + "\n" + f"""
 repo_root={shlex.quote(str(ROOT))}
 temporary={shlex.quote(str(root))}
+install_root=$temporary/install
 releases_dir=$temporary/releases
 candidate_env=$temporary/env
 candidate_metadata=$temporary/metadata
@@ -112,6 +114,176 @@ if preflight_checkpoint_images "$release_dir" "$candidate_env"; then exit 1; fi
 raw_available=true
 preflight_checkpoint_images "$release_dir" "$candidate_env"
 [[ ! -e "$temporary/mutation" ]]
+""")
+
+    def test_opaque_manual_capture_preflight_drain_and_restoration_use_incumbent_source(self):
+        self.shell(("release_tree_digest", "runtime_release_complete", "release_tree_permissions_trusted",
+                    "current_runtime_release", "runtime_release_for_environment", "capture_current_pointer", "canonical_release_target",
+                    "portable_managed_images", "capture_legacy_image_ids", "load_checkpoint_images", "make_checkpoint",
+                    "checkpoint_images_reproducible", "preflight_checkpoint_images", "managed_image_objects_match",
+                    "try_drain_current", "retag_checkpoint_image", "restore_reviewed_image_tags",
+                    "managed_images_match", "restore_checkpoint"), r"""
+install_root=$temporary/opt/ci-fleet
+releases_dir=$install_root/releases
+mkdir -p "$releases_dir"
+mv "$release_dir" "$releases_dir/$engine_ref"
+release_dir=$releases_dir/$engine_ref
+manager_releases=$install_root/manager/releases
+manager_current=$install_root/manager/current
+current_link=$install_root/current
+state_root=$temporary/state
+checkpoints_dir=$state_root/checkpoints
+systemd_dir=$temporary/units
+testing=1
+root_prefix=$temporary
+mode=adopt
+captured_current_state=''
+staging_paths=()
+unit_names=()
+capacity_unit_names=()
+optional_unit_names=()
+timer_names=()
+legacy_ref=7777777777777777777777777777777777777777
+legacy_source=$manager_releases/$legacy_ref
+legacy_runner=sha256:1111111111111111111111111111111111111111111111111111111111111111
+legacy_controller=sha256:2222222222222222222222222222222222222222222222222222222222222222
+mkdir -p "$legacy_source/deploy" "$legacy_source/scripts" "$legacy_source/controller" "$legacy_source/runner" "$systemd_dir" "$release_dir/deploy"
+cp "$repo_root/deploy/compose.yaml" "$release_dir/deploy/compose.yaml"
+python3 - "$repo_root" "$legacy_source" "$legacy_ref" "$rendered_env" "$release_dir" <<'PREPARE_LEGACY'
+import json, sys
+from pathlib import Path
+source, target = map(Path, sys.argv[1:3])
+revision, environment = sys.argv[3], Path(sys.argv[4])
+compose = (source / "deploy/compose.yaml").read_text()
+compose = compose.replace("${CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID:?verified controller runtime image ID is required}", "${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}")
+compose = compose.replace("${CI_FLEET_RUNNER_RUNTIME_IMAGE_ID:?verified runner runtime image ID is required}", "${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}")
+(target / "deploy/compose.yaml").write_text(compose)
+(target / ".ci-fleet-engine-ref").write_text(revision + "\n")
+(target / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": False, "reproducible_managed_images": False}}))
+for name in ("preflight.sh", "healthcheck.sh", "cleanup.sh"):
+    path = target / "scripts" / name
+    path.write_text("#!/bin/bash\nexit 0\n")
+    path.chmod(0o755)
+for name in ("controller/Dockerfile", "controller/go.mod", "controller/main.go", "controller/config.go", "controller/scaler.go", "controller/state.go", "runner/Dockerfile"):
+    (target / name).write_text("fixture source\n")
+values = dict(line.split("=", 1) for line in (source / "deploy/ci-fleet.env.example").read_text().splitlines() if line and not line.startswith("#"))
+values.update(CI_FLEET_ENGINE_REF=revision, CI_FLEET_CONTROLLER_STATE="active", CI_FLEET_INSTANCE="legacy-controller",
+              CI_FLEET_RUNNER_IMAGE="runner:legacy", CI_FLEET_CONTROLLER_IMAGE="controller:legacy",
+              CI_FLEET_RUNNER_IMAGE_DIGEST="sha256:" + "1" * 64, CI_FLEET_CONTROLLER_IMAGE_DIGEST="sha256:" + "2" * 64)
+environment.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+environment.chmod(0o600)
+candidate = Path(sys.argv[5])
+for relative in ("scripts/preflight.sh", "scripts/healthcheck.sh", "scripts/cleanup.sh", "scripts/managed_image_identity.py",
+                 "controller/Dockerfile", "controller/go.mod", "controller/main.go", "controller/config.go",
+                 "controller/scaler.go", "controller/state.go", "runner/Dockerfile"):
+    path = candidate / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fixture candidate source\n")
+    if path.suffix == ".sh":
+        path.chmod(0o755)
+PREPARE_LEGACY
+release_tree_digest "$release_dir" >"$release_dir/.ci-fleet-tree-sha256"
+release_tree_digest "$legacy_source" >"$legacy_source/.ci-fleet-tree-sha256"
+controller_status() { printf running; }
+die() { printf '%s\n' "$*" >&2; exit 7; }
+systemctl() { return 1; }
+managed_runner_count() { printf 0; }
+configuration_approval_required() { return 1; }
+load_installed_controller_identity() { :; }
+remove_inactive_managed_runners() { :; }
+restore_systemd_snapshot() { :; }
+run_health_check() { [[ $1 == "$releases_dir/$legacy_ref" ]]; }
+on_error() { exit 99; }
+runner_tag=$legacy_runner
+controller_tag=$legacy_controller
+missing=false
+docker() {
+  case "$1 ${2:-}" in
+    'image inspect')
+      [[ $missing != true ]] || { printf 'No such image: %s\n' "${!#}" >&2; return 1; }
+      if [[ "$*" == *'{{eq '* ]]; then printf true
+      elif [[ "$*" == *'org.opencontainers.image.revision'* ]]; then printf '%s' "$legacy_ref"
+      elif [[ "${!#}" == runner:legacy ]]; then printf '%s' "$runner_tag"
+      elif [[ "${!#}" == controller:legacy ]]; then printf '%s' "$controller_tag"
+      else printf '%s' "${!#}"; fi ;;
+    'image tag')
+      [[ $4 != runner:legacy ]] || runner_tag=$3
+      [[ $4 != controller:legacy ]] || controller_tag=$3 ;;
+    'inspect --format')
+      if [[ $3 == '{{.Image}}' ]]; then printf '%s' "$legacy_controller"
+      elif [[ $3 == *'org.opencontainers.image.revision'* ]]; then printf '%s' "$legacy_ref"
+      else printf false; fi ;;
+    'info ') : ;;
+    *) return 98 ;;
+  esac
+}
+compose() {
+  python3 - "$1/deploy/compose.yaml" "$2" <<'CHECK_REQUIRED' || return
+from pathlib import Path
+import re, sys
+compose, environment = map(Path, sys.argv[1:])
+values = dict(line.split("=", 1) for line in environment.read_text().splitlines())
+missing = {key for key in re.findall(r"\$\{([A-Z_]+):\?", compose.read_text()) if not values.get(key)}
+if missing:
+    print("missing required fields: " + ", ".join(sorted(missing)), file=sys.stderr)
+    raise SystemExit(47)
+CHECK_REQUIRED
+  printf '%s|%s\n' "$1" "${*:3}" >>"$temporary/compose-calls"
+}
+# Candidate Compose demonstrably cannot interpolate this complete opaque environment.
+if (set -e; compose "$release_dir" "$rendered_env" config --quiet); then exit 1; fi
+rm -f "$temporary/compose-calls"
+make_checkpoint "$release_dir"
+[[ $(cat "$checkpoint_dir/release-target") == "$legacy_source" ]] || { printf 'checkpoint selected incompatible source: %s\n' "$(cat "$checkpoint_dir/release-target")" >&2; exit 1; }
+[[ ! -e "$checkpoint_dir/install-state.json" ]]
+[[ ! -e "$releases_dir/$legacy_ref" ]]
+load_checkpoint_images "$checkpoint_dir/ci-fleet.env" "$checkpoint_dir/image-ids.env"
+preflight_checkpoint_images "$legacy_source" "$checkpoint_dir/image-env"
+if preflight_checkpoint_images "$release_dir" "$checkpoint_dir/image-env"; then exit 1; fi
+missing=true
+if preflight_checkpoint_images "$legacy_source" "$checkpoint_dir/image-env"; then exit 1; fi
+missing=false
+try_drain_current false "$rendered_env" "$release_dir"
+grep -Fxq "$legacy_source|pause controller" "$temporary/compose-calls"
+grep -Fxq "$legacy_source|stop --timeout 300 controller" "$temporary/compose-calls"
+install_release() {
+  [[ $1 == "$legacy_ref" && $2 == "$releases_dir/$legacy_ref" ]]
+  mkdir -p "$2"
+  cp -a "$legacy_source/deploy" "$legacy_source/scripts" "$legacy_source/controller" "$legacy_source/runner" "$legacy_source/engine-capabilities.json" "$legacy_source/.ci-fleet-engine-ref" "$legacy_source/.ci-fleet-tree-sha256" "$2/"
+}
+restore_checkpoint
+grep -Fxq "$releases_dir/$legacy_ref|up -d --remove-orphans controller" "$temporary/compose-calls"
+[[ $(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$rendered_env") == "$legacy_controller" ]]
+# A candidate revision, missing source, unsafe tree, or mismatched marker grants no fallback.
+rm -rf "$releases_dir/$legacy_ref"
+rm "$legacy_source/.ci-fleet-engine-ref"
+: >"$temporary/compose-calls"
+if (make_checkpoint "$release_dir"); then exit 1; fi
+if try_drain_current false "$rendered_env" "$release_dir"; then exit 1; fi
+[[ ! -s "$temporary/compose-calls" ]]
+printf '%s\n' "$legacy_ref" >"$legacy_source/.ci-fleet-engine-ref"
+chmod 777 "$legacy_source/scripts"
+if try_drain_current false "$rendered_env" "$release_dir"; then exit 1; fi
+chmod 755 "$legacy_source/scripts"
+printf '%s\n' "$engine_ref" >"$legacy_source/.ci-fleet-engine-ref"
+if try_drain_current false "$rendered_env" "$release_dir"; then exit 1; fi
+[[ ! -s "$temporary/compose-calls" ]]
+""")
+
+    def test_in_place_incumbent_source_is_preserved_before_candidate_installation(self):
+        converge = functions("perform_converge")
+        preservation = converge[converge.index("  capture_current_pointer\n"):converge.index("  install_release\n", converge.index("  capture_current_pointer\n"))]
+        self.shell((), """
+mkdir -p "$install_root"
+printf '%s\n' 7777777777777777777777777777777777777777 >"$install_root/.ci-fleet-engine-ref"
+current_runtime_release() { printf '%s' "$install_root"; }
+capture_current_pointer() { printf 'capture\n' >>"$temporary/order"; }
+install_release() {
+  [[ $# == 4 && $1 == 7777777777777777777777777777777777777777 && $2 == "$releases_dir/$1" && $3 == 0 && $4 == 0 ]]
+  printf 'preserve-incumbent-source\n' >>"$temporary/order"
+}
+""" + preservation + """
+[[ $(cat "$temporary/order") == $'capture\npreserve-incumbent-source' ]]
 """)
 
     def test_checkpoint_capture_authenticates_origin_and_refreshes_only_original_roots(self):
@@ -203,6 +375,7 @@ export FAKE_COMPOSE_LOG=$temporary/compose.log
 export FAKE_FAIL_CONFIG=1
 : >"$FAKE_DOCKER_STATE"
 capture_current_pointer() { :; }
+current_runtime_release() { :; }
 install_release() { :; }
 pending_policy_checkpoint() { return 1; }
 make_checkpoint() { printf 'checkpoint\n' >>"$temporary/order"; printf 'CHECKPOINT_CREATED\n'; }
@@ -561,6 +734,66 @@ write_config active 1 1 {'b' * 40}
                                         executable=wrapper_path).returncode, 0)
                 self.assertEqual(git(checkout, "remote", "set-url", "origin", "https://github.com/example/unrelated.git").returncode, 0)
                 self.assertNotEqual(git(checkout, *arguments, executable=wrapper_path).returncode, 0)
+
+    def test_historical_fixture_inputs_remain_fetchable_after_synthetic_transport(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        prepare = re.search(r"^prepare_historical_engine_inputs\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        wrapper = re.search(r"""cat >"\$fake_bin/git" <<'EOF'\n(.*?)\nEOF""", fixture, re.S).group(1)
+        historical = "8bd27a2e7451806a1e37f79a15eeb7c677a12c3e"
+        expected_tree = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", historical + "^{tree}"], text=True).strip()
+        seed_call = fixture[fixture.index('prepare_historical_engine_inputs "$repo_root"'):fixture.index("repo_root=$fixture_repo")]
+        for ref in (historical, "af9c0c13cd12866ce75dd6c43a4cda01915507e1", "003de44f7e27d7bfe5bb753098efb6eb5f9712f1"):
+            self.assertIn(ref, seed_call)
+        self.assertLess(fixture.index(seed_call), fixture.index('cat >"$fake_bin/git"'))
+        canonical = "https://github.com/RandomDevelopment/ci-fleet.git"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = os.environ | {"GIT_ALLOW_PROTOCOL": "file", "GIT_CONFIG_GLOBAL": os.devnull,
+                                        "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+            def git(path, *arguments):
+                return subprocess.check_output(["git", "-C", str(path), *arguments], text=True, env=environment).strip()
+            source = root / "synthetic-source"
+            source.mkdir()
+            git(source, "init", "-q")
+            (source / "synthetic").write_text("fixture-only source")
+            git(source, "add", ".")
+            git(source, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "test: synthetic engine")
+            synthetic = git(source, "rev-parse", "HEAD")
+            script = "set -Eeuo pipefail\n" + prepare + f"""
+prepare_historical_engine_inputs {shlex.quote(str(ROOT))} {shlex.quote(str(source))} {historical}
+"""
+            result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(git(source, "rev-parse", "HEAD"), synthetic)
+            self.assertEqual(git(source, "rev-parse", historical + "^{tree}"), expected_tree)
+            capabilities = json.loads(git(source, "show", historical + ":engine-capabilities.json"))
+            self.assertNotIn("capacity_telemetry", capabilities["capabilities"])
+            failed = subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + prepare +
+                f"\nprepare_historical_engine_inputs {shlex.quote(str(ROOT))} {shlex.quote(str(source))} {'f' * 40}"],
+                capture_output=True, text=True, env=environment)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("historical engine fixture input unavailable", failed.stderr)
+            executable = root / "git-wrapper"
+            executable.write_text(wrapper + "\n")
+            executable.chmod(0o700)
+            target = root / "installed-fetch"
+            target.mkdir()
+            git(target, "init", "-q")
+            git(target, "remote", "add", "origin", canonical)
+            environment.update(REAL_GIT=shutil.which("git"), FAKE_ENGINE_GIT_SOURCE=str(source))
+            for ref in (synthetic, historical):
+                for depth in (1, 2):
+                    args = ["-C", str(target), "fetch", "-q", "--depth=" + str(depth), "origin", ref]
+                    self.assertNotEqual(subprocess.run(["git", *args], capture_output=True, env=environment).returncode, 0)
+                    result = subprocess.run([str(executable), *args], capture_output=True, text=True, env=environment)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(git(target, "rev-parse", "FETCH_HEAD"), ref)
+                    self.assertEqual(git(target, "remote", "get-url", "origin"), canonical)
+                    self.assertEqual(subprocess.run([str(executable), *args], capture_output=True,
+                        env=environment | {"FAKE_FAIL_GIT_FETCH": "1"}).returncode, 90)
+            git(target, "remote", "set-url", "origin", "https://github.com/example/unrelated.git")
+            self.assertNotEqual(subprocess.run([str(executable), "-C", str(target), "fetch", "origin", historical],
+                capture_output=True, env=environment).returncode, 0)
 
     def test_cleanup_protects_current_and_checkpoint_c_r_m_without_export(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -393,6 +393,16 @@ opaque Docker IDs. Never infer the kind from `sha256:` or rewrite historical
 entries. Initializer digest flags accept the scalar appropriate to the selected
 source. The public fixture catalog remains illustrative historical data.
 
+For an established image-free fleet, prepare evidence before changing any manager
+pin. If incumbent active records are missing, integrate them in an evidence-only
+commit with the entire fleet unchanged. Each record describes the observed active
+runtime and reviewed exact source, including all-false capability flags where
+appropriate. Source review alone cannot establish activation. Keep existing active
+and pending records unchanged. Then add target pending records in a separate
+evidence-only commit, still without fleet changes. Strict validation admits these
+preparatory additions and rejects a true no-op or preparation combined with staging.
+This is separate from the new-controller first-install sequence above.
+
 Before engine selection, integrate a nonempty
 `next-engine-rollout-evidence.json` with the same schema and controller map as
 active evidence. Its engine refs must differ from incumbent runtime evidence.

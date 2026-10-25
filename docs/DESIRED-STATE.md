@@ -93,8 +93,14 @@ matching pending records through manager staging and image-policy introduction.
 After runtime verification, promote evidence alone without changing fleet state.
 Every staged controller needs matching predecessor pending evidence, even with
 no optional status/network block and all-false capability flags.
-Record explicit incumbent runtime evidence before manager staging and retain it
-through image introduction. An absent record is insufficient; the staged manager
+For an established image-free fleet, integrate missing explicit incumbent runtime
+evidence first in an evidence-only commit, with the entire fleet unchanged and all
+existing records retained. Base it on observed activation and exact source review,
+including an explicit all-false record when appropriate. Next add reviewed target
+pending records in a separate evidence-only commit, retaining the fleet and prior
+records. Strict validation distinguishes these additions from manager staging.
+Stage manager pins only after that pending evidence is integrated, then retain both
+maps through image introduction. An absent record is insufficient; the staged manager
 pin cannot identify the incumbent runtime.
 
 Transition validation requires prior integrated active capability evidence when
@@ -224,7 +230,7 @@ sudo ./scripts/install-worker-controller.sh \
   --controller example-ci-01
 ```
 
-If `/etc/ci-fleet/host.env` does not exist, adoption extracts only the approved host identity fields from the existing root-owned `/etc/ci-fleet/ci-fleet.env`. It never copies project settings or secret values into Git. The running controller is paused, existing managed runners are allowed to finish, and activation proceeds only after the host is idle.
+If `/etc/ci-fleet/host.env` does not exist, adoption extracts only the approved host identity fields from the existing root-owned `/etc/ci-fleet/ci-fleet.env`. It never copies project settings or secret values into Git. The running controller is paused, existing managed runners are allowed to finish, and activation proceeds only after the host is idle. Adoption also requires trusted complete source matching the incumbent's engine revision. It preserves historical in-place source before candidate installation and uses incumbent-compatible Compose for drain and recovery. A different portable candidate cannot supply missing opaque recovery context. Missing, mismatched or unsafe source refuses before drain; prepare trusted pinned source or follow reviewed reinstall recovery.
 
 ## Check, upgrade, roll back, and remove
 
