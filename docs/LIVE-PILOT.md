@@ -66,50 +66,49 @@ Install the App only on the target organization. Record its Client ID (the App I
 
 Do not paste the PEM into chat, an issue, a workflow secret, an environment variable, or a repository file.
 
-## 4. Prepare host-local configuration
+## 4. Prepare host-local identity and reviewed policy
 
 ```bash
 sudo install -d -m 0700 /etc/ci-fleet/secrets
 sudo install -m 0600 -o root -g root DOWNLOADED-KEY.pem /etc/ci-fleet/secrets/github-app.pem
-sudo install -m 0600 -o root -g root deploy/ci-fleet.env.example /etc/ci-fleet/ci-fleet.env
+sudo install -m 0600 -o root -g root host/host.env.example /etc/ci-fleet/host.env
 ```
 
-Edit the environment file locally. Set the Docker socket's numeric group with:
+Edit `host.env` locally with the approved App identity and key path. Declare the
+controller, experimental routing, `min_runners: 0` and `max_runners: 1` in reviewed
+schema-v3 desired state. Use [adding a host](ADDING-A-HOST.md) for prerequisites.
+The installer renders runtime configuration. Do not copy or hand-edit runtime
+IDs from an example or another host.
+
+## 5. Prepare image evidence without starting
+
+Follow [managed images](MANAGED-IMAGES.md) on an authorized isolated build host.
+Build only the actual reviewed merged engine, twice from clean state, and review
+both role scalars for the target architecture into the approved configuration.
+Portable sources require original config digests and root-side content binding;
+`docker image inspect` alone is insufficient. Preserve old opaque-ID catalogs and
+complete pending-sidecar predecessor staging when upgrading an existing host.
+
+This runbook does not waive independent native classic/containerd validation or
+host activation approval. The installer verifies both images before its own
+publication and activation transaction.
+
+## 6. Install at zero idle runners and observe
+
+From the reviewed engine checkout, use the exact approved configuration commit:
 
 ```bash
-stat -c '%g' /var/run/docker.sock
+sudo ./scripts/install-worker-controller.sh --install \
+  --config-repo example-org/fleet-config --ref APPROVED_FULL_CONFIG_COMMIT \
+  --controller example-ci-01
+sudo docker logs --tail=100 ci-fleet-controller-1
+sudo docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true
 ```
 
-Then load the non-secret configuration and run preflight:
-
-```bash
-set -a
-. /etc/ci-fleet/ci-fleet.env
-set +a
-scripts/preflight.sh
-```
-
-Proceed only when the final line is `PREFLIGHT_OK warnings=0`.
-
-## 5. Build without starting
-
-```bash
-docker compose -f deploy/compose.yaml build runner-image controller
-docker image inspect "$CI_FLEET_RUNNER_IMAGE" >/dev/null
-docker image inspect "$CI_FLEET_CONTROLLER_IMAGE" >/dev/null
-```
-
-Rerun preflight. Capture only the pass/fail summary, not environment contents.
-
-## 6. Start at zero and observe
-
-```bash
-docker compose -f deploy/compose.yaml up -d controller
-docker compose -f deploy/compose.yaml logs --tail=100 controller
-docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true
-```
-
-With `MIN=0`, there must be no runner container before a job is dispatched. Confirm the uniquely named scale set is visible in the experimental runner group.
+Use the separately reviewed adoption or upgrade path for an existing installation.
+With the reviewed minimum at zero, there must be no runner before a job dispatch.
+Confirm the unique scale set is visible in the experimental runner group. The
+installer must report `CONVERGED`; preserve only redacted summaries outside Git.
 
 ## 7. Run exactly one job
 

@@ -124,3 +124,13 @@ The report records identifiers and outcomes, not credential values, tokens, priv
 | A guide asks for an unavailable role | Status table above | Stop at the linked issue or review gate; do not combine roles or invent a production path. |
 
 For detailed errors and recovery commands, use the runbook linked from the selected outcome rather than reconstructing the workflow from this summary.
+
+
+## Portable managed-image preparation
+
+Follow [managed images](MANAGED-IMAGES.md) for runtime-source scalar semantics,
+producer evidence, protected warm proof and exact-ID recovery. Keep the existing
+Docker backend and capacity. Stage matching pending capability evidence before
+selection, preserve image-free bootstrap predecessor rules, and obtain independent
+native classic/containerd evidence before host activation. Do not repair drift by
+editing rendered runtime IDs or replacing historical image catalogs.

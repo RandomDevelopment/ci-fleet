@@ -2,6 +2,12 @@
 
 This is a reviewable deployment unit, not authorization to register a runner. Phase 2 validation builds it without credentials. A later issue must explicitly authorize GitHub App creation and the first live scale set.
 
+The manual build/start commands below describe the historical prototype. Current
+portable managed engines require installer-derived runtime IDs and protected
+content proof. Use [adding a host](ADDING-A-HOST.md) and
+[managed images](MANAGED-IMAGES.md) for current installation. Do not apply the
+historical commands to a portable runtime source.
+
 ## Host shape
 
 One Docker host may run one controller and many single-use runner containers, up to the configured CPU and memory capacity. Additional hosts use the identical Compose files with a unique `CI_FLEET_INSTANCE` and unique `CI_FLEET_SCALE_SET_NAME`; compatible hosts share `CI_FLEET_LABELS` so GitHub can route matching jobs across the fleet.

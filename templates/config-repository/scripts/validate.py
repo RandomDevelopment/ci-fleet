@@ -572,30 +572,23 @@ def validate_config(config: Any, validation: Validation, strict: bool, *, allow_
             validation.require(repository != "example-org/example-app", f"{path}.repository", "replace the example repository before use")
 
 
-def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, dict[str, Any]]:
-    if not validation.exact_keys(
-        value,
-        "engine-rollout-evidence.json",
-        {"schema_version", "status_reporting_engine_capabilities"},
-    ):
-        return {}
-    validation.require(value.get("schema_version") == 1, "engine-rollout-evidence.json.schema_version", "must equal 1")
-    capabilities = value.get("status_reporting_engine_capabilities")
-    if not isinstance(capabilities, dict):
-        validation.errors.append("engine-rollout-evidence.json.status_reporting_engine_capabilities: must be an object mapping controller IDs to capability evidence")
-        return {}
-    valid: dict[str, dict[str, Any]] = {}
-    for controller, evidence in capabilities.items():
-        path = f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}"
-        controller_valid = bool(SLUG.fullmatch(controller))
-        validation.require(controller_valid, path, "controller ID must be a lowercase slug")
+def validate_rollout_evidence(
+    value: Any,
+    validation: Validation,
+    source: str = "engine-rollout-evidence.json",
+) -> dict[str, dict[str, Any]]:
+    def validate_engine_evidence(
+        evidence: Any,
+        path: str,
+        optional: set[str],
+    ) -> dict[str, Any] | None:
         if not validation.exact_keys(
             evidence,
             path,
             {"engine_ref", "status_reporting_config", "required_status_reporting"},
-            {"docker_network_policy_config", "docker_default_bridge_cidr_config"},
+            optional | {"docker_default_bridge_cidr_config", "portable_managed_image_ids"},
         ):
-            continue
+            return None
         ref = evidence.get("engine_ref")
         configured = evidence.get("status_reporting_config")
         required = evidence.get("required_status_reporting")
@@ -607,20 +600,54 @@ def validate_rollout_evidence(value: Any, validation: Validation) -> dict[str, d
         validation.require(type(required) is bool, f"{path}.required_status_reporting", "must be a boolean")
         if "docker_network_policy_config" in evidence:
             validation.require(type(network_policy) is bool, f"{path}.docker_network_policy_config", "must be a boolean")
+        network_policy_valid = "docker_network_policy_config" not in evidence or type(network_policy) is bool
         if "docker_default_bridge_cidr_config" in evidence:
             validation.require(type(default_bridge) is bool, f"{path}.docker_default_bridge_cidr_config", "must be a boolean")
-        network_policy_valid = "docker_network_policy_config" not in evidence or type(network_policy) is bool
         default_bridge_valid = "docker_default_bridge_cidr_config" not in evidence or type(default_bridge) is bool
-        if controller_valid and ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid and default_bridge_valid:
-            valid[controller] = {
-                "engine_ref": ref,
-                "status_reporting_config": configured,
-                "required_status_reporting": required,
-            }
-            if "docker_network_policy_config" in evidence:
-                valid[controller]["docker_network_policy_config"] = network_policy
-            if "docker_default_bridge_cidr_config" in evidence:
-                valid[controller]["docker_default_bridge_cidr_config"] = default_bridge
+        if not (ref_valid and type(configured) is bool and type(required) is bool and network_policy_valid and default_bridge_valid):
+            return None
+        parsed = {
+            "engine_ref": ref,
+            "status_reporting_config": configured,
+            "required_status_reporting": required,
+        }
+        if "docker_network_policy_config" in evidence:
+            parsed["docker_network_policy_config"] = network_policy
+        if "docker_default_bridge_cidr_config" in evidence:
+            parsed["docker_default_bridge_cidr_config"] = default_bridge
+        if "portable_managed_image_ids" in evidence:
+            portable = evidence["portable_managed_image_ids"]
+            validation.require(type(portable) is bool, f"{path}.portable_managed_image_ids", "must be a boolean")
+            if type(portable) is not bool:
+                return None
+            parsed["portable_managed_image_ids"] = portable
+        return parsed
+
+    if not validation.exact_keys(
+        value,
+        source,
+        {"schema_version", "status_reporting_engine_capabilities"},
+    ):
+        return {}
+    validation.require(value.get("schema_version") == 1, f"{source}.schema_version", "must equal 1")
+    capabilities = value.get("status_reporting_engine_capabilities")
+    if not isinstance(capabilities, dict):
+        validation.errors.append(f"{source}.status_reporting_engine_capabilities: must be an object mapping controller IDs to capability evidence")
+        return {}
+    if source.endswith("next-engine-rollout-evidence.json"):
+        validation.require(bool(capabilities), f"{source}.status_reporting_engine_capabilities", "must contain at least one staged record; remove the sidecar when empty")
+    valid: dict[str, dict[str, Any]] = {}
+    for controller, evidence in capabilities.items():
+        path = f"{source}.status_reporting_engine_capabilities.{controller}"
+        controller_valid = bool(SLUG.fullmatch(controller))
+        validation.require(controller_valid, path, "controller ID must be a lowercase slug")
+        parsed = validate_engine_evidence(
+            evidence,
+            path,
+            {"docker_network_policy_config", "docker_default_bridge_cidr_config"},
+        )
+        if controller_valid and parsed is not None:
+            valid[controller] = parsed
     return valid
 
 
@@ -629,23 +656,42 @@ def validate_reporting_evidence(
     controller: dict[str, Any],
     evidence: dict[str, Any],
     validation: Validation,
-) -> None:
+    *,
+    network_evidence: dict[str, Any] | None = None,
+) -> bool:
+    errors_before = len(validation.errors)
+    network_evidence = evidence if network_evidence is None else network_evidence
+    if "docker_network_policy" in controller:
+        network_policy = controller["docker_network_policy"]
+        if isinstance(network_policy, dict) and "default_bridge_cidr" in network_policy:
+            validation.require(
+                network_evidence.get("engine_ref") == controller.get("engine_ref")
+                and network_evidence.get("docker_default_bridge_cidr_config") is True,
+                f"$.controllers.{name}.docker_network_policy",
+                "requires Docker default bridge CIDR configuration capability evidence for this controller and engine_ref",
+            )
+        validation.require(
+            network_evidence.get("engine_ref") == controller.get("engine_ref")
+            and network_evidence.get("docker_network_policy_config") is True,
+            f"$.controllers.{name}.docker_network_policy",
+            "requires Docker network policy configuration capability evidence for this controller and engine_ref",
+        )
     reporting = controller.get("status_reporting")
-    if not isinstance(reporting, dict):
-        return
-    validation.require(
-        evidence.get("engine_ref") == controller.get("engine_ref")
-        and evidence.get("status_reporting_config") is True,
-        f"$.controllers.{name}.status_reporting",
-        "requires status-reporting configuration capability evidence for this controller and engine_ref",
-    )
-    if reporting.get("enabled") is True:
+    if isinstance(reporting, dict):
         validation.require(
             evidence.get("engine_ref") == controller.get("engine_ref")
-            and evidence.get("required_status_reporting") is True,
-            f"$.controllers.{name}.status_reporting.enabled",
-            "requires required status-reporting rollout evidence for this controller and engine_ref",
+            and evidence.get("status_reporting_config") is True,
+            f"$.controllers.{name}.status_reporting",
+            "requires status-reporting configuration capability evidence for this controller and engine_ref",
         )
+        if reporting.get("enabled") is True:
+            validation.require(
+                evidence.get("engine_ref") == controller.get("engine_ref")
+                and evidence.get("required_status_reporting") is True,
+                f"$.controllers.{name}.status_reporting.enabled",
+                "requires required status-reporting rollout evidence for this controller and engine_ref",
+            )
+    return len(validation.errors) == errors_before
 
 
 def validate_transition(
@@ -654,62 +700,92 @@ def validate_transition(
     compatible_engine_refs: dict[str, dict[str, Any]],
     validation: Validation,
     previous_compatible_engine_refs: dict[str, dict[str, Any]] | None = None,
+    previous_next_engine_refs: dict[str, dict[str, Any]] | None = None,
+    *, manager_bootstrap: bool = False, enforce_managed_images: bool = True,
 ) -> None:
     if not isinstance(previous, dict) or not isinstance(current, dict):
         return
+    validation.require(
+        "managed_images" not in previous or "managed_images" in current,
+        "$.managed_images",
+        "cannot be removed after image enforcement",
+    )
     old_controllers = previous.get("controllers")
     new_controllers = current.get("controllers")
     if not isinstance(old_controllers, dict) or not isinstance(new_controllers, dict):
         return
-    if "managed_images" not in current:
-        validation.require("managed_images" not in previous, "$.managed_images", "cannot be removed after image enforcement")
-        validation.require(
-            {key: value for key, value in previous.items() if key != "controllers"}
-            == {key: value for key, value in current.items() if key != "controllers"},
-            "$",
-            "manager-only staging may change only controller engine_ref values",
-        )
-        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "manager-only staging cannot add or remove controllers")
-        validation.require(any(isinstance(old_controllers[name], dict) and isinstance(new_controllers[name], dict) and old_controllers[name].get("engine_ref") != new_controllers[name].get("engine_ref") for name in set(old_controllers) & set(new_controllers)), "$.controllers", "manager-only staging requires at least one engine_ref change")
-        for name in set(old_controllers) & set(new_controllers):
-            old = old_controllers[name]
-            new = new_controllers[name]
-            if not isinstance(old, dict) or not isinstance(new, dict):
-                continue
+    manager_bootstrap = manager_bootstrap or (
+        enforce_managed_images and bool(old_controllers)
+        and ("managed_images" not in previous or "managed_images" not in current)
+    )
+    if manager_bootstrap or (old_controllers and enforce_managed_images):
+        if "managed_images" not in current:
             validation.require(
-                {key: value for key, value in old.items() if key != "engine_ref"}
-                == {key: value for key, value in new.items() if key != "engine_ref"},
-                f"$.controllers.{name}",
-                "manager-only staging may change only engine_ref",
+                {key: value for key, value in previous.items() if key != "controllers"}
+                == {key: value for key, value in current.items() if key != "controllers"},
+                "$", "manager-only staging may change only controller engine_ref values",
             )
-    if "managed_images" not in previous and "managed_images" in current:
-        validation.require(old_controllers == new_controllers, "$.controllers", "image-policy introduction must retain controller settings from manager staging")
-        validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
-        for name in set(old_controllers) & set(new_controllers):
-            old, new = old_controllers[name], new_controllers[name]
-            if isinstance(old, dict) and isinstance(new, dict):
-                validation.require(
-                    old.get("engine_ref") == new.get("engine_ref"),
-                    f"$.controllers.{name}.engine_ref",
-                    "image policy must be introduced after the same compatible engine_ref is active",
-                )
+            validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "manager-only staging cannot add or remove controllers")
+            validation.require(
+                any(isinstance(old_controllers[name], dict) and isinstance(new_controllers[name], dict)
+                    and old_controllers[name].get("engine_ref") != new_controllers[name].get("engine_ref")
+                    for name in set(old_controllers) & set(new_controllers)),
+                "$.controllers", "manager-only staging requires at least one engine_ref change",
+            )
+            for name in set(old_controllers) & set(new_controllers):
+                old, new = old_controllers[name], new_controllers[name]
+                if isinstance(old, dict) and isinstance(new, dict):
+                    validation.require(
+                        {key: value for key, value in old.items() if key != "engine_ref"}
+                        == {key: value for key, value in new.items() if key != "engine_ref"},
+                        f"$.controllers.{name}", "manager-only staging may change only engine_ref",
+                    )
+        elif "managed_images" not in previous:
+            validation.require(set(old_controllers) == set(new_controllers), "$.controllers", "image-policy introduction cannot add or remove controllers")
+            for name in set(old_controllers) & set(new_controllers):
+                validation.require(old_controllers[name].get("engine_ref") == new_controllers[name].get("engine_ref"),
+                                   f"$.controllers.{name}.engine_ref", "image policy requires the same compatible engine_ref from manager staging")
+            validation.require(
+                {key: value for key, value in previous.items() if key != "managed_images"}
+                == {key: value for key, value in current.items() if key != "managed_images"},
+                "$", "image-policy introduction must retain all manager-staging settings",
+            )
     for name, new in new_controllers.items():
         old = old_controllers.get(name)
         if not isinstance(new, dict):
             continue
-        if name not in old_controllers:
+        if not isinstance(old, dict):
             if "status_reporting" in new:
                 validation.errors.append(
                     f"$.controllers.{name}.status_reporting: must be omitted from a new controller until its engine rollout is proven"
                 )
+            if "docker_network_policy" in new:
+                validation.errors.append(
+                    f"$.controllers.{name}.docker_network_policy: must be omitted from a new controller until its engine rollout is proven"
+                )
+            if "docker_storage_retention" in new:
+                validation.errors.append(f"$.controllers.{name}.docker_storage_retention: must be omitted from a new controller until its engine rollout is proven")
             continue
-        if not isinstance(old, dict):
-            continue
+        if "docker_storage_retention" in new:
+            validation.require(old.get("state") in ("active", "drained") and new.get("state") in ("active", "drained"),
+                               f"$.controllers.{name}.docker_storage_retention", "requires active or drained controller states in both the previous and current integrated configurations; enable without retention first")
+        if "docker_storage_retention" not in old and "docker_storage_retention" in new:
+            validation.require(old.get("engine_ref") == new.get("engine_ref"), f"$.controllers.{name}.docker_storage_retention", "must be introduced in a later commit after the compatible engine_ref is active")
+        if "docker_storage_retention" in old:
+            validation.require(old.get("engine_ref") == new.get("engine_ref"), f"$.controllers.{name}.docker_storage_retention", "must be removed in an earlier commit before changing engine_ref")
         current_evidence = compatible_engine_refs.get(name, {})
-        bootstrap = "managed_images" not in current or "managed_images" not in previous
-        if bootstrap:
-            # Bootstrap changes the manager before activating a reviewed runtime.
+        if manager_bootstrap:
             runtime_ref = current_evidence.get("engine_ref", old.get("engine_ref"))
+            if runtime_ref != new.get("engine_ref") and (
+                "docker_network_policy" in new or "status_reporting" in new
+            ):
+                next_engine = (previous_next_engine_refs or {}).get(name, {})
+                validation.require(
+                    next_engine.get("engine_ref") == new.get("engine_ref"),
+                    f"$.controllers.{name}.engine_ref",
+                    "requires next-engine capability evidence from the previous integrated sidecar",
+                )
+                validate_reporting_evidence(name, new, next_engine, validation)
             old = {**old, "engine_ref": runtime_ref}
             new = {**new, "engine_ref": runtime_ref}
         previous_evidence_source = (
@@ -720,10 +796,22 @@ def validate_transition(
         previous_evidence = previous_evidence_source.get(name, {})
         old_reporting = old.get("status_reporting")
         new_reporting = new.get("status_reporting")
-        old_network_policy = old.get("docker_network_policy")
-        new_network_policy = new.get("docker_network_policy")
-        old_default_bridge = isinstance(old_network_policy, dict) and "default_bridge_cidr" in old_network_policy
-        new_default_bridge = isinstance(new_network_policy, dict) and "default_bridge_cidr" in new_network_policy
+        if old.get("engine_ref") != new.get("engine_ref") and (
+            "docker_network_policy" in new or "status_reporting" in new or "managed_images" in current
+        ):
+            next_engine = (previous_next_engine_refs or {}).get(name, {})
+            validation.require(
+                next_engine.get("engine_ref") == new.get("engine_ref"),
+                f"$.controllers.{name}.engine_ref",
+                "requires next-engine capability evidence from the previous integrated sidecar",
+            )
+            validate_reporting_evidence(name, new, next_engine, validation)
+            if "managed_images" in current:
+                validation.require(
+                    current_evidence == next_engine and next_engine.get("engine_ref") == new.get("engine_ref"),
+                    f"$.controllers.{name}.engine_ref",
+                    "requires promotion of the matching managed-image engine evidence from the previous integrated sidecar",
+                )
         if "docker_network_policy" not in old and "docker_network_policy" in new:
             validation.require(
                 old.get("engine_ref") == new.get("engine_ref"),
@@ -736,37 +824,34 @@ def validate_transition(
                 f"$.controllers.{name}.docker_network_policy",
                 "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with Docker network policy configuration capability",
             )
-        if "docker_network_policy" in new:
-            validation.require(
-                current_evidence.get("engine_ref") == new.get("engine_ref")
-                and current_evidence.get("docker_network_policy_config") is True,
-                f"$.controllers.{name}.docker_network_policy",
-                "requires Docker network policy configuration capability evidence for this controller and engine_ref",
-            )
-        if not old_default_bridge and new_default_bridge:
+        old_policy = old.get("docker_network_policy") if isinstance(old, dict) else None
+        new_policy = new.get("docker_network_policy") if isinstance(new, dict) else None
+        old_has_bridge = isinstance(old_policy, dict) and "default_bridge_cidr" in old_policy
+        new_has_bridge = isinstance(new_policy, dict) and "default_bridge_cidr" in new_policy
+        if not old_has_bridge and new_has_bridge:
             validation.require(
                 old.get("engine_ref") == new.get("engine_ref"),
-                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                f"$.controllers.{name}.docker_network_policy",
                 "must be introduced in a later commit after the compatible engine_ref is active",
             )
             validation.require(
                 previous_evidence.get("engine_ref") == new.get("engine_ref")
                 and previous_evidence.get("docker_default_bridge_cidr_config") is True,
-                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
-                "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with default bridge CIDR capability",
+                f"$.controllers.{name}.docker_network_policy",
+                "requires reviewed evidence from the previous integrated state that this controller activated the same engine_ref with Docker default bridge CIDR configuration capability",
             )
-        if old_default_bridge and not new_default_bridge:
+        if old_has_bridge and not new_has_bridge:
             validation.require(
                 old.get("engine_ref") == new.get("engine_ref"),
-                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
+                f"$.controllers.{name}.docker_network_policy",
                 "must be removed before changing engine_ref",
             )
-        if new_default_bridge:
+        if new_has_bridge:
             validation.require(
                 current_evidence.get("engine_ref") == new.get("engine_ref")
                 and current_evidence.get("docker_default_bridge_cidr_config") is True,
-                f"$.controllers.{name}.docker_network_policy.default_bridge_cidr",
-                "requires default bridge CIDR capability evidence for this controller and engine_ref",
+                f"$.controllers.{name}.docker_network_policy",
+                "requires reviewed evidence that this controller activated the current engine_ref with Docker default bridge CIDR configuration capability",
             )
         staged_capability_required = (
             "status_reporting" not in old
@@ -776,8 +861,19 @@ def validate_transition(
                 and (not isinstance(old_reporting, dict) or old_reporting.get("enabled") is not True)
             )
         )
-        evidence = previous_evidence if staged_capability_required else current_evidence
-        validate_reporting_evidence(name, new, evidence, validation)
+        reporting_evidence = previous_evidence if staged_capability_required else current_evidence
+        network_evidence = (
+            previous_evidence
+            if "docker_network_policy" not in old and "docker_network_policy" in new
+            else current_evidence
+        )
+        validate_reporting_evidence(
+            name,
+            new,
+            reporting_evidence,
+            validation,
+            network_evidence=network_evidence,
+        )
         if "status_reporting" not in old and "status_reporting" in new:
             validation.require(
                 old.get("engine_ref") == new.get("engine_ref"),
@@ -785,7 +881,7 @@ def validate_transition(
                 "must be introduced in a later commit after the compatible engine_ref is active",
             )
             validation.require(
-                evidence.get("engine_ref") == old.get("engine_ref"),
+                reporting_evidence.get("engine_ref") == old.get("engine_ref"),
                 f"$.controllers.{name}.status_reporting",
                 "requires reviewed rollout evidence for this controller and its already-active compatible engine_ref",
             )
@@ -795,6 +891,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--previous-config", type=Path, help="previous integrated configuration for rollout validation")
     parser.add_argument("--rollout-evidence", type=Path, help="rollout evidence file (defaults to engine-rollout-evidence.json only for the default fleet.json)")
     parser.add_argument("--previous-rollout-evidence", type=Path, help="previous integrated rollout evidence")
+    parser.add_argument("--next-engine-rollout-evidence", type=Path, help="pending next-engine capability sidecar")
+    parser.add_argument("--previous-next-engine-rollout-evidence", type=Path, help="previous integrated pending sidecar")
     parser.add_argument("--strict", action="store_true", help="reject unchanged example values")
     parser.add_argument("--skip-path-scan", action="store_true", help="skip repository path checks (for external fixtures)")
     parser.add_argument("--tree-paths", type=Path, help="NUL-delimited committed paths to scan instead of the local template tree")
@@ -815,6 +913,20 @@ def main(*, retained_configuration: bool = False) -> int:
         if evidence is not None
         else {}
     )
+    next_evidence_path = (
+        args.next_engine_rollout_evidence.absolute()
+        if args.next_engine_rollout_evidence
+        else None
+    )
+    default_next_evidence = ROOT / "next-engine-rollout-evidence.json"
+    if next_evidence_path is None and config_path == ROOT / "fleet.json" and default_next_evidence.is_file():
+        next_evidence_path = default_next_evidence
+    next_evidence = load_json(next_evidence_path, validation) if next_evidence_path is not None else None
+    current_next_engine_refs = (
+        validate_rollout_evidence(next_evidence, validation, "next-engine-rollout-evidence.json")
+        if next_evidence is not None
+        else {}
+    )
     schema = load_json(ROOT / "fleet.schema.json", validation)
     if schema is not None:
         validation.require(schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema", "fleet.schema.json.$schema", "must use JSON Schema draft 2020-12")
@@ -822,17 +934,31 @@ def main(*, retained_configuration: bool = False) -> int:
         validate_config(config, validation, args.strict)
     if config is not None:
         scan_secret_material(config, validation)
-        previous_for_bootstrap = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
-        bootstrap = isinstance(previous_for_bootstrap, dict) and isinstance(config, dict) and ("managed_images" not in config or "managed_images" not in previous_for_bootstrap)
-        if bootstrap or (isinstance(config, dict) and "managed_images" not in config and args.previous_config):
-            validate_config(previous_for_bootstrap, validation, False)
-        validate_config(config, validation, args.strict, allow_manager_staging=isinstance(previous_for_bootstrap, dict) or retained_configuration)
+        previous = load_json(args.previous_config.absolute(), validation) if args.previous_config else None
         current_controllers = config.get("controllers", {}) if isinstance(config, dict) else {}
-        if bootstrap:
-            previous_bootstrap_evidence = load_json(args.previous_rollout_evidence.absolute(), validation) if args.previous_rollout_evidence else None
-            retained_evidence = validate_rollout_evidence(previous_bootstrap_evidence, validation) if previous_bootstrap_evidence is not None else {}
-            validation.require(current_compatible_engine_refs == retained_evidence, "engine-rollout-evidence.json", "manager bootstrap must retain incumbent runtime capability evidence")
-            current_controllers = {name: {**value, "engine_ref": current_compatible_engine_refs.get(name, {}).get("engine_ref", value.get("engine_ref"))} if isinstance(value, dict) else value for name, value in current_controllers.items()}
+        manager_bootstrap = (
+            isinstance(config, dict) and isinstance(previous, dict)
+            and isinstance(previous.get("controllers"), dict) and bool(previous["controllers"])
+            and isinstance(current_controllers, dict)
+            and ("managed_images" not in config or "managed_images" not in previous)
+            and (
+                args.strict
+                or any((isinstance(current_controllers.get(name), dict)
+                        and current_controllers[name].get("engine_ref") != record["engine_ref"])
+                       or (isinstance(previous["controllers"].get(name), dict)
+                           and previous["controllers"][name].get("engine_ref") != record["engine_ref"])
+                       for name, record in current_compatible_engine_refs.items())
+            )
+        )
+        validate_config(config, validation, args.strict, allow_manager_staging=manager_bootstrap or retained_configuration)
+        if manager_bootstrap:
+            validate_config(previous, validation, False)
+            current_controllers = dict(current_controllers)
+            for name, controller in current_controllers.items():
+                old = previous["controllers"].get(name)
+                if isinstance(controller, dict) and isinstance(old, dict):
+                    runtime_ref = current_compatible_engine_refs.get(name, {}).get("engine_ref", old.get("engine_ref"))
+                    current_controllers[name] = {**controller, "engine_ref": runtime_ref}
         for controller, evidence in current_compatible_engine_refs.items():
             current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
             validation.require(
@@ -840,9 +966,22 @@ def main(*, retained_configuration: bool = False) -> int:
                 f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
                 "must match the current controller engine_ref; remove stale evidence before changing or removing the controller",
             )
+        for controller, evidence in current_next_engine_refs.items():
+            current_controller = current_controllers.get(controller) if isinstance(current_controllers, dict) else None
+            validation.require(
+                isinstance(current_controller, dict),
+                f"next-engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}",
+                "must reference a current controller",
+            )
+            if isinstance(current_controller, dict):
+                validation.require(
+                    current_controller.get("engine_ref") != evidence["engine_ref"],
+                    f"next-engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
+                    "must differ from the current controller engine_ref; remove the promoted record from the sidecar",
+                )
         if isinstance(current_controllers, dict):
             for controller, value in current_controllers.items():
-                if isinstance(value, dict):
+                if isinstance(value, dict) and (args.strict or args.previous_config is not None or "status_reporting" in value):
                     validate_reporting_evidence(
                         controller,
                         value,
@@ -850,7 +989,10 @@ def main(*, retained_configuration: bool = False) -> int:
                         validation,
                     )
         if args.previous_config is not None:
-            previous = load_json(args.previous_config.absolute(), validation)
+            validation.require(
+                isinstance(previous, dict) and isinstance(previous.get("controllers"), dict),
+                "--previous-config", "must contain a controllers object for rollout validation",
+            )
             previous_evidence = (
                 load_json(args.previous_rollout_evidence.absolute(), validation)
                 if args.previous_rollout_evidence
@@ -861,15 +1003,70 @@ def main(*, retained_configuration: bool = False) -> int:
                 if previous_evidence is not None
                 else {}
             )
+            previous_next_evidence = (
+                load_json(args.previous_next_engine_rollout_evidence.absolute(), validation)
+                if args.previous_next_engine_rollout_evidence
+                else None
+            )
+            previous_next_engine_refs = (
+                validate_rollout_evidence(
+                    previous_next_evidence,
+                    validation,
+                    "previous next-engine-rollout-evidence.json",
+                )
+                if previous_next_evidence is not None
+                else {}
+            )
+            if manager_bootstrap:
+                validation.require(current_compatible_engine_refs == previous_compatible_engine_refs,
+                                   "engine-rollout-evidence.json", "manager bootstrap must retain incumbent runtime capability evidence")
+                validation.require(current_next_engine_refs == previous_next_engine_refs,
+                                   "next-engine-rollout-evidence.json", "manager bootstrap must retain pending next-engine evidence")
             if previous is not None:
                 previous_controllers = previous.get("controllers", {}) if isinstance(previous, dict) else {}
+                if (
+                    isinstance(previous, dict) and "managed_images" in previous and "managed_images" in config
+                    and isinstance(previous_controllers, dict)
+                    and any(isinstance(previous_controllers.get(name), dict)
+                            and previous_controllers[name].get("engine_ref") != record["engine_ref"]
+                            for name, record in previous_compatible_engine_refs.items())
+                ):
+                    validation.require(config == previous, "$",
+                                       "post-bootstrap evidence promotion must retain all runtime-verified fleet settings")
+                for controller, evidence in previous_compatible_engine_refs.items():
+                    previous_controller = previous_controllers.get(controller) if isinstance(previous_controllers, dict) else None
+                    validation.require(
+                        isinstance(previous_controller, dict)
+                        and (
+                            previous_controller.get("engine_ref") == evidence["engine_ref"]
+                            or (manager_bootstrap and current_compatible_engine_refs.get(controller) == evidence)
+                            or (
+                                "managed_images" in previous and "managed_images" in config
+                                and current_compatible_engine_refs.get(controller, {}).get("engine_ref") == previous_controller.get("engine_ref")
+                                and current_compatible_engine_refs.get(controller) == previous_next_engine_refs.get(controller)
+                            )
+                        ),
+                        f"previous engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
+                        "must match the previous integrated controller engine_ref",
+                    )
+                for controller in previous_next_engine_refs:
+                    previous_controller = previous_controllers.get(controller) if isinstance(previous_controllers, dict) else None
+                    validation.require(
+                        isinstance(previous_controller, dict),
+                        f"previous next-engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}",
+                        "must reference a previous integrated controller",
+                    )
                 for controller, evidence in current_compatible_engine_refs.items():
                     if previous_compatible_engine_refs.get(controller) == evidence:
                         continue
                     ref = evidence["engine_ref"]
                     previous_controller = previous_controllers.get(controller) if isinstance(previous_controllers, dict) else None
                     validation.require(
-                        isinstance(previous_controller, dict) and previous_controller.get("engine_ref") == ref,
+                        (
+                            isinstance(previous_controller, dict)
+                            and previous_controller.get("engine_ref") == ref
+                        )
+                        or previous_next_engine_refs.get(controller) == evidence,
                         f"engine-rollout-evidence.json.status_reporting_engine_capabilities.{controller}.engine_ref",
                         f"{ref} must already be selected for this controller in the previous integrated fleet configuration",
                     )
@@ -879,6 +1076,9 @@ def main(*, retained_configuration: bool = False) -> int:
                     current_compatible_engine_refs,
                     validation,
                     previous_compatible_engine_refs,
+                    previous_next_engine_refs,
+                    manager_bootstrap=manager_bootstrap,
+                    enforce_managed_images=args.strict,
                 )
     if args.tree_paths is not None:
         scan_tree_path_list(args.tree_paths, validation)

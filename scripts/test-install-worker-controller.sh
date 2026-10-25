@@ -16,6 +16,23 @@ git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" re
 git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
 git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
 repo_root=$fixture_repo
+# Existing transaction regressions model historical opaque-ID runtime sources.
+# Portable content proofs have separate parser and lifecycle regressions.
+python3 - "$repo_root" <<'PYTHON'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+manifest = root / "engine-capabilities.json"
+value = json.loads(manifest.read_text())
+value["capabilities"]["portable_managed_image_ids"] = False
+manifest.write_text(json.dumps(value, indent=2) + "\n")
+compose = root / "deploy/compose.yaml"
+text = compose.read_text().replace("${CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID:?verified controller runtime image ID is required}", "${CI_FLEET_CONTROLLER_IMAGE:-ci-fleet-controller:dev}")
+text = text.replace("${CI_FLEET_RUNNER_RUNTIME_IMAGE_ID:?verified runner runtime image ID is required}", "${CI_FLEET_RUNNER_IMAGE_DIGEST:?reviewed runner image ID is required}")
+compose.write_text(text)
+PYTHON
+git -C "$fixture_repo" add -A
+git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@invalid.example commit -qm 'test: model opaque runtime sources'
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
 export REAL_STAT
@@ -810,6 +827,27 @@ else:
         "config_file": "/etc/ci-fleet/monitoring.env",
     }
 value["runner_pools"]["trusted-ci"]["capacity_budget"] = int(budget)
+from pathlib import Path
+import subprocess
+prior_path = Path(target)
+prior = json.loads(prior_path.read_text()) if prior_path.exists() else None
+proof = {"engine_ref": engine_ref, "status_reporting_config": True,
+         "required_status_reporting": True, "docker_network_policy_config": network_policy != "omit"}
+pending_path = prior_path.parent / "next-engine-rollout-evidence.json"
+if prior and "managed_images" in prior and prior["controllers"]["example-ci-01"]["engine_ref"] == engine_ref and pending_path.exists():
+    pending_record = json.loads(pending_path.read_text())["status_reporting_engine_capabilities"].get("example-ci-01")
+    if pending_record == proof:
+        pending_path.unlink()
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending_path)], check=True)
+if prior and prior["controllers"]["example-ci-01"]["engine_ref"] != engine_ref:
+    pending = prior_path.parent / "next-engine-rollout-evidence.json"
+    existing = json.loads(pending.read_text())["status_reporting_engine_capabilities"].get("example-ci-01") if pending.exists() else None
+    if existing != proof:
+        pending.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": {"example-ci-01": proof}}))
+        subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending)], check=True)
+        subprocess.run(["git", "-C", str(prior_path.parent), "commit", "-qm", "fixture pending engine"], check=True)
+    pending.unlink()
+    subprocess.run(["git", "-C", str(prior_path.parent), "add", str(pending)], check=True)
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(value, handle, indent=2)
     handle.write("\n")
@@ -1440,6 +1478,14 @@ import json
 import sys
 path, engine = sys.argv[1:]
 value = json.load(open(path))
+from pathlib import Path
+import subprocess
+pending = Path(path).parent / "next-engine-rollout-evidence.json"
+pending.write_text(json.dumps({"schema_version": 1, "status_reporting_engine_capabilities": {
+    "example-ci-01": {"engine_ref": engine, "status_reporting_config": True,
+                      "required_status_reporting": True, "docker_network_policy_config": False}}}))
+subprocess.run(["git", "-C", str(pending.parent), "add", str(pending)], check=True)
+subprocess.run(["git", "-C", str(pending.parent), "commit", "-qm", "fixture pending manager"], check=True)
 value["controllers"]["example-ci-01"]["engine_ref"] = engine
 with open(path, "w") as output:
     json.dump(value, output)

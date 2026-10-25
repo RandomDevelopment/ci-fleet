@@ -14,7 +14,8 @@ import time
 import urllib.request
 
 import cleanup_networks as coordination
-from desired_state import parse_env
+from desired_state import load_engine_capabilities, parse_env
+from managed_image_identity import read_bindings
 
 PREFIX = coordination.LABEL_PREFIX
 ADMISSION = "exclusive-fleet-daemon-v1"
@@ -62,7 +63,7 @@ def disk_percent() -> int:
     return (used * 100 + total - 1) // total
 
 
-def protected_images() -> set[str]:
+def protected_images(usage: dict | None = None) -> set[str]:
     current = coordination.host_path("/etc/ci-fleet/ci-fleet.env")
     checkpoints = coordination.host_path("/var/lib/ci-fleet/checkpoints")
     files = [current]
@@ -76,6 +77,7 @@ def protected_images() -> set[str]:
                     files.append(path)
     protected = set()
     current_values = None
+    portable_references = set()
     for path in files:
         coordination.trusted_path(path.parent, directory=True)
         coordination.trusted_path(path, directory=False)
@@ -85,12 +87,49 @@ def protected_images() -> set[str]:
         for name in ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE",
                      "CI_FLEET_RUNNER_IMAGE_DIGEST", "CI_FLEET_CONTROLLER_IMAGE_DIGEST",
                      "CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID",
-                     "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID"):
+                     "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID",
+                     "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID", "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID"):
             reference = values.get(name)
             if reference and reference != "absent":
                 protected.add(reference)
+    # Resolve policy semantics from the retained runtime source, never digest syntax.
+    for path in files:
+        if path.name not in {"ci-fleet.env", "image-env"}:
+            continue
+        values = parse_env(path, allow_unknown=True)
+        revision = values.get("CI_FLEET_ENGINE_REF", "")
+        state = (coordination.host_path("/var/lib/ci-fleet/install-state.json")
+                 if path == current else path.parent / "install-state.json")
+        has_runtime = any(name.endswith("_RUNTIME_IMAGE_ID") for name in values)
+        portable = has_runtime
+        if revision:
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise ValueError("retained image engine is invalid")
+            release = coordination.host_path("/opt/ci-fleet/releases") / revision
+            coordination.trusted_path(release, directory=True)
+            manifest = release / "engine-capabilities.json"
+            if manifest.exists() or manifest.is_symlink():
+                coordination.trusted_path(manifest, directory=False)
+                portable = "portable_managed_image_ids" in load_engine_capabilities(manifest)
+                if has_runtime and not portable:
+                    raise ValueError("runtime binding conflicts with retained source capability")
+        if portable:
+            binding = read_bindings(state, values)
+            for role in binding["roles"].values():
+                references = {value for key in ("config_digest", "runtime_image_id", "manifest_digest")
+                              if (value := role.get(key))}
+                protected.update(references)
+                portable_references.update(references)
     if not {"CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE"} <= current_values.keys():
         raise ValueError("installed environment omitted rollback image references")
+    if usage is not None:
+        aliases = set()
+        for image in usage["Images"]:
+            aliases.update({image["Id"], *(image.get("RepoTags") or []), *(image.get("RepoDigests") or [])})
+        opaque = {reference for reference in protected - portable_references
+                  if re.fullmatch(r"sha256:[0-9a-f]{64}", reference)}
+        if opaque - aliases:
+            raise ValueError("opaque rollback image identities are unresolved in Docker accounting; storage removal deferred")
     return protected
 
 
@@ -269,7 +308,7 @@ def cleanup_storage(*, apply: bool, usage: dict | None = None) -> None:
     admission = os.environ.get("CI_FLEET_DOCKER_STORAGE_RETENTION", "")
     if admission not in {"", ADMISSION}:
         raise ValueError("unknown Docker storage retention admission")
-    protected = protected_images() if admission else set()
+    protected = protected_images(usage) if admission else set()
     references = {item["ImageID"] for item in usage["Containers"]}
     now = int(time.time())
     eligible = []

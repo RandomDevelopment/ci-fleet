@@ -337,3 +337,31 @@ runs use the source SHA as main and retain the event's base, including an
 initial push's zero sentinel. Host policy-v1 keeps requiring hosted evidence
 until separately migrated to the compatible signed-local policy. No workflow variable changes
 host policy, and the public template receives no private runner access.
+
+
+## Portable managed images and pending evidence
+
+The scalar `managed_images` shape is unchanged. A selected runtime source with
+`portable_managed_image_ids` requires original config digests from two clean builds
+of the same reviewed merged source and architecture. Older engines keep exact
+opaque Docker IDs. Never infer the kind from `sha256:` or rewrite historical
+entries. Initializer digest flags accept the scalar appropriate to the selected
+source. The public fixture catalog remains illustrative historical data.
+
+Before engine selection, integrate a nonempty
+`next-engine-rollout-evidence.json` with the same schema and controller map as
+active evidence. Its engine refs must differ from incumbent runtime evidence.
+Records may include boolean `portable_managed_image_ids` capability evidence.
+Ordinary upgrades promote matching prior records unchanged and remove the empty
+sidecar. Image-free manager bootstrap retains incumbent active evidence and
+pending records through manager staging and image-policy introduction, then
+promotes evidence alone after verified runtime activation. A no-change staging
+commit remains invalid. Pass current and previous active/pending files together
+with `--previous-config`; the engine callers use the immediate first parent.
+
+The root installer derives runtime IDs and protected proof. Do not add them to
+fleet policy or host inputs. See the engine's
+[managed-image guide](https://github.com/RandomDevelopment/ci-fleet/blob/main/docs/MANAGED-IMAGES.md)
+for build evidence, limits, cache refresh, cleanup and recovery. A published engine
+or template does not establish native import or host acceptance. Standalone
+template publication, adopter promotion and live rollout remain separate gates.

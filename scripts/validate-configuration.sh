@@ -14,6 +14,7 @@ python3 "$trusted_template/scripts/test_policy.py"
 git ls-tree -rz --name-only HEAD >"$temporary_directory/tree-paths"
 current=(--config "$PWD/fleet.json" --tree-paths "$temporary_directory/tree-paths")
 if [[ -f engine-rollout-evidence.json ]]; then current+=(--rollout-evidence "$PWD/engine-rollout-evidence.json"); fi
+if [[ -f next-engine-rollout-evidence.json ]]; then current+=(--next-engine-rollout-evidence "$PWD/next-engine-rollout-evidence.json"); fi
 
 if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:fleet.json" 2>/dev/null; then
   git show "$BASE_SHA:fleet.json" >"$temporary_directory/previous-fleet.json"
@@ -21,6 +22,10 @@ if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA:f
   if git cat-file -e "$BASE_SHA:engine-rollout-evidence.json" 2>/dev/null; then
     git show "$BASE_SHA:engine-rollout-evidence.json" >"$temporary_directory/previous-rollout-evidence.json"
     args+=(--previous-rollout-evidence "$temporary_directory/previous-rollout-evidence.json")
+  fi
+  if git cat-file -e "$BASE_SHA:next-engine-rollout-evidence.json" 2>/dev/null; then
+    git show "$BASE_SHA:next-engine-rollout-evidence.json" >"$temporary_directory/previous-next-engine-rollout-evidence.json"
+    args+=(--previous-next-engine-rollout-evidence "$temporary_directory/previous-next-engine-rollout-evidence.json")
   fi
   python3 "$validator" --strict "${current[@]}" "${args[@]}"
 elif [[ "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then

@@ -4,6 +4,7 @@
     "apt_cache": true,
     "capacity_telemetry": true,
     "reproducible_managed_images": true,
+    "portable_managed_image_ids": true,
     "docker_storage_retention": true,
     "docker_network_policy_config": true,
     "docker_network_policy_adapter": true,

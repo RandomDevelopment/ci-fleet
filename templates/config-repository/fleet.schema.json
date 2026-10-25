@@ -71,6 +71,7 @@
       }
     },
     "managed_image_ids": {
+      "description": "Role scalars are original config digests when the selected runtime source declares portable_managed_image_ids; older source values remain exact opaque local Docker IDs. Derived runtime IDs and host binding proof never belong in this catalog.",
       "type": "object",
       "additionalProperties": false,
       "required": ["controller", "runner"],

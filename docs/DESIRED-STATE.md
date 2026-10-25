@@ -309,7 +309,7 @@ Legacy project-specific hosts remain until CI, promotion, and deployment no long
 
 ## Failure and recovery behavior
 
-Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Compose validation happens before the checkpoint. Required builds use temporary tags after checkpoint creation and before drain. Both exact image IDs and revision labels must match, and post-build host checks must pass, before drain; canonical tags are published only after a successful drain within checkpoint recovery coverage. Failed preparation or drain preserves incumbent tags and the active controller; scoped candidate image or layer artifacts may remain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
+Before mutation, the installer records the prior rendered environment, installation metadata, runtime release, installer-manager release, and maintenance unit/timer state under `/var/lib/ci-fleet/checkpoints`. Each checkpoint is staged and atomically renamed with a completion marker; rollback ignores partial staging directories. Portable preparation hydrates verified runtime IDs before candidate Compose validation. Required builds use temporary tags after checkpoint creation and before drain. Both roles must pass the runtime source's managed-image identity contract, source and platform checks, and post-build host checks must pass, before drain; canonical tags are published only after a successful drain within checkpoint recovery coverage. Failed preparation or drain preserves incumbent tags and the active controller; scoped candidate image or layer artifacts may remain. A failed activation or health check drains the candidate, restores those artifacts, restarts the prior controller only when no managed runner is active, and verifies prior-release health before reporting rollback success. A host-local installer lock serializes every check and mutation. Runtime and installer-manager releases are staged on their respective target filesystems and renamed atomically so a failed copy cannot masquerade as an installed immutable release.
 
 Installer checkpoints and machine backups serve different failure classes. A checkpoint rolls back a single failed reconciliation. Recoverability of the machine itself is governed by each host's declared failure boundary (see [Adding a host](ADDING-A-HOST.md)): a disposable controller needs no machine backup at all — recovery is rebuilding from reviewed Git-authored desired state — while a non-disposable host follows its own documented local backup policy. Rollback is a bounded convenience, not a guarantee that every catastrophic or major-version interruption leaves the controller operational. The installer repairs only canonical, digest-valid artifacts from their pinned revisions; otherwise it fails closed and reports that an operator must recover or reinstall from reviewed desired state rather than executing untrusted rollback material.
 
@@ -326,3 +326,20 @@ completion after process death or reboot is not guaranteed.
 Monitoring thresholds, heartbeat endpoints, and backup hooks are host-local operational facts, not fleet desired state. Keep them in the protected file documented by [Fleet health monitoring](HEALTH-MONITORING.md); the installer preserves that file across upgrades and rollback.
 
 This contract implements the engine portions of [issue #32](https://github.com/RandomDevelopment/ci-fleet/issues/32) and integrates the installer, documentation, phone-first bootstrap, and capacity work tracked by [#21](https://github.com/RandomDevelopment/ci-fleet/issues/21), [#24](https://github.com/RandomDevelopment/ci-fleet/issues/24), [#27](https://github.com/RandomDevelopment/ci-fleet/issues/27), and [#30](https://github.com/RandomDevelopment/ci-fleet/issues/30).
+
+
+## Managed image scalar semantics and predecessor evidence
+
+The runtime source's `portable_managed_image_ids` capability makes existing
+`managed_images[engine][architecture][role]` scalars original config digests.
+Older source entries remain opaque Docker IDs, even under a newer manager.
+The shape stays unchanged. Root preparation derives the two rendered runtime
+IDs and protected proof described in [managed images](MANAGED-IMAGES.md).
+
+Stage a nonempty `next-engine-rollout-evidence.json` in an earlier integrated
+commit. Ordinary selection promotes its matching record unchanged. Image-free
+manager bootstrap retains active and pending evidence through image introduction,
+then promotes evidence alone after runtime verification. Both installer and
+reconciler read the committed current and immediate first-parent fleet/evidence.
+Missing history fails. Keep protected installed-ref and bootstrap LKG exceptions
+limited to their retained identity checks.

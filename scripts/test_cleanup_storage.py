@@ -304,6 +304,10 @@ class StorageTests(unittest.TestCase):
             fresh_ids.write_text(f"CI_FLEET_CONTROLLER_IMAGE_ID={OTHER}\nCI_FLEET_RUNNER_IMAGE_ID=absent\n")
             protected = cleanup.protected_images()
             self.assertEqual(protected, {"runner:current", "controller:current", "runner:previous", "runner:original", IMAGE, OTHER, reviewed})
+            complete = {"Images": [image(identity=value, RepoTags=[]) for value in (IMAGE, OTHER, reviewed)]}
+            self.assertEqual(cleanup.protected_images(complete), protected)
+            with self.assertRaisesRegex(ValueError, "opaque rollback image identities are unresolved"):
+                cleanup.protected_images({"Images": [image(identity=OTHER, RepoTags=[])]})
             self.assertEqual(cleanup.image_reason(image(OTHER, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
             self.assertEqual(cleanup.image_reason(image(reviewed, RepoTags=None), set(), protected, NOW), "installed-or-checkpoint-release")
             for path in (ids, fresh_ids, checkpoint / "image-env"):
