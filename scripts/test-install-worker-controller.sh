@@ -41,6 +41,7 @@ export REAL_TAR
 REAL_TAR=$(command -v tar)
 export REAL_GIT
 REAL_GIT=$(command -v git)
+export FAKE_ENGINE_GIT_SOURCE=$fixture_repo
 export REAL_DF
 REAL_DF=$(command -v df)
 export REAL_MV
@@ -541,6 +542,10 @@ if [[ -n ${FAKE_FAIL_GIT_ARCHIVE_ONCE:-} && -f "$FAKE_FAIL_GIT_ARCHIVE_ONCE" && 
 fi
 if [[ -n ${FAKE_FAIL_GIT_FETCH:-} && " $* " == *" fetch "* ]]; then
   exit 90
+fi
+if [[ " $* " == *" fetch "* ]]; then
+  # Installed copies have no Git metadata; keep synthetic engine fetches local.
+  exec "$REAL_GIT" -c "url.${FAKE_ENGINE_GIT_SOURCE:?}.insteadOf=https://github.com/RandomDevelopment/ci-fleet.git" "$@"
 fi
 exec "$REAL_GIT" "$@"
 EOF

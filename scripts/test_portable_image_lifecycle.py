@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -458,6 +459,58 @@ write_config active 1 1 {'b' * 40}
                 result = validate(omitted, policy, previous_proof, current_proof)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("capability evidence", result.stderr)
+
+    def test_installed_fixture_fetches_synthetic_engines_without_network(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        wrapper = re.search(r"""cat >"\$fake_bin/git" <<'EOF'\n(.*?)\nEOF""", fixture, re.S).group(1)
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        canonical = "https://github.com/RandomDevelopment/ci-fleet.git"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "engine source with spaces"
+            source.mkdir()
+            environment = os.environ | {"REAL_GIT": real_git, "FAKE_ENGINE_GIT_SOURCE": str(source),
+                "GIT_ALLOW_PROTOCOL": "file", "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0", "PYTHONDONTWRITEBYTECODE": "1"}
+
+            def git(repository, *arguments, executable=real_git, **updates):
+                return subprocess.run([str(executable), "-C", str(repository), *arguments],
+                                      capture_output=True, text=True, cwd=root, env=environment | updates)
+
+            for arguments in (("init", "-q"), ("config", "user.name", "fixture"),
+                              ("config", "user.email", "fixture@example.invalid")):
+                result = git(source, *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            marker = source / "engine"
+            for value in ("prior", "synthetic unpublished engine"):
+                marker.write_text(value)
+                self.assertEqual(git(source, "add", "engine").returncode, 0)
+                self.assertEqual(git(source, "commit", "-qm", "test: " + value).returncode, 0)
+            selected = git(source, "rev-parse", "HEAD").stdout.strip()
+            wrapper_path = root / "git"
+            wrapper_path.write_text(wrapper + "\n")
+            wrapper_path.chmod(0o700)
+            for depth in (1, 2):
+                checkout = root / ("fetch-" + str(depth))
+                checkout.mkdir()
+                self.assertEqual(git(checkout, "init", "-q").returncode, 0)
+                self.assertEqual(git(checkout, "remote", "add", "origin", canonical).returncode, 0)
+                arguments = ("fetch", "-q", "--depth=" + str(depth), "origin", selected)
+                # The unwrapped fallback cannot contact GitHub in this offline regression.
+                self.assertNotEqual(git(checkout, *arguments).returncode, 0)
+                result = git(checkout, *arguments, executable=wrapper_path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(git(checkout, "rev-parse", "FETCH_HEAD").stdout.strip(), selected)
+                self.assertEqual(git(checkout, "config", "--get", "remote.origin.url").stdout.strip(), canonical)
+                self.assertEqual(git(checkout, *arguments, executable=wrapper_path, FAKE_FAIL_GIT_FETCH="1").returncode, 90)
+                self.assertNotEqual(git(checkout, *arguments, executable=wrapper_path,
+                                        FAKE_ENGINE_GIT_SOURCE="").returncode, 0)
+                self.assertNotEqual(git(checkout, "fetch", "-q", "origin", "0" * 40,
+                                        executable=wrapper_path).returncode, 0)
+                self.assertEqual(git(checkout, "remote", "set-url", "origin", "https://github.com/example/unrelated.git").returncode, 0)
+                self.assertNotEqual(git(checkout, *arguments, executable=wrapper_path).returncode, 0)
 
     def test_cleanup_protects_current_and_checkpoint_c_r_m_without_export(self):
         with tempfile.TemporaryDirectory() as directory:
