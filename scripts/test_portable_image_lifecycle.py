@@ -182,6 +182,56 @@ build_candidate
 [[ $(cat "$temporary/order") == $'prepare\nbuild-pair\nwarm-pair\ncompose' ]]
 """)
 
+    def test_compose_failure_respects_source_specific_preparation_order(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        fake_docker = re.search(r'^cat >"\$fake_bin/docker" <<\'EOF\'\n(.*?)^EOF$', fixture, re.M | re.S).group(1)
+        converge = functions("perform_converge")
+        preparation = converge[converge.index("  capture_current_pointer\n"):converge.index("  build_before_drain=true\n")]
+        for portable in (False, True):
+            with self.subTest(portable=portable):
+                self.shell(("compose", "portable_managed_images", "build_candidate"), """
+mkdir "$temporary/bin"
+cat >"$temporary/bin/docker" <<'FIXTURE_DOCKER'
+""" + fake_docker + """FIXTURE_DOCKER
+chmod 700 "$temporary/bin/docker"
+PATH=$temporary/bin:$PATH
+[[ $(command -v docker) == "$temporary/bin/docker" ]]
+testing=1
+root_prefix=$temporary
+export FAKE_DOCKER_STATE=$temporary/incumbent
+export FAKE_COMPOSE_LOG=$temporary/compose.log
+export FAKE_FAIL_CONFIG=1
+: >"$FAKE_DOCKER_STATE"
+capture_current_pointer() { :; }
+install_release() { :; }
+pending_policy_checkpoint() { return 1; }
+make_checkpoint() { printf 'checkpoint\n' >>"$temporary/order"; printf 'CHECKPOINT_CREATED\n'; }
+repair_pending_checkpoint_authority() { exit 98; }
+managed_images_match() { return 0; }
+managed_image_objects_match() { return 0; }
+build_managed_images() { exit 98; }
+prepare_portable_images() { printf 'prove-pair\n' >>"$temporary/order"; }
+portable_image_objects_match() { printf 'check-pair\n' >>"$temporary/order"; }
+die() { printf '%s\n' "$*" >&2; exit 97; }
+set +e
+(
+  set -Eeuo pipefail
+""" + preparation + """
+) >"$temporary/output" 2>&1
+status=$?
+set -e
+[[ $status == 47 ]]
+[[ -f "$FAKE_DOCKER_STATE" ]]
+[[ $(wc -l <"$FAKE_COMPOSE_LOG") == 1 ]]
+grep -q '^config|' "$FAKE_COMPOSE_LOG"
+if grep -Eq 'DRAIN_READY|ROLLBACK_' "$temporary/output"; then exit 1; fi
+""" + ("""
+[[ $(cat "$temporary/order") == $'checkpoint\nprove-pair\ncheck-pair' ]]
+""" if portable else """
+[[ ! -e "$temporary/order" ]]
+if grep -q CHECKPOINT_CREATED "$temporary/output"; then exit 1; fi
+"""), portable=portable)
+
     def test_hydration_precedes_exact_drift_comparisons(self):
         self.shell(("drift_count",), """
 testing=0

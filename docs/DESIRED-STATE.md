@@ -202,8 +202,8 @@ The installer:
 3. selects exactly one logical controller;
 4. renders `/etc/ci-fleet/ci-fleet.env` without secret values;
 5. fetches and verifies the pinned public engine commit;
-6. validates the candidate Compose configuration;
-7. creates a root-only controller checkpoint, prepares and verifies images under temporary tags, and passes post-build host checks;
+6. validates candidate Compose before checkpoint capture for opaque runtime sources;
+7. creates a root-only controller checkpoint and prepares and verifies images under temporary tags. Portable sources then validate Compose using both verified image bindings. Post-build host checks must pass;
 8. drains the current controller and waits for every managed runner to finish, including orphaned runners left after a stopped or crashed controller;
 9. runs managed workload-quiescence preflight, then publishes verified canonical tags within checkpoint recovery coverage;
 10. installs health, cleanup, and pinned-state drift unit definitions;

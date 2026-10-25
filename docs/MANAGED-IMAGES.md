@@ -57,7 +57,11 @@ bound identities and immutable objects remain unchanged. Warm proof trusts the
 daemon's content-addressed store. It cannot detect hostile root/store replacement
 that copies all bound identities.
 
-Preparation captures the incumbent checkpoint before required builds. Builds use
+Preparation captures the incumbent checkpoint before required builds.
+Opaque runtime sources validate candidate Compose before checkpoint capture.
+Portable sources validate Compose after both image bindings pass, following any
+required builds under checkpoint coverage. Neither source drains or publishes
+canonical tags after failed Compose validation. Builds use
 private temporary tags. Both roles must pass before publication; post-build host
 checks and drain still precede canonical tags. Matching verified objects are
 reused despite tag drift. Failed preparation preserves incumbent runtime and tags.

@@ -3099,7 +3099,7 @@ if "$installer" --upgrade "${base_args[@]}" --ref "$ref_two" >"$config_failure_o
   fail 'candidate Compose validation failure unexpectedly succeeded'
 fi
 unset FAKE_FAIL_CONFIG
-if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail 'candidate Compose validation failure entered the transaction'; fi
+if grep -Eq 'CHECKPOINT_CREATED|DRAIN_READY|ROLLBACK_' "$config_failure_output"; then fail "candidate Compose validation failure entered the transaction: $(<"$config_failure_output")"; fi
 [[ -f "$FAKE_DOCKER_STATE" ]] || fail 'candidate Compose validation failure stopped the installed controller'
 invalid_image_output=$tmp/invalid-image-id.out
 export FAKE_COMPOSE_LOG=$tmp/invalid-image-id-compose.log

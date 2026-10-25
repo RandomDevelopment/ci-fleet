@@ -2870,6 +2870,9 @@ perform_converge() {
   fi
   capture_current_pointer
   install_release
+  if ! portable_managed_images "$candidate_env" "$release_dir"; then
+    compose "$release_dir" "$candidate_env" config --quiet
+  fi
   candidate_runner_image=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate runner image is invalid'
   candidate_controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {count++; value=substr($0, index($0, "=") + 1)} END {if (count != 1) exit 1; print value}' "$candidate_env") || die 'rendered candidate controller image is invalid'
   [[ -n "$candidate_runner_image" && -n "$candidate_controller_image" ]] || die 'rendered candidate image name is missing'
