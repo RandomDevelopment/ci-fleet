@@ -594,15 +594,16 @@ class FileAndPreparationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="managed-image-offline-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # Simulate root ownership for portable unit fixtures. Only the shared
-        # temporary ancestor's writable mode is masked; fixture modes stay real.
+        # Simulate trusted external ancestry without masking fixture modes.
         original_fstat = os.fstat
-        temporary_ancestor = os.stat(self.root.parent)
+        temporary_ancestors = {(info.st_dev, info.st_ino)
+                               for parent in self.root.parents
+                               for info in (parent.stat(),)}
         def fstat(fd):
             result = original_fstat(fd)
             fields = list(result)
             fields[4] = 0
-            if (result.st_dev, result.st_ino) == (temporary_ancestor.st_dev, temporary_ancestor.st_ino):
+            if (result.st_dev, result.st_ino) in temporary_ancestors:
                 fields[0] &= ~0o022
             return os.stat_result(fields)
         self.addCleanup(patch.stopall)

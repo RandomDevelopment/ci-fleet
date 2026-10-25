@@ -310,13 +310,13 @@ PY
   local lkg_token
   lkg_token=$(cat "$temp_dir/reconcile-token" 2>/dev/null || echo "")
   if [[ -n "$lkg_token" ]]; then
-    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 \
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=2 \
       "https://x-access-token:${lkg_token}@github.com/${lkg_repo}.git" "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
       log_json "ERROR" "rollback" "LKG fetch failed"
       return 1
     }
   else
-    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=1 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
+    GIT_TERMINAL_PROMPT=0 git -C "$lkg_pinned" fetch -q --depth=2 origin "$lkg_ref" 2>"$temp_dir/lkg_fetch_err" || {
       log_json "ERROR" "rollback" "LKG fetch failed"
       return 1
     }

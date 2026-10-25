@@ -105,18 +105,22 @@ The initializer refuses to replace a configured file unless `--force` is explici
   networks per runner, and a reserved subnet count for health inspection.
 
 `status_reporting` is deliberately omitted from initialized and reference
-configurations. For an existing controller, roll out schema support in three
-separately reviewed, integrated changes: first update only `engine_ref` and prove
-routine reconciliation has activated that engine; then record the controller ID,
-proven active ref, and reviewed `status_reporting_config` and
-`required_status_reporting` capability booleans in
-`engine-rollout-evidence.json`; only then add the optional `status_reporting`
-object without changing `engine_ref`. Enabling required delivery also requires the
-prior evidence to record both capabilities as `true`. Transition validation
-rejects introducing or enabling the property without the corresponding evidence.
-This staging prevents an older active manager from rejecting the new property before it
-can upgrade itself. Endpoint and key values remain host-local and never enter
-Git.
+configurations. For an image-enforced controller, integrate the target engine's
+reviewed capability record in `next-engine-rollout-evidence.json` before changing
+`engine_ref`. In a later commit, select that engine and promote the matching
+pending record unchanged into `engine-rollout-evidence.json`. Remove its pending
+record, and remove the sidecar when empty. After routine reconciliation verifies
+the selected runtime, add `status_reporting` in a later commit while retaining
+the engine and active evidence. Enabling required delivery requires both
+`status_reporting_config` and `required_status_reporting` to be `true` in the
+previous integrated active record.
+
+For image-free manager bootstrap, retain incumbent active evidence and the
+matching pending records through manager staging and image-policy introduction.
+Only after runtime verification promote evidence unchanged in an evidence-only
+commit. This applies even when optional status/network fields are absent and all
+capability flags are false. See [portable managed images and pending evidence](#portable-managed-images-and-pending-evidence).
+Endpoint and key values remain host-local and never enter Git.
 
 The same per-controller evidence record may declare
 `docker_network_policy_config` and `docker_default_bridge_cidr_config`. A
@@ -170,18 +174,19 @@ operational Docker pool CIDR. This is the narrow capacity-policy exception
 described above, not permission to commit host or service addresses.
 
 The field is optional solely for staged upgrades from older schema-v3 engines.
-First pin and activate a compatible engine without adding the field. In a second
-reviewed desired-state commit, record the active ref and
-`docker_network_policy_config: true` in `engine-rollout-evidence.json`. Add the
-reviewed policy in a third commit, retaining the same ref and evidence. The older
-engine rejects the new key, so skipped commits must not satisfy the gate.
-Transition validation requires the activation evidence to exist in the previous
-integrated state when introducing the policy. It also requires matching current
-evidence whenever a controller retains the policy, including across engine
-changes or rollbacks. Adding `default_bridge_cidr` later repeats the prior-state
-gate with `docker_default_bridge_cidr_config: true`.
+For an image-enforced controller, first integrate matching target-engine pending
+evidence with `docker_network_policy_config: true`. In a later commit, select the
+compatible engine, promote that record unchanged into active evidence, and remove
+the promoted pending record. After runtime verification, add the reviewed policy
+in a later commit with the same ref and active evidence. The older engine rejects
+the new key, so skipped commits must not satisfy the gate. Image-free bootstrap
+uses the separate retention and evidence-only promotion sequence above.
+Transition validation requires active evidence from the previous integrated state
+when introducing policy. Retained policy also needs matching current evidence.
+Adding `default_bridge_cidr` repeats the prior-state capability gate with
+`docker_default_bridge_cidr_config: true`.
 
-After the three-commit engine activation gate above, the pinned public engine
+After the staged engine activation gate above, the pinned public engine
 can apply or remove a validated policy with at most 64 pools. The executable
 stage holds the installer lock, drains the controller and managed runners, and
 changes Docker's `default-address-pools` key plus `bip` only when

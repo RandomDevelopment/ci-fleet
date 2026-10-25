@@ -84,11 +84,21 @@ def protected_images(usage: dict | None = None) -> set[str]:
         values = parse_env(path, allow_unknown=True)
         if path == current:
             current_values = values
+        if path.name == "fresh-image-env":
+            original = path.parent / "fresh-image-ids"
+            coordination.trusted_path(original, directory=False)
+            captured = parse_env(original, allow_unknown=True)
+            if set(captured) != {"CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID"} or any(
+                value != "absent" and not re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in captured.values()
+            ):
+                raise ValueError("fresh checkpoint original image mappings are missing or invalid")
         for name in ("CI_FLEET_RUNNER_IMAGE", "CI_FLEET_CONTROLLER_IMAGE",
                      "CI_FLEET_RUNNER_IMAGE_DIGEST", "CI_FLEET_CONTROLLER_IMAGE_DIGEST",
                      "CI_FLEET_RUNNER_IMAGE_ID", "CI_FLEET_CONTROLLER_IMAGE_ID",
                      "CI_FLEET_CONTROLLER_LIVE_IMAGE_ID",
                      "CI_FLEET_RUNNER_RUNTIME_IMAGE_ID", "CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID"):
+            if path.name == "fresh-image-env" and name.endswith(("_IMAGE_DIGEST", "_RUNTIME_IMAGE_ID")):
+                continue  # Prospective policy is not an original captured image.
             reference = values.get(name)
             if reference and reference != "absent":
                 protected.add(reference)

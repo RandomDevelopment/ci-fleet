@@ -776,9 +776,7 @@ def validate_transition(
         current_evidence = compatible_engine_refs.get(name, {})
         if manager_bootstrap:
             runtime_ref = current_evidence.get("engine_ref", old.get("engine_ref"))
-            if runtime_ref != new.get("engine_ref") and (
-                "docker_network_policy" in new or "status_reporting" in new
-            ):
+            if runtime_ref != new.get("engine_ref"):
                 next_engine = (previous_next_engine_refs or {}).get(name, {})
                 validation.require(
                     next_engine.get("engine_ref") == new.get("engine_ref"),

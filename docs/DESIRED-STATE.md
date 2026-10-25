@@ -76,21 +76,28 @@ operational CIDRs.
 
 `docker_network_policy` is optional only to preserve a staged upgrade path from
 older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
-an existing controller in three reviewed desired-state commits. First change
-only `engine_ref`. After routine reconciliation shows that exact engine is active,
-record `docker_network_policy_config: true` for that controller and ref in
-`engine-rollout-evidence.json`. Only then add the reviewed network policy without
-changing the engine or evidence. Transition validation reads the evidence from
-the previous integrated state, so a commit that adds evidence and policy together
-cannot satisfy the gate. Do not add the field while the old engine still performs
-reconciliation. Once present, the policy requires current evidence naming the
-selected engine and declaring `docker_network_policy_config: true`. Adding
-`default_bridge_cidr` to an existing policy has the same prior-state gate with
-`docker_default_bridge_cidr_config: true`. A retained bridge field requires
-matching current evidence. The selected engine manifest must advertise
-`docker_network_policy_config`, `docker_network_policy_adapter`, and, when the
-bridge field is present, `docker_default_bridge_cidr_config`. Remove unsupported
-fields before selecting an older engine.
+an existing image-enforced controller through separately integrated changes.
+First stage the compatible target engine's record with
+`docker_network_policy_config: true` in `next-engine-rollout-evidence.json`, while
+keeping the incumbent engine and active evidence. Later select that engine and
+promote the matching pending record unchanged into `engine-rollout-evidence.json`.
+Remove the promoted pending record and remove the sidecar when empty. After
+routine reconciliation verifies the selected runtime, add the network policy in
+a later commit without changing the engine or active evidence. A record staged
+in the selection commit cannot satisfy this predecessor gate.
+
+Image-free manager bootstrap instead retains incumbent active evidence and the
+matching pending records through manager staging and image-policy introduction.
+After runtime verification, promote evidence alone without changing fleet state.
+Every staged controller needs matching predecessor pending evidence, even with
+no optional status/network block and all-false capability flags.
+
+Transition validation requires prior integrated active capability evidence when
+introducing network policy or `default_bridge_cidr`. Retained fields need matching
+current evidence. The selected engine must advertise `docker_network_policy_config`,
+`docker_network_policy_adapter`, and, when the bridge field is present,
+`docker_default_bridge_cidr_config`. Remove unsupported fields before selecting
+an older engine through its own reviewed pending-evidence sequence.
 
 This accepted phase permits the executable policy stage to own Docker's
 `default-address-pools` key and, only when configured, its `bip` key. The stage

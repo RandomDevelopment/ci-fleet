@@ -89,8 +89,10 @@ It completes before drain and is attempted at most once. Pre-enforcement images
 have mutable inputs and must never be rebuilt as an alleged match. Lost legacy
 objects fail with `ROLLBACK_IMAGE_REINSTALL_REQUIRED`. Retained objects are
 retagged without Buildx. Unversioned checkpoints require matching existing tags;
-they do not retag or rebuild. Raw prior tags and live IDs remain exact identities,
-including the deferred restoration of a prior controller tag after startup.
+they do not retag or rebuild. Captured raw tag and live IDs remain exact identities for preflight. Inherited
+installed restoration later republishes reviewed tags, so it does not guarantee
+every final raw tag mapping or absence. Fresh no-install restoration and deferred
+prior controller-tag restoration retain their specific exact-ID checks.
 
 The [caller coverage audit](MANAGED-IMAGE-CALLERS.md) records all lifecycle and
 retention dispositions and the standalone template follow-up.

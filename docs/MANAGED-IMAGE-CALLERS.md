@@ -22,7 +22,7 @@ The caller IDs are review references, not configuration or evidence identities.
 - C16, `checkpoint_images_reproducible/rebuild_checkpoint_images`. Preserves old release-specific capability/build dispatch and at-most-once reconstruction. Mutable legacy images never rebuild. Portable rollback requires its exact retained roots instead of guessing a reconstructed root.
 - C17, `retag_checkpoint_image`. Keeps exact raw object selection, post-tag ID equality, daemon-versus-absence distinction and return code 2.
 - C18, `restore_checkpoint evidence gates`. Formats 2/3 and unversioned gates retain ownership, permissions, original-value and pre-drain checks. Portable proof travels in existing install metadata.
-- C19, `restore_checkpoint retained/fresh tags`. Preserves raw old tag/live mapping and confirmed original absence. Content equivalence cannot replace these checks.
+- C19, `restore_checkpoint retained/fresh tags`. Captures and preflights raw tag/live IDs and absence separately. Inherited installed restoration later republishes reviewed tags, so it does not guarantee every final raw tag mapping or absence. Fresh no-install restoration and the deferred controller-tag case retain their specific exact-ID checks.
 - C20, `restore_checkpoint final verification`. Reviewed image gates share portable proof. Deferred prior controller-tag restoration still requires its exact captured raw ID.
 - C21, `staged_runtime_matches`. Keeps image-free staging on the retained runtime source and environment. Manager capability never reinterprets incumbent images.
 - C22, `controller run`. Inspects the supplied immutable R and checks its exact ID, source revision and Linux architecture. It never accesses root proof or exports content.
@@ -33,7 +33,7 @@ The caller IDs are review references, not configuration or evidence identities.
 - C27, `cleanup protected_images`. Reads current/checkpoint proof and protects authenticated C/R/manifest plus existing raw references. Missing/untrusted/stale proof defers image/cache removal.
 - C28, `image_reason/cleanup_storage`. Existing container-use, alias, age, ownership and unknown-use gates consume the expanded protection set. An opaque retained ID absent from complete storage accounting defers removal instead of guessing an alias. Warm proof performs no full export.
 - C29, `eligible image removal`. Exact inspected backend-object reference removal remains unforced and no-prune. Coordination, pass and count limits stay unchanged.
-- C30, `health container/stale/proxy checks`. Uses the same fail-closed cleanup accounting. Health success is not content proof or native acceptance.
+- C30, `health container/stale/proxy checks`. Direct cleanup accounting fails closed. The inherited health stale-resource helper counts successful cleanup output but returns zero counts on cleanup failure; health success cannot establish usable image proof or native acceptance.
 - C31, `healthcheck entrypoint`. Uses the shared rendered allowlist for derived runtime IDs. It remains read-only and does not repair missing proof.
 - C32, `installed drift dispatch`. Existing protected installed-ref/installer check dispatch inherits warm proof and hydration. No new mutation path.
 - C33, `remote reconciliation`. Supplies committed current and immediate-parent fleet/active/pending evidence. Approval, final health, protected LKG and transaction outcomes remain separate gates.
@@ -63,5 +63,6 @@ historical release/compatibility records and published fixture identities. Stage
 retain old catalogs, and validate ordinary upgrades plus image-free bootstrap and
 final evidence-only promotion. Required checks include its complete policy,
 compatibility, initializer/updater/release checks and exact source/base suite.
-A tracked issue and published template release remain separate follow-up work;
-this engine commit neither tracks nor completes standalone synchronization.
+Root tracks the standalone gap in [template issue #43](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/43).
+The issue records the pending engine work; standalone implementation and publication
+remain separate and incomplete.

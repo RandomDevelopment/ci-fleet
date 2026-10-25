@@ -990,7 +990,11 @@ portable_image_objects_match() {
   install -m 0600 "$metadata" "$scratch/metadata" || return 1
   prepare_portable_images "$scratch/environment" "$scratch/metadata" "$release" "$metadata" true || return 1
   # A check must not silently replace a captured runtime identity.
-  cmp -s "$environment" "$scratch/environment"
+  python3 - "$environment" "$scratch/environment" <<'PYTHON'
+from pathlib import Path
+import sys
+raise SystemExit(0 if Path(sys.argv[1]).read_bytes() == Path(sys.argv[2]).read_bytes() else 1)
+PYTHON
 }
 
 hydrate_candidate_images() {
@@ -1425,7 +1429,11 @@ PYTHON
       --release "$releases_dir/$installed_ref" \
       --runner-reference "$runner_runtime" --controller-reference "$controller_runtime" \
       || die 'portable checkpoint requires fresh proof of the original runtime IDs'
-    cmp -s "$directory/ci-fleet.env" "$directory/image-env" || die 'portable checkpoint preparation changed original runtime fields'
+    python3 - "$directory/ci-fleet.env" "$directory/image-env" <<'PYTHON' || die 'portable checkpoint preparation changed original runtime fields'
+from pathlib import Path
+import sys
+raise SystemExit(0 if Path(sys.argv[1]).read_bytes() == Path(sys.argv[2]).read_bytes() else 1)
+PYTHON
   fi
 }
 

@@ -121,11 +121,13 @@ cp "$candidate_env" "$checkpoint_dir/image-env"
 die() {{ exit 7; }}
 portable_image_objects_match() {{ [[ $warm == true ]]; }}
 python3() {{
-  if [[ "$1" == - ]]; then
+  if [[ "$1" == - && $# == 6 ]]; then
     cat >/dev/null
     printf 'authenticate\\n' >>"$temporary/order"
     [[ $trusted == true ]] || return 1
     printf '{{}}' >"$checkpoint_dir/install-state.json"
+  elif [[ "$1" == - ]]; then
+    command python3 "$@"
   else
     [[ "$*" == *'--runner-reference {RUNNER_ROOT}'* && "$*" == *'--controller-reference {CONTROLLER_ROOT}'* ]]
     printf 'fresh-original-pair\\n' >>"$temporary/order"
@@ -205,6 +207,112 @@ drift_count
                 path.write_text(f"{name}={CONTROLLER_ROOT}\n")
                 with self.assertRaises(DesiredStateError):
                     parse_env(path, allow_unknown=False)
+
+    def test_portable_retained_objects_compare_without_cmp(self):
+        self.shell(("image_metadata_path", "portable_image_objects_match"), """
+printf '{}' >"$candidate_metadata"
+prepare_portable_images() {
+  [[ $proof == true ]] || return 1
+  if [[ $change == true ]]; then printf 'changed\n' >>"$1"; fi
+}
+mkdir "$temporary/no-cmp"
+for tool in awk mktemp install dirname python3; do ln -s "$(command -v "$tool")" "$temporary/no-cmp/$tool"; done
+PATH=$temporary/no-cmp
+if command -v cmp >/dev/null; then exit 1; fi
+proof=true
+change=false
+portable_image_objects_match "$candidate_env"
+change=true
+if portable_image_objects_match "$candidate_env"; then exit 1; fi
+proof=false
+if portable_image_objects_match "$candidate_env"; then exit 1; fi
+""")
+
+    def test_lkg_fetch_retains_parent_for_portable_and_opaque_image_policy(self):
+        remote = (ROOT / "scripts/remote-reconcile.sh").read_text()
+        apply = re.search(r"^apply_lkg\(\) \{.*?^\}", remote, re.M | re.S).group()
+        for portable in (False, True):
+            with self.subTest(portable=portable), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "configuration"
+                repository.mkdir()
+                def git(*arguments):
+                    return subprocess.check_output(["git", "-C", str(repository), *arguments], text=True).strip()
+                value = json.loads((ROOT / "templates/config-repository/fleet.json").read_text())
+                value["organization"].update(slug="sample-org", registry="ghcr.io/sample-org")
+                value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["sample-org/sample-app"]
+                value["projects"]["example-app"].update(repository="sample-org/sample-app", image="ghcr.io/sample-org/sample-app")
+                controller = value["controllers"]["example-ci-01"]
+                controller.pop("docker_network_policy", None)
+                controller.pop("status_reporting", None)
+                engine = controller["engine_ref"]
+                value["managed_images"] = {engine: {"amd64": {"controller": CONTROLLER_CONFIG, "runner": RUNNER_CONFIG}}}
+                evidence = {"schema_version": 1, "status_reporting_engine_capabilities": {"example-ci-01": {
+                    "engine_ref": engine, "status_reporting_config": False, "required_status_reporting": False,
+                    "portable_managed_image_ids": portable}}}
+                git("init", "-q")
+                for index in range(2):
+                    (repository / "fleet.json").write_text(json.dumps(value))
+                    (repository / "engine-rollout-evidence.json").write_text(json.dumps(evidence))
+                    (repository / "revision").write_text(str(index))
+                    git("add", ".")
+                    git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+                ref = git("rev-parse", "HEAD")
+                installer = root / "validate-retained.sh"
+                installer.write_text("#!/bin/bash\nset -Eeuo pipefail\n" + functions("validate_candidate_config_commit") + f"""
+repo_root={shlex.quote(str(ROOT))}
+temporary={shlex.quote(str(root))}
+state_file=$temporary/absent-state
+rendered_env=$temporary/absent-env
+mode=upgrade
+restore_lkg=true
+die() {{ printf '%s\\n' "$*" >&2; exit 7; }}
+while (($#)); do
+  case "$1" in
+    --config-repo) config_source_checkout=$2; shift 2 ;;
+    --ref) config_ref=$2; shift 2 ;;
+    --config-identity|--controller) shift 2 ;;
+    *) shift ;;
+  esac
+done
+candidate_config=$config_source_checkout/fleet.json
+validate_candidate_config_commit
+printf '{{"schema_version":1,"outcome":"applied"}}\\n' >&7
+""")
+                installer.chmod(0o700)
+                for token in (False, True):
+                    for depth in (1, 2):
+                        temporary = root / f"attempt-{token}-{depth}"
+                        temporary.mkdir()
+                        (temporary / "metadata.json").write_text(json.dumps({"config_ref": ref,
+                            "config_repository": "sample-org/fleet-config", "controller": "example-ci-01"}))
+                        if token:
+                            (temporary / "reconcile-token").write_text("fixture-only")
+                        function = apply.replace("--depth=2", f"--depth={depth}")
+                        script = "set -Eeuo pipefail\n" + function + f"""
+no_op=false
+explicit_ref=''
+lkg_dir={shlex.quote(str(temporary))}
+temp_dir=$lkg_dir
+transaction_result=$temp_dir/transaction-result
+installer={shlex.quote(str(installer))}
+note() {{ :; }}
+log_json() {{ printf '%s\\n' "$*" >&2; }}
+transaction_outcome() {{ printf applied; }}
+git() {{
+  if [[ "${{1:-}}" == -C && "${{3:-}}" == fetch ]]; then
+    local target=$2 option depth
+    for option in "$@"; do [[ "$option" != --depth=* ]] || depth=$option; done
+    command git -C "$target" fetch -q "$depth" {shlex.quote(repository.as_uri())} {ref}
+  else command git "$@"; fi
+}}
+apply_lkg
+"""
+                        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                                env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"})
+                        self.assertEqual(result.returncode == 0, depth == 2, result.stderr)
+                        if depth == 1:
+                            self.assertIn("previous integrated configuration history is unavailable", result.stderr)
 
     def test_callers_pass_both_pending_records_and_refuse_missing_parent_history(self):
         with tempfile.TemporaryDirectory() as directory:

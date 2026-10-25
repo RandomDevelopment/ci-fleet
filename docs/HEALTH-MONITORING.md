@@ -24,8 +24,10 @@ The check covers:
 - an optional host-local backup check;
 - optional authenticated outbound status delivery.
 
-Portable managed-image proof failures make admitted storage accounting fail
-closed. Health and cleanup cannot repair that proof. Installed drift reports
+Portable managed-image proof failures make direct admitted cleanup accounting
+fail closed. The inherited health stale-resource helper returns zero counts when
+its cleanup command fails, so those counts cannot establish usable proof. Health
+and cleanup cannot repair that proof. Installed drift reports
 `managed_image_bindings` when candidate hydration cannot reuse protected proof.
 Use separately authorized installer preparation for fresh proof, then rerun the
 checks. Health success alone does not establish image content or native acceptance.

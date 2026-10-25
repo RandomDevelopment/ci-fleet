@@ -181,29 +181,39 @@ if args[:2] == ["container", "inspect"]:
             script = root / "check.sh"
             script.write_text('set -euo pipefail\n' + function + '''
 current_runtime_release() { printf '%s\\n' "$APT_TEST_ROOT"; }
+portable_managed_images() { [[ "$APT_TEST_PORTABLE" == true ]]; }
 docker() { cat "$APT_TEST_ROOT/live.env"; }
 controller_container=fixture
 candidate_env=$APT_TEST_ROOT/expected.env
 controller_environment_matches
 ''')
-            for configured, stale, duplicate in ((False, False, False), (False, True, False),
-                                                  (True, False, False), (True, True, False), (False, False, True)):
-                expected = dict(environment)
-                if configured:
-                    expected['CI_FLEET_APT_HTTP_PROXY'] = 'http://cache.example.invalid:3142'
-                    expected['CI_FLEET_NO_PROXY'] = 'mirror.example.invalid'
-                live = dict(expected)
-                if 'CI_FLEET_RUNNER_IMAGE_DIGEST' in expected:
-                    live['CI_FLEET_RUNNER_IMAGE'] = expected['CI_FLEET_RUNNER_IMAGE_DIGEST']
-                if stale:
-                    live['CI_FLEET_APT_HTTP_PROXY'] = 'http://stale.example.invalid:3142'
-                for name, values in (('expected', expected), ('live', live)):
-                    text = ''.join(f'{key}={value}\n' for key, value in values.items())
-                    if duplicate and name == 'live':
-                        text += 'CI_FLEET_APT_HTTP_PROXY=\nCI_FLEET_APT_HTTP_PROXY=\n'
-                    (root / f'{name}.env').write_text(text)
-                result = subprocess.run(['bash', str(script)], env=os.environ | {'APT_TEST_ROOT': str(root)}, capture_output=True)
-                self.assertEqual(result.returncode == 0, not stale and not duplicate, (configured, stale, duplicate, result.stderr))
+            for portable in (False, True):
+                for configured, stale, duplicate in ((False, False, False), (False, True, False),
+                                                      (True, False, False), (True, True, False), (False, False, True)):
+                    compose = (ROOT / "deploy/compose.yaml").read_text()
+                    if not portable:
+                        compose = compose.replace('CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_RUNTIME_IMAGE_ID:',
+                                                  'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:')
+                    (root / "deploy/compose.yaml").write_text(compose)
+                    expected = dict(environment)
+                    if portable:
+                        expected['CI_FLEET_RUNNER_RUNTIME_IMAGE_ID'] = 'sha256:' + '7' * 64
+                        expected['CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID'] = 'sha256:' + '8' * 64
+                    if configured:
+                        expected['CI_FLEET_APT_HTTP_PROXY'] = 'http://cache.example.invalid:3142'
+                        expected['CI_FLEET_NO_PROXY'] = 'mirror.example.invalid'
+                    live = dict(expected)
+                    if 'CI_FLEET_RUNNER_IMAGE_DIGEST' in expected:
+                        live['CI_FLEET_RUNNER_IMAGE'] = expected['CI_FLEET_RUNNER_RUNTIME_IMAGE_ID' if portable else 'CI_FLEET_RUNNER_IMAGE_DIGEST']
+                    if stale:
+                        live['CI_FLEET_APT_HTTP_PROXY'] = 'http://stale.example.invalid:3142'
+                    for name, values in (('expected', expected), ('live', live)):
+                        text = ''.join(f'{key}={value}\n' for key, value in values.items())
+                        if duplicate and name == 'live':
+                            text += 'CI_FLEET_APT_HTTP_PROXY=\nCI_FLEET_APT_HTTP_PROXY=\n'
+                        (root / f'{name}.env').write_text(text)
+                    result = subprocess.run(['bash', str(script)], env=os.environ | {'APT_TEST_ROOT': str(root), 'APT_TEST_PORTABLE': str(portable).lower()}, capture_output=True)
+                    self.assertEqual(result.returncode == 0, not stale and not duplicate, (portable, configured, stale, duplicate, result.stderr))
 
 
 if __name__ == "__main__":

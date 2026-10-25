@@ -41,6 +41,52 @@ def usage():
 
 
 class StorageTests(unittest.TestCase):
+    def test_failed_fresh_policy_is_prospective_but_original_ids_remain_protected(self):
+        for portable in (False, True):
+            with self.subTest(portable=portable), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory}):
+                root = Path(directory)
+                current = root / "etc/ci-fleet/ci-fleet.env"
+                current.parent.mkdir(parents=True)
+                revision = "a" * 40
+                values = f"CI_FLEET_ENGINE_REF={revision}\nCI_FLEET_RUNNER_IMAGE=runner:B\nCI_FLEET_CONTROLLER_IMAGE=controller:B\nCI_FLEET_RUNNER_IMAGE_DIGEST={IMAGE}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={OTHER}\n"
+                if portable:
+                    values += f"CI_FLEET_RUNNER_RUNTIME_IMAGE_ID={IMAGE}\nCI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID={OTHER}\n"
+                current.write_text(values)
+                release = root / "opt/ci-fleet/releases" / revision
+                release.mkdir(parents=True)
+                (release / "engine-capabilities.json").write_text(json.dumps({"schema_version": 1, "capabilities": {"portable_managed_image_ids": portable}}))
+                fresh = root / "var/lib/ci-fleet/checkpoints/failed-A"
+                fresh.mkdir(parents=True)
+                prospective = "sha256:" + "c" * 64
+                retained = "sha256:" + "d" * 64
+                (fresh / "fresh-image-env").write_text(f"CI_FLEET_ENGINE_REF={'b' * 40}\nCI_FLEET_RUNNER_IMAGE=runner:A\nCI_FLEET_CONTROLLER_IMAGE=controller:A\nCI_FLEET_RUNNER_IMAGE_DIGEST={prospective}\nCI_FLEET_CONTROLLER_IMAGE_DIGEST={prospective}\nCI_FLEET_RUNNER_RUNTIME_IMAGE_ID={prospective}\n")
+                captured = fresh / "fresh-image-ids"
+                captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                binding = {"roles": {name: {"config_digest": value, "runtime_image_id": value, "manifest_digest": None}
+                                     for name, value in (("runner", IMAGE), ("controller", OTHER))}}
+                accounting = {"Images": [image(IMAGE), image(OTHER)]}
+                with patch.object(cleanup, "read_bindings", return_value=binding) as read:
+                    protected = cleanup.protected_images(accounting)
+                    self.assertNotIn(prospective, protected)
+                    self.assertEqual(read.call_count, int(portable))
+                    captured.write_text(f"CI_FLEET_RUNNER_IMAGE_ID={retained}\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                    with self.assertRaisesRegex(ValueError, "unresolved"):
+                        cleanup.protected_images(accounting)
+                    accounting["Images"].append(image(retained))
+                    self.assertIn(retained, cleanup.protected_images(accounting))
+                    captured.unlink()
+                    with self.assertRaises((OSError, ValueError)):
+                        cleanup.protected_images(accounting)
+                    captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\n")
+                    with self.assertRaisesRegex(ValueError, "mappings"):
+                        cleanup.protected_images(accounting)
+                    if portable:
+                        captured.write_text("CI_FLEET_RUNNER_IMAGE_ID=absent\nCI_FLEET_CONTROLLER_IMAGE_ID=absent\n")
+                        read.side_effect = ValueError("unknown current proof")
+                        with self.assertRaisesRegex(ValueError, "unknown current proof"):
+                            cleanup.protected_images(accounting)
+
     def test_docker_usage_reads_detailed_lists_on_old_and_new_daemons(self):
         for modern_daemon in (False, True):
             with self.subTest(modern_daemon=modern_daemon):
