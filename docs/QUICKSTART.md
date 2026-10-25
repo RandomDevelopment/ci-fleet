@@ -107,17 +107,14 @@ jobs through the Docker socket.
    # sources require original config digests, as described in MANAGED-IMAGES.md.
    ```
 
-   Replace the generated RFC 5737 Docker network values in `fleet.json` with
-   reviewed operational values. Before strict validation, prepare the new
-   controller's [first-install capability evidence](../templates/config-repository/README.md#first-install-capability-evidence)
-   in `engine-rollout-evidence.json`. Review the exact merged selected engine's
-   `engine-capabilities.json` for network policy support and its adapter, plus
-   default bridge support if configured. Historical example pins may lack these
-   declarations. The initializer's SHA input does not prove support. Bind the
-   record to the selected full engine SHA and approved controller ID, using only
-   reviewed capability booleans. This is selected-source evidence before install;
-   verify runtime activation after install before enabling later optional features.
-   Existing installations follow the staged upgrade contract instead.
+   For this new controller, remove generated `docker_network_policy` from
+   `fleet.json`, including any bridge field. Keep `managed_images` present and
+   `engine-rollout-evidence.json`'s active map empty. Omit optional status
+   reporting and storage retention. A reviewed source manifest alone cannot
+   establish active runtime evidence before the controller exists. Follow the
+   [first-install stages](../templates/config-repository/README.md#first-install-capability-evidence);
+   validate against the actual prior integrated state. Existing installations
+   preserve their history and use the staged upgrade contract instead.
 
    ```bash
    # Validate before committing so a rejected file or accidental value
@@ -160,6 +157,14 @@ jobs through the Docker socket.
 
 7. Verify: the same command with `--check` reports `CHECK_OK`, and the
    GitHub runner group shows the scale set idle at zero runners.
+   Use the exact same configuration commit and controller ID. `CHECK_STAGED`
+   cannot prove a new controller activated its runtime. After this verification,
+   review capabilities at the exact selected engine source and integrate the
+   controller's active record in a separate evidence-only configuration commit,
+   with `fleet.json` unchanged. Add reviewed operational network policy and
+   optional bridge values only in a later commit using that previously integrated
+   evidence and the same engine. Source support and runtime activation are both
+   required. Merge and apply each through the approved configuration procedure.
 
 ## Step 2: Connect one repository
 

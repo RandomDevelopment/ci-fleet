@@ -215,6 +215,8 @@ drift_count
                     for line in block.replace("\\\n", " ").splitlines() if line.strip()]
         manager = "/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh"
         self.assertIn(["sudo", manager, "--uninstall"], commands)
+        install = next(command for command in commands if "--install" in command)
+        self.assertIn(["sudo", manager, "--check", *install[3:]], commands)
         for mode in ("--install", "--upgrade"):
             command = next(command for command in commands if mode in command)
             self.assertEqual(command[0], "sudo")

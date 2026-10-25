@@ -74,9 +74,11 @@ under the narrow exception above. Public examples use RFC 5737 documentation
 ranges, which strict validation rejects until the operator supplies reviewed
 operational CIDRs.
 
-`docker_network_policy` is optional only to preserve a staged upgrade path from
-older schema-v3 engines whose exact-key validator does not recognize it. Upgrade
-an existing image-enforced controller through separately integrated changes.
+`docker_network_policy` is optional for first-install staging and for upgrades
+from older schema-v3 engines whose exact-key validator does not recognize it.
+New controllers first install without policy, then establish active runtime
+evidence as described below. Upgrade an existing image-enforced controller
+through separately integrated changes.
 First stage the compatible target engine's record with
 `docker_network_policy_config: true` in `next-engine-rollout-evidence.json`, while
 keeping the incumbent engine and active evidence. Later select that engine and
@@ -151,7 +153,18 @@ GitHub App and runner-group creation remain the bootstrap responsibility tracked
 
 The managed installer supports Debian 12 or newer. Before reading configuration or changing the host, it verifies Docker Engine and Compose v2, Git, curl, jq, the system CA bundle, direct Docker-socket access, and that the Docker filesystem is below the documented 80% warning threshold. It rejects alternate Docker endpoints and contexts, then pins every lifecycle command to the verified local Unix socket. Rollback and uninstall require only their recovery tools, not Git, tar, cmp, host-release metadata, CA bootstrap, or capacity checks.
 
-Run the command from a reviewed checkout of ci-fleet on the target Linux Docker machine:
+Use a reviewed checkout of ci-fleet on the target Linux Docker machine.
+
+For a new controller, initialize with a reviewed merged engine and its reviewed
+images, then remove generated `docker_network_policy`, including any bridge
+field, before the initial configuration commit. Omit optional status reporting
+and storage retention. Keep `managed_images` present. A new installation starts
+with an empty active evidence map; an existing fleet retains other controllers'
+records and omits only this new controller's record. Validate, review and merge
+against the actual prior integrated state.
+Source capability declarations cannot establish activation before an instance
+exists. This first-install sequence does not permit an existing installation to
+discard its history or incumbent evidence.
 
 ```bash
 sudo ./scripts/install-worker-controller.sh \
@@ -162,6 +175,25 @@ sudo ./scripts/install-worker-controller.sh \
 ```
 
 `--ref` must be a full configuration commit SHA. The installer never follows a moving branch. For a private remote repository, configure a narrowly scoped read-only Git credential on the host before running the command. Do not embed credentials in the URL or command line. A local pinned Git checkout is also accepted.
+
+Verify the exact same initial configuration and active runtime:
+
+```bash
+sudo ./scripts/install-worker-controller.sh --check \
+  --config-repo example-org/example-fleet-config \
+  --ref 1111111111111111111111111111111111111111 \
+  --controller example-ci-01
+```
+
+Require `CHECK_OK`. `CHECK_STAGED` only verifies an incumbent during manager
+staging. After actual runtime verification, review capability declarations and
+implementation at the exact selected engine SHA and integrate this controller's
+active record in a separate evidence-only commit, leaving `fleet.json` unchanged.
+In a later commit, add reviewed operational network policy and optional bridge
+values using the previously integrated active record and the same engine. Review,
+validate and merge each commit against its real predecessor before approved
+reconciliation. Source review alone is insufficient, and historical example
+pins without the required capabilities cannot support a capability claim.
 
 The installer:
 

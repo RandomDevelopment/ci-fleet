@@ -201,7 +201,9 @@ def main() -> int:
     finally:
         temporary.unlink(missing_ok=True)
     print(f"Initialized {output}")
-    print("Next: replace RFC 5737 Docker network values, run ./scripts/validate.sh --strict, and keep every secret value outside Git.")
+    print("New controller: remove generated docker_network_policy, including bridge; keep managed_images and an empty active evidence map, omit optional status/storage, then validate against actual prior state and review/merge. Keep secrets outside Git.")
+    print("After install, require --check at that exact config to report CHECK_OK. Review selected-source capabilities and observed runtime activation, then integrate active evidence in an evidence-only commit. Add network policy only in a later commit. See README.md.")
+    print("Existing installations must retain actual history and incumbent evidence through the documented upgrade path; do not reinitialize them.")
     print("Storage retention remains disabled. After activating a compatible engine and inventorying an exclusive fleet daemon, add docker_storage_retention in a separate reviewed change. See README.md.")
     return 0
 

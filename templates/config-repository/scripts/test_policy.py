@@ -242,6 +242,52 @@ class PolicyTests(unittest.TestCase):
                                               (changed, pending, None), (pending, pending, pending)):
                 self.assertNotEqual(self.rollout_cli(introduced, introduced, active, selected, prior, current).returncode, 0)
 
+    def test_cli_first_install_integrates_runtime_evidence_before_network_policy(self):
+        previous = reference_config()
+        engine_ref = first_controller(previous)["engine_ref"]
+        name = "new-ci-01"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fleet.json"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "scripts/init.py"),
+                "--organization", "sample-org", "--project", "sample-app", "--controller", name,
+                "--engine-ref", engine_ref, "--architecture", "amd64",
+                "--controller-image-digest", "sha256:" + "3" * 64,
+                "--runner-image-digest", "sha256:" + "4" * 64,
+                "--default-bridge-cidr", "192.0.2.1/24", "--output", str(output),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            initial = json.loads(output.read_text())
+        self.assertIn("remove generated docker_network_policy", result.stdout)
+        self.assertIn("CHECK_OK", result.stdout)
+        self.assertIn("evidence-only commit", result.stdout)
+        initial["controllers"][name].pop("docker_network_policy")
+        self.assertIn("managed_images", initial)
+        self.assertNotIn("status_reporting", initial["controllers"][name])
+        self.assertNotIn("docker_storage_retention", initial["controllers"][name])
+        result = self.rollout_cli(previous, initial, {}, {})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # This synthetic record models evidence after separately verified runtime activation.
+        active = {name: dict(engine_ref=engine_ref, status_reporting_config=False, required_status_reporting=False,
+                             docker_network_policy_config=True, docker_default_bridge_cidr_config=True)}
+        result = self.rollout_cli(previous, initial, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must already be selected", result.stderr)
+        result = self.rollout_cli(initial, initial, {}, active)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        policy = copy.deepcopy(initial)
+        policy["controllers"][name]["docker_network_policy"] = docker_network_policy()
+        policy["controllers"][name]["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+        policy["controllers"][name]["docker_network_policy"]["default_bridge_cidr"] = "10.65.0.1/24"
+        result = self.rollout_cli(initial, policy, active, active)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.rollout_cli(initial, policy, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous integrated state", result.stderr)
+        result = self.rollout_cli(previous, policy, {}, active)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be omitted from a new controller", result.stderr)
+
     def assert_rejected(self, config: dict, expected: str, *, strict: bool = False) -> None:
         errors = errors_for(config, strict=strict)
         self.assertTrue(any(expected in error for error in errors), errors)

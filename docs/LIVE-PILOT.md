@@ -79,6 +79,9 @@ controller, experimental routing, `min_runners: 0` and `max_runners: 1` in revie
 schema-v3 desired state. Use [adding a host](ADDING-A-HOST.md) for prerequisites.
 The installer renders runtime configuration. Do not copy or hand-edit runtime
 IDs from an example or another host.
+For a new controller, follow the [first-install stages](DESIRED-STATE.md#install-a-fresh-controller).
+Omit optional network/status/storage policy and keep active evidence empty until
+the exact installed runtime is verified. Existing hosts retain their actual history.
 
 ## 5. Prepare image evidence without starting
 
@@ -103,6 +106,9 @@ identity from that configuration.
 sudo ./scripts/install-worker-controller.sh --install \
   --config-repo example-org/fleet-config --ref APPROVED_FULL_CONFIG_COMMIT \
   --controller home-ci-01
+sudo /opt/ci-fleet/manager/current/scripts/install-worker-controller.sh --check \
+  --config-repo example-org/fleet-config --ref APPROVED_FULL_CONFIG_COMMIT \
+  --controller home-ci-01
 sudo docker logs --tail=100 ci-fleet-controller-1
 sudo docker ps --filter label=io.randomdevelopment.ci-fleet.managed=true \
   --filter label=io.randomdevelopment.ci-fleet.instance=home-ci-01
@@ -112,7 +118,10 @@ sudo /opt/ci-fleet/manager/current/scripts/healthcheck.sh --json
 Use the separately reviewed adoption or upgrade path for an existing installation.
 With the reviewed minimum at zero, there must be no runner before a job dispatch.
 Confirm the unique scale set is visible in the experimental runner group. The
-installer must report `CONVERGED`; preserve only redacted summaries outside Git.
+installer must report `CONVERGED` and the exact-config check must report
+`CHECK_OK`. `CHECK_STAGED` cannot prove first activation. Preserve only redacted
+summaries outside Git. Integrate active evidence only after source review and
+runtime verification, then add optional network policy in a later commit.
 
 ## 7. Run exactly one job
 
