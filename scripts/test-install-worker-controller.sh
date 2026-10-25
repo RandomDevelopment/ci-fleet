@@ -829,11 +829,11 @@ git -C "$config_repo" config user.email fixture@example.invalid
 
 write_config() {
   local state=$1 maximum=$2 budget=$3
-  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present} images=${7:-present}
-  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" "$images" <<'PY'
+  local desired_engine=${4:-$engine_ref} reporting=${5:-false} network_policy=${6:-present} images=${7:-present} pool_size=${8:-}
+  python3 - "$repo_root/templates/config-repository/fleet.json" "$config_repo/fleet.json" "$config_repo/engine-rollout-evidence.json" "$desired_engine" "$state" "$maximum" "$budget" "$reporting" "$network_policy" "$images" "$pool_size" <<'PY'
 import json
 import sys
-source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy, images = sys.argv[1:]
+source, target, evidence_target, engine_ref, state, maximum, budget, reporting, network_policy, images, pool_size = sys.argv[1:]
 value = json.load(open(source, encoding="utf-8"))
 value["organization"]["slug"] = "fixture-org"
 value["runner_pools"]["trusted-ci"]["allowed_repositories"] = ["fixture-org/example-app"]
@@ -843,6 +843,8 @@ if images == "omit":
     value.pop("managed_images", None)
 controller = value["controllers"]["example-ci-01"]
 controller["docker_network_policy"]["default_address_pools"][0]["base"] = "10.64.0.0/24"
+if pool_size:
+    controller["docker_network_policy"]["default_address_pools"][0]["size"] = int(pool_size)
 controller["engine_ref"] = engine_ref
 controller["state"] = state
 controller["max_runners"] = int(maximum)
@@ -1841,7 +1843,8 @@ export CI_FLEET_DRAIN_TIMEOUT_SECONDS=2
 
 # Preserve A's durable recovery if B is hard-stopped after nested activation.
 activate_cross_ref_incumbent
-interrupted_ref=$(write_config active 3 3)
+# Change B's reviewed policy while preserving A's exact verified rollback baseline.
+interrupted_ref=$(write_config active 3 3 "$engine_ref" false present present 27)
 interrupted_env=$tmp/interrupted-a.env
 interrupted_state=$tmp/interrupted-a-state.json
 interrupted_daemon=$tmp/interrupted-a-daemon.json
@@ -1852,7 +1855,6 @@ cp "$daemon_config" "$interrupted_daemon"
 cp "$policy_marker" "$interrupted_marker"
 interrupted_current=$(readlink "$root/opt/ci-fleet/current")
 interrupted_manager=$(readlink "$root/opt/ci-fleet/manager/current")
-drift_policy
 interrupted_pause=$tmp/interrupted-policy-pause
 : >"$interrupted_pause"
 export FAKE_PAUSE_SYSTEMCTL_ONCE=$interrupted_pause
@@ -1961,7 +1963,7 @@ rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 [[ ${CI_FLEET_TEST_STOP_AFTER_PENDING_CHECKPOINT_REPAIR:-0} != 1 ]] || { printf 'PENDING_CHECKPOINT_REPAIR_REGRESSION_OK\n'; exit 0; }
 
 # TERM only the outer installer while its nested resume is paused.
-term_ref=$(write_config active 4 4)
+term_ref=$(write_config active 4 4 "$engine_ref" false present present 27)
 term_daemon=$tmp/parent-term-daemon.json
 term_marker=$tmp/parent-term-marker.json
 term_env=$tmp/parent-term.env
@@ -1972,7 +1974,6 @@ cp "$root/etc/ci-fleet/ci-fleet.env" "$term_env"
 cp "$root/var/lib/ci-fleet/install-state.json" "$term_state"
 term_current=$(readlink "$root/opt/ci-fleet/current")
 term_manager=$(readlink "$root/opt/ci-fleet/manager/current")
-drift_policy
 parent_term_pause=$tmp/parent-only-term-pause
 parent_term_result=$tmp/parent-only-term-result.json
 : >"$parent_term_pause"

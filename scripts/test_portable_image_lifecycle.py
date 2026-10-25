@@ -865,6 +865,135 @@ release_tree_permissions_trusted "$stale_checkpoint_manager"
 [[ -z $(find "$interrupted_checkpoint" -name '.current-link.*' -print -quit) ]]
 """)
 
+    def test_policy_rollback_fixtures_preserve_the_captured_incumbent_baseline(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        write = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        drift = re.search(r"^drift_policy\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        policy = (ROOT / "scripts/apply-docker-network-policy.sh").read_text()
+        helpers = "\n".join(re.search(r"^" + name + r"\(\) \{.*?^\}", policy, re.M | re.S).group()
+                            for name in ("persist_recovery", "authoritative_recovery", "set_verified_generation",
+                                         "file_generation", "restore_daemon", "rollback_daemon", "daemon_policy_matches"))
+        snapshot = policy[policy.index('staging_daemon="$work_dir/daemon.json"'):
+                          policy.index('python3 - "$env_file" "$rollback_source"')]
+        retry = policy[policy.index('interrupted_recovery=\n'):policy.index('touch_bip=false\n')]
+        for prefix, start, end, prior_engine in (
+            ("interrupted", "interrupted_ref=$(write_config", "interrupted_pause=", "b" * 40),
+            ("term", "term_ref=$(write_config", "parent_term_pause=", ENGINE),
+        ):
+            setup = fixture[fixture.index(start):fixture.index(end)]
+            assertions = "\n".join(line for line in fixture.splitlines()
+                                   if line.startswith(f'cmp -s "${prefix}_daemon"') or line.startswith(f'cmp -s "${prefix}_marker"'))
+            self.assertEqual(len(assertions.splitlines()), 2)
+            with self.subTest(phase=prefix):
+                self.shell(("validate_candidate_config_commit",), write + "\n" + drift + "\n" + helpers + r"""
+root=$temporary/host
+tmp=$temporary
+config_repo=$temporary/config
+config_source_checkout=$config_repo
+candidate_config=$config_repo/fleet.json
+rendered_env=$root/etc/ci-fleet/ci-fleet.env
+state_file=$root/var/lib/ci-fleet/install-state.json
+daemon_config=$root/etc/docker/daemon.json
+daemon_dir=$(dirname "$daemon_config")
+policy_marker=$root/var/lib/ci-fleet/docker-network-policy/docker-network-policy.json
+current_link=$root/opt/ci-fleet/current
+manager_current=$root/opt/ci-fleet/manager/current
+mkdir -p "$config_repo" "$(dirname "$rendered_env")" "$(dirname "$state_file")" "$(dirname "$daemon_config")" "$(dirname "$policy_marker")" "$(dirname "$current_link")" "$(dirname "$manager_current")"
+git -C "$config_repo" init -q
+git -C "$config_repo" config user.name fixture
+git -C "$config_repo" config user.email fixture@example.invalid
+fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+die() { fail "$*"; }
+# Render real policy/configuration; runtime activation and external effects are modeled.
+render() {
+  python3 - "$repo_root/scripts" "$config_repo/fleet.json" "$1" "$2" "$3" <<'RENDER_POLICY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from desired_state import build_rendered_env, render_docker_daemon_config
+config = json.loads(Path(sys.argv[2]).read_text())
+values, metadata = build_rendered_env(config, "example-ci-01", {
+    "CI_FLEET_GITHUB_APP_CLIENT_ID": "fixture", "CI_FLEET_GITHUB_APP_INSTALLATION_ID": "123",
+    "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": "/fixture-only/key.pem"},
+    config_repository="fixture-org/fleet-config", config_ref="c" * 40, docker_gid=998, machine="x86_64",
+    engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"})
+Path(sys.argv[3]).write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+Path(sys.argv[4]).write_text(json.dumps({"live-restore": True, **render_docker_daemon_config(values)}, indent=2, sort_keys=True) + "\n")
+Path(sys.argv[5]).write_text(json.dumps(metadata))
+RENDER_POLICY
+}
+write_config active 1 1 """ + prior_engine + r""" >/dev/null
+render "$rendered_env" "$daemon_config" "$state_file"
+python3 - "$daemon_config" "$policy_marker" <<'INITIAL_MARKER'
+import hashlib, json, sys
+from pathlib import Path
+state = dict(managed=True, prior_default_address_pools=None, prior_default_address_pools_present=False,
+             prior_mode="644", prior_present=True, verified_generation=hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+Path(sys.argv[2]).write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+INITIAL_MARKER
+ln -s """ + prior_engine + r""" "$current_link"
+ln -s """ + prior_engine + r""" "$manager_current"
+""" + setup + r"""
+config_ref=$(git -C "$config_repo" rev-parse HEAD)
+mode=upgrade
+restore_lkg=false
+validate_candidate_config_commit
+render "$candidate_env" "$temporary/desired-daemon.json" "$temporary/desired-state.json"
+if cmp -s "$daemon_config" "$temporary/desired-daemon.json"; then fail 'candidate did not exercise a policy change'; fi
+# Use the real snapshot, persistence and interrupted-retry source selection.
+state_file=$policy_marker
+checkpoint_dir=$(dirname "$policy_marker")
+checkpoint_owner=$(id -u)
+checkpoint_path_is_pinned() { return 0; }
+controller_checkpoint=$temporary/controller-checkpoint
+mkdir "$controller_checkpoint"
+cp "$rendered_env" "$controller_checkpoint/env"
+work_dir=$temporary/first-transaction
+mkdir "$work_dir"
+""" + snapshot + r"""
+prior_env=$rendered_env
+transaction_recovery=$(persist_recovery "$rollback_source" "$prior_env")
+recovery_inode=$(stat -c %i "$transaction_recovery")
+set_verified_generation '' reapply-pending
+# Model B activation, scratch loss and retry without launching an installer.
+cp "$temporary/desired-daemon.json" "$daemon_config"
+cp "$candidate_env" "$rendered_env"
+rm -rf "$work_dir"
+work_dir=$temporary/retry
+mkdir "$work_dir"
+""" + snapshot + r"""
+cp "$temporary/desired-daemon.json" "$staging_daemon"
+managed_before=true
+apply_phase=reapply-pending
+prior_verified_generation=''
+""" + retry + r"""
+[[ $rollback_source == "$transaction_recovery/daemon.json.before" ]]
+[[ $(stat -c %i "$transaction_recovery") == "$recovery_inode" ]]
+controller_resumed=true
+touch_bip=false
+daemon_mode=644
+daemon_gid=$(id -g)
+atomic_replace_daemon() { cmp -s "$daemon_config" "$4" && cp "$1" "$daemon_config"; }
+run_primitive() {
+  case $1 in
+    rollback-drain|restart) ;;
+    restore) [[ $2 == --env && $3 == "$transaction_recovery/prior-ci-fleet.env" ]] && cp "$3" "$rendered_env" ;;
+    *) return 99 ;;
+  esac
+}
+run_health() { cmp -s "$1" "$controller_checkpoint/env"; }
+rollback_daemon
+cmp -s "$daemon_config" "$transaction_recovery/daemon.json.before"
+cmp -s "$rendered_env" "$controller_checkpoint/env"
+python3 - "$daemon_config" "$policy_marker" <<'RESTORED_MARKER'
+import hashlib, json, sys
+from pathlib import Path
+state = json.loads(Path(sys.argv[2]).read_text())
+assert "phase" not in state
+assert state["verified_generation"] == hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest()
+RESTORED_MARKER
+""" + assertions)
+
     def test_fixture_expected_failure_diagnostic_preserves_output_and_call_site(self):
         fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
         expect_failure = re.search(r"^expect_failure\(\) \{.*?^\}", fixture, re.M | re.S).group()
