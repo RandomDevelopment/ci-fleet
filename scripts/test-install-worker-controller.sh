@@ -1689,6 +1689,32 @@ ref_one=$(write_config active 1 1)
 expect_success "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$ref_one" >/dev/null
 unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
 
+activate_cross_ref_incumbent() {
+  local original_tags=$tmp/cross-ref-original-tags old_tags=$tmp/cross-ref-old-tags old_ref
+  mkdir -p "$original_tags" "$old_tags"
+  cp "$FAKE_RUNNER_IMAGE_STATE" "$original_tags/runner-state"
+  cp "$FAKE_RUNNER_IMAGE_ID_STATE" "$original_tags/runner-id"
+  cp "$FAKE_CONTROLLER_IMAGE_STATE" "$original_tags/controller-state"
+  cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$original_tags/controller-id"
+  old_ref=$(write_config active 1 1 "$cross_ref_old")
+  local -a old_context=(env
+    "FAKE_ENGINE_REF=$cross_ref_old"
+    "FAKE_RUNNER_IMAGE=ci-fleet-runner:${cross_ref_old:0:12}"
+    "FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${cross_ref_old:0:12}"
+    "FAKE_RUNNER_IMAGE_STATE=$old_tags/runner-state"
+    "FAKE_RUNNER_IMAGE_ID_STATE=$old_tags/runner-id"
+    "FAKE_CONTROLLER_IMAGE_STATE=$old_tags/controller-state"
+    "FAKE_CONTROLLER_IMAGE_ID_STATE=$old_tags/controller-id"
+    "FAKE_PRIOR_RUNNER_IMAGE=$FAKE_RUNNER_IMAGE"
+    "FAKE_PRIOR_CONTROLLER_IMAGE=$FAKE_CONTROLLER_IMAGE"
+    "FAKE_PRIOR_IMAGE_STATES=$original_tags")
+  expect_success "${old_context[@]}" "$installer" --upgrade "${base_args[@]}" --ref "$old_ref" >/dev/null
+  expect_success "${old_context[@]}" "$installer" --check "${base_args[@]}" --ref "$old_ref" >/dev/null
+  export FAKE_PRIOR_RUNNER_IMAGE=ci-fleet-runner:${cross_ref_old:0:12}
+  export FAKE_PRIOR_CONTROLLER_IMAGE=ci-fleet-controller:${cross_ref_old:0:12}
+  export FAKE_PRIOR_IMAGE_STATES=$old_tags
+}
+
 authority_active_release=$(readlink -f "$root/opt/ci-fleet/current")
 authority_active_manager=$(readlink -f "$root/opt/ci-fleet/manager/current")
 cross_ref_tree=$(git -C "$repo_root" rev-parse 'HEAD^{tree}')
@@ -1720,6 +1746,8 @@ expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one"
 [[ $(<"$cross_ref_manager/.ci-fleet-tree-sha256") != invalid ]] || fail 'explicit reinstall did not restage the incomplete manager release'
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
+# Model the running environment, source and image revision together.
+activate_cross_ref_incumbent
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
 cp -a "$authority_active_release" "$cross_ref_runtime"
 printf '%s\n' "$cross_ref_old" >"$cross_ref_runtime/.ci-fleet-engine-ref"
@@ -1752,10 +1780,12 @@ if find "$cross_ref_runtime" "$cross_ref_manager" \( -type d -o -type f \) -perm
   fail 'cross-ref repair retained group/world-writable release content'
 fi
 [[ ! -e "$cross_ref_manager/scripts/__pycache__" && ! -L "$cross_ref_manager/scripts/__pycache__" ]] || fail 'cross-ref manager was not securely restaged before bytecode handling'
+# Restore the original runtime while the old checkpoint source is still retained.
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
 ln -sfn "$authority_active_release" "$root/opt/ci-fleet/current"
 ln -sfn "$authority_active_manager" "$root/opt/ci-fleet/manager/current"
 rm -rf "$cross_ref_runtime" "$cross_ref_manager"
-expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
 git -C "$config_repo" reset -q --hard "$ref_one"
 [[ ${CI_FLEET_TEST_STOP_AFTER_CROSS_REF_RESTAGE:-0} != 1 ]] || { printf 'CROSS_REF_RESTAGE_REGRESSION_OK\n'; exit 0; }
 
@@ -1810,6 +1840,7 @@ unset FAKE_PAUSE_SYSTEMCTL_ONCE CI_FLEET_COMMAND_TIMEOUT_SECONDS FAKE_TIMEOUT_LO
 export CI_FLEET_DRAIN_TIMEOUT_SECONDS=2
 
 # Preserve A's durable recovery if B is hard-stopped after nested activation.
+activate_cross_ref_incumbent
 interrupted_ref=$(write_config active 3 3)
 interrupted_env=$tmp/interrupted-a.env
 interrupted_state=$tmp/interrupted-a-state.json
@@ -1854,6 +1885,7 @@ grep -Fxq 'CI_FLEET_MAX_RUNNERS=3' "$root/etc/ci-fleet/ci-fleet.env" || fail 'ha
 interrupted_checkpoint=$(<"$interrupted_recovery/controller-checkpoint")
 stale_checkpoint_release=$root/opt/ci-fleet/releases/$cross_ref_old
 stale_checkpoint_manager=$root/opt/ci-fleet/manager/releases/$cross_ref_old
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 cp -a "$(readlink -f "$root/opt/ci-fleet/current")" "$stale_checkpoint_release"
 printf '%s\n' "$cross_ref_old" >"$stale_checkpoint_release/.ci-fleet-engine-ref"
 chmod g+w "$stale_checkpoint_release/scripts" "$stale_checkpoint_release/scripts/docker-network-policy-adapter.sh"
@@ -1917,8 +1949,10 @@ cmp -s "$interrupted_marker" "$policy_marker" || fail 'interrupted policy rollba
 [[ $(readlink "$root/opt/ci-fleet/current") == "$stale_checkpoint_release" && $(readlink "$root/opt/ci-fleet/manager/current") == "$stale_checkpoint_manager" ]] || fail 'interrupted policy rollback did not restore normalized checkpoint pointers'
 ln -sfn "$interrupted_current" "$root/opt/ci-fleet/current"
 ln -sfn "$interrupted_manager" "$root/opt/ci-fleet/manager/current"
-rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 unset FAKE_PAUSE_SYSTEMCTL_ONCE
+expect_success "$installer" --install "${base_args[@]}" --ref "$ref_one" >/dev/null
+unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
+rm -rf "$stale_checkpoint_release" "$stale_checkpoint_manager"
 [[ ${CI_FLEET_TEST_STOP_AFTER_PENDING_CHECKPOINT_REPAIR:-0} != 1 ]] || { printf 'PENDING_CHECKPOINT_REPAIR_REGRESSION_OK\n'; exit 0; }
 
 # TERM only the outer installer while its nested resume is paused.

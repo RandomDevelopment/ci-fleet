@@ -620,6 +620,149 @@ log_json() {{ :; }}
             self.assertEqual(result.returncode, 7, result.stderr)
             self.assertIn("history is unavailable", result.stderr)
 
+    def test_cross_ref_fixture_activates_the_captured_runtime_before_relabeling_sources(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        activate = re.search(r"^activate_cross_ref_incumbent\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        write = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        fake_docker = re.search(r'^cat >"\$fake_bin/docker" <<\'EOF\'\n(.*?)^EOF$', fixture, re.M | re.S).group(1)
+        self.assertEqual(len(re.findall(r"^activate_cross_ref_incumbent$", fixture, re.M)), 2)
+        self.shell(("current_runtime_release", "runtime_release_for_environment", "capture_current_pointer",
+                    "capture_legacy_image_ids", "load_checkpoint_images", "make_checkpoint",
+                    "portable_managed_images", "validate_candidate_config_commit"), write + "\n" + activate + r"""
+root=$temporary/host
+tmp=$temporary
+install_root=$root/opt/ci-fleet
+releases_dir=$install_root/releases
+manager_releases=$install_root/manager/releases
+current_link=$install_root/current
+manager_current=$install_root/manager/current
+state_root=$root/var/lib/ci-fleet
+state_file=$state_root/install-state.json
+rendered_env=$root/etc/ci-fleet/ci-fleet.env
+systemd_dir=$temporary/units
+config_repo=$temporary/config
+config_source_checkout=$config_repo
+candidate_config=$config_repo/fleet.json
+cross_ref_old=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cross_ref_runtime=$releases_dir/$cross_ref_old
+release_dir=$releases_dir/$engine_ref
+mkdir -p "$state_root" "$(dirname "$rendered_env")" "$systemd_dir" "$config_repo" "$temporary/bin"
+git -C "$config_repo" init -q
+git -C "$config_repo" config user.name fixture
+git -C "$config_repo" config user.email fixture@example.invalid
+for revision in "$engine_ref" "$cross_ref_old"; do
+  mkdir -p "$releases_dir/$revision/deploy" "$manager_releases/$revision"
+  printf '%s\n' "$revision" >"$releases_dir/$revision/.ci-fleet-engine-ref"
+  printf '%s\n' "$revision" >"$manager_releases/$revision/.ci-fleet-engine-ref"
+  printf '{}' >"$releases_dir/$revision/deploy/compose.yaml"
+done
+export FAKE_DOCKER_STATE=$temporary/controller
+export FAKE_ENGINE_REF=$engine_ref
+export FAKE_RUNNER_IMAGE=ci-fleet-runner:${engine_ref:0:12}
+export FAKE_CONTROLLER_IMAGE=ci-fleet-controller:${engine_ref:0:12}
+export FAKE_RUNNER_IMAGE_STATE=$temporary/runner-state
+export FAKE_CONTROLLER_IMAGE_STATE=$temporary/controller-state
+export FAKE_RUNNER_IMAGE_ID_STATE=$temporary/runner-id
+export FAKE_CONTROLLER_IMAGE_ID_STATE=$temporary/controller-id
+export FAKE_AVAILABLE_IMAGE_IDS=$temporary/available
+export FAKE_CONTROLLER_PROVENANCE_FILE=$temporary/live-revision
+export FAKE_CONTROLLER_IMAGE_ID_FILE=$temporary/live-image
+export FAKE_CONTROLLER_ENV_FILE=$temporary/live-env
+export TEST_SOURCE_ROOT=$repo_root TEST_HOST_ROOT=$root
+cat >"$temporary/bin/docker" <<'FAKE_DOCKER'
+""" + fake_docker + r"""FAKE_DOCKER
+chmod 700 "$temporary/bin/docker"
+PATH=$temporary/bin:$PATH
+[[ $(command -v docker) == "$temporary/bin/docker" ]]
+installer=$temporary/model-runtime
+cat >"$installer" <<'MODEL_RUNTIME'
+#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["TEST_SOURCE_ROOT"] + "/scripts")
+from desired_state import build_rendered_env
+args = sys.argv[1:]
+config = json.loads((Path(args[args.index("--config-repo") + 1]) / "fleet.json").read_text())
+name = args[args.index("--controller") + 1]
+selected = config["controllers"][name]["engine_ref"]
+assert os.environ["FAKE_ENGINE_REF"] == selected
+host = Path(os.environ["TEST_HOST_ROOT"])
+environment = host / "etc/ci-fleet/ci-fleet.env"
+state = host / "var/lib/ci-fleet/install-state.json"
+if args[0] == "--upgrade":
+    values, metadata = build_rendered_env(config, name, {
+        "CI_FLEET_GITHUB_APP_CLIENT_ID": "fixture", "CI_FLEET_GITHUB_APP_INSTALLATION_ID": "123",
+        "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": "/fixture-only/key.pem"},
+        config_repository="sample-org/fleet-config", config_ref=args[args.index("--ref") + 1], docker_gid=998,
+        machine="x86_64", engine_capabilities={"status_reporting_config", "required_status_reporting", "docker_network_policy_config", "docker_network_policy_adapter"})
+    environment.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+    environment.chmod(0o600)
+    state.write_text(json.dumps(metadata))
+    state.chmod(0o600)
+    for role in ("RUNNER", "CONTROLLER"):
+        Path(os.environ[f"FAKE_{role}_IMAGE_STATE"]).write_text(selected + "\n")
+        Path(os.environ[f"FAKE_{role}_IMAGE_ID_STATE"]).write_text(values[f"CI_FLEET_{role}_IMAGE_DIGEST"] + "\n")
+    Path(os.environ["FAKE_CONTROLLER_PROVENANCE_FILE"]).write_text(selected + "\n")
+    Path(os.environ["FAKE_CONTROLLER_IMAGE_ID_FILE"]).write_text(values["CI_FLEET_CONTROLLER_IMAGE_DIGEST"] + "\n")
+    Path(os.environ["FAKE_DOCKER_STATE"]).touch()
+    for kind in ("releases", "manager/releases"):
+        link = host / "opt/ci-fleet" / ("current" if kind == "releases" else "manager/current")
+        link.unlink(missing_ok=True)
+        link.symlink_to(host / "opt/ci-fleet" / kind / selected)
+else:
+    assert args[0] == "--check"
+    assert f"CI_FLEET_ENGINE_REF={selected}\n" in environment.read_text()
+    assert json.loads(state.read_text())["engine_ref"] == selected
+    assert Path(os.environ["FAKE_CONTROLLER_PROVENANCE_FILE"]).read_text().strip() == selected
+with (host / "calls").open("a") as output:
+    output.write(args[0] + " " + selected + "\n")
+MODEL_RUNTIME
+chmod 700 "$installer"
+base_args=(--config-repo "$config_repo" --controller example-ci-01)
+expect_success() { "$@"; }
+# Authentication and runtime effects are modeled here; R8 tests cover the real guards.
+runtime_release_complete() { [[ -f $1/.ci-fleet-engine-ref && $(<"$1/.ci-fleet-engine-ref") == "$2" ]]; }
+manager_release_complete() { runtime_release_complete "$@"; }
+release_tree_permissions_trusted() { return 0; }
+controller_status() { printf running; }
+systemctl() { return 1; }
+die() { printf '%s\n' "$*" >&2; exit 7; }
+mode=upgrade
+restore_lkg=false
+testing=1
+staging_paths=()
+unit_names=()
+capacity_unit_names=()
+optional_unit_names=()
+timer_names=()
+original_ref=$(write_config active 1 1)
+"$installer" --upgrade "${base_args[@]}" --ref "$original_ref"
+for maximum in 2 3; do
+  activate_cross_ref_incumbent
+  config_ref=$(git -C "$config_repo" rev-parse HEAD)
+  validate_candidate_config_commit
+  grep -Fxq "CI_FLEET_ENGINE_REF=$cross_ref_old" "$rendered_env"
+  [[ $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$cross_ref_old" ]]
+  config_ref=$(write_config active "$maximum" "$maximum")
+  validate_candidate_config_commit
+  # This is the real fixture's pointer restaging, after its incumbent activation.
+  ln -sfn "$cross_ref_runtime" "$current_link"
+  ln -sfn "$manager_releases/$cross_ref_old" "$manager_current"
+  captured_current_state=''
+  rm -f "$temporary/current-link"  # Each real installer call has a fresh scratch directory.
+  checkpoints_dir=$state_root/checkpoints-$maximum
+  make_checkpoint "$release_dir"
+  grep -Fxq "$cross_ref_runtime" "$checkpoint_dir/release-target"
+  grep -Fxq "$manager_releases/$cross_ref_old" "$checkpoint_dir/manager-target"
+  grep -Fxq "CI_FLEET_ENGINE_REF=$cross_ref_old" "$checkpoint_dir/ci-fleet.env"
+  [[ -f "$checkpoint_dir/.complete" ]]
+  # Return through the modeled activation before discarding any old source context.
+  "$installer" --upgrade "${base_args[@]}" --ref "$config_ref"
+  unset FAKE_PRIOR_RUNNER_IMAGE FAKE_PRIOR_CONTROLLER_IMAGE FAKE_PRIOR_IMAGE_STATES
+done
+[[ $(grep -Fc -- "--check $cross_ref_old" "$root/calls") == 2 ]]
+""", portable=False)
+
     def test_installer_fixture_stages_runtime_evidence_before_policy_reintroduction(self):
         fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
         helper = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()
