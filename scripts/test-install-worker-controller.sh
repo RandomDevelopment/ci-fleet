@@ -712,7 +712,7 @@ expect_success() {
 expect_failure() {
   local expected=$1 output
   shift
-  if output=$("$@" 2>&1); then fail "expected failure: $*"; fi
+  if output=$("$@" 2>&1); then fail "expected failure [$expected] at line ${BASH_LINENO[0]}: $*; output: $output"; fi
   grep -Fq -- "$expected" <<<"$output" || fail "missing failure [$expected]: $output"
 }
 expect_command_failure() {
@@ -1904,6 +1904,11 @@ printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-targ
 [[ $(readlink -f "$root/opt/ci-fleet/current") != "$stale_checkpoint_release" ]] || fail 'stale checkpoint release was still live'
 [[ $(readlink -f "$root/opt/ci-fleet/manager/current") != "$stale_checkpoint_manager" ]] || fail 'stale checkpoint manager was still live'
 
+# The alias refusal already repaired these sources; rearm the restage failure.
+for pending_target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
+  chmod g+w "$pending_target/scripts" "$pending_target/scripts/docker-network-policy-adapter.sh"
+  refresh_release_digest "$pending_target"
+done
 pending_fsync_daemon=$tmp/pending-fsync-daemon.json
 pending_fsync_marker=$tmp/pending-fsync-marker.json
 cp "$daemon_config" "$pending_fsync_daemon"

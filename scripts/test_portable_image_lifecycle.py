@@ -763,6 +763,132 @@ done
 [[ $(grep -Fc -- "--check $cross_ref_old" "$root/calls") == 2 ]]
 """, portable=False)
 
+    def test_pending_checkpoint_fixture_rearms_restage_before_fsync_failure(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        expect_failure = re.search(r"^expect_failure\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        alias_check = fixture[fixture.index('ln -s releases "$root/opt/ci-fleet/release-aliases"'):
+                              fixture.index('rm "$root/opt/ci-fleet/release-aliases"')]
+        fsync_check = fixture[fixture.index('rm "$root/opt/ci-fleet/release-aliases"'):
+                              fixture.index('retry_pause=$tmp/interrupted-retry-pause')]
+        fake_python = re.search(r'^cat >"\$fake_bin/python3" <<\'EOF\'\n(.*?)^EOF$', fixture, re.M | re.S).group(1)
+        self.shell(("repair_pending_checkpoint_authority", "release_tree_permissions_trusted",
+                    "raw_link_target_path", "resolve_link_target", "canonical_release_target",
+                    "atomic_replace_directory", "release_tree_digest"), expect_failure + r"""
+root=$temporary/host
+root_prefix=$root
+tmp=$temporary
+testing=1
+releases_dir=$root/opt/ci-fleet/releases
+manager_releases=$root/opt/ci-fleet/manager/releases
+current_link=$root/opt/ci-fleet/current
+manager_current=$root/opt/ci-fleet/manager/current
+cross_ref_old=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+stale_checkpoint_release=$releases_dir/$cross_ref_old
+stale_checkpoint_manager=$manager_releases/$cross_ref_old
+interrupted_checkpoint=$temporary/checkpoint
+mkdir -p "$stale_checkpoint_release" "$stale_checkpoint_manager" "$releases_dir/$engine_ref" "$manager_releases/$engine_ref" "$interrupted_checkpoint" "$temporary/archive/scripts" "$temporary/bin"
+printf '%s\n' "$cross_ref_old" >"$temporary/archive/.ci-fleet-engine-ref"
+printf 'fixture adapter\n' >"$temporary/archive/scripts/docker-network-policy-adapter.sh"
+for target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
+  cp -a "$temporary/archive/." "$target"
+  chmod g+w "$target/scripts" "$target/scripts/docker-network-policy-adapter.sh"
+done
+printf '%s\n' "$stale_checkpoint_release" >"$interrupted_checkpoint/release-target"
+printf '%s\n' "$stale_checkpoint_manager" >"$interrupted_checkpoint/manager-target"
+: >"$interrupted_checkpoint/current-link"
+chmod 600 "$interrupted_checkpoint/"*-target "$interrupted_checkpoint/current-link"
+printf '%s\n' "$engine_ref" >"$releases_dir/$engine_ref/.ci-fleet-engine-ref"
+printf '%s\n' "$engine_ref" >"$manager_releases/$engine_ref/.ci-fleet-engine-ref"
+ln -s "$releases_dir/$engine_ref" "$current_link"
+ln -s "$manager_releases/$engine_ref" "$manager_current"
+: >"$temporary/restages"
+fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+# Completeness and immutable input retrieval are modeled; repair, permissions,
+# directory exchange and the fixture's fsync injection run unchanged.
+runtime_release_complete() { [[ -f $1/.ci-fleet-engine-ref && $(<"$1/.ci-fleet-engine-ref") == "$2" ]]; }
+manager_release_complete() { runtime_release_complete "$@"; }
+install_release() {
+  local ref=$1 target=$2 stage
+  [[ $ref == "$cross_ref_old" && $target == "$stale_checkpoint_release" ]] || return 1
+  release_tree_permissions_trusted "$target" && return 0
+  stage=$(mktemp -d "$releases_dir/.restage.XXXXXX")
+  cp -a "$temporary/archive/." "$stage"
+  printf 'runtime\n' >>"$temporary/restages"
+  atomic_replace_directory "$stage" "$target"
+}
+install_manager() {
+  local ref=$1 source=$2 target=$3 stage
+  [[ $ref == "$cross_ref_old" && $source == "$stale_checkpoint_release" && $target == "$stale_checkpoint_manager" ]] || return 1
+  stage=$(mktemp -d "$manager_releases/.restage.XXXXXX")
+  cp -a "$source/." "$stage"
+  printf 'manager\n' >>"$temporary/restages"
+  atomic_replace_directory "$stage" "$target"
+}
+refresh_release_digest() { release_tree_digest "$1" >"$1/.ci-fleet-tree-sha256"; }
+retry() {
+  repair_pending_checkpoint_authority "$interrupted_checkpoint" || {
+    printf 'pending network-policy controller checkpoint is invalid\n' >&2
+    return 2
+  }
+}
+installer=retry
+base_args=()
+interrupted_ref=fixture-config
+export REAL_PYTHON3
+REAL_PYTHON3=$(command -v python3)
+cat >"$temporary/bin/python3" <<'FIXTURE_PYTHON'
+""" + fake_python + r"""FIXTURE_PYTHON
+chmod 700 "$temporary/bin/python3"
+PATH=$temporary/bin:$PATH
+[[ $(command -v python3) == "$temporary/bin/python3" ]]
+""" + alias_check + r"""
+[[ $(cat "$temporary/restages") == $'runtime\nmanager' ]]
+release_tree_permissions_trusted "$stale_checkpoint_release"
+release_tree_permissions_trusted "$stale_checkpoint_manager"
+printf 'alias rejection repaired runtime and manager\n'
+daemon_config=$temporary/daemon.json
+policy_marker=$temporary/policy.json
+printf '{"fixture":"daemon"}\n' >"$daemon_config"
+printf '{"fixture":"pending"}\n' >"$policy_marker"
+""" + fsync_check + r"""
+[[ ! -e "$tmp/pending-fsync-failure" ]]
+[[ $(cat "$temporary/restages") == $'runtime\nmanager\nruntime' ]]
+[[ $(<"$interrupted_checkpoint/current-link") == '../../unavailable-relative-release' ]]
+if release_tree_permissions_trusted "$stale_checkpoint_manager"; then exit 1; fi
+retry
+[[ $(<"$interrupted_checkpoint/current-link") == "$stale_checkpoint_release" ]]
+[[ $(stat -c %a "$interrupted_checkpoint/current-link") == 600 ]]
+release_tree_permissions_trusted "$stale_checkpoint_release"
+release_tree_permissions_trusted "$stale_checkpoint_manager"
+[[ $(readlink "$current_link") == "$releases_dir/$engine_ref" ]]
+[[ $(readlink "$manager_current") == "$manager_releases/$engine_ref" ]]
+[[ -z $(find "$interrupted_checkpoint" -name '.current-link.*' -print -quit) ]]
+""")
+
+    def test_fixture_expected_failure_diagnostic_preserves_output_and_call_site(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        expect_failure = re.search(r"^expect_failure\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        self.shell((), expect_failure + r"""
+fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+refuse() { printf 'fixture refusal\n'; return 2; }
+expect_failure 'fixture refusal' refuse
+set +e
+expected_line=$((LINENO + 1))
+(expect_failure 'fixture refusal' printf 'fixture unexpected success\n') >"$temporary/diagnostic" 2>&1
+status=$?
+set -e
+[[ $status == 1 ]]
+grep -Fq '[fixture refusal]' "$temporary/diagnostic"
+grep -Fq "line $expected_line" "$temporary/diagnostic"
+grep -Fq 'fixture unexpected success' "$temporary/diagnostic"
+set +e
+(expect_failure 'different refusal' refuse) >"$temporary/missing" 2>&1
+status=$?
+set -e
+[[ $status == 1 ]]
+grep -Fq 'missing failure [different refusal]: fixture refusal' "$temporary/missing"
+""")
+
     def test_installer_fixture_stages_runtime_evidence_before_policy_reintroduction(self):
         fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
         helper = re.search(r"^write_config\(\) \{.*?^\}", fixture, re.M | re.S).group()
