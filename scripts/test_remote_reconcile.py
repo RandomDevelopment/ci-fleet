@@ -47,6 +47,7 @@ state_file=$repo_root/state
 rendered_env=$repo_root/env
 candidate_env=$rendered_env
 release_dir=$repo_root/candidate
+install_root=$repo_root/incumbent
 current_link=$repo_root/current
 manager_current=$repo_root/manager
 releases_dir=$repo_root/releases
@@ -77,6 +78,8 @@ drift_count() {
   DRIFT_COUNT=1
 }
 capture_current_pointer() { :; }
+current_runtime_release() { :; }
+portable_managed_images() { return 1; }
 compose() { [[ $scenario != candidate_preparation ]] || die 'fixture-sensitive-value'; }
 pending_policy_checkpoint() { printf '%s\n' "$repo_root/checkpoint"; }
 repair_pending_checkpoint_authority() { : >"$REPAIR_MARKER"; return 1; }
@@ -89,6 +92,13 @@ perform_converge
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertTrue((root / "repaired").exists(), result.stdout + result.stderr)
                 self.assertEqual((root / "result.json").read_text(), "")
+                expected_error = {
+                    "incomplete_manager": "manager current pointer is invalid",
+                    "untrusted_manager": "manager current pointer is invalid",
+                    "pending_checkpoint": "pending network-policy controller checkpoint is invalid",
+                }.get(scenario, "fixture-sensitive-value")
+                self.assertIn(f"ERROR: {expected_error}\n", result.stderr)
+                self.assertNotIn("command not found", result.stderr)
 
     def test_only_explicit_pre_transaction_failures_report_rejection(self):
         prefix = INSTALLER.read_text().split("while (($#)); do", 1)[0]
