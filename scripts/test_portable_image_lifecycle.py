@@ -865,6 +865,115 @@ release_tree_permissions_trusted "$stale_checkpoint_manager"
 [[ -z $(find "$interrupted_checkpoint" -name '.current-link.*' -print -quit) ]]
 """)
 
+    def test_damaged_uninstall_refusal_distinguishes_retained_source_from_missing_context(self):
+        fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
+        start = fixture.index('export FAKE_COMPOSE_LOG=$tmp/damaged-uninstall-compose.log')
+        stop = fixture.index('unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG', start)
+        damaged = fixture[start:stop]
+        expect_failure = re.search(r"^expect_failure\(\) \{.*?^\}", fixture, re.M | re.S).group()
+        uninstall = functions("perform_uninstall")
+        admission = uninstall[uninstall.index("  local candidate"):uninstall.index("  transaction_started=true")]
+        capture = functions("make_checkpoint")
+        authority = capture[capture.index("  local timestamp"):capture.index("  timestamp=$(date")]
+        self.shell(("current_runtime_release", "runtime_release_for_environment", "runtime_release_complete",
+                    "release_tree_digest", "release_tree_permissions_trusted", "load_installed_controller_identity",
+                    "controller_status", "capture_current_pointer", "raw_pointer_target_exists", "raw_link_target_path",
+                    "canonical_release_target", "canonical_release_target_from_raw_pointer",
+                    "release_target_from_raw_pointer", "manager_release_from_raw_pointer"),
+                   expect_failure + "\nuninstall_admission() {\n" + admission + "}\nmake_checkpoint() {\n" + authority + r"""
+  printf 'CHECKPOINT_AUTHORITY source=%s\n' "$target"
+  : >"$tmp/operation-reached"
+}
+root=$temporary/host
+tmp=$temporary
+install_root=$root/opt/ci-fleet
+releases_dir=$install_root/releases
+manager_releases=$install_root/manager/releases
+current_link=$install_root/current
+manager_current=$install_root/manager/current
+rendered_env=$root/etc/ci-fleet/ci-fleet.env
+state_file=$root/var/lib/ci-fleet/install-state.json
+mkdir -p "$releases_dir" "$manager_releases" "$(dirname "$rendered_env")" "$(dirname "$state_file")" "$root/etc/systemd/system"
+mv "$release_dir" "$releases_dir/$engine_ref"
+release_dir=$releases_dir/$engine_ref
+cp "$candidate_env" "$rendered_env"
+printf '{"controller":"example-ci-01","engine_ref":"%s"}\n' "$engine_ref" >"$state_file"
+printf 'fixture health unit\n' >"$root/etc/systemd/system/ci-fleet-health.service"
+chmod 600 "$rendered_env" "$state_file"
+# These complete synthetic source files are authenticated by the real tree guards;
+# no source executable, image build, controller or service is launched.
+python3 - "$release_dir" <<'SOURCE_FILES'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for relative in ("deploy/compose.yaml", "controller/Dockerfile", "controller/go.mod", "controller/main.go",
+                 "controller/config.go", "controller/scaler.go", "controller/state.go", "runner/Dockerfile"):
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fixture-only source\n")
+for name in ("preflight.sh", "healthcheck.sh", "cleanup.sh"):
+    path = root / "scripts" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("#!/bin/bash\nexit 0\n")
+    path.chmod(0o755)
+SOURCE_FILES
+release_tree_digest "$release_dir" >"$release_dir/.ci-fleet-tree-sha256"
+testing=1
+root_prefix=$root
+mode=uninstall
+controller_container=controller
+FAKE_DOCKER_STATE=$tmp/controller
+FAKE_ALL_RUNNER_STATE=$tmp/damaged-no-controller-inactive-runner
+ln -s "$releases_dir/missing/runtime" "$current_link"
+ln -s "$manager_releases/missing" "$manager_current"
+fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+die() { printf '%s\n' "$*" >&2; exit 7; }
+docker() { [[ $1 == inspect && -f $FAKE_DOCKER_STATE ]] && printf running; }
+model_installer() (
+  temporary=$(mktemp -d "$tmp/admission.XXXXXX")
+  captured_current_state=''
+  uninstall_admission
+)
+installer=model_installer
+cp "$rendered_env" "$tmp/expected-env"
+for context in runtime manager; do
+  if [[ $context == manager ]]; then
+    mv "$releases_dir/$engine_ref" "$manager_releases/$engine_ref"
+  fi
+  source=$releases_dir/$engine_ref
+  [[ $context != manager ]] || source=$manager_releases/$engine_ref
+  # Broken pointers do not revoke a matching protected source selected by env.
+  output=$(model_installer --uninstall)
+  [[ $output == "CHECKPOINT_AUTHORITY source=$source" && -f $tmp/operation-reached ]]
+  rm "$tmp/operation-reached"
+  # Retained-source fallback still rejects missing, mismatched and unsafe source.
+  mv "$source" "$tmp/held-source"
+  expect_failure 'incumbent recovery requires a trusted complete source matching its engine revision before drain' model_installer --uninstall
+  mv "$tmp/held-source" "$source"
+  printf '%040d\n' 0 >"$source/.ci-fleet-engine-ref"
+  release_tree_digest "$source" >"$source/.ci-fleet-tree-sha256"
+  expect_failure 'incumbent recovery requires a trusted complete source matching its engine revision before drain' model_installer --uninstall
+  printf '%s\n' "$engine_ref" >"$source/.ci-fleet-engine-ref"
+  chmod g+w "$source/scripts"
+  release_tree_digest "$source" >"$source/.ci-fleet-tree-sha256"
+  expect_failure 'incumbent recovery requires a trusted complete source matching its engine revision before drain' model_installer --uninstall
+  chmod g-w "$source/scripts"
+  release_tree_digest "$source" >"$source/.ci-fleet-tree-sha256"
+  mkdir "$tmp/invalid-live-target"
+  ln -sfn "$tmp/invalid-live-target" "$current_link"
+  expect_failure 'current pointer is invalid; operator recovery or reinstall required' model_installer --uninstall
+  ln -sfn "$releases_dir/missing/runtime" "$current_link"
+  rmdir "$tmp/invalid-live-target"
+  [[ ! -e $tmp/operation-reached ]]
+  # Execute the actual final damaged-case setup and original refusal predicates.
+""" + damaged + r"""
+  [[ ! -e $tmp/operation-reached && -f $rendered_env ]]
+  cmp -s "$tmp/expected-env" "$rendered_env"
+  [[ $(stat -c %a "$rendered_env") == 600 ]]
+  [[ -f $FAKE_ALL_RUNNER_STATE && -f $state_file ]]
+done
+""", portable=False)
+
     def test_no_release_fixture_reestablishes_absence_after_each_rollback(self):
         fixture = (ROOT / "scripts/test-install-worker-controller.sh").read_text()
         first = fixture[fixture.index('unset FAKE_RUNNER_STATE_ONCE FAKE_COMPOSE_LOG'):

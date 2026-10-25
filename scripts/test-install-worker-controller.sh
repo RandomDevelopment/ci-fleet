@@ -3654,12 +3654,15 @@ expect_failure 'a trusted complete canonical manager release is required to unin
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'untrusted present-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'untrusted present-controller uninstall invoked Compose'; fi
 rm -f "$FAKE_DOCKER_STATE"
+# Withhold rendered source identity so the dangling pointers have no authority.
+mv "$root/etc/ci-fleet/ci-fleet.env" "$tmp/damaged-uninstall.env"
 export FAKE_ALL_RUNNER_STATE=$tmp/damaged-no-controller-inactive-runner
 : >"$FAKE_ALL_RUNNER_STATE"
 expect_failure 'a trusted complete runtime release is required before controller mutation' "$installer" --uninstall
 [[ -f "$FAKE_ALL_RUNNER_STATE" ]] || fail 'damaged no-controller uninstall removed a runner before validating runtime authority'
 [[ -f "$root/var/lib/ci-fleet/install-state.json" && -f "$root/etc/systemd/system/ci-fleet-health.service" ]] || fail 'damaged no-controller uninstall removed managed state'
 if grep -Eq '^(stop|down|rm)\|' "$FAKE_COMPOSE_LOG"; then fail 'damaged no-controller uninstall invoked Compose'; fi
+mv "$tmp/damaged-uninstall.env" "$root/etc/ci-fleet/ci-fleet.env"
 unset FAKE_ALL_RUNNER_STATE FAKE_COMPOSE_LOG
 [[ ${CI_FLEET_TEST_STOP_AFTER_DAMAGED_UNINSTALL:-0} != 1 ]] || { printf 'DAMAGED_UNINSTALL_REGRESSION_OK\n'; exit 0; }
 [[ ${CI_FLEET_TEST_STOP_AFTER_CURRENT_LINK_FALLBACK:-0} != 1 ]] || { printf 'CURRENT_LINK_FALLBACK_REGRESSIONS_OK\n'; exit 0; }
