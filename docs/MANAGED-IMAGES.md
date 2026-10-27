@@ -125,8 +125,11 @@ retention dispositions and the standalone template follow-up.
 
 Initial protocol limits are 128 KiB reads, 1 MiB per metadata/config object,
 8 MiB retained metadata, 4096 members, 8 GiB per role, JSON depth 32 and 1 MiB final
-zero padding. The local transport uses API 1.52, 30-second inactivity limits and
-a 180-second overall pair budget. These are bounds, not measured native capacity.
+zero padding. The local transport uses API 1.52 and a 180-second overall pair
+budget. Docker may prepare an export until that shared deadline before sending
+its first byte. Connections, metadata responses and gaps after an export starts
+retain 30-second inactivity limits. Starting the second role never resets the
+pair deadline. These are bounds, not measured native capacity.
 Cold export transfers every layer and classic Docker may need temporary disk.
 Measure both-role duration and peak disk on supervised disposable classic and
 containerd workers, with empty and populated stores. Prove native export ending,

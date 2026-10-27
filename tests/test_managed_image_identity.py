@@ -3,7 +3,7 @@
 
 import argparse
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import copy
 import io
 import json
@@ -416,9 +416,35 @@ class TransportTests(unittest.TestCase):
                 read_all(http_body(raw))
 
     def test_overall_deadline_rejects_trickling_response(self):
-        reader = identity.SocketReader(FakeSocket(b"anything"), 10)
-        with patch.object(identity.time, "monotonic", return_value=11), self.assertRaisesRegex(identity.IdentityError, "deadline"):
+        for export_startup in (False, True):
+            reader = identity.SocketReader(FakeSocket(b"anything"), 10, export_startup=export_startup)
+            with self.subTest(export_startup=export_startup), patch.object(identity.time, "monotonic", return_value=11), \
+                    self.assertRaisesRegex(identity.IdentityError, "deadline"):
+                reader.read(1)
+
+    def test_export_startup_spends_the_pair_budget_then_restores_idle_timeout(self):
+        sock = FakeSocket(b"data", chunk=1)
+        reader = identity.SocketReader(sock, 180, export_startup=True)
+        for now, expected in ((20, 160), (21, 30), (175, 5)):
+            with patch.object(identity.time, "monotonic", return_value=now):
+                self.assertTrue(reader.read(1))
+            self.assertEqual(sock.timeouts[-1], expected)
+        with patch.object(identity.time, "monotonic", return_value=180), \
+                self.assertRaisesRegex(identity.IdentityError, "deadline"):
             reader.read(1)
+        self.assertEqual(sock.raw.tell(), 3)
+
+    def test_only_export_responses_receive_the_startup_allowance(self):
+        for path, startup in (("/info", 30), ("/images/get?names=fixture", 160)):
+            sock = FakeSocket(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            sock.connect = lambda *_: None
+            sock.sendall = lambda *_: None
+            with self.subTest(path=path), patch.object(identity.socket, "socket", return_value=nullcontext(sock)), \
+                    patch.object(identity.time, "monotonic", return_value=20):
+                with identity.Docker(deadline=180).response(path) as body:
+                    self.assertEqual(read_all(body), b"")
+            self.assertEqual(sock.timeouts[:2], [30, startup])
+            self.assertTrue(all(value == 30 for value in sock.timeouts[2:]))
 
     def test_export_request_is_full_runtime_and_has_no_platform_filter(self):
         client, image, paths = identity.Docker(), Image(), []
