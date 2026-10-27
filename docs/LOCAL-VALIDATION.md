@@ -309,7 +309,14 @@ budgets because the complete fixture stage exceeded 1,800 seconds on a
 four-CPU disposable worker. This is a completion budget, not a reliability
 claim. The convention job and ordinary task jobs keep their five-minute limits.
 
-Its existing trusted-main commit and secret policy guards remain separate during staging. Engine PR runs
+Its existing trusted-main commit and secret policy guards remain separate during staging.
+Manual branch dispatches use the merge base with freshly fetched main for both
+commit-message validation and scanning every proposed committed tree. Manual
+tags use the current-main release baseline. A first release without a prior
+baseline still scans all reachable history. Removed secrets within the proposed
+range remain failures; unrelated integrated history does not replace that range.
+
+Engine PR runs
 use a per-PR concurrency group, and both jobs skip events for closed PRs. Open
 PR title and target-base edits still rerun validation without cancelling main
 push validation. Hosted PR jobs

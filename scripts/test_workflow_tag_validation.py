@@ -283,6 +283,45 @@ class WorkflowExecutionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(".env", result.stdout + result.stderr)
 
+    def test_manual_branch_uses_integrated_base_and_checks_all_proposed_messages(self) -> None:
+        self.main = self.stable_history_with_removed_environment()
+        self.git("checkout", "-b", "manual-branch")
+        self.write("payload.txt", "manual branch payload\n")
+        head = self.commit("fix: prepare manual validation")
+        self.assertEqual(self.load_validator("workflow_dispatch", head).returncode, 0)
+        env = dict(EVENT_NAME="workflow_dispatch", REF_TYPE="branch", TAG_NAME="manual-branch",
+                   BASE_SHA="", HEAD_SHA=head)
+        result = self.run_step("Scan every proposed commit for secrets", **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.runtime / "proposed-commits").read_text().splitlines(), [head])
+        self.write("payload.txt", "invalid intermediate message\n")
+        self.commit("not conventional")
+        self.write("payload.txt", "final branch payload\n")
+        env["HEAD_SHA"] = self.commit("fix: finish manual validation")
+        result = self.run_step("Validate proposed commit messages", **env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
+
+    def test_manual_branch_scans_removed_secrets_in_the_proposed_range(self) -> None:
+        self.git("checkout", "-b", "manual-secret", self.main)
+        self.write(".env", "EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden environment fixture")
+        (self.repo / ".env").unlink()
+        head = self.commit("fix: remove forbidden environment fixture")
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="workflow_dispatch",
+                               REF_TYPE="branch", TAG_NAME="manual-secret", BASE_SHA="", HEAD_SHA=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_manual_tag_scans_removed_secrets_since_previous_release(self) -> None:
+        head = self.stable_history_with_removed_environment()
+        self.git("tag", "v0.1.0", self.base)
+        self.git("tag", "v0.1.1", head)
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="workflow_dispatch",
+                               BASE_SHA="", HEAD_SHA=head, TAG_NAME="v0.1.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
     def test_missing_policy_fails_closed_even_when_tagged_copy_exists(self) -> None:
         self.git("checkout", "main")
         self.git("rm", "scripts/validate_commits.py", "scripts/scan_committed_secrets.py")
