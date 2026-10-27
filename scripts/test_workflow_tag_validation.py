@@ -103,6 +103,25 @@ class WorkflowEventTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = WORKFLOW.read_text(encoding="utf-8")
 
+    def test_runner_override_routes_both_required_jobs_with_bounded_budgets(self) -> None:
+        import yaml
+        workflow = yaml.safe_load(self.text)
+        for name, budget in (("commit-convention", 5), ("validate", 90)):
+            job = workflow["jobs"][name]
+            selector = job["runs-on"]
+            self.assertTrue(selector.startswith("${{ ") and selector.endswith(" }}"))
+            for label in ("", "approved-disposable-worker"):
+                expression = selector[4:-3].replace("vars.CI_FLEET_VALIDATION_RUNNER", repr(label))
+                expression = expression.replace("||", "or")
+                with self.subTest(job=name, label=label):
+                    self.assertEqual(eval(expression, {"__builtins__": {}}, {}), label or "ubuntu-latest")
+            self.assertEqual(job["timeout-minutes"], budget)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(workflow["jobs"]["validate"]["name"], "Build without registering a runner")
+        step = next(step for step in workflow["jobs"]["validate"]["steps"]
+                    if step["name"] == "Run the complete local suite")
+        self.assertIn("--timeout 3600", step["run"])
+
     def assert_jobs_enabled(self, expected: bool, *, event: str = "pull_request",
                             state: str = "open", deleted: bool = False,
                             cancelled: bool = False) -> None:

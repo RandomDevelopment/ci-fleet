@@ -294,8 +294,22 @@ and the existing signed-evidence checks.
 | Embedded schema, policy, multi-host and initializer checks | Pinned `validate-template.sh` |
 
 The engine workflow calls the full local entry point and preserves the
-`Build without registering a runner` check identity. Its existing trusted-main
-commit and secret policy guards remain separate during staging. Engine PR runs
+`Build without registering a runner` check identity.
+
+Both engine jobs select the runner label in repository variable
+`CI_FLEET_VALIDATION_RUNNER`, defaulting to `ubuntu-latest` when unset.
+To avoid hosted minutes, set it to a unique label on an operator-approved,
+disposable self-hosted Linux worker before enabling or dispatching validation.
+Run only reviewed source on that worker. Use one-job runners, remove their
+registrations afterward, and keep validation paused if no approved worker is
+available. The worker still needs the tools, systemd and isolation described
+above. This selection does not change required check names.
+The complete infrastructure job has a 90-minute ceiling and 3,600-second stage
+budgets because the complete fixture stage exceeded 1,800 seconds on a
+four-CPU disposable worker. This is a completion budget, not a reliability
+claim. The convention job and ordinary task jobs keep their five-minute limits.
+
+Its existing trusted-main commit and secret policy guards remain separate during staging. Engine PR runs
 use a per-PR concurrency group, and both jobs skip events for closed PRs. Open
 PR title and target-base edits still rerun validation without cancelling main
 push validation. Hosted PR jobs
