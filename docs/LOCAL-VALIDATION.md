@@ -304,10 +304,12 @@ Run only reviewed source on that worker. Use one-job runners, remove their
 registrations afterward, and keep validation paused if no approved worker is
 available. The worker still needs the tools, systemd and isolation described
 above. This selection does not change required check names.
-The complete infrastructure job has a 90-minute ceiling and 3,600-second stage
-budgets because the complete fixture stage exceeded 1,800 seconds on a
-four-CPU disposable worker. This is a completion budget, not a reliability
-claim. The convention job and ordinary task jobs keep their five-minute limits.
+The complete infrastructure job has a 150-minute ceiling and 7,200-second stage
+budgets. The complete fixture stage exceeded 3,600 seconds on a four-CPU
+disposable worker after its Python groups and tester-installer fixture passed,
+while controller-installer coverage was still incomplete. The larger bound
+allows the complete corpus to finish; it does not establish a passing run or
+reliability. The convention job and ordinary task jobs keep their five-minute limits.
 
 Its existing trusted-main commit and secret policy guards remain separate during staging.
 Manual branch dispatches use the merge base with freshly fetched main for both
