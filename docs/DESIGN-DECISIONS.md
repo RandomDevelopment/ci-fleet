@@ -259,7 +259,7 @@ by this implementation.
 
 Status: accepted in merged PR #136.
 
-The read-only hosted engine integration job has a 45-minute ceiling. Repository
+PR #136 raised the read-only hosted engine integration job ceiling to 45 minutes. Repository
 regressions measured about 24 minutes before image acceptance; optional APT cache
 acceptance adds clean reference and cache-enabled managed builds, measured at
 roughly five minutes together. Registry download delays exhausted the former
@@ -270,6 +270,11 @@ Ordinary fleet task jobs keep their five-minute hard timeout. Longer feedback
 and additional hosted runner time are the tradeoffs. Reduce this ceiling after
 optimization or independent validation jobs demonstrate reliable completion
 with full coverage under a shorter limit.
+
+PR #157 extends the complete infrastructure job to 150 minutes with 7,200-second
+stage limits after the full fixture corpus exceeded 3,600 seconds on a four-CPU
+disposable worker. Convention and ordinary task jobs retain five-minute limits.
+See the [current validation budgets and runner policy](LOCAL-VALIDATION.md#coverage-and-hosted-adapter).
 
 ## System-manager execution for local validation
 

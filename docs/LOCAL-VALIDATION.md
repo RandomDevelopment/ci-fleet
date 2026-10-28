@@ -229,8 +229,8 @@ The existing engine workflow's `validate` job exports the entire
 `local-validation-RUN_ID-RUN_ATTEMPT`. Download it from the workflow run's
 Artifacts section within seven days. The upload includes hidden files and fails
 when output is missing. The preceding step makes only that result directory
-readable by the runner account; the workflow permissions, trusted checks and
-45-minute infrastructure job budget remain unchanged.
+readable by the runner account. Workflow permissions and trusted checks remain
+unchanged. The job uses the [infrastructure timeout documented below](#coverage-and-hosted-adapter).
 
 Retain `result.json` and every recorded log and verify their hashes after download
 before disposing of the worker. Artifact archives do not preserve protected Unix
