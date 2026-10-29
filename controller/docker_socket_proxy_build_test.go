@@ -158,15 +158,28 @@ func TestDockerSocketProxyReleasesSpoolBeforeBuildResponseCompletes(t *testing.T
 		t.Fatalf("uploaded contexts retained disk files: %v, %v", entries, err)
 	}
 	// Unlinked files still consume disk until their descriptors close.
-	descriptors, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, descriptor := range descriptors {
-		path, _ := os.Readlink(filepath.Join("/proc/self/fd", descriptor.Name()))
-		if strings.HasPrefix(path, spoolDirectory+"/") {
-			t.Errorf("uploaded context retained an open descriptor: %s", path)
+	// HTTP transport may close the request body asynchronously after returning headers.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		descriptors, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
 		}
+		open := ""
+		for _, descriptor := range descriptors {
+			path, _ := os.Readlink(filepath.Join("/proc/self/fd", descriptor.Name()))
+			if strings.HasPrefix(path, spoolDirectory+"/") {
+				open = path
+				break
+			}
+		}
+		if open == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("uploaded context retained an open descriptor: %s", open)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if proxyMarkerCount(t, fixture) != 3 {
 		t.Fatal("releasing upload storage also released unfinished build markers")
