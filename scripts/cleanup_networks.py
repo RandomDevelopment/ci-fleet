@@ -300,12 +300,14 @@ def remove_networks(*, apply: bool, instance: str, pools: list[ipaddress.IPv4Net
             print(f"WOULD_REMOVE network {name} {reason}")
 
 
-def cleanup_networks(*, apply: bool, instance: str, maintenance=None) -> None:
+def cleanup_networks(*, apply: bool, instance: str, maintenance=None, storage=None) -> None:
     pools = configured_pools()
     if not apply:
         if maintenance is not None:
             maintenance(False)
         remove_networks(apply=False, instance=instance, pools=pools)
+        if storage is not None:
+            storage(apply=False)
         return
     with ExitStack() as stack:
         installer_path = Path(os.environ.get("CI_FLEET_INSTALLER_LOCK", str(host_path("/run/ci-fleet-installer.lock"))))
@@ -339,6 +341,8 @@ def cleanup_networks(*, apply: bool, instance: str, maintenance=None) -> None:
                             if maintenance is not None:
                                 maintenance(True)
                             remove_networks(apply=True, instance=instance, pools=pools)
+                            if storage is not None:
+                                storage(apply=True)
                             return
                 finally:
                     fcntl.flock(maintenance_lock, fcntl.LOCK_UN)
