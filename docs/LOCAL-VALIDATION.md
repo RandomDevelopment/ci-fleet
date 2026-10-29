@@ -312,6 +312,8 @@ section took 24 minutes when measured separately on the four-CPU disposable
 worker. The larger bounds cover the complete fixture corpus and subsequent image
 builds; they do not establish a passing run or reliability. The convention job
 and ordinary task jobs keep their five-minute limits.
+The APT acceptance build client stays alive until fixture cleanup; it has no
+separate 30-minute expiry that can interrupt the managed image builds.
 
 Its existing trusted-main commit and secret policy guards remain separate during staging.
 Manual branch dispatches use the merge base with freshly fetched main for both
