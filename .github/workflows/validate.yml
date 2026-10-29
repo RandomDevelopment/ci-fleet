@@ -111,7 +111,7 @@ jobs:
     needs: commit-convention
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
     runs-on: ${{ vars.CI_FLEET_VALIDATION_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 150
+    timeout-minutes: 240
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -186,7 +186,7 @@ jobs:
           sudo python3 -I scripts/local_validation_executor.py --prepare --disposable-host
           sudo python3 scripts/local_validate.py --repository "$PWD" \
             --source "$SOURCE" --base "$BASE" --policy "$(git rev-parse HEAD)" --main "$main" \
-            --disposable-host --timeout 7200 --output "$RUNNER_TEMP/local-validation" "${args[@]}"
+            --disposable-host --timeout 10800 --output "$RUNNER_TEMP/local-validation" "${args[@]}"
 
       - name: Make validation evidence readable
         if: ${{ always() }}

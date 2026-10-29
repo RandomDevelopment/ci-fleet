@@ -106,7 +106,7 @@ class WorkflowEventTests(unittest.TestCase):
     def test_runner_override_routes_both_required_jobs_with_bounded_budgets(self) -> None:
         import yaml
         workflow = yaml.safe_load(self.text)
-        for name, budget in (("commit-convention", 5), ("validate", 150)):
+        for name, budget in (("commit-convention", 5), ("validate", 240)):
             job = workflow["jobs"][name]
             selector = job["runs-on"]
             self.assertTrue(selector.startswith("${{ ") and selector.endswith(" }}"))
@@ -120,7 +120,7 @@ class WorkflowEventTests(unittest.TestCase):
         self.assertEqual(workflow["jobs"]["validate"]["name"], "Build without registering a runner")
         step = next(step for step in workflow["jobs"]["validate"]["steps"]
                     if step["name"] == "Run the complete local suite")
-        self.assertIn("--timeout 7200", step["run"])
+        self.assertIn("--timeout 10800", step["run"])
 
     def assert_jobs_enabled(self, expected: bool, *, event: str = "pull_request",
                             state: str = "open", deleted: bool = False,

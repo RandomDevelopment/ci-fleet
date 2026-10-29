@@ -106,7 +106,7 @@ sudo python3 /trusted/ci-fleet/scripts/local_validate.py \
   --source SOURCE_SHA --base BASE_SHA \
   --policy POLICY_SHA --main MAIN_SHA \
   --pr-title 'ci: replace hosted validation with local testing' \
-  --disposable-host --output /results/unique-run
+  --disposable-host --timeout 10800 --output /results/unique-run
 ```
 
 The default profile is `full`. `--profile quick` omits container builds and
@@ -178,7 +178,8 @@ outside Git. A changed source, base, title, tag or policy requires a new run.
 Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
-Each stage has a 1,800-second timeout, configurable with `--timeout`. The shared
+The CLI defaults to 1,800 seconds per stage. The complete engine command above
+explicitly sets 10,800 seconds to cover the measured fixture corpus. The shared
 `scripts/local_validation_executor.py` creates a unique system-manager transient
 service per stage. `RuntimeMaxSec` enforces its deadline; `KillMode=control-group`
 includes descendants that detach or double-fork. `ExitType=cgroup` keeps the
@@ -304,12 +305,13 @@ Run only reviewed source on that worker. Use one-job runners, remove their
 registrations afterward, and keep validation paused if no approved worker is
 available. The worker still needs the tools, systemd and isolation described
 above. This selection does not change required check names.
-The complete infrastructure job has a 150-minute ceiling and 7,200-second stage
-budgets. The complete fixture stage exceeded 3,600 seconds on a four-CPU
-disposable worker after its Python groups and tester-installer fixture passed,
-while controller-installer coverage was still incomplete. The larger bound
-allows the complete corpus to finish; it does not establish a passing run or
-reliability. The convention job and ordinary task jobs keep their five-minute limits.
+The complete infrastructure job has a 240-minute ceiling and 10,800-second stage
+budgets. A full fixture attempt reached its 7,200-second limit after the Python,
+tester and controller-installer groups passed. The remaining deployer-installer
+section took 24 minutes when measured separately on the four-CPU disposable
+worker. The larger bounds cover the complete fixture corpus and subsequent image
+builds; they do not establish a passing run or reliability. The convention job
+and ordinary task jobs keep their five-minute limits.
 
 Its existing trusted-main commit and secret policy guards remain separate during staging.
 Manual branch dispatches use the merge base with freshly fetched main for both

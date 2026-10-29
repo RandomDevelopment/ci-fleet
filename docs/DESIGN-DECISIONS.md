@@ -271,8 +271,8 @@ and additional hosted runner time are the tradeoffs. Reduce this ceiling after
 optimization or independent validation jobs demonstrate reliable completion
 with full coverage under a shorter limit.
 
-PR #157 extends the complete infrastructure job to 150 minutes with 7,200-second
-stage limits after the full fixture corpus exceeded 3,600 seconds on a four-CPU
+PR #157 extends the complete infrastructure job to 240 minutes with 10,800-second
+stage limits after the full fixture corpus exceeded 7,200 seconds on a four-CPU
 disposable worker. Convention and ordinary task jobs retain five-minute limits.
 See the [current validation budgets and runner policy](LOCAL-VALIDATION.md#coverage-and-hosted-adapter).
 
