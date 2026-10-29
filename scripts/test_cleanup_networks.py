@@ -44,7 +44,7 @@ class CleanupNetworksTests(unittest.TestCase):
                 cleanup.docker("volume", "inspect", "fixture")
             run.assert_not_called()
 
-    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None, root=None, active_containers=None, attempt_create_on_remove=False, check_wait_unlock=False, swarm_state="inactive", maintenance=None):
+    def run_cleanup(self, inventory, *, apply=True, policy=None, instance="example", attach_on_recheck=False, container_references=None, disappeared_on_recheck=None, attach_on_remove=None, remove_failures=None, root=None, active_containers=None, attempt_create_on_remove=False, check_wait_unlock=False, swarm_state="inactive", maintenance=None, storage=None):
         remaining = copy.deepcopy(inventory)
         calls = []
         inspections = {}
@@ -107,7 +107,7 @@ class CleanupNetworksTests(unittest.TestCase):
                         cleanup.fcntl.flock(lock, cleanup.fcntl.LOCK_SH | cleanup.fcntl.LOCK_NB)
 
             with patch.dict(os.environ, environment, clear=True), patch.object(cleanup, "docker", docker), patch.object(cleanup.time, "sleep", sleep), redirect_stdout(output):
-                cleanup.cleanup_networks(apply=apply, instance=instance, maintenance=maintenance)
+                cleanup.cleanup_networks(apply=apply, instance=instance, maintenance=maintenance, storage=storage)
         return remaining, calls, output.getvalue()
 
     def test_empty_unlabeled_pool_networks_are_removed_and_active_and_legacy_remain(self):
@@ -147,17 +147,17 @@ class CleanupNetworksTests(unittest.TestCase):
                     with path.open("r+") as contender, self.assertRaises(BlockingIOError):
                         cleanup.fcntl.flock(contender, cleanup.fcntl.LOCK_SH | cleanup.fcntl.LOCK_NB)
                 calls.append(apply)
-            self.run_cleanup({}, root=root, maintenance=maintenance)
-            self.assertEqual(calls, [True])
+            self.run_cleanup({}, root=root, maintenance=maintenance, storage=maintenance)
+            self.assertEqual(calls, [True, True])
             calls.clear()
             with (root / "run/ci-fleet-installer.lock").open("r+") as installer:
                 cleanup.fcntl.flock(installer, cleanup.fcntl.LOCK_EX)
-                self.run_cleanup({}, root=root, maintenance=maintenance)
+                self.run_cleanup({}, root=root, maintenance=maintenance, storage=maintenance)
             self.assertEqual(calls, [])
             with patch.object(cleanup, "IDLE_WAIT_SECONDS", 0):
-                self.run_cleanup({}, root=root, active_containers={"job": {"State": {"Status": "running"}, "Config": {}, "Mounts": []}}, maintenance=maintenance)
+                self.run_cleanup({}, root=root, active_containers={"job": {"State": {"Status": "running"}, "Config": {}, "Mounts": []}}, maintenance=maintenance, storage=maintenance)
             self.assertEqual(calls, [])
-            self.run_cleanup({}, root=root, swarm_state="active", maintenance=maintenance)
+            self.run_cleanup({}, root=root, swarm_state="active", maintenance=maintenance, storage=maintenance)
             self.assertEqual(calls, [])
 
     def test_active_work_defers_cleanup_and_releases_maintenance_lock(self):
