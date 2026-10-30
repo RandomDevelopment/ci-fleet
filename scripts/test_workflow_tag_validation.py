@@ -103,6 +103,25 @@ class WorkflowEventTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = WORKFLOW.read_text(encoding="utf-8")
 
+    def test_runner_override_routes_both_required_jobs_with_bounded_budgets(self) -> None:
+        import yaml
+        workflow = yaml.safe_load(self.text)
+        for name, budget in (("commit-convention", 5), ("validate", 240)):
+            job = workflow["jobs"][name]
+            selector = job["runs-on"]
+            self.assertTrue(selector.startswith("${{ ") and selector.endswith(" }}"))
+            for label in ("", "approved-disposable-worker"):
+                expression = selector[4:-3].replace("vars.CI_FLEET_VALIDATION_RUNNER", repr(label))
+                expression = expression.replace("||", "or")
+                with self.subTest(job=name, label=label):
+                    self.assertEqual(eval(expression, {"__builtins__": {}}, {}), label or "ubuntu-latest")
+            self.assertEqual(job["timeout-minutes"], budget)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(workflow["jobs"]["validate"]["name"], "Build without registering a runner")
+        step = next(step for step in workflow["jobs"]["validate"]["steps"]
+                    if step["name"] == "Run the complete local suite")
+        self.assertIn("--timeout 10800", step["run"])
+
     def assert_jobs_enabled(self, expected: bool, *, event: str = "pull_request",
                             state: str = "open", deleted: bool = False,
                             cancelled: bool = False) -> None:
@@ -261,6 +280,45 @@ class WorkflowExecutionTests(unittest.TestCase):
         head = self.commit("fix: remove forbidden environment file")
         result = self.run_step("Scan every proposed commit for secrets",
                                EVENT_NAME="push", BASE_SHA="0" * 40, HEAD_SHA=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_manual_branch_uses_integrated_base_and_checks_all_proposed_messages(self) -> None:
+        self.main = self.stable_history_with_removed_environment()
+        self.git("checkout", "-b", "manual-branch")
+        self.write("payload.txt", "manual branch payload\n")
+        head = self.commit("fix: prepare manual validation")
+        self.assertEqual(self.load_validator("workflow_dispatch", head).returncode, 0)
+        env = dict(EVENT_NAME="workflow_dispatch", REF_TYPE="branch", TAG_NAME="manual-branch",
+                   BASE_SHA="", HEAD_SHA=head)
+        result = self.run_step("Scan every proposed commit for secrets", **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.runtime / "proposed-commits").read_text().splitlines(), [head])
+        self.write("payload.txt", "invalid intermediate message\n")
+        self.commit("not conventional")
+        self.write("payload.txt", "final branch payload\n")
+        env["HEAD_SHA"] = self.commit("fix: finish manual validation")
+        result = self.run_step("Validate proposed commit messages", **env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("header is not conventional", result.stderr)
+
+    def test_manual_branch_scans_removed_secrets_in_the_proposed_range(self) -> None:
+        self.git("checkout", "-b", "manual-secret", self.main)
+        self.write(".env", "EXAMPLE=placeholder\n")
+        self.commit("fix: add forbidden environment fixture")
+        (self.repo / ".env").unlink()
+        head = self.commit("fix: remove forbidden environment fixture")
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="workflow_dispatch",
+                               REF_TYPE="branch", TAG_NAME="manual-secret", BASE_SHA="", HEAD_SHA=head)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+
+    def test_manual_tag_scans_removed_secrets_since_previous_release(self) -> None:
+        head = self.stable_history_with_removed_environment()
+        self.git("tag", "v0.1.0", self.base)
+        self.git("tag", "v0.1.1", head)
+        result = self.run_step("Scan every proposed commit for secrets", EVENT_NAME="workflow_dispatch",
+                               BASE_SHA="", HEAD_SHA=head, TAG_NAME="v0.1.1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(".env", result.stdout + result.stderr)
 
