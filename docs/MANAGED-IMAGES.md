@@ -195,7 +195,18 @@ Installer and reconciler validation use the selected commit's immediate first
 parent. Missing history, changed pending records, early evidence promotion,
 image-field removal, unrelated bootstrap edits and no-change image-free staging
 fail. Evidence preparation permits additions to established active/pending maps,
-with all prior records and the entire fleet unchanged. A true no-op, same-commit
+with all prior records and the entire fleet unchanged. Before manager selection,
+it also permits canceling or replacing unused pending records in an evidence-only
+commit. The complete fleet and active evidence must remain unchanged, and every
+controller needs an explicit active record matching its selected engine.
+Validate against the actual immediate predecessor. Remove the pending sidecar
+when canceling its last record. A replacement still needs normal target-capability
+review and must be integrated before selection. This exception cannot change
+active evidence, repair a manager/runtime mismatch, introduce images, or combine
+retargeting with selection. The trusted validator and executing manager must
+support this route independently of the unchanged incumbent runtime pin.
+Candidate-local validation cannot override an older trusted policy.
+A true no-op, same-commit
 preparation and selection, or fresh image-free installation remains invalid. A suite base chosen elsewhere does not replace this predecessor. The
 protected exact installed-ref drift exception and protected bootstrap LKG recovery
 remain separate; neither admits a new image-free installation. Keep approval,

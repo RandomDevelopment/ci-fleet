@@ -103,6 +103,14 @@ Stage manager pins only after that pending evidence is integrated, then retain b
 maps through image introduction. An absent record is insufficient; the staged manager
 pin cannot identify the incumbent runtime.
 
+Before selecting a manager, an established image-free fleet may cancel or replace
+unused pending records in a separate evidence-only commit. The entire fleet and
+active records remain unchanged. Every controller must have explicit active
+evidence matching its selected engine. Use the actual predecessor and normal
+target-record validation, then integrate the replacement before selection.
+Remove an empty pending sidecar. Missing incumbent evidence, manager/runtime
+mismatch, image introduction and same-commit selection do not qualify.
+
 Transition validation requires prior integrated active capability evidence when
 introducing network policy or `default_bridge_cidr`. Retained fields need matching
 current evidence. The selected engine must advertise `docker_network_policy_config`,

@@ -232,6 +232,54 @@ class PolicyTests(unittest.TestCase):
                     empty["controllers"] = {}
                     self.assertNotEqual(self.rollout_cli(empty, fleet, {}, active, None, pending).returncode, 0)
 
+    def test_cli_unused_image_free_pending_evidence_can_be_canceled_or_retargeted(self):
+        fleet, name, active, pending = self.pending_rollout()
+        images = fleet.pop("managed_images")
+        replacement = {name: {**pending[name], "engine_ref": "b" * 40}}
+        for selected in (None, replacement):
+            result = self.rollout_cli(fleet, fleet, active, active, pending, selected)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.rollout_cli(fleet, fleet, active, active, None, replacement)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        selected = copy.deepcopy(fleet)
+        selected["controllers"][name]["engine_ref"] = replacement[name]["engine_ref"]
+        result = self.rollout_cli(fleet, selected, active, active, replacement, replacement)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        changed = copy.deepcopy(fleet)
+        changed["controllers"][name]["state"] = "drained"
+        staged = copy.deepcopy(fleet)
+        staged["controllers"][name]["engine_ref"] = pending[name]["engine_ref"]
+        introduced = copy.deepcopy(staged)
+        introduced["managed_images"] = {pending[name]["engine_ref"]: next(iter(images.values()))}
+        changed_active = {name: {**active[name], "required_status_reporting": False}}
+        for before, after, old_active, new_active, target in (
+            (fleet, changed, active, active, replacement),
+            (fleet, fleet, active, changed_active, replacement),
+            (fleet, fleet, {}, {}, replacement),
+            (staged, staged, active, active, replacement),
+            (staged, introduced, active, active, replacement),
+            (fleet, staged, active, active, replacement),
+            (fleet, fleet, active, active, {name: {**replacement[name], "engine_ref": active[name]["engine_ref"]}}),
+            (fleet, fleet, active, active, {name: {**replacement[name], "portable_managed_image_ids": "true"}}),
+            ({}, fleet, active, active, replacement),
+        ):
+            result = self.rollout_cli(before, after, old_active, new_active, pending, target)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        unknown = copy.deepcopy(fleet)
+        unknown["controllers"]["sample-ci-02"] = {**unknown["controllers"][name], "scale_set_name": "sample-ci-02"}
+        first_pool = next(iter(unknown["runner_pools"].values()))
+        first_pool["capacity_budget"] += unknown["controllers"][name]["max_runners"]
+        result = self.rollout_cli(unknown, unknown, active, active, pending, replacement)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        all_active = {**active, "sample-ci-02": {**active[name]}}
+        result = self.rollout_cli(unknown, unknown, all_active, all_active, pending, replacement)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fleet["controllers"][name].pop("docker_network_policy")
+        inactive = {name: {key: value if key == "engine_ref" else False for key, value in active[name].items()}}
+        result = self.rollout_cli(fleet, fleet, inactive, inactive, pending, replacement)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_empty_pending_sidecar_is_rejected(self):
         validation = Validation()
         validate_rollout_evidence({"schema_version": 1, "status_reporting_engine_capabilities": {}},
