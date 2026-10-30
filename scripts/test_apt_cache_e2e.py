@@ -145,7 +145,7 @@ def main():
             build_client = client
             containers.append(client)
             run("docker", "run", "-d", "--name", client, "--entrypoint", "/bin/sh",
-                "--volume", "/var/run/docker.sock:/var/run/docker.sock", tools_image, "-c", "sleep 1800")
+                "--volume", "/var/run/docker.sock:/var/run/docker.sock", tools_image, "-c", "sleep infinity")
             run("docker", "cp", str(secret), client + ":/etc/apt/apt.conf.d/99-ci-fleet-cache")
             context = temporary / "context"
             context.mkdir()

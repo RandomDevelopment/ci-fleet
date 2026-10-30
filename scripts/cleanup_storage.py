@@ -28,28 +28,41 @@ MAX_IMAGES = 50
 PASS_SECONDS = 120
 
 
-def docker_usage() -> dict:
+def docker_json(path: str):
     connection = http.client.HTTPConnection("localhost", timeout=30)
     connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.sock.settimeout(30)
     try:
         connection.sock.connect(str(coordination.host_path("/var/run/docker.sock")))
-        connection.request("GET", "/system/df?verbose=true")
+        connection.request("GET", path)
         response = connection.getresponse()
         body = response.read(64 * 1024**2 + 1)
         if response.status != 200 or len(body) > 64 * 1024**2:
-            raise ValueError("Docker storage accounting unavailable or too large")
-        value = json.loads(body)
-        for field, modern in (("Images", "ImageUsage"), ("Containers", "ContainerUsage"), ("BuildCache", "BuildCacheUsage")):
-            # API 1.52+ puts detailed resource lists inside usage objects.
-            if field not in value and isinstance(value.get(modern), dict) and "Items" in value[modern]:
-                value[field] = value[modern]["Items"]
-            if field not in value or (value[field] is not None and not isinstance(value[field], list)):
-                raise ValueError("Docker storage accounting omitted resource lists")
-            value[field] = value[field] or []
-        return value
+            raise ValueError("Docker inventory unavailable or too large")
+        return json.loads(body)
     finally:
         connection.close()
+
+
+def docker_containers() -> list[dict]:
+    containers = docker_json("/containers/json?all=true")
+    if not isinstance(containers, list) or any(not isinstance(item, dict) for item in containers):
+        raise ValueError("Docker inventory omitted containers")
+    return containers
+
+
+def docker_usage() -> dict:
+    value = docker_json("/system/df?verbose=true")
+    if not isinstance(value, dict):
+        raise ValueError("Docker storage accounting omitted resource lists")
+    for field, modern in (("Images", "ImageUsage"), ("Containers", "ContainerUsage"), ("BuildCache", "BuildCacheUsage")):
+        # API 1.52+ puts detailed resource lists inside usage objects.
+        if field not in value and isinstance(value.get(modern), dict) and "Items" in value[modern]:
+            value[field] = value[modern]["Items"]
+        if field not in value or (value[field] is not None and not isinstance(value[field], list)):
+            raise ValueError("Docker storage accounting omitted resource lists")
+        value[field] = value[field] or []
+    return value
 
 
 def disk_percent() -> int:
@@ -356,27 +369,33 @@ def report_workloads(usage: dict) -> None:
 
 
 def cleanup_storage(*, apply: bool, usage: dict | None = None) -> None:
-    if usage is None:
-        usage = docker_usage()
-    used = disk_percent()
     admission = os.environ.get("CI_FLEET_DOCKER_STORAGE_RETENTION", "")
     if admission not in {"", ADMISSION}:
         raise ValueError("unknown Docker storage retention admission")
-    protected = protected_images(usage) if admission else set()
+    if not admission:
+        print("KEEP storage no-reviewed-exclusive-daemon-admission")
+        return
+    if usage is None:
+        usage = docker_usage()
+    used = disk_percent()
+    protected = protected_images(usage)
     references = {item["ImageID"] for item in usage["Containers"]}
+    parents = {item.get("ParentId") for item in usage["Images"]}
     now = int(time.time())
     eligible = []
     print(f"HEADROOM Docker used={used}% trigger={START_PERCENT}% target={TARGET_PERCENT}% age=7d cache-reserve={CACHE_KEEP_BYTES}B image-limit={MAX_IMAGES}")
     for image in usage["Images"]:
-        reason = image_reason(image, references, protected, now) if admission else "no-reviewed-exclusive-daemon-admission"
+        reason = image_reason(image, references, protected, now)
+        if reason == "eligible" and image["Id"] in parents:
+            reason = "image-has-children"
         if reason == "eligible":
             eligible.append(image)
         print(f"{'ELIGIBLE' if reason == 'eligible' else 'KEEP'} image {image['Id']} {reason}")
     for record in usage["BuildCache"]:
-        reason = cache_reason(record, now) if admission else "no-reviewed-exclusive-daemon-admission"
+        reason = cache_reason(record, now)
         print(f"{'ELIGIBLE' if reason.startswith('eligible') else 'KEEP'} build-cache {record['ID']} {reason}")
-    if not apply or not admission or used < START_PERCENT:
-        print("KEEP storage dry-run-or-no-admission-or-below-trigger")
+    if not apply or used < START_PERCENT:
+        print("KEEP storage dry-run-or-below-trigger")
         return
     if any((item.get("Labels") or {}).get(coordination.PROXY_PROTOCOL_LABEL) != "v2"
            for item in usage["Containers"] if item.get("State") in {"running", "restarting", "paused"}):
@@ -415,14 +434,14 @@ def main():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--instance", default=os.environ.get("CI_FLEET_INSTANCE", ""))
     args = parser.parse_args()
-    diagnostic_usage = docker_usage()
+    diagnostic_usage = {"Containers": docker_containers()}
     report_workloads(diagnostic_usage)
 
     def maintenance(apply):
-        cleanup_expired(apply=apply, instance=args.instance, usage=docker_usage() if apply else diagnostic_usage)
-        cleanup_storage(apply=apply, usage=None if apply else diagnostic_usage)
+        cleanup_expired(apply=apply, instance=args.instance,
+                        usage={"Containers": docker_containers()} if apply else diagnostic_usage)
 
-    coordination.cleanup_networks(apply=args.apply, instance=args.instance, maintenance=maintenance)
+    coordination.cleanup_networks(apply=args.apply, instance=args.instance, maintenance=maintenance, storage=cleanup_storage)
     if not args.apply:
         print("DRY_RUN no changes made; pass --apply to remove eligible resources")
 
