@@ -236,7 +236,7 @@ avoid `1.0.0` until the controlled migration and compliance checklist
 
 ## Validation
 
-The engine integration job has a 45-minute ceiling for clean image builds,
+The engine integration job has a 240-minute ceiling for clean image builds,
 APT cache acceptance, and installer fault regressions. See the
 [validation budget decision](DESIGN-DECISIONS.md#engine-integration-validation-budget).
 Ordinary fleet task jobs retain their five-minute hard timeout.

@@ -963,7 +963,7 @@ def main(*, retained_configuration: bool = False) -> int:
             if previous_next_evidence is not None
             else {}
         )
-        # Preparation adds reviewed evidence without selecting a manager or runtime.
+        # Preparation changes evidence without selecting a manager or runtime.
         evidence_preparation = (
             isinstance(previous, dict) and isinstance(current_controllers, dict) and config == previous
             and bool(previous.get("controllers")) and "managed_images" not in previous
@@ -971,8 +971,16 @@ def main(*, retained_configuration: bool = False) -> int:
                  or current_next_engine_refs != previous_next_engine_refs)
             and all(current_compatible_engine_refs.get(name) == record
                     for name, record in previous_compatible_engine_refs.items())
-            and all(current_next_engine_refs.get(name) == record
+            and (
+                all(current_next_engine_refs.get(name) == record
                     for name, record in previous_next_engine_refs.items())
+                or (
+                    current_compatible_engine_refs == previous_compatible_engine_refs
+                    and all(isinstance(controller, dict)
+                            and current_compatible_engine_refs.get(name, {}).get("engine_ref") == controller.get("engine_ref")
+                            for name, controller in current_controllers.items())
+                )
+            )
             and all(isinstance(current_controllers.get(name), dict)
                     and current_controllers[name].get("engine_ref") == record["engine_ref"]
                     for name, record in current_compatible_engine_refs.items())

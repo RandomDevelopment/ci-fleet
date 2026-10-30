@@ -100,6 +100,10 @@ source lookup also requires the exact captured engine revision. Missing, unsafe 
 mismatched source stops removal; do not delete checkpoints or rebuild mutable old
 images to bypass it. See [recovery source requirements](MANAGED-IMAGES.md#recovery-and-retained-images). Untrusted or unreadable protection files stop cleanup. Multiple tags on one
 eligible image are removed together without force or parent-image pruning.
+Classic-builder parents with surviving child images remain protected. Cleanup
+selects eligible leaves so a parent conflict cannot prevent other leaf removals
+or default-builder cache reclamation. Later passes can select a parent after its
+last child disappears. This also preserves ancestors of kept or recent images.
 
 Default-builder cache removal uses Engine's unused-cache selection with
 `until=168h` and a 10 GiB cache reserve. It preserves in-use cache and recently
@@ -108,11 +112,15 @@ Shared image layers remain referenced by retained images. The cache reserve is
 a retention floor for Engine garbage collection, not a hard maximum. Do not sum
 Docker's image and cache estimates because their layers can overlap.
 
-The documented dry-run reports each image/cache record and its retention reason,
-expired resource candidates, uncertain volume ownership, and disk thresholds.
+On an admitted daemon, the documented dry-run reports each image/cache record
+and its retention reason, expired resource candidates, uncertain volume
+ownership, and disk thresholds.
 `ELIGIBLE` means a resource qualifies if applying maintenance reaches it before
 the headroom or pass limit. It does not promise Engine will reclaim that record
 or its reported size. A dry-run changes no resources or coordination markers.
+Without storage admission, cleanup reports that retention is disabled and skips
+image/cache accounting. Container diagnostics use a separate inventory that
+includes inactive containers.
 
 Applying cleanup shares the installer lock, idle checks, exclusive proxy gate,
 and boot-scoped uncertainty markers used for network reclamation. Container and
@@ -125,6 +133,11 @@ Registry pulls and imports from remote URLs bypass upload slots while retaining
 the maintenance lock. Other guarded request bodies have a 1 MiB metadata limit;
 oversized bodies receive HTTP 413 before reaching Docker.
 Neither an installer nor a new job can enter while maintenance applies.
+Inside the gate, cleanup removes eligible expired containers and volumes, then
+eligible networks, then admitted images and cache. A storage-accounting timeout
+or image-protection failure still fails the service, but it cannot prevent the
+preceding network pass. It does not prove storage recovery. Network inspection
+or removal failures still stop the pass before storage maintenance.
 An interrupted or uncertain removal blocks subsequent mutations until a host
 reboot changes its boot identity. Confirmed daemon rejections clear their marker
 and fail the service. A failure to launch the Docker client clears its marker
