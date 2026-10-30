@@ -149,7 +149,7 @@ Compose selections are unchanged.
 
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
-| Debian 13.7 slim, both managed images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim` |
+| Debian 13.7 slim, reviewed 2026-10-12 for both images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim`; retained historical review |
 | Go 1.27.2 Bookworm build image | `sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61` | Docker Hub registry manifest for `library/golang:1.27.2-bookworm` |
 | Debian packages | signed snapshot `20261012T000000Z` | `snapshot.debian.org/archive/debian/20261012T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
@@ -158,6 +158,7 @@ Compose selections are unchanged.
 | Runner Buildx plugin 0.32.1 amd64 / arm64 | exact package version and SHA-256 `c50835adb10d6e9fc16c877d37a7a651b0ef2bac165be3ec52f8f05666cbccc8` / `a9ebb845ba8c2a67a815329bba341e31596c1c1f02d49ffb5670d0222253154e` | official Docker Debian `trixie` package index, added for optional APT build integration |
 | Actions Runner 2.338.0 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
 | Controller modules | versions plus checksums in `controller/go.mod` and `controller/go.sum` | Go checksum-verified module inputs |
+| Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.
 
