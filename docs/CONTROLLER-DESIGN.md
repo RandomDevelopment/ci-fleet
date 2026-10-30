@@ -47,6 +47,15 @@ The pinned SDK also documents canceled scale-set assignments that never reach a 
 
 Before handling a completion, the controller logs its result, runner name and ID, runner assignment time, job ID, runner request ID, and workflow run ID. Unknown or contradictory events and Docker inspection or cleanup errors still fail. The pinned listener acknowledges a batch before invoking callbacks, so a callback failure can stop the rest of that batch; do not assume the failed event will be replayed or that restarting fixes its cause.
 
+For repeated `job completed for unknown runner ""` exits, compare the installed
+engine's handler with the reviewed source before changing code or restarting.
+An older handler without the unassigned-cancellation guard cannot distinguish
+that documented event from a contradictory blank completion. If its logs omit
+the completion fields above, the upstream event remains unclassified. After a
+supported engine rollout, retain those diagnostics, verify representative jobs
+start and complete, and verify runner cleanup and later reconciliation. Fixture
+success and a running listener alone do not establish operational recovery.
+
 ## Security boundary
 
 Docker socket access is host-root-equivalent. This pool is therefore limited to trusted repositories and trusted workflow revisions. Containers provide repeatability and cleanup; they do not make hostile workflow code safe.

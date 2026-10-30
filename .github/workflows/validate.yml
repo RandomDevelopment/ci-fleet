@@ -21,7 +21,7 @@ jobs:
   commit-convention:
     name: Enforce conventional commits and pull-request title
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_FLEET_VALIDATION_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Reject updates to published tags
@@ -72,7 +72,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           # The merge base selects commits, never executable validation policy.
-          if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
+          if [[ ( "$EVENT_NAME" == push || "$EVENT_NAME" == workflow_dispatch ) && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
             if [[ "$REF_TYPE" == tag ]]; then
               BASE_SHA="$(python3 "$RUNNER_TEMP/trusted-validator.py" --release-base-for "$HEAD_SHA" --exclude-tag "$TAG_NAME")"
               if [[ -z "$BASE_SHA" ]]; then
@@ -110,8 +110,8 @@ jobs:
     name: Build without registering a runner
     needs: commit-convention
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ${{ vars.CI_FLEET_VALIDATION_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 240
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -135,7 +135,7 @@ jobs:
             exit 1
           fi
           git show "$TRUSTED_SHA:scripts/scan_committed_secrets.py" >"$scanner"
-          if [[ "$EVENT_NAME" == push && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
+          if [[ ( "$EVENT_NAME" == push || "$EVENT_NAME" == workflow_dispatch ) && ( -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ) ]]; then
             if [[ "$REF_TYPE" == tag ]]; then
               validator="$RUNNER_TEMP/trusted-release-validator.py"
               git show "$TRUSTED_SHA:scripts/validate_commits.py" >"$validator"
@@ -186,7 +186,7 @@ jobs:
           sudo python3 -I scripts/local_validation_executor.py --prepare --disposable-host
           sudo python3 scripts/local_validate.py --repository "$PWD" \
             --source "$SOURCE" --base "$BASE" --policy "$(git rev-parse HEAD)" --main "$main" \
-            --disposable-host --output "$RUNNER_TEMP/local-validation" "${args[@]}"
+            --disposable-host --timeout 10800 --output "$RUNNER_TEMP/local-validation" "${args[@]}"
 
       - name: Make validation evidence readable
         if: ${{ always() }}
@@ -196,7 +196,7 @@ jobs:
       - name: Export complete validation evidence
         id: validation-artifact
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: local-validation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/local-validation/

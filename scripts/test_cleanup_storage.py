@@ -194,6 +194,21 @@ class StorageTests(unittest.TestCase):
                     cleanup.docker_usage()
                 connection.close.assert_called_once()
 
+    def test_container_inventory_includes_inactive_references_without_storage_accounting(self):
+        connection = unittest.mock.MagicMock()
+        connection.getresponse.return_value.status = 200
+        containers = [{"Id": "stopped", "State": "exited", "ImageID": IMAGE}]
+        connection.getresponse.return_value.read.return_value = json.dumps(containers).encode()
+        with patch.object(cleanup.http.client, "HTTPConnection", return_value=connection), \
+             patch.object(cleanup.socket, "socket"):
+            self.assertEqual(cleanup.docker_containers(), containers)
+        connection.request.assert_called_once_with("GET", "/containers/json?all=true")
+        connection.close.assert_called_once()
+        for invalid in (None, {}, [None], ["stopped"]):
+            with self.subTest(invalid=invalid), patch.object(cleanup, "docker_json", return_value=invalid):
+                with self.assertRaisesRegex(ValueError, "omitted containers"):
+                    cleanup.docker_containers()
+
     def test_retention_decisions(self):
         for change, references, protected, expected in [
             ({}, set(), set(), "eligible"),
@@ -261,6 +276,64 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(mutations), cleanup.MAX_IMAGES)
         self.assertTrue(all(call.args[0] == "image" for call in mutations))
 
+    def test_classic_builder_parents_do_not_abort_leaf_and_cache_reclamation(self):
+        accounting = usage()
+        accounting["Images"] = [image(RepoTags=[], Created=OLD - 1), image(identity=OTHER, ParentId=IMAGE)]
+        output, mutations = self.run_storage(accounting=accounting)
+        self.assertEqual([call.args[:2] for call in mutations], [("image", "rm"), ("builder", "prune")])
+        self.assertEqual(mutations[0].args[-1], "example:old")
+        self.assertIn(f"KEEP image {IMAGE} image-has-children", output)
+
+    def test_kept_child_protects_untagged_parent(self):
+        accounting = usage()
+        accounting["Images"] = [image(RepoTags=[]), image(identity=OTHER, ParentId=IMAGE,
+            Labels={cleanup.PREFIX + "retention": "keep"})]
+        _, mutations = self.run_storage(accounting=accounting)
+        self.assertEqual([call.args[:2] for call in mutations], [("builder", "prune")])
+
+    def test_unadmitted_cleanup_does_not_request_storage_accounting(self):
+        with patch.object(sys, "argv", ["cleanup_storage.py", "--apply"]), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch.object(cleanup, "docker_containers", return_value=[]), \
+             patch.object(cleanup, "docker_usage", side_effect=TimeoutError("image accounting stalled")) as accounting, \
+             patch.object(cleanup, "cleanup_expired"), patch.object(cleanup, "disk_percent", return_value=81), \
+             patch.object(cleanup.coordination, "cleanup_networks", side_effect=lambda **args: (
+                 args["maintenance"](True), args["storage"](apply=True))), redirect_stdout(io.StringIO()):
+            cleanup.main()
+        accounting.assert_not_called()
+
+    def test_network_recovery_precedes_storage_failure_under_the_same_locks(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory,
+                                    "CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION}, clear=True):
+            events = []
+            root = Path(directory)
+            boot = root / "proc/sys/kernel/random/boot_id"
+            boot.parent.mkdir(parents=True)
+            boot.write_text(BOOT_ID)
+
+            def networks(**_kwargs):
+                events.append("networks")
+                for path in (root / "run/ci-fleet-installer.lock", root / "run/lock/ci-fleet/docker-maintenance.lock"):
+                    with path.open("r+") as contender, self.assertRaises(BlockingIOError):
+                        cleanup.coordination.fcntl.flock(contender, cleanup.coordination.fcntl.LOCK_SH | cleanup.coordination.fcntl.LOCK_NB)
+
+            def accounting():
+                events.append("storage")
+                raise TimeoutError("image accounting stalled")
+
+            with patch.object(sys, "argv", ["cleanup_storage.py", "--apply"]), \
+                 patch.object(cleanup, "docker_containers", return_value=[]), \
+                 patch.object(cleanup, "docker_usage", side_effect=accounting), \
+                 patch.object(cleanup, "cleanup_expired", side_effect=lambda **_kwargs: events.append("expired")), \
+                 patch.object(cleanup.coordination, "docker", return_value="inactive"), \
+                 patch.object(cleanup.coordination, "active_work", return_value=False), \
+                 patch.object(cleanup.coordination, "remove_networks", side_effect=networks), \
+                 patch.object(cleanup.time, "sleep"), redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(TimeoutError, "image accounting stalled"):
+                    cleanup.main()
+            self.assertEqual(events, ["expired", "networks", "storage"])
+
     def test_old_proxy_defers_storage(self):
         accounting = usage()
         accounting["Containers"] = [{"ImageID": OTHER, "State": "running", "Labels": {cleanup.coordination.PROXY_PROTOCOL_LABEL: "v1"}}]
@@ -304,14 +377,18 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(mutations[2].args[:2], ("builder", "prune"))
 
     def test_dry_run_reuses_one_accounting_snapshot(self):
-        with patch.object(sys, "argv", ["cleanup_storage.py"]), patch.dict(os.environ, {}, clear=True), \
+        with patch.object(sys, "argv", ["cleanup_storage.py"]), \
+             patch.dict(os.environ, {"CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION}, clear=True), \
+             patch.object(cleanup, "docker_containers", return_value=[]) as containers, \
              patch.object(cleanup, "docker_usage", return_value=usage()) as accounting, \
+             patch.object(cleanup, "protected_images", return_value=set()), \
              patch.object(cleanup, "disk_percent", return_value=10), \
              patch.object(cleanup.coordination, "docker", return_value=""), \
              patch.object(cleanup.coordination, "remove_networks") as networks, \
              patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
             cleanup.main()
         accounting.assert_called_once()
+        containers.assert_called_once()
         networks.assert_called_once_with(apply=False, instance="", pools=[])
         mutate.assert_not_called()
 
@@ -321,15 +398,18 @@ class StorageTests(unittest.TestCase):
         fresh = {**usage(), "BuildCache": []}
         with patch.object(sys, "argv", ["cleanup_storage.py", "--apply"]), \
              patch.dict(os.environ, {"CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION}, clear=True), \
-             patch.object(cleanup, "docker_usage", side_effect=[expired, expired, fresh]) as accounting, \
+             patch.object(cleanup, "docker_containers", return_value=expired["Containers"]) as containers, \
+             patch.object(cleanup, "docker_usage", return_value=fresh) as accounting, \
              patch.object(cleanup, "disk_percent", side_effect=[81, 81, 64, 64]), \
              patch.object(cleanup.time, "time", return_value=NOW), \
              patch.object(cleanup, "protected_images", return_value=set()), \
              patch.object(cleanup.coordination, "docker", return_value=""), \
-             patch.object(cleanup.coordination, "cleanup_networks", side_effect=lambda **args: args["maintenance"](args["apply"])), \
+             patch.object(cleanup.coordination, "cleanup_networks", side_effect=lambda **args: (
+                 args["maintenance"](args["apply"]), args["storage"](apply=args["apply"]))), \
              patch.object(cleanup, "mutate") as mutate, redirect_stdout(io.StringIO()):
             cleanup.main()
-        self.assertEqual(accounting.call_count, 3)
+        self.assertEqual(containers.call_count, 2)
+        accounting.assert_called_once()
         self.assertEqual([call.args for call in mutate.call_args_list], [
             ("rm", "expired"), ("image", "rm", "--no-prune", "--", "example:old")])
 
