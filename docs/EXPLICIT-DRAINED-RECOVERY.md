@@ -103,7 +103,9 @@ protections and automation holds in place throughout acceptance.
 The command holds the installer lock and fetches only the locked installation's
 full configuration identity. It requires the existing approval policy, an exact
 installed check and fresh state-aware full health before replacing LKG through
-the normal checked metadata writer. Healthy or warning is accepted for active
+the normal checked metadata writer. Authored managed-image policy is required;
+image-free or staged baselines need their separate protected-checkpoint recovery
+procedure and are refused by this command. Healthy or warning is accepted for active
 controllers; drained and disabled controllers require matching maintenance or
 warning health. The prior record remains in place during verification. Save its
 protected metadata and recovery-source evidence outside Git before acceptance.

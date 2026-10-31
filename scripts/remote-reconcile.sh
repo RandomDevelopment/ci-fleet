@@ -584,6 +584,17 @@ if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_re
   fi
 fi
 
+if [[ "$accept_installed" == true ]]; then
+  git -C "$temp_dir/config-repo" show "$desired_commit:fleet.json" >"$temp_dir/acceptance-fleet.json" \
+    || die 'installed acceptance configuration is unavailable'
+  python3 - "$temp_dir/acceptance-fleet.json" <<'PY' || die 'installed acceptance requires an activated managed-image configuration'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+images = value.get("managed_images") if isinstance(value, dict) else None
+raise SystemExit(0 if isinstance(images, dict) and images else 1)
+PY
+fi
+
 # Compare with installed
 if [[ "$desired_commit" == "$installed_config_ref" && -z "$explicit_ref" ]]; then
   # Same commit — just verify convergence

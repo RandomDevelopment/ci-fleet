@@ -585,6 +585,15 @@ exec {shlex.quote(real_git or 'git')} "$@"
         return json.loads(path.read_text(encoding="utf-8"))
 
     def _installed_candidate_with_retained_lkg(self, desired_state="active") -> bytes:
+        fleet = json.loads((self.config_repo / "fleet.json").read_text())
+        if not fleet.get("managed_images"):
+            fleet["managed_images"] = {"1" * 40: {"amd64": {
+                "controller": "sha256:" + "a" * 64, "runner": "sha256:" + "b" * 64}}}
+            (self.config_repo / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+            self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
+            self.assertEqual(git("commit", "-qm", "activated fixture", cwd=self.config_repo).returncode, 0)
+            self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+            self.env["REMOTE_FIXTURE_REF"] = self.desired_ref
         self._reset(self.prior_ref, desired_state)
         self._write_installed_ref(self.desired_ref, desired_state)
         path = self.lkg_dir / "metadata.json"
@@ -658,6 +667,23 @@ exec {shlex.quote(real_git or 'git')} "$@"
         self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
         self.assertEqual(self.state_file.read_bytes(), installed)
         self.assertFalse(self.health_observed_lkg.exists())
+
+    def test_accept_installed_rejects_image_free_or_staged_configuration(self):
+        for images in (None, {}, []):
+            with self.subTest(images=images):
+                original = self._installed_candidate_with_retained_lkg()
+                fleet = {} if images is None else {"managed_images": images}
+                (self.config_repo / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+                self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
+                self.assertEqual(git("commit", "--allow-empty", "-qm", "unactivated fixture", cwd=self.config_repo).returncode, 0)
+                self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+                self.env["REMOTE_FIXTURE_REF"] = self.desired_ref
+                self._write_installed_ref(self.desired_ref)
+                result = self._run("healthy", arguments=("--accept-installed",))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("activated managed-image configuration", result.stderr)
+                self.assertFalse(self.installer_log.exists())
+                self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
 
     def test_accept_installed_requires_lkg_persistence_and_readback(self):
         for failure in ("write", "readback"):
