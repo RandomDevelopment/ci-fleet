@@ -28,6 +28,10 @@ type Scaler struct {
 	scalesetClient interface {
 		GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 	}
+	messageClient interface {
+		AcquireJobs(context.Context, []int64) ([]int64, error)
+	}
+	assignedJobs        int
 	logger              *slog.Logger
 	config              Config
 	scaleSetID          int
@@ -96,7 +100,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobComple
 		s.logger.Info("ignored unassigned canceled job completion", "jobID", job.JobID, "runnerRequestID", job.RunnerRequestID)
 		return nil
 	}
-	id, cleanup, ok := s.runners.markDone(job.RunnerName)
+	id, cleanup, ok := s.runners.completion(job.RunnerName)
 	if !ok {
 		missing, err := s.missingPriorRunner(ctx, job.RunnerName)
 		if err != nil {
@@ -108,12 +112,15 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, job *scaleset.JobComple
 		}
 		return fmt.Errorf("job completed for unknown runner %q", job.RunnerName)
 	}
-	s.writeStatus()
 	s.logger.Info("job completed", "runner", job.RunnerName, "jobID", job.JobID)
-	if !cleanup {
-		return nil
+	if cleanup {
+		if err := s.logAndRemove(ctx, job.RunnerName, id, true); err != nil {
+			return err
+		}
 	}
-	return s.logAndRemove(ctx, job.RunnerName, id, true)
+	s.runners.forget(job.RunnerName, id)
+	s.writeStatus()
+	return nil
 }
 
 // The selected scale-set session can report runners removed before this controller started.

@@ -23,6 +23,8 @@ type lifecycleBatchClient struct {
 	message      *scaleset.RunnerScaleSetMessage
 	polls        int
 	acknowledged atomic.Bool
+	acquireJobs  func(context.Context, []int64) ([]int64, error)
+	deleteError  error
 }
 
 func (c *lifecycleBatchClient) Session() scaleset.RunnerScaleSetSession {
@@ -37,15 +39,24 @@ func (c *lifecycleBatchClient) GetMessage(context.Context, int, int) (*scaleset.
 	return nil, context.Canceled
 }
 
-func (c *lifecycleBatchClient) DeleteMessage(_ context.Context, id int) error {
+func (c *lifecycleBatchClient) DeleteMessage(ctx context.Context, id int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if id != c.message.MessageID {
 		return fmt.Errorf("unexpected message ID %d", id)
+	}
+	if c.deleteError != nil {
+		return c.deleteError
 	}
 	c.acknowledged.Store(true)
 	return nil
 }
 
-func (c *lifecycleBatchClient) AcquireJobs(context.Context, []int64) ([]int64, error) {
+func (c *lifecycleBatchClient) AcquireJobs(ctx context.Context, ids []int64) ([]int64, error) {
+	if c.acquireJobs != nil {
+		return c.acquireJobs(ctx, ids)
+	}
 	return nil, fmt.Errorf("unexpected job acquisition")
 }
 
@@ -69,8 +80,8 @@ func TestLateEventsAfterRestartDoNotDiscardTheRestOfTheSDKBatch(t *testing.T) {
 			// The earlier controller removed gone; only the surviving job can be recovered.
 			json.NewEncoder(w).Encode([]map[string]string{{"Id": "live-id"}})
 		case path == "/containers/"+gone+"/json":
-			if !client.acknowledged.Load() {
-				t.Error("expected the pinned SDK to acknowledge the batch before callbacks")
+			if client.acknowledged.Load() {
+				t.Error("SDK acknowledged the batch before callbacks completed")
 			}
 			missingInspections.Add(1)
 			w.WriteHeader(http.StatusNotFound)

@@ -165,7 +165,7 @@ func TestEnsureScaleSet(t *testing.T) {
 			defer server.Close()
 			client, err := scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 				GitHubConfigURL: server.URL + "/EXAMPLE-ORG", PersonalAccessToken: "test-only",
-			}, scaleset.WithRetryMax(0))
+			}, scaleset.WithRetry(scaleset.RetryConfig{Max: 0}))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -145,7 +145,9 @@ The Go build image was updated to 1.27.2 on 2026-10-13.
 
 The Go build image was updated to 1.27.3 on 2026-10-30. This patch fixes
 `crypto/x509` security issues. The reviewed registry manifest includes Linux
-amd64 and arm64. The controller's module language version remains 1.26.3.
+amd64 and arm64. The controller's module requires 1.27.3 for `actions/scaleset`
+0.5.0, matching the pinned builder. The build stage sets `GOTOOLCHAIN=local` so
+a higher module requirement fails instead of downloading a different toolchain.
 
 Runner Buildx 0.32.1 package hashes were checked against the official Docker
 package index on 2026-10-15 for amd64 and arm64. The existing Docker CLI and

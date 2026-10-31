@@ -101,8 +101,8 @@ func TestUnassignedCompletionPreservesTheRestOfTheSDKBatch(t *testing.T) {
 			}}
 			var removals atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if !client.acknowledged.Load() {
-					t.Error("Docker access preceded SDK acknowledgment")
+				if client.acknowledged.Load() {
+					t.Error("SDK acknowledged the batch before cleanup")
 				}
 				switch {
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/live-id/logs"):
@@ -129,8 +129,8 @@ func TestUnassignedCompletionPreservesTheRestOfTheSDKBatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = l.Run(context.Background(), scaler)
-			if !client.acknowledged.Load() {
-				t.Fatal("SDK did not acknowledge the batch")
+			if client.acknowledged.Load() == invalid {
+				t.Fatal("SDK acknowledgment did not match batch success")
 			}
 			if invalid {
 				if err == nil || !strings.Contains(err.Error(), "unknown runner") || client.polls != 1 || removals.Load() != 0 || scaler.runners.count() != 1 {
