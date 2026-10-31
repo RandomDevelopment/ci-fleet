@@ -86,6 +86,44 @@ nonzero exit. Failed recovery must remain held; admission needs separate review
 and authorization. This command does not establish active-pilot evidence,
 isolation proof or permission to publish otherwise unapproved images.
 
+## Accept an already installed recovery baseline
+
+A supporting reviewed reconciliation checkout can accept the current installed
+configuration as last-known-good without another installer transaction:
+
+```bash
+sudo /path/to/reviewed-ci-fleet/scripts/remote-reconcile.sh --accept-installed
+```
+
+Use the exact independently reviewed, merged source that supports this command.
+Older managers do not support it. The runtime and installed manager do not need
+to be replaced for this verification. Keep the reviewed capacities, workload
+protections and automation holds in place throughout acceptance.
+
+The command holds the installer lock and fetches only the locked installation's
+full configuration identity. It requires the existing approval policy, an exact
+installed check and fresh state-aware full health before replacing LKG through
+the normal checked metadata writer. Authored managed-image policy is required;
+image-free or staged baselines need their separate protected-checkpoint recovery
+procedure and are refused by this command. Healthy or warning is accepted for active
+controllers; drained and disabled controllers require matching maintenance or
+warning health. The prior record remains in place during verification. Save its
+protected metadata and recovery-source evidence outside Git before acceptance.
+
+Drift, a mismatched fetch, missing or inconsistent health, and metadata write or
+readback failure stop acceptance. This command never repairs configuration or
+applies the older LKG, including on failure. It cannot be combined with another
+reconciliation mode. Normal same-commit reconciliation, `--check-only`,
+`--installed-ref` and `--no-op` retain their existing behavior and do not accept an
+installed LKG. Inspect the terminal reconciliation record after any failure and
+keep automation held until the actual result is established.
+
+This provides a separate route when an older LKG has an incompatible capacity or
+resource policy. It does not authorize restoration of that older state, changes
+to a checkpoint, an engine upgrade, workload retirement or storage cleanup.
+Template guidance and private adopter verification must follow the accepted
+supporting source before live use.
+
 ## Rollout boundary
 
 This feature requires a new reviewed supporting engine/manager pin and complete
