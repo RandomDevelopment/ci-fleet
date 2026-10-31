@@ -11,6 +11,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -552,6 +553,7 @@ exec {shlex.quote(real_git or 'git')} "$@"
         policy_state: str = "healthy",
         transaction_record: str = "",
         transaction_exit: str = "2",
+        arguments: tuple[str, ...] = (),
     ):
         env = dict(self.env)
         env.update(
@@ -565,7 +567,7 @@ exec {shlex.quote(real_git or 'git')} "$@"
             FAKE_TRANSACTION_EXIT=transaction_exit,
         )
         return subprocess.run(
-            [str(self.root / "scripts" / "remote-reconcile.sh")],
+            [str(self.root / "scripts" / "remote-reconcile.sh"), *arguments],
             capture_output=True,
             text=True,
             env=env,
@@ -581,6 +583,151 @@ exec {shlex.quote(real_git or 'git')} "$@"
     def _reconcile_state(self) -> dict:
         path = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def _installed_candidate_with_retained_lkg(self, desired_state="active") -> bytes:
+        fleet = json.loads((self.config_repo / "fleet.json").read_text())
+        if not fleet.get("managed_images"):
+            fleet["managed_images"] = {"1" * 40: {"amd64": {
+                "controller": "sha256:" + "a" * 64, "runner": "sha256:" + "b" * 64}}}
+            (self.config_repo / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+            self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
+            self.assertEqual(git("commit", "-qm", "activated fixture", cwd=self.config_repo).returncode, 0)
+            self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+            self.env["REMOTE_FIXTURE_REF"] = self.desired_ref
+        self._reset(self.prior_ref, desired_state)
+        self._write_installed_ref(self.desired_ref, desired_state)
+        path = self.lkg_dir / "metadata.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["saved_at"] = 1
+        path.write_text(json.dumps(value), encoding="utf-8")
+        path.chmod(0o600)
+        return path.read_bytes()
+
+    def test_same_commit_accepts_installed_lkg_after_state_aware_health(self):
+        for desired_state, health in (("active", "healthy"), ("active", "warning"),
+                                     ("drained", "maintenance"), ("drained", "warning"),
+                                     ("disabled", "maintenance"), ("disabled", "warning")):
+            with self.subTest(desired_state=desired_state, health=health):
+                self._installed_candidate_with_retained_lkg(desired_state)
+                result = self._run(health, desired_state=desired_state, arguments=("--accept-installed",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check"])
+                self.assertEqual(self.health_observed_lkg.read_text().strip(), self.prior_ref)
+                self.assertEqual(self._lkg_ref(), self.desired_ref)
+                state = self._reconcile_state()
+                self.assertEqual(state["status"], "converged")
+                self.assertEqual(state["health"], health)
+
+    def test_same_commit_unaccepted_health_preserves_lkg_without_rollback(self):
+        for health, reported_state in (("unhealthy", "active"), ("malformed", "active"),
+                                       ("maintenance", "active"), ("healthy", "drained")):
+            with self.subTest(health=health, reported_state=reported_state):
+                original = self._installed_candidate_with_retained_lkg()
+                installed = self.state_file.read_bytes()
+                result = self._run(health, desired_state=reported_state, arguments=("--accept-installed",))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check"])
+                self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
+                self.assertEqual(self.state_file.read_bytes(), installed)
+                self.assertEqual(self._reconcile_state()["status"], "failed")
+                self.assertNotIn("ROLLBACK_OK", result.stdout)
+                self.assertNotIn("CONVERGED controller=", result.stdout)
+
+    def test_same_commit_readonly_modes_do_not_accept_lkg(self):
+        for argument in ("--check-only", "--no-op", None):
+            with self.subTest(argument=argument):
+                original = self._installed_candidate_with_retained_lkg()
+                result = self._run("healthy", arguments=(argument,) if argument else ())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
+                self.assertFalse(self.health_observed_lkg.exists())
+                if argument != "--no-op":
+                    self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check"])
+                else:
+                    self.assertFalse(self.installer_log.exists())
+
+    def test_accept_installed_rejects_mode_combinations_before_authentication(self):
+        for other in (("--check-only",), ("--installed-ref",), ("--no-op",),
+                      ("--ref", "a" * 40), ("--accept-installed",)):
+            for arguments in (("--accept-installed", *other), (*other, "--accept-installed")):
+                with self.subTest(arguments=arguments):
+                    original = self._installed_candidate_with_retained_lkg()
+                    result = self._run("healthy", arguments=arguments)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertNotIn("GENERATING_TOKEN", result.stdout)
+                    self.assertFalse(self.installer_log.exists())
+                    self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
+
+    def test_accept_installed_never_repairs_failed_installed_check(self):
+        original = self._installed_candidate_with_retained_lkg()
+        installed = self.state_file.read_bytes()
+        result = self._run("healthy", policy_state="corrupt", arguments=("--accept-installed",))
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check"])
+        self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
+        self.assertEqual(self.state_file.read_bytes(), installed)
+        self.assertFalse(self.health_observed_lkg.exists())
+
+    def test_accept_installed_rejects_image_free_or_staged_configuration(self):
+        for images in (None, {}, []):
+            with self.subTest(images=images):
+                original = self._installed_candidate_with_retained_lkg()
+                fleet = {} if images is None else {"managed_images": images}
+                (self.config_repo / "fleet.json").write_text(json.dumps(fleet), encoding="utf-8")
+                self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
+                self.assertEqual(git("commit", "--allow-empty", "-qm", "unactivated fixture", cwd=self.config_repo).returncode, 0)
+                self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+                self.env["REMOTE_FIXTURE_REF"] = self.desired_ref
+                self._write_installed_ref(self.desired_ref)
+                result = self._run("healthy", arguments=("--accept-installed",))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("activated managed-image configuration", result.stderr)
+                self.assertFalse(self.installer_log.exists())
+                self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
+
+    def test_accept_installed_requires_lkg_persistence_and_readback(self):
+        for failure in ("write", "readback"):
+            with self.subTest(failure=failure):
+                if (self.lkg_dir / "metadata.json").is_dir():
+                    (self.lkg_dir / "metadata.json").rmdir()
+                self._installed_candidate_with_retained_lkg()
+                if failure == "write":
+                    path = self.lkg_dir / "metadata.json"
+                    path.unlink()
+                    path.mkdir()
+                else:
+                    self._write_executable(self.td / "bin" / "python3", f'''#!/usr/bin/env bash
+if [[ ${{1:-}} == -c && ${{3:-}} == "$CI_FLEET_LKG_DIR/metadata.json" && ${{5:-}} == "$REMOTE_FIXTURE_REF" ]]; then exit 1; fi
+exec {shlex.quote(sys.executable)} "$@"
+''')
+                result = self._run("healthy", arguments=("--accept-installed",))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual([call["args"][0] for call in self._installer_calls()], ["--check"])
+                self.assertEqual(self._reconcile_state()["status"], "failed")
+                self.assertNotIn("CONVERGED controller=", result.stdout)
+
+    def test_accept_installed_fetches_only_installed_ref_and_rejects_wrong_result(self):
+        self._installed_candidate_with_retained_lkg()
+        fetch_log = self.td / "fetches"
+        wrapper = self.td / "bin" / "git"
+        wrapper.write_text(wrapper.read_text().replace(
+            'if [[ ${1:-} == -C && ${3:-} == fetch ]]; then',
+            'if [[ ${1:-} == -C && ${3:-} == fetch ]]; then\n'
+            + '  printf "%s\\n" "${@: -1}" >>' + shlex.quote(str(fetch_log))), encoding="utf-8")
+        self.assertEqual(git("commit", "--allow-empty", "-qm", "later default branch", cwd=self.config_repo).returncode, 0)
+        newer_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+        result = self._run("healthy", arguments=("--accept-installed",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(fetch_log.read_text().splitlines(), [self.desired_ref])
+        self.assertEqual(self._lkg_ref(), self.desired_ref)
+
+        original = self._installed_candidate_with_retained_lkg()
+        self.env["REMOTE_FIXTURE_REF"] = newer_ref
+        result = self._run("healthy", arguments=("--accept-installed",))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("installed acceptance fetch identity mismatch", result.stderr)
+        self.assertFalse(self.installer_log.exists())
+        self.assertEqual((self.lkg_dir / "metadata.json").read_bytes(), original)
 
     def _assert_rolled_back(self, result: subprocess.CompletedProcess, health: str) -> None:
         self.assertEqual(result.returncode, 3, result.stderr)
