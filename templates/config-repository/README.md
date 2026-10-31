@@ -403,6 +403,13 @@ evidence-only commit, still without fleet changes. Strict validation admits thes
 preparatory additions and rejects a true no-op or preparation combined with staging.
 This is separate from the new-controller first-install sequence above.
 
+Before manager selection, unused pending records may be canceled or replaced in
+an evidence-only commit. Keep the whole image-free fleet and active records
+unchanged; every controller must have explicit active evidence matching its
+selected engine. Validate the real predecessor and the new target normally.
+Remove an empty pending sidecar and integrate any replacement before selection.
+This cannot bypass a manager/runtime mismatch or introduce image policy.
+
 Before engine selection, integrate a nonempty
 `next-engine-rollout-evidence.json` with the same schema and controller map as
 active evidence. Its engine refs must differ from incumbent runtime evidence.

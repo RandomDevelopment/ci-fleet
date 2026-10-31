@@ -125,8 +125,11 @@ retention dispositions and the standalone template follow-up.
 
 Initial protocol limits are 128 KiB reads, 1 MiB per metadata/config object,
 8 MiB retained metadata, 4096 members, 8 GiB per role, JSON depth 32 and 1 MiB final
-zero padding. The local transport uses API 1.52, 30-second inactivity limits and
-a 180-second overall pair budget. These are bounds, not measured native capacity.
+zero padding. The local transport uses API 1.52 and a 180-second overall pair
+budget. Docker may prepare an export until that shared deadline before sending
+its first byte. Connections, metadata responses and gaps after an export starts
+retain 30-second inactivity limits. Starting the second role never resets the
+pair deadline. These are bounds, not measured native capacity.
 Cold export transfers every layer and classic Docker may need temporary disk.
 Measure both-role duration and peak disk on supervised disposable classic and
 containerd workers, with empty and populated stores. Prove native export ending,
@@ -192,7 +195,18 @@ Installer and reconciler validation use the selected commit's immediate first
 parent. Missing history, changed pending records, early evidence promotion,
 image-field removal, unrelated bootstrap edits and no-change image-free staging
 fail. Evidence preparation permits additions to established active/pending maps,
-with all prior records and the entire fleet unchanged. A true no-op, same-commit
+with all prior records and the entire fleet unchanged. Before manager selection,
+it also permits canceling or replacing unused pending records in an evidence-only
+commit. The complete fleet and active evidence must remain unchanged, and every
+controller needs an explicit active record matching its selected engine.
+Validate against the actual immediate predecessor. Remove the pending sidecar
+when canceling its last record. A replacement still needs normal target-capability
+review and must be integrated before selection. This exception cannot change
+active evidence, repair a manager/runtime mismatch, introduce images, or combine
+retargeting with selection. The trusted validator and executing manager must
+support this route independently of the unchanged incumbent runtime pin.
+Candidate-local validation cannot override an older trusted policy.
+A true no-op, same-commit
 preparation and selection, or fresh image-free installation remains invalid. A suite base chosen elsewhere does not replace this predecessor. The
 protected exact installed-ref drift exception and protected bootstrap LKG recovery
 remain separate; neither admits a new image-free installation. Keep approval,

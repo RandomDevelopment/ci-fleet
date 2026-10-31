@@ -170,14 +170,17 @@ def protected_read(path, *, private=False, limit=MAX_STATE):
 
 
 class SocketReader:
-    def __init__(self, sock, deadline):
+    def __init__(self, sock, deadline, *, export_startup=False):
         self.sock, self.deadline, self.buffer = sock, deadline, bytearray()
+        self.export_startup = export_startup
 
     def receive(self):
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Docker request deadline exceeded")
-        self.sock.settimeout(min(30, remaining))
-        return self.sock.recv(CHUNK)
+        self.sock.settimeout(remaining if self.export_startup else min(30, remaining))
+        chunk = self.sock.recv(CHUNK)
+        self.export_startup = False
+        return chunk
 
     def read(self, count):
         require(0 < count <= CHUNK, "invalid transport read size")
@@ -282,7 +285,7 @@ class Docker:
             sock.settimeout(min(30, remaining))
             sock.connect(SOCKET_PATH)
             sock.sendall(("GET " + API + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").encode("ascii"))
-            yield HTTPBody(SocketReader(sock, self.deadline))
+            yield HTTPBody(SocketReader(sock, self.deadline, export_startup=path.startswith("/images/get?")))
 
     def get(self, path):
         with self.response(path) as body:
