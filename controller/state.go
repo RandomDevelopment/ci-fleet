@@ -88,22 +88,29 @@ func (r *runnerState) forgetExited(name, expectedID string) {
 	}
 }
 
-func (r *runnerState) markDone(name string) (string, bool, bool) {
+func (r *runnerState) completion(name string) (string, bool, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if id, ok := r.busy[name]; ok {
-		delete(r.busy, name)
 		return id, true, true
 	}
 	if id, ok := r.idle[name]; ok {
-		delete(r.idle, name)
 		return id, true, true
 	}
 	if id, ok := r.exited[name]; ok {
-		delete(r.exited, name)
 		return id, false, true
 	}
 	return "", false, false
+}
+
+func (r *runnerState) forget(name, expectedID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, runners := range []map[string]string{r.idle, r.busy, r.exited} {
+		if runners[name] == expectedID {
+			delete(runners, name)
+		}
+	}
 }
 
 func (r *runnerState) drain() map[string]string {

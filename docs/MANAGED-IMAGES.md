@@ -141,7 +141,13 @@ host resize, SDK upgrade or containerd socket access is required by this protoco
 
 Base-image and runner selections updated on 2026-10-12 from official upstream endpoints. The signed Debian snapshots were reviewed on 2026-10-12. Docker package pins retain their 2026-08-16 review:
 
-The Go build image was updated to 1.27.2 on 2026-10-13. Docker Hub tag metadata confirms the pinned multi-architecture manifest digest below, including amd64 and arm64 variants.
+The Go build image was updated to 1.27.2 on 2026-10-13.
+
+The Go build image was updated to 1.27.3 on 2026-10-30. This patch fixes
+`crypto/x509` security issues. The reviewed registry manifest includes Linux
+amd64 and arm64. The controller's module requires 1.27.3 for `actions/scaleset`
+0.5.0, matching the pinned builder. The build stage sets `GOTOOLCHAIN=local` so
+a higher module requirement fails instead of downloading a different toolchain.
 
 Runner Buildx 0.32.1 package hashes were checked against the official Docker
 package index on 2026-10-15 for amd64 and arm64. The existing Docker CLI and
@@ -149,8 +155,10 @@ Compose selections are unchanged.
 
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
+| Runner Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
+| Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 | Debian 13.7 slim, reviewed 2026-10-12 for both images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim`; retained historical review |
-| Go 1.27.2 Bookworm build image | `sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61` | Docker Hub registry manifest for `library/golang:1.27.2-bookworm` |
+| Go 1.27.3 Bookworm build image | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3) |
 | Debian packages | signed snapshot `20261012T000000Z` | `snapshot.debian.org/archive/debian/20261012T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
@@ -158,7 +166,6 @@ Compose selections are unchanged.
 | Runner Buildx plugin 0.32.1 amd64 / arm64 | exact package version and SHA-256 `c50835adb10d6e9fc16c877d37a7a651b0ef2bac165be3ec52f8f05666cbccc8` / `a9ebb845ba8c2a67a815329bba341e31596c1c1f02d49ffb5670d0222253154e` | official Docker Debian `trixie` package index, added for optional APT build integration |
 | Actions Runner 2.338.0 | architecture-specific archive hashes in `runner/Dockerfile` | official GitHub Actions Runner release |
 | Controller modules | versions plus checksums in `controller/go.mod` and `controller/go.sum` | Go checksum-verified module inputs |
-| Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 
 The Dockerfiles fail closed if an upstream artifact no longer matches. Updating any pin requires a reviewed source change and new managed image IDs.
 
