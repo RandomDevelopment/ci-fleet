@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -198,5 +199,87 @@ func TestUntrackedRunnerEventsRetainUnrelatedAndDockerErrors(t *testing.T) {
 				t.Errorf("inspections=%d, want %d", inspections.Load(), wantInspections)
 			}
 		})
+	}
+}
+
+func TestExitWatcherDoesNotRemoveAgainWhileCompletionResponseIsPending(t *testing.T) {
+	const name, id = "ci-fleet-example-0123abcd", "runner-id"
+	waiting, exited, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var waitOnce, exitOnce, releaseOnce sync.Once
+	var removals atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := strings.TrimPrefix(r.URL.Path, "/v1.48")
+		switch {
+		case path == "/containers/"+id+"/wait":
+			waitOnce.Do(func() { close(waiting) })
+			select {
+			case <-exited:
+				json.NewEncoder(w).Encode(map[string]int{"StatusCode": 0})
+			case <-r.Context().Done():
+			}
+		case path == "/containers/"+id+"/json":
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "No such container"})
+		case path == "/containers/"+id+"/logs":
+			w.WriteHeader(http.StatusOK)
+		case path == "/containers/"+id && r.Method == http.MethodDelete:
+			if removals.Add(1) == 1 {
+				exitOnce.Do(func() { close(exited) })
+				// Docker is already absent, but completion still awaits its response.
+				<-release
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected Docker request: %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	docker, err := dockerclient.NewClientWithOpts(dockerclient.WithHost(server.URL), dockerclient.WithHTTPClient(server.Client()), dockerclient.WithVersion("1.48"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer docker.Close()
+	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, logger: slog.New(slog.DiscardHandler),
+		config: Config{FleetInstance: "example", MaxRunners: 1, StatusFile: t.TempDir() + "/status.json"}}
+	scaler.runners.addBusy(name, id)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		exitOnce.Do(func() { close(exited) })
+		scaler.runners.forget(name, id)
+		cancel()
+	}()
+	watchDone := make(chan struct{})
+	go func() { scaler.watchRunner(ctx, name, id); close(watchDone) }()
+	select {
+	case <-waiting:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exit watcher did not start")
+	}
+	completion := make(chan error, 1)
+	go func() {
+		completion <- scaler.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name})
+	}()
+	select {
+	case <-watchDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exit watcher did not accept confirmed container absence")
+	}
+	if !scaler.runners.contains(name, id) {
+		t.Fatal("tracking was discarded while completion was pending")
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-completion:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("completion did not finish")
+	}
+	if removals.Load() != 1 || scaler.runners.count() != 0 || scaler.runners.contains(name, id) {
+		t.Fatalf("duplicate removal or retained tracking: removals=%d runners=%d", removals.Load(), scaler.runners.count())
 	}
 }

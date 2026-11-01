@@ -63,6 +63,12 @@ runner still require the instance-specific name check and Docker's confirmation
 that the container is absent. Contradictory events and uncertain Docker results
 remain failures; restarting alone does not fix their cause.
 
+When Docker confirms that the exact tracked container ID is absent, the exit
+watcher records its exit without issuing another removal. This avoids a duplicate
+delete while a completion removal's response is still pending. Tracking remains
+available until completion finishes; inspection and removal errors retain their
+existing retry behavior.
+
 A batch canceled before admission performs no work. Once admitted, a real batch
 finishes acquisition, callbacks, cleanup and reconciliation without inheriting
 caller cancellation, preserving the previous listener's cleanup behavior. The
