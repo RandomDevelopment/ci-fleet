@@ -45,7 +45,30 @@ The listener ignores late authenticated events for this instance's generated run
 
 The pinned SDK also documents canceled scale-set assignments that never reach a runner. The controller ignores such a completion only when `result` is exactly `canceled`, `runnerName` is empty, `runnerId` is zero, `runnerAssignTime` is unset, the job ID is nonempty, and the runner request ID is positive. This conservative exception does not complete or remove any managed runner. Scaling continues to use the scale-set statistics. A blank runner name alone does not prove assignment cancellation.
 
-Before handling a completion, the controller logs its result, runner name and ID, runner assignment time, job ID, runner request ID, and workflow run ID. Unknown or contradictory events and Docker inspection or cleanup errors still fail. The pinned listener acknowledges a batch before invoking callbacks, so a callback failure can stop the rest of that batch; do not assume the failed event will be replayed or that restarting fixes its cause.
+Before handling a completion, the controller logs its result, runner name and ID, runner assignment time, job ID, runner request ID, and workflow run ID. Unknown or contradictory events and Docker inspection or cleanup errors still fail.
+
+The pinned `actions/scaleset` 0.5.0 listener calls the controller's `Scale`
+handler for initial statistics, each message batch, and empty polls. The handler
+retains the latest assigned-job count so empty polls can replace exited runners
+while demand remains. It acquires available jobs before processing starts and
+completions, then reconciles capacity against the reported statistics. Reacquiring
+an already acquired job is a service no-op.
+
+The listener acknowledges a batch only after the handler succeeds. An acquisition,
+callback, cleanup or acknowledgment failure stops the listener and leaves the
+batch eligible for replay. Earlier effects in a partially completed batch can
+repeat. Runner tracking remains until removal succeeds or the exit watcher
+confirms removal, so failed cleanup can be retried. Replayed events for a removed
+runner still require the instance-specific name check and Docker's confirmation
+that the container is absent. Contradictory events and uncertain Docker results
+remain failures; restarting alone does not fix their cause.
+
+A batch canceled before admission performs no work. Once admitted, a real batch
+finishes acquisition, callbacks, cleanup and reconciliation without inheriting
+caller cancellation, preserving the previous listener's cleanup behavior. The
+SDK also acknowledges a successfully completed batch without caller cancellation.
+Initial statistics and empty polls retain their caller's cancellation. Shutdown
+and existing cleanup deadlines are unchanged.
 
 For repeated `job completed for unknown runner ""` exits, compare the installed
 engine's handler with the reviewed source before changing code or restarting.
@@ -75,7 +98,10 @@ ci-fleet is optimized for organizations that already operate Linux and Docker ho
 | Disposable VM per job | Higher-isolation or higher-risk workloads | Stronger separation costs more startup time, storage, and provisioning infrastructure |
 | GitHub-hosted runners | Teams that prefer managed capacity and do not require self-hosted resources or networks | Provides less control over hardware, locality, caching, and private infrastructure access |
 
-The current controller uses the official `actions/scaleset` client at a pinned revision. Updates require a reviewed build and live validation before rollout.
+The current controller pins the official `actions/scaleset` 0.5.0 client and
+requires Go 1.27.3, including its pinned build image. Updates require a reviewed
+build and live validation before rollout. Source validation does not establish
+host acceptance.
 
 ## Operations and rollback
 

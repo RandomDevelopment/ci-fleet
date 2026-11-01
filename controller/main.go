@@ -99,6 +99,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("create message session: %w", err)
 	}
 	defer session.Close(context.Background())
+	scaler.messageClient = session
 	l, err := listener.New(session, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
 	if err != nil {
 		return fmt.Errorf("create listener: %w", err)

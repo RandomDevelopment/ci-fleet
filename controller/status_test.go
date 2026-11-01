@@ -14,21 +14,49 @@ import (
 func TestRunnerStateMakesExitAndCompletionIdempotent(t *testing.T) {
 	state := newRunnerState()
 	state.addIdle("runner", "container-1")
-	if state.markExited("runner", "container-2") { t.Fatal("removed replacement runner for stale exit") }
-	if current, _ := state.counts(); current != 1 { t.Fatalf("current=%d, want 1", current) }
-	if !state.markExited("runner", "container-1") { t.Fatal("matching exited runner was not removed") }
-	if current, _ := state.counts(); current != 0 { t.Fatalf("current=%d, want 0", current) }
-	if !state.markBusy("runner") { t.Fatal("late job start rejected exited runner") }
-	if current, busy := state.counts(); current != 0 || busy != 0 { t.Fatalf("late start restored exited runner: current=%d busy=%d", current, busy) }
-	if id, cleanup, ok := state.markDone("runner"); !ok || cleanup || id != "container-1" {
+	if state.markExited("runner", "container-2") {
+		t.Fatal("removed replacement runner for stale exit")
+	}
+	if current, _ := state.counts(); current != 1 {
+		t.Fatalf("current=%d, want 1", current)
+	}
+	if !state.markExited("runner", "container-1") {
+		t.Fatal("matching exited runner was not removed")
+	}
+	if current, _ := state.counts(); current != 0 {
+		t.Fatalf("current=%d, want 0", current)
+	}
+	if !state.markBusy("runner") {
+		t.Fatal("late job start rejected exited runner")
+	}
+	if current, busy := state.counts(); current != 0 || busy != 0 {
+		t.Fatalf("late start restored exited runner: current=%d busy=%d", current, busy)
+	}
+	if id, cleanup, ok := state.completion("runner"); !ok || cleanup || id != "container-1" {
 		t.Fatalf("late completion = id %q cleanup %t ok %t", id, cleanup, ok)
 	}
 
 	state.addIdle("normal", "container-2")
-	if !state.contains("normal", "container-2") { t.Fatal("tracked runner was not found") }
-	if _, cleanup, ok := state.markDone("normal"); !ok || !cleanup { t.Fatal("normal completion skipped cleanup") }
-	if state.contains("normal", "container-2") { t.Fatal("completed runner remained tracked") }
-	if state.markExited("normal", "container-2") { t.Fatal("exit won after normal completion") }
+	if !state.contains("normal", "container-2") {
+		t.Fatal("tracked runner was not found")
+	}
+	if _, cleanup, ok := state.completion("normal"); !ok || !cleanup {
+		t.Fatal("normal completion skipped cleanup")
+	}
+	if !state.contains("normal", "container-2") {
+		t.Fatal("unconfirmed removal released runner tracking")
+	}
+	state.forget("normal", "container-1")
+	if !state.contains("normal", "container-2") {
+		t.Fatal("stale completion removed replacement runner")
+	}
+	state.forget("normal", "container-2")
+	if state.contains("normal", "container-2") {
+		t.Fatal("completed runner remained tracked")
+	}
+	if state.markExited("normal", "container-2") {
+		t.Fatal("exit won after normal completion")
+	}
 }
 
 func TestWriteStatusReportsRunnerCountsWithoutControllingExecution(t *testing.T) {

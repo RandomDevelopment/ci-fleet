@@ -7,6 +7,7 @@
 #
 # Usage:
 #   remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
+#   remote-reconcile.sh --accept-installed
 set -Eeuo pipefail
 set +x
 export PYTHONDONTWRITEBYTECODE=1
@@ -29,6 +30,7 @@ lkg_dir=${CI_FLEET_LKG_DIR:-/var/lib/ci-fleet/last-known-good}
 mode=reconcile  # reconcile or check-only
 no_op=false
 installed_ref=false
+accept_installed=false
 explicit_ref=
 max_attempts=${CI_FLEET_RECONCILE_MAX_ATTEMPTS:-3}
 # ponytail: one-hour queue cap; align with any future installer transaction timeout.
@@ -38,15 +40,19 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   remote-reconcile.sh [--check-only] [--installed-ref] [--no-op]
+  remote-reconcile.sh --accept-installed
 
   Fetches the desired-state repository at the current default-branch HEAD,
   validates it, and reconciles the controller if a newer commit is available.
 
   --ref SHA     Mutating opt-in drained recovery at one full lowercase 40-hex
                 commit; unchanged controller/fleet policy and runtime engine only.
-                Incompatible with --check-only, --installed-ref and --no-op.
+                Incompatible with --check-only, --installed-ref, --no-op and --accept-installed.
   --check-only  Validate and report without reconciling.
   --installed-ref Check the locked installation's commit (check-only only).
+  --accept-installed Verify only the locked installed commit and full health,
+                then accept it as LKG without applying or repairing configuration.
+                Incompatible with --check-only, --installed-ref, --no-op and --ref.
   --no-op       Log what would be done without side effects.
 EOF
 }
@@ -58,6 +64,9 @@ while (($#)); do
       explicit_ref=$2; shift ;;
     --check-only) mode=check-only ;;
     --installed-ref) installed_ref=true ;;
+    --accept-installed)
+      [[ "$accept_installed" == false ]] || { echo 'ERROR: duplicate --accept-installed' >&2; exit 2; }
+      accept_installed=true ;;
     --no-op) no_op=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
@@ -66,6 +75,7 @@ while (($#)); do
 done
 [[ -z "$explicit_ref" || ( "$installed_ref" == false && "$no_op" == false && "$mode" == reconcile ) ]] || { echo 'ERROR: --ref is incompatible with --installed-ref, --check-only and --no-op' >&2; exit 2; }
 [[ "$installed_ref" == false || "$mode" == check-only ]] || { echo 'ERROR: --installed-ref requires --check-only' >&2; exit 2; }
+[[ "$accept_installed" == false || ( "$mode" == reconcile && "$installed_ref" == false && "$no_op" == false && -z "$explicit_ref" ) ]] || { echo 'ERROR: --accept-installed cannot be combined with another mode' >&2; exit 2; }
 
 temp_dir=$(mktemp -d) || exit 2
 transaction_result=$temp_dir/transaction-result.json
@@ -517,6 +527,7 @@ if [[ -n "$explicit_ref" ]]; then
   fetch_ref=$explicit_ref
 fi
 [[ "$installed_ref" == false ]] || fetch_ref=$installed_config_ref
+[[ "$accept_installed" == false ]] || fetch_ref=$installed_config_ref
 note "INSTALLED controller=${installed_controller} config_repo=${installed_config_repo} config_ref=${installed_config_ref}"
 
 # Prefer host.env for token generation; fall back to rendered_env
@@ -554,6 +565,7 @@ while ((attempt < max_attempts)); do
 done
 
 note "RESOLVED desired_ref=${desired_commit}"
+[[ "$accept_installed" == false || "$desired_commit" == "$installed_config_ref" ]] || die 'installed acceptance fetch identity mismatch'
 if [[ -n "$explicit_ref" ]]; then
   [[ "$desired_commit" == "$explicit_ref" ]] || die 'explicit ref fetch identity mismatch'
   git -C "$temp_dir/config-repo" show "$desired_commit:fleet.json" >"$temp_dir/recovery-candidate.json" || die 'candidate unavailable'
@@ -570,6 +582,17 @@ if [[ -e "$config_review_policy" || -L "$config_review_policy" || -e "$config_re
     save_reconcile_state 'invalid' "$desired_commit" "$installed_config_ref" 'unknown' 'configuration approval rejected'
     exit 3
   fi
+fi
+
+if [[ "$accept_installed" == true ]]; then
+  git -C "$temp_dir/config-repo" show "$desired_commit:fleet.json" >"$temp_dir/acceptance-fleet.json" \
+    || die 'installed acceptance configuration is unavailable'
+  python3 - "$temp_dir/acceptance-fleet.json" <<'PY' || die 'installed acceptance requires an activated managed-image configuration'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+images = value.get("managed_images") if isinstance(value, dict) else None
+raise SystemExit(0 if isinstance(images, dict) and images else 1)
+PY
 fi
 
 # Compare with installed
@@ -590,10 +613,34 @@ if [[ "$desired_commit" == "$installed_config_ref" && -z "$explicit_ref" ]]; the
       --config-identity "$installed_config_repo" \
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
+      health_status=healthy
+      if [[ "$accept_installed" == true ]]; then
+        save_reconcile_state 'reconciling' "$desired_commit" "$installed_config_ref" 'unknown' 'installed configuration checked; verifying health' false '' '' true \
+          || die 'installed acceptance state persistence unverified'
+        health_status=$(run_health_check "$temp_dir/health.json")
+        health_desired_state=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["desired_state"])' "$temp_dir/health.json" 2>/dev/null || echo unknown)
+        case "$installed_controller_state:$health_desired_state:$health_status" in
+          active:active:healthy|active:active:warning|drained:drained:maintenance|drained:drained:warning|disabled:disabled:maintenance|disabled:disabled:warning) ;;
+          *)
+            save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" "$health_status" 'installed configuration health rejected'
+            exit 3
+            ;;
+        esac
+        # A failed verification must never replay an older, potentially incompatible LKG.
+        if ! { save_lkg "$installed_config_ref" true && lkg_readback_matches "$installed_config_ref"; }; then
+          save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" "$health_status" 'installed LKG persistence failed'
+          exit 3
+        fi
+      fi
+      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" "$health_status" 'no change, converged' true '' '' true \
+        || die 'installed convergence state persistence unverified'
       note "CONVERGED controller=${installed_controller} config_ref=${installed_config_ref}"
-      save_reconcile_state 'converged' "$desired_commit" "$installed_config_ref" 'healthy' 'no change, converged' true
       exit 0
     fi
+  fi
+  if [[ "$accept_installed" == true ]]; then
+    save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" 'unknown' 'installed configuration check rejected; no repair attempted'
+    exit 3
   fi
   # Same commit + drift is still drift: check-only reports it, normal mode repairs it.
   if [[ "$mode" == check-only ]]; then

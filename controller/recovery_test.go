@@ -210,7 +210,7 @@ waitForExit:
 		t.Fatalf("late completion for recovered exit rejected: %v", err)
 	}
 	// Leave the last active runner untracked before releasing its simulated wait.
-	scaler.runners.markDone("ci-fleet-example-restarting")
+	scaler.runners.forget("ci-fleet-example-restarting", "restarting")
 }
 
 func TestRecoveryNeverForcesARunnerThatStartsDuringCleanup(t *testing.T) {
