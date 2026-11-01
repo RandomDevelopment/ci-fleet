@@ -219,6 +219,7 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 		}
 		// Docker can wake a not-running waiter while the container is restarting.
 		current, err := s.dockerClient.ContainerInspect(ctx, id)
+		// A not-found inspection already proves this exact container is retired.
 		if !errdefs.IsNotFound(err) {
 			if err != nil || current.State == nil {
 				s.logger.Warn("inspect exited runner", "runner", name, "error", err)
@@ -228,11 +229,11 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 			if current.State.Running || current.State.Restarting || current.State.Paused {
 				continue
 			}
-		}
-		if err := s.logAndRemove(ctx, name, id, false); err != nil {
-			s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
-			time.Sleep(time.Minute)
-			continue
+			if err := s.logAndRemove(ctx, name, id, false); err != nil {
+				s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
+				time.Sleep(time.Minute)
+				continue
+			}
 		}
 		if !s.runners.markExited(name, id) {
 			return
