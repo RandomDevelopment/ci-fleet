@@ -60,6 +60,57 @@ note() {{ :; }}
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_runtime_capability_helpers_fail_closed(self):
+        self.shell(("release_tree_digest", "runtime_release_complete"), r"""
+mkdir -p "$release_dir/"{deploy,scripts,controller,runner}
+cp "$repo_root/engine-capabilities.json" "$release_dir/engine-capabilities.json"
+for required in deploy/compose.yaml controller/Dockerfile controller/go.mod controller/main.go controller/config.go controller/scaler.go controller/state.go runner/Dockerfile; do
+  : >"$release_dir/$required"
+done
+helpers=(apply-docker-network-policy.sh docker-network-policy-adapter.sh build-managed-images.sh managed_image_identity.py apt_cache.py)
+for helper in preflight.sh healthcheck.sh cleanup.sh "${helpers[@]}"; do
+  printf '#!/bin/sh\n' >"$release_dir/scripts/$helper"
+  chmod 755 "$release_dir/scripts/$helper"
+done
+refresh() { release_tree_digest "$release_dir" >"$release_dir/.ci-fleet-tree-sha256"; }
+refresh
+runtime_release_complete "$release_dir" "$engine_ref"
+for helper in "${helpers[@]}"; do
+  target=$release_dir/scripts/$helper
+  mv "$target" "$temporary/helper"
+  refresh
+  if runtime_release_complete "$release_dir" "$engine_ref"; then exit 1; fi
+  ln -s "$temporary/helper" "$target"
+  refresh
+  if runtime_release_complete "$release_dir" "$engine_ref"; then exit 1; fi
+  rm "$target"
+  mv "$temporary/helper" "$target"
+  chmod 644 "$target"
+  refresh
+  if [[ $helper == *.py ]]; then
+    runtime_release_complete "$release_dir" "$engine_ref"
+  elif runtime_release_complete "$release_dir" "$engine_ref"; then exit 1; fi
+  chmod 755 "$target"
+done
+refresh
+runtime_release_complete "$release_dir" "$engine_ref"
+python3 - "$release_dir/engine-capabilities.json" <<'DISABLED'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+value = json.loads(p.read_text())
+for key in ("docker_network_policy_config", "docker_network_policy_adapter", "reproducible_managed_images", "portable_managed_image_ids", "apt_cache"):
+    value["capabilities"][key] = False
+    value["capabilities"]["unknown\n" + key] = True
+p.write_text(json.dumps(value))
+DISABLED
+for helper in "${helpers[@]}"; do rm "$release_dir/scripts/$helper"; done
+refresh
+runtime_release_complete "$release_dir" "$engine_ref"
+jq() { return 127; }
+if runtime_release_complete "$release_dir" "$engine_ref"; then exit 1; fi
+""")
+
     def test_runtime_source_selects_semantics_not_scalar_syntax(self):
         for portable in (False, True):
             self.shell(("portable_managed_images",),

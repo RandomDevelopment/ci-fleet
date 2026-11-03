@@ -1930,7 +1930,7 @@ retry_result=$tmp/interrupted-retry-result.json
 : >"$retry_result"
 FAKE_PAUSE_SYSTEMCTL_ONCE=$retry_pause CI_FLEET_TRANSACTION_RESULT_FD=7 "$installer" --upgrade "${base_args[@]}" --ref "$interrupted_ref" 7>"$retry_result" >"$tmp/interrupted-retry.out" 2>&1 &
 retry_pid=$!
-wait_for_file "$retry_pause.entered" 'interrupted policy retry did not reach nested activation'
+(wait_for_file "$retry_pause.entered" 'interrupted policy retry did not reach nested activation') || fail "interrupted policy retry did not reach nested activation: $(<"$tmp/interrupted-retry.out")"
 for repaired_checkpoint_target in "$stale_checkpoint_release" "$stale_checkpoint_manager"; do
   if find "$repaired_checkpoint_target" \( -type d -o -type f \) -perm /022 -print -quit | grep -q .; then
     fail "pending checkpoint target remained permission-unsafe: $repaired_checkpoint_target"
