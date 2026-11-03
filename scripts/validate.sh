@@ -28,6 +28,7 @@ python3 -m py_compile \
   scripts/cleanup_networks.py \
   scripts/cleanup_storage.py \
   scripts/test_cleanup_storage.py \
+  scripts/test_proxy_memory.py \
   scripts/health.py \
   scripts/endpoint_snapshot.py \
   scripts/endpoint_snapshot_sources.py \
@@ -148,6 +149,7 @@ docker compose -f deploy/compose.yaml build runner-image
 docker buildx build --load --build-arg CI_FLEET_COMMIT --build-arg CI_FLEET_VERSION \
   --tag "$CI_FLEET_CONTROLLER_IMAGE" --file controller/Dockerfile .
 docker run --name "${CI_FLEET_VALIDATION_ID:-ci-fleet-validation}-runner-inspect" --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
+python3 scripts/test_proxy_memory.py --image "$CI_FLEET_CONTROLLER_IMAGE"
 python3 scripts/test_apt_cache_e2e.py
 bash scripts/test-cleanup-e2e.sh
 CI_FLEET_INSTANCE=${CI_FLEET_VALIDATION_ID:-validation} scripts/cleanup.sh
