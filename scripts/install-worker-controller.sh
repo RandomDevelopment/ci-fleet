@@ -824,7 +824,7 @@ PY
 }
 
 runtime_release_complete() {
-  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script
+  local path=$1 expected=$2 require_status=${3:-0} require_schema=${4:-0} marker required stored_digest actual_digest policy_script enabled_capabilities
   local -a capability_args=()
   [[ -d "$path" && -f "$path/.ci-fleet-engine-ref" && -f "$path/.ci-fleet-tree-sha256" && -f "$path/deploy/compose.yaml" ]] || return 1
   [[ -x "$path/scripts/preflight.sh" && -x "$path/scripts/healthcheck.sh" && -x "$path/scripts/cleanup.sh" ]] || return 1
@@ -834,14 +834,10 @@ runtime_release_complete() {
     [[ "$require_status" != 1 ]] || capability_args+=(--require-status-reporting)
     python3 "$repo_root/scripts/desired_state.py" validate-engine-capabilities \
       --manifest "$path/engine-capabilities.json" "${capability_args[@]}" >/dev/null || return 1
+    enabled_capabilities=$(jq -c '.capabilities | to_entries[] | select(.value == true) | .key' "$path/engine-capabilities.json") || return 1
     for required in docker_network_policy_config:apply-docker-network-policy.sh docker_network_policy_adapter:docker-network-policy-adapter.sh reproducible_managed_images:build-managed-images.sh portable_managed_image_ids:managed_image_identity.py apt_cache:apt_cache.py; do
       policy_script=${required#*:}
-      if python3 - "$path/engine-capabilities.json" "${required%%:*}" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(value.get("capabilities", {}).get(sys.argv[2]) is not True)
-PY
-      then
+      if grep -Fxq -- "\"${required%%:*}\"" <<<"$enabled_capabilities"; then
         [[ -f "$path/scripts/$policy_script" && ! -L "$path/scripts/$policy_script" ]] || return 1
         [[ "$policy_script" == *.py || -x "$path/scripts/$policy_script" ]] || return 1
       fi
