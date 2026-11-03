@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import signal
 import socket
 import socketserver
 import subprocess
@@ -102,6 +103,11 @@ def upload(index):
     except Exception as error:
         event('client_failed', client=index, error=type(error).__name__ + ': ' + str(error))
 
+def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, terminate)
 container = None
 try:
     cmd = ['run', '-d', '--name', name, '--memory=128m', '--cpus=1', '--user=0:0', '--network=none', '--security-opt=no-new-privileges',
@@ -145,9 +151,12 @@ finally:
     if 'monitor_thread' in locals():
         monitor_thread.join(3)
     server.shutdown()
+    server.server_close()
     if container:
-        (root / 'proxy.log').write_text(docker('logs', container))
-        docker('rm', '-f', container)
+        try:
+            (root / 'proxy.log').write_text(docker('logs', container))
+        finally:
+            docker('rm', '-f', container)
     upstream.unlink(missing_ok=True)
     (root / 'events.json').write_text(json.dumps(events, indent=2) + '\n')
     (root / 'memory.json').write_text(json.dumps(samples) + '\n')

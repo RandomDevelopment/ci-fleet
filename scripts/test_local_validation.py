@@ -452,6 +452,37 @@ class RunnerTests(unittest.TestCase):
                 run(["python3", "-c", leader], root, os.environ.copy(), root / "test.log", 5)
             self.assertEqual((root / "cleaned").read_text(), "done")
 
+    def test_proxy_memory_timeout_unwinds_owned_fixture_through_shell(self):
+        for logs_status in (0, 1):
+            with self.subTest(logs_status=logs_status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                docker = root / "docker"
+                docker.write_text('''#!/usr/bin/python3
+import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["PROXY_COMMANDS"]).open("a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["run", "-d"]:
+    print("fixture-proxy")
+if args[:2] == ["inspect", "--format"]:
+    time.sleep(60)
+if args[:1] == ["logs"]:
+    sys.exit(int(os.environ["PROXY_LOGS_STATUS"]))
+''')
+                docker.chmod(0o755)
+                commands = root / "commands.jsonl"
+                env = os.environ | {"PATH": str(root) + ":" + os.environ["PATH"],
+                                    "PROXY_COMMANDS": str(commands), "PROXY_LOGS_STATUS": str(logs_status)}
+                command = ["bash", "-c", 'python3 "$1" --image fixture-image; exit "$?"',
+                           "bash", str(ROOT / "scripts/test_proxy_memory.py")]
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run(command, ROOT, env, root / "fixture.log", 2)
+                recorded = [json.loads(line) for line in commands.read_text().splitlines()]
+                self.assertTrue(any(args[:2] == ["run", "-d"] for args in recorded))
+                self.assertIn(["logs", "fixture-proxy"], recorded)
+                self.assertIn(["rm", "-f", "fixture-proxy"], recorded)
+
     def test_container_stage_propagates_cleanup_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
