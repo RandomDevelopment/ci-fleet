@@ -458,6 +458,7 @@ class RunnerTests(unittest.TestCase):
             scripts = root / "scripts"; scripts.mkdir()
             (scripts / "test_apt_cache_e2e.py").write_text(
                 "import os, sys\nsys.exit(int(os.environ['TEST_STAGE_STATUS']))\n")
+            (scripts / "test_proxy_memory.py").write_text("")
             (scripts / "scan_committed_secrets.py").write_text("")
             for name in ("test-cleanup-e2e.sh", "cleanup.sh"):
                 path = scripts / name
