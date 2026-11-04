@@ -64,17 +64,76 @@ func newSocketProxyTest(t *testing.T, handler http.Handler) *socketProxyTest {
 			t.Error("proxy did not shut down")
 		}
 	})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if info, err := os.Stat(fixture.socket); err == nil && info.Mode()&os.ModeSocket != 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("proxy did not listen")
-		}
-		time.Sleep(time.Millisecond)
+	if err := waitForTestProxySocket(fixture.socket, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatalf("proxy did not listen: %v", err)
 	}
 	return fixture
+}
+
+func waitForTestProxySocket(socket string, deadline time.Time) error {
+	for time.Now().Before(deadline) {
+		connection, err := (&net.Dialer{Deadline: deadline}).Dial("unix", socket)
+		if err == nil {
+			if err := connection.Close(); err != nil {
+				return err
+			}
+			if !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
+		time.Sleep(min(time.Millisecond, time.Until(deadline)))
+	}
+	return context.DeadlineExceeded
+}
+
+func TestProxySocketReadinessBoundWithoutListen(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "proxy.sock")
+	descriptor, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syscall.CloseOnExec(descriptor)
+	defer syscall.Close(descriptor)
+	if err := syscall.Bind(descriptor, &syscall.SockaddrUnix{Name: socket}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(socket)
+	if err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("bound socket must satisfy the old file predicate: %v", err)
+	}
+	if err := waitForTestProxySocket(socket, time.Now().Add(25*time.Millisecond)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bound socket without a listener passed readiness: %v", err)
+	}
+}
+
+func TestProxySocketReadinessReadyListenerClosesProbe(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "proxy.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := waitForTestProxySocket(socket, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	listener.SetDeadline(time.Now().Add(time.Second))
+	connection, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := connection.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("readiness probe was not closed: %v", err)
+	}
+}
+
+func TestProxySocketReadinessUnavailableListener(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "missing.sock")
+	if err := waitForTestProxySocket(socket, time.Now().Add(25*time.Millisecond)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unavailable socket passed readiness: %v", err)
+	}
 }
 
 func proxyMarkerCount(t *testing.T, fixture *socketProxyTest) int {
