@@ -156,6 +156,7 @@ Compose selections are unchanged.
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
 | Runner Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
+| Controller Debian 13.7 slim, reviewed 2026-11-05 | `sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-27 |
 | Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 | Debian 13.7 slim, reviewed 2026-10-12 for both images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim`; retained historical review |
 | Go 1.27.3 Bookworm build image | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3) |
