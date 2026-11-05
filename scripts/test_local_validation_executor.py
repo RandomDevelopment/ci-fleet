@@ -231,6 +231,18 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(self.log.read_text(), "$HOME %n literal\n")
         self.assert_empty()
 
+    def test_timeout_with_short_cleanup_produces_a_receipt(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.execute('''
+if os.fork() == 0:
+    os.setsid(); record()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready(); time.sleep(60)
+else:
+    wait_ready(); time.sleep(60)
+''', timeout=1, grace=.2)
+        self.assert_empty()
+
     def test_detached_child_is_cleaned_before_next_stage(self):
         self.execute('''
 if os.fork() == 0:
