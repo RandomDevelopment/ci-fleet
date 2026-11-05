@@ -166,6 +166,12 @@ also checks project images for endpoint leakage and tests outage failure and
 direct HTTPS. It removes only its own containers, images, and
 builders. It never clears or changes a production cache.
 
+The disposable cache uses the pinned Go build image's APT 2.6.1 client identifier
+for outbound requests. The disposable cache returned 404 for a signed Bookworm
+index with its default identifier, while the APT-compatible identifier
+served the exact signed bytes. This fixture setting changes no package pins,
+client timeouts, cache-outage checks or operator-managed cache configuration.
+
 Before live acceptance, repeat representative shards on the approved host.
 Record elapsed time, upstream package bytes, cache-served package bytes, and
 repeated package hits. Report index revalidation separately. `apt-get update`

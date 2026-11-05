@@ -7,4 +7,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends apt-cacher-ng p
     && install -d -o apt-cacher-ng -g apt-cacher-ng /var/cache/apt-cacher-ng /var/log/apt-cacher-ng /run/apt-cacher-ng \
     && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT ["/usr/sbin/apt-cacher-ng"]
-CMD ["-c", "/etc/apt-cacher-ng", "ForeGround=1", "BindAddress=0.0.0.0"]
+# Use the pinned APT client's identifier for snapshot index requests.
+CMD ["-c", "/etc/apt-cacher-ng", "ForeGround=1", "BindAddress=0.0.0.0", "UserAgent=Debian APT-HTTP/1.3 (2.6.1)"]
