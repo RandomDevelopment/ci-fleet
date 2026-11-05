@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 )
 
 const dockerProxySocket = "/run/ci-fleet/locks/docker.sock"
@@ -30,6 +31,7 @@ const dockerProxyHealth = "ci-fleet-docker-socket-proxy-v1\n"
 const dockerBuildContextLimit = 1 << 30
 const dockerBuildUploadLimit = 2
 const dockerMetadataBodyLimit = 1 << 20
+const dockerSpoolCacheWindow = 4 << 20
 
 var dockerAPIVersion = regexp.MustCompile(`^/v[0-9]+\.[0-9]+/`)
 
@@ -308,15 +310,79 @@ func (body *dockerProxyBody) Close() error {
 }
 
 type dockerBuildSpool struct {
-	*os.File
-	closed sync.Once
-	slots  chan struct{}
-	err    error
+	file    *os.File
+	offset  int64
+	dropped int64
+	closed  sync.Once
+	slots   chan struct{}
+	err     error
+}
+
+func (spool *dockerBuildSpool) requireDisk() error {
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(int(spool.file.Fd()), &filesystem); err != nil {
+		return err
+	}
+	if filesystem.Type == unix.TMPFS_MAGIC || filesystem.Type == unix.RAMFS_MAGIC {
+		return errors.New("Docker upload spool requires disk-backed temporary storage")
+	}
+	return nil
+}
+
+func (spool *dockerBuildSpool) Write(buffer []byte) (int, error) {
+	count, err := spool.file.Write(buffer)
+	spool.offset += int64(count)
+	if err == nil && spool.offset-spool.dropped >= dockerSpoolCacheWindow {
+		err = spool.releaseWritten()
+	}
+	return count, err
+}
+
+func (spool *dockerBuildSpool) releaseWritten() error {
+	// Dirty and reread file pages count against the proxy's memory cgroup too.
+	if err := unix.Fdatasync(int(spool.file.Fd())); err != nil {
+		return err
+	}
+	return spool.releaseCache()
+}
+
+func (spool *dockerBuildSpool) releaseCache() error {
+	length := spool.offset - spool.dropped
+	if length == 0 {
+		return nil
+	}
+	if err := unix.Fadvise(int(spool.file.Fd()), spool.dropped, length, unix.FADV_DONTNEED); err != nil {
+		return err
+	}
+	spool.dropped = spool.offset
+	return nil
+}
+
+func (spool *dockerBuildSpool) rewind() error {
+	if err := spool.releaseWritten(); err != nil {
+		return err
+	}
+	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	spool.offset, spool.dropped = 0, 0
+	return nil
+}
+
+func (spool *dockerBuildSpool) Read(buffer []byte) (int, error) {
+	count, err := spool.file.Read(buffer)
+	spool.offset += int64(count)
+	if spool.offset-spool.dropped >= dockerSpoolCacheWindow || errors.Is(err, io.EOF) {
+		if cacheErr := spool.releaseCache(); cacheErr != nil {
+			err = errors.Join(err, cacheErr)
+		}
+	}
+	return count, err
 }
 
 func (spool *dockerBuildSpool) Close() error {
 	spool.closed.Do(func() {
-		spool.err = spool.File.Close()
+		spool.err = spool.file.Close()
 		<-spool.slots
 	})
 	return spool.err
@@ -375,14 +441,18 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}
-				spool := &dockerBuildSpool{File: file, slots: buildSlots}
+				spool := &dockerBuildSpool{file: file, slots: buildSlots}
 				defer spool.Close()
 				// Unlink before writing so a killed proxy cannot leave spooled contexts behind.
 				if err := os.Remove(file.Name()); err != nil {
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}
-				length, err := io.Copy(file, http.MaxBytesReader(w, request.Body, dockerBuildContextLimit))
+				if err := spool.requireDisk(); err != nil {
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
+				}
+				length, err := io.Copy(spool, http.MaxBytesReader(w, request.Body, dockerBuildContextLimit))
 				if err != nil {
 					var tooLarge *http.MaxBytesError
 					if errors.As(err, &tooLarge) {
@@ -392,7 +462,7 @@ func newDockerSocketProxy(upstream, lockPath, bootID string) (http.Handler, *htt
 					http.Error(w, err.Error(), http.StatusBadRequest)
 					return
 				}
-				if _, err := file.Seek(0, io.SeekStart); err != nil {
+				if err := spool.rewind(); err != nil {
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}

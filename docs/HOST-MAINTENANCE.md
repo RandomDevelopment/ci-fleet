@@ -129,6 +129,17 @@ image removal, and builder pruning participate in proxy protocol `v2` alongside
 builds and container reference mutations. Storage removal defers with older
 proxies. Image-load uploads use the same 1 GiB spool limit as build contexts.
 Image imports use that bounded spool too and share its two upload slots.
+Upload spools synchronize written file data and discard its cached pages in
+4 MiB windows. Forwarding also discards consumed pages. File-cache charges
+belong to the proxy's memory cgroup, so an unlinked disk file alone does not
+keep a large upload within its unchanged 128 MiB memory limit. Synchronization
+or cache-advice failures during spooling refuse the request before forwarding.
+A cache-advice error during forwarding retains the existing uncertainty guard.
+The body limit and two upload slots are unchanged.
+The temporary directory must have disk backing. Memory-backed `tmpfs` or `ramfs`
+spools are refused before forwarding because their data cannot be evicted from
+the memory limit as a disk page can. Do not move spools to a memory filesystem
+to avoid synchronization costs.
 Registry pulls and imports from remote URLs bypass upload slots while retaining
 the maintenance lock. Other guarded request bodies have a 1 MiB metadata limit;
 oversized bodies receive HTTP 413 before reaching Docker.
