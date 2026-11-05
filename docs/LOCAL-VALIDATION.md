@@ -201,6 +201,9 @@ records that executor revision. An unrelated sibling helper cannot execute
 stages, and a mismatched installation fails before launching any service.
 The executor reads a root-protected `ExecStopPost` receipt and verifies the
 service cgroup is empty before recording success or starting another stage.
+The completion hook uses isolated Python without site initialization or optional
+module imports to reduce startup work within the same cleanup allowance. It writes the
+same three manager fields as JSON, rejecting unexpected field bytes or lengths.
 Missing receipts, unsuccessful service results, forced termination and incomplete
 cleanup fail validation. There is no `/proc` walk, pidfd table or child-subreaper
 in the executor. Ordinary configuration stages cannot write the trusted policy,
