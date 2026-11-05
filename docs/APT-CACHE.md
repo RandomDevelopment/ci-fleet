@@ -172,6 +172,11 @@ index with its default identifier, while the APT-compatible identifier
 served the exact signed bytes. This fixture setting changes no package pins,
 client timeouts, cache-outage checks or operator-managed cache configuration.
 
+The tooling image installs its dependencies over HTTPS from the same reviewed
+snapshot. A fresh HTTP install returned 503 while the HTTPS install completed
+with the same package selection. The build restores its original HTTP source
+afterward so the cache and outage checks still exercise HTTP proxy behavior.
+
 Before live acceptance, repeat representative shards on the approved host.
 Record elapsed time, upstream package bytes, cache-served package bytes, and
 repeated package hits. Report index revalidation separately. `apt-get update`
