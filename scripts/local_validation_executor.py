@@ -24,11 +24,15 @@ WORK = Path("/var/lib/ci-validation-work")
 HOST_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 # ExecStopPost runs after systemd has terminated the stage's remaining processes.
 # Its receipt lives in a root-only directory, outside candidate-writable paths.
-FINISH = '''import json, os
-from pathlib import Path
-result = {key: os.environ.get(key) for key in ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")}
-with Path(__file__).with_name("result.json").open("x") as output:
-    json.dump(result, output)
+FINISH = '''import os
+names = ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")
+values = [os.environ.get(name) for name in names]
+allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+if any(value is not None and (len(value) > 64 or any(char not in allowed for char in value)) for value in values):
+    raise ValueError("invalid system manager receipt field")
+fields = ['"' + name + '":' + ('null' if value is None else '"' + value + '"') for name, value in zip(names, values)]
+with open(__file__.rsplit("/", 1)[0] + "/result.json", "x", encoding="utf-8") as output:
+    output.write("{" + ",".join(fields) + "}")
 '''
 
 
@@ -112,7 +116,7 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
         properties = ["Type=exec", "ExitType=cgroup", "Slice=system.slice", "Restart=no", "Delegate=no",
                       "KillMode=control-group", "SendSIGKILL=yes", "RuntimeMaxSec=" + str(timeout) + "s",
                       "TimeoutStopSec=" + str(max(grace, .001)) + "s", "TasksMax=512",
-                      "User=" + user, "ExecStopPost=+/usr/bin/python3 -I " + str(finish)]
+                      "User=" + user, "ExecStopPost=+/usr/bin/python3 -I -S " + str(finish)]
         if user != "root":
             writable = list(dict.fromkeys([str(cwd), *(env[key] for key in ("HOME", "TMPDIR") if key in env)]))
             if any(not Path(path).is_absolute() for path in writable):
