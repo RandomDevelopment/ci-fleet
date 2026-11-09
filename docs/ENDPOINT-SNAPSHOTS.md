@@ -56,8 +56,8 @@ severity cannot substitute for its decision. The
 [disk-pressure observation note](DISK-PRESSURE-OBSERVATION.md) records the
 current-source evidence limits and non-normative proposal for #166/#118/#120.
 Any extension needs a reviewed versioning and compatibility decision, strict
-projection/readback tests, and preserved measurement times. This documentation
-change leaves unsupported readiness and all producer/consumer schemas unchanged.
+projection/readback tests, and preserved measurement times. Snapshot v1 retains
+unsupported readiness; the proposed admission semantics do not extend its schema.
 
 ## Protected publication
 

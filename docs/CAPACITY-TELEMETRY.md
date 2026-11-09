@@ -18,13 +18,13 @@ Run on the controller host; reads local state only and changes nothing:
 sudo python3 /opt/ci-fleet/current/scripts/health.py capacity-report
 ```
 
-The JSON report groups the preceding seven days by logical pool and gives nearest-rank p50/p95 values for every observed host and runner metric, plus sample and anonymous runner-observation counts. An empty report means no valid retained samples contributed during the period; it does not prove that no runner ran or that collection succeeded. Check sampler failures and source coverage separately.
+The JSON report groups the preceding seven days by logical pool and gives nearest-rank p50/p95 values for every observed host and runner metric, plus sample and anonymous runner-observation counts. An empty report means no valid retained samples contributed during the period; it does not prove that no runner ran or that collection succeeded. Check persisted sampler failures in the [local health result](HEALTH-MONITORING.md#local-check), and distinguish idle periods from missing or failed collection before interpreting the history.
 
 Review the report before changing runner count, per-runner resources, or pool budget. A capacity change still requires its own reviewed private-configuration change; this public repository does not create or modify that external change.
 
 ## Disk-pressure evidence limits
 
-History records root and Docker **used** bytes and inode counts, not filesystem
+History records root and Docker **used** bytes and used inode counts, not filesystem
 capacity or bytes available to the workload. It does not map workspace or proxy
 spool filesystems, distinguish same-filesystem aliases, or measure I/O pressure,
 latency or cache effectiveness. Do not add root and Docker usage together: they

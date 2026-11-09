@@ -5,6 +5,8 @@ engine `a56fad2c47bf6b3f80e839af69615a2b42fc1461`. This document adds no produce
 snapshot field, collector, UI, threshold, or host authorization. The proposed
 [#166](https://github.com/RandomDevelopment/ci-fleet/issues/166) admission producer
 and its enforcement guarantees require separate implementation and review.
+Update or supersede this base-pinned inventory when #166 is integrated; approval
+to implement a candidate does not establish acceptance or deployment.
 
 ## Reuse the existing evidence
 
@@ -14,9 +16,9 @@ protected snapshot foundation. Do not recreate either collector.
 
 | Existing source | What it establishes | What it does not establish |
 | --- | --- | --- |
-| [`controllerStatus`](../controller/status.go), `controller/status.go` | Controller identity, software version, current/busy/maximum counts and status generation time | Disk admission, listener readiness, or why capacity is restricted |
+| [`controller/status.go`](../controller/status.go), `controllerStatus` | Controller identity, software version, current/busy/maximum counts and status generation time | Disk admission, listener readiness, or why capacity is restricted |
 | [`scripts/health.py`](../scripts/health.py), `collect_capacity_snapshot` / `record_capacity` | Active-runner samples: host CPU/memory/swap, root/Docker used bytes and inodes, anonymous runner CPU/memory | Available bytes, filesystem capacity history, workspace/spool mapping, I/O latency, PSI, or job attribution |
-| [`scripts/endpoint_snapshot.py`](../scripts/endpoint_snapshot.py), `project_controller` / `project_health` | Allowlisted counts/version, controlled health check IDs/severities, original source timestamps | Admission details, raw health helper values, capacity history, cleanup receipts or overall readiness |
+| [`scripts/endpoint_snapshot.py`](../scripts/endpoint_snapshot.py), `project_controller` / `project_health` | Allowlisted counts/version and reviewed-maximum comparison, controlled health check IDs/severities, original source timestamps | Admission details, raw health helper values, capacity history, cleanup receipts or overall readiness |
 | [`scripts/cleanup_storage.py`](../scripts/cleanup_storage.py), `cleanup_storage` | Bounded maintenance report and rounded filesystem utilization where inspection succeeds | A durable structured cleanup outcome, net reclaimed bytes, or current admission state |
 
 The [snapshot v1 contract](ENDPOINT-SNAPSHOTS.md#snapshot-version-1) remains
@@ -24,15 +26,20 @@ unchanged: readiness-related sources and capacity history are unsupported.
 `project_controller` deliberately projects only its approved fields; a new
 `disk_admission` field in controller output would **not** automatically reach a
 snapshot consumer. A future extension needs an explicitly reviewed versioning,
-projection, readback-validation and old-export compatibility decision. Reuse the
-existing privileged bounded status read (five seconds, 64 KiB); never give the
-read-only consumer Docker access or access to private source stores. Outbound
+projection, readback-validation and old-export compatibility decision. Prefer the
+existing privileged bounded status read (five seconds, 64 KiB) for future snapshot
+consumption unless a reviewed decision replaces it; never give the read-only
+consumer Docker access or access to private source stores. Outbound
 [status-report v1](STATUS-REPORTING.md) is a different contract and is unchanged.
 
 ## Proposed admission observation semantics
 
-These are requirements to resolve with the sole controller-owned producer, not a
-JSON schema or a claim about current SDK job-acquisition enforcement:
+These are proposed requirements and open questions for #166 review, not a JSON
+schema or a claim about current SDK job-acquisition enforcement. Names such as
+`disk_admission` and `blocked_since` are illustrative, not reserved fields. The
+controller owns the admission decision; measurement may originate in a separately
+reviewed bounded host export. Measurement and decision ownership are distinct,
+and both must preserve the actual measurement time:
 
 - Separate component decision (`ready`, `blocked`, `unknown`) from source
   availability and freshness. Disk `ready` does not override drain, maintenance,
@@ -106,7 +113,9 @@ count alone does not establish mutation progress or a deadlock.
 
 A read-only evidence refresh on 2026-11-09 confirmed the consumer
 [plan at tested head `04df04cf55e8640dfd99a7d3cbb84991ff6a075e`](https://github.com/RandomDevelopment/asic-testbench/blob/04df04cf55e8640dfd99a7d3cbb84991ff6a075e/scripts/ci/plan.json)
-still expands to 23 shards. The GitHub jobs API for
+declares shard counts totaling 23; this was a sum of the pinned plan, not execution
+of its expansion tool or evaluation of the consumer's current head. The GitHub
+jobs API for
 [run 38795110132, attempt 4](https://github.com/RandomDevelopment/asic-testbench/actions/runs/38795110132/attempts/4)
 confirmed all 23 task steps succeeded and their artifact uploads failed. The
 quota explanation is retained issue evidence, not inferred from those step
@@ -139,9 +148,9 @@ Stop at the unchanged workload/diagnostic deadlines and retain missing evidence
 as missing. Complete exact-head results, cleanup and applicable migration proof
 remain necessary. Do not publish private paths, device inventories, addresses,
 job logs or raw command output in this repository, or join anonymous telemetry to
-job identities. No accessible exclusively allocated execution machine has been
-confirmed for this work; full exact-source `local_validate.py` acceptance and
-live reproduction remain blocked, not waived.
+job identities. As of 2026-11-09, no accessible exclusively allocated execution
+machine was confirmed for this work; full exact-source `local_validate.py`
+acceptance and live reproduction were blocked, not waived.
 
 ## Follow-up boundaries
 
