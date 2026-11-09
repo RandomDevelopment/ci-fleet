@@ -82,10 +82,13 @@ host. Idle runners and running, restarting or paused uncoordinated leftovers can
 still prevent applying maintenance. Existing installer/proxy locks, workload
 checks, uncertainty and current/checkpoint image protections remain authoritative.
 
-Distinguish these outcomes only when evidence supports them:
+Distinguish these outcomes only when evidence supports them; they are not mutually
+exclusive:
 
-- **Deferred:** maintenance did not establish permission to apply. A successful
-  unit exit can still represent deferral.
+- **Deferred:** maintenance could not begin or continue, or the pass left its
+  headroom target unmet. Preserve the reported reason: missing permission,
+  protected resources and pass limits are distinct. A successful command or unit
+  exit can coexist with deferred work or insufficient headroom.
 - **Command completed:** a removal/prune request returned successfully. It may
   have reclaimed nothing. Text saying `REMOVE`, object counts, cache eligibility,
   Docker reclaimable estimates and timer enablement do not establish freed bytes.
