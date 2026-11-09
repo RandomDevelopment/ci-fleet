@@ -20,7 +20,7 @@ ARG CI_FLEET_COMMIT=unknown
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${CI_FLEET_VERSION} -X main.commitSHA=${CI_FLEET_COMMIT}" -o /out/ci-fleet-controller . \
     && touch -d "@${SOURCE_DATE_EPOCH}" /out/ci-fleet-controller
 
-FROM debian:13.7-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+FROM debian:13.7-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG SOURCE_DATE_EPOCH=1786752000
 ARG DEBIAN_SNAPSHOT=20261012T000000Z
 ARG CI_FLEET_COMMIT=unknown
