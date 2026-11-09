@@ -164,8 +164,10 @@ threshold. See [capacity evidence limits](CAPACITY-TELEMETRY.md#disk-pressure-ev
 snapshot extension; [#121](https://github.com/RandomDevelopment/ci-fleet/issues/121)
 owns eventual read-only presentation. Neither is implemented by this note.
 
-Configuration-template admission guidance must track the final #166 producer and
-its observation/versioning gaps before engine merge or release. Existing
+[Template #49](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/49)
+tracks pending adoption guidance for the #166 producer and its observation/versioning
+gaps. Update that record with the final reviewed and actual merged engine identities
+when available; tracking does not establish implementation or acceptance. Existing
 [template #44](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/44)
 tracks cleanup/recovery guidance; do not duplicate it or confuse issue tracking
 with a published template release, adopter promotion or live-host acceptance.
