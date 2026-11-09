@@ -163,9 +163,19 @@ inventory queries have a thirty-second timeout. This leaves a minute before
 the service's fifteen-minute termination limit; later timer passes can continue
 through a large expired-resource backlog.
 
-The service reports measured filesystem use after applying. If protected or
-recent resources prevent reaching 65%, it reports insufficient headroom and
-retains them. The next timer can continue a count-limited pass. This policy
+The service reports measured filesystem use as rounded percentages after applying.
+`COMPLETE default-builder cache prune` means the command succeeded, not that any
+cache was removed or filesystem bytes were reclaimed. Engine may retain all
+eligible cache to satisfy its reserve or shared references. Image removal lines
+likewise do not measure reclaimed bytes. Record before/after filesystem used and
+available bytes separately; Docker's human-readable reclaimed-space output and
+image/cache estimates are not a net filesystem measurement. Unchanged percentages
+can hide a byte-level change. Without byte measurements, reclamation is unknown,
+not zero. Successful execution with measured zero reclamation, `DEFER`, and actual
+measured recovery are distinct outcomes; positive reclaimed bytes alone do not
+prove sufficient headroom.
+If protected or recent resources prevent reaching 65%, the service reports
+insufficient headroom and retains them. The next timer can continue a count-limited pass. This policy
 cannot guarantee headroom when protected storage or seven days of workload
 growth exceed disk capacity. Measure growth and increase capacity or reduce
 the admitted workload rather than bypassing the upgrade gate.
@@ -192,7 +202,11 @@ successful, failed, cancelled, and timed-out attempts.
 This diagnostic does not authorize removal of those workloads. Existing inactive
 fleet-owned resources still require their explicit managed/instance/expiry
 contract. Unlabelled volumes remain intact. Running leftovers continue to defer
-maintenance. Any later host teardown that stops workloads must independently
+maintenance. Stopping new admissions can let already admitted work finish
+naturally, but does not prove the daemon becomes idle. Preexisting runnable
+leftovers and still-running idle runners can prevent that window indefinitely;
+pressure or a terminal workflow does not authorize their retirement.
+Any later host teardown that stops workloads must independently
 verify repository, run attempt, task, shard, and resource ownership through a
 concurrency-safe lifecycle contract. A forged label or terminal run alone is
 insufficient.
