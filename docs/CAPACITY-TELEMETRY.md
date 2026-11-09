@@ -18,6 +18,28 @@ Run on the controller host; reads local state only and changes nothing:
 sudo python3 /opt/ci-fleet/current/scripts/health.py capacity-report
 ```
 
-The JSON report groups the preceding seven days by logical pool and gives nearest-rank p50/p95 values for every observed host and runner metric, plus sample and anonymous runner-observation counts. An empty report means no managed runner was observed during the period.
+The JSON report groups the preceding seven days by logical pool and gives nearest-rank p50/p95 values for every observed host and runner metric, plus sample and anonymous runner-observation counts. An empty report means no valid retained samples contributed during the period; it does not prove that no runner ran or that collection succeeded. Check sampler failures and source coverage separately.
 
 Review the report before changing runner count, per-runner resources, or pool budget. A capacity change still requires its own reviewed private-configuration change; this public repository does not create or modify that external change.
+
+## Disk-pressure evidence limits
+
+History records root and Docker **used** bytes and inode counts, not filesystem
+capacity or bytes available to the workload. It does not map workspace or proxy
+spool filesystems, distinguish same-filesystem aliases, or measure I/O pressure,
+latency or cache effectiveness. Do not add root and Docker usage together: they
+may describe the same filesystem. The weekly report is an aggregate of observed
+active-runner samples, not a peak bound or a current admission decision. Report
+generation time is not the last measurement time; idle periods normally have no
+new samples. Keep samples anonymous and local.
+
+A reviewed absolute-space reserve and resume policy needs additional evidence:
+per-role capacity and available bytes, representative concurrent workload growth
+(including cold builds and cleanup lag), sampling gaps, and space needed for
+separately authorized image preparation/recovery. No numeric adequacy conclusion
+can be drawn from the existing p50/p95 report alone. Obtain those measurements
+through authorized access before claiming a policy is sufficient; do not invent
+measurements or change capacity to make a test pass. The
+[disk-pressure observation note](DISK-PRESSURE-OBSERVATION.md) separates current
+sources, proposed admission semantics, cleanup outcomes and the bounded #139
+investigation. It introduces no new collector or telemetry schema.

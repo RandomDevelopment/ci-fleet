@@ -50,6 +50,15 @@ Readiness, GitHub authentication, scale-set matching, identity presence, reporti
 
 Health helpers can substitute zero counts or a configured engine revision after failed reads. This producer does not consume those fallbacks. It does not rerun health/capacity probes, make GitHub requests, inspect credentials, read logs, or increase outbound reporting. The Docker status read has a 64 KiB output cap and an absolute five-second deadline; other protected reads have their own bounded reads.
 
+Disk-admission details are not part of this v1 projection. A future controller
+field does not automatically become an approved export, and counts or health
+severity cannot substitute for its decision. The
+[disk-pressure observation note](DISK-PRESSURE-OBSERVATION.md) records the
+current-source evidence limits and non-normative proposal for #166/#118/#120.
+Any extension needs a reviewed versioning and compatibility decision, strict
+projection/readback tests, and preserved measurement times. This documentation
+change leaves unsupported readiness and all producer/consumer schemas unchanged.
+
 ## Protected publication
 
 The base `/var/lib/ci-fleet-observer` and its `exports` child must already be root-owned with the dedicated observer GID and mode `0750`. The existing private `/var/lib/ci-fleet` and `/etc/ci-fleet` trees keep their permissions.
