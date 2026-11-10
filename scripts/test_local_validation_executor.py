@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import builtins
 import hashlib
 import json
 import os
@@ -37,6 +38,37 @@ def wait_ready():
         time.sleep(.01)
 record()
 '''
+
+
+class ReceiptTests(unittest.TestCase):
+    def test_receipt_writer_uses_only_os_and_preserves_manager_fields(self):
+        original_import = builtins.__import__
+
+        def frozen_import(name, *args, **kwargs):
+            if name != "os":
+                raise ImportError("completion hook must not load " + name)
+            return original_import(name, *args, **kwargs)
+
+        for values in ({"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"},
+                       {"SERVICE_RESULT": "timeout", "EXIT_CODE": "killed", "EXIT_STATUS": "TERM"},
+                       {}):
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as temporary:
+                finish = Path(temporary) / "finish.py"
+                with patch.dict(os.environ, values, clear=True), \
+                        patch.object(builtins, "__import__", side_effect=frozen_import):
+                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
+                expected = {name: values.get(name) for name in ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")}
+                self.assertEqual(json.loads(finish.with_name("result.json").read_text()), expected)
+                with patch.dict(os.environ, values, clear=True), self.assertRaises(FileExistsError):
+                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
+
+    def test_receipt_writer_refuses_unexpected_bytes_without_a_receipt(self):
+        for value in ('success"', "success\n", "x" * 65):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                finish = Path(temporary) / "finish.py"
+                with patch.dict(os.environ, {"SERVICE_RESULT": value}, clear=True), self.assertRaises(ValueError):
+                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
+                self.assertFalse(finish.with_name("result.json").exists())
 
 
 class AdmissionTests(unittest.TestCase):
@@ -125,7 +157,9 @@ class AdmissionTests(unittest.TestCase):
                         {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "7"}):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
                 def launch(command, **_):
-                    finish = Path(next(value for value in command if value.startswith("--property=ExecStopPost=")).split()[-1])
+                    hook = next(value for value in command if value.startswith("--property=ExecStopPost="))
+                    self.assertIn(" -I -S ", hook)
+                    finish = Path(hook.split()[-1])
                     if outcome is not None:
                         finish.with_name("result.json").write_text(json.dumps(outcome))
                     return type("Process", (), {"returncode": 0, "poll": lambda _: 0})()
@@ -195,6 +229,18 @@ class ExecutorTests(unittest.TestCase):
         with patch.dict(os.environ, CI_EXECUTOR_PRIVATE="must-not-escape"):
             self.execute("assert 'CI_EXECUTOR_PRIVATE' not in os.environ; print('$HOME %n literal')")
         self.assertEqual(self.log.read_text(), "$HOME %n literal\n")
+        self.assert_empty()
+
+    def test_timeout_with_short_cleanup_produces_a_receipt(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.execute('''
+if os.fork() == 0:
+    os.setsid(); record()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready(); time.sleep(60)
+else:
+    wait_ready(); time.sleep(60)
+''', timeout=1, grace=.2)
         self.assert_empty()
 
     def test_detached_child_is_cleaned_before_next_stage(self):
