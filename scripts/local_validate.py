@@ -58,8 +58,16 @@ def image_comparison_required(repo: Path, base: str, source: str) -> bool:
             if instruction == "ADD":
                 return True
             mounts = re.findall(r"--mount=([^\s]+)", line)
-            if any("type=bind" in mount and mount != "type=bind,from=build,source=/out,target=/out" for mount in mounts):
-                return True
+            for mount in mounts:
+                options = {}
+                for field in mount.split(","):
+                    key, _, value = field.partition("=")
+                    if key in options:
+                        return True
+                    options[key] = value
+                mount_type = options.pop("type", "bind")
+                if mount_type == "bind" and options != {"from": "build", "source": "/out", "target": "/out"}:
+                    return True
             if instruction == "COPY":
                 try:
                     inputs = shlex.split(line)[1:-1]
@@ -68,6 +76,12 @@ def image_comparison_required(repo: Path, base: str, source: str) -> bool:
                 if not inputs or any(not path.startswith(("controller/", "scripts/")) or ".." in Path(path).parts for path in inputs):
                     return True
     return False
+
+
+def require_buildx(version: str) -> None:
+    fields = version.split()
+    if len(fields) < 2 or fields[1] != "v0.32.1":
+        raise ValueError("reviewed Docker Buildx v0.32.1 is required")
 
 
 def regression_context(report: dict) -> str:
@@ -296,6 +310,8 @@ def validate(args: argparse.Namespace) -> int:
             load_executor(executor_revision).require_worker()
             for name, command in tools.items():
                 report["tools"][name] = subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT).strip()
+                if name == "buildx":
+                    require_buildx(report["tools"][name])
             validator = str(policy / "scripts/validate_commits.py")
             scanner = str(policy / "scripts/scan_committed_secrets.py")
             selected_tags = release_tags(repo, validator, args.source, args.main, args.tag, env) if args.tag else {}

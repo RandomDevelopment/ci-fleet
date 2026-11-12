@@ -21,10 +21,11 @@ Python 3.11 or later, PyYAML, ShellCheck, OpenSSL with Ed25519 support,
 coreutils, util-linux, curl, jq, systemd 255 or newer and cgroup v2.
 The system systemd manager must be PID 1 on the execution machine. Both engine profiles
 check for jq before running stages because the installer fixtures require it.
-The full engine run also requires Docker Engine, Compose v2, the Docker Buildx
-plugin and access to its local Unix socket. The tool preflight checks Buildx
-before any validation stage so Docker cannot silently use its legacy builder
-for the APT-cache fixture image.
+The full engine run also requires Docker Engine, Compose v2, Docker Buildx
+v0.32.1 and access to its local Unix socket. The tool preflight rejects another
+Buildx client before any validation stage. The shared direct reference pair and
+managed rebuilds use this same reviewed client with the pinned BuildKit v0.32.2
+backend, so client differences cannot invalidate the cache comparison.
 The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem
