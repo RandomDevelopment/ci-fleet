@@ -125,7 +125,7 @@ validation_command compose-json docker compose -f deploy/compose.yaml config --f
 export CI_FLEET_COMMIT
 CI_FLEET_COMMIT=$(git rev-parse HEAD)
 export CI_FLEET_VERSION=${CI_FLEET_COMMIT:0:12}
-validation_command reference-images bash scripts/build-validation-images.sh
+validation_command reference-images bash "$(dirname "${BASH_SOURCE[0]}")/build-validation-images.sh"
 validation_command runner-inspect docker run --name "${CI_FLEET_VALIDATION_ID:-ci-fleet-validation}-runner-inspect" --rm --entrypoint /bin/bash "$CI_FLEET_RUNNER_IMAGE" -c './bin/Runner.Listener --version && docker --version && docker compose version && git --version'
 validation_command proxy-memory python3 scripts/test_proxy_memory.py --image "$CI_FLEET_CONTROLLER_IMAGE"
 cache_args=(--reference-runner "$CI_FLEET_RUNNER_IMAGE" --reference-controller "$CI_FLEET_CONTROLLER_IMAGE")
