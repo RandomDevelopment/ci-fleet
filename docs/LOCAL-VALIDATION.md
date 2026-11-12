@@ -329,8 +329,21 @@ and the existing signed-evidence checks.
 | Compose validation, image builds, APT cache reuse/image-ID parity, inert runner and cleanup outcomes | Pinned `validate.sh --containers` |
 | Embedded schema, policy, multi-host and initializer checks | Pinned `validate-template.sh` |
 
-The engine workflow calls the full local entry point and preserves the
-`Build without registering a runner` check identity.
+The engine workflow at `.github/workflows/build.yml` calls the full local
+entry point and preserves the `Build without registering a runner` check
+identity and the separate conventional-commit check. It replaces the retired
+`validate.yml` producer. Keep the retired workflow disabled; switching producers
+does not cancel its existing runs.
+
+Before publishing the reviewed workflow change, set and read back
+`CI_FLEET_VALIDATION_RUNNER` for the approved disposable worker. A new producer
+can start immediately on publication without an enable step. Publish on the
+existing PR branch; its `synchronize` event uses the PR merge ref and emits
+checks for that candidate. Do not dispatch the new producer before GitHub recognizes it. Manual
+dispatch requires a workflow known to GitHub, and the default-branch file is
+required for initial discovery. Verify the new workflow ID and path, source,
+base, merge SHA and actual job assignment before admitting a disposable worker.
+The new producer does not authorize an old queued run or weaken branch protection.
 
 Both engine jobs select the runner label in repository variable
 `CI_FLEET_VALIDATION_RUNNER`, defaulting to `ubuntu-latest` when unset.
