@@ -110,6 +110,13 @@ recorded hashes there, and reference that bundle for review and signing.
 Partial exports and lost-worker runs cannot authorize acceptance. A quick run, missing report, interrupted run or unexpected
 skip does not establish full acceptance.
 
+Follow live `VALIDATION_TASK` and `VALIDATION_TEST` records in the invoking
+terminal or Actions job. Export the entire `tasks/` directory along with the
+stage logs; its per-group logs retain output that the console filters. See
+[task logging and reuse](LOCAL-VALIDATION.md#task-logs-concurrency-and-matching-result-reuse)
+for resource-aware concurrency and protected same-input resumption. A focused
+task result never substitutes for the complete command above.
+
 The harness refreshes and verifies source and policy checkouts for every stage.
 Those checkouts fetch only declared commit identities and ancestors. Release
 runs also freeze the needed stable tag objects from declared source/main in

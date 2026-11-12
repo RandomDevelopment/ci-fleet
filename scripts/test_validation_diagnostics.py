@@ -84,7 +84,6 @@ class ShellDiagnosticsTests(unittest.TestCase):
 
     def test_quick_plan_records_commands_and_stops_at_failure_without_running_fixtures(self):
         plan = (ROOT / 'scripts/validate.sh').read_text()
-        commands = re.findall(r'^validation_command ([\w-]+) ', plan.split('fi\nif [[ ${1:-} == --quick ]]')[0], re.M)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'scripts').mkdir()
@@ -97,17 +96,17 @@ class ShellDiagnosticsTests(unittest.TestCase):
                 p = root / name
                 p.write_text('#!/bin/bash\nexit 0\n'); p.chmod(0o755)
             env = dict(os.environ, CI_FLEET_VALIDATION_ROOT=str(root), PATH=str(bin_dir) + ':/usr/bin:/bin')
-            for failure in ('never-match', 'scripts/test_apply_docker_network_policy.py'):
+            for failure in ('never-match', str(ROOT / 'scripts/validation_tasks.py')):
                 result = subprocess.run(['/bin/bash', str(ROOT / 'scripts/validate.sh'), '--quick'],
                                         env=dict(env, FAIL_TARGET=failure), text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0 if failure == 'never-match' else 37, result.stderr)
                 if failure == 'never-match':
-                    for command in commands:
+                    for command in ('python-compile', 'regressions'):
                         self.assertIn('BEGIN ' + command + '\n', result.stderr)
                         self.assertIn('END ' + command + ' exit=0', result.stderr)
                 else:
-                    self.assertIn('END network-policy exit=37', result.stderr)
-                    self.assertNotIn('BEGIN remote-reconcile', result.stderr)
+                    self.assertIn('END regressions exit=37', result.stderr)
+                    self.assertNotIn('BEGIN runner-build', result.stderr)
 
 
 class PythonDiagnosticsTests(unittest.TestCase):

@@ -40,6 +40,26 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], env=git_environment(), text=True).strip()
 
 
+def image_comparison_required(repo: Path, base: str, source: str) -> bool:
+    if base == NO_PRIOR:
+        return True
+    changed = subprocess.check_output(["git", "-C", str(repo), "diff", "--name-only", "--no-renames", "-z", base, source],
+                                      env=git_environment()).split(b"\0")
+    # Only known non-image documentation can omit the expensive pair comparison.
+    documentation = {b"README.md", b"AGENTS.md", b"CHANGELOG.md", b"LICENSE", b"UNLICENSE"}
+    return any(path and path not in documentation and not path.startswith(b"docs/") for path in changed)
+
+
+def regression_context(report: dict) -> str:
+    context = {key: report[key] for key in (
+        "suite", "profile", "source", "reviewed_head", "tree", "base", "policy", "main",
+        "executor_revision", "pr_title", "tag", "tag_created", "tools", "release_tags")}
+    context["machine"] = Path("/etc/machine-id").read_text().strip()
+    context["boot"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    context["kernel"] = list(os.uname())
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+
 def output_directory(path: Path, *repositories: Path) -> Path:
     output = path.resolve()
     ancestor = output
@@ -275,6 +295,18 @@ def validate(args: argparse.Namespace) -> int:
                 if not no_prior:
                     history_base = release_base
             report["history_base"] = history_base
+            if args.kind == "engine":
+                # Reuse requires the same inputs, tools and boot, not merely the same branch.
+                report["task_context"] = regression_context(report)
+                env["CI_FLEET_VALIDATION_CONTEXT"] = report["task_context"]
+                env["CI_FLEET_TASK_OUTPUT"] = str(output / "tasks")
+                env["CI_FLEET_APT_E2E_LOG"] = str(output / "apt-cache-commands.log")
+                report["managed_image_comparison"] = image_comparison_required(repo, args.base, args.source)
+                env["CI_FLEET_IMAGE_COMPARISON"] = "required" if report["managed_image_comparison"] else "unaffected"
+                resume = getattr(args, "resume_from", None)
+                if resume is not None:
+                    env["CI_FLEET_TASK_RESUME"] = str(output_directory(resume, repo, policy_repo) / "tasks")
+                    report["resume_from"] = str(resume.resolve())
             heads = list(dict.fromkeys((args.source, reviewed_head)))
             commits = []
             for head in heads:
@@ -373,6 +405,8 @@ def main() -> int:
     parser.add_argument("--disposable-host", action="store_true")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path,
+                        help="reuse protected passed regression groups with identical inputs, tools and boot; other stages rerun")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("timeout must be positive")
