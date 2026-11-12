@@ -27,6 +27,7 @@ class ImageSelectionTests(unittest.TestCase):
                 return git('rev-parse', 'HEAD')
             git('init', '-q')
             (root / 'controller').mkdir(); (root / 'controller/Dockerfile').write_text('FROM fixture\n')
+            (root / 'runner').mkdir(); (root / 'runner/Dockerfile').write_text('FROM fixture\n')
             base = commit()
             (root / 'docs').mkdir(); (root / 'docs/guide.md').write_text('guide\n')
             docs = commit()
@@ -38,6 +39,16 @@ class ImageSelectionTests(unittest.TestCase):
             (root / 'controller/Dockerfile').rename(root / 'docs/former-dockerfile.md')
             renamed = commit()
             self.assertTrue(image_comparison_required(root, unknown, renamed))
+
+    def test_documentation_comparison_stays_required_when_a_dockerfile_consumes_docs(self):
+        from unittest.mock import patch
+        for definition in ('COPY docs/ /guide', 'copy\tdocs/ /guide',
+                           'RUN --mount=source=docs,type=bind,target=/guide cat /guide',
+                           'RUN --mount=type=bind,from=build,source=/out,target=/out --mount=type=bind,source=docs,target=/guide cat /guide'):
+            with self.subTest(definition=definition), \
+                    patch('local_validate.subprocess.check_output', return_value=b'docs/guide.md\0'), \
+                    patch('local_validate.git', return_value=definition):
+                self.assertTrue(image_comparison_required(Path('/unused'), 'a' * 40, 'b' * 40))
 
 
 class ReferenceBuildTests(unittest.TestCase):

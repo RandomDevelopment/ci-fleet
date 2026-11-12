@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -47,7 +48,26 @@ def image_comparison_required(repo: Path, base: str, source: str) -> bool:
                                       env=git_environment()).split(b"\0")
     # Only known non-image documentation can omit the expensive pair comparison.
     documentation = {b"README.md", b"AGENTS.md", b"CHANGELOG.md", b"LICENSE", b"UNLICENSE"}
-    return any(path and path not in documentation and not path.startswith(b"docs/") for path in changed)
+    if any(path and path not in documentation and not path.startswith(b"docs/") for path in changed):
+        return True
+    # Future Dockerfiles that consume other context paths must include comparison.
+    for name in ("runner/Dockerfile", "controller/Dockerfile"):
+        for line in git(repo, "show", source + ":" + name).splitlines():
+            line = line.strip()
+            instruction = line.split(None, 1)[0].upper() if line else ""
+            if instruction == "ADD":
+                return True
+            mounts = re.findall(r"--mount=([^\s]+)", line)
+            if any("type=bind" in mount and mount != "type=bind,from=build,source=/out,target=/out" for mount in mounts):
+                return True
+            if instruction == "COPY":
+                try:
+                    inputs = shlex.split(line)[1:-1]
+                except ValueError:
+                    return True
+                if not inputs or any(not path.startswith(("controller/", "scripts/")) or ".." in Path(path).parts for path in inputs):
+                    return True
+    return False
 
 
 def regression_context(report: dict) -> str:
