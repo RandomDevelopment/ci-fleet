@@ -625,7 +625,7 @@ exit 0
             if "uses" in step:
                 self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
                 self.assertIs(step["with"]["persist-credentials"], False)
-        engine = (ROOT / ".github/workflows/validate.yml").read_text()
+        engine = (ROOT / ".github/workflows/build.yml").read_text()
         self.assertIn("name: Build without registering a runner", engine)
 
     def test_embedded_hosted_admission_requires_opt_in_and_open_prs(self):
