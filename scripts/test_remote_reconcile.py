@@ -1048,4 +1048,5 @@ class TestSystemdUnits(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    from validation_diagnostics import TimedTestRunner
+    unittest.main(testRunner=TimedTestRunner)

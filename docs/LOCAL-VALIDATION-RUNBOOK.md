@@ -304,6 +304,14 @@ truncate logs, edit reports, change timestamps or relabel quick results to make
 them acceptable. Reports, each accepted log and the encoded envelope have a
 1 MiB limit. Reduce noisy suite output deliberately and rerun if necessary.
 Keep larger diagnostics separately. Never publish private reports as PR evidence.
+For an engine timeout, inspect the last command BEGIN/END, tester CASE and
+per-test timing records described in [timeout diagnostics](LOCAL-VALIDATION.md#timeout-diagnostics).
+A missing END is unfinished work, not evidence of a deadlock. Sum completed work
+against the admitted stage budget before proposing a repair. Preserve the original
+failed bundle; do not raise the deadline or retry unchanged source solely because
+a command lacked time to finish. New diagnostics require reviewed source/policy
+selection and authorized execution on a suitable assigned machine with no conflicting
+active use. A previously released machine may be reused when those conditions hold.
 
 ## 6. Provision and check host acceptance
 

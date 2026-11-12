@@ -1272,7 +1272,7 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
 
     def test_reconcile_fixtures_preserve_restrictive_checkout_permissions(self):
-        for name in ("test_remote_reconcile.py", "github-app-token.sh", "remote-reconcile.sh"):
+        for name in ("test_remote_reconcile.py", "validation_diagnostics.py", "github-app-token.sh", "remote-reconcile.sh"):
             target = self.repo / "scripts" / name
             target.write_bytes((ROOT / "scripts" / name).read_bytes())
             if name.endswith(".sh"):
@@ -1423,4 +1423,5 @@ class PolicyExecutionTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    from validation_diagnostics import TimedTestRunner
+    unittest.main(testRunner=TimedTestRunner)

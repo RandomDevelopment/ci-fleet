@@ -178,6 +178,38 @@ outside Git. A changed source, base, title, tag or policy requires a new run.
 Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
+### Timeout diagnostics
+
+The engine command plan emits UTC `VALIDATION ... BEGIN <id>` and
+`VALIDATION ... END <id> exit=<status>` records to stderr around each validation
+command. These remain in the stage log even when that command's stdout is
+suppressed. IDs are fixed labels, not command arguments or environment dumps.
+The tester fixture additionally emits `VALIDATION ... CASE tester.<id>` before
+its case groups and readiness/completion waits. A CASE identifies the next group;
+it does not assert completion or identify every operation inside that group.
+
+The local-validation, network-policy, remote-reconcile and explicit-recovery
+Python suites emit flushed `VALIDATION_TEST` JSON records with the test ID,
+UTC timestamp and `begin`/`end` event. End records include monotonic
+`elapsed_seconds`, including setup, teardown and test cleanup. Subtest parameters
+are not added to these records. Standard unittest failures, skips, expected
+failures and exit codes remain authoritative; timing is not an acceptance check.
+
+After interruption, an unmatched BEGIN or test begin identifies unfinished work.
+A process-group kill may prevent an END record entirely; do not invent a status
+or treat its absence as proof of deadlock. Correlate the last CASE with the
+systemd stage result and completed test durations. Existing cleanup still removes
+fixture scratch trees; the retained log does not contain a live stack snapshot.
+
+This instrumentation does not change command order, assertions, retries, cleanup
+or the CLI's default **1800-second per-stage deadline**. The example above has an
+explicit operator-selected timeout; instrumentation does not authorize changing
+an admitted budget. The command plan and shell helper come from the pinned policy;
+case markers and Python timing come from the selected source. To obtain all
+records, a future run needs independently reviewed source and policy revisions
+containing the respective instrumentation. An older pinned policy will not gain
+new command markers merely because the candidate changed.
+
 The CLI defaults to 1,800 seconds per stage. The complete engine command above
 explicitly sets 10,800 seconds to cover the measured fixture corpus. The shared
 `scripts/local_validation_executor.py` creates a unique system-manager transient
