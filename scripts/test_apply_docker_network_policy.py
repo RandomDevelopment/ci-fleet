@@ -193,16 +193,10 @@ class RenderDaemonConfigTests(unittest.TestCase):
 
 class ValidationTests(unittest.TestCase):
     def test_validate_runs_docker_network_policy_suite(self) -> None:
-        from validation_tasks import TASKS
+        from validation_tasks import require_registered_task
 
-        validate = (SCRIPTS / "validate.sh").read_text(encoding="utf-8")
-        self.assertIn(
+        require_registered_task(
             ("network-policy", ["python3", "scripts/test_apply_docker_network_policy.py"], False),
-            TASKS,
-        )
-        self.assertIn(
-            'validation_command regressions python3 "$(dirname "${BASH_SOURCE[0]}")/validation_tasks.py" "${task_args[@]}"',
-            validate,
         )
 
 

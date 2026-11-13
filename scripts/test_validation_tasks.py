@@ -6,12 +6,61 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import validation_tasks as tasks
+
+
+class RegistryWiringTests(unittest.TestCase):
+    REQUIRED = [
+        ('network-policy', ['python3', 'scripts/test_apply_docker_network_policy.py'], False),
+        ('numeric-regressions', ['scripts/test-numeric-regressions.sh'], False),
+        ('deployer-units', ['scripts/test-deployer-units.sh'], True),
+    ]
+
+    def test_required_tasks_and_dispatch_are_present(self):
+        for expected in self.REQUIRED:
+            with self.subTest(task=expected[0]):
+                tasks.require_registered_task(expected)
+
+    def test_missing_or_wrong_task_command_is_rejected(self):
+        for expected in self.REQUIRED:
+            missing = [task for task in tasks.TASKS if task[0] != expected[0]]
+            wrong = missing + [(expected[0], ['wrong-command'], expected[2])]
+            for case, registry in (('missing', missing), ('wrong', wrong)):
+                with self.subTest(task=expected[0], case=case):
+                    with patch.object(tasks, 'TASKS', registry), self.assertRaisesRegex(ValueError, 'exact required task'):
+                        tasks.require_registered_task(expected)
+
+    def test_missing_or_comment_only_dispatch_is_rejected(self):
+        root = Path(__file__).resolve().parents[1]
+        validate = (root / 'scripts/validate.sh').read_text()
+        dispatch = next(line for line in validate.splitlines() if line.startswith('validation_command regressions '))
+        for replacement in ('', '# ' + dispatch):
+            with patch.object(Path, 'read_text', return_value=validate.replace(dispatch, replacement)):
+                for expected in self.REQUIRED:
+                    with self.subTest(task=expected[0], replacement=replacement):
+                        with self.assertRaisesRegex(ValueError, 'does not dispatch'):
+                            tasks.require_registered_task(expected)
+
+    def test_actual_guards_pass_before_long_fixtures(self):
+        root = Path(__file__).resolve().parents[1]
+        network = subprocess.run([sys.executable, '-B', str(root / 'scripts/test_apply_docker_network_policy.py'), 'ValidationTests'],
+                                 cwd=root, capture_output=True, text=True, timeout=10)
+        self.assertEqual(network.returncode, 0, network.stderr)
+        header = 'if ! python3 -I -B - "$repo_root" <<\'PY_VALIDATION_TASK\''
+        for name in ('test-numeric-regressions.sh', 'test-install-deployer.sh'):
+            with self.subTest(script=name):
+                source = (root / 'scripts' / name).read_text()
+                self.assertIn(header, source.splitlines())
+                guard = source.split(header + '\n', 1)[1].split('\nPY_VALIDATION_TASK\n', 1)[0]
+                result = subprocess.run([sys.executable, '-I', '-B', '-', str(root)],
+                                        input=guard, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TaskTests(unittest.TestCase):

@@ -227,6 +227,9 @@ for new admissions; increases take effect on the next invocation. Unknown limits
 fall back to one group. These estimates are conservative admission bounds, not
 measured peak resource guarantees. No VM resource size is assumed forever.
 
+The early task-execution checks verify network-policy, numeric and deployer-unit
+registry wiring, including the actual shell guards, before slower fixtures run.
+
 Installer, executor and GitHub bootstrap groups run alone. Their own assertions,
 rollback paths, transaction ordering and systemd ownership stay intact. The
 capacity-stop regression runs once through the controller-installer group,

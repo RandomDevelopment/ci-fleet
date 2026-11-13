@@ -71,6 +71,15 @@ PRINT_LOCK = threading.Lock()
 SKIPPED = re.compile(rb'(?:skipped=[1-9][0-9]*|\.\.\. skipped )')
 
 
+def require_registered_task(expected):
+    if TASKS.count(expected) != 1:
+        raise ValueError('validation registry must contain the exact required task once')
+    dispatch = 'validation_command regressions python3 "$(dirname "${BASH_SOURCE[0]}")/validation_tasks.py" "${task_args[@]}"'
+    lines = Path(__file__).with_name('validate.sh').read_text().splitlines()
+    if dispatch not in (line.strip() for line in lines):
+        raise ValueError('validate.sh does not dispatch the validation registry')
+
+
 def record(event, **fields):
     value = {'event': event, 'timestamp': datetime.now(timezone.utc).isoformat(), **fields}
     with PRINT_LOCK:
