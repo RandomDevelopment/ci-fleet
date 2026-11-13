@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Prove APT payload reuse on an inert Docker validation daemon, without real endpoints."""
 
+import argparse
 import io
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import signal
@@ -31,7 +33,24 @@ def fixture_failure_details(output: bytes, max_lines=10) -> str:
     return "\n".join(text.splitlines()[-max_lines:])
 
 
+def release_archive(root, tracked):
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        for raw in tracked.split(b"\0"):
+            name = os.fsdecode(raw)
+            if (name == "engine-capabilities.json" or name.startswith(("controller/", "runner/", "scripts/"))) and (root / name).is_file():
+                tar.add(root / name, arcname=name, recursive=False)
+    return archive.getvalue()
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference-runner')
+    parser.add_argument('--reference-controller')
+    parser.add_argument('--skip-managed-comparison', action='store_true')
+    options = parser.parse_args()
+    if bool(options.reference_runner) != bool(options.reference_controller):
+        parser.error('both direct reference images are required')
     def terminate(signum, _frame):
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, terminate)
@@ -47,11 +66,28 @@ def main():
     with tempfile.TemporaryDirectory(prefix=prefix) as directory:
         temporary = Path(directory)
         step = "setup"
+        command_log = Path(os.environ.get("CI_FLEET_APT_E2E_LOG", str(temporary / "commands.log")))
+        previous_step = None
 
         def run(*args, timeout=1200, input=None):
-            result = subprocess.run(args, input=input, capture_output=True, timeout=timeout)
-            with (temporary / "commands.log").open("ab") as log:
-                log.write(result.stdout + result.stderr)
+            nonlocal previous_step
+            if previous_step != step:
+                print('VALIDATION_TASK ' + json.dumps(dict(event='begin', task='apt-cache-e2e', step=step)), flush=True)
+                previous_step = step
+            started = time.monotonic()
+            result = None
+            try:
+                result = subprocess.run(args, input=input, capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                result = subprocess.CompletedProcess(args, 124, error.stdout or b'', error.stderr or b'')
+                raise
+            finally:
+                with command_log.open("ab") as log:
+                    log.write(('VALIDATION_TASK ' + json.dumps(dict(event='end', task='apt-cache-e2e', step=step,
+                               elapsed_seconds=round(time.monotonic() - started, 6),
+                               exit_code=result.returncode if result else None)) + '\n').encode())
+                    if result is not None:
+                        log.write(result.stdout + result.stderr)
             if result.returncode:
                 details = fixture_failure_details(result.stdout + result.stderr)
                 raise RuntimeError(f"APT_CACHE_E2E_FAILED step={step} exit={result.returncode}\n{details}")
@@ -190,62 +226,73 @@ def main():
                         tail = data[-len(proxy):]
                 run("docker", "run", "--rm", "--entrypoint", "/bin/sh", tag, "-ec",
                     "test ! -e /etc/apt/apt.conf.d/99-ci-fleet-cache")
-            step = "managed images preserve reviewed identities"
-            run("docker", "exec", client, "mkdir", "/release")
-            tracked = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT)
-            archive = io.BytesIO()
-            with tarfile.open(fileobj=archive, mode="w") as tar:
-                for raw in tracked.split(b"\0"):
-                    name = os.fsdecode(raw)
-                    if name.startswith(("controller/", "runner/", "scripts/")) and (ROOT / name).is_file():
-                        tar.add(ROOT / name, arcname=name, recursive=False)
-            run("docker", "cp", "-", client + ":/release", input=archive.getvalue())
-            step = "uncached managed reference images"
-            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-            reference_builder = prefix + "-reference"
-            builders.append((client, reference_builder))
-            containers.append("buildx_buildkit_" + reference_builder + "0")
-            reference_runner = prefix + "-reference-runner"
-            reference_controller = prefix + "-reference-controller"
-            images.extend([reference_runner, reference_controller])
-            run("docker", "exec", client, "docker", "buildx", "create", "--name", reference_builder,
-                "--driver", "docker-container", "--driver-opt", "image=" + BUILDKIT)
-            # Keep the reviewed toolchain and arguments identical; omit only the APT secret.
-            build = ["docker", "exec", client, "docker", "buildx", "build", "--builder", reference_builder,
-                     "--no-cache", "--load", "--provenance=false", "--sbom=false",
-                     "--build-arg", "CI_FLEET_COMMIT=" + revision, "--build-arg", "SOURCE_DATE_EPOCH=" + epoch]
-            before = totals(cache)
-            started = time.monotonic()
-            run(*build, "--tag", reference_runner, "/release/runner")
-            run(*build, "--build-arg", "CI_FLEET_VERSION=" + revision[:12], "--tag", reference_controller,
-                "--file", "/release/controller/Dockerfile", "/release")
-            if totals(cache) != before:
-                raise RuntimeError("APT_CACHE_E2E_FAILED step=uncached reference used the cache")
-            measurements.append(dict(path="managed-images-direct", served_package_bytes=0,
-                                     elapsed_seconds=round(time.monotonic() - started, 2)))
-            run("docker", "exec", client, "docker", "buildx", "rm", "--force", reference_builder)
-            step = "managed images preserve reviewed identities"
-            settings = dict(CI_FLEET_ENGINE_REF=revision, CI_FLEET_COMMIT=revision, CI_FLEET_VERSION=revision[:12],
-                            CI_FLEET_RUNNER_IMAGE=prefix + "-managed-runner", CI_FLEET_CONTROLLER_IMAGE=prefix + "-managed-controller",
-                            CI_FLEET_RUNNER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", reference_runner),
-                            CI_FLEET_CONTROLLER_IMAGE_DIGEST=run("docker", "image", "inspect", "--format", "{{.Id}}", reference_controller),
-                            CI_FLEET_APT_HTTP_PROXY=proxy)
-            images.extend([settings["CI_FLEET_RUNNER_IMAGE"], settings["CI_FLEET_CONTROLLER_IMAGE"]])
-            environment = temporary / "managed.env"
-            environment.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items()))
-            run("docker", "cp", str(environment), client + ":/managed.env")
-            before = totals(cache)
-            started = time.monotonic()
-            run("docker", "exec", "--env", "BASH_ENV=/release/scripts/fixtures/apt-cache/trace-builds.sh",
-                "--env", "CI_FLEET_BUILD_TRACE=/apt-build.log", client,
-                "bash", "/release/scripts/build-managed-images.sh", "/release", "/managed.env")
-            after = totals(cache)
-            if after[1] <= before[1]:
-                raise RuntimeError("APT_CACHE_E2E_FAILED step=managed image package traffic")
-            # These builds use the cache for every APT stage and reject any identity mismatch.
-            measurements.append(dict(path="managed-images", reviewed_identities="matched",
-                                     elapsed_seconds=round(time.monotonic() - started, 2),
-                                     upstream_package_bytes=after[0] - before[0], served_package_bytes=after[1] - before[1]))
+            if options.skip_managed_comparison:
+                measurements.append(dict(path="managed-images", selection="unaffected-documentation-inputs"))
+            else:
+                step = "managed images preserve reviewed identities"
+                run("docker", "exec", client, "mkdir", "/release")
+                tracked = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT)
+                run("docker", "cp", "-", client + ":/release", input=release_archive(ROOT, tracked))
+                step = "uncached managed reference images"
+                revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+                reference_runner, reference_controller = options.reference_runner, options.reference_controller
+                if reference_runner is None:
+                    reference_runner = prefix + "-reference-runner"
+                    reference_controller = prefix + "-reference-controller"
+                    reference_builder = prefix + "-reference"
+                    builders.append((client, reference_builder))
+                    containers.append("buildx_buildkit_" + reference_builder + "0")
+                    images.extend([reference_runner, reference_controller])
+                    run("docker", "exec", client, "docker", "buildx", "create", "--name", reference_builder,
+                        "--driver", "docker-container", "--driver-opt", "image=" + BUILDKIT)
+                    # Keep the reviewed toolchain and arguments identical; omit only the APT secret.
+                    build = ["docker", "exec", client, "docker", "buildx", "build", "--builder", reference_builder,
+                             "--no-cache", "--load", "--provenance=false", "--sbom=false",
+                             "--build-arg", "CI_FLEET_COMMIT=" + revision, "--build-arg", "SOURCE_DATE_EPOCH=" + epoch]
+                    before = totals(cache)
+                    started = time.monotonic()
+                    run(*build, "--tag", reference_runner, "/release/runner")
+                    run(*build, "--build-arg", "CI_FLEET_VERSION=" + revision[:12], "--tag", reference_controller,
+                        "--file", "/release/controller/Dockerfile", "/release")
+                    if totals(cache) != before:
+                        raise RuntimeError("APT_CACHE_E2E_FAILED step=uncached reference used the cache")
+                    measurements.append(dict(path="managed-images-direct", served_package_bytes=0,
+                                             elapsed_seconds=round(time.monotonic() - started, 2)))
+                    run("docker", "exec", client, "docker", "buildx", "rm", "--force", reference_builder)
+                else:
+                    measurements.append(dict(path="managed-images-direct", reused_from="same-invocation-reference-pair"))
+                step = "managed images preserve reviewed identities"
+                architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+                if architecture is None:
+                    raise RuntimeError("APT_CACHE_E2E_FAILED step=unsupported image architecture")
+                # The daemon's image ID can be an index. Compare authenticated config content.
+                def config_digest(reference):
+                    proof = json.loads(run("docker", "exec", client, "python3", "/release/scripts/managed_image_identity.py",
+                                           "describe", "--reference", reference, "--engine", revision,
+                                           "--architecture", architecture))
+                    return proof["config_digest"]
+                settings = dict(CI_FLEET_ENGINE_REF=revision, CI_FLEET_COMMIT=revision, CI_FLEET_VERSION=revision[:12],
+                                CI_FLEET_RUNNER_IMAGE=prefix + "-managed-runner", CI_FLEET_CONTROLLER_IMAGE=prefix + "-managed-controller",
+                                CI_FLEET_RUNNER_IMAGE_DIGEST=config_digest(reference_runner),
+                                CI_FLEET_CONTROLLER_IMAGE_DIGEST=config_digest(reference_controller),
+                                CI_FLEET_APT_HTTP_PROXY=proxy)
+                images.extend([settings["CI_FLEET_RUNNER_IMAGE"], settings["CI_FLEET_CONTROLLER_IMAGE"]])
+                environment = temporary / "managed.env"
+                environment.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items()))
+                environment.chmod(0o600)
+                run("docker", "cp", str(environment), client + ":/managed.env")
+                before = totals(cache)
+                started = time.monotonic()
+                run("docker", "exec", "--env", "BASH_ENV=/release/scripts/fixtures/apt-cache/trace-builds.sh",
+                    "--env", "CI_FLEET_BUILD_TRACE=/apt-build.log", client,
+                    "bash", "/release/scripts/build-managed-images.sh", "/release", "/managed.env")
+                after = totals(cache)
+                if after[1] <= before[1]:
+                    raise RuntimeError("APT_CACHE_E2E_FAILED step=managed image package traffic")
+                # These builds use the cache for every APT stage and reject any identity mismatch.
+                measurements.append(dict(path="managed-images", reviewed_identities="matched",
+                                         elapsed_seconds=round(time.monotonic() - started, 2),
+                                         upstream_package_bytes=after[0] - before[0], served_package_bytes=after[1] - before[1]))
             step = "cache outage and direct HTTPS"
             unreachable = temporary / "unreachable.conf"
             unreachable.write_text(apt_config("http://127.0.0.1:9"))
