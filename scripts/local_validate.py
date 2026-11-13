@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -38,6 +39,59 @@ def git_environment(values: dict | None = None) -> dict:
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], env=git_environment(), text=True).strip()
+
+
+def image_comparison_required(repo: Path, base: str, source: str) -> bool:
+    if base == NO_PRIOR:
+        return True
+    changed = subprocess.check_output(["git", "-C", str(repo), "diff", "--name-only", "--no-renames", "-z", base, source],
+                                      env=git_environment()).split(b"\0")
+    # Only known non-image documentation can omit the expensive pair comparison.
+    documentation = {b"README.md", b"AGENTS.md", b"CHANGELOG.md", b"LICENSE", b"UNLICENSE"}
+    if any(path and path not in documentation and not path.startswith(b"docs/") for path in changed):
+        return True
+    # Future Dockerfiles that consume other context paths must include comparison.
+    for name in ("runner/Dockerfile", "controller/Dockerfile"):
+        for line in git(repo, "show", source + ":" + name).splitlines():
+            line = line.strip()
+            instruction = line.split(None, 1)[0].upper() if line else ""
+            if instruction == "ADD":
+                return True
+            mounts = re.findall(r"--mount=([^\s]+)", line)
+            for mount in mounts:
+                options = {}
+                for field in mount.split(","):
+                    key, _, value = field.partition("=")
+                    if key in options:
+                        return True
+                    options[key] = value
+                mount_type = options.pop("type", "bind")
+                if mount_type == "bind" and options != {"from": "build", "source": "/out", "target": "/out"}:
+                    return True
+            if instruction == "COPY":
+                try:
+                    inputs = shlex.split(line)[1:-1]
+                except ValueError:
+                    return True
+                if not inputs or any(not path.startswith(("controller/", "scripts/")) or ".." in Path(path).parts for path in inputs):
+                    return True
+    return False
+
+
+def require_buildx(version: str) -> None:
+    fields = version.split()
+    if len(fields) < 2 or fields[1] != "v0.32.1":
+        raise ValueError("reviewed Docker Buildx v0.32.1 is required")
+
+
+def regression_context(report: dict) -> str:
+    context = {key: report[key] for key in (
+        "suite", "profile", "source", "reviewed_head", "tree", "base", "policy", "main",
+        "executor_revision", "pr_title", "tag", "tag_created", "tools", "release_tags")}
+    context["machine"] = Path("/etc/machine-id").read_text().strip()
+    context["boot"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    context["kernel"] = list(os.uname())
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
 
 
 def output_directory(path: Path, *repositories: Path) -> Path:
@@ -256,6 +310,8 @@ def validate(args: argparse.Namespace) -> int:
             load_executor(executor_revision).require_worker()
             for name, command in tools.items():
                 report["tools"][name] = subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT).strip()
+                if name == "buildx":
+                    require_buildx(report["tools"][name])
             validator = str(policy / "scripts/validate_commits.py")
             scanner = str(policy / "scripts/scan_committed_secrets.py")
             selected_tags = release_tags(repo, validator, args.source, args.main, args.tag, env) if args.tag else {}
@@ -275,6 +331,18 @@ def validate(args: argparse.Namespace) -> int:
                 if not no_prior:
                     history_base = release_base
             report["history_base"] = history_base
+            if args.kind == "engine":
+                # Reuse requires the same inputs, tools and boot, not merely the same branch.
+                report["task_context"] = regression_context(report)
+                env["CI_FLEET_VALIDATION_CONTEXT"] = report["task_context"]
+                env["CI_FLEET_TASK_OUTPUT"] = str(output / "tasks")
+                env["CI_FLEET_APT_E2E_LOG"] = str(output / "apt-cache-commands.log")
+                report["managed_image_comparison"] = image_comparison_required(repo, args.base, args.source)
+                env["CI_FLEET_IMAGE_COMPARISON"] = "required" if report["managed_image_comparison"] else "unaffected"
+                resume = getattr(args, "resume_from", None)
+                if resume is not None:
+                    env["CI_FLEET_TASK_RESUME"] = str(output_directory(resume, repo, policy_repo) / "tasks")
+                    report["resume_from"] = str(resume.resolve())
             heads = list(dict.fromkeys((args.source, reviewed_head)))
             commits = []
             for head in heads:
@@ -373,6 +441,8 @@ def main() -> int:
     parser.add_argument("--disposable-host", action="store_true")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path,
+                        help="reuse protected passed regression groups with identical inputs, tools and boot; other stages rerun")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("timeout must be positive")

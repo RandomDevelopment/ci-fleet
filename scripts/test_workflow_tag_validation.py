@@ -95,8 +95,8 @@ class TrustedTagValidatorTests(unittest.TestCase):
         self.assertIn("startsWith(github.ref, 'refs/tags/')", reject)
 
     def test_repository_validation_runs_this_suite(self) -> None:
-        validation = (ROOT / "scripts" / "validate.sh").read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/test_workflow_tag_validation.py", validation)
+        from validation_tasks import TASKS
+        self.assertIn(('workflow-policy', ['python3', 'scripts/test_workflow_tag_validation.py'], False), TASKS)
 
 
 class WorkflowEventTests(unittest.TestCase):
