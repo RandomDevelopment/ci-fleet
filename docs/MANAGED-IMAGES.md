@@ -118,8 +118,10 @@ installed restoration later republishes reviewed tags, so it does not guarantee
 every final raw tag mapping or absence. Fresh no-install restoration and deferred
 prior controller-tag restoration retain their specific exact-ID checks.
 
-The [caller coverage audit](MANAGED-IMAGE-CALLERS.md) records all lifecycle and
-retention dispositions and the standalone template follow-up.
+Use protected image proof and exact-object checks to verify retained images.
+The [health stale-resource helper](HEALTH-MONITORING.md#local-check) returns zero
+counts when its cleanup command fails. Health success alone cannot establish
+usable image proof or native acceptance.
 
 ## Native acceptance remains separate
 
@@ -294,3 +296,21 @@ repeated config digests match, add them to one private desired-state entry:
 ```
 
 The checked-in template uses conspicuous `111...` / `222...` non-production fixture IDs only so validation and mocked tests are runnable; replace them during initialization. The repository-only marathon does not run a Docker daemon or invent production IDs, so live private configuration remains an external evidence gate.
+
+## Standalone template follow-up
+
+[Template issue #43](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/43)
+tracks matching active/pending evidence validation, caller flags, scalar
+descriptions, initializer help, capability evidence, policy tests and
+adoption/recovery guidance. Preserve historical release records and fixture
+identities. Cover first installation without optional policy or active evidence,
+observed runtime activation, separate evidence integration and later network
+policy. Image-free manager staging requires explicit incumbent records and
+evidence-only preparation before selection. Adoption, recovery and maintenance
+need retained compatible historical source.
+
+Stage `portable_managed_image_ids` against the reviewed merged engine and retain
+old catalogs. Run the standalone template's complete policy, compatibility,
+initializer, updater, release and exact-source/base checks, including ordinary
+upgrades, image-free bootstrap and final evidence-only promotion. Engine support,
+standalone implementation, publication and host acceptance remain separate gates.
