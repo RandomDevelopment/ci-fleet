@@ -61,6 +61,13 @@ Runnable changes must eventually include:
 - measured shard duration and five-minute timeout enforcement;
 - comparison against the existing CI path during migration.
 
+## Timing and diagnostic records
+
+- When implementing or changing tests and repeated non-user-facing routines, record elapsed durations for tests, suites, and meaningful job steps when practical to help future debugging.
+- Preserve useful context such as the command or operation, date/time, code revision, relevant environment and input/workload, outcome, and failures or retries when they help explain a measurement. Exclude secrets and sensitive payloads.
+- Prefer existing test-runner reports, CI artifacts, structured logs, or another discoverable project-appropriate destination with useful retention. Document where records live.
+- Use judgment about detail and overhead, and add coverage as work is touched rather than through a retroactive instrumentation sweep. This habit adds no gate or timing thresholds. Missing timings under this guidance must not block good work or require extra test runs, a new logging system, or blanket instrumentation. Existing verification requirements still apply.
+
 ## Change policy
 
 Keep changes small and reversible. Existing project CI must continue operating until the new fleet path has passed parallel validation, completed the compliance checklist, and has an explicit tested rollback or documented reinstall procedure appropriate to the host's failure boundary.
