@@ -21,10 +21,11 @@ Python 3.11 or later, PyYAML, ShellCheck, OpenSSL with Ed25519 support,
 coreutils, util-linux, curl, jq, systemd 255 or newer and cgroup v2.
 The system systemd manager must be PID 1 on the execution machine. Both engine profiles
 check for jq before running stages because the installer fixtures require it.
-The full engine run also requires Docker Engine, Compose v2, the Docker Buildx
-plugin and access to its local Unix socket. The tool preflight checks Buildx
-before any validation stage so Docker cannot silently use its legacy builder
-for the APT-cache fixture image.
+The full engine run also requires Docker Engine, Compose v2, Docker Buildx
+v0.32.1 and access to its local Unix socket. The tool preflight rejects another
+Buildx client before any validation stage. The shared direct reference pair and
+managed rebuilds use this same reviewed client with the pinned BuildKit v0.32.2
+backend, so client differences cannot invalidate the cache comparison.
 The harness records tool versions. Missing tools, skipped tests and interrupted
 checks fail the run. Do not use an active fleet, application or signing host.
 The `--disposable-host` flag acknowledges this execution requirement; a filesystem
@@ -178,6 +179,90 @@ outside Git. A changed source, base, title, tag or policy requires a new run.
 Nonzero exit means failure or incomplete execution; no report also means
 incomplete execution. Never infer success from the last visible test line.
 
+### Timeout diagnostics
+
+The engine command plan emits UTC `VALIDATION ... BEGIN <id>` and
+`VALIDATION ... END <id> exit=<status>` records to stderr around each validation
+command. These remain in the stage log even when that command's stdout is
+suppressed. IDs are fixed labels, not command arguments or environment dumps.
+The tester fixture additionally emits `VALIDATION ... CASE tester.<id>` before
+its case groups and readiness/completion waits. A CASE identifies the next group;
+it does not assert completion or identify every operation inside that group.
+
+The local-validation, network-policy, remote-reconcile and explicit-recovery
+Python suites emit flushed `VALIDATION_TEST` JSON records with the test ID,
+UTC timestamp and `begin`/`end` event. End records include monotonic
+`elapsed_seconds`, including setup, teardown and test cleanup. Subtest parameters
+are not added to these records. Standard unittest failures, skips, expected
+failures and exit codes remain authoritative; timing is not an acceptance check.
+
+After interruption, an unmatched BEGIN or test begin identifies unfinished work.
+A process-group kill may prevent an END record entirely; do not invent a status
+or treat its absence as proof of deadlock. Correlate the last CASE with the
+systemd stage result and completed test durations. Existing cleanup still removes
+fixture scratch trees; the retained log does not contain a live stack snapshot.
+
+The command plan, task scheduler and shell helper come from the pinned policy;
+case markers and Python timing come from the selected source. To obtain all
+records, a future run needs independently reviewed source and policy revisions
+containing the respective instrumentation. An older pinned policy will not gain
+new command markers merely because the candidate changed.
+
+### Task logs, concurrency and matching-result reuse
+
+The fixture stage runs the named groups in `scripts/validation_tasks.py`.
+Every group produces a complete `tasks/<name>.log`, a JSON result with its exit
+code, duration and log hash, and an entry in `tasks/result.json`. The stage log
+and live console receive bounded diagnostic records. Ordinary output stays in
+the complete task log. Thirty-second running records distinguish a quiet active
+stage from a completed result; they do not prove that a test will finish.
+
+Independent groups can overlap within the current execution machine's limits.
+The scheduler reads CPU affinity, inherited cgroup CPU quotas, available memory,
+inherited memory headroom and process headroom for each invocation. Its initial
+budget uses at most 75 percent of memory headroom at an estimated 512 MiB per
+group and reserves 128 processes per group plus launcher headroom. It checks
+limits again before admitting more groups. Reductions take effect immediately
+for new admissions; increases take effect on the next invocation. Unknown limits
+fall back to one group. These estimates are conservative admission bounds, not
+measured peak resource guarantees. No VM resource size is assumed forever.
+
+The early task-execution checks verify network-policy, numeric and deployer-unit
+registry wiring, including the actual shell guards, before slower fixtures run.
+
+Installer, executor and GitHub bootstrap groups run alone. Their own assertions,
+rollback paths, transaction ordering and systemd ownership stay intact. The
+capacity-stop regression runs once through the controller-installer group,
+which already includes it. Fake-host immutability checks use exact content,
+type, mode, link and ownership manifests instead of making comparison-only
+copies. Copies needed for restoration remain.
+
+After investigating a failure and verifying task cleanup, a caller can repeat
+the same complete command with a new `--output` and
+`--resume-from /protected/path/to/previous-result`. Only passed fixture groups
+with matching source, base, policy, reviewed head, main, profile, title, tag,
+tool versions, machine and boot are reusable. Receipts and logs must be owned
+by the caller, under non-writable protected ancestors, with matching hashes.
+Writable, substituted or skipped-test evidence fails. Mismatched inputs run
+again. Reused groups remain explicitly marked `reused`; this never retries a
+failed group automatically. All other stages run again, and full acceptance
+still requires every planned group and stage to pass with verified cleanup.
+Never reuse a result after unexplained checkout mutation or forced cleanup.
+
+For focused diagnosis, run `python3 scripts/validation_tasks.py --task NAME
+--output /protected/path/to/task-result` on the isolated execution machine.
+This selects a fixture group only and is incomplete acceptance evidence.
+
+The container stage builds one direct runner/controller pair with the pinned
+managed BuildKit backend and controlled arguments. It reuses that pair for the
+APT cache comparison. Only known documentation-only changes can omit the
+expensive managed-pair comparison; all other inputs, unknown paths and initial
+history include it. The report records this selection; `apt-cache-commands.log` retains the package
+and image command output and timings without command arguments. Container builds,
+package reuse, outage, leakage, inert-runner and cleanup checks still run.
+The CLI's default per-stage deadline, configured job ceilings, required-check
+names and timeout/cancellation cleanup remain unchanged.
+
 The CLI defaults to 1,800 seconds per stage. The complete engine command above
 explicitly sets 10,800 seconds to cover the measured fixture corpus. The shared
 `scripts/local_validation_executor.py` creates a unique system-manager transient
@@ -297,8 +382,21 @@ and the existing signed-evidence checks.
 | Compose validation, image builds, APT cache reuse/image-ID parity, inert runner and cleanup outcomes | Pinned `validate.sh --containers` |
 | Embedded schema, policy, multi-host and initializer checks | Pinned `validate-template.sh` |
 
-The engine workflow calls the full local entry point and preserves the
-`Build without registering a runner` check identity.
+The engine workflow at `.github/workflows/build.yml` calls the full local
+entry point and preserves the `Build without registering a runner` check
+identity and the separate conventional-commit check. It replaces the retired
+`validate.yml` producer. Keep the retired workflow disabled; switching producers
+does not cancel its existing runs.
+
+Before publishing the reviewed workflow change, set and read back
+`CI_FLEET_VALIDATION_RUNNER` for the approved disposable worker. A new producer
+can start immediately on publication without an enable step. Publish on the
+existing PR branch; its `synchronize` event uses the PR merge ref and emits
+checks for that candidate. Do not dispatch the new producer before GitHub recognizes it. Manual
+dispatch requires a workflow known to GitHub, and the default-branch file is
+required for initial discovery. Verify the new workflow ID and path, source,
+base, merge SHA and actual job assignment before admitting a disposable worker.
+The new producer does not authorize an old queued run or weaken branch protection.
 
 Both engine jobs select the runner label in repository variable
 `CI_FLEET_VALIDATION_RUNNER`, defaulting to `ubuntu-latest` when unset.

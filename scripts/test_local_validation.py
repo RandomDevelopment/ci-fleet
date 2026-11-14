@@ -486,6 +486,10 @@ if args[:1] == ["logs"]:
     def test_container_stage_propagates_cleanup_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            for command in (("init", "--quiet"),
+                            ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                             "commit", "--quiet", "--allow-empty", "-m", "test: cleanup fixture identity")):
+                subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True)
             scripts = root / "scripts"; scripts.mkdir()
             (scripts / "test_apt_cache_e2e.py").write_text(
                 "import os, sys\nsys.exit(int(os.environ['TEST_STAGE_STATUS']))\n")
@@ -498,6 +502,8 @@ if args[:1] == ["logs"]:
             docker.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$TEST_DOCKER_LOG"
 case "$1 $2" in
+  'buildx version') printf 'github.com/docker/buildx v0.32.1 fixture\\n' ;;
+  'buildx inspect') printf 'BuildKit version: v0.32.2\\n' ;;
   'compose -f')
     [[ -n ${CI_FLEET_RUNNER_IMAGE_DIGEST:-} ]] || exit 1
     if [[ "$*" == *'--format json' ]]; then
@@ -625,7 +631,7 @@ exit 0
             if "uses" in step:
                 self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
                 self.assertIs(step["with"]["persist-credentials"], False)
-        engine = (ROOT / ".github/workflows/validate.yml").read_text()
+        engine = (ROOT / ".github/workflows/build.yml").read_text()
         self.assertIn("name: Build without registering a runner", engine)
 
     def test_embedded_hosted_admission_requires_opt_in_and_open_prs(self):
@@ -1272,7 +1278,7 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
 
     def test_reconcile_fixtures_preserve_restrictive_checkout_permissions(self):
-        for name in ("test_remote_reconcile.py", "github-app-token.sh", "remote-reconcile.sh"):
+        for name in ("test_remote_reconcile.py", "validation_diagnostics.py", "github-app-token.sh", "remote-reconcile.sh"):
             target = self.repo / "scripts" / name
             target.write_bytes((ROOT / "scripts" / name).read_bytes())
             if name.endswith(".sh"):
@@ -1423,4 +1429,5 @@ class PolicyExecutionTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    from validation_diagnostics import TimedTestRunner
+    unittest.main(testRunner=TimedTestRunner)

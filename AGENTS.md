@@ -94,3 +94,27 @@ Keep changes small and reversible. Existing project CI must continue operating u
   authority and a pinned validator. Keep signing keys off execution machines.
 - Preserve current required checks until coverage, recovery and a deliberate
   policy migration pass. Optional hosted convenience never creates a host gate.
+
+## Temporary working material
+
+Do not commit implementation plans, research notes, or agent scratch files. Keep temporary working material outside the worktree.
+
+Maintain the repository's established project documentation when needed; temporary agent output is not project documentation.
+
+## Testing and review
+
+Adapted from [T3 Code's testing guidance](https://github.com/pingdotgg/t3code/blob/main/docs/internals/testing.md), using this repository's language and test tools.
+
+- Test behavior with meaningful failure modes: orchestration, protocol boundaries, authorization, persistence, migrations, parsing, races, and changed business logic. Do not add tests for guarantees already enforced by the language or type checker, trivial logic, copy text, static markup, or mocks that merely repeat the implementation's calls.
+- Extend an existing case, assertion, or test table before adding a new test. Cover a regression at the lowest layer that exposes it; do not repeat it in wrappers, at every caller, or across platforms sharing the same logic.
+- For logic, data, state, protocol, and backend behavior fixes, first reproduce the bug with the smallest relevant failing test, then fix it. Reuse the owning module's existing tests where possible. A server-only fix should also include a short, safe runtime transcript when applicable.
+- Use real before-and-after captures to prove purely visual fixes such as spacing, colors, or alignment. Do not add automated tests just for cosmetic details when captures demonstrate the fix.
+- Reserve browser tests for behavior requiring a real browser, such as layout, scrolling, focus, pointer input, workers, or rendered integration. Test underlying logic with fast unit tests instead of rendering a page merely to exercise it.
+- Synchronize asynchronous tests with completion events, futures, queues, persisted milestones, or drained workers. Do not use arbitrary sleeps, busy waiting, or handwritten polling loops. A timeout bounds failure; it is not a synchronization mechanism.
+- Use controlled clocks for time-dependent logic. Reserve real-time fixtures for subprocess or network behavior that requires them. Assert outcomes, events, and counts rather than elapsed wall-clock time unless timing itself is the behavior under test.
+- Do not add per-test timeout overrides or automatic retries to hide slow or flaky tests. Fix the cause and preserve the repository's existing deadline and cleanup contracts. Any skipped or quarantined test needs an adjacent tracking issue and a reason.
+- Use the browser test framework's condition assertions for readiness rather than animation-frame or transition-event waits. Keep mocks narrow; do not import heavyweight real modules solely to construct a mock.
+- Give each test fresh mutable state. Acquire resources in dependency order and dispose of them in reverse order, including when setup, rendering, waiting, or assertions fail. Clean up render roots, timers, spies, workers, processes, and other owned fixtures. Use fresh render inputs when rerendering and retain required routing or application context.
+- In review, request a test only when it would catch a concrete regression. Do not demand one assertion per constant, label, or branch. For redundant tests, name the useful correction: extend an existing case, remove duplication, keep one layer, or move browser-independent assertions into unit tests.
+
+These rules guide test design and review. They do not authorize skipping required checks, weakening safety assertions, or deleting existing coverage without assessing its purpose.

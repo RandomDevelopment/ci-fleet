@@ -262,6 +262,31 @@ class StorageTests(unittest.TestCase):
         self.assertIn("after=64%", output)
         self.assertNotIn("headroom-insufficient", output)
 
+    def test_completed_cache_prune_does_not_claim_reclamation(self):
+        # Engine may successfully do nothing because of its cache reserve or
+        # shared layers. Exercise the real client/marker path without Docker.
+        for reclaimed in ("0B", "1GB"):
+            with self.subTest(reclaimed=reclaimed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                boot = root / "proc/sys/kernel/random/boot_id"
+                boot.parent.mkdir(parents=True)
+                boot.write_text(BOOT_ID)
+                client = root / "docker"
+                client.write_text(f"#!/bin/sh\nprintf 'Total reclaimed space: {reclaimed}\\n'\n")
+                client.chmod(0o700)
+                accounting = {"Images": [], "Containers": [], "BuildCache": [cache()]}
+                with patch.dict(os.environ, {"CI_FLEET_ROOT_PREFIX": directory, "PATH": directory,
+                                             "CI_FLEET_DOCKER_STORAGE_RETENTION": cleanup.ADMISSION}, clear=True), \
+                     patch.object(cleanup, "docker_usage", return_value=accounting), \
+                     patch.object(cleanup, "disk_percent", return_value=81), \
+                     patch.object(cleanup, "protected_images", return_value=set()), \
+                     patch.object(cleanup.time, "time", return_value=NOW), redirect_stdout(io.StringIO()) as output:
+                    cleanup.cleanup_storage(apply=True)
+                    self.assertFalse(cleanup.coordination.pending_requests("removals"))
+                self.assertNotIn("REMOVE", output.getvalue())
+                self.assertIn("COMPLETE default-builder cache prune; reclaimed bytes not measured", output.getvalue())
+                self.assertIn("headroom-insufficient", output.getvalue())
+
     def test_stops_at_headroom_target_and_reports_insufficient_capacity(self):
         _, mutations = self.run_storage(disk=[70, 65, 65, 65])
         self.assertFalse(mutations)

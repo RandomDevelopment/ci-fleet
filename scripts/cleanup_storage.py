@@ -422,7 +422,7 @@ def cleanup_storage(*, apply: bool, usage: dict | None = None) -> None:
         # Engine GC skips in-use cache; the admitted daemon owns the entire default builder cache.
         mutate("builder", "prune", "--all", "--force", "--filter", "until=168h", "--keep-storage", str(CACHE_KEEP_BYTES),
                timeout=max(0.1, deadline - time.monotonic()))
-        print("REMOVE eligible default-builder cache subject to age and reserve", flush=True)
+        print("COMPLETE default-builder cache prune; reclaimed bytes not measured", flush=True)
     after = disk_percent()
     print(f"HEADROOM Docker after={after}% target={TARGET_PERCENT}%")
     if after > TARGET_PERCENT:
