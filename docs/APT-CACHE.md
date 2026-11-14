@@ -161,7 +161,13 @@ The container test creates a disposable apt-cacher-ng instance. It measures
 package bytes and elapsed time for cold/warm and concurrent runners and
 Docker/Compose/Buildx builds. It verifies managed rebuilds against images built
 without a cache using the same pinned Buildx client, BuildKit backend, and build
-arguments. The cache-enabled rebuild must match those exact image IDs. The test
+arguments. The cache-enabled rebuild must match the authenticated image config
+digests, even when the daemon's image ID identifies an OCI index. The fixture
+includes the capability manifest and exercises portable content verification.
+The complete validator builds its direct pair once and supplies it using
+`--reference-runner` and `--reference-controller`; standalone invocation builds
+its own pair. Only the pinned validator's known documentation-only selection
+omits that pair comparison. Unknown or image-related changes include it. The test
 also checks project images for endpoint leakage and tests outage failure and
 direct HTTPS. It removes only its own containers, images, and
 builders. It never clears or changes a production cache.

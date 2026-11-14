@@ -1620,11 +1620,11 @@ pre_adapter_output=$tmp/pre-adapter-policy.out
 export FAKE_COMPOSE_LOG=$tmp/pre-adapter-policy-compose.log
 : >"$FAKE_COMPOSE_LOG"
 : >"$FAKE_TRANSACTION_LOG"
-cp -a "$pre_adapter_root" "$pre_adapter_snapshot"
+"$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$pre_adapter_root" >"$pre_adapter_snapshot"
 if "${pre_adapter_env[@]}" "$installer" --upgrade "${pre_adapter_args[@]}" --ref "$pre_adapter_policy_ref" >"$pre_adapter_output" 2>&1; then
   fail 'adapterless engine accepted a retained managed Docker policy'
 fi
-diff --no-dereference -r "$pre_adapter_snapshot" "$pre_adapter_root" >/dev/null || fail 'adapterless retained-policy rejection changed installed state'
+"$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$pre_adapter_root" | cmp -s "$pre_adapter_snapshot" - || fail 'adapterless retained-policy rejection changed installed state'
 if grep -Eq '^(build|up|stop|pause|unpause|kill|down|rm|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then
   fail 'adapterless retained-policy rejection invoked Compose or mutated Docker state'
 fi
@@ -2234,10 +2234,10 @@ assert_uninstall_manager_rejected_without_mutation() {
   : >"$FAKE_COMPOSE_LOG"
   : >"$FAKE_SYSTEMCTL_LOG"
   : >"$FAKE_MV_LOG"
-  cp -a "$root" "$snapshot"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" >"$snapshot"
   if "$installer" --uninstall >"$output" 2>&1; then fail "invalid uninstall manager pointer was accepted: $label"; fi
   grep -Fq "$expected" "$output" || fail "invalid uninstall manager pointer returned the wrong error: $label: $(<"$output")"
-  diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid uninstall manager pointer mutated host files: $label"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" | cmp -s "$snapshot" - || fail "invalid uninstall manager pointer mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid uninstall manager pointer caused a Compose or Docker mutation: $label"; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid uninstall manager pointer caused a systemd mutation: $label"; fi
   [[ ! -s "$FAKE_MV_LOG" ]] || fail "invalid uninstall manager pointer replaced a link: $label"
@@ -2468,12 +2468,12 @@ assert_checkpoint_rejected_without_mutation() {
   : >"$FAKE_COMPOSE_LOG"
   : >"$FAKE_SYSTEMCTL_LOG"
   : >"$FAKE_MV_LOG"
-  cp -a "$root" "$snapshot"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" >"$snapshot"
   if "$installer" --rollback >"$output" 2>&1; then
     fail "invalid checkpoint was accepted: $label"
   fi
   grep -Fq "$expected" "$output" || fail "invalid checkpoint returned the wrong error: $label: $(<"$output")"
-  diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid checkpoint mutated host files: $label"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" | cmp -s "$snapshot" - || fail "invalid checkpoint mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then
     fail "invalid checkpoint caused a Compose or Docker mutation: $label"
   fi
@@ -2573,9 +2573,9 @@ if [[ $(id -u) == 0 ]]; then
   : >"$FAKE_MV_LOG"
   ln -s ../../unavailable-owner-target "$root/opt/ci-fleet/current"
   chown -h 1 "$root/opt/ci-fleet/current"
-  cp -a "$root" "$live_owner_snapshot"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" >"$live_owner_snapshot"
   expect_failure 'current pointer is invalid' "$installer" --upgrade "${base_args[@]}" --ref "$absent_pointer_ref"
-  diff --no-dereference -r "$live_owner_snapshot" "$root" >/dev/null || fail 'wrong-owner live current pointer mutated host files'
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" | cmp -s "$live_owner_snapshot" - || fail 'wrong-owner live current pointer mutated host files'
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail 'wrong-owner live current pointer caused a Compose or Docker mutation'; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail 'wrong-owner live current pointer caused a systemd mutation'; fi
   [[ ! -s "$FAKE_MV_LOG" ]] || fail 'wrong-owner live current pointer replaced a link'
@@ -2593,10 +2593,10 @@ assert_invalid_live_manager() {
   : >"$FAKE_COMPOSE_LOG"
   : >"$FAKE_SYSTEMCTL_LOG"
   : >"$FAKE_MV_LOG"
-  cp -a "$root" "$snapshot"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" >"$snapshot"
   if "$installer" --upgrade "${base_args[@]}" --ref "$manager_ref" >"$output" 2>&1; then fail "invalid manager pointer was accepted: $label"; fi
   grep -Fq 'manager current pointer is invalid' "$output" || fail "invalid manager pointer returned the wrong error: $label: $(<"$output")"
-  diff --no-dereference -r "$snapshot" "$root" >/dev/null || fail "invalid manager pointer mutated host files: $label"
+  "$REAL_PYTHON3" "$repo_root/scripts/fixture_manifest.py" "$root" | cmp -s "$snapshot" - || fail "invalid manager pointer mutated host files: $label"
   if grep -Eq '^(stop|build|up|down|rm|pause|unpause|kill|container-rm|image-(tag|rm))\|' "$FAKE_COMPOSE_LOG"; then fail "invalid manager pointer caused a Compose or Docker mutation: $label"; fi
   if grep -Eq '^(enable|disable|start|stop|daemon-reload)( |$)' "$FAKE_SYSTEMCTL_LOG"; then fail "invalid manager pointer caused a systemd mutation: $label"; fi
   [[ ! -s "$FAKE_MV_LOG" ]] || fail "invalid manager pointer replaced a link: $label"

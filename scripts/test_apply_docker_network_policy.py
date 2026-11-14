@@ -193,8 +193,11 @@ class RenderDaemonConfigTests(unittest.TestCase):
 
 class ValidationTests(unittest.TestCase):
     def test_validate_runs_docker_network_policy_suite(self) -> None:
-        validate = (SCRIPTS / "validate.sh").read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/test_apply_docker_network_policy.py", validate)
+        from validation_tasks import require_registered_task
+
+        require_registered_task(
+            ("network-policy", ["python3", "scripts/test_apply_docker_network_policy.py"], False),
+        )
 
 
 class HealthcheckScriptTests(unittest.TestCase):
@@ -6341,4 +6344,5 @@ class ApplyScriptTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    from validation_diagnostics import TimedTestRunner
+    unittest.main(testRunner=TimedTestRunner)

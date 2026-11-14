@@ -36,6 +36,28 @@ with open(__file__.rsplit("/", 1)[0] + "/result.json", "x", encoding="utf-8") as
 '''
 
 
+class Progress:
+    """Forward bounded diagnostic records while retaining all bytes in the log."""
+    def __init__(self):
+        self.pending = b""
+        self.discard = False
+
+    def feed(self, chunk):
+        lines = (self.pending + chunk).split(b"\n")
+        self.pending = lines.pop()
+        for line in lines:
+            if not self.discard and len(line) <= 8192 and line.startswith(
+                    (b"VALIDATION ", b"VALIDATION_TEST ", b"VALIDATION_TASK ")) and all(32 <= c < 127 for c in line):
+                try:
+                    print(line.decode("ascii"), flush=True)
+                except OSError:
+                    pass
+            self.discard = False
+        if len(self.pending) > 8192 or self.discard:
+            self.pending = b""
+            self.discard = True
+
+
 def require_revision(revision: str) -> None:
     """Bind consumers to the reviewed executor installed by worker preparation."""
     program = INSTALL / "executor.py"
@@ -135,15 +157,25 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     if signal.getsignal(signum) != signal.SIG_IGN:
                         previous[signum] = signal.signal(signum, cancel)
-            with log.open("wb") as output:
+            with log.open("wb") as output, log.open("rb") as progress_log:
+                progress = Progress()
                 process = subprocess.Popen(launch, env=HOST_ENV, stdin=subprocess.DEVNULL,
                                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 stopping = False
                 last_probe = started - 1
+                last_progress = started
                 while process.poll() is None:
+                    progress.feed(progress_log.read(65536))
                     if cancelled and not stopping:
                         stopping = stop()
                     now = time.monotonic()
+                    if now - last_progress >= 30:
+                        last_progress = now
+                        try:
+                            print('VALIDATION_TASK ' + json.dumps({"event": "stage-running",
+                                  "elapsed_seconds": round(now - started, 1)}), flush=True)
+                        except OSError:
+                            pass
                     if not stopping and now - last_probe >= .5:
                         last_probe = now
                         state = subprocess.run(["systemctl", "--system", "show", unit, "--property=MainPID",
@@ -161,6 +193,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                         process.wait(timeout=.1)
                     except subprocess.TimeoutExpired:
                         pass
+                while chunk := progress_log.read(65536):
+                    progress.feed(chunk)
         except BaseException:
             stop()
             raise

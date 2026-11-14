@@ -2709,7 +2709,15 @@ rm -f "$root/var/lib/ci-fleet-deployer/drained"
 
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
-grep -Fq 'scripts/test-deployer-units.sh' "$repo_root/scripts/validate.sh" || fail 'repository validation omits systemd unit verification'
+if ! python3 -I -B - "$repo_root" <<'PY_VALIDATION_TASK'
+import sys
+sys.path.insert(0, sys.argv[1] + '/scripts')
+from validation_tasks import require_registered_task
+require_registered_task(('deployer-units', ['scripts/test-deployer-units.sh'], True))
+PY_VALIDATION_TASK
+then
+  fail 'repository validation omits systemd unit verification'
+fi
 lock_line=$(grep -n 'flock -n 9' "$runtime" | head -n1 | cut -d: -f1)
 policy_line=$(grep -n "secure_file \"\$config\" 'deployer configuration'" "$runtime" | cut -d: -f1)
 ((lock_line < policy_line)) || fail 'runtime loads active policy before acquiring the shared operation lock'
