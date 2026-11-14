@@ -151,6 +151,10 @@ amd64 and arm64. The controller's module requires 1.27.3 for `actions/scaleset`
 0.5.0, matching the pinned builder. The build stage sets `GOTOOLCHAIN=local` so
 a higher module requirement fails instead of downloading a different toolchain.
 
+The Go 1.27.3 Bookworm build-image digest was refreshed on 2026-11-10. Docker
+Hub manifest and config bytes match their digests for Linux amd64 and arm64;
+both configs still declare `GOLANG_VERSION=1.27.3`.
+
 Runner Buildx 0.32.1 package hashes were checked against the official Docker
 package index on 2026-10-15 for amd64 and arm64. The existing Docker CLI and
 Compose selections are unchanged.
@@ -162,7 +166,8 @@ Compose selections are unchanged.
 | Controller Debian 13.7 slim, reviewed 2026-11-05 | `sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-27 |
 | Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 | Debian 13.7 slim, reviewed 2026-10-12 for both images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim`; retained historical review |
-| Go 1.27.3 Bookworm build image | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3) |
+| Go 1.27.3 Bookworm build image, reviewed 2026-11-10 | `sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9` | Docker Hub manifest and config digests verified for Linux amd64 and arm64; both declare Go 1.27.3 |
+| Go 1.27.3 Bookworm build image, reviewed 2026-10-30 | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3); retained historical review |
 | Debian packages | signed snapshot `20261012T000000Z` | `snapshot.debian.org/archive/debian/20261012T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
