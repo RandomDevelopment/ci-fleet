@@ -30,7 +30,6 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
 | Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
-| See what informed the design | [Discovery summary](DISCOVERY-SUMMARY.md) |
 
 ## Concepts
 

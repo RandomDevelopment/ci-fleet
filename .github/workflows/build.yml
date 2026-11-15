@@ -1,4 +1,4 @@
-name: Validate ci-fleet prototype
+name: Build ci-fleet
 
 on:
   pull_request:

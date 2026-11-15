@@ -244,7 +244,7 @@ Ordinary fleet task jobs retain their five-minute hard timeout.
 `scripts/validate_commits.py` enforces the Conventional Commits grammar, the
 SemVer validator, and a `--suggest-bump` helper. `scripts/test_validate_commits.py`
 is the regression suite. Both run in CI (see the `commit-convention` job in
-`.github/workflows/validate.yml`).
+`.github/workflows/build.yml`).
 
 Run locally:
 

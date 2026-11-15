@@ -657,4 +657,9 @@ for name in list(vars(fixtures.TestRemoteReconcileTransaction)):
         setattr(ExplicitRecovery, name, None)
 
 if __name__ == "__main__":
-    unittest.main()
+    # This suite runs with -I; load only the adjacent reviewed helper.
+    timing_spec = importlib.util.spec_from_file_location("validation_diagnostics", Path(__file__).with_name("validation_diagnostics.py"))
+    assert timing_spec is not None and timing_spec.loader is not None
+    timing = importlib.util.module_from_spec(timing_spec)
+    timing_spec.loader.exec_module(timing)
+    unittest.main(testRunner=timing.TimedTestRunner)

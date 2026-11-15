@@ -33,6 +33,12 @@ Record:
 
 The original workflow remains authoritative during this step.
 
+Verify organization runner administration and runner-group access, including fork
+workflow access to secrets and write tokens. Before migration, verify each host's
+security updates, firewall and network policy, recovery procedure, draining,
+monitoring and disk-pressure response through [host enrollment](ADDING-A-HOST.md)
+and [host maintenance](HOST-MAINTENANCE.md).
+
 ## Step 2: Classify every job
 
 | Class | Examples | Target |

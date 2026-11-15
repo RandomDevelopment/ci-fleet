@@ -24,16 +24,44 @@ WORK = Path("/var/lib/ci-validation-work")
 HOST_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 # ExecStopPost runs after systemd has terminated the stage's remaining processes.
 # Its receipt lives in a root-only directory, outside candidate-writable paths.
-FINISH = '''import os
-names = ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")
-values = [os.environ.get(name) for name in names]
-allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-if any(value is not None and (len(value) > 64 or any(char not in allowed for char in value)) for value in values):
-    raise ValueError("invalid system manager receipt field")
-fields = ['"' + name + '":' + ('null' if value is None else '"' + value + '"') for name, value in zip(names, values)]
-with open(__file__.rsplit("/", 1)[0] + "/result.json", "x", encoding="utf-8") as output:
-    output.write("{" + ",".join(fields) + "}")
+# Shell builtins avoid Python startup within the descendant cleanup budget.
+FINISH = '''set -euC
+LC_ALL=C
+export LC_ALL
+umask 077
+for value in "${SERVICE_RESULT-}" "${EXIT_CODE-}" "${EXIT_STATUS-}"; do
+    case "$value" in *[!a-zA-Z0-9_-]*) exit 1 ;; esac
+    [ "${#value}" -le 64 ] || exit 1
+done
+result=null code=null status=null
+if [ "${SERVICE_RESULT+x}" ]; then result='"'"$SERVICE_RESULT"'"'; fi
+if [ "${EXIT_CODE+x}" ]; then code='"'"$EXIT_CODE"'"'; fi
+if [ "${EXIT_STATUS+x}" ]; then status='"'"$EXIT_STATUS"'"'; fi
+printf '{"SERVICE_RESULT":%s,"EXIT_CODE":%s,"EXIT_STATUS":%s}' \\
+    "$result" "$code" "$status" > "${0%/*}/result.json"
 '''
+
+
+class Progress:
+    """Forward bounded diagnostic records while retaining all bytes in the log."""
+    def __init__(self):
+        self.pending = b""
+        self.discard = False
+
+    def feed(self, chunk):
+        lines = (self.pending + chunk).split(b"\n")
+        self.pending = lines.pop()
+        for line in lines:
+            if not self.discard and len(line) <= 8192 and line.startswith(
+                    (b"VALIDATION ", b"VALIDATION_TEST ", b"VALIDATION_TASK ")) and all(32 <= c < 127 for c in line):
+                try:
+                    print(line.decode("ascii"), flush=True)
+                except OSError:
+                    pass
+            self.discard = False
+        if len(self.pending) > 8192 or self.discard:
+            self.pending = b""
+            self.discard = True
 
 
 def require_revision(revision: str) -> None:
@@ -111,12 +139,12 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
 
     with tempfile.TemporaryDirectory(prefix=unit.removesuffix(".service") + "-", dir="/run") as temporary:
         root = Path(temporary)
-        finish = root / "finish.py"
+        finish = root / "finish.sh"
         finish.write_text(FINISH)
         properties = ["Type=exec", "ExitType=cgroup", "Slice=system.slice", "Restart=no", "Delegate=no",
                       "KillMode=control-group", "SendSIGKILL=yes", "RuntimeMaxSec=" + str(timeout) + "s",
                       "TimeoutStopSec=" + str(max(grace, .001)) + "s", "TasksMax=512",
-                      "User=" + user, "ExecStopPost=+/usr/bin/python3 -I -S " + str(finish)]
+                      "User=" + user, "ExecStopPost=+/bin/sh -p " + str(finish)]
         if user != "root":
             writable = list(dict.fromkeys([str(cwd), *(env[key] for key in ("HOME", "TMPDIR") if key in env)]))
             if any(not Path(path).is_absolute() for path in writable):
@@ -135,15 +163,25 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     if signal.getsignal(signum) != signal.SIG_IGN:
                         previous[signum] = signal.signal(signum, cancel)
-            with log.open("wb") as output:
+            with log.open("wb") as output, log.open("rb") as progress_log:
+                progress = Progress()
                 process = subprocess.Popen(launch, env=HOST_ENV, stdin=subprocess.DEVNULL,
                                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 stopping = False
                 last_probe = started - 1
+                last_progress = started
                 while process.poll() is None:
+                    progress.feed(progress_log.read(65536))
                     if cancelled and not stopping:
                         stopping = stop()
                     now = time.monotonic()
+                    if now - last_progress >= 30:
+                        last_progress = now
+                        try:
+                            print('VALIDATION_TASK ' + json.dumps({"event": "stage-running",
+                                  "elapsed_seconds": round(now - started, 1)}), flush=True)
+                        except OSError:
+                            pass
                     if not stopping and now - last_probe >= .5:
                         last_probe = now
                         state = subprocess.run(["systemctl", "--system", "show", unit, "--property=MainPID",
@@ -161,6 +199,8 @@ def run(command: list[str], cwd: Path, env: dict, log: Path, timeout: int,
                         process.wait(timeout=.1)
                     except subprocess.TimeoutExpired:
                         pass
+                while chunk := progress_log.read(65536):
+                    progress.feed(chunk)
         except BaseException:
             stop()
             raise
