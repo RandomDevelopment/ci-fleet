@@ -161,6 +161,7 @@ Compose selections are unchanged.
 
 | Input | Immutable selection | Evidence |
 | --- | --- | --- |
+| Runner and controller Debian 13.7 slim, reviewed 2026-11-10 | `sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2` | Docker Hub index, Linux amd64/arm64 manifests and config bytes match their digests; base configs were created 2026-11-04. Registry metadata alone does not establish package compatibility, specific CVE fixes or native acceptance |
 | Runner Debian 13.7 slim, reviewed 2026-11-05 | `sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4` | Docker Hub index, Linux amd64/arm64 manifests and config bytes match their digests; base configs were created 2026-10-27. Registry metadata alone does not establish package compatibility or specific CVE fixes |
 | Runner Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20; retained historical review |
 | Controller Debian 13.7 slim, reviewed 2026-11-05 | `sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-27 |
