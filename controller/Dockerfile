@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
-FROM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build
+FROM golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS build
 ENV GOTOOLCHAIN=local
 ARG SOURCE_DATE_EPOCH=1786752000
 RUN --mount=type=secret,id=ci_fleet_apt,target=/etc/apt/apt.conf.d/99-ci-fleet-cache \

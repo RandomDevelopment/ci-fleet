@@ -118,8 +118,10 @@ installed restoration later republishes reviewed tags, so it does not guarantee
 every final raw tag mapping or absence. Fresh no-install restoration and deferred
 prior controller-tag restoration retain their specific exact-ID checks.
 
-The [caller coverage audit](MANAGED-IMAGE-CALLERS.md) records all lifecycle and
-retention dispositions and the standalone template follow-up.
+Use protected image proof and exact-object checks to verify retained images.
+The [health stale-resource helper](HEALTH-MONITORING.md#local-check) returns zero
+counts when its cleanup command fails. Health success alone cannot establish
+usable image proof or native acceptance.
 
 ## Native acceptance remains separate
 
@@ -149,6 +151,10 @@ amd64 and arm64. The controller's module requires 1.27.3 for `actions/scaleset`
 0.5.0, matching the pinned builder. The build stage sets `GOTOOLCHAIN=local` so
 a higher module requirement fails instead of downloading a different toolchain.
 
+The Go 1.27.3 Bookworm build-image digest was refreshed on 2026-11-10. Docker
+Hub manifest and config bytes match their digests for Linux amd64 and arm64;
+both configs still declare `GOLANG_VERSION=1.27.3`.
+
 Runner Buildx 0.32.1 package hashes were checked against the official Docker
 package index on 2026-10-15 for amd64 and arm64. The existing Docker CLI and
 Compose selections are unchanged.
@@ -160,7 +166,8 @@ Compose selections are unchanged.
 | Controller Debian 13.7 slim, reviewed 2026-11-05 | `sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-27 |
 | Controller Debian 13.7 slim, reviewed 2026-10-30 | `sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad` | Docker Hub manifest bytes match the digest and include Linux amd64 and arm64; base configs were created 2026-10-20 |
 | Debian 13.7 slim, reviewed 2026-10-12 for both images | `sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f` | Docker Hub registry manifest for `library/debian:13.7-slim`; retained historical review |
-| Go 1.27.3 Bookworm build image | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3) |
+| Go 1.27.3 Bookworm build image, reviewed 2026-11-10 | `sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9` | Docker Hub manifest and config digests verified for Linux amd64 and arm64; both declare Go 1.27.3 |
+| Go 1.27.3 Bookworm build image, reviewed 2026-10-30 | `sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5` | Docker Hub registry manifest for `library/golang:1.27.3-bookworm`; [upstream patch notes](https://go.dev/doc/devel/release#go1.27.3); retained historical review |
 | Debian packages | signed snapshot `20261012T000000Z` | `snapshot.debian.org/archive/debian/20261012T000000Z/dists/trixie/InRelease` |
 | Build timestamps | `SOURCE_DATE_EPOCH=1786752000` | BuildKit reproducible-build timestamp input declared in every stage |
 | Docker CLI 29.7.2 amd64 / arm64 | exact package version and SHA-256 `3d1a00d1549f7539606252b1e2b88ae2a0c855e02e5fa92ad962c8a118d7f6ad` / `6bb694f01789b9869e99e34df3492104c0150d12df93192034db5f88cf0f7c8c` | official Docker Debian `trixie` package index |
@@ -289,3 +296,21 @@ repeated config digests match, add them to one private desired-state entry:
 ```
 
 The checked-in template uses conspicuous `111...` / `222...` non-production fixture IDs only so validation and mocked tests are runnable; replace them during initialization. The repository-only marathon does not run a Docker daemon or invent production IDs, so live private configuration remains an external evidence gate.
+
+## Standalone template follow-up
+
+[Template issue #43](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/43)
+tracks matching active/pending evidence validation, caller flags, scalar
+descriptions, initializer help, capability evidence, policy tests and
+adoption/recovery guidance. Preserve historical release records and fixture
+identities. Cover first installation without optional policy or active evidence,
+observed runtime activation, separate evidence integration and later network
+policy. Image-free manager staging requires explicit incumbent records and
+evidence-only preparation before selection. Adoption, recovery and maintenance
+need retained compatible historical source.
+
+Stage `portable_managed_image_ids` against the reviewed merged engine and retain
+old catalogs. Run the standalone template's complete policy, compatibility,
+initializer, updater, release and exact-source/base checks, including ordinary
+upgrades, image-free bootstrap and final evidence-only promotion. Engine support,
+standalone implementation, publication and host acceptance remain separate gates.

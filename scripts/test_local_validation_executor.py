@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import builtins
 import hashlib
 import json
 import os
@@ -41,34 +40,51 @@ record()
 
 
 class ReceiptTests(unittest.TestCase):
-    def test_receipt_writer_uses_only_os_and_preserves_manager_fields(self):
-        original_import = builtins.__import__
-
-        def frozen_import(name, *args, **kwargs):
-            if name != "os":
-                raise ImportError("completion hook must not load " + name)
-            return original_import(name, *args, **kwargs)
-
+    def test_receipt_writer_needs_no_python_or_external_commands_and_preserves_manager_fields(self):
         for values in ({"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"},
                        {"SERVICE_RESULT": "timeout", "EXIT_CODE": "killed", "EXIT_STATUS": "TERM"},
-                       {}):
+                       {"SERVICE_RESULT": "", "EXIT_STATUS": "x" * 64}, {}):
             with self.subTest(values=values), tempfile.TemporaryDirectory() as temporary:
-                finish = Path(temporary) / "finish.py"
-                with patch.dict(os.environ, values, clear=True), \
-                        patch.object(builtins, "__import__", side_effect=frozen_import):
-                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
+                finish = Path(temporary) / "finish.sh"
+                finish.write_text(executor.FINISH)
+                command = ["/bin/sh", "-p", str(finish)]
+                subprocess.run(command, env={"PATH": "", **values}, check=True, capture_output=True)
                 expected = {name: values.get(name) for name in ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS")}
                 self.assertEqual(json.loads(finish.with_name("result.json").read_text()), expected)
-                with patch.dict(os.environ, values, clear=True), self.assertRaises(FileExistsError):
-                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
+                receipt = finish.with_name("result.json")
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+                original = receipt.read_bytes()
+                with self.assertRaises(subprocess.CalledProcessError):
+                    subprocess.run(command, env={"PATH": "", **values}, check=True, capture_output=True)
+                self.assertEqual(receipt.read_bytes(), original)
+
+    def test_receipt_writer_refuses_existing_and_dangling_symlinks(self):
+        for existing in (True, False):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                finish = root / "finish.sh"
+                finish.write_text(executor.FINISH)
+                target = root / "target"
+                if existing:
+                    target.write_text("preserved")
+                (root / "result.json").symlink_to(target)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    subprocess.run(["/bin/sh", "-p", str(finish)], env={"PATH": ""},
+                                   check=True, capture_output=True)
+                self.assertTrue((root / "result.json").is_symlink())
+                self.assertEqual(target.read_text() if target.exists() else None, "preserved" if existing else None)
 
     def test_receipt_writer_refuses_unexpected_bytes_without_a_receipt(self):
-        for value in ('success"', "success\n", "x" * 65):
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
-                finish = Path(temporary) / "finish.py"
-                with patch.dict(os.environ, {"SERVICE_RESULT": value}, clear=True), self.assertRaises(ValueError):
-                    exec(compile(executor.FINISH, str(finish), "exec"), {"__file__": str(finish)})
-                self.assertFalse(finish.with_name("result.json").exists())
+        for name in ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"):
+            for value in ('success"', "success\n", "x" * 65, "$(touch injected)", "succ\u00e8s"):
+                with self.subTest(name=name, value=value), tempfile.TemporaryDirectory() as temporary:
+                    finish = Path(temporary) / "finish.sh"
+                    finish.write_text(executor.FINISH)
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        subprocess.run(["/bin/sh", "-p", str(finish)], env={"PATH": "", name: value},
+                                       cwd=temporary, check=True, capture_output=True)
+                    self.assertFalse(finish.with_name("result.json").exists())
+                    self.assertFalse((Path(temporary) / "injected").exists())
 
 
 class AdmissionTests(unittest.TestCase):
@@ -158,7 +174,7 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
                 def launch(command, **_):
                     hook = next(value for value in command if value.startswith("--property=ExecStopPost="))
-                    self.assertIn(" -I -S ", hook)
+                    self.assertTrue(hook.startswith("--property=ExecStopPost=+/bin/sh -p "))
                     finish = Path(hook.split()[-1])
                     if outcome is not None:
                         finish.with_name("result.json").write_text(json.dumps(outcome))
@@ -390,7 +406,7 @@ Path('scratch-result').write_text('ok')
         self.assert_empty()
 
     def test_missing_receipt_fails_closed(self):
-        with patch.object(executor, "FINISH", "pass\n"), self.assertRaisesRegex(RuntimeError, "receipt"):
+        with patch.object(executor, "FINISH", "exit 0\n"), self.assertRaisesRegex(RuntimeError, "receipt"):
             self.execute("print('leader succeeded')")
         self.assert_empty()
 
