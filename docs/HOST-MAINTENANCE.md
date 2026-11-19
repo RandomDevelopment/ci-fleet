@@ -334,6 +334,23 @@ subnet capacity.
 
 Dependabot proposes updates for GitHub Actions, Go modules, and both Dockerfiles. Those pull requests must pass inert validation and be reviewed before merge. This preserves unattended host security patching without silently changing the runner control plane.
 
+The engine's `Queue Dependabot artifact patch` workflow can request native
+GitHub auto-merge for a `routine-actions` patch to the `actions/upload-artifact`
+SHA pin and version comment in `.github/workflows/build.yml`. It requires a
+signed Dependabot update, the exact diff, the upstream release pin, an up-to-date
+base and a successful GitHub Actions `Build without registering a runner` check
+on the current head. It sends the verified head with the queue request. Mixed,
+minor, major and security updates, checkout and Buildx changes, and controller,
+runner and other runtime or production dependencies follow manual review.
+
+Activation follows the existing [required-check cutover](https://github.com/RandomDevelopment/ci-fleet/issues/114).
+Build must publish the required result, and the repository and protected branch
+must support native auto-merge. GitHub offers native auto-merge only while a
+pull request has a merge requirement pending. If Build is the sole pending
+requirement, a successful Build can leave the pull request ready to merge and
+ineligible for a queue request. In that case it stays on the manual merge path.
+Verify that a head change revokes the old eligibility during the cutover.
+
 The `Update GitHub Actions runner release` workflow checks the official `actions/runner` releases each Monday. It ignores drafts and prereleases, validates the stable tag and exact Linux x64 and arm64 assets, downloads both archives, and calculates their SHA-256 checksums. When an update exists, it updates the three pins in `runner/Dockerfile` and the `CI_FLEET_RUNNER_VERSION` default in `deploy/compose.yaml` on the machine-managed `automation/update-actions-runner` branch. It creates or refreshes one pull request for normal review and validation. If all four pins are current, it makes no branch or pull-request change.
 
 Run the same check on demand from **Actions → Update GitHub Actions runner release → Run workflow**. The workflow only proposes a repository change. It does not build or deploy a host update.
