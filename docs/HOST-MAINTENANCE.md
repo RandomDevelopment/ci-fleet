@@ -351,8 +351,10 @@ requirement, a successful Build can leave the pull request ready to merge and
 ineligible for a queue request. In that case it stays on the manual merge path.
 Verify that a head change revokes the old eligibility during the cutover.
 
-The `Update GitHub Actions runner release` workflow checks the official `actions/runner` releases each Monday. It ignores drafts and prereleases, validates the stable tag and exact Linux x64 and arm64 assets, downloads both archives, and calculates their SHA-256 checksums. When an update exists, it updates the three pins in `runner/Dockerfile` and the `CI_FLEET_RUNNER_VERSION` default in `deploy/compose.yaml` on the machine-managed `automation/update-actions-runner` branch. It creates or refreshes one pull request for normal review and validation. If all four pins are current, it makes no branch or pull-request change.
+The `Update runner dependencies` workflow checks for stable updates each Monday. It verifies both Linux archives from the official `actions/runner` release and updates the pins in `runner/Dockerfile` and `deploy/compose.yaml` on `automation/update-actions-runner`.
 
-Run the same check on demand from **Actions → Update GitHub Actions runner release → Run workflow**. The workflow only proposes a repository change. It does not build or deploy a host update.
+For Buildx, APT verifies Docker's signed Debian trixie stable indexes against the pinned Docker signing key. The updater requires the same package version for amd64 and arm64. It downloads and checks both packages before updating all three Buildx pins in `runner/Dockerfile` on `automation/update-buildx`.
+
+Each update opens or refreshes its own pull request and dispatches Build validation for the update branch. Current pins produce no change to their branch or pull request. Run the workflow on demand from **Actions → Update runner dependencies → Run workflow**.
 
 Controller and runner engine updates are also pinned. A merged private configuration change is applied with `install-worker-controller.sh --upgrade`; the host never follows a moving engine or configuration branch automatically. See [Git-authored controller desired state](DESIRED-STATE.md).

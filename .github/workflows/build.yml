@@ -170,13 +170,15 @@ jobs:
       - name: Install reviewed Buildx on GitHub-hosted runners
         if: runner.environment == 'github-hosted'
         run: |
+          pins=$(python3 scripts/buildx_pin.py)
+          read -r buildx_package_version buildx_amd64_sha buildx_arm64_sha <<<"$pins"
           case "$(dpkg --print-architecture)" in
-            amd64) buildx_arch=amd64; buildx_sha=c50835adb10d6e9fc16c877d37a7a651b0ef2bac165be3ec52f8f05666cbccc8 ;;
-            arm64) buildx_arch=arm64; buildx_sha=a9ebb845ba8c2a67a815329bba341e31596c1c1f02d49ffb5670d0222253154e ;;
+            amd64) buildx_arch=amd64; buildx_sha=$buildx_amd64_sha ;;
+            arm64) buildx_arch=arm64; buildx_sha=$buildx_arm64_sha ;;
             *) echo 'unsupported Buildx architecture' >&2; exit 1 ;;
           esac
           package="$RUNNER_TEMP/buildx.deb"
-          curl -fsSLo "$package" "https://download.docker.com/linux/debian/dists/trixie/pool/stable/$buildx_arch/docker-buildx-plugin_0.32.1-1~debian.13~trixie_$buildx_arch.deb"
+          curl -fsSLo "$package" "https://download.docker.com/linux/debian/dists/trixie/pool/stable/$buildx_arch/docker-buildx-plugin_${buildx_package_version}_$buildx_arch.deb"
           printf '%s  %s\n' "$buildx_sha" "$package" | sha256sum -c -
           dpkg-deb --extract "$package" "$RUNNER_TEMP/buildx"
           sudo install -D -m 0755 "$RUNNER_TEMP/buildx/usr/libexec/docker/cli-plugins/docker-buildx" /usr/local/lib/docker/cli-plugins/docker-buildx
