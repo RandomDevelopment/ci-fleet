@@ -334,6 +334,23 @@ subnet capacity.
 
 Dependabot proposes updates for GitHub Actions, Go modules, and both Dockerfiles. Those pull requests must pass inert validation and be reviewed before merge. This preserves unattended host security patching without silently changing the runner control plane.
 
+The engine's `Queue Dependabot artifact patch` workflow can request native
+GitHub auto-merge for a `routine-actions` patch to the `actions/upload-artifact`
+SHA pin and version comment in `.github/workflows/build.yml`. It requires a
+signed Dependabot update, the exact diff, the upstream release pin, an up-to-date
+base and a successful GitHub Actions `Build without registering a runner` check
+on the current head. It sends the verified head with the queue request. Mixed,
+minor, major and security updates, checkout and Buildx changes, and controller,
+runner and other runtime or production dependencies follow manual review.
+
+Activation follows the existing [required-check cutover](https://github.com/RandomDevelopment/ci-fleet/issues/114).
+Build must publish the required result, and the repository and protected branch
+must support native auto-merge. GitHub offers native auto-merge only while a
+pull request has a merge requirement pending. If Build is the sole pending
+requirement, a successful Build can leave the pull request ready to merge and
+ineligible for a queue request. In that case it stays on the manual merge path.
+Verify that a head change revokes the old eligibility during the cutover.
+
 The `Update runner dependencies` workflow checks for stable updates each Monday. It verifies both Linux archives from the official `actions/runner` release and updates the pins in `runner/Dockerfile` and `deploy/compose.yaml` on `automation/update-actions-runner`.
 
 For Buildx, APT verifies Docker's signed Debian trixie stable indexes against the pinned Docker signing key. The updater requires the same package version for amd64 and arm64. It downloads and checks both packages before updating all three Buildx pins in `runner/Dockerfile` on `automation/update-buildx`.
