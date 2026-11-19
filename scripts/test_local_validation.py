@@ -17,6 +17,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from buildx_pin import DOCKERFILE, parse_pins
 from local_validate import run
 from verify_config_approval import Rejected, policy_digest, read_policy, verify, verify_local_evidence
 from test_config_approval import COMMIT, HEAD, TREE, PARENT, POLICY, REPOSITORY, FixtureAPI, evidence
@@ -502,7 +503,7 @@ if args[:1] == ["logs"]:
             docker.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$TEST_DOCKER_LOG"
 case "$1 $2" in
-  'buildx version') printf 'github.com/docker/buildx v0.32.1 fixture\\n' ;;
+  'buildx version') printf 'github.com/docker/buildx %s fixture\\n' "$TEST_BUILDX_VERSION" ;;
   'buildx inspect') printf 'BuildKit version: v0.32.2\\n' ;;
   'compose -f')
     [[ -n ${CI_FLEET_RUNNER_IMAGE_DIGEST:-} ]] || exit 1
@@ -529,7 +530,8 @@ exit 0
                    "CI_FLEET_VALIDATION_ROOT": str(root), "CI_FLEET_VALIDATION_ID": "cleanup-fixture",
                    "CI_FLEET_RUNNER_IMAGE": "cleanup-fixture-runner:dev",
                    "CI_FLEET_CONTROLLER_IMAGE": "cleanup-fixture-controller:dev",
-                   "TEST_DOCKER_LOG": str(log)}
+                   "TEST_DOCKER_LOG": str(log),
+                   "TEST_BUILDX_VERSION": parse_pins((ROOT / DOCKERFILE).read_text()).client_version}
             for failure, stage_status in (("none", 0), ("absent", 0), ("info", 0), ("container", 0), ("image", 0),
                                           ("container-query", 0), ("image-query", 0),
                                           ("none", 7), ("none", 130), ("none", 143)):
@@ -1122,7 +1124,7 @@ class PolicyExecutionTests(unittest.TestCase):
         validator = self.repo / ".ci-fleet-validator"
         subprocess.run(["git", "clone", "--quiet", "--no-local", str(self.repo), str(validator)], check=True)
         subprocess.run(["git", "-C", str(validator), "checkout", "--quiet", self.policy], check=True)
-        for name in ("local_validate.py", "local_validation_executor.py"):
+        for name in ("local_validate.py", "local_validation_executor.py", "buildx_pin.py"):
             shutil.copyfile(ROOT / "scripts" / name, validator / "scripts" / name)
         for event, title, base, main, accepted in (
                 ("pull_request", "invalid $(touch title-injected)", self.base, self.base, False),
