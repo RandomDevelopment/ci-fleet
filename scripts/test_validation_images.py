@@ -9,10 +9,12 @@ import tempfile
 import tarfile
 import unittest
 
-from local_validate import image_comparison_required, require_buildx, NO_PRIOR
+from buildx_pin import DOCKERFILE, parse_pins, require_buildx
+from local_validate import image_comparison_required, NO_PRIOR
 from test_apt_cache_e2e import release_archive
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILDX_VERSION = parse_pins((ROOT / DOCKERFILE).read_text()).client_version
 
 
 class ImageSelectionTests(unittest.TestCase):
@@ -63,10 +65,10 @@ class ImageSelectionTests(unittest.TestCase):
 
 class ReferenceBuildTests(unittest.TestCase):
     def test_client_preflight_requires_the_reviewed_buildx_version(self):
-        require_buildx('github.com/docker/buildx v0.32.1 fixture')
-        for version in ('github.com/docker/buildx v0.31.0 fixture', '', 'unexpected'):
-            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'v0.32.1'):
-                require_buildx(version)
+        require_buildx(f'github.com/docker/buildx {BUILDX_VERSION} fixture', ROOT)
+        for version in ('github.com/docker/buildx v0.0.0 fixture', '', 'unexpected'):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'reviewed Docker Buildx'):
+                require_buildx(version, ROOT)
 
     def test_cache_fixture_contains_the_portable_identity_capability_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -89,14 +91,14 @@ from pathlib import Path
 args = sys.argv[1:]
 with Path(os.environ['COMMANDS']).open('a') as log: log.write(json.dumps(args) + '\\n')
 if args[:2] == ['buildx', 'inspect']: print('BuildKit version: v0.32.2')
-if args[:2] == ['buildx', 'version']: print('github.com/docker/buildx v0.32.1 fixture')
+if args[:2] == ['buildx', 'version']: print('github.com/docker/buildx', os.environ['BUILDX_VERSION'], 'fixture')
 if args[:2] == ['buildx', 'build'] and 'controller/Dockerfile' in args:
     raise SystemExit(int(os.environ.get('FAIL_BUILD', '0')))
 ''')
             docker.chmod(0o755)
             for failure in ('0', '37'):
                 log = root / ('commands-' + failure)
-                env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'], COMMANDS=str(log),
+                env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'], COMMANDS=str(log), BUILDX_VERSION=BUILDX_VERSION,
                            CI_FLEET_COMMIT='a' * 40, CI_FLEET_VERSION='a' * 12,
                            CI_FLEET_RUNNER_IMAGE='fixture-runner', CI_FLEET_CONTROLLER_IMAGE='fixture-controller', FAIL_BUILD=failure)
                 result = subprocess.run(['bash', str(ROOT / 'scripts/build-validation-images.sh')],

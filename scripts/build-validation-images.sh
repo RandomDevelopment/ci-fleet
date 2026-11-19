@@ -3,8 +3,8 @@ set -Eeuo pipefail
 # shellcheck source=scripts/validation_diagnostics.sh
 source "$(dirname "${BASH_SOURCE[0]}")/validation_diagnostics.sh"
 # The cache comparison reuses this direct pair, with identical managed build inputs.
-version=$(docker buildx version 2>/dev/null | awk '{print $2}')
-[[ "$version" == v0.32.1 ]] || { printf 'reviewed Docker Buildx v0.32.1 is required\n' >&2; exit 1; }
+version=$(docker buildx version 2>/dev/null) || version=
+python3 "$(dirname "${BASH_SOURCE[0]}")/buildx_pin.py" --check "$version"
 builder=ci-fleet-validation-$(</proc/sys/kernel/random/uuid)
 cleanup() { docker buildx rm --force "$builder" >/dev/null; }
 docker buildx create --name "$builder" --driver docker-container \

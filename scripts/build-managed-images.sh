@@ -4,8 +4,8 @@ release=$1
 environment=$2
 manifest=${3:-}
 metadata=${4:-}
-version=$(docker buildx version 2>/dev/null | awk '{print $2}')
-[[ "$version" == v0.32.1 ]] || { printf 'reviewed Docker Buildx v0.32.1 is required\n' >&2; exit 1; }
+version=$(docker buildx version 2>/dev/null) || version=
+python3 "$(dirname "${BASH_SOURCE[0]}")/buildx_pin.py" --check "$version"
 # A caller's ambient proxy settings must not enable a managed cache implicitly.
 unset CI_FLEET_APT_HTTP_PROXY CI_FLEET_NO_PROXY
 set -a

@@ -74,6 +74,8 @@ export REAL_PYTHON3
 REAL_PYTHON3=$(command -v python3)
 export REAL_TIMEOUT
 REAL_TIMEOUT=$(command -v timeout)
+FAKE_DEFAULT_BUILDX_VERSION=$(python3 "$repo_root/scripts/buildx_pin.py" --version)
+export FAKE_DEFAULT_BUILDX_VERSION
 
 cat >"$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -122,7 +124,7 @@ case "${1:-}" in
     ;;
   buildx)
     case "${2:-}" in
-      version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-v0.32.1}" ;;
+      version) [[ ${FAKE_BUILDX_UNAVAILABLE:-0} == 0 ]] || exit 1; printf 'github.com/docker/buildx %s\n' "${FAKE_BUILDX_VERSION:-${FAKE_DEFAULT_BUILDX_VERSION:?}}" ;;
       inspect) [[ ${FAKE_FAIL_BUILDER_BOOTSTRAP:-0} == 0 ]] || exit 1; printf 'Name: ci-fleet-managed\nDriver: docker-container\nNodes:\nBuildKit version: %s\n' "${FAKE_BUILDKIT_VERSION-v0.32.2}" ;;
       create|rm)
         [[ -z ${FAKE_BUILDER_LOG:-} ]] || printf '%s|%s\n' "$2" "$*" >>"$FAKE_BUILDER_LOG"
@@ -941,8 +943,8 @@ secret_ref=$(git -C "$config_repo" rev-parse HEAD)
 git -C "$config_repo" reset -q --hard "$ref_one"
 installer=$repo_root/scripts/install-worker-controller.sh
 base_args=(--config-repo "$config_repo" --controller example-ci-01)
-export FAKE_BUILDX_VERSION=v0.9.0
-expect_failure 'reviewed Docker Buildx v0.32.1 is required' "$repo_root/scripts/build-managed-images.sh" "$repo_root" "$tmp/unused-build.env"
+export FAKE_BUILDX_VERSION=v0.0.0
+expect_failure "reviewed Docker Buildx $FAKE_DEFAULT_BUILDX_VERSION is required" "$repo_root/scripts/build-managed-images.sh" "$repo_root" "$tmp/unused-build.env"
 unset FAKE_BUILDX_VERSION
 
 expect_failure 'alternate Docker endpoints are not supported' env DOCKER_HOST=tcp://example.invalid:2376 "$installer" --check "${base_args[@]}" --ref "$ref_one"

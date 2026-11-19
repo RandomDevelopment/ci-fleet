@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 repo = Path(sys.argv[1])
+buildx_version = subprocess.check_output(['python3', str(repo / 'scripts/buildx_pin.py'), '--version'], text=True).strip()
 fixture = (repo / 'scripts/test-install-worker-controller.sh').read_text()
 docker_source = fixture.split('cat >"$fake_bin/docker" <<\'EOF\'\n', 1)[1].split('\nEOF', 1)[0]
 with tempfile.TemporaryDirectory() as temporary:
@@ -26,6 +27,7 @@ with tempfile.TemporaryDirectory() as temporary:
                   CI_FLEET_RUNNER_IMAGE_DIGEST=runner_id, CI_FLEET_CONTROLLER_IMAGE_DIGEST=controller_id)
     environment.write_text(''.join(f'{key}={value}\n' for key, value in values.items()))
     env = os.environ | dict(PATH=str(root) + ':' + os.environ['PATH'],
+                           FAKE_DEFAULT_BUILDX_VERSION=buildx_version,
                            FAKE_DOCKER_STATE=str(root / 'running'),
                            FAKE_RUNNER_IMAGE=values['CI_FLEET_RUNNER_IMAGE'],
                            FAKE_CONTROLLER_IMAGE=values['CI_FLEET_CONTROLLER_IMAGE'],
