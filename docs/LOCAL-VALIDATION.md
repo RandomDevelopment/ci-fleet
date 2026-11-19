@@ -23,7 +23,9 @@ The system systemd manager must be PID 1 on the execution machine. Both engine p
 check for jq before running stages because the installer fixtures require it.
 The full engine run also requires Docker Engine, Compose v2, Docker Buildx
 v0.32.1 and access to its local Unix socket. The tool preflight rejects another
-Buildx client before any validation stage. The shared direct reference pair and
+Buildx client before any validation stage. The engine workflow installs the
+checksum-verified v0.32.1 plugin system-wide on GitHub-hosted runners. Self-hosted
+runners must supply that version. The shared direct reference pair and
 managed rebuilds use this same reviewed client with the pinned BuildKit v0.32.2
 backend, so client differences cannot invalidate the cache comparison.
 The harness records tool versions. Missing tools, skipped tests and interrupted
