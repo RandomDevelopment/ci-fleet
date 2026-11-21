@@ -72,6 +72,12 @@ Runnable changes must eventually include:
 
 Keep changes small and reversible. Existing project CI must continue operating until the new fleet path has passed parallel validation, completed the compliance checklist, and has an explicit tested rollback or documented reinstall procedure appropriate to the host's failure boundary.
 
+## GitHub reviews, assignments, and notifications
+
+- Never request PR reviews from anyone other than Nick or a bot. Do not request reviews from other humans or teams.
+- Never assign any GitHub user to anything, including PRs and issues. This includes Nick and bot accounts.
+- Do not pester anyone or create unnecessary notifications through mentions, review requests, repeated comments, or other GitHub actions.
+
 
 ## Documentation impact
 

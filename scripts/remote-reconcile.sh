@@ -82,7 +82,7 @@ transaction_result=$temp_dir/transaction-result.json
 : >"$transaction_result"
 chmod 0600 "$transaction_result"
 exec 7>"$transaction_result"
-# shellcheck disable=SC2317 # cleanup_temp is invoked indirectly via trap
+# shellcheck disable=SC2317,SC2329 # cleanup_temp is invoked indirectly via trap
 cleanup_temp() { rm -rf "$temp_dir"; }
 trap cleanup_temp EXIT
 
