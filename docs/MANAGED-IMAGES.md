@@ -267,7 +267,12 @@ for role in controller runner; do
 done
 ```
 
-Managed builds require the reviewed Docker Buildx client v0.32.1. Read-only checks, manager staging, maintenance that reuses matching images, uninstall and retained-image rollback do not require that plugin. Rollback that must rebuild requires the reviewed client. Host tool installation or upgrade remains separately authorized.
+Managed builds require the exact Docker Buildx client version pinned in the
+selected engine's `runner/Dockerfile`. Read-only checks, manager staging,
+maintenance that reuses matching images, uninstall and retained-image rollback
+do not require that plugin. Rollback that must rebuild requires the version
+pinned by the engine being rebuilt. Host tool installation or upgrade remains
+separately authorized.
 
 Managed installation creates the same digest-pinned v0.32.2 backend for every rebuild, verifies its reported version exactly, and removes only its own temporary builder afterward. Builder and staging names include a per-invocation UUID; an existing operator builder is never removed.
 

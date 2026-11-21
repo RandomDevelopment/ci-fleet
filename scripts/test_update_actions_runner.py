@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for update_actions_runner.py."""
+"""Focused tests for the dependency updaters."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import update_actions_runner as updater
+import update_buildx
 
 
 DOCKERFILE = """# syntax=docker/dockerfile:1.18
@@ -245,6 +247,38 @@ class ReplacementTests(unittest.TestCase):
 
         with self.assertRaisesRegex(updater.UpdateError, "refusing to downgrade"):
             updater.update_repository(self.root, selected_release("2.336.0"), self.checksums)
+
+
+class BuildxUpdateTests(unittest.TestCase):
+    def test_bad_arm64_download_leaves_all_pins_intact(self) -> None:
+        version = "0.40.1-1~debian.13~trixie"
+        artifacts = {"amd64": b"amd64-buildx", "arm64": b"arm64-buildx"}
+        packages = {
+            arch: update_buildx.Package(
+                version, update_buildx.package_path(version, arch),
+                len(data), hashlib.sha256(data).hexdigest(),
+            )
+            for arch, data in artifacts.items()
+        }
+
+        def download(url, destination):
+            arch = "amd64" if url.endswith("_amd64.deb") else "arm64"
+            destination.write_bytes(artifacts[arch] if arch == "amd64" else b"bad-download")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dockerfile = root / "Dockerfile"
+            original = (
+                "ARG BUILDX_VERSION=0.32.1-1~debian.13~trixie\n"
+                f"ARG BUILDX_SHA256_AMD64={'a' * 64}\n"
+                f"ARG BUILDX_SHA256_ARM64={'b' * 64}\n"
+            )
+            dockerfile.write_text(original)
+            with patch("update_buildx.download", side_effect=download) as fetch:
+                with self.assertRaisesRegex(ValueError, "arm64 package SHA-256 mismatch"):
+                    update_buildx.update_pins(dockerfile, packages, root)
+                self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(dockerfile.read_text(), original)
 
 
 if __name__ == "__main__":

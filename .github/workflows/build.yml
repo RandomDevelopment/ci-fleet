@@ -167,6 +167,22 @@ jobs:
       - name: Install static analysis tools
         run: sudo apt-get update && sudo apt-get install -y shellcheck python3-yaml
 
+      - name: Install reviewed Buildx on GitHub-hosted runners
+        if: runner.environment == 'github-hosted'
+        run: |
+          pins=$(python3 scripts/buildx_pin.py)
+          read -r buildx_package_version buildx_amd64_sha buildx_arm64_sha <<<"$pins"
+          case "$(dpkg --print-architecture)" in
+            amd64) buildx_arch=amd64; buildx_sha=$buildx_amd64_sha ;;
+            arm64) buildx_arch=arm64; buildx_sha=$buildx_arm64_sha ;;
+            *) echo 'unsupported Buildx architecture' >&2; exit 1 ;;
+          esac
+          package="$RUNNER_TEMP/buildx.deb"
+          curl -fsSLo "$package" "https://download.docker.com/linux/debian/dists/trixie/pool/stable/$buildx_arch/docker-buildx-plugin_${buildx_package_version}_$buildx_arch.deb"
+          printf '%s  %s\n' "$buildx_sha" "$package" | sha256sum -c -
+          dpkg-deb --extract "$package" "$RUNNER_TEMP/buildx"
+          sudo install -D -m 0755 "$RUNNER_TEMP/buildx/usr/libexec/docker/cli-plugins/docker-buildx" /usr/local/lib/docker/cli-plugins/docker-buildx
+
       - name: Run the complete local suite
         env:
           SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
