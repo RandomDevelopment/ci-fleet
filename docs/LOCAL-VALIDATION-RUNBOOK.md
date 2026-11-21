@@ -35,8 +35,9 @@ sudo apt-get install --no-install-recommends \
 ```
 
 Install Docker Engine, Compose v2 and the Docker Buildx plugin through your
-reviewed Linux host procedure, then check `docker version`, `docker compose version`
-and `docker buildx version`. Do not install Docker
+reviewed Linux host procedure, then check `docker version` and `docker compose version`.
+Run `python3 scripts/buildx_pin.py --check "$(docker buildx version)"` from the
+reviewed policy checkout to check the installed Buildx version. Do not install Docker
 or run privileged fixtures on an existing fleet or application host. Downloads
 need network access unless Git objects, packages and images are already present.
 Verify outbound DNS and HTTPS from Docker build containers under the worker's

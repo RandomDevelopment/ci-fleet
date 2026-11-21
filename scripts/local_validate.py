@@ -18,6 +18,8 @@ import sys
 import tempfile
 import time
 
+from buildx_pin import require_buildx
+
 WORK = Path("/var/lib/ci-validation-work")
 EXECUTOR_PATH = Path("/usr/local/lib/ci-fleet-validation/executor.py")
 
@@ -76,12 +78,6 @@ def image_comparison_required(repo: Path, base: str, source: str) -> bool:
                 if not inputs or any(not path.startswith(("controller/", "scripts/")) or ".." in Path(path).parts for path in inputs):
                     return True
     return False
-
-
-def require_buildx(version: str) -> None:
-    fields = version.split()
-    if len(fields) < 2 or fields[1] != "v0.32.1":
-        raise ValueError("reviewed Docker Buildx v0.32.1 is required")
 
 
 def regression_context(report: dict) -> str:
@@ -311,7 +307,7 @@ def validate(args: argparse.Namespace) -> int:
             for name, command in tools.items():
                 report["tools"][name] = subprocess.check_output(command, env=env, text=True, stderr=subprocess.STDOUT).strip()
                 if name == "buildx":
-                    require_buildx(report["tools"][name])
+                    require_buildx(report["tools"][name], policy)
             validator = str(policy / "scripts/validate_commits.py")
             scanner = str(policy / "scripts/scan_committed_secrets.py")
             selected_tags = release_tags(repo, validator, args.source, args.main, args.tag, env) if args.tag else {}

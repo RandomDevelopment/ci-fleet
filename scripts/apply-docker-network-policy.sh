@@ -1193,7 +1193,7 @@ PY
   checkpoint_path_is_pinned || die 'checkpoint directory changed during network-policy removal'
 
   removal_failure='network-policy removal interrupted'
-  # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
+  # shellcheck disable=SC2317,SC2329 # invoked indirectly by the EXIT trap below
   rollback_removal() {
     local failed=0 rollback_daemon=$work_dir/daemon.json.rollback rollback_expected=$work_dir/daemon.json.rollback-expected
     if [[ "$controller_resumed" == true ]]; then
@@ -1254,7 +1254,7 @@ PY
     fi
     return "$failed"
   }
-  # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap below
+  # shellcheck disable=SC2317,SC2329 # invoked indirectly by the EXIT trap below
   removal_on_exit() {
     local status=$? result
     trap '' INT TERM
