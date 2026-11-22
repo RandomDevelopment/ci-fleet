@@ -29,6 +29,7 @@ TASKS = [
     ('validation-images', ['python3', 'scripts/test_validation_images.py'], False),
     ('task-plan', ['python3', '.github/actions/plan/test_plan.py'], False),
     ('runner-update', ['python3', 'scripts/test_update_actions_runner.py'], False),
+    ('dependabot-patch', ['python3', 'scripts/test_verify_dependabot_patch.py'], False),
     ('desired-state', ['python3', 'scripts/test_desired_state.py'], False),
     ('image-identity', ['python3', 'tests/test_managed_image_identity.py'], False),
     ('image-lifecycle', ['python3', 'scripts/test_portable_image_lifecycle.py'], False),

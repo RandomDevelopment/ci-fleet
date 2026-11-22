@@ -1,0 +1,36 @@
+name: Verify Dependabot artifact patch
+
+on:
+  workflow_run:
+    workflows: [Build ci-fleet]
+    types: [completed]
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: dependabot-verify-${{ github.event.workflow_run.head_sha }}
+
+jobs:
+  verify:
+    if: >-
+      github.repository == 'RandomDevelopment/ci-fleet' &&
+      github.event.workflow_run.workflow_id == 416363263 &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.id == github.event.repository.id &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/github_actions/routine-actions-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # workflow_run executes on the default branch. Never execute the PR tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 -I scripts/verify_dependabot_patch.py
+        env:
+          GH_TOKEN: ${{ github.token }}
