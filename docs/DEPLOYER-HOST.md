@@ -233,6 +233,20 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudo chmod 0600 /etc/ci-fleet-deployer/deployer.conf
 ```
 
+Optional host-local keys enable verified pre-replacement shutdown during `--rollback` for singleton workloads such as schedulers:
+
+```text
+ROLLBACK_EXCLUSIVE_SERVICES=scheduler
+ROLLBACK_STOP_TIMEOUT_SECONDS=120
+ROLLBACK_STOP_SIGNAL=SIGTERM
+```
+
+`ROLLBACK_EXCLUSIVE_SERVICES` is a comma-separated list of 1 to 32 unique service identifiers (`^[a-z0-9][a-z0-9._-]{0,63}$`), where `ci-fleet-deploy-<DEPLOYER_IDENTITY>-<service>` is at most 128 characters. `ROLLBACK_STOP_TIMEOUT_SECONDS` is optional (`1` to `600`, default `120`), and the product of exclusive service count across active and last-known-good policies and timeout cannot exceed `1800` seconds. `ROLLBACK_STOP_SIGNAL` is optional (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, or `SIGWINCH`); `SIGKILL` is forbidden in policy. When `ROLLBACK_STOP_SIGNAL` is omitted, rollback reads the container's `StopSignal` if it is in the graceful allowlist, defaults to `SIGTERM` if empty, and rejects `SIGKILL` or unknown signals before signaling. Both timeout and signal keys require `ROLLBACK_EXCLUSIVE_SERVICES`.
+
+Core resolves each service only within the target's four ownership labels (`role=deployer`, `identity`, `environment`, `target`). A container matches `<service>` when its `io.randomdevelopment.ci-fleet.service` label equals `<service>`, or when that label is absent and its container name equals `ci-fleet-deploy-<DEPLOYER_IDENTITY>-<service>`. Ambiguous matches, conflicting labels, or paused containers fail closed before signaling. Sibling non-exclusive containers and persistent volumes remain untouched.
+
+Core commits supporting these keys reject unknown policy keys on older revisions. Upgrade to a supporting `CORE_REF` before adding `ROLLBACK_*` fields to `deployer.conf`, and keep both the active release and the retained last-known-good `CORE_REF` on supporting commits; `--rollback` blocks if a last-known-good policy declaring `ROLLBACK_*` points at an older core release without support.
+
 For an external secret manager, provision the protected credential file before invocation, keep `CREDENTIAL_PROVIDER=file`, and set `CREDENTIAL_REF` to its canonical path. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`. Production additionally requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/production-authorization.conf`.
 
 ## Install, check, repair, upgrade, drain, and rollback
@@ -284,11 +298,18 @@ sudo ./scripts/install-deployer.sh \
   --resume --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
-Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active:
+Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active. When `ROLLBACK_EXCLUSIVE_SERVICES` is configured on the active or last-known-good policy, `--rollback` stops each declared singleton before invoking `adapter rollback`. It sets `RestartPolicy=no`, sends the configured graceful signal without silent `SIGKILL`, and waits until Docker confirms the container has exited (`Running=false`, `Restarting=false`, `Paused=false`, `Pid=0`, `RestartPolicy=no`). During the adapter run, the broker prevents creating or starting overlapping exclusive containers, blocks starting containers with unapproved images, and rejects commit publication if duplicate or unhealthy active containers remain. After commit finalization, core runs read-only `adapter health` and writes the rolled-back artifact, exclusive services, escalation state, and elapsed stop duration to `/var/log/ci-fleet-deployer/audit.log`.
 
 ```bash
 sudo ./scripts/install-deployer.sh \
   --rollback --config /etc/ci-fleet-deployer/deployer.conf
+```
+
+If graceful shutdown times out or exit cannot be verified, core reports the environment, target, service, container ID, and reason, logs `result=stop_failed` to `audit.log`, leaves `install-state.json`, `active-policy.conf`, and the `current` symlink at their pre-rollback state, and retains the rollback transaction. Subsequent checks, upgrades, repairs, drains, resumes, and runtime operations block until `--rollback` reconciles the workload. Wait for the workload to exit and rerun `--rollback`, or explicitly authorize `SIGKILL` escalation after timeout (which audits `result=stop_escalated escalation=sigkill` before signaling and still verifies exit within 30 seconds):
+
+```bash
+sudo ./scripts/install-deployer.sh \
+  --rollback --force-stop-timeout --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
 The report's next action is `restore-host-policy-evidence-then-check`. Restore the prior reviewed `deployer.conf`, exact-head approval evidence, and checkpoint evidence through the same protected operator process that created them; do not copy secrets through the shell. Then verify read-only:
