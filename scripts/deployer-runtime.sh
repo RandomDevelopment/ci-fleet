@@ -9,6 +9,7 @@ case "$operation" in health|cleanup|deploy|drain) ;; *) printf 'ERROR: usage: de
 root=${CI_FLEET_DEPLOYER_ROOT:-}
 testing=${CI_FLEET_DEPLOYER_TESTING:-0}
 [[ -z "$root" || "$testing" == 1 ]] || { printf 'ERROR: alternate root is test-only\n' >&2; exit 2; }
+[[ -z ${CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET:-} || "$testing" == 1 ]] || { printf 'ERROR: test Docker socket override is test-only\n' >&2; exit 2; }
 if [[ "$testing" == 1 && -z "$root" ]]; then printf 'ERROR: test mode requires an alternate root\n' >&2; exit 2; fi
 root_path() { printf '%s%s' "$root" "$1"; }
 config=${CI_FLEET_DEPLOYER_CONFIG:-$(root_path /var/lib/ci-fleet-deployer/active-policy.conf)}
@@ -389,7 +390,7 @@ fi
 install -m 0600 "$config" "$policy_snapshot"
 config=$policy_snapshot
 trap 'rm -f "${policy_snapshot:-}"' EXIT
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE ROLLBACK_EXCLUSIVE_SERVICES ROLLBACK_STOP_TIMEOUT_SECONDS ROLLBACK_STOP_SIGNAL'
 parse_file "$config" cfg configuration "$config_keys"
 [[ $testing == 1 || -v 'cfg[DOCKER_SOCKET]' ]] || die 'configuration requires a dedicated rootless Docker socket'
 DOCKER_HOST=unix://${cfg[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
@@ -435,6 +436,7 @@ exec 7<"${cfg[ADAPTER_PATH]}"
 [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "${cfg[ADAPTER_SHA256]}" ]] || die 'application adapter digest mismatch'
 adapter_path=/proc/$$/fd/7
 validate_credential
+python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$config" >/dev/null || die 'configuration has invalid rollback exclusive-service settings'
 if [[ -e $log_root/pending-consumption.json || -L $log_root/pending-consumption.json ]]; then
   [[ $operation == deploy ]] || die 'pending approval consumption requires mutating installer recovery'
   python3 "$script_dir/deployer_adapter.py" consumption --store "$log_root" || die 'approval consumption recovery failed'
@@ -636,6 +638,7 @@ PY
       [[ ! -L "${lkg_policy[ADAPTER_PATH]}" && -f "${lkg_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${lkg_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'last-known-good adapter is missing or unsafe'
       [[ $(sha256sum "${lkg_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${lkg_policy[ADAPTER_SHA256]}" ]] || die 'last-known-good adapter digest does not match its retained policy'
       validate_credential lkg_policy
+      python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$previous_policy" >/dev/null || die 'last-known-good policy has invalid rollback exclusive-service settings'
     fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'
@@ -680,6 +683,7 @@ PY
     else
       die 'deployed rollback policy has an unsupported credential provider'
     fi
+    python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$deployed_snapshot/policy.conf" >/dev/null || die 'deployed rollback policy has invalid rollback exclusive-service settings'
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
     chmod 0700 "$snapshot"
     install -m 0600 "$config" "$snapshot/policy.conf"
