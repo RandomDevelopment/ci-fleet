@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Request GitHub native auto-merge for a verified Dependabot artifact patch."""
+"""Verify the Dependabot artifact patch and its Build without changing the PR."""
 
 import json
 import os
@@ -17,47 +17,11 @@ DEPENDABOT_ID = 49699333
 SHA = r"[0-9a-f]{40}"
 VERSION = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}"
 PIN = re.compile(rf"( +uses: actions/upload-artifact@)({SHA}) # v({VERSION})")
-QUEUE_STATE = """
-query($id: ID!) {
-  node(id: $id) {
-    ... on PullRequest {
-      headRefOid
-      baseRefOid
-      baseRefName
-      state
-      isDraft
-      viewerCanEnableAutoMerge
-      autoMergeRequest { enabledAt }
-      isMergeQueueEnabled
-      repository { autoMergeAllowed }
-      baseRef {
-        branchProtectionRule {
-          isAdminEnforced
-          requiresStatusChecks
-          requiresStrictStatusChecks
-          requiredStatusChecks { context app { databaseId } }
-        }
-      }
-    }
-  }
-}
-"""
-ENABLE_AUTO_MERGE = """
-mutation($input: EnablePullRequestAutoMergeInput!) {
-  enablePullRequestAutoMerge(input: $input) {
-    pullRequest { autoMergeRequest { enabledAt } }
-  }
-}
-"""
 
 
-def gh(path, *args, data=None):
-    command = ["gh", "api", path, *args]
-    if data is not None:
-        command.extend(["--method", "POST", "--input", "-"])
+def gh(path, *args):
     result = subprocess.run(
-        command, input=json.dumps(data).encode() if data is not None else None,
-        check=True, stdout=subprocess.PIPE,
+        ["gh", "api", "--method", "GET", path, *args], check=True, stdout=subprocess.PIPE,
     )
     return result.stdout.decode()
 
@@ -112,7 +76,7 @@ def eligible_pull(pull, repo_id, head, branch):
     )
 
 
-def build_passed(api, repo, event_run):
+def build_passed(api, repo, event_run, pull):
     query = urlencode({"event": "pull_request", "head_sha": event_run["head_sha"], "per_page": 1})
     runs = api(f"{repo}/actions/workflows/{BUILD_WORKFLOW_ID}/runs?{query}")["workflow_runs"]
     if not runs:
@@ -120,7 +84,18 @@ def build_passed(api, repo, event_run):
     run = runs[0]
     if (run["id"] != event_run["id"] or run["run_attempt"] != event_run["run_attempt"]
             or run["head_sha"] != event_run["head_sha"] or run["workflow_id"] != BUILD_WORKFLOW_ID
-            or run["status"] != "completed" or run["conclusion"] != "success"):
+            or run["event"] != "pull_request" or run["status"] != "completed"
+            or run["conclusion"] != "success"):
+        return False
+    associations = run.get("pull_requests") or []
+    if len(associations) != 1:
+        return False
+    associated, = associations
+    if (associated["number"] != pull["number"]
+            or any(associated[side]["ref"] != pull[side]["ref"]
+                   or associated[side]["sha"] != pull[side]["sha"]
+                   or associated[side]["repo"]["id"] != pull[side]["repo"]["id"]
+                   for side in ("base", "head"))):
         return False
     query = urlencode({"check_name": BUILD_CHECK, "filter": "latest"})
     result = api(f"{repo}/check-suites/{run['check_suite_id']}/check-runs?{query}")
@@ -134,9 +109,9 @@ def build_passed(api, repo, event_run):
     )
 
 
-def queue_patch(event, request=gh):
-    def api(path, *args, **kwargs):
-        return json.loads(request(path, *args, **kwargs))
+def verify_patch(event, request=gh):
+    def api(path, *args):
+        return json.loads(request(path, *args))
 
     repository = event["repository"]
     if repository["full_name"] != "RandomDevelopment/ci-fleet":
@@ -153,9 +128,10 @@ def queue_patch(event, request=gh):
     pulls = api(f"{repo}/pulls?{query}")
     if len(pulls) != 1:
         return False
-    path = f"{repo}/pulls/{int(pulls[0]['number'])}"
+    number = int(pulls[0]["number"])
+    path = f"{repo}/pulls/{number}"
     pull = api(path)
-    if not eligible_pull(pull, repository["id"], head, branch) or pull["auto_merge"] is not None:
+    if not eligible_pull(pull, repository["id"], head, branch):
         return False
 
     base = pull["base"]["sha"]
@@ -184,37 +160,16 @@ def queue_patch(event, request=gh):
     if api(f"{upstream}/commits/refs%2Ftags%2F{tag}")["sha"] != pin:
         return False
 
-    if not build_passed(api, repo, run):
-        return False
-    pull_id = pull["node_id"]
-    state = api("graphql", data={"query": QUEUE_STATE, "variables": {"id": pull_id}})["data"]["node"]
-    protection = (state["baseRef"] or {}).get("branchProtectionRule") or {}
-    required_build = any(
-        check["context"] == BUILD_CHECK and (check["app"] or {}).get("databaseId") == GITHUB_ACTIONS_APP_ID
-        for check in protection.get("requiredStatusChecks") or []
-    )
-    if (state["headRefOid"] != head or state["baseRefOid"] != base or state["baseRefName"] != "main"
-            or state["state"] != "OPEN" or state["isDraft"]
-            or state["autoMergeRequest"] or state["isMergeQueueEnabled"]
-            or not state["repository"]["autoMergeAllowed"] or not state["viewerCanEnableAutoMerge"]
-            or not all(protection.get(setting) is True for setting in
-                       ("isAdminEnforced", "requiresStatusChecks", "requiresStrictStatusChecks"))
-            or not required_build):
+    if not build_passed(api, repo, run, pull):
         return False
 
-    # The CLI's --auto can immediately merge a ready PR. Request only native auto-merge.
-    queued = api("graphql", data={
-        "query": ENABLE_AUTO_MERGE,
-        "variables": {"input": {
-            "pullRequestId": pull_id,
-            "expectedHeadOid": head,
-            "mergeMethod": "SQUASH",
-            "commitHeadline": f"ci(deps): bump actions/upload-artifact to {tag} (#{pull['number']})",
-        }},
-    })["data"]["enablePullRequestAutoMerge"]["pullRequest"]
-    return queued["autoMergeRequest"] is not None
+    current = api(path)
+    return eligible_pull(current, repository["id"], head, branch) and current["base"]["sha"] == base
 
 
 if __name__ == "__main__":
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    print("Requested native auto-merge." if queue_patch(event) else "No auto-merge requested.")
+    if verify_patch(event):
+        print(f"Verified artifact patch and Build for {event['workflow_run']['head_sha']}. Merge remains manual.")
+    else:
+        print("No matching artifact patch and Build verified.")
