@@ -291,7 +291,7 @@ class _DockerClient:
             yield
             return
 
-        # Only the dedicated stop helper's main thread uses the alarm.
+        # Stop and readiness run in the helper's main thread.
         def expired(_signum, _frame):
             raise TimeoutError("Docker stop deadline elapsed")
 
@@ -816,6 +816,7 @@ def handler(policy: Policy):
 
         def dispatch(self):
             mutation = False
+            lock = None
             try:
                 require(not self.headers.get("Transfer-Encoding"), "chunked requests are forbidden")
                 length = int(self.headers.get("Content-Length", "0"))
@@ -826,73 +827,76 @@ def handler(policy: Policy):
                 exclusive_rollback = policy.operation == "rollback" and bool(policy.exclusive_services)
                 read_only_wait = exclusive_rollback and self.command == "POST" and re.fullmatch(r"/containers/[^/]+/wait", req_norm)
                 serialize_exclusive = exclusive_rollback and self.command in ("POST", "DELETE") and not read_only_wait
-                lock = policy._exclusive_lock if serialize_exclusive else contextlib.nullcontext()
-                with lock:
-                    if serialize_exclusive:
-                        require(not policy.uncertain, "Docker mutation completion is unverified")
-                        require(policy.rollback_outcome is None or self.path == "/ci-fleet/rollback-commit",
-                                "rollback outcome has already been published")
-                    if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
-                        require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
-                        require(policy.operation == "rollback" and policy.marker is not None
-                                and body in (b"committed", b"failed"), "rollback outcome is not authorized")
-                        outcome = body.decode()
-                        require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
-                        if outcome == "committed":
-                            if policy.rollback_ready is not None:
-                                mutation = True
-                                durable_file(policy.rollback_ready, json.dumps({
-                                    "marker": str(policy.marker),
-                                    "services": policy.exclusive_services,
-                                    "incumbents": policy.rollback_incumbents,
-                                }, sort_keys=True).encode())
-                            else:
-                                policy.verify_rollback_commit()
-                                mutation = True
-                                durable_file(policy.marker, b"committed\n")
+                if serialize_exclusive:
+                    policy._exclusive_lock.acquire()
+                    lock = policy._exclusive_lock
+                    require(not policy.uncertain, "Docker mutation completion is unverified")
+                    require(policy.rollback_outcome is None or self.path == "/ci-fleet/rollback-commit",
+                            "rollback outcome has already been published")
+                if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
+                    require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
+                    require(policy.operation == "rollback" and policy.marker is not None
+                            and body in (b"committed", b"failed"), "rollback outcome is not authorized")
+                    outcome = body.decode()
+                    require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
+                    if outcome == "committed":
+                        if policy.rollback_ready is not None:
+                            mutation = True
+                            durable_file(policy.rollback_ready, json.dumps({
+                                "marker": str(policy.marker),
+                                "services": policy.exclusive_services,
+                                "incumbents": policy.rollback_incumbents,
+                            }, sort_keys=True).encode())
                         else:
-                            require(not policy.marker.exists() and not policy.marker.is_symlink(),
-                                    "failed rollback conflicts with its commit marker")
-                        policy.rollback_outcome = outcome
-                        status, response = 204, b""
+                            policy.verify_rollback_commit()
+                            mutation = True
+                            durable_file(policy.marker, b"committed\n")
                     else:
-                        path, body = policy.authorize(self.command, self.path, body)
-                        headers = {"Content-Type": "application/json"}
-                        mutation = self.command not in ("GET", "HEAD") and not read_only_wait
-                        status, response = policy.backend.request(self.command, path, body, headers)
-                        if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
-                            progress = [decode(line) for line in response.splitlines() if line.strip()]
-                            require(bool(progress), "image pull completion is unavailable")
-                            if not any(item.get("error") or item.get("errorDetail") for item in progress):
-                                image = policy.backend.inspect("images", policy.image)
-                                require(policy.image in (image.get("RepoDigests") or []), "pulled artifact digest is unverified")
-                                policy.record_artifact()
-                        if self.command == "GET" and path.startswith("/images/json?") and status == 200:
-                            inventory = json.loads(response, object_pairs_hook=unique_object)
-                            require(isinstance(inventory, list), "invalid image inventory")
-                            owned = {image for image, labels in policy.artifacts().items() if labels == policy.labels}
-                            scoped = []
-                            for item in inventory:
-                                require(isinstance(item, dict), "invalid image inventory entry")
-                                digests = [digest for digest in item.get("RepoDigests") or [] if digest in owned]
-                                if digests:
-                                    item["RepoDigests"], item["RepoTags"] = digests, []
-                                    scoped.append(item)
-                            response = json.dumps(scoped).encode()
-                        if self.command == "DELETE" and path.startswith("/images/") and 200 <= status < 300 and policy.artifact_store is not None:
-                            records = policy.artifacts()
-                            records.pop(path.split("?", 1)[0][len("/images/"):], None)
-                            durable_file(policy.artifact_store, json.dumps(records, sort_keys=True).encode())
-                        if mutation and status >= 500:
-                            policy.uncertain = True
-                            if policy.uncertain_marker is not None:
-                                durable_file(policy.uncertain_marker, b"uncertain\n")
+                        require(not policy.marker.exists() and not policy.marker.is_symlink(),
+                                "failed rollback conflicts with its commit marker")
+                    policy.rollback_outcome = outcome
+                    status, response = 204, b""
+                else:
+                    path, body = policy.authorize(self.command, self.path, body)
+                    headers = {"Content-Type": "application/json"}
+                    mutation = self.command not in ("GET", "HEAD") and not read_only_wait
+                    status, response = policy.backend.request(self.command, path, body, headers)
+                    if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
+                        progress = [decode(line) for line in response.splitlines() if line.strip()]
+                        require(bool(progress), "image pull completion is unavailable")
+                        if not any(item.get("error") or item.get("errorDetail") for item in progress):
+                            image = policy.backend.inspect("images", policy.image)
+                            require(policy.image in (image.get("RepoDigests") or []), "pulled artifact digest is unverified")
+                            policy.record_artifact()
+                    if self.command == "GET" and path.startswith("/images/json?") and status == 200:
+                        inventory = json.loads(response, object_pairs_hook=unique_object)
+                        require(isinstance(inventory, list), "invalid image inventory")
+                        owned = {image for image, labels in policy.artifacts().items() if labels == policy.labels}
+                        scoped = []
+                        for item in inventory:
+                            require(isinstance(item, dict), "invalid image inventory entry")
+                            digests = [digest for digest in item.get("RepoDigests") or [] if digest in owned]
+                            if digests:
+                                item["RepoDigests"], item["RepoTags"] = digests, []
+                                scoped.append(item)
+                        response = json.dumps(scoped).encode()
+                    if self.command == "DELETE" and path.startswith("/images/") and 200 <= status < 300 and policy.artifact_store is not None:
+                        records = policy.artifacts()
+                        records.pop(path.split("?", 1)[0][len("/images/"):], None)
+                        durable_file(policy.artifact_store, json.dumps(records, sort_keys=True).encode())
+                    if mutation and status >= 500:
+                        policy.uncertain = True
+                        if policy.uncertain_marker is not None:
+                            durable_file(policy.uncertain_marker, b"uncertain\n")
             except (ValueError, KeyError, TypeError, AttributeError, OSError, json.JSONDecodeError, http.client.HTTPException):
                 if mutation:
                     policy.uncertain = True
                     if policy.uncertain_marker is not None:
                         durable_file(policy.uncertain_marker, b"uncertain\n")
                 status, response = 403, b'{"message":"deployment Docker policy rejected the request"}'
+            finally:
+                if lock is not None:
+                    lock.release()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -1254,18 +1258,20 @@ def _service_has_active_container(backend, prefix: str, service: str, expected_l
 def _wait_container_exited(backend, cid: str, prefix: str, service: str, expected_labels: dict[str, str],
                            deadline: float, start: float, monotonic, sleep, retry_signal: str | None = None) -> tuple[bool, float, str]:
     delay = 0.05
+    observed_active = False
     quoted = urllib.parse.quote(cid, safe="")
     while True:
         now = monotonic()
         if now >= deadline:
-            return False, round(now - start, 3), "timeout"
+            reason = "timeout" if observed_active else "stop_deadline_unverified"
+            return False, round(now - start, 3), reason
         try:
             status, body = backend.request("GET", f"/containers/{quoted}/json")
         except TimeoutError:
             return False, round(monotonic() - start, 3), "stop_deadline_unverified"
         now = monotonic()
         if now >= deadline:
-            return False, round(now - start, 3), "timeout"
+            return False, round(now - start, 3), "stop_deadline_unverified"
         if status == 404:
             active = _service_has_active_container(backend, prefix, service, expected_labels)
             elapsed = round(monotonic() - start, 3)
@@ -1285,10 +1291,14 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
             return True, round(monotonic() - start, 3), "exited"
         now = monotonic()
         if now >= deadline:
-            return False, round(now - start, 3), "timeout"
+            return False, round(now - start, 3), "stop_deadline_unverified"
+        observed_active = True
         cstate = info.get("State") or {}
         if retry_signal and cstate.get("Status") == "running":
             signal_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": retry_signal}))
+            observed_active = False
+            if monotonic() >= deadline:
+                return False, round(monotonic() - start, 3), "stop_deadline_unverified"
             if signal_status in (200, 204):
                 retry_signal = None
             elif signal_status not in (404, 409):
@@ -1548,6 +1558,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 backend._hard_stop_deadline = True
             try:
                 k_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": sig}))
+                if monotonic() >= svc_deadline:
+                    return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
                 if k_status == 404:
                     active = _service_has_active_container(backend, prefix, svc, expected_labels)
                     if monotonic() >= svc_deadline:
@@ -1565,8 +1577,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                                                                       svc_deadline, svc_start, monotonic, sleep,
                                                                       retry_signal=sig if k_status == 409 else None)
             except TimeoutError:
-                # A request that outlives its deadline can still have reached Docker.
-                return emit_failure("docker_communication_failed", service=svc, container_id=cid,
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid,
                                     signal_name=sig, elapsed=round(monotonic() - svc_start, 3))
             except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
                 return emit_failure("docker_communication_failed", service=svc, container_id=cid, signal_name=sig,
@@ -1622,6 +1633,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             backend._hard_stop_deadline = True
         try:
             fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
+            if monotonic() >= kill_deadline:
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name="SIGKILL", escalation="sigkill")
             if fk_status == 404:
                 active = _service_has_active_container(backend, prefix, svc, expected_labels)
                 if monotonic() >= kill_deadline:
@@ -1740,11 +1753,13 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
         deadline = time.monotonic() + 30
         backend = Backend(values["DOCKER_SOCKET"], 30)
         backend.deadline = deadline
+        backend._hard_stop_deadline = True
         policy = Policy(values, backend, operation="rollback", exclusive_services=intent["services"])
         policy.rollback_incumbents = intent["incumbents"]
         while True:
             try:
                 policy.verify_rollback_commit()
+                require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
                 break
             except RollbackHealthStarting:
                 remaining = deadline - time.monotonic()

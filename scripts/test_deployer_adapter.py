@@ -1392,6 +1392,35 @@ class RollbackExclusiveStop(unittest.TestCase):
         )
         self.assertEqual(result, (False, 2.0, "stop_deadline_unverified"))
 
+    def test_late_graceful_signal_does_not_authorize_forced_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._write_policy(root / 'policy.conf', {
+                'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2',
+            })
+            monotonic, sleep = self._fake_clock()
+            journal = root / 'stop.json'
+            containers = {'current': {
+                'Id': 'current', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 3},
+            }}
+            signals = []
+
+            def late_sig(_cid, sig):
+                signals.append(sig)
+                sleep(2)
+                return 409, b"{}"
+
+            backend, _ = self._make_docker_mock(containers, on_kill=late_sig)
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, journal, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertEqual(signals, ['SIGTERM'])
+            self.assertEqual(json.loads(journal.read_text())['reason'], 'stop_deadline_unverified')
+
     def test_rollback_broker_guards_and_real_socket_ordering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1606,6 +1635,14 @@ class RollbackExclusiveStop(unittest.TestCase):
                                         adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
                                     self.assertFalse(marker.exists())
                                     containers[new_id]['State']['Health']['Status'] = 'healthy'
+                                    monotonic, sleep = self._fake_clock()
+                                    def verify_late(_policy):
+                                        sleep(31)
+                                    with patch.object(adapter.time, 'monotonic', monotonic), \
+                                         patch.object(adapter.Policy, 'verify_rollback_commit', verify_late):
+                                        with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                                            adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertFalse(marker.exists())
                                     self.assertTrue(adapter.complete_rollback_readiness(store, policy.unit, os.getuid()))
                                 status = json.loads((journal_dir / 'status.json').read_text())
                                 self.assertEqual(status['verified_containers'], [new_id])

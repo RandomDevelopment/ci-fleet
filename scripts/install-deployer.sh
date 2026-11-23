@@ -1314,6 +1314,7 @@ PY_STOP
     health=unhealthy
     result=unhealthy
   fi
+  [[ $health != healthy ]] || publish_deployed_snapshot "$active_policy" "$state_file" || return
   local -a audit_options=()
   [[ $result != success ]] || audit_options+=(--once)
   append_rollback_audit "${audit_options[@]}" "transaction=${transaction_dir##*/}" "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "action=rollback" "environment=$environment" "target=$target" "source=$source_commit" "artifact=${artifact#*@}" "core=$core_ref" "exclusive_services=$stop_services" "stop_escalation=$stop_escalation" "stop_elapsed_s=$stop_elapsed_s" "health=$health" "result=$result" || return
@@ -1321,7 +1322,6 @@ PY_STOP
     transaction_committed=1
     return
   fi
-  publish_deployed_snapshot "$active_policy" "$state_file" || return
   rm -f "$previous_state" "$previous_policy" || return
   retired=$journal_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
