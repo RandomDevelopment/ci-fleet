@@ -417,18 +417,12 @@ def container_exited_and_non_restartable(info: dict) -> tuple[bool, str]:
     if not isinstance(state, dict) or not isinstance(host, dict):
         return False, "container_state_unavailable"
     restart_policy = host.get("RestartPolicy")
-    if restart_policy is None:
-        restart_name = ""
-    elif isinstance(restart_policy, dict):
-        restart_name = restart_policy.get("Name", "")
-    else:
-        restart_name = None
-    if restart_name not in ("", "no"):
-        return False, "restart_policy_active"
+    if not isinstance(restart_policy, dict) or restart_policy.get("Name") not in ("", "no"):
+        return False, "restart_policy_unverified"
     status = state.get("Status")
     if status not in ("exited", "dead", "created"):
         return False, f"status_{status}"
-    if state.get("Running") is not False or state.get("Restarting") is not False or state.get("Paused") is not False or state.get("Pid") != 0:
+    if state.get("Running") is not False or state.get("Restarting") is not False or state.get("Paused") is not False or type(state.get("Pid")) is not int or state["Pid"] != 0:
         return False, "container_still_active"
     return True, "exited"
 
@@ -919,7 +913,7 @@ def handler(policy: Policy):
     return Handler
 
 
-def durable_file(path: Path, body: bytes) -> None:
+def durable_file(path: Path, body: bytes, *, deadline: float | None = None) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -927,6 +921,8 @@ def durable_file(path: Path, body: bytes) -> None:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+        if deadline is not None:
+            require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -1619,6 +1615,36 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("timeout", service=svc, container_id=cid, signal_name=sig,
                                     elapsed=svc_elapsed, status_label="timeout", write_audit=True)
 
+        # Refresh the exact container after other services may have consumed their stop budgets.
+        kill_start = monotonic()
+        kill_deadline = kill_start + FORCED_KILL_VERIFY_SECONDS
+        if operation_deadline is not None:
+            backend.deadline = min(operation_deadline, kill_deadline)
+            backend._hard_stop_deadline = True
+        try:
+            fresh = backend.inspect("containers", cid)
+            matches, conflict = container_matches_service(fresh, prefix, svc, expected_labels)
+            host = fresh.get("HostConfig")
+            restart = host.get("RestartPolicy") if isinstance(host, dict) else None
+            require(matches and not conflict and fresh.get("Id") == cid
+                    and isinstance(restart, dict) and restart.get("Name") in ("", "no"),
+                    "escalation container identity or restart policy is unverified")
+            exited, _ = container_exited_and_non_restartable(fresh)
+            require(monotonic() < kill_deadline, "escalation deadline elapsed")
+            if exited:
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": "already_stopped",
+                                                "verified": True, "escalation": "none", "elapsed_seconds": svc_elapsed})
+                continue
+            require(container_confirmed_active(fresh), "escalation container state is unverified")
+        except (ValueError, OSError, http.client.HTTPException):
+            return emit_failure("escalation_state_unverified", service=svc, container_id=cid, signal_name=sig,
+                                elapsed=round(monotonic() - svc_start, 3))
+        finally:
+            if operation_deadline is not None:
+                backend.deadline = operation_deadline
+                backend._hard_stop_deadline = False
+
         # Explicit operator-authorized SIGKILL escalation after graceful timeout.
         print(
             f"WARN: rollback exclusive-service stop timed out; applying authorized SIGKILL escalation: "
@@ -1646,12 +1672,12 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 "result": "stop_escalated",
                 "reason": "timeout",
             }, uid)
-        kill_start = monotonic()
-        kill_deadline = kill_start + FORCED_KILL_VERIFY_SECONDS
         if operation_deadline is not None:
             backend.deadline = min(operation_deadline, kill_deadline)
             backend._hard_stop_deadline = True
         try:
+            if monotonic() >= kill_deadline:
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
             fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
             if monotonic() >= kill_deadline:
                 return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name="SIGKILL", escalation="sigkill")
@@ -1790,8 +1816,7 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
             "artifact_image": values["ARTIFACT_IMAGE"], "verified_containers": policy.verified_containers,
         }
         durable_file(journal / "rollback-verified.json", json.dumps(record).encode())
-        require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
-        durable_file(marker, b"committed\n")
+        durable_file(marker, b"committed\n", deadline=deadline)
     durable_file(journal / "status.json", json.dumps(record).encode())
     return True
 

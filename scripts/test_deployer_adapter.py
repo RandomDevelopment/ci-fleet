@@ -1375,6 +1375,26 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(signals, [('cid-inflight', 'SIGTERM')])
 
+    def test_exit_proof_requires_explicit_restart_policy_and_integer_pid(self):
+        info = {'State': {'Status': 'exited', 'Running': False, 'Restarting': False,
+                          'Paused': False, 'Pid': 0}, 'HostConfig': {}}
+        self.assertFalse(adapter.container_exited_and_non_restartable(info)[0])
+        info['HostConfig']['RestartPolicy'] = {'Name': 'no'}
+        info['State']['Pid'] = False
+        self.assertFalse(adapter.container_exited_and_non_restartable(info)[0])
+        info['State']['Pid'] = 0
+        self.assertTrue(adapter.container_exited_and_non_restartable(info)[0])
+
+    def test_late_marker_sync_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'commit'
+            monotonic, sleep = self._fake_clock()
+            with patch.object(adapter.time, 'monotonic', monotonic), \
+                 patch.object(adapter.os, 'fsync', side_effect=lambda _fd: sleep(31)):
+                with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                    adapter.durable_file(marker, b'committed\n', deadline=30)
+            self.assertFalse(marker.exists())
+
     def test_removed_container_inventory_must_complete_before_stop_deadline(self):
         monotonic, sleep = self._fake_clock()
         backend = MagicMock()
