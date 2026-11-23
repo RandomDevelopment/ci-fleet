@@ -2827,6 +2827,7 @@ class Server(socketserver.UnixStreamServer):
 
 srv = Server(sock_path, Handler)
 os.chmod(sock_path, 0o600)
+print('ready', flush=True)
 srv.serve_forever()
 PY
 
@@ -2859,11 +2860,11 @@ PY
 img_a='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 img_b='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 python3 "$tmp/docker-state-init.py" ambiguous "$fake_docker_state" "$img_a" "$img_b"
-python3 "$tmp/fake_docker_server.py" "$fake_docker_sock" "$fake_docker_state" &
+mkfifo -m 0600 "$tmp/fake-docker-ready"
+python3 "$tmp/fake_docker_server.py" "$fake_docker_sock" "$fake_docker_state" >"$tmp/fake-docker-ready" &
 fake_docker_pid=$!
 trap 'kill "$fake_docker_pid" 2>/dev/null || true; restore_live_checkout; rm -rf "$tmp"' EXIT
-for ((attempt=0; attempt<100; attempt++)); do [[ -S "$fake_docker_sock" ]] && break; sleep 0.05; done
-[[ -S "$fake_docker_sock" ]] || fail 'fake Docker Unix socket did not start'
+timeout 15s bash -c 'IFS= read -r ready <"$1" && [[ $ready == ready ]]' -- "$tmp/fake-docker-ready" || fail 'fake Docker Unix socket did not start'
 
 export CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET=1
 export FAKE_DOCKER_PS='cid-sched|deployer|staging-deployer-01|staging|example-staging'

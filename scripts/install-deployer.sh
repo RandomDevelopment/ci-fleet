@@ -1158,9 +1158,12 @@ print(d.get("escalation","none"), f"{val:.3f}", sep="\t")' <<<"$stop_status_json
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
     adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
     if [[ $transaction_kind == rollback ]]; then
-      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" ||
-        timeout --kill-after=5s 50s python3 "$repo_root/scripts/deployer_adapter.py" rollback-readiness --store "$state_root/.adapter-recovery" "$pending_unit" ||
-        block 'rollback adapter readiness is unverified; retain the transaction and retry --rollback after checking Docker health'
+      local recovery_store=$state_root/.adapter-recovery
+      if ! python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$recovery_store" "$pending_unit"; then
+        [[ -f $recovery_store/$pending_unit/rollback-ready.json ]] || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+        timeout --kill-after=5s 50s python3 "$repo_root/scripts/deployer_adapter.py" rollback-readiness --store "$recovery_store" "$pending_unit" ||
+          block 'rollback adapter readiness is unverified; retain the transaction and retry --rollback after checking Docker health'
+      fi
     fi
   fi
   local candidate_marker=$candidate/application-rollback-committed
