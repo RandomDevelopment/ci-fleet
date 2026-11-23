@@ -683,7 +683,7 @@ PY
     else
       die 'deployed rollback policy has an unsupported credential provider'
     fi
-    python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$deployed_snapshot/policy.conf" >/dev/null || die 'deployed rollback policy has invalid rollback exclusive-service settings'
+    python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$deployed_snapshot/policy.conf" --incumbent-policy "$installed_policy" >/dev/null || die 'active and deployed rollback stop policies are incompatible'
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX")
     chmod 0700 "$snapshot"
     install -m 0600 "$config" "$snapshot/policy.conf"

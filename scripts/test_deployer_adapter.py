@@ -1437,7 +1437,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                         lkg = self._write_policy(root / 'lkg.conf', {'DOCKER_SOCKET': sock_path, 'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
                         backend = adapter.TestingDockerBackend(sock_path, 30)
                         marker = root / 'rollback-commit'
-                        policy = adapter.Policy(json.loads(json.dumps(dict(self.base_values, DOCKER_SOCKET=sock_path))), backend,
+                        policy = adapter.Policy(json.loads(json.dumps(dict(self.base_values, DOCKER_SOCKET=sock_path, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'))), backend,
                                                 marker=marker, operation='rollback', exclusive_services=('scheduler',),
                                                 unit='ci-fleet-deployer-adapter-1-2.service')
                         proxy_sock = str(root / 'proxy.sock')
@@ -1469,6 +1469,16 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 rc = adapter.stop_exclusive_services(lkg, journal, uid=os.getuid())
                                 self.assertEqual(rc, 0)
 
+                                # The stopped incumbent cannot satisfy commit readiness.
+                                with self.assertRaisesRegex(ValueError, 'scheduler is missing'):
+                                    policy.verify_rollback_commit()
+
+                                # Restartable stopped containers still block replacement.
+                                containers['old-sched']['HostConfig']['RestartPolicy']['Name'] = 'always'
+                                with self.assertRaisesRegex(ValueError, 'active or restartable'):
+                                    policy._require_no_active_service_container('scheduler')
+                                containers['old-sched']['HostConfig']['RestartPolicy']['Name'] = 'no'
+
                                 # Replacement create + start succeeds after exit verified.
                                 conn = adapter.UnixConnection(proxy_sock, rootless=False)
                                 conn.request('POST', '/containers/create?name=ci-fleet-deploy-example-scheduler-new', req_body)
@@ -1483,6 +1493,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 # Unhealthy, restarting, or paused active container prevents rollback-commit.
                                 for bad_patch in (
                                     {'Health': {'Status': 'unhealthy'}},
+                                    {'Health': {'Status': 'starting'}},
                                     {'Health': {'Status': 'healthy'}, 'Restarting': True},
                                     {'Health': {'Status': 'healthy'}, 'Restarting': False, 'Paused': True},
                                 ):
@@ -1500,6 +1511,10 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 resp = conn.getresponse(); resp.read(); conn.close()
                                 self.assertEqual(resp.status, 204)
                                 self.assertEqual(policy.verified_containers, [new_id])
+
+                                # A later rollback ignores the retained, inert old container.
+                                self.assertEqual(adapter.stop_exclusive_services(
+                                    lkg, root / 'repeat-stop.json', uid=os.getuid()), 0)
                             finally:
                                 proxy.shutdown()
                                 pthread.join()

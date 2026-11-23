@@ -1411,7 +1411,9 @@ health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 recovery=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'interrupted committed rollback recovery lacks the operator reconciliation action'
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'convergence ran after committed rollback recovery'
-[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'convergence health ran after committed rollback recovery'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$((health_calls_before + 1))" ]] || fail 'committed rollback recovery did not check health exactly once'
+grep -Fq 'digest=sha256:aaaaaaaa' <<<"$recovery" || fail 'committed rollback recovery did not report the active artifact'
+[[ $(tail -n 1 "$root/var/log/ci-fleet-deployer/audit.log") == *'action=rollback '* && $(tail -n 1 "$root/var/log/ci-fleet-deployer/audit.log") == *'health=healthy result=success' ]] || fail 'committed rollback recovery did not audit successful health'
 [[ ! -e "$recovery_transaction" ]] || fail 'committed rollback recovery retained its transaction'
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
