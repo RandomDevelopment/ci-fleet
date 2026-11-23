@@ -1491,11 +1491,13 @@ publish_deployed_snapshot() {
     # validated rollback pair; only identical bytes short-circuit.
     if [[ -L "$deployed_current" ]]; then
       incumbent=$(readlink -f "$deployed_current")
-      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && $(stat -c '%u:%a' "$incumbent/policy.conf") == "$expected_uid:600" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" && $(stat -c '%u:%a' "$incumbent/state.json") == "$expected_uid:600" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && $(stat -c '%u:%a' "$incumbent/policy.conf") == "$expected_uid:600" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" && $(stat -c '%u:%a' "$incumbent/state.json") == "$expected_uid:600" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then
+        sync -f "$deployed_root" 2>/dev/null || block 'deployed snapshot pointer is not durable'
+        return
+      fi
     fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
-    rm -f -- "$deployed_current" || return
   fi
   if [[ -n $created_record ]]; then
     snapshot=$(mktemp -u "$deployed_root/.snapshot.XXXXXX") || return
@@ -1509,8 +1511,10 @@ publish_deployed_snapshot() {
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
     chmod 0700 "$snapshot" || return
   fi
-  install -m 0600 "$policy" "$snapshot/policy.conf" || return
-  install -m 0600 "$state" "$snapshot/state.json" || return
+  if ! install -m 0600 "$policy" "$snapshot/policy.conf" || ! install -m 0600 "$state" "$snapshot/state.json"; then
+    rm -rf -- "$snapshot"
+    return 1
+  fi
   pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
   ln -s "${snapshot##*/}" "$pointer" || return
   sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || block 'replacement deployed snapshot is not durable'

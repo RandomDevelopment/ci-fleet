@@ -1421,6 +1421,21 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.assertEqual(signals, ['SIGTERM'])
             self.assertEqual(json.loads(journal.read_text())['reason'], 'stop_deadline_unverified')
 
+            journal = root / 'incomplete-stop.json'
+            signals.clear()
+            def incomplete_state(cid, sig):
+                signals.append(sig)
+                containers[cid]['State'] = {'Status': 'running'}
+                return 204, b''
+
+            backend, _ = self._make_docker_mock(containers, on_kill=incomplete_state)
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, journal, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertEqual(signals, ['SIGTERM'])
+            self.assertEqual(json.loads(journal.read_text())['reason'], 'container_state_unverified')
+
     def test_rollback_broker_guards_and_real_socket_ordering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

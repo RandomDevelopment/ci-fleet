@@ -331,24 +331,25 @@ class _DockerClient:
 
 
 class Backend(_DockerClient):
-    def __init__(self, path: str, seconds: int = 120):
-        self.deadline = time.monotonic() + seconds + 10
+    def __init__(self, path: str, seconds: int = 120, *, deadline: float | None = None):
+        self.deadline = deadline if deadline is not None else time.monotonic() + seconds + 10
+        self._hard_stop_deadline = deadline is not None
         require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
         self.path = path
         self.rootless = True
         startup_deadline = min(self.deadline, time.monotonic() + 30)
         connection = UnixConnection(path, timeout=max(0.001, startup_deadline - time.monotonic()))
-        try:
-            connection.request("GET", "/info")
-            response = connection.getresponse()
-            value = decode(response.read(MAX_REQUEST + 1))
-            require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
-                    "a dedicated rootless Docker daemon is required")
-            self.uid, self.gid = connection.peer_uid, connection.peer_gid
-            reject_rootful_workloads(path, startup_deadline)
-        finally:
-            connection.close()
-
+        with self.stop_request_alarm():
+            try:
+                connection.request("GET", "/info")
+                response = connection.getresponse()
+                value = decode(response.read(MAX_REQUEST + 1))
+                require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
+                        "a dedicated rootless Docker daemon is required")
+                self.uid, self.gid = connection.peer_uid, connection.peer_gid
+                reject_rootful_workloads(path, startup_deadline)
+            finally:
+                connection.close()
 
 class TestingDockerBackend(_DockerClient):
     """Test-only Docker socket client for non-rootless local test/CI daemons."""
@@ -430,6 +431,17 @@ def container_exited_and_non_restartable(info: dict) -> tuple[bool, str]:
     if state.get("Running") is not False or state.get("Restarting") is not False or state.get("Paused") is not False or state.get("Pid") != 0:
         return False, "container_still_active"
     return True, "exited"
+
+
+def container_confirmed_active(info: dict) -> bool:
+    state = info.get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True or state.get("Paused") is not False:
+        return False
+    pid = state.get("Pid")
+    return type(pid) is int and (
+        state.get("Status") == "running" and state.get("Restarting") is False and pid > 0
+        or state.get("Status") == "restarting" and state.get("Restarting") is True and pid == 0
+    )
 
 
 def container_active(info: dict) -> bool:
@@ -1287,12 +1299,14 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
         if (info.get("State") or {}).get("Paused") is True:
             return False, round(monotonic() - start, 3), "container_paused"
         exited, _ = container_exited_and_non_restartable(info)
-        if exited:
-            return True, round(monotonic() - start, 3), "exited"
+        observed_active = container_confirmed_active(info)
         now = monotonic()
         if now >= deadline:
             return False, round(now - start, 3), "stop_deadline_unverified"
-        observed_active = True
+        if exited:
+            return True, round(now - start, 3), "exited"
+        if not observed_active:
+            return False, round(now - start, 3), "container_state_unverified"
         cstate = info.get("State") or {}
         if retry_signal and cstate.get("Status") == "running":
             signal_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": retry_signal}))
@@ -1535,6 +1549,9 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
 
         exited, _ = container_exited_and_non_restartable(info)
+        active = container_confirmed_active(info)
+        if monotonic() >= svc_deadline:
+            return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
         if exited:
             prev_esc = prior_services.get(svc, {}).get("escalation", "none")
             state["timed_out_containers"].pop(svc, None)
@@ -1549,6 +1566,9 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         svc_elapsed = 0.0
         svc_escalation = "none"
         skip_graceful = reconcile and prior_timed_out.get(svc) == cid and force_stop_timeout
+
+        if skip_graceful and not active:
+            return emit_failure("container_state_unverified", service=svc, container_id=cid, signal_name=sig)
 
         if not skip_graceful:
             if monotonic() >= svc_deadline:
@@ -1751,9 +1771,7 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
         record = decode(protected_file(journal / "rollback-verified.json", uid))
     else:
         deadline = time.monotonic() + 30
-        backend = Backend(values["DOCKER_SOCKET"], 30)
-        backend.deadline = deadline
-        backend._hard_stop_deadline = True
+        backend = Backend(values["DOCKER_SOCKET"], deadline=deadline)
         policy = Policy(values, backend, operation="rollback", exclusive_services=intent["services"])
         policy.rollback_incumbents = intent["incumbents"]
         while True:
@@ -1772,6 +1790,7 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
             "artifact_image": values["ARTIFACT_IMAGE"], "verified_containers": policy.verified_containers,
         }
         durable_file(journal / "rollback-verified.json", json.dumps(record).encode())
+        require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
         durable_file(marker, b"committed\n")
     durable_file(journal / "status.json", json.dumps(record).encode())
     return True
