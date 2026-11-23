@@ -2754,7 +2754,7 @@ install -m 0600 "$tmp/lkg-compat-state.saved" "$root/var/lib/ci-fleet-deployer/l
 rm -rf "$old_release"
 
 # End-to-end installer rollback with local fake Docker Unix-socket server.
-fake_docker_sock=$tmp/fake-docker.sock
+fake_docker_sock=$root/run/docker.sock
 fake_docker_state=$tmp/fake-docker-state.json
 cat >"$tmp/fake_docker_server.py" <<'PY'
 import http.server, json, os, socketserver, sys, urllib.parse
@@ -2871,12 +2871,7 @@ export FAKE_DOCKER_PS='cid-sched|deployer|staging-deployer-01|staging|example-st
 write_stop_config() {
   write_evidence
   write_config
-  python3 - "$config" "$fake_docker_sock" <<'PY'
-from pathlib import Path; import re, sys
-p = Path(sys.argv[1])
-txt = re.sub(r'(?m)^DOCKER_SOCKET=.*$', 'DOCKER_SOCKET=' + sys.argv[2], p.read_text())
-p.write_text(txt + 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=1\n')
-PY
+  printf 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=1\n' >>"$config"
   chmod 0600 "$config"
 }
 deploy_stop_pair() {
@@ -2892,6 +2887,15 @@ deploy_stop_pair() {
 
 # Deploy a -> upgrade/deploy b with ROLLBACK_EXCLUSIVE_SERVICES=scheduler and fake Docker socket.
 deploy_stop_pair
+
+# Unit drift must block before the exclusive stop changes Docker.
+mkdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+expect_failure 'unreviewed drop-in override' "$installer" --rollback --config "$config" >/dev/null
+rmdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+python3 - "$fake_docker_state" <<'PY_VERIFY' || fail 'unit preflight changed Docker'
+import json, sys
+assert not json.load(open(sys.argv[1]))["events"]
+PY_VERIFY
 
 # Ambiguous identity fails pre-signal without invoking rollback adapter.
 rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
@@ -2979,6 +2983,8 @@ cat >"$crash_tx/exclusive-stop.json" <<'JSON'
 JSON
 chmod 0600 "$crash_tx/exclusive-stop.json"
 expect_failure 'rollback exclusive-service stop requires reconciliation' "$installer" --repair --config "$config" >/dev/null
+sed -i 's/"inflight"/"verified"/' "$crash_tx/exclusive-stop.json"
+expect_failure 'exclusive service exited and replacement is pending' "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --rollback --config "$config" >/dev/null
 
 kill "$fake_docker_pid" 2>/dev/null || true

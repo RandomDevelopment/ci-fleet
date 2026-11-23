@@ -93,6 +93,13 @@ on_exit() {
     status=1
     printf 'ERROR: exclusive service stop is unverified; retained %s for reconciliation (rerun --rollback after exit or with --force-stop-timeout)\n' "$transaction_dir" >&2
   fi
+  if [[ -n $transaction_dir && $transaction_committed != 1 && $transaction_kind == rollback ]] &&
+    rollback_commit_marker_uncommitted "$rollback_commit_file" &&
+    { python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$transaction_dir/exclusive-stop.json" 2>/dev/null || true; } |
+      python3 -c 'import json,sys; sys.exit(not json.load(sys.stdin).get("replacement_pending"))' 2>/dev/null; then
+    stop_unresolved=1
+    failure_next=reconcile-exclusive-stop
+  fi
   if ((recovery_status == 0 && stop_unresolved == 0)) && [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
     if restore_state_directory "$state_root"; then
       if ! { rm -rf -- "$transaction_dir" && restore_transaction_backup; }; then recovery_status=1; fi
@@ -1077,6 +1084,13 @@ recover_interrupted_transaction() {
     sync_transaction_audit "$candidate"
     local stop_status_json stop_unresolved=0
     stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null) || stop_unresolved=$?
+    if [[ $mode != rollback ]] && python3 -c 'import json,sys; sys.exit(not json.load(sys.stdin).get("replacement_pending"))' <<<"$stop_status_json"; then
+      local recovery_marker=$candidate/commit/application-rollback-committed
+      if rollback_commit_marker_uncommitted "$recovery_marker"; then
+        failure_next=reconcile-exclusive-stop
+        block 'exclusive service exited and replacement is pending; rerun --rollback'
+      fi
+    fi
     if ((stop_unresolved == 0)); then
       if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
         failure_next=reconcile-exclusive-stop
@@ -1130,13 +1144,13 @@ print(d.get("environment","unknown"), d.get("target","unknown"), d.get("service"
         failure_next=reconcile-exclusive-stop
         block "rollback exclusive-service stop still unresolved (environment=$r_env target=$r_tgt service=$r_svc container=$r_cid reason=$r_reason); resolve or pass --force-stop-timeout"
       fi
-      stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null || true)
-      IFS=$'\t' read -r recovered_stop_escalation recovered_stop_elapsed_s < <(python3 -c 'import json,sys
+    fi
+    stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null || true)
+    IFS=$'\t' read -r recovered_stop_escalation recovered_stop_elapsed_s < <(python3 -c 'import json,sys
 try: d=json.loads(sys.stdin.read())
 except Exception: d={}
 val=float(d.get("total_elapsed_seconds",0.0))
 print(d.get("escalation","none"), f"{val:.3f}", sep="\t")' <<<"$stop_status_json")
-    fi
   fi
   if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
     secure_file "$candidate/adapter-unit" 'adapter unit guard'
@@ -1144,7 +1158,9 @@ print(d.get("escalation","none"), f"{val:.3f}", sep="\t")' <<<"$stop_status_json
     [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
     adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
     if [[ $transaction_kind == rollback ]]; then
-      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" ||
+        timeout --kill-after=5s 50s python3 "$repo_root/scripts/deployer_adapter.py" rollback-readiness --store "$state_root/.adapter-recovery" "$pending_unit" ||
+        block 'rollback adapter readiness is unverified; retain the transaction and retry --rollback after checking Docker health'
     fi
   fi
   local candidate_marker=$candidate/application-rollback-committed
@@ -1268,6 +1284,10 @@ PY_STOP
     result=unhealthy
   fi
   append_rollback_audit "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "action=rollback" "environment=$environment" "target=$target" "source=$source_commit" "artifact=${artifact#*@}" "core=$core_ref" "exclusive_services=$stop_services" "stop_escalation=$stop_escalation" "stop_elapsed_s=$stop_elapsed_s" "health=$health" "result=$result" || return
+  if [[ $health == unhealthy && -f $transaction_dir/exclusive-stop.json ]]; then
+    transaction_committed=1
+    return
+  fi
   rm -f "$previous_state" "$previous_policy" || return
   retired=$journal_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
@@ -1466,10 +1486,7 @@ publish_deployed_snapshot() {
   if [[ -n ${retired:-} && -d "$deployed_root/$retired" && ! -L "$deployed_root/$retired" ]]; then rm -rf -- "${deployed_root:?}/$retired"; fi
 }
 
-install_units() {
-  [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
-  install -d -m 0700 "$state_root/.adapter-recovery"
-  install -d -m 0711 "$(root_path /var/lib/ci-fleet-deployer-container-credentials)"
+check_unit_boundary() {
   local unit systemd_mode
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_mode=$(stat -c %a "$systemd_root")
@@ -1479,6 +1496,16 @@ install_units() {
     if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
       [[ ! -L "$systemd_root/$unit" && -f "$systemd_root/$unit" && $(stat -c %u "$systemd_root/$unit") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
     fi
+  done
+}
+
+install_units() {
+  [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
+  install -d -m 0700 "$state_root/.adapter-recovery"
+  install -d -m 0711 "$(root_path /var/lib/ci-fleet-deployer-container-credentials)"
+  check_unit_boundary
+  local unit
+  for unit in "${unit_names[@]}"; do
     install -m 0644 "$unit_source/$unit" "$systemd_root/$unit"
   done
   systemd-analyze verify "${unit_names[@]/#/$systemd_root/}" >/dev/null || die 'systemd unit verification failed'
@@ -1822,6 +1849,9 @@ PY
   exclusive_services_csv=$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(",".join(d["services"]))' <<<"$stop_json")
   reject_mixed_role
   if [[ -n $exclusive_services_csv ]]; then
+    check_unit_boundary
+    local retained_units=$releases/$core_ref/deploy/deployer
+    systemd-analyze verify "${unit_names[@]/#/$retained_units/}" >/dev/null || die 'systemd unit verification failed before stop'
     policy_adapter_operation "$previous_policy" validate 'last-known-good policy' || block 'last-known-good adapter validation failed before stop'
   fi
   begin_transaction

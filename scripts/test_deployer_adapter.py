@@ -1370,6 +1370,13 @@ class RollbackExclusiveStop(unittest.TestCase):
                               'HostConfig': {'RestartPolicy': {'Name': 'always'}},
                               'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 50}},
             }
+            containers['web'] = {
+                'Id': 'web', 'Name': '/ci-fleet-deploy-example-web',
+                'Config': {'Labels': self.labels, 'Image': bad_img},
+                'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False,
+                          'Paused': False, 'Pid': 51, 'StartedAt': '2026-11-22T01:00:00Z'},
+            }
             event_log = []
             def on_update(cid, payload):
                 event_log.append(f'update:{cid}:{payload["RestartPolicy"]["Name"]}')
@@ -1461,6 +1468,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                         policy = adapter.Policy(json.loads(json.dumps(dict(self.base_values, DOCKER_SOCKET=sock_path, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'))), backend,
                                                 marker=marker, operation='rollback', exclusive_services=('scheduler',),
                                                 unit='ci-fleet-deployer-adapter-1-2.service')
+                        policy.capture_rollback_incumbents()
                         proxy_sock = str(root / 'proxy.sock')
                         with adapter.ProxyServer(proxy_sock, adapter.handler(policy)) as proxy, \
                              patch.object(adapter, 'executor_peer', return_value=True):
@@ -1525,13 +1533,31 @@ class RollbackExclusiveStop(unittest.TestCase):
                                     self.assertEqual(resp.status, 403)
                                 containers[new_id]['State'].update({'Restarting': False, 'Paused': False})
 
-                                # Healthy approved container commits cleanly.
-                                containers[new_id]['State']['Health']['Status'] = 'healthy'
+                                # A durable successful adapter outcome can wait for
+                                # Docker health without dispatching the adapter again.
+                                store = root / 'recovery'
+                                journal_dir = store / policy.unit
+                                store.mkdir(mode=0o700)
+                                journal_dir.mkdir(mode=0o700)
+                                adapter.durable_file(journal_dir / 'policy.conf', lkg.read_bytes())
+                                policy.rollback_ready = journal_dir / 'rollback-ready.json'
+                                containers[new_id]['State']['Health']['Status'] = 'unhealthy'
                                 conn = adapter.UnixConnection(proxy_sock, rootless=False)
                                 conn.request('POST', '/ci-fleet/rollback-commit', b'committed')
                                 resp = conn.getresponse(); resp.read(); conn.close()
                                 self.assertEqual(resp.status, 204)
-                                self.assertEqual(policy.verified_containers, [new_id])
+                                with patch.object(adapter, 'Backend', return_value=backend), \
+                                     patch.object(adapter, 'trusted_directory'), \
+                                     patch.object(adapter, 'unit_inactive', return_value=True):
+                                    with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertFalse(marker.exists())
+                                    containers[new_id]['State']['Health']['Status'] = 'healthy'
+                                    self.assertTrue(adapter.complete_rollback_readiness(store, policy.unit, os.getuid()))
+                                status = json.loads((journal_dir / 'status.json').read_text())
+                                self.assertEqual(status['verified_containers'], [new_id])
+                                self.assertEqual(containers['web']['Config']['Image'], bad_img)
+                                self.assertTrue(containers['web']['State']['Running'])
 
                                 # A later rollback ignores the retained, inert old container.
                                 self.assertEqual(adapter.stop_exclusive_services(

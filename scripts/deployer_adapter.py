@@ -438,6 +438,10 @@ def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict
     return [item for item in items if isinstance(item, dict) and container_owned(item, expected_labels)]
 
 
+class RollbackHealthStarting(ValueError):
+    pass
+
+
 class Policy:
     def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None, unit: str | None = None, exclusive_services: tuple[str, ...] | list[str] = ()):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
@@ -447,6 +451,8 @@ class Policy:
         self.exclusive_services = tuple(exclusive_services)
         self.required_rollback_services = _parse_single_stop_policy(values)[0] if operation == "rollback" else []
         self.verified_containers: list[str] = []
+        self.rollback_ready: Path | None = None
+        self.rollback_incumbents: dict[str, str] = {}
         self._exclusive_lock = threading.Lock()
         self._image_id: str | None = None
         self.artifact_store = artifact_store
@@ -484,6 +490,14 @@ class Policy:
                 require(container_exited_and_non_restartable(info)[0],
                         f"exclusive service {service} still has an active or restartable container")
 
+    def capture_rollback_incumbents(self) -> None:
+        for item in list_owned_containers(self.backend, self.labels):
+            info = self.owned("containers", item["Id"])
+            state = info.get("State") or {}
+            started_at = state.get("StartedAt")
+            if state.get("Status") == "running" and isinstance(started_at, str):
+                self.rollback_incumbents[item["Id"]] = started_at
+
     def verify_rollback_commit(self) -> None:
         if not self.exclusive_services:
             return
@@ -494,21 +508,28 @@ class Policy:
             require(isinstance(cid, str) and bool(cid), "invalid owned container identity")
             info = self.owned("containers", cid)
             active = container_active(info)
+            exclusive = False
             for svc in self.exclusive_services:
                 matches, conflict = container_matches_service(info, self.prefix, svc, self.labels)
                 require(not conflict, "ambiguous exclusive service identity")
+                exclusive |= matches
                 if matches and not container_exited_and_non_restartable(info)[0]:
                     require(active, f"exclusive service {svc} has a stopped restartable container")
                     active_counts[svc] += 1
                     require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
             if active:
-                require(self._container_matches_approved_image(info), "active rollback container does not match approved artifact")
                 cstate = info.get("State") or {}
+                if (not exclusive and cid in self.rollback_incumbents
+                        and cstate.get("StartedAt") == self.rollback_incumbents[cid]):
+                    continue
+                require(self._container_matches_approved_image(info), "active rollback container does not match approved artifact")
                 require(cstate.get("Status") == "running" and cstate.get("Running") is True
                         and cstate.get("Restarting") is False and cstate.get("Paused") is False
                         and type(cstate.get("Pid")) is int and cstate["Pid"] > 0,
                         "active rollback container is not running")
                 health = cstate.get("Health")
+                if isinstance(health, dict) and health.get("Status") == "starting":
+                    raise RollbackHealthStarting("Docker health check is starting")
                 require(health is None or isinstance(health, dict) and health.get("Status") == "healthy",
                         "active rollback container health is unverified")
                 verified_ids.append(cid)
@@ -802,9 +823,17 @@ def handler(policy: Policy):
                         outcome = body.decode()
                         require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
                         if outcome == "committed":
-                            policy.verify_rollback_commit()
-                            mutation = True
-                            durable_file(policy.marker, b"committed\n")
+                            if policy.rollback_ready is not None:
+                                mutation = True
+                                durable_file(policy.rollback_ready, json.dumps({
+                                    "marker": str(policy.marker),
+                                    "services": policy.exclusive_services,
+                                    "incumbents": policy.rollback_incumbents,
+                                }, sort_keys=True).encode())
+                            else:
+                                policy.verify_rollback_commit()
+                                mutation = True
+                                durable_file(policy.marker, b"committed\n")
                         else:
                             require(not policy.marker.exists() and not policy.marker.is_symlink(),
                                     "failed rollback conflicts with its commit marker")
@@ -1175,13 +1204,17 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _service_has_any_container(backend, prefix: str, service: str, expected_labels: dict[str, str]) -> bool:
+def _service_has_active_container(backend, prefix: str, service: str, expected_labels: dict[str, str]) -> bool:
     for item in list_owned_containers(backend, expected_labels):
         matches, conflict = container_matches_service(item, prefix, service, expected_labels)
-        if conflict or matches:
+        if conflict:
             return True
+        if matches:
+            info = backend.inspect("containers", item["Id"])
+            matches, conflict = container_matches_service(info, prefix, service, expected_labels)
+            if conflict or not matches or not container_exited_and_non_restartable(info)[0]:
+                return True
     return False
-
 
 def _wait_container_exited(backend, cid: str, prefix: str, service: str, expected_labels: dict[str, str],
                            deadline: float, start: float, monotonic, sleep, retry_signal: str | None = None) -> tuple[bool, float, str]:
@@ -1201,7 +1234,7 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
         if now >= deadline:
             return False, round(now - start, 3), "timeout"
         if status == 404:
-            if _service_has_any_container(backend, prefix, service, expected_labels):
+            if _service_has_active_container(backend, prefix, service, expected_labels):
                 return False, round(monotonic() - start, 3), "unexpected_replacement_detected"
             return True, round(monotonic() - start, 3), "removed"
         if status != 200:
@@ -1426,10 +1459,14 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         state.update({"status": "inflight", "signaled": True, "service": svc, "container_id": cid, "signal": sig})
         durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
 
+        svc_start = monotonic()
+        svc_deadline = svc_start + timeout_seconds
         # Disable auto-restart before signaling so Docker cannot relaunch on exit.
         restart_policy = (info.get("HostConfig") or {}).get("RestartPolicy")
         restart_name = restart_policy.get("Name", "") if isinstance(restart_policy, dict) else ""
         if restart_name not in ("", "no"):
+            if operation_deadline is not None:
+                backend.deadline = min(operation_deadline, svc_deadline)
             try:
                 upd_status, _ = backend.request("POST", f"/containers/{quoted}/update",
                                                 json.dumps({"RestartPolicy": {"Name": "no", "MaximumRetryCount": 0}}).encode(),
@@ -1439,6 +1476,9 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 info = backend.inspect("containers", cid)
             except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
                 return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
+            finally:
+                if operation_deadline is not None:
+                    backend.deadline = operation_deadline
             updated_rp = ((info.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name", "")
             if updated_rp not in ("", "no"):
                 return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
@@ -1458,16 +1498,16 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         svc_elapsed = 0.0
         svc_escalation = "none"
         skip_graceful = reconcile and prior_timed_out.get(svc) == cid and force_stop_timeout
-        svc_start = monotonic()
 
         if not skip_graceful:
-            svc_deadline = svc_start + timeout_seconds
+            if monotonic() >= svc_deadline:
+                return emit_failure("restart_policy_update_unverified", service=svc, container_id=cid, signal_name=sig)
             if operation_deadline is not None:
                 backend.deadline = min(operation_deadline, svc_deadline)
             try:
                 k_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": sig}))
                 if k_status == 404:
-                    if _service_has_any_container(backend, prefix, svc, expected_labels):
+                    if _service_has_active_container(backend, prefix, svc, expected_labels):
                         return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
                     state["timed_out_containers"].pop(svc, None)
                     state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
@@ -1536,7 +1576,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         try:
             fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
             if fk_status == 404:
-                if _service_has_any_container(backend, prefix, svc, expected_labels):
+                if _service_has_active_container(backend, prefix, svc, expected_labels):
                     return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid,
                                         signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
                 state["timed_out_containers"].pop(svc, None)
@@ -1624,6 +1664,48 @@ def read_stop_status(journal_path: Path, uid: int | None = None) -> tuple[bool, 
                       "container_id": "unknown", "reason": "corrupted_stop_journal"}
 
 
+def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
+    require(bool(UNIT.fullmatch(unit)), "invalid adapter unit")
+    journal = store / unit
+    trusted_directory(journal, uid, 0o700)
+    ready = journal / "rollback-ready.json"
+    if not ready.exists():
+        return False
+    require(unit_inactive(unit) and not os.path.lexists(journal / "docker-uncertain"),
+            "rollback adapter termination or mutation is unverified")
+    intent = decode(protected_file(ready, uid))
+    marker = Path(intent["marker"])
+    require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
+    values = parse_policy(protected_file(journal / "policy.conf", uid))
+    if os.path.lexists(marker):
+        require(protected_file(marker, uid) == b"committed\n", "rollback commit marker is unverified")
+        record = decode(protected_file(journal / "rollback-verified.json", uid))
+    else:
+        deadline = time.monotonic() + 30
+        backend = Backend(values["DOCKER_SOCKET"], 30)
+        backend.deadline = deadline
+        policy = Policy(values, backend, operation="rollback", exclusive_services=intent["services"])
+        policy.rollback_incumbents = intent["incumbents"]
+        while True:
+            try:
+                policy.verify_rollback_commit()
+                break
+            except RollbackHealthStarting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.5, remaining))
+        record = {
+            "unit": unit, "operation": "rollback", "status": "completed", "exit_code": 0,
+            "rollback_outcome": "committed", "rollback_marker": str(marker),
+            "artifact_image": values["ARTIFACT_IMAGE"], "verified_containers": policy.verified_containers,
+        }
+        durable_file(journal / "rollback-verified.json", json.dumps(record).encode())
+        durable_file(marker, b"committed\n")
+    durable_file(journal / "status.json", json.dumps(record).encode())
+    return True
+
+
 def run_adapter(args) -> int:
     require(args.operation in ("validate", "health", "cleanup", "deploy", "rollback") and 1 <= args.seconds <= 2700, "invalid adapter operation or deadline")
     uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
@@ -1672,6 +1754,9 @@ def run_adapter(args) -> int:
         policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain",
                         args.store / "artifact-images.json", protected_images, args.unit,
                         exclusive_services=stop_policy["services"])
+        if policy.operation == "rollback" and policy.exclusive_services:
+            policy.capture_rollback_incumbents()
+            policy.rollback_ready = journal / "rollback-ready.json"
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
@@ -1688,6 +1773,9 @@ def run_adapter(args) -> int:
     require(unit_inactive(args.unit), "adapter termination is unverified")
     require(args.operation != "rollback" or policy.rollback_outcome == "committed"
             or policy.rollback_outcome == "failed" and result != 0, "rollback outcome is unverified")
+    if policy.rollback_ready is not None and policy.rollback_outcome == "committed":
+        require(complete_rollback_readiness(args.store, args.unit, uid), "rollback readiness is unverified")
+        return result
     status_payload: dict = {
         "unit": args.unit, "operation": args.operation, "status": "completed", "exit_code": result,
         "rollback_outcome": policy.rollback_outcome,
@@ -1716,6 +1804,9 @@ def main() -> int:
     complete = sub.add_parser("journal-complete")
     complete.add_argument("--store", type=Path, required=True)
     complete.add_argument("unit")
+    readiness = sub.add_parser("rollback-readiness")
+    readiness.add_argument("--store", type=Path, required=True)
+    readiness.add_argument("unit")
     validate_stop = sub.add_parser("validate-stop-policy")
     validate_stop.add_argument("--policy", type=Path, required=True)
     validate_stop.add_argument("--incumbent-policy", type=Path)
@@ -1754,6 +1845,8 @@ def main() -> int:
         if args.command == "journal-retire":
             retire_journal(args.store, args.unit, uid)
             return 0
+        if args.command == "rollback-readiness":
+            return 0 if complete_rollback_readiness(args.store, args.unit, uid) else 1
         if args.command == "journal-complete":
             return 0 if journal_complete(args.store, args.unit, uid) else 1
         if args.command == "validate-stop-policy":
@@ -1780,6 +1873,7 @@ def main() -> int:
             unresolved, data = read_stop_status(args.journal, uid)
             print(json.dumps({
                 "unresolved": unresolved,
+                "replacement_pending": data.get("signaled") is True and data.get("status") == "verified",
                 "environment": data.get("environment", "unknown"),
                 "target": data.get("target", "unknown"),
                 "service": data.get("service", "none"),
