@@ -638,7 +638,7 @@ PY
       [[ ! -L "${lkg_policy[ADAPTER_PATH]}" && -f "${lkg_policy[ADAPTER_PATH]}" && $(stat -c '%u:%a' "${lkg_policy[ADAPTER_PATH]}") == "$expected_uid:700" ]] || die 'last-known-good adapter is missing or unsafe'
       [[ $(sha256sum "${lkg_policy[ADAPTER_PATH]}" | cut -d' ' -f1) == "${lkg_policy[ADAPTER_SHA256]}" ]] || die 'last-known-good adapter digest does not match its retained policy'
       validate_credential lkg_policy
-      python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$previous_policy" >/dev/null || die 'last-known-good policy has invalid rollback exclusive-service settings'
+      python3 "$script_dir/deployer_adapter.py" validate-stop-policy --policy "$previous_policy" --incumbent-policy "$installed_policy" >/dev/null || die 'active and last-known-good rollback stop policies are incompatible'
     fi
     [[ -L "$deployed_current" ]] || die 'deployed snapshot pointer is absent or unsafe'
     [[ $(readlink "$deployed_current") =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || die 'deployed snapshot pointer target is not canonical'

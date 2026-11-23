@@ -1074,6 +1074,7 @@ recover_interrupted_transaction() {
   fi
   if [[ $transaction_kind == rollback && ( -e "$candidate/exclusive-stop.json" || -L "$candidate/exclusive-stop.json" ) ]]; then
     secure_file "$candidate/exclusive-stop.json" 'rollback stop journal'
+    sync_transaction_audit "$candidate"
     local stop_status_json stop_unresolved=0
     stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null) || stop_unresolved=$?
     if ((stop_unresolved == 0)); then

@@ -1239,6 +1239,27 @@ class RollbackExclusiveStop(unittest.TestCase):
                              ('timeout', True, False, 'none'))
             self.assertIn('result=stop_failed reason=timeout', audit.read_text())
 
+            # Docker can reject signals during restart backoff. The helper still
+            # waits to the deadline and permits a verified explicit escalation.
+            crash = containers['cid-stuck']
+            crash['State'].update(Status='restarting', Restarting=True, Pid=0)
+            crash['HostConfig']['RestartPolicy']['Name'] = 'always'
+            crash_journal = root / 'crash-stop.json'
+            def signal_crash(cid, sig):
+                if sig != 'SIGKILL':
+                    return 409, b''
+                crash['State']['Restarting'] = False
+                return on_kill(cid, sig)
+            crash_backend, _ = self._make_docker_mock(containers, on_kill=signal_crash)
+            self.assertEqual(adapter.stop_exclusive_services(
+                lkg, crash_journal, uid=os.getuid(), backend_factory=lambda *_: crash_backend,
+                monotonic=mono, sleep=slp), 4)
+            self.assertEqual(json.loads(crash_journal.read_text())['reason'], 'timeout')
+            self.assertEqual(adapter.stop_exclusive_services(
+                lkg, crash_journal, reconcile=True, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: crash_backend, monotonic=mono, sleep=slp), 0)
+            crash['State'].update(Status='running', Running=True, Pid=99)
+
             # Reconcile while still running without --force-stop-timeout refuses without re-signaling.
             signals.clear()
             rc = adapter.stop_exclusive_services(lkg, journal, reconcile=True, audit_log=audit, uid=os.getuid(),

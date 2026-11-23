@@ -1197,6 +1197,9 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
             if monotonic() >= deadline:
                 return False, round(monotonic() - start, 3), "timeout"
             raise
+        now = monotonic()
+        if now >= deadline:
+            return False, round(now - start, 3), "timeout"
         if status == 404:
             if _service_has_any_container(backend, prefix, service, expected_labels):
                 return False, round(monotonic() - start, 3), "unexpected_replacement_detected"
@@ -1204,7 +1207,8 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
         if status != 200:
             return False, round(monotonic() - start, 3), "container_inspect_failed"
         info = decode(body)
-        if not container_owned(info, expected_labels):
+        matches, conflict = container_matches_service(info, prefix, service, expected_labels)
+        if conflict or not matches:
             return False, round(monotonic() - start, 3), "ownership_changed"
         if (info.get("State") or {}).get("Paused") is True:
             return False, round(monotonic() - start, 3), "container_paused"
