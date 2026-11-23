@@ -2986,6 +2986,9 @@ chmod 0600 "$crash_tx/exclusive-stop.json"
 expect_failure 'rollback exclusive-service stop requires reconciliation' "$installer" --repair --config "$config" >/dev/null
 sed -i 's/"inflight"/"verified"/' "$crash_tx/exclusive-stop.json"
 expect_failure 'exclusive service exited and replacement is pending' "$installer" --repair --config "$config" >/dev/null
+FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed before stop' "$installer" --rollback --config "$config" >/dev/null
+[[ -f "$crash_tx/exclusive-stop.json" ]] || fail 'preflight failure discarded the pending replacement guard'
+expect_failure 'exclusive service exited and replacement is pending' "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --rollback --config "$config" >/dev/null
 
 kill "$fake_docker_pid" 2>/dev/null || true

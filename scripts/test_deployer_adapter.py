@@ -539,6 +539,16 @@ class Containment(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('run this mode as root', result.stderr)
 
+    def test_rollback_success_audit_is_idempotent_after_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audit = Path(directory) / 'audit.log'
+            fields = {'transaction': '.transaction.first', 'action': 'rollback', 'result': 'success'}
+            adapter.append_audit_record(audit, dict(fields, time='initial'), os.getuid(), once=True)
+            adapter.append_audit_record(audit, dict(fields, time='recovered'), os.getuid(), once=True)
+            adapter.append_audit_record(audit, dict(fields, transaction='.transaction.second'), os.getuid(), once=True)
+            self.assertEqual(len(audit.read_text().splitlines()), 2)
+            self.assertNotIn('time=recovered', audit.read_text())
+
     def test_rollback_recovery_requires_durable_completion_after_reboot(self):
         installer = Path(__file__).with_name('install-deployer.sh')
         functions = ''.join(subprocess.check_output(['sed', '-n', f'/^{name}() {{$/,/^}}$/p',
@@ -553,6 +563,7 @@ root_path() { printf '%s%s' "$fixture_root" "$1"; }
 reject_other_role_state() { return 0; }
 adapter_unit_inactive() { return 0; }
 rollback_commit_marker_uncommitted() { test ! -e "$1"; }
+rollback_commit_marker_safe() { test -f "$1"; }
 restore_transaction() { printf restored >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 finalize_committed_rollback() { printf finalized >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 python3() { command "$test_python" -c "$journal_probe" "$@"; }
@@ -560,12 +571,15 @@ acquire_lock
 '''
         # Directory ancestry is covered separately; this fixture lives in /tmp.
         probe = "import sys; from unittest.mock import patch; import deployer_adapter as a; sys.argv=sys.argv[1:]; " \
-                "p=patch.object(a,'trusted_directory'); p.start(); raise SystemExit(a.main())"
+                "patch.object(a,'trusted_directory').start(); patch.object(a,'unit_inactive',return_value=True).start(); " \
+                "raise SystemExit(a.main())"
         for committed, volatile in ((False, False), (False, True), (True, False), (True, True)):
-            for state, uncertain, outcome in [('missing', False, None), ('inflight', False, None),
-                                              ('completed', True, 'committed' if committed else 'failed'),
-                                              ('completed', False, None),
-                                              ('completed', False, 'committed' if committed else 'failed')]:
+            cases = [('missing', False, None), ('inflight', False, None),
+                     ('completed', True, 'committed' if committed else 'failed'),
+                     ('completed', False, None), ('completed', False, 'committed' if committed else 'failed')]
+            if committed:
+                cases.append(('health-inflight', False, None))
+            for state, uncertain, outcome in cases:
                 with self.subTest(committed=committed, volatile=volatile, state=state,
                                   uncertain=uncertain, outcome=outcome), \
                         tempfile.TemporaryDirectory() as directory:
@@ -581,6 +595,8 @@ acquire_lock
                     unit = 'ci-fleet-deployer-adapter-1-2.service'
                     adapter.durable_file(transaction / 'kind', b'rollback\n')
                     adapter.durable_file(transaction / 'adapter-unit', (unit + '\n').encode())
+                    if state == 'health-inflight':
+                        adapter.durable_file(transaction / 'rollback-health-unit', (unit + '\n').encode())
                     if volatile:
                         adapter.durable_file(lock / 'adapter-unit', (unit + '\n').encode())
                     if committed:
@@ -589,7 +605,8 @@ acquire_lock
                         journal = store / '.adapter-recovery' / unit
                         journal.mkdir(parents=True, mode=0o700)
                         adapter.durable_file(journal / 'status.json', json.dumps({
-                            'unit': unit, 'operation': 'rollback', 'status': state,
+                            'unit': unit, 'operation': 'health' if state == 'health-inflight' else 'rollback',
+                            'status': 'inflight' if state == 'health-inflight' else state,
                             'exit_code': 1, 'rollback_outcome': outcome,
                             'rollback_marker': str(transaction / 'application-rollback-committed')}).encode())
                         if uncertain:
@@ -607,7 +624,7 @@ acquire_lock
                                                      CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
                                                      test_python=sys.executable, journal_probe=probe,
                                                      PYTHONPATH=str(installer.parent)))
-                    if state != 'completed' or uncertain or outcome is None:
+                    if state != 'health-inflight' and (state != 'completed' or uncertain or outcome is None):
                         self.assertEqual(result.returncode, 42, result.stderr)
                         self.assertIn('rollback adapter journal completion is unverified', result.stderr)
                         self.assertFalse(result_file.exists())
@@ -1549,6 +1566,10 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 with patch.object(adapter, 'Backend', return_value=backend), \
                                      patch.object(adapter, 'trusted_directory'), \
                                      patch.object(adapter, 'unit_inactive', return_value=True):
+                                    with self.assertRaisesRegex(ValueError, 'broker drain is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    adapter.durable_file(journal_dir / 'rollback-drained',
+                                                         adapter.hashlib.sha256(policy.rollback_ready.read_bytes()).hexdigest().encode())
                                     with self.assertRaisesRegex(ValueError, 'health is unverified'):
                                         adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
                                     self.assertFalse(marker.exists())

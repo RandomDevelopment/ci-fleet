@@ -1043,9 +1043,20 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
         return False
 
 
-def retire_journal(store: Path, unit: str, uid: int = 0) -> None:
-    require(journal_complete(store, unit, uid), "journal completion is unverified")
-    shutil.rmtree(store / unit)
+def retire_journal(store: Path, unit: str, uid: int = 0, *, inactive_health: bool = False) -> None:
+    journal = store / unit
+    if inactive_health:
+        require(bool(UNIT.fullmatch(unit)) and unit_inactive(unit), "health unit termination is unverified")
+        if not os.path.lexists(journal):
+            return
+        trusted_directory(journal, uid, 0o700)
+        status_path = journal / "status.json"
+        if os.path.lexists(status_path):
+            status = decode(protected_file(status_path, uid))
+            require(status.get("unit") == unit and status.get("operation") == "health", "health journal operation is unverified")
+    else:
+        require(journal_complete(store, unit, uid), "journal completion is unverified")
+    shutil.rmtree(journal)
     descriptor = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(descriptor)
@@ -1163,7 +1174,7 @@ def sandbox_command(unit: str, seconds: int, proxy: Path, policy: Path, adapter:
     return command + ["/usr/bin/python3", "%d/executor", "execute", operation]
 
 
-def append_audit_record(audit_log: Path, fields: dict[str, str], uid: int = 0) -> None:
+def append_audit_record(audit_log: Path, fields: dict[str, str], uid: int = 0, *, once: bool = False) -> None:
     parent = audit_log.parent
     if not parent.exists() and not parent.is_symlink():
         parent.mkdir(mode=0o700)
@@ -1180,11 +1191,19 @@ def append_audit_record(audit_log: Path, fields: dict[str, str], uid: int = 0) -
     line = " ".join(parts) + "\n"
     require(line.isascii() and len(line) <= 4096, "audit entry is invalid")
     body = line.encode()
-    descriptor = os.open(audit_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    access = os.O_RDWR if once else os.O_WRONLY
+    descriptor = os.open(audit_log, access | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         metadata = os.fstat(descriptor)
         require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == uid and metadata.st_nlink == 1
                 and stat.S_IMODE(metadata.st_mode) == 0o600, "audit log is unsafe")
+        if once:
+            require("transaction" in fields and fields.get("result") == "success", "missing terminal audit identity")
+            transaction = f"transaction={fields['transaction']}".encode()
+            with os.fdopen(os.dup(descriptor), "rb") as prior:
+                for line in prior:
+                    if line.endswith(b"\n") and {transaction, b"result=success"}.issubset(line.split()):
+                        return
         written = 0
         while written < len(body):
             count = os.write(descriptor, body[written:])
@@ -1673,7 +1692,11 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
         return False
     require(unit_inactive(unit) and not os.path.lexists(journal / "docker-uncertain"),
             "rollback adapter termination or mutation is unverified")
-    intent = decode(protected_file(ready, uid))
+    intent_bytes = protected_file(ready, uid)
+    drained = journal / "rollback-drained"
+    require(drained.exists() and protected_file(drained, uid) == hashlib.sha256(intent_bytes).hexdigest().encode(),
+            "rollback broker drain is unverified")
+    intent = decode(intent_bytes)
     marker = Path(intent["marker"])
     require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
     values = parse_policy(protected_file(journal / "policy.conf", uid))
@@ -1774,6 +1797,8 @@ def run_adapter(args) -> int:
     require(args.operation != "rollback" or policy.rollback_outcome == "committed"
             or policy.rollback_outcome == "failed" and result != 0, "rollback outcome is unverified")
     if policy.rollback_ready is not None and policy.rollback_outcome == "committed":
+        intent_bytes = protected_file(policy.rollback_ready, uid)
+        durable_file(journal / "rollback-drained", hashlib.sha256(intent_bytes).hexdigest().encode())
         require(complete_rollback_readiness(args.store, args.unit, uid), "rollback readiness is unverified")
         return result
     status_payload: dict = {
@@ -1801,6 +1826,7 @@ def main() -> int:
     retire = sub.add_parser("journal-retire")
     retire.add_argument("--store", type=Path, required=True)
     retire.add_argument("unit")
+    retire.add_argument("--inactive-health", action="store_true")
     complete = sub.add_parser("journal-complete")
     complete.add_argument("--store", type=Path, required=True)
     complete.add_argument("unit")
@@ -1822,6 +1848,7 @@ def main() -> int:
     stop_status.add_argument("--journal", type=Path, required=True)
     audit_cmd = sub.add_parser("append-audit")
     audit_cmd.add_argument("--audit-log", type=Path, required=True)
+    audit_cmd.add_argument("--once", action="store_true")
     audit_cmd.add_argument("fields", nargs="+")
     run = sub.add_parser("run")
     run.add_argument("--policy", type=Path, required=True)
@@ -1843,7 +1870,7 @@ def main() -> int:
             consume_approval(args.store, line, uid)
             return 0
         if args.command == "journal-retire":
-            retire_journal(args.store, args.unit, uid)
+            retire_journal(args.store, args.unit, uid, inactive_health=args.inactive_health)
             return 0
         if args.command == "rollback-readiness":
             return 0 if complete_rollback_readiness(args.store, args.unit, uid) else 1
@@ -1889,7 +1916,7 @@ def main() -> int:
                 key, sep, value = item.partition("=")
                 require(bool(sep) and bool(key) and bool(value), "invalid audit field")
                 parsed_fields[key] = value
-            append_audit_record(args.audit_log, parsed_fields, uid)
+            append_audit_record(args.audit_log, parsed_fields, uid, once=args.once)
             return 0
         if args.command == "execute":
             return execute_adapter(args.operation)
