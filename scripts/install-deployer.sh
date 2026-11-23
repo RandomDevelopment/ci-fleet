@@ -1108,6 +1108,7 @@ print(d.get("environment","unknown"), d.get("target","unknown"), d.get("service"
       export DOCKER_HOST
       unset DOCKER_CONTEXT
       reject_mixed_role
+      recover_adapter_guard
       policy_adapter_operation "$candidate/state/last-known-good-policy.conf" validate 'retained rollback policy' '' 0 || block 'retained rollback adapter validation failed'
       local -a rec_cmd=(python3 "$repo_root/scripts/deployer_adapter.py" stop-exclusive --reconcile --policy "$candidate/state/last-known-good-policy.conf" --journal "$candidate/exclusive-stop.json" --audit-log "$log_root/audit.log")
       if [[ -e "$candidate/state/active-policy.conf" || -L "$candidate/state/active-policy.conf" ]]; then
@@ -1271,6 +1272,12 @@ PY
   append_rollback_audit "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" action=rollback "environment=$environment" "target=$target" \
     "source=${final_policy[SOURCE_COMMIT]}" "artifact=${artifact#*@}" "core=$core_ref" "exclusive_services=$exclusive_services" \
     "stop_escalation=$stop_escalation" "stop_elapsed_s=$stop_elapsed_s" "health=$health" "result=$result" || die 'rollback audit log write failed'
+  if [[ $health != healthy ]]; then
+    error_reported=1
+    printf 'ERROR: rolled-back deployment health check failed; retained the committed transaction\n' >&2
+    report FAILED yes recover-committed-rollback no >&2
+    exit 2
+  fi
   publish_deployed_snapshot "$active_policy" "$state_file" || return
   rm -f "$previous_state" "$previous_policy" || return
   retired=$journal_root/.retired.$$.transaction
@@ -1284,12 +1291,6 @@ PY
 }
 
 report_committed_rollback() {
-  if [[ $health != healthy ]]; then
-    error_reported=1
-    printf 'ERROR: rolled-back deployment health check failed\n' >&2
-    report FAILED yes inspect-and-retry no >&2
-    exit 2
-  fi
   report CHANGED yes restore-host-policy-evidence-then-check no
 }
 

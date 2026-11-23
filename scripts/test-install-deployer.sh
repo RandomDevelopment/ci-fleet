@@ -2959,7 +2959,11 @@ health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 unhealthy_out=$(FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before expect_failure 'rolled-back deployment health check failed' "$installer" --rollback --config "$config")
 grep -Fq 'health=unhealthy' <<<"$unhealthy_out" || fail 'unhealthy rollback report omitted health=unhealthy'
 grep -Fq 'health=unhealthy result=unhealthy' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'unhealthy rollback was not audited'
-expect_success "$installer" --repair --config "$config" >/dev/null
+grep -Fq 'next=recover-committed-rollback' <<<"$unhealthy_out" || fail 'unhealthy rollback report omitted recovery required'
+[[ -f "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" ]] || fail 'unhealthy rollback discarded the last-known-good policy'
+expect_failure 'interrupted installer transaction requires recovery' "$installer" --check --config "$config" >/dev/null
+recovered_out=$(expect_success "$installer" --repair --config "$config")
+grep -Fq 'health=healthy' <<<"$recovered_out" || fail 'recovered rollback did not verify health'
 
 # Mid-stop crash (inflight exclusive-stop.json) blocks other ops and reconciles on --rollback.
 deploy_stop_pair

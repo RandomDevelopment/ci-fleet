@@ -1370,6 +1370,19 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(signals, [('current', 'SIGTERM')] * 2)
 
+    def test_removed_container_inventory_must_complete_before_stop_deadline(self):
+        mono, slp = self._fake_clock()
+        backend = MagicMock()
+        def request(method, *_):
+            if method == 'POST':
+                return 404, b''
+            slp(2)
+            return 200, b'[]'
+        backend.request.side_effect = request
+        result = adapter._signal_and_wait(backend, 'scheduler', 'ci-fleet-deploy-example-', 'scheduler',
+                                          self.labels, 'SIGTERM', 0, 1, mono, slp)
+        self.assertEqual(result, (False, 2.0, 'stop_deadline_unverified'))
+
     def test_rollback_broker_guards_and_real_socket_ordering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1381,6 +1394,10 @@ class RollbackExclusiveStop(unittest.TestCase):
                               'Config': {'Labels': self.labels, 'Image': bad_img},
                               'HostConfig': {'RestartPolicy': {'Name': 'always'}},
                               'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 50}},
+                'web': {'Id': 'web', 'Name': '/ci-fleet-deploy-example-web', 'Image': 'sha256:' + 'b' * 64,
+                        'Config': {'Labels': self.labels, 'Image': bad_img},
+                        'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                        'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 51}},
             }
             event_log = []
             def on_update(cid, payload):
@@ -1541,6 +1558,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 resp = conn.getresponse(); resp.read(); conn.close()
                                 self.assertEqual(resp.status, 204)
                                 self.assertEqual(policy.verified_containers, [new_id])
+                                self.assertEqual(containers['web']['State']['Pid'], 51)
                             finally:
                                 proxy.shutdown()
                                 pthread.join()
