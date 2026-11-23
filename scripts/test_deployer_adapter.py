@@ -1337,6 +1337,39 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(signals, [('cid-inflight', 'SIGTERM')])
 
+    def test_crash_loop_or_retained_exited_container_does_not_block_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lkg = self._write_policy(root / 'lkg.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2'})
+            labels = dict(self.labels, **{adapter.SERVICE_LABEL: 'scheduler'})
+            containers = {
+                'previous': {'Id': 'previous', 'Name': '/ci-fleet-deploy-example-previous', 'Config': {'Labels': labels},
+                             'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                             'State': {'Status': 'exited', 'Running': False, 'Restarting': False, 'Paused': False, 'Pid': 0}},
+                'current': {'Id': 'current', 'Name': '/ci-fleet-deploy-example-current', 'Config': {'Labels': labels},
+                            'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                            'State': {'Status': 'restarting', 'Running': True, 'Restarting': True, 'Paused': False, 'Pid': 0}},
+            }
+            signals = []
+            def on_kill(cid, sig):
+                signals.append((cid, sig))
+                if containers[cid]['State']['Restarting']:
+                    return 409, b''
+                containers[cid]['State'].update(Status='exited', Running=False, Pid=0)
+                return 204, b''
+
+            mono, slp = self._fake_clock()
+            def finish_backoff(duration):
+                slp(duration)
+                if containers['current']['State']['Restarting']:
+                    containers['current']['State'].update(Status='running', Restarting=False, Pid=41)
+
+            backend, _ = self._make_docker_mock(containers, on_kill=on_kill)
+            rc = adapter.stop_exclusive_services(lkg, root / 'exclusive-stop.json', uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend, monotonic=mono, sleep=finish_backoff)
+            self.assertEqual(rc, 0)
+            self.assertEqual(signals, [('current', 'SIGTERM')] * 2)
+
     def test_rollback_broker_guards_and_real_socket_ordering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1398,7 +1431,8 @@ class RollbackExclusiveStop(unittest.TestCase):
                         name = adapter.urllib.parse.parse_qs(parsed.query)['name'][0]
                         payload = json.loads(body)
                         cid = 'new-' + name
-                        containers[cid] = {'Id': cid, 'Name': '/' + name, 'Config': {'Labels': payload['Labels'], 'Image': payload['Image']},
+                        containers[cid] = {'Id': cid, 'Name': '/' + name, 'Image': 'sha256:' + 'a' * 64,
+                                           'Config': {'Labels': payload['Labels'], 'Image': payload['Image']},
                                            'HostConfig': {'RestartPolicy': {'Name': 'no'}},
                                            'State': {'Status': 'created', 'Running': False, 'Restarting': False, 'Paused': False, 'Pid': 0}}
                         event_log.append(f'create:{cid}')
@@ -1437,7 +1471,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                         lkg = self._write_policy(root / 'lkg.conf', {'DOCKER_SOCKET': sock_path, 'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
                         backend = adapter.TestingDockerBackend(sock_path, 30)
                         marker = root / 'rollback-commit'
-                        policy = adapter.Policy(json.loads(json.dumps(dict(self.base_values, DOCKER_SOCKET=sock_path))), backend,
+                        policy = adapter.Policy(dict(self.base_values, DOCKER_SOCKET=sock_path, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'), backend,
                                                 marker=marker, operation='rollback', exclusive_services=('scheduler',),
                                                 unit='ci-fleet-deployer-adapter-1-2.service')
                         proxy_sock = str(root / 'proxy.sock')
@@ -1475,6 +1509,12 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 resp = conn.getresponse(); new_id = json.loads(resp.read())['Id']; conn.close()
                                 self.assertEqual(resp.status, 201)
 
+                                # A created replacement is not enough to mark the rollback committed.
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', '/ci-fleet/rollback-commit', b'committed')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 403)
+
                                 conn = adapter.UnixConnection(proxy_sock, rootless=False)
                                 conn.request('POST', f'/containers/{new_id}/start')
                                 resp = conn.getresponse(); resp.read(); conn.close()
@@ -1483,6 +1523,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 # Unhealthy, restarting, or paused active container prevents rollback-commit.
                                 for bad_patch in (
                                     {'Health': {'Status': 'unhealthy'}},
+                                    {'Health': {'Status': 'starting'}},
                                     {'Health': {'Status': 'healthy'}, 'Restarting': True},
                                     {'Health': {'Status': 'healthy'}, 'Restarting': False, 'Paused': True},
                                 ):

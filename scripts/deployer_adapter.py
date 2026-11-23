@@ -96,14 +96,13 @@ def parse_rollback_stop_policy(values: dict[str, str], incumbent_values: dict[st
     if incumbent_values is not None:
         for key in ("ENVIRONMENT", "TARGET_ID", "DEPLOYER_IDENTITY"):
             require(incumbent_values.get(key) == values.get(key), f"incumbent policy {key} does not match rollback policy")
-        if incumbent_values.get("DOCKER_SOCKET") is not None or values.get("DOCKER_SOCKET") is not None:
-            require(incumbent_values.get("DOCKER_SOCKET") == values.get("DOCKER_SOCKET"),
-                    "incumbent policy DOCKER_SOCKET does not match rollback policy")
         inc_services, inc_timeout, inc_signal = _parse_single_stop_policy(incumbent_values)
         if inc_timeout is not None:
             require(len(inc_services) * inc_timeout <= MAX_ROLLBACK_STOP_TOTAL, "incumbent rollback stop timeout budget exceeds 1800 seconds")
         services = list(dict.fromkeys([*inc_services, *lkg_services]))
         require(len(services) <= MAX_EXCLUSIVE_SERVICES, "combined exclusive services exceed maximum count")
+        require(not services or incumbent_values.get("DOCKER_SOCKET") == values.get("DOCKER_SOCKET"),
+                "incumbent policy DOCKER_SOCKET does not match rollback policy")
         timeout = inc_timeout if inc_timeout is not None else (lkg_timeout if lkg_timeout is not None else (DEFAULT_ROLLBACK_STOP_TIMEOUT if services else 0))
         signal_name = inc_signal if inc_signal is not None else lkg_signal
     else:
@@ -283,6 +282,15 @@ class _DockerClient:
     uid = None
     gid = None
 
+    @contextlib.contextmanager
+    def bounded(self, deadline: float):
+        operation_deadline = self.deadline
+        self.deadline = min(operation_deadline, deadline)
+        try:
+            yield
+        finally:
+            self.deadline = operation_deadline
+
     def request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes]:
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Docker operation deadline elapsed")
@@ -421,14 +429,6 @@ def container_active(info: dict) -> bool:
     )
 
 
-def container_uses_image(info: dict, approved_image: str, approved_image_id: str | None = None) -> bool:
-    config = info.get("Config")
-    cfg_image = config.get("Image") if isinstance(config, dict) else None
-    if cfg_image == approved_image:
-        return True
-    return bool(approved_image_id and info.get("Image") == approved_image_id)
-
-
 def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict]:
     filters = json.dumps({"label": [f"{k}={v}" for k, v in expected_labels.items()]}, separators=(",", ":"))
     status, body = backend.request("GET", "/containers/json?" + urllib.parse.urlencode({"all": "1", "filters": filters}))
@@ -456,16 +456,12 @@ class Policy:
         self.prefix = "ci-fleet-deploy-" + values["DEPLOYER_IDENTITY"] + "-"
 
     def _container_matches_approved_image(self, info: dict) -> bool:
-        if container_uses_image(info, self.image):
-            return True
         if self._image_id is None:
-            try:
-                image_info = self.backend.inspect("images", self.image)
-                image_id = image_info.get("Id")
-                self._image_id = image_id if isinstance(image_id, str) else ""
-            except (ValueError, KeyError):
-                self._image_id = ""
-        return container_uses_image(info, self.image, self._image_id or None)
+            image_id = self.backend.inspect("images", self.image).get("Id", "")
+            require(isinstance(image_id, str) and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)),
+                    "approved rollback image ID is unavailable")
+            self._image_id = image_id
+        return info.get("Image") == self._image_id
 
     def _require_no_active_service_container(self, service: str, ignore_id: str | None = None) -> None:
         for item in list_owned_containers(self.backend, self.labels):
@@ -477,10 +473,10 @@ class Policy:
             require(not conflict, "ambiguous exclusive service identity")
             if matches:
                 info = self.owned("containers", cid)
-                m2, c2 = container_matches_service(info, self.prefix, service, self.labels)
-                require(not c2, "ambiguous exclusive service identity")
-                if m2:
-                    require(not container_active(info), f"exclusive service {service} still has an active container")
+                still_matches, conflict = container_matches_service(info, self.prefix, service, self.labels)
+                require(still_matches and not conflict, "exclusive service identity changed during inspection")
+                require(container_exited_and_non_restartable(info)[0],
+                        f"exclusive service {service} still has an active or restartable container")
 
     def verify_rollback_commit(self) -> None:
         if not self.exclusive_services:
@@ -495,18 +491,29 @@ class Policy:
             for svc in self.exclusive_services:
                 matches, conflict = container_matches_service(info, self.prefix, svc, self.labels)
                 require(not conflict, "ambiguous exclusive service identity")
-                if matches and active:
-                    active_counts[svc] += 1
-                    require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
+                if matches:
+                    if active:
+                        active_counts[svc] += 1
+                        require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
+                    else:
+                        require(container_exited_and_non_restartable(info)[0],
+                                f"exclusive service {svc} still has a restartable container")
             if active:
                 require(self._container_matches_approved_image(info), "active rollback container does not match approved artifact")
-                cstate = info.get("State") or {}
-                require(cstate.get("Restarting") is not True and cstate.get("Paused") is not True,
-                        "active rollback container is restarting or paused")
+                cstate = info.get("State", {})
+                require(cstate.get("Status") == "running" and cstate.get("Running") is True
+                        and cstate.get("Restarting") is False and cstate.get("Paused") is False
+                        and type(cstate.get("Pid")) is int and cstate["Pid"] > 0,
+                        "rollback container is not running")
                 health = cstate.get("Health")
-                if isinstance(health, dict):
-                    require(health.get("Status") != "unhealthy", "active rollback container is unhealthy")
+                check = (info.get("Config") or {}).get("Healthcheck") or {}
+                if health is not None or check.get("Test") not in (None, [], ["NONE"]):
+                    require(isinstance(health, dict) and health.get("Status") == "healthy",
+                            "rollback container health is unverified")
                 verified_ids.append(cid)
+        required_services = parse_rollback_stop_policy(self.values)["services"]
+        require(verified_ids and all(active_counts[svc] == 1 for svc in required_services),
+                "rollback is missing a running replacement for the approved release")
         self.verified_containers = verified_ids
 
     def artifacts(self) -> dict:
@@ -1168,43 +1175,60 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _service_has_any_container(backend, prefix: str, service: str, expected_labels: dict[str, str]) -> bool:
+def _service_has_live_container(backend, prefix: str, service: str, expected_labels: dict[str, str]) -> bool:
     for item in list_owned_containers(backend, expected_labels):
         matches, conflict = container_matches_service(item, prefix, service, expected_labels)
-        if conflict or matches:
+        if conflict or matches and not container_exited_and_non_restartable(backend.inspect("containers", item["Id"]))[0]:
             return True
     return False
 
 
-def _wait_container_exited(backend, cid: str, prefix: str, service: str, expected_labels: dict[str, str],
-                           wait_seconds: float, monotonic, sleep) -> tuple[bool, float, str]:
+def _signal_and_wait(backend, cid: str, prefix: str, service: str, expected_labels: dict[str, str],
+                     signal: str, wait_seconds: float, monotonic, sleep) -> tuple[bool, float, str]:
     start = monotonic()
     deadline = start + wait_seconds
-    delay = 0.05
     quoted = urllib.parse.quote(cid, safe="")
-    while True:
-        status, body = backend.request("GET", f"/containers/{quoted}/json")
-        if status == 404:
-            if _service_has_any_container(backend, prefix, service, expected_labels):
-                return False, round(monotonic() - start, 3), "unexpected_replacement_detected"
-            return True, round(monotonic() - start, 3), "removed"
-        if status != 200:
-            return False, round(monotonic() - start, 3), "container_inspect_failed"
-        info = decode(body)
-        if not container_owned(info, expected_labels):
-            return False, round(monotonic() - start, 3), "ownership_changed"
-        if (info.get("State") or {}).get("Restarting") is True:
-            return False, round(monotonic() - start, 3), "container_restarting_unexpectedly"
-        if (info.get("State") or {}).get("Paused") is True:
-            return False, round(monotonic() - start, 3), "container_paused"
-        exited, _ = container_exited_and_non_restartable(info)
-        if exited:
-            return True, round(monotonic() - start, 3), "exited"
-        now = monotonic()
-        if now >= deadline:
-            return False, round(now - start, 3), "timeout"
-        sleep(min(delay, deadline - now))
-        delay = min(0.5, delay * 2)
+    signal_path = f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": signal})
+
+    def removed():
+        live = _service_has_live_container(backend, prefix, service, expected_labels)
+        return not live, round(monotonic() - start, 3), "unexpected_replacement_detected" if live else "removed"
+
+    bound = backend.bounded(deadline) if isinstance(backend, _DockerClient) else contextlib.nullcontext()
+    delay = 0.05
+    with bound:
+        signaled, _ = backend.request("POST", signal_path)
+        while monotonic() < deadline:
+            if signaled == 404:
+                return removed()
+            if signaled not in (200, 204, 409):
+                return False, round(monotonic() - start, 3), "signal_delivery_failed"
+            status, body = backend.request("GET", f"/containers/{quoted}/json")
+            if status == 404:
+                return removed()
+            if status != 200:
+                return False, round(monotonic() - start, 3), "container_inspect_failed"
+            info = decode(body)
+            matches, conflict = container_matches_service(info, prefix, service, expected_labels)
+            if conflict or not matches or info.get("Id") != cid:
+                return False, round(monotonic() - start, 3), "container_identity_changed"
+            cstate = info.get("State") or {}
+            if cstate.get("Paused") is True:
+                return False, round(monotonic() - start, 3), "container_paused"
+            if container_exited_and_non_restartable(info)[0]:
+                if monotonic() < deadline:
+                    return True, round(monotonic() - start, 3), "exited"
+                break
+            if cstate.get("Restarting") is True:
+                # Docker can still complete a restart that was already scheduled.
+                signaled = 409
+            elif signaled == 409 and cstate.get("Running") is True and monotonic() < deadline:
+                signaled, _ = backend.request("POST", signal_path)
+            now = monotonic()
+            if now < deadline:
+                sleep(min(delay, deadline - now))
+                delay = min(0.5, delay * 2)
+    return False, round(monotonic() - start, 3), "timeout"
 
 
 def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
@@ -1260,12 +1284,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         60, len(services) * timeout_seconds + (FORCED_KILL_VERIFY_SECONDS * len(services) if force_stop_timeout else 0) + 30
     )
     if backend_factory is None:
-        if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" and os.environ.get("CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET") == "1":
-            backend = TestingDockerBackend(values["DOCKER_SOCKET"], budget)
-        else:
-            backend = Backend(values["DOCKER_SOCKET"], budget)
-    else:
-        backend = backend_factory(values["DOCKER_SOCKET"], budget)
+        test_socket = os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" and os.environ.get("CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET") == "1"
+        backend_factory = TestingDockerBackend if test_socket else Backend
 
     prior_timed_out: dict[str, str] = {}
     if reconcile:
@@ -1298,22 +1318,19 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         "total_elapsed_seconds": 0.0,
     }
 
-    def emit_failure(reason: str, *, service: str = "none", container_id: str = "none",
+    def emit_failure(reason: str, *, service: str | None = None, container_id: str | None = None,
                      signal_name: str = "none", elapsed: float = 0.0, escalation: str = "none",
-                     exit_code: int = 4, status_label: str = "unverified", write_audit: bool = False,
-                     extra: dict | None = None) -> int:
+                     exit_code: int = 4, status_label: str = "unverified") -> int:
         state["status"] = status_label
         state["reason"] = reason
-        if service != "none":
+        if service is not None:
             state["service"] = service
-        if container_id != "none":
+        if container_id is not None:
             state["container_id"] = container_id
-        if status_label == "timeout" and service != "none" and container_id != "none":
+        if status_label == "timeout" and service is not None and container_id is not None:
             state["timed_out_containers"][service] = container_id
-        if extra:
-            state.update(extra)
         durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
-        if write_audit and audit_log is not None:
+        if state["signaled"] and audit_log is not None:
             append_audit_record(audit_log, {
                 "time": _utc_now(),
                 "action": "rollback",
@@ -1321,8 +1338,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 "target": target,
                 "source": source_commit,
                 "artifact": artifact_digest,
-                "service": service,
-                "container": container_id,
+                "service": service or "none",
+                "container": container_id or "none",
                 "signal": signal_name,
                 "timeout_seconds": str(timeout_seconds),
                 "elapsed_seconds": f"{elapsed:.3f}",
@@ -1332,13 +1349,17 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             }, uid)
         print(
             f"ERROR: rollback exclusive-service stop failed: environment={environment} target={target} "
-            f"service={service} container={container_id} reason={reason} signal={signal_name} "
+            f"service={service or 'none'} container={container_id or 'none'} reason={reason} signal={signal_name} "
             f"elapsed={elapsed:.3f}s timeout={timeout_seconds}s escalation={escalation}",
             file=sys.stderr,
         )
         return exit_code
 
     # Resolution phase: resolve every declared service before signaling anything.
+    try:
+        backend = backend_factory(values["DOCKER_SOCKET"], budget)
+    except (ValueError, OSError, KeyError, http.client.HTTPException):
+        return emit_failure("docker_backend_unavailable", exit_code=3, status_label="blocked")
     try:
         inventory = list_owned_containers(backend, expected_labels)
     except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
@@ -1347,20 +1368,16 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
     resolved: list[tuple[str, str | None, dict | None, str]] = []
     for svc in services:
         matched: list[dict] = []
+        stopped: list[dict] = []
         for item in inventory:
             matches, conflict = container_matches_service(item, prefix, svc, expected_labels)
             if conflict:
                 cid = item.get("Id") if isinstance(item.get("Id"), str) else "unknown"
                 return emit_failure("ambiguous_service_identity", service=svc, container_id=cid,
-                                    exit_code=3, status_label="blocked", extra={"containers": [cid]})
-            if matches:
-                matched.append(item)
-        if len(matched) > 1:
-            cids = [m.get("Id", "unknown") for m in matched]
-            return emit_failure("ambiguous_service_identity", service=svc, container_id=",".join(cids),
-                                exit_code=3, status_label="blocked", extra={"containers": cids})
-        if len(matched) == 1:
-            cid = matched[0].get("Id")
+                                    exit_code=3, status_label="blocked")
+            if not matches:
+                continue
+            cid = item.get("Id")
             if not isinstance(cid, str) or not cid:
                 return emit_failure("invalid_container_identity", service=svc, exit_code=3, status_label="blocked")
             try:
@@ -1369,9 +1386,16 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("container_inspect_failed", service=svc, container_id=cid,
                                     exit_code=3, status_label="blocked")
             matches, conflict = container_matches_service(info, prefix, svc, expected_labels)
-            if conflict or not matches:
+            if conflict or not matches or info.get("Id") != cid:
                 return emit_failure("ambiguous_service_identity", service=svc, container_id=cid,
                                     exit_code=3, status_label="blocked")
+            (stopped if container_exited_and_non_restartable(info)[0] else matched).append(info)
+        if len(matched) > 1:
+            return emit_failure("ambiguous_service_identity", service=svc, container_id=",".join(m["Id"] for m in matched),
+                                exit_code=3, status_label="blocked")
+        if matched:
+            info = matched[0]
+            cid = info["Id"]
             cstate = info.get("State")
             if not isinstance(cstate, dict):
                 return emit_failure("container_state_unavailable", service=svc, container_id=cid,
@@ -1385,6 +1409,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("unsupported_stop_signal", service=svc, container_id=cid,
                                     exit_code=3, status_label="blocked")
             resolved.append((svc, cid, info, sig))
+        elif stopped:
+            resolved.append((svc, stopped[0]["Id"], stopped[0], ""))
         else:
             resolved.append((svc, None, None, policy_signal or "SIGTERM"))
 
@@ -1393,6 +1419,12 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         if cid is None or info is None:
             state["timed_out_containers"].pop(svc, None)
             state["services_state"].append({"service": svc, "action": "absent", "verified": True, "escalation": "none", "elapsed_seconds": 0.0})
+            continue
+        if not sig:
+            state["timed_out_containers"].pop(svc, None)
+            state["services_state"].append({"service": svc, "container_id": cid, "action": "already_stopped",
+                                            "verified": True, "escalation": prior_services.get(svc, {}).get("escalation", "none"),
+                                            "elapsed_seconds": 0.0})
             continue
         quoted = urllib.parse.quote(cid, safe="")
         state.update({"status": "inflight", "signaled": True, "service": svc, "container_id": cid, "signal": sig})
@@ -1434,22 +1466,11 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
 
         if not skip_graceful:
             try:
-                k_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": sig}))
-                if k_status == 404:
-                    if _service_has_any_container(backend, prefix, svc, expected_labels):
-                        return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
-                    state["timed_out_containers"].pop(svc, None)
-                    state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
-                                                    "verified": True, "escalation": "none", "elapsed_seconds": 0.0})
-                    continue
-                if k_status not in (200, 204, 409):
-                    return emit_failure("signal_delivery_failed", service=svc, container_id=cid, signal_name=sig)
-
-                ok, svc_elapsed, wait_reason = _wait_container_exited(backend, cid, prefix, svc, expected_labels,
-                                                                      float(timeout_seconds), monotonic, sleep)
-            except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                ok, svc_elapsed, wait_reason = _signal_and_wait(backend, cid, prefix, svc, expected_labels,
+                                                                 sig, timeout_seconds, monotonic, sleep)
+            except (ValueError, KeyError, OSError, http.client.HTTPException):
                 return emit_failure("docker_communication_failed", service=svc, container_id=cid, signal_name=sig,
-                                    elapsed=round(monotonic() - svc_start, 3), escalation=state["escalation"], write_audit=True)
+                                    elapsed=round(monotonic() - svc_start, 3), escalation=state["escalation"])
             if ok:
                 state["timed_out_containers"].pop(svc, None)
                 state["services_state"].append({"service": svc, "container_id": cid, "action": wait_reason,
@@ -1458,10 +1479,10 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 continue
             if wait_reason != "timeout":
                 return emit_failure(wait_reason, service=svc, container_id=cid, signal_name=sig,
-                                    elapsed=svc_elapsed, write_audit=True)
+                                    elapsed=svc_elapsed)
             if not force_stop_timeout:
                 return emit_failure("timeout", service=svc, container_id=cid, signal_name=sig,
-                                    elapsed=svc_elapsed, status_label="timeout", write_audit=True)
+                                    elapsed=svc_elapsed, status_label="timeout")
 
         # Explicit operator-authorized SIGKILL escalation after graceful timeout.
         print(
@@ -1470,6 +1491,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             f"elapsed={svc_elapsed:.3f}s timeout={timeout_seconds}s",
             file=sys.stderr,
         )
+        state["timed_out_containers"][svc] = cid
         state["escalation"] = "sigkill"
         state["escalation_requested_at"] = _utc_now()
         durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
@@ -1492,31 +1514,17 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             }, uid)
         kill_start = monotonic()
         try:
-            fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
-            if fk_status == 404:
-                if _service_has_any_container(backend, prefix, svc, expected_labels):
-                    return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid,
-                                        signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
-                state["timed_out_containers"].pop(svc, None)
-                state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
-                                                "signal": "SIGKILL", "verified": True, "escalation": "sigkill",
-                                                "elapsed_seconds": svc_elapsed})
-                continue
-            if fk_status not in (200, 204, 409):
-                return emit_failure("forced_stop_signal_failed", service=svc, container_id=cid,
-                                    signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
-            kill_budget = min(FORCED_KILL_VERIFY_SECONDS, max(5, timeout_seconds))
-            ok, kill_elapsed, kill_reason = _wait_container_exited(backend, cid, prefix, svc, expected_labels,
-                                                                   float(kill_budget), monotonic, sleep)
+            ok, kill_elapsed, kill_reason = _signal_and_wait(backend, cid, prefix, svc, expected_labels,
+                                                               "SIGKILL", FORCED_KILL_VERIFY_SECONDS, monotonic, sleep)
         except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
             return emit_failure("docker_communication_failed", service=svc, container_id=cid, signal_name="SIGKILL",
                                 elapsed=round(svc_elapsed + (monotonic() - kill_start), 3),
-                                escalation="sigkill", write_audit=True)
+                                escalation="sigkill")
         total_svc = round(svc_elapsed + kill_elapsed, 3)
         if not ok:
-            reason = "forced_stop_exit_unverified" if kill_reason == "timeout" else kill_reason
+            reason = {"timeout": "forced_stop_exit_unverified", "signal_delivery_failed": "forced_stop_signal_failed"}.get(kill_reason, kill_reason)
             return emit_failure(reason, service=svc, container_id=cid, signal_name="SIGKILL",
-                                elapsed=total_svc, escalation="sigkill", write_audit=True)
+                                elapsed=total_svc, escalation="sigkill")
         svc_escalation = "sigkill"
         state["timed_out_containers"].pop(svc, None)
         state["services_state"].append({"service": svc, "container_id": cid, "action": kill_reason,
@@ -1529,27 +1537,22 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
     except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
         return emit_failure("container_inventory_unavailable", escalation=state["escalation"])
     for svc in services:
-        matched = []
         for item in final_inventory:
             matches, conflict = container_matches_service(item, prefix, svc, expected_labels)
+            cid = item.get("Id")
             if conflict:
-                return emit_failure("ambiguous_service_identity", service=svc,
-                                    container_id=str(item.get("Id", "unknown")), escalation=state["escalation"])
-            if matches:
-                matched.append(item)
-        if len(matched) > 1:
-            return emit_failure("ambiguous_service_identity", service=svc,
-                                container_id=",".join(str(m.get("Id", "unknown")) for m in matched),
-                                escalation=state["escalation"])
-        if len(matched) == 1:
-            cid = matched[0]["Id"]
+                return emit_failure("ambiguous_service_identity", service=svc, container_id=str(cid),
+                                    escalation=state["escalation"])
+            if not matches:
+                continue
             try:
                 info = backend.inspect("containers", cid)
-            except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
-                return emit_failure("container_inspect_failed", service=svc, container_id=cid,
+                same_service, conflict = container_matches_service(info, prefix, svc, expected_labels)
+                require(same_service and not conflict and info.get("Id") == cid, "exclusive service identity changed")
+            except (ValueError, TypeError, OSError, http.client.HTTPException):
+                return emit_failure("container_inspect_failed", service=svc, container_id=str(cid),
                                     escalation=state["escalation"])
-            exited, _ = container_exited_and_non_restartable(info)
-            if not exited:
+            if not container_exited_and_non_restartable(info)[0]:
                 return emit_failure("unexpected_active_container", service=svc, container_id=cid,
                                     escalation=state["escalation"])
 

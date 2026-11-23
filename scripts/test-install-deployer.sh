@@ -1410,8 +1410,10 @@ deploy_calls_before=$(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true)
 health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 recovery=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'interrupted committed rollback recovery lacks the operator reconciliation action'
+grep -Eq 'digest=sha256:a{64} health=healthy' <<<"$recovery" || fail 'committed recovery reported the wrong artifact or health'
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'convergence ran after committed rollback recovery'
-[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'convergence health ran after committed rollback recovery'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == $((health_calls_before + 1)) ]] || fail 'committed rollback recovery did not verify restored health exactly once'
+tail -n 1 "$root/var/log/ci-fleet-deployer/audit.log" | grep -Eq 'action=rollback .*artifact=sha256:a{64} .*health=healthy result=success' || fail 'committed rollback recovery did not audit the restored artifact'
 [[ ! -e "$recovery_transaction" ]] || fail 'committed rollback recovery retained its transaction'
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
@@ -2752,7 +2754,7 @@ install -m 0600 "$tmp/lkg-compat-state.saved" "$root/var/lib/ci-fleet-deployer/l
 rm -rf "$old_release"
 
 # End-to-end installer rollback with local fake Docker Unix-socket server.
-fake_docker_sock=$tmp/fake-docker.sock
+fake_docker_sock=$root/run/docker.sock
 fake_docker_state=$tmp/fake-docker-state.json
 cat >"$tmp/fake_docker_server.py" <<'PY'
 import http.server, json, os, socketserver, sys, urllib.parse
@@ -2869,13 +2871,7 @@ export FAKE_DOCKER_PS='cid-sched|deployer|staging-deployer-01|staging|example-st
 write_stop_config() {
   write_evidence
   write_config
-  python3 - "$config" "$fake_docker_sock" <<'PY'
-from pathlib import Path; import re, sys
-p = Path(sys.argv[1])
-txt = re.sub(r'(?m)^DOCKER_SOCKET=.*$', 'DOCKER_SOCKET=' + sys.argv[2], p.read_text())
-p.write_text(txt + 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=1\n')
-PY
-  chmod 0600 "$config"
+  printf 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=1\n' >>"$config"
 }
 deploy_stop_pair() {
   image=$img_a; write_stop_config
