@@ -18,6 +18,7 @@ import pwd
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import socketserver
 import stat
@@ -282,22 +283,45 @@ class _DockerClient:
     rootless = True
     uid = None
     gid = None
+    _hard_stop_deadline = False
+
+    @contextlib.contextmanager
+    def stop_request_alarm(self):
+        if not self._hard_stop_deadline:
+            yield
+            return
+
+        # Only the dedicated stop helper's main thread uses the alarm.
+        def expired(_signum, _frame):
+            raise TimeoutError("Docker stop deadline elapsed")
+
+        previous_handler = signal.signal(signal.SIGALRM, expired)
+        try:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Docker stop deadline elapsed")
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
     def request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes]:
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Docker operation deadline elapsed")
         connection = UnixConnection(self.path, rootless=self.rootless, timeout=remaining)
-        try:
-            connection.connect()
-            if self.rootless:
-                require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
-            connection.request(method, path, body, headers or {})
-            response = connection.getresponse()
-            result = response.read(MAX_RESPONSE + 1)
-            require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
-            return response.status, result
-        finally:
-            connection.close()
+        with self.stop_request_alarm():
+            try:
+                connection.connect()
+                if self.rootless:
+                    require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
+                connection.request(method, path, body, headers or {})
+                response = connection.getresponse()
+                result = response.read(MAX_RESPONSE + 1)
+                require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
+                return response.status, result
+            finally:
+                connection.close()
 
     def inspect(self, kind: str, name: str) -> dict:
         suffix = "/json" if kind in ("containers", "images") else ""
@@ -421,14 +445,6 @@ def container_active(info: dict) -> bool:
     )
 
 
-def container_uses_image(info: dict, approved_image: str, approved_image_id: str | None = None) -> bool:
-    config = info.get("Config")
-    cfg_image = config.get("Image") if isinstance(config, dict) else None
-    if cfg_image == approved_image:
-        return True
-    return bool(approved_image_id and info.get("Image") == approved_image_id)
-
-
 def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict]:
     filters = json.dumps({"label": [f"{k}={v}" for k, v in expected_labels.items()]}, separators=(",", ":"))
     status, body = backend.request("GET", "/containers/json?" + urllib.parse.urlencode({"all": "1", "filters": filters}))
@@ -463,16 +479,12 @@ class Policy:
         self.prefix = "ci-fleet-deploy-" + values["DEPLOYER_IDENTITY"] + "-"
 
     def _container_matches_approved_image(self, info: dict) -> bool:
-        if container_uses_image(info, self.image):
-            return True
         if self._image_id is None:
-            try:
-                image_info = self.backend.inspect("images", self.image)
-                image_id = image_info.get("Id")
-                self._image_id = image_id if isinstance(image_id, str) else ""
-            except (ValueError, KeyError):
-                self._image_id = ""
-        return container_uses_image(info, self.image, self._image_id or None)
+            image_id = self.backend.inspect("images", self.image).get("Id", "")
+            require(isinstance(image_id, str) and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)),
+                    "approved rollback image ID is unavailable")
+            self._image_id = image_id
+        return info.get("Image") == self._image_id
 
     def _require_no_active_service_container(self, service: str, ignore_id: str | None = None) -> None:
         for item in list_owned_containers(self.backend, self.labels):
@@ -485,8 +497,7 @@ class Policy:
             if matches:
                 info = self.owned("containers", cid)
                 m2, c2 = container_matches_service(info, self.prefix, service, self.labels)
-                require(not c2, "ambiguous exclusive service identity")
-                require(m2, "exclusive service identity changed")
+                require(m2 and not c2 and info.get("Id") == cid, "exclusive service identity changed")
                 require(container_exited_and_non_restartable(info)[0],
                         f"exclusive service {service} still has an active or restartable container")
 
@@ -507,6 +518,7 @@ class Policy:
             cid = item.get("Id")
             require(isinstance(cid, str) and bool(cid), "invalid owned container identity")
             info = self.owned("containers", cid)
+            require(info.get("Id") == cid, "rollback container identity changed during inspection")
             active = container_active(info)
             exclusive = False
             for svc in self.exclusive_services:
@@ -530,8 +542,10 @@ class Policy:
                 health = cstate.get("Health")
                 if isinstance(health, dict) and health.get("Status") == "starting":
                     raise RollbackHealthStarting("Docker health check is starting")
-                require(health is None or isinstance(health, dict) and health.get("Status") == "healthy",
-                        "active rollback container health is unverified")
+                check = (info.get("Config") or {}).get("Healthcheck") or {}
+                if health is not None or check.get("Test") not in (None, [], ["NONE"]):
+                    require(isinstance(health, dict) and health.get("Status") == "healthy",
+                            "active rollback container health is unverified")
                 verified_ids.append(cid)
         for svc in self.required_rollback_services:
             require(active_counts[svc] == 1, f"exclusive rollback service {svc} is missing")
@@ -809,13 +823,15 @@ def handler(policy: Policy):
                 body = self.rfile.read(length)
                 req_norm = os.path.normpath(re.sub(r"^/v[0-9]+\.[0-9]+(?=/)", "",
                                                    urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)))
-                serialize_exclusive = (
-                    policy.operation == "rollback" and bool(policy.exclusive_services) and self.command == "POST"
-                    and (self.path == "/ci-fleet/rollback-commit" or req_norm == "/containers/create"
-                         or bool(re.fullmatch(r"/containers/[^/]+/(start|restart)", req_norm)))
-                )
+                exclusive_rollback = policy.operation == "rollback" and bool(policy.exclusive_services)
+                read_only_wait = exclusive_rollback and self.command == "POST" and re.fullmatch(r"/containers/[^/]+/wait", req_norm)
+                serialize_exclusive = exclusive_rollback and self.command in ("POST", "DELETE") and not read_only_wait
                 lock = policy._exclusive_lock if serialize_exclusive else contextlib.nullcontext()
                 with lock:
+                    if serialize_exclusive:
+                        require(not policy.uncertain, "Docker mutation completion is unverified")
+                        require(policy.rollback_outcome is None or self.path == "/ci-fleet/rollback-commit",
+                                "rollback outcome has already been published")
                     if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
                         require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
                         require(policy.operation == "rollback" and policy.marker is not None
@@ -842,7 +858,7 @@ def handler(policy: Policy):
                     else:
                         path, body = policy.authorize(self.command, self.path, body)
                         headers = {"Content-Type": "application/json"}
-                        mutation = self.command not in ("GET", "HEAD")
+                        mutation = self.command not in ("GET", "HEAD") and not read_only_wait
                         status, response = policy.backend.request(self.command, path, body, headers)
                         if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
                             progress = [decode(line) for line in response.splitlines() if line.strip()]
@@ -1231,7 +1247,7 @@ def _service_has_active_container(backend, prefix: str, service: str, expected_l
         if matches:
             info = backend.inspect("containers", item["Id"])
             matches, conflict = container_matches_service(info, prefix, service, expected_labels)
-            if conflict or not matches or not container_exited_and_non_restartable(info)[0]:
+            if conflict or not matches or info.get("Id") != item["Id"] or not container_exited_and_non_restartable(info)[0]:
                 return True
     return False
 
@@ -1246,21 +1262,21 @@ def _wait_container_exited(backend, cid: str, prefix: str, service: str, expecte
         try:
             status, body = backend.request("GET", f"/containers/{quoted}/json")
         except TimeoutError:
-            if monotonic() >= deadline:
-                return False, round(monotonic() - start, 3), "timeout"
-            raise
+            return False, round(monotonic() - start, 3), "stop_deadline_unverified"
         now = monotonic()
         if now >= deadline:
             return False, round(now - start, 3), "timeout"
         if status == 404:
-            if _service_has_active_container(backend, prefix, service, expected_labels):
-                return False, round(monotonic() - start, 3), "unexpected_replacement_detected"
-            return True, round(monotonic() - start, 3), "removed"
+            active = _service_has_active_container(backend, prefix, service, expected_labels)
+            elapsed = round(monotonic() - start, 3)
+            if monotonic() >= deadline:
+                return False, elapsed, "stop_deadline_unverified"
+            return not active, elapsed, "unexpected_replacement_detected" if active else "removed"
         if status != 200:
             return False, round(monotonic() - start, 3), "container_inspect_failed"
         info = decode(body)
         matches, conflict = container_matches_service(info, prefix, service, expected_labels)
-        if conflict or not matches:
+        if conflict or not matches or info.get("Id") != cid:
             return False, round(monotonic() - start, 3), "ownership_changed"
         if (info.get("State") or {}).get("Paused") is True:
             return False, round(monotonic() - start, 3), "container_paused"
@@ -1306,6 +1322,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
     timeout_seconds: int = parsed["timeout_seconds"]
     policy_signal: str | None = parsed["signal"]
     environment = values["ENVIRONMENT"]
+    require(environment != "production", "production rollback is not authorized")
     target = values["TARGET_ID"]
     identity = values["DEPLOYER_IDENTITY"]
     prefix = f"ci-fleet-deploy-{identity}-"
@@ -1440,7 +1457,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("container_inspect_failed", service=svc, container_id=cid,
                                     exit_code=3, status_label="blocked")
             matches, conflict = container_matches_service(info, prefix, svc, expected_labels)
-            if conflict or not matches:
+            if conflict or not matches or info.get("Id") != cid:
                 return emit_failure("ambiguous_service_identity", service=svc, container_id=cid,
                                     exit_code=3, status_label="blocked")
             if container_exited_and_non_restartable(info)[0]:
@@ -1486,6 +1503,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         if restart_name not in ("", "no"):
             if operation_deadline is not None:
                 backend.deadline = min(operation_deadline, svc_deadline)
+                backend._hard_stop_deadline = True
             try:
                 upd_status, _ = backend.request("POST", f"/containers/{quoted}/update",
                                                 json.dumps({"RestartPolicy": {"Name": "no", "MaximumRetryCount": 0}}).encode(),
@@ -1498,6 +1516,10 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             finally:
                 if operation_deadline is not None:
                     backend.deadline = operation_deadline
+                    backend._hard_stop_deadline = False
+            same_service, conflict = container_matches_service(info, prefix, svc, expected_labels)
+            if conflict or not same_service or info.get("Id") != cid:
+                return emit_failure("ownership_changed", service=svc, container_id=cid, signal_name=sig)
             updated_rp = ((info.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name", "")
             if updated_rp not in ("", "no"):
                 return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
@@ -1523,10 +1545,14 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("restart_policy_update_unverified", service=svc, container_id=cid, signal_name=sig)
             if operation_deadline is not None:
                 backend.deadline = min(operation_deadline, svc_deadline)
+                backend._hard_stop_deadline = True
             try:
                 k_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": sig}))
                 if k_status == 404:
-                    if _service_has_active_container(backend, prefix, svc, expected_labels):
+                    active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                    if monotonic() >= svc_deadline:
+                        return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
+                    if active:
                         return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
                     state["timed_out_containers"].pop(svc, None)
                     state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
@@ -1548,6 +1574,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             finally:
                 if operation_deadline is not None:
                     backend.deadline = operation_deadline
+                    backend._hard_stop_deadline = False
             if ok:
                 state["timed_out_containers"].pop(svc, None)
                 state["services_state"].append({"service": svc, "container_id": cid, "action": wait_reason,
@@ -1592,10 +1619,15 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         kill_deadline = kill_start + FORCED_KILL_VERIFY_SECONDS
         if operation_deadline is not None:
             backend.deadline = min(operation_deadline, kill_deadline)
+            backend._hard_stop_deadline = True
         try:
             fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
             if fk_status == 404:
-                if _service_has_active_container(backend, prefix, svc, expected_labels):
+                active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                if monotonic() >= kill_deadline:
+                    return emit_failure("stop_deadline_unverified", service=svc, container_id=cid,
+                                        signal_name="SIGKILL", escalation="sigkill")
+                if active:
                     return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid,
                                         signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
                 state["timed_out_containers"].pop(svc, None)
@@ -1616,6 +1648,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
         finally:
             if operation_deadline is not None:
                 backend.deadline = operation_deadline
+                backend._hard_stop_deadline = False
         total_svc = round(svc_elapsed + kill_elapsed, 3)
         if not ok:
             reason = "forced_stop_exit_unverified" if kill_reason == "timeout" else kill_reason
@@ -1650,7 +1683,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                                     escalation=state["escalation"])
             exited, _ = container_exited_and_non_restartable(info)
             matches, conflict = container_matches_service(info, prefix, svc, expected_labels)
-            if conflict or not matches or not exited:
+            if conflict or not matches or info.get("Id") != cid or not exited:
                 return emit_failure("unexpected_active_container", service=svc, container_id=cid,
                                     escalation=state["escalation"])
 

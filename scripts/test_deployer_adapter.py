@@ -1375,6 +1375,23 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(signals, [('cid-inflight', 'SIGTERM')])
 
+    def test_removed_container_inventory_must_complete_before_stop_deadline(self):
+        monotonic, sleep = self._fake_clock()
+        backend = MagicMock()
+
+        def request(_method, path):
+            if "/containers/json?" in path:
+                sleep(2)
+                return 200, b"[]"
+            return 404, b"{}"
+
+        backend.request.side_effect = request
+        result = adapter._wait_container_exited(
+            backend, "removed", "ci-fleet-deploy-example-", "scheduler",
+            self.labels, 2, 0, monotonic, sleep,
+        )
+        self.assertEqual(result, (False, 2.0, "stop_deadline_unverified"))
+
     def test_rollback_broker_guards_and_real_socket_ordering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1443,7 +1460,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                         name = adapter.urllib.parse.parse_qs(parsed.query)['name'][0]
                         payload = json.loads(body)
                         cid = 'new-' + name
-                        containers[cid] = {'Id': cid, 'Name': '/' + name, 'Config': {'Labels': payload['Labels'], 'Image': payload['Image']},
+                        containers[cid] = {'Id': cid, 'Name': '/' + name, 'Image': 'sha256:' + 'a' * 64, 'Config': {'Labels': payload['Labels'], 'Image': payload['Image']},
                                            'HostConfig': {'RestartPolicy': {'Name': 'no'}},
                                            'State': {'Status': 'created', 'Running': False, 'Restarting': False, 'Paused': False, 'Pid': 0}}
                         event_log.append(f'create:{cid}')
@@ -1550,6 +1567,17 @@ class RollbackExclusiveStop(unittest.TestCase):
                                     self.assertEqual(resp.status, 403)
                                 containers[new_id]['State'].update({'Restarting': False, 'Paused': False})
 
+                                replacement = containers[new_id]
+                                replacement['Image'] = 'sha256:' + 'b' * 64
+                                with self.assertRaisesRegex(ValueError, 'does not match approved artifact'):
+                                    policy.verify_rollback_commit()
+                                replacement['Image'] = 'sha256:' + 'a' * 64
+                                replacement['Config']['Healthcheck'] = {'Test': ['CMD', 'check']}
+                                replacement['State'].pop('Health')
+                                with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                    policy.verify_rollback_commit()
+                                replacement['State']['Health'] = {'Status': 'healthy'}
+
                                 # A durable successful adapter outcome can wait for
                                 # Docker health without dispatching the adapter again.
                                 store = root / 'recovery'
@@ -1563,6 +1591,10 @@ class RollbackExclusiveStop(unittest.TestCase):
                                 conn.request('POST', '/ci-fleet/rollback-commit', b'committed')
                                 resp = conn.getresponse(); resp.read(); conn.close()
                                 self.assertEqual(resp.status, 204)
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', f'/containers/{new_id}/kill?signal=SIGTERM')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 403)
                                 with patch.object(adapter, 'Backend', return_value=backend), \
                                      patch.object(adapter, 'trusted_directory'), \
                                      patch.object(adapter, 'unit_inactive', return_value=True):
