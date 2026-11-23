@@ -1063,7 +1063,7 @@ restore_transaction() {
 }
 
 recover_interrupted_transaction() {
-  local candidates=() candidate pending_unit= replacement_pending=0
+  local candidates=() candidate pending_unit='' replacement_pending=0
   shopt -s nullglob
   candidates=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
@@ -1124,7 +1124,9 @@ print(d.get("environment","unknown"), d.get("target","unknown"), d.get("service"
       reject_mixed_role
       check_unit_boundary
       local retained_units=$releases/${rec_lkg[CORE_REF]:-}/deploy/deployer
-      [[ ${rec_lkg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] && release_complete "$releases/${rec_lkg[CORE_REF]}" || block 'retained rollback release is incomplete'
+      if [[ ! ${rec_lkg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || ! release_complete "$releases/${rec_lkg[CORE_REF]}"; then
+        block 'retained rollback release is incomplete'
+      fi
       systemd-analyze verify "${unit_names[@]/#/$retained_units/}" >/dev/null || die 'systemd unit verification failed before stop reconciliation'
       policy_adapter_operation "$candidate/state/last-known-good-policy.conf" validate 'retained rollback policy' || block 'last-known-good adapter validation failed before stop reconciliation'
       local -a rec_cmd=(python3 "$repo_root/scripts/deployer_adapter.py" stop-exclusive --reconcile --policy "$candidate/state/last-known-good-policy.conf" --journal "$candidate/exclusive-stop.json" --audit-log "$log_root/audit.log")

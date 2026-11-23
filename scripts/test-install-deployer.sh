@@ -2864,7 +2864,7 @@ mkfifo -m 0600 "$tmp/fake-docker-ready"
 python3 "$tmp/fake_docker_server.py" "$fake_docker_sock" "$fake_docker_state" >"$tmp/fake-docker-ready" &
 fake_docker_pid=$!
 trap 'kill "$fake_docker_pid" 2>/dev/null || true; restore_live_checkout; rm -rf "$tmp"' EXIT
-timeout 15s bash -c 'IFS= read -r ready <"$1" && [[ $ready == ready ]]' -- "$tmp/fake-docker-ready" || fail 'fake Docker Unix socket did not start'
+timeout 15s grep -Fxq ready "$tmp/fake-docker-ready" || fail 'fake Docker Unix socket did not start'
 
 export CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET=1
 export FAKE_DOCKER_PS='cid-sched|deployer|staging-deployer-01|staging|example-staging'
