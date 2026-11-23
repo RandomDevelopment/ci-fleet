@@ -282,13 +282,25 @@ class _DockerClient:
     rootless = True
     uid = None
     gid = None
+    _hard_stop_deadline = False
 
     @contextlib.contextmanager
     def bounded(self, deadline: float):
-        # Stop operations run on the main thread in the dedicated stop helper.
-        operation_deadline = self.deadline
+        operation_deadline, hard_stop_deadline = self.deadline, self._hard_stop_deadline
         self.deadline = min(operation_deadline, deadline)
+        self._hard_stop_deadline = True
+        try:
+            yield
+        finally:
+            self.deadline, self._hard_stop_deadline = operation_deadline, hard_stop_deadline
 
+    @contextlib.contextmanager
+    def stop_request_alarm(self):
+        if not self._hard_stop_deadline:
+            yield
+            return
+
+        # Only the dedicated stop helper's main thread uses the alarm.
         def expired(_signum, _frame):
             raise TimeoutError("Docker stop deadline elapsed")
 
@@ -302,23 +314,23 @@ class _DockerClient:
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
-            self.deadline = operation_deadline
 
     def request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes]:
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Docker operation deadline elapsed")
         connection = UnixConnection(self.path, rootless=self.rootless, timeout=remaining)
-        try:
-            connection.connect()
-            if self.rootless:
-                require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
-            connection.request(method, path, body, headers or {})
-            response = connection.getresponse()
-            result = response.read(MAX_RESPONSE + 1)
-            require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
-            return response.status, result
-        finally:
-            connection.close()
+        with self.stop_request_alarm():
+            try:
+                connection.connect()
+                if self.rootless:
+                    require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
+                connection.request(method, path, body, headers or {})
+                response = connection.getresponse()
+                result = response.read(MAX_RESPONSE + 1)
+                require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
+                return response.status, result
+            finally:
+                connection.close()
 
     def inspect(self, kind: str, name: str) -> dict:
         suffix = "/json" if kind in ("containers", "images") else ""
@@ -497,23 +509,28 @@ class Policy:
         active_counts = {svc: 0 for svc in self.exclusive_services}
         verified_ids: list[str] = []
         for item in list_owned_containers(self.backend, self.labels):
+            services = []
+            for svc in self.exclusive_services:
+                matches, conflict = container_matches_service(item, self.prefix, svc, self.labels)
+                require(not conflict, "ambiguous exclusive service identity")
+                if matches:
+                    services.append(svc)
+            if not services:
+                continue
             cid = item.get("Id")
             require(isinstance(cid, str) and bool(cid), "invalid owned container identity")
             info = self.owned("containers", cid)
             active = container_active(info)
-            exclusive = False
-            for svc in self.exclusive_services:
+            for svc in services:
                 matches, conflict = container_matches_service(info, self.prefix, svc, self.labels)
-                require(not conflict, "ambiguous exclusive service identity")
-                if matches:
-                    exclusive = True
-                    if active:
-                        active_counts[svc] += 1
-                        require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
-                    else:
-                        require(container_exited_and_non_restartable(info)[0],
-                                f"exclusive service {svc} still has a restartable container")
-            if exclusive and active:
+                require(matches and not conflict and info.get("Id") == cid, "exclusive service identity changed during inspection")
+                if active:
+                    active_counts[svc] += 1
+                    require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
+                else:
+                    require(container_exited_and_non_restartable(info)[0],
+                            f"exclusive service {svc} still has a restartable container")
+            if active:
                 require(self._container_matches_approved_image(info), "active rollback container does not match approved artifact")
                 cstate = info.get("State", {})
                 require(cstate.get("Status") == "running" and cstate.get("Running") is True

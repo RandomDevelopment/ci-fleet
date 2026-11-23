@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -1405,7 +1406,8 @@ class RollbackExclusiveStop(unittest.TestCase):
                 return None
             def on_kill(cid, sig):
                 event_log.append(f'kill:{cid}:{sig}')
-                containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                if sig != 'SIGUSR1':
+                    containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
                 return None
 
             # Serve over a real local Unix socket for full end-to-end HTTP verification.
@@ -1422,7 +1424,7 @@ class RollbackExclusiveStop(unittest.TestCase):
                         self.send_response(200)
                     elif p.startswith('/containers/') and p.endswith('/json'):
                         cid = adapter.urllib.parse.unquote(p[len('/containers/'):-len('/json')])
-                        if cid not in containers:
+                        if cid not in containers or cid == 'web':
                             self.send_response(404); data = b'{}'
                         else:
                             event_log.append(f'inspect:{cid}:{containers[cid]["State"]["Status"]}')
@@ -1487,6 +1489,12 @@ class RollbackExclusiveStop(unittest.TestCase):
                     with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1', 'CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET': '1'}):
                         lkg = self._write_policy(root / 'lkg.conf', {'DOCKER_SOCKET': sock_path, 'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
                         backend = adapter.TestingDockerBackend(sock_path, 30)
+                        start = time.monotonic()
+                        stopped, _, reason = adapter._signal_and_wait(
+                            backend, 'old-sched', 'ci-fleet-deploy-example-', 'scheduler', self.labels,
+                            'SIGUSR1', start, start + 0.5, time.monotonic, time.sleep,
+                        )
+                        self.assertEqual((stopped, reason), (False, 'timeout'))
                         marker = root / 'rollback-commit'
                         policy = adapter.Policy(dict(self.base_values, DOCKER_SOCKET=sock_path, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'), backend,
                                                 marker=marker, operation='rollback', exclusive_services=('scheduler',),
