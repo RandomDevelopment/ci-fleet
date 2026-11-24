@@ -43,6 +43,7 @@ TASKS = [
     ('remote-reconcile', ['python3', 'scripts/test_remote_reconcile.py'], False),
     ('explicit-recovery', ['python3', '-I', '-B', 'scripts/test_explicit_recovery.py'], False),
     ('health', ['python3', 'scripts/test_health.py'], False),
+    ('disk-admission', ['python3', 'scripts/test_disk_admission_sample.py'], False),
     ('endpoint-snapshot', ['python3', 'scripts/test_endpoint_snapshot.py'], False),
     ('snapshot-sources', ['python3', 'scripts/test_endpoint_snapshot_sources.py'], False),
     ('snapshot-store', ['python3', 'scripts/test_endpoint_snapshot_store.py'], False),

@@ -2008,6 +2008,21 @@ else:
 PY
 }
 
+prepare_disk_admission_export() {
+  local source=$1
+  if [[ -f "$source/scripts/disk_admission_sample.py" ]]; then
+    python3 "$source/scripts/disk_admission_sample.py" --prepare --output "$state_root/disk-admission"
+  fi
+}
+
+remove_disk_admission_export() {
+  # This manager's helper removes only its protected, allowlisted export. Never
+  # delete capacity history merely because an engine predates disk admission.
+  if [[ -f "$repo_root/scripts/disk_admission_sample.py" ]]; then
+    python3 "$repo_root/scripts/disk_admission_sample.py" --remove --output "$state_root/disk-admission"
+  fi
+}
+
 activate_candidate() {
   local check_health=${1:-true} staged_state
   restore_reviewed_image_tags "$candidate_env" || die 'verified candidate image publication failed'
@@ -2034,6 +2049,7 @@ PY
   chmod 0600 "$staged_state"
   mv -f "$staged_state" "$state_file"
   if [[ "$target_state" == active ]]; then
+    prepare_disk_admission_export "$release_dir" || die 'disk admission export preparation failed'
     compose "$release_dir" "$rendered_env" up -d --remove-orphans controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
     runtime_matches active || die 'controller did not remain running after activation'
@@ -2581,7 +2597,8 @@ PY
       if [[ $(managed_runner_count) != 0 ]]; then
         failed=1
       else
-        compose "$release_dir" "$rendered_env" up -d --remove-orphans controller || failed=1
+        prepare_disk_admission_export "$release_dir" || failed=1
+        if ((failed == 0)); then compose "$release_dir" "$rendered_env" up -d --remove-orphans controller || failed=1; fi
         if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" true || failed=1; fi
       fi
     fi
@@ -2968,6 +2985,7 @@ perform_converge() {
     transaction_active=false
     trap on_term TERM
     if ((policy_status == 0)); then
+      if [[ ! -f "$release_dir/scripts/disk_admission_sample.py" ]]; then remove_disk_admission_export; fi
       note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
       return
     fi
@@ -2997,6 +3015,7 @@ perform_converge() {
   activate_candidate
   transaction_active=false
   if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
+  if [[ ! -f "$release_dir/scripts/disk_admission_sample.py" ]]; then remove_disk_admission_export; fi
   note "CONVERGED mode=$mode controller=$controller_id config_ref=$config_ref engine_ref=$engine_ref state=$target_state"
 }
 
@@ -3021,6 +3040,7 @@ perform_rollback() {
   transaction_started=true
   restore_checkpoint || die 'checkpoint restoration failed'
   if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
+  if [[ ! -f "$release_dir/scripts/disk_admission_sample.py" ]]; then remove_disk_admission_export; fi
   note "ROLLBACK_OK checkpoint=$checkpoint_dir"
 }
 
@@ -3081,6 +3101,7 @@ perform_uninstall() {
   rm -f "$manager_current"
   transaction_active=false
   remove_capacity_history
+  remove_disk_admission_export
   note "UNINSTALL_OK host_config_preserved=$host_config secrets_preserved=$etc_dir/secrets"
 }
 
@@ -3142,6 +3163,7 @@ case "$mode" in
       transaction_started=true
       restore_checkpoint || die 'last-known-good checkpoint restoration failed'
       if [[ ! -x "$release_dir/scripts/capacity-sample.sh" ]]; then remove_capacity_history; fi
+      if [[ ! -f "$release_dir/scripts/disk_admission_sample.py" ]]; then remove_disk_admission_export; fi
       note "ROLLBACK_OK checkpoint=$checkpoint_dir"
       write_transaction_result applied
       exit 0

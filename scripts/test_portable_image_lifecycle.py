@@ -173,7 +173,7 @@ preflight_checkpoint_images "$release_dir" "$candidate_env"
                     "portable_managed_images", "capture_legacy_image_ids", "load_checkpoint_images", "make_checkpoint",
                     "checkpoint_images_reproducible", "preflight_checkpoint_images", "managed_image_objects_match",
                     "try_drain_current", "retag_checkpoint_image", "restore_reviewed_image_tags",
-                    "managed_images_match", "restore_checkpoint"), r"""
+                    "managed_images_match", "prepare_disk_admission_export", "restore_checkpoint"), r"""
 install_root=$temporary/opt/ci-fleet
 releases_dir=$install_root/releases
 mkdir -p "$releases_dir"
@@ -1038,7 +1038,7 @@ done
                     "make_checkpoint", "latest_checkpoint", "canonical_release_target", "raw_pointer_target_exists",
                     "raw_link_target_path", "portable_managed_images", "preflight_checkpoint_images",
                     "checkpoint_images_reproducible", "managed_image_objects_match", "restore_reviewed_image_tags",
-                    "retag_checkpoint_image", "managed_images_match", "restore_checkpoint", "try_drain_current",
+                    "retag_checkpoint_image", "managed_images_match", "prepare_disk_admission_export", "restore_checkpoint", "try_drain_current",
                     "drain_current", "managed_runner_count", "remove_inactive_managed_runners"),
                    "uninstall_preparation() {\n" + preparation + "}\n" + r"""
 root=$temporary/host

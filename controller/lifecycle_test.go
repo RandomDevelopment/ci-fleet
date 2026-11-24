@@ -23,6 +23,7 @@ import (
 type lifecycleBatchClient struct {
 	message      *scaleset.RunnerScaleSetMessage
 	polls        int
+	pollCapacity []int
 	acknowledged atomic.Bool
 	acquireJobs  func(context.Context, []int64) ([]int64, error)
 	deleteError  error
@@ -32,8 +33,9 @@ func (c *lifecycleBatchClient) Session() scaleset.RunnerScaleSetSession {
 	return scaleset.RunnerScaleSetSession{SessionID: uuid.New(), Statistics: &scaleset.RunnerScaleSetStatistic{}}
 }
 
-func (c *lifecycleBatchClient) GetMessage(context.Context, int, int) (*scaleset.RunnerScaleSetMessage, error) {
+func (c *lifecycleBatchClient) GetMessage(_ context.Context, _, capacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	c.polls++
+	c.pollCapacity = append(c.pollCapacity, capacity)
 	if c.polls == 1 {
 		return c.message, nil
 	}

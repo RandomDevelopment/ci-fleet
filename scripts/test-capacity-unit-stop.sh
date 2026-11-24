@@ -34,9 +34,11 @@ printf 'CAPACITY_UNIT_STOP_TESTS_OK\n'
 {
   printf 'set -Eeuo pipefail\n'
   sed -n '/^remove_capacity_history() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
+  sed -n '/^remove_disk_admission_export() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   sed -n '/^perform_uninstall() {/,/^}/p' "$repo_root/scripts/install-worker-controller.sh"
   cat <<'TEST'
 state_root=$1/state
+repo_root=$2
 current_link=$1/current
 manager_current=$1/manager-current
 rendered_env=$1/env
@@ -46,6 +48,7 @@ host_config=fixture
 etc_dir=$1/etc
 mkdir -p "$state_root/capacity" "$state_root/health"
 printf 'retained observations\n' >"$state_root/capacity/samples.jsonl"
+python3 "$repo_root/scripts/disk_admission_sample.py" --prepare --output "$state_root/disk-admission"
 load_installed_controller_identity() { :; }
 controller_status() { :; }
 manager_release_from_raw_pointer() { :; }
@@ -62,16 +65,17 @@ rm() {
 }
 transaction_active=false
 fail_manager_removal=true
-trap '[[ $transaction_active == true && -f $state_root/capacity/samples.jsonl ]] || exit 99; exit 7' ERR
+trap '[[ $transaction_active == true && -f $state_root/capacity/samples.jsonl && -d $state_root/disk-admission ]] || exit 99; exit 7' ERR
 perform_uninstall
 TEST
 } >"$temporary/uninstall.sh"
 status=0
-bash "$temporary/uninstall.sh" "$temporary" || status=$?
+bash "$temporary/uninstall.sh" "$temporary" "$repo_root" || status=$?
 [[ $status == 7 ]] || { printf 'FAIL: uninstall removed capacity history before commit, status=%s\n' "$status" >&2; exit 1; }
 sed -i 's/fail_manager_removal=true/fail_manager_removal=false/' "$temporary/uninstall.sh"
-bash "$temporary/uninstall.sh" "$temporary"
+bash "$temporary/uninstall.sh" "$temporary" "$repo_root"
 [[ ! -e $temporary/state/capacity ]] || { printf 'FAIL: committed uninstall retained capacity history\n' >&2; exit 1; }
+[[ ! -e $temporary/state/disk-admission ]] || { printf 'FAIL: committed uninstall retained disk admission export\n' >&2; exit 1; }
 printf 'CAPACITY_UNINSTALL_TRANSACTION_TESTS_OK\n'
 
 mkdir -p "$temporary/outside/capacity"
