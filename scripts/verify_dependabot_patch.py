@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the Dependabot artifact patch and its Build without changing the PR."""
+"""Verify the Dependabot artifact patch and its full validation result."""
 
 import json
 import os
@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 WORKFLOW = ".github/workflows/build.yml"
 BUILD_WORKFLOW_ID = 416363263
-BUILD_CHECK = "Build without registering a runner"
+BUILD_CHECK = "Run the full ci-fleet validation suite"
 GITHUB_ACTIONS_APP_ID = 15368
 DEPENDABOT_ID = 49699333
 SHA = r"[0-9a-f]{40}"
@@ -170,6 +170,6 @@ def verify_patch(event, request=gh):
 if __name__ == "__main__":
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     if verify_patch(event):
-        print(f"Verified artifact patch and Build for {event['workflow_run']['head_sha']}. Merge remains manual.")
+        print(f"Verified artifact patch and full validation for {event['workflow_run']['head_sha']}. Merge remains manual.")
     else:
-        print("No matching artifact patch and Build verified.")
+        print("No matching artifact patch and full validation verified.")

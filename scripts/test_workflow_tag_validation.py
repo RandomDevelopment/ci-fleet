@@ -105,7 +105,14 @@ class WorkflowEventTests(unittest.TestCase):
 
     def test_runner_override_routes_both_required_jobs_with_bounded_budgets(self) -> None:
         import yaml
+        from verify_dependabot_patch import BUILD_CHECK
+
         workflow = yaml.safe_load(self.text)
+        verifier = yaml.safe_load(WORKFLOW.with_name("verify-dependabot.yml").read_text())
+        triggers = verifier.get("on", verifier.get(True))
+        self.assertEqual(workflow["name"], "ci-fleet tests, image builds and cleanup")
+        self.assertEqual(triggers["workflow_run"]["workflows"], [workflow["name"]])
+        self.assertEqual(BUILD_CHECK, "Run the full ci-fleet validation suite")
         for name, budget in (("commit-convention", 5), ("validate", 240)):
             job = workflow["jobs"][name]
             selector = job["runs-on"]
@@ -117,7 +124,7 @@ class WorkflowEventTests(unittest.TestCase):
                     self.assertEqual(eval(expression, {"__builtins__": {}}, {}), label or "ubuntu-latest")
             self.assertEqual(job["timeout-minutes"], budget)
         self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(workflow["jobs"]["validate"]["name"], "Build without registering a runner")
+        self.assertEqual(workflow["jobs"]["validate"]["name"], BUILD_CHECK)
         step = next(step for step in workflow["jobs"]["validate"]["steps"]
                     if step["name"] == "Run the complete local suite")
         self.assertIn("--timeout 10800", step["run"])

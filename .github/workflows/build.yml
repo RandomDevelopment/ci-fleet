@@ -1,4 +1,4 @@
-name: Build ci-fleet
+name: ci-fleet tests, image builds and cleanup
 
 on:
   pull_request:
@@ -107,7 +107,7 @@ jobs:
             --base "$RELEASE_BASE" --head "$TAG_COMMIT" --exclude-tag "$TAG_NAME"
 
   validate:
-    name: Build without registering a runner
+    name: Run the full ci-fleet validation suite
     needs: commit-convention
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.state == 'open') && (github.event_name != 'push' || github.event.deleted == false) }}
     runs-on: ${{ vars.CI_FLEET_VALIDATION_RUNNER || 'ubuntu-latest' }}
