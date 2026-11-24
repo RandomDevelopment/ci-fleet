@@ -457,7 +457,11 @@ def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict
     require(status == 200, "owned container inventory is unavailable")
     items = json.loads(body, object_pairs_hook=unique_object)
     require(isinstance(items, list), "invalid container inventory")
-    return [item for item in items if isinstance(item, dict) and container_owned(item, expected_labels)]
+    for item in items:
+        require(isinstance(item, dict) and isinstance(item.get("Id"), str) and bool(item["Id"])
+                and isinstance(item.get("Labels"), dict) and isinstance(item.get("Names"), list)
+                and all(isinstance(name, str) for name in item["Names"]), "invalid container inventory row")
+    return [item for item in items if container_owned(item, expected_labels)]
 
 
 class RollbackHealthStarting(ValueError):
@@ -1371,6 +1375,7 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
     budget = seconds if seconds is not None else max(
         60, len(services) * timeout_seconds + (FORCED_KILL_VERIFY_SECONDS * len(services) if force_stop_timeout else 0) + 30
     )
+    stop_deadline = monotonic() + budget
     prior_timed_out: dict[str, str] = {}
     if reconcile:
         raw_timed_out = prior.get("timed_out_containers")
@@ -1732,6 +1737,10 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                                         "elapsed_seconds": total_svc})
 
     # Final pre-dispatch inventory barrier across all declared exclusive services.
+    if operation_deadline is not None:
+        stop_deadline = min(stop_deadline, operation_deadline)
+        backend.deadline = stop_deadline
+        backend._hard_stop_deadline = True
     try:
         final_inventory = list_owned_containers(backend, expected_labels)
     except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
@@ -1758,6 +1767,8 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
                 return emit_failure("unexpected_active_container", service=svc, container_id=cid,
                                     escalation=state["escalation"])
 
+    if monotonic() >= stop_deadline:
+        return emit_failure("stop_deadline_unverified", escalation=state["escalation"])
     total_elapsed = round(monotonic() - overall_start, 3)
     state["status"] = "verified"
     state["reason"] = "verified"
@@ -1832,13 +1843,11 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
         # A restart can only accept the commit after the timed directory sync succeeds.
         durable_file(pending, b"pending\n", deadline=deadline)
         durable_file(marker, b"committed\n", deadline=deadline)
+        durable_file(journal / "status.json", json.dumps(record).encode(), deadline=deadline)
         require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
+        # The marker and status are durable. A pending file restored by a reboot only forces revalidation.
         pending.unlink()
-        directory = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        return True
     durable_file(journal / "status.json", json.dumps(record).encode())
     return True
 
