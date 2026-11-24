@@ -25,7 +25,13 @@ transaction_committed=0
 transaction_kind=convergence
 rollback_commit_file=
 recovered_rollback=0
+resume_rollback=0
 active_adapter_unit=
+force_stop_timeout=0
+failure_next=
+recovered_stop_escalation=none
+recovered_stop_elapsed_s=0.000
+source_commit=unknown
 backup_transaction() {
   local path relative
   rollback_transaction_backup=
@@ -50,31 +56,62 @@ restore_transaction_backup() {
 }
 rollback_commit_marker_safe() {
   local marker=$1
-  [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker" 2>/dev/null) == "$expected_uid:600" ]]
+  [[ ! -e "$marker.pending" && ! -L "$marker.pending" && ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker" 2>/dev/null) == "$expected_uid:600" ]]
 }
 rollback_commit_marker_uncommitted() {
   local marker=$1
   [[ $transaction_kind == rollback ]] || return 0
   [[ ! -e "$marker" && ! -L "$marker" ]] || { [[ ! -L "$marker" && -f "$marker" ]] && ! rollback_commit_marker_safe "$marker"; }
 }
+exclusive_stop_unresolved() {
+  local tx=$1
+  [[ -n $tx && ( -e "$tx/exclusive-stop.json" || -L "$tx/exclusive-stop.json" ) ]] || return 1
+  python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$tx/exclusive-stop.json" >/dev/null 2>&1
+}
+sync_transaction_audit() {
+  local tx=$1
+  [[ -n $tx && -d "$tx/log" && ! -L "$tx/log" ]] || return 0
+  if [[ -f "$log_root/audit.log" && ! -L "$log_root/audit.log" && $(stat -c '%u:%a' "$log_root/audit.log" 2>/dev/null) == "$expected_uid:600" ]]; then
+    install -T -m 0600 "$log_root/audit.log" "$tx/log/audit.log" || return
+    sync -f "$tx/log/audit.log" "$tx/log" 2>/dev/null || true
+  fi
+}
+append_rollback_audit() {
+  secure_directory "$log_root" 700 1 || return
+  python3 "$repo_root/scripts/deployer_adapter.py" append-audit --audit-log "$log_root/audit.log" "$@"
+}
 on_exit() {
-  local status=$? recovery_status=0
+  local status=$? recovery_status=0 stop_unresolved=0
   if [[ -n ${active_adapter_unit:-} ]] && ! { stop_adapter_unit "$active_adapter_unit" && retire_adapter_guard "$active_adapter_unit"; }; then
     recovery_status=1
     status=1
     printf 'ERROR: adapter termination could not be verified; retain the journal before recovery\n' >&2
   fi
-  if ((recovery_status == 0)) && [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
+  if [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && exclusive_stop_unresolved "$transaction_dir"; then
+    stop_unresolved=1
+    failure_next=reconcile-exclusive-stop
+    recovery_status=1
+    status=1
+    printf 'ERROR: exclusive service stop is unverified; retained %s for reconciliation (rerun --rollback after exit or with --force-stop-timeout)\n' "$transaction_dir" >&2
+  fi
+  if [[ -n $transaction_dir && $transaction_committed != 1 && $transaction_kind == rollback ]] &&
+    rollback_commit_marker_uncommitted "$rollback_commit_file" &&
+    { python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$transaction_dir/exclusive-stop.json" 2>/dev/null || true; } |
+      python3 -c 'import json,sys; sys.exit(not json.load(sys.stdin).get("replacement_pending"))' 2>/dev/null; then
+    stop_unresolved=1
+    failure_next=reconcile-exclusive-stop
+  fi
+  if ((recovery_status == 0 && stop_unresolved == 0)) && [[ -n ${rollback_transaction_backup:-} && -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]] && rollback_commit_marker_uncommitted "$rollback_commit_file"; then
     if restore_state_directory "$state_root"; then
       if ! { rm -rf -- "$transaction_dir" && restore_transaction_backup; }; then recovery_status=1; fi
     else
       recovery_status=1
     fi
   fi
-  if ((recovery_status == 0)) && [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
+  if ((recovery_status == 0 && stop_unresolved == 0)) && [[ -n ${transaction_dir:-} && ${transaction_preparing:-0} == 1 ]]; then
     rm -rf -- "$transaction_dir"
     transaction_dir=
-  elif [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
+  elif ((stop_unresolved == 0)) && [[ -n ${transaction_dir:-} && ${transaction_committed:-0} != 1 ]]; then
     set +e
     if ((recovery_status == 0)); then
       if rollback_commit_marker_uncommitted "$rollback_commit_file"; then restore_transaction; recovery_status=$?; else finalize_committed_rollback; recovery_status=$?; fi
@@ -90,17 +127,18 @@ on_exit() {
   [[ -z ${validated_config:-} ]] || rm -f -- "$validated_config"
   [[ -z ${policy_check_snapshot:-} ]] || rm -f -- "$policy_check_snapshot"
 
-  if ((status != 0 && error_reported == 0)); then report FAILED no inspect-and-retry "$(rollback_available)" >&2; fi
+  if ((status != 0 && error_reported == 0)); then report FAILED no "${failure_next:-inspect-and-retry}" "$(rollback_available)" >&2; fi
   return "$status"
 }
 trap on_exit EXIT
 
 usage() {
   cat >&2 <<'EOF'
-usage: install-deployer.sh --check|--install|--upgrade|--repair|--rollback|--drain|--resume|--uninstall --config /etc/ci-fleet-deployer/deployer.conf
+usage: install-deployer.sh --check|--install|--upgrade|--repair|--rollback|--drain|--resume|--uninstall [--force-stop-timeout] --config /etc/ci-fleet-deployer/deployer.conf
 
-Modes are explicit and mutually exclusive. Configuration and credential references
-are host-local; secret values are never accepted as arguments.
+Modes are explicit and mutually exclusive. --force-stop-timeout is only permitted
+with --rollback. Configuration and credential references are host-local; secret
+values are never accepted as arguments.
 EOF
 }
 report() {
@@ -112,9 +150,9 @@ rollback_available() {
   [[ ${validating_rollback_marker:-0} != 1 ]] || { printf no; return; }
   [[ -n ${previous_state:-} && -f ${previous_state:-/nonexistent} && ! -L ${previous_state:-/nonexistent} && -n ${previous_policy:-} && -f ${previous_policy:-/nonexistent} && ! -L ${previous_policy:-/nonexistent} ]] || { printf no; return; }
   [[ $(stat -c '%u:%a' "$previous_state" 2>/dev/null) == "$expected_uid:600" && $(stat -c '%u:%a' "$previous_policy" 2>/dev/null) == "$expected_uid:600" ]] || { printf no; return; }
-  python3 - "$previous_state" "$previous_policy" <<'PY' >/dev/null 2>&1 || { printf no; return; }
+  python3 - "$previous_state" "$previous_policy" "$repo_root/scripts" <<'PY' >/dev/null 2>&1 || { printf no; return; }
 import json, sys
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE","ROLLBACK_EXCLUSIVE_SERVICES","ROLLBACK_STOP_TIMEOUT_SECONDS","ROLLBACK_STOP_SIGNAL"}
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError):
@@ -130,6 +168,12 @@ try:
             raise SystemExit(1)
         policy[key] = value
 except OSError:
+    raise SystemExit(1)
+sys.path.insert(0, sys.argv[3])
+try:
+    from deployer_adapter import parse_rollback_stop_policy
+    parse_rollback_stop_policy(policy)
+except Exception:
     raise SystemExit(1)
 import re
 sha = re.compile(r'^[0-9a-f]{40}$')
@@ -168,20 +212,22 @@ PY
   (validating_rollback_marker=1; validate_completed_request "$state_root/last-request.conf" "$rollback_environment" "$rollback_target") >/dev/null 2>&1 || { printf no; return; }
   printf yes
 }
-die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no inspect-and-retry "$(rollback_available)" >&2; exit 2; }
-block() { error_reported=1; printf 'BLOCKED: %s\n' "$*" >&2; report BLOCKED no resolve-precondition "$(rollback_available)" >&2; exit 3; }
+die() { error_reported=1; printf 'ERROR: %s\n' "$*" >&2; report FAILED no "${failure_next:-inspect-and-retry}" "$(rollback_available)" >&2; exit 2; }
+block() { error_reported=1; printf 'BLOCKED: %s\n' "$*" >&2; report BLOCKED no "${failure_next:-resolve-precondition}" "$(rollback_available)" >&2; exit 3; }
 
 while (($#)); do
   case "$1" in
     --check|--install|--upgrade|--repair|--rollback|--drain|--resume|--uninstall)
       [[ -z "$mode" ]] || die 'select exactly one operating mode'
       mode=${1#--}; action=$mode; shift ;;
+    --force-stop-timeout) force_stop_timeout=1; shift ;;
     --config) (($# >= 2)) || die '--config requires a value'; config=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 [[ -n "$mode" ]] || { usage; die 'an explicit operating mode is required'; }
+[[ $force_stop_timeout == 0 || $mode == rollback ]] || die '--force-stop-timeout is only permitted with --rollback'
 [[ -n "$config" ]] || die '--config is required'
 [[ -z "$root" || "$testing" == 1 ]] || die 'CI_FLEET_DEPLOYER_ROOT is test-only'
 if [[ "$testing" == 1 ]]; then
@@ -190,6 +236,7 @@ if [[ "$testing" == 1 ]]; then
 else
   [[ -z "$root" ]] || die 'alternate root is forbidden'
   [[ -z ${CI_FLEET_DEPLOYER_EUID_OVERRIDE:-} ]] || die 'effective UID override is test-only'
+  [[ -z ${CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET:-} ]] || die 'test Docker socket override is test-only'
 fi
 if [[ "$effective_uid" != 0 ]]; then die 'run this mode as root'; fi
 
@@ -220,7 +267,7 @@ unit_names=(
   ci-fleet-deployer-drain.service
 )
 timer_names=(ci-fleet-deployer-health.timer ci-fleet-deployer-cleanup.timer)
-config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE'
+config_keys='SCHEMA_VERSION CORE_REF ENVIRONMENT TARGET_ID DEPLOYER_IDENTITY DOCKER_SOCKET ADAPTER_PATH ADAPTER_SHA256 CREDENTIAL_PROVIDER CREDENTIAL_REF CREDENTIAL_SCOPE APPROVAL_PROVIDER APPROVAL_EVIDENCE_PATH APPROVAL_CAPABILITY_EVIDENCE_PATH PRODUCTION_AUTHORIZATION_EVIDENCE_PATH CHECKPOINT_EVIDENCE_PATH SOURCE_COMMIT ARTIFACT_IMAGE NETWORK_HOST MIN_DISK_GIB REQUIRE_COMPOSE ROLLBACK_EXCLUSIVE_SERVICES ROLLBACK_STOP_TIMEOUT_SECONDS ROLLBACK_STOP_SIGNAL'
 request_keys='SCHEMA_VERSION ENVIRONMENT TARGET_ID SOURCE_COMMIT ARTIFACT_IMAGE APPROVAL_IDENTITY POLICY_IDENTITY APPROVAL_ID APPROVED_AT'
 
 expected_uid=0
@@ -371,6 +418,8 @@ validate_config() {
   esac
   validate_evidence
   validate_production_gate
+  local stop_err
+  stop_err=$(python3 "$repo_root/scripts/deployer_adapter.py" validate-stop-policy --policy "$config" 2>&1 >/dev/null) || block "${stop_err#ERROR: }"
 }
 
 validate_production_gate() {
@@ -892,7 +941,7 @@ restore_transaction() {
   local name target_value backed_up systemd_restore_mode journal_root=${transaction_dir%/*}
   [[ -n ${transaction_dir:-} && -d $transaction_dir ]] || return 1
   transaction_committed=1
-  for name in kind units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created; do
+  for name in kind units-present state-present timers-enabled timers-enabled-runtime timers-active current-target deployed-target deployed-created exclusive-stop.json; do
     [[ ! -e "$transaction_dir/$name" && ! -L "$transaction_dir/$name" ]] || [[ ! -L "$transaction_dir/$name" && -f "$transaction_dir/$name" ]] || block "transaction manifest $name has an unsafe type"
   done
   if [[ -f "$transaction_dir/units-present" ]]; then
@@ -1007,13 +1056,14 @@ restore_transaction() {
   sync -f "$state_root" 2>/dev/null || block 'restored host state is not durable'
   sync -f "$install_root" 2>/dev/null || block 'restored install root is not durable'
   sync -f "$systemd_root" 2>/dev/null || block 'restored systemd boundary is not durable'
+  [[ ${1:-} != keep ]] || return 0
   rm -rf -- "$transaction_dir" || return
   transaction_dir=
   sync -f "$journal_root" 2>/dev/null || block 'retired recovery journal is not durable'
 }
 
 recover_interrupted_transaction() {
-  local candidates=() candidate pending_unit=
+  local candidates=() candidate pending_unit='' replacement_pending=0
   shopt -s nullglob
   candidates=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
@@ -1031,13 +1081,87 @@ recover_interrupted_transaction() {
   elif [[ -e "$candidate/application-rollback-committed" || -L "$candidate/application-rollback-committed" ]]; then
     block 'legacy rollback marker requires operator recovery'
   fi
-  if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
-    secure_file "$candidate/adapter-unit" 'adapter unit guard'
-    pending_unit=$(<"$candidate/adapter-unit")
-    [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
-    adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
-    if [[ $transaction_kind == rollback ]]; then
-      python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$pending_unit" || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+  if [[ $transaction_kind == rollback && ( -e "$candidate/exclusive-stop.json" || -L "$candidate/exclusive-stop.json" ) ]]; then
+    secure_file "$candidate/exclusive-stop.json" 'rollback stop journal'
+    sync_transaction_audit "$candidate"
+    local stop_status_json stop_unresolved=0
+    stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null) || stop_unresolved=$?
+    if [[ $mode != rollback ]] && python3 -c 'import json,sys; sys.exit(not json.load(sys.stdin).get("replacement_pending"))' <<<"$stop_status_json"; then
+      local recovery_marker=$candidate/application-rollback-committed
+      [[ ! -d $candidate/commit ]] || recovery_marker=$candidate/commit/application-rollback-committed
+      if rollback_commit_marker_uncommitted "$recovery_marker"; then
+        failure_next=reconcile-exclusive-stop
+        block 'exclusive service exited and replacement is pending; rerun --rollback'
+      fi
+    fi
+    if ((stop_unresolved == 0)); then
+      if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
+        failure_next=reconcile-exclusive-stop
+        block 'rollback transaction has both an unresolved exclusive-service stop journal and an adapter unit guard; requires operator recovery'
+      fi
+      local r_env r_tgt r_svc r_cid r_reason
+      IFS=$'\t' read -r r_env r_tgt r_svc r_cid r_reason < <(python3 -c 'import json,sys
+try: d=json.loads(sys.stdin.read())
+except Exception: d={}
+print(d.get("environment","unknown"), d.get("target","unknown"), d.get("service","none"), d.get("container_id","none"), d.get("reason","unknown"), sep="\t")' <<<"$stop_status_json")
+      if [[ $mode != rollback ]]; then
+        failure_next=reconcile-exclusive-stop
+        block "rollback exclusive-service stop requires reconciliation (environment=$r_env target=$r_tgt service=$r_svc container=$r_cid reason=$r_reason); rerun --rollback after the workload exits or with --force-stop-timeout"
+      fi
+      [[ -f "$candidate/state/last-known-good-policy.conf" ]] || block 'rollback transaction is missing retained policy for stop reconciliation'
+      secure_file "$candidate/state/last-known-good-policy.conf" 'retained rollback policy'
+      local -A rec_lkg=()
+      parse_file "$candidate/state/last-known-good-policy.conf" rec_lkg 'retained rollback policy' "$config_keys"
+      [[ -n ${rec_lkg[ENVIRONMENT]:-} && -n ${rec_lkg[TARGET_ID]:-} && -n ${rec_lkg[DEPLOYER_IDENTITY]:-} ]] || block 'retained rollback policy is missing target identity'
+      [[ ${rec_lkg[ENVIRONMENT]} != production ]] || block 'production rollback is not authorized by the current accepted scope'
+      cfg[ENVIRONMENT]=${rec_lkg[ENVIRONMENT]}
+      cfg[TARGET_ID]=${rec_lkg[TARGET_ID]}
+      cfg[DEPLOYER_IDENTITY]=${rec_lkg[DEPLOYER_IDENTITY]}
+      [[ $testing == 1 || -v 'rec_lkg[DOCKER_SOCKET]' ]] || block 'retained rollback policy requires its dedicated Docker socket'
+      DOCKER_HOST=unix://${rec_lkg[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
+      export DOCKER_HOST
+      unset DOCKER_CONTEXT
+      reject_mixed_role
+      check_unit_boundary
+      local retained_units=$releases/${rec_lkg[CORE_REF]:-}/deploy/deployer
+      if [[ ! ${rec_lkg[CORE_REF]:-} =~ ^[0-9a-f]{40}$ ]] || ! release_complete "$releases/${rec_lkg[CORE_REF]}"; then
+        block 'retained rollback release is incomplete'
+      fi
+      systemd-analyze verify "${unit_names[@]/#/$retained_units/}" >/dev/null || die 'systemd unit verification failed before stop reconciliation'
+      policy_adapter_operation "$candidate/state/last-known-good-policy.conf" validate 'retained rollback policy' || block 'last-known-good adapter validation failed before stop reconciliation'
+      local -a rec_cmd=(python3 "$repo_root/scripts/deployer_adapter.py" stop-exclusive --reconcile --policy "$candidate/state/last-known-good-policy.conf" --journal "$candidate/exclusive-stop.json" --audit-log "$log_root/audit.log")
+      if [[ -e "$candidate/state/active-policy.conf" || -L "$candidate/state/active-policy.conf" ]]; then
+        secure_file "$candidate/state/active-policy.conf" 'retained active policy'
+        rec_cmd+=(--incumbent-policy "$candidate/state/active-policy.conf")
+      fi
+      if ((force_stop_timeout == 1)); then
+        rec_cmd+=(--force-stop-timeout)
+      fi
+      if [[ $testing != 1 ]]; then
+        rec_cmd=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback stop reconciliation is active' -- "${rec_cmd[@]}")
+      fi
+      local rec_rc=0
+      secure_directory "$log_root" 700 1
+      timeout --kill-after=5s 2850s "${rec_cmd[@]}" || rec_rc=$?
+      sync_transaction_audit "$candidate"
+      if ((rec_rc != 0)); then
+        stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null || true)
+        IFS=$'\t' read -r r_env r_tgt r_svc r_cid r_reason < <(python3 -c 'import json,sys
+try: d=json.loads(sys.stdin.read())
+except Exception: d={}
+print(d.get("environment","unknown"), d.get("target","unknown"), d.get("service","none"), d.get("container_id","none"), d.get("reason","unknown"), sep="\t")' <<<"$stop_status_json")
+        failure_next=reconcile-exclusive-stop
+        block "rollback exclusive-service stop still unresolved (environment=$r_env target=$r_tgt service=$r_svc container=$r_cid reason=$r_reason); resolve or pass --force-stop-timeout"
+      fi
+    fi
+    stop_status_json=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$candidate/exclusive-stop.json" 2>/dev/null || true)
+    IFS=$'\t' read -r recovered_stop_escalation recovered_stop_elapsed_s < <(python3 -c 'import json,sys
+try: d=json.loads(sys.stdin.read())
+except Exception: d={}
+val=float(d.get("total_elapsed_seconds",0.0))
+print(d.get("escalation","none"), f"{val:.3f}", sep="\t")' <<<"$stop_status_json")
+    if python3 -c 'import json,sys; sys.exit(not json.load(sys.stdin).get("replacement_pending"))' <<<"$stop_status_json"; then
+      replacement_pending=1
     fi
   fi
   local candidate_marker=$candidate/application-rollback-committed
@@ -1045,20 +1169,51 @@ recover_interrupted_transaction() {
     secure_directory "$candidate/commit" 700 0 || block 'rollback commit directory is unsafe'
     candidate_marker=$candidate/commit/application-rollback-committed
   fi
+  local health_guard=$candidate/rollback-health-unit
+  if [[ -e $health_guard || -L $health_guard ]]; then
+    rollback_commit_marker_safe "$candidate_marker" || block 'rollback health guard requires a committed rollback'
+    secure_file "$health_guard" 'rollback health unit guard'
+    local health_unit
+    health_unit=$(<"$health_guard")
+    adapter_unit_inactive "$health_unit" || block 'rollback health probe is still active or its status is unknown'
+    retire_adapter_guard "$health_unit" "$candidate" health || block 'inactive rollback health probe could not be retired'
+    rm -f -- "$health_guard" || return
+    sync -f "$candidate" 2>/dev/null || return
+  fi
+  if [[ -e "$candidate/adapter-unit" || -L "$candidate/adapter-unit" ]]; then
+    secure_file "$candidate/adapter-unit" 'adapter unit guard'
+    pending_unit=$(<"$candidate/adapter-unit")
+    [[ $pending_unit =~ ^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$ ]] || block 'adapter unit guard is unsafe'
+    adapter_unit_inactive "$pending_unit" || block 'adapter service is still active or its status is unknown; retain the journal until it stops'
+    if [[ $transaction_kind == rollback ]]; then
+      local recovery_store=$state_root/.adapter-recovery
+      if ! python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$recovery_store" "$pending_unit"; then
+        [[ -f $recovery_store/$pending_unit/rollback-ready.json ]] || block 'rollback adapter journal completion is unverified; retain the transaction for operator recovery'
+        [[ -f $recovery_store/$pending_unit/rollback-drained ]] || block 'rollback broker drain is unverified; retain the transaction for operator recovery'
+        timeout --kill-after=5s 50s python3 "$repo_root/scripts/deployer_adapter.py" rollback-readiness --store "$recovery_store" "$pending_unit" ||
+          block 'rollback adapter readiness is unverified; retain the transaction and retry --rollback after checking Docker health'
+      fi
+    fi
+  fi
   if [[ -n $pending_unit ]]; then
     retire_adapter_guard "$pending_unit" "$candidate" || block 'completed adapter guard could not be retired; retain the transaction for operator recovery'
   fi
   transaction_dir=$candidate
   rollback_commit_file=$candidate_marker
   if ! rollback_commit_marker_uncommitted "$rollback_commit_file"; then
-    finalize_committed_rollback
+    finalize_committed_rollback || block 'could not finalize committed rollback'
     recovered_rollback=1
     transaction_committed=0
     return
   fi
   # Restoration does not consume deployed-snapshot dependencies; requiring
   # them here would wedge recovery behind unrelated deployed drift.
-  restore_transaction
+  if ((replacement_pending)); then
+    restore_transaction keep || block 'could not restore rollback staging while retaining the replacement guard'
+    resume_rollback=1
+  else
+    restore_transaction || block 'could not restore interrupted installer state'
+  fi
   transaction_committed=0
 }
 
@@ -1076,14 +1231,14 @@ finalize_committed_rollback() {
   final_credential_provider=$(awk '$0 ~ /^CREDENTIAL_PROVIDER=/ {sub(/^CREDENTIAL_PROVIDER=/, ""); print}' "$active_policy")
   final_credential_ref=$(awk '$0 ~ /^CREDENTIAL_REF=/ {sub(/^CREDENTIAL_REF=/, ""); print}' "$active_policy")
   credential_reference_safe "$final_credential_provider" "$final_credential_ref" 'committed rollback policy' || return
-  python3 - "$state_file" "$active_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || return
+  python3 - "$state_file" "$active_policy" "$etc_root/adapters" "$etc_root/credentials" "$repo_root/scripts" <<'PY' >/dev/null 2>&1 || return
 import json, re, sys
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError):
     raise SystemExit(1)
 policy = {}
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE","ROLLBACK_EXCLUSIVE_SERVICES","ROLLBACK_STOP_TIMEOUT_SECONDS","ROLLBACK_STOP_SIGNAL"}
 try:
     for line in open(sys.argv[2], encoding='utf-8'):
         line = line.rstrip('\n')
@@ -1094,6 +1249,12 @@ try:
             raise SystemExit(1)
         policy[key] = value
 except OSError:
+    raise SystemExit(1)
+sys.path.insert(0, sys.argv[5])
+try:
+    from deployer_adapter import parse_rollback_stop_policy
+    parse_rollback_stop_policy(policy)
+except Exception:
     raise SystemExit(1)
 sha = re.compile(r'^[0-9a-f]{40}$')
 pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
@@ -1112,7 +1273,19 @@ else:
     ok = ok and bool(re.fullmatch(r'external:[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._/-]{1,128}', policy.get('CREDENTIAL_REF','')))
 raise SystemExit(0 if ok else 1)
 PY
-  core_ref=$(awk -F= '$1=="CORE_REF"{print $2}' "$active_policy")
+  local -A final_policy=()
+  parse_file "$active_policy" final_policy 'committed rollback policy' "$config_keys"
+  core_ref=${final_policy[CORE_REF]}
+  environment=${final_policy[ENVIRONMENT]}
+  target=${final_policy[TARGET_ID]}
+  artifact=${final_policy[ARTIFACT_IMAGE]}
+  source_commit=${final_policy[SOURCE_COMMIT]}
+  cfg[ENVIRONMENT]=$environment
+  cfg[TARGET_ID]=$target
+  cfg[DEPLOYER_IDENTITY]=${final_policy[DEPLOYER_IDENTITY]}
+  DOCKER_HOST=unix://${final_policy[DOCKER_SOCKET]:-$(root_path /run/docker.sock)}
+  export DOCKER_HOST
+  unset DOCKER_CONTEXT
   [[ $core_ref =~ ^[0-9a-f]{40}$ ]] || return 1
   unit_source=$releases/$core_ref/deploy/deployer
   release_complete "$releases/$core_ref" || return 1
@@ -1125,7 +1298,30 @@ PY
     current_matches && units_match || return 1
   fi
   sync -f "$install_root" "$systemd_root" 2>/dev/null || return
-  publish_deployed_snapshot "$active_policy" "$state_file" || return
+  local stop_services stop_escalation stop_elapsed_s result=success
+  read -r stop_services stop_escalation stop_elapsed_s < <(python3 - "$transaction_dir/exclusive-stop.json" <<'PY_STOP'
+import json
+import sys
+from pathlib import Path
+journal = Path(sys.argv[1])
+data = json.loads(journal.read_text()) if journal.exists() else {}
+print(",".join(data.get("exclusive_services", [])) or "none",
+      data.get("escalation", "none"), f"{data.get('total_elapsed_seconds', 0.0):.3f}")
+PY_STOP
+  ) || return
+  health=healthy
+  if ! policy_adapter_operation "$active_policy" health 'rolled-back policy' '' 0; then
+    health=unhealthy
+    result=unhealthy
+  fi
+  [[ $health != healthy ]] || publish_deployed_snapshot "$active_policy" "$state_file" || return
+  local -a audit_options=()
+  [[ $result != success ]] || audit_options+=(--once)
+  append_rollback_audit "${audit_options[@]}" "transaction=${transaction_dir##*/}" "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "action=rollback" "environment=$environment" "target=$target" "source=$source_commit" "artifact=${artifact#*@}" "core=$core_ref" "exclusive_services=$stop_services" "stop_escalation=$stop_escalation" "stop_elapsed_s=$stop_elapsed_s" "health=$health" "result=$result" || return
+  if [[ $health == unhealthy ]]; then
+    transaction_committed=1
+    return
+  fi
   rm -f "$previous_state" "$previous_policy" || return
   retired=$journal_root/.retired.$$.transaction
   mv -Tf "$transaction_dir" "$retired" || return
@@ -1135,6 +1331,16 @@ PY
   # The journal rename and deletion must persist with the finalization, or a
   # reboot can resurrect the committed-rollback transaction and repeat it.
   sync -f "$journal_root" 2>/dev/null || block 'retired recovery journal is not durable'
+}
+
+report_committed_rollback() {
+  if [[ $health == unhealthy ]]; then
+    error_reported=1
+    printf 'ERROR: rolled-back deployment health check failed\n' >&2
+    report FAILED yes inspect-and-retry "$(rollback_available)" >&2
+    exit 2
+  fi
+  report CHANGED yes restore-host-policy-evidence-then-check no
 }
 
 commit_transaction() {
@@ -1229,14 +1435,14 @@ load_deployed_snapshot() {
   deployed_credential_scope=$(awk '$0 ~ /^CREDENTIAL_SCOPE=/ {sub(/^CREDENTIAL_SCOPE=/, ""); print}' "$deployed_snapshot_policy")
   deployed_environment=$(awk '$0 ~ /^ENVIRONMENT=/ {sub(/^ENVIRONMENT=/, ""); print}' "$deployed_snapshot_policy")
   [[ $deployed_credential_scope == "$deployed_environment" ]] || block 'deployed rollback credential scope does not match its environment'
-  python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
+  python3 - "$deployed_snapshot_state" "$deployed_snapshot_policy" "$etc_root/adapters" "$etc_root/credentials" "$repo_root/scripts" <<'PY' >/dev/null 2>&1 || block 'deployed rollback snapshot state and policy do not cross-validate'
 import json, re, sys
 try:
     state = json.load(open(sys.argv[1], encoding='utf-8'))
 except (OSError, ValueError):
     raise SystemExit(1)
 policy = {}
-allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE"}
+allowed = {"SCHEMA_VERSION","CORE_REF","ENVIRONMENT","TARGET_ID","DEPLOYER_IDENTITY","DOCKER_SOCKET","ADAPTER_PATH","ADAPTER_SHA256","CREDENTIAL_PROVIDER","CREDENTIAL_REF","CREDENTIAL_SCOPE","APPROVAL_PROVIDER","APPROVAL_EVIDENCE_PATH","APPROVAL_CAPABILITY_EVIDENCE_PATH","PRODUCTION_AUTHORIZATION_EVIDENCE_PATH","CHECKPOINT_EVIDENCE_PATH","SOURCE_COMMIT","ARTIFACT_IMAGE","NETWORK_HOST","MIN_DISK_GIB","REQUIRE_COMPOSE","ROLLBACK_EXCLUSIVE_SERVICES","ROLLBACK_STOP_TIMEOUT_SECONDS","ROLLBACK_STOP_SIGNAL"}
 try:
     for line in open(sys.argv[2], encoding='utf-8'):
         line = line.rstrip('\n')
@@ -1247,6 +1453,12 @@ try:
             raise SystemExit(1)
         policy[key] = value
 except OSError:
+    raise SystemExit(1)
+sys.path.insert(0, sys.argv[5])
+try:
+    from deployer_adapter import parse_rollback_stop_policy
+    parse_rollback_stop_policy(policy)
+except Exception:
     raise SystemExit(1)
 sha = re.compile(r'^[0-9a-f]{40}$')
 pairs = (('core_ref','CORE_REF'), ('environment','ENVIRONMENT'), ('target','TARGET_ID'), ('source_commit','SOURCE_COMMIT'), ('artifact','ARTIFACT_IMAGE'), ('deployer_identity','DEPLOYER_IDENTITY'))
@@ -1279,11 +1491,13 @@ publish_deployed_snapshot() {
     # validated rollback pair; only identical bytes short-circuit.
     if [[ -L "$deployed_current" ]]; then
       incumbent=$(readlink -f "$deployed_current")
-      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && $(stat -c '%u:%a' "$incumbent/policy.conf") == "$expected_uid:600" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" && $(stat -c '%u:%a' "$incumbent/state.json") == "$expected_uid:600" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then return; fi
+      if [[ $incumbent == "$deployed_root"/.snapshot.* && ! -L "$incumbent" && -d "$incumbent" && $(stat -c '%u:%a' "$incumbent") == "$expected_uid:700" && -f "$incumbent/policy.conf" && ! -L "$incumbent/policy.conf" && $(stat -c '%u:%a' "$incumbent/policy.conf") == "$expected_uid:600" && -f "$incumbent/state.json" && ! -L "$incumbent/state.json" && $(stat -c '%u:%a' "$incumbent/state.json") == "$expected_uid:600" ]] && cmp -s "$incumbent/policy.conf" "$policy" && cmp -s "$incumbent/state.json" "$state"; then
+        sync -f "$deployed_root" 2>/dev/null || block 'deployed snapshot pointer is not durable'
+        return
+      fi
     fi
     retired=$(readlink "$deployed_current")
     [[ "$retired" =~ ^\.snapshot\.[A-Za-z0-9._-]+$ ]] || block 'current deployed snapshot pointer is unsafe'
-    rm -f -- "$deployed_current" || return
   fi
   if [[ -n $created_record ]]; then
     snapshot=$(mktemp -u "$deployed_root/.snapshot.XXXXXX") || return
@@ -1297,8 +1511,10 @@ publish_deployed_snapshot() {
     snapshot=$(mktemp -d "$deployed_root/.snapshot.XXXXXX") || return
     chmod 0700 "$snapshot" || return
   fi
-  install -m 0600 "$policy" "$snapshot/policy.conf" || return
-  install -m 0600 "$state" "$snapshot/state.json" || return
+  if ! install -m 0600 "$policy" "$snapshot/policy.conf" || ! install -m 0600 "$state" "$snapshot/state.json"; then
+    rm -rf -- "$snapshot"
+    return 1
+  fi
   pointer=$(mktemp -u "$deployed_root/.current.XXXXXX") || return
   ln -s "${snapshot##*/}" "$pointer" || return
   sync -f "$snapshot/policy.conf" "$snapshot/state.json" 2>/dev/null || block 'replacement deployed snapshot is not durable'
@@ -1308,10 +1524,7 @@ publish_deployed_snapshot() {
   if [[ -n ${retired:-} && -d "$deployed_root/$retired" && ! -L "$deployed_root/$retired" ]]; then rm -rf -- "${deployed_root:?}/$retired"; fi
 }
 
-install_units() {
-  [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
-  install -d -m 0700 "$state_root/.adapter-recovery"
-  install -d -m 0711 "$(root_path /var/lib/ci-fleet-deployer-container-credentials)"
+check_unit_boundary() {
   local unit systemd_mode
   [[ -d "$systemd_root" && ! -L "$systemd_root" && $(stat -c %u "$systemd_root") == "$expected_uid" ]] || block 'systemd unit directory has an unsafe owner or type'
   systemd_mode=$(stat -c %a "$systemd_root")
@@ -1321,6 +1534,16 @@ install_units() {
     if [[ -e "$systemd_root/$unit" || -L "$systemd_root/$unit" ]]; then
       [[ ! -L "$systemd_root/$unit" && -f "$systemd_root/$unit" && $(stat -c %u "$systemd_root/$unit") == "$expected_uid" ]] || block 'managed systemd unit has an unsafe owner or type'
     fi
+  done
+}
+
+install_units() {
+  [[ ! -L "$state_root/.adapter-recovery" ]] || block 'adapter recovery directory is unsafe'
+  install -d -m 0700 "$state_root/.adapter-recovery"
+  install -d -m 0711 "$(root_path /var/lib/ci-fleet-deployer-container-credentials)"
+  check_unit_boundary
+  local unit
+  for unit in "${unit_names[@]}"; do
     install -m 0644 "$unit_source/$unit" "$systemd_root/$unit"
   done
   systemd-analyze verify "${unit_names[@]/#/$systemd_root/}" >/dev/null || die 'systemd unit verification failed'
@@ -1356,10 +1579,14 @@ adapter_unit_inactive() {
 }
 
 retire_adapter_guard() {
-  local unit=$1 guard guard_transaction=${2:-${transaction_dir:-}}
-  if [[ $testing != 1 ]]; then
+  local unit=$1 guard guard_transaction=${2:-${transaction_dir:-}} operation_name=${3:-}
+  if [[ $testing != 1 && $operation_name == health ]]; then
+    python3 "$repo_root/scripts/deployer_adapter.py" journal-retire --inactive-health --store "$state_root/.adapter-recovery" "$unit" || return 1
+  elif [[ $testing != 1 ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$unit" || return 1
   fi
+  # Persist the readiness pending-file removal before dropping the unit reference.
+  [[ -z $guard_transaction ]] || sync -f "$guard_transaction" 2>/dev/null || return 1
   local -a guards=("$adapter_guard")
   [[ -z $guard_transaction ]] || guards+=("$guard_transaction/adapter-unit")
   for guard in "${guards[@]}"; do
@@ -1368,7 +1595,7 @@ retire_adapter_guard() {
     rm -f -- "$guard" || return
     sync -f "${guard%/*}" 2>/dev/null || return
   done
-  if [[ $testing != 1 ]]; then
+  if [[ $testing != 1 && $operation_name != health ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" journal-retire --store "$state_root/.adapter-recovery" "$unit" || return 1
   fi
 }
@@ -1390,7 +1617,7 @@ stop_adapter_unit() {
 }
 
 run_adapter() {
-  local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} seconds status unit
+  local policy=$1 adapter_path=$2 operation_name=$3 marker=${4:-} incumbent_policy=${5:-} seconds status unit
   local writable_paths=/run/docker.sock readonly_paths="$etc_root -$install_root -$state_root -$log_root -$lock_root $policy"
   local -a adapter_env=(CI_FLEET_DEPLOYER_CONFIG="$policy") sandbox=() inhibitor=() guard=()
   seconds=$(adapter_deadline "$operation_name")
@@ -1398,6 +1625,10 @@ run_adapter() {
     unit=ci-fleet-deployer-adapter-$$-$RANDOM.service
     active_adapter_unit=$unit
     [[ ! -e $adapter_guard && ! -L $adapter_guard ]] || block 'outstanding adapter guard prevents dispatch'
+    if [[ $operation_name == health && -n $transaction_dir ]] && rollback_commit_marker_safe "$rollback_commit_file"; then
+      (umask 077; printf '%s\n' "$unit" >"$transaction_dir/rollback-health-unit")
+      sync -f "$transaction_dir" 2>/dev/null || die 'rollback health guard is not durable'
+    fi
     (umask 077; printf '%s\n' "$unit" >"$adapter_guard")
     sync -f "$lock_root" 2>/dev/null || die 'adapter unit guard is not durable'
     if [[ -n ${transaction_dir:-} ]]; then
@@ -1415,6 +1646,7 @@ run_adapter() {
     [[ ! -L $credential_store ]] || block 'container credential store is unsafe'
     install -d -m 0711 "$credential_store"
     local -a confined=(python3 "$repo_root/scripts/deployer_adapter.py" run --policy "$policy" --adapter "/proc/$$/fd/7" --store "$recovery" --runtime "$runtime" --credential-store "$credential_store" --unit "$unit" --seconds "$seconds")
+    [[ -z "$incumbent_policy" ]] || confined+=(--incumbent-policy "$incumbent_policy")
     [[ -z "$marker" ]] || confined+=(--marker "$marker")
     [[ $operation_name != rollback ]] || inhibitor=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback is active' --)
     status=0
@@ -1468,18 +1700,18 @@ run_adapter() {
 }
 
 run_verified_adapter() {
-  local policy=$1 path=$2 digest=$3 operation_name=$4 marker=${5:-}
+  local policy=$1 path=$2 digest=$3 operation_name=$4 marker=${5:-} incumbent_policy=${6:-}
   secure_file "$path" "$operation_name adapter" 700
   exec 7<"$path"
   [[ $(sha256sum /proc/$$/fd/7 | cut -d' ' -f1) == "$digest" ]] || die "$operation_name adapter digest mismatch"
   if [[ $testing == 1 && ${CI_FLEET_DEPLOYER_TEST_SANDBOX:-0} != 1 ]]; then
     path=/proc/$$/fd/7
   fi
-  run_adapter "$policy" "$path" "$operation_name" "$marker"
+  run_adapter "$policy" "$path" "$operation_name" "$marker" "$incumbent_policy"
 }
 
 policy_adapter_operation() {
-  local policy=$1 operation_name=$2 description=$3 marker=${4:-} snapshot=${5:-1} key
+  local policy=$1 operation_name=$2 description=$3 marker=${4:-} snapshot=${5:-1} incumbent_policy=${6:-} key
   local -A policy_cfg=()
   secure_file "$policy" "$description"
   reject_mixed_role
@@ -1497,17 +1729,24 @@ policy_adapter_operation() {
   [[ ${policy_cfg[CREDENTIAL_SCOPE]} == "${policy_cfg[ENVIRONMENT]}" ]] || die "$description credential scope does not match its environment"
   credential_reference_safe "${policy_cfg[CREDENTIAL_PROVIDER]}" "${policy_cfg[CREDENTIAL_REF]}" "$description"
   local status
-  run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" >/dev/null
+  run_verified_adapter "$policy" "${policy_cfg[ADAPTER_PATH]}" "${policy_cfg[ADAPTER_SHA256]}" "$operation_name" "$marker" "$incumbent_policy" >/dev/null
   status=$?
   if [[ "$snapshot" != 0 ]]; then rm -f "$snapshot"; policy_check_snapshot=; fi
   return "$status"
 }
 
 perform_check() {
-  local transactions=()
+  local transactions=() tx stop_info=''
   shopt -s nullglob
   transactions=("$state_root"/.transaction.* "$transaction_root"/.transaction.*)
   shopt -u nullglob
+  for tx in "${transactions[@]}"; do
+    if exclusive_stop_unresolved "$tx"; then
+      stop_info=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$tx/exclusive-stop.json" 2>/dev/null || true)
+      failure_next=reconcile-exclusive-stop
+      block "interrupted installer transaction requires recovery: unresolved exclusive-service stop ($stop_info); rerun --rollback after the workload exits or with --force-stop-timeout"
+    fi
+  done
   ((${#transactions[@]} == 0)) || block 'interrupted installer transaction requires recovery'
   if active_deployment; then block 'active deployment prevents a consistent check'; fi
   if [[ -e "$active_operation" || -L "$active_operation" ]]; then block 'stale operation marker requires a mutating recovery'; fi
@@ -1539,6 +1778,7 @@ PY
     [[ -e "$deployed_current" || -L "$deployed_current" ]] || block 'deployed rollback snapshot is missing; restore it before convergence'
     # Repair can rebuild this candidate's core; retained older cores must exist.
     load_deployed_snapshot "$mode"
+    python3 "$repo_root/scripts/deployer_adapter.py" validate-stop-policy --policy "$deployed_snapshot_policy" --incumbent-policy "$config" >/dev/null || block 'candidate and deployed rollback stop policies are incompatible'
     if [[ "$mode" == install && -L "$current" ]] && ! state_matches; then block 'install cannot select a new candidate; use --upgrade or --repair'; fi
   elif [[ "$mode" == upgrade ]]; then
     block '--upgrade requires an existing installation'
@@ -1602,9 +1842,9 @@ PY
 }
 
 perform_rollback() {
-  local source_commit deployer_identity key
-  local -A rollback_policy=()
-  if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; return; fi
+  local deployer_identity key exclusive_services_csv='' stop_escalation=${recovered_stop_escalation:-none} stop_elapsed_s=${recovered_stop_elapsed_s:-0.000} stop_status=0 incumbent_tx_policy='' stop_json=''
+  local -A rollback_policy=() incumbent_policy=()
+  if ((recovered_rollback)); then report_committed_rollback; return; fi
   active_deployment && block 'active deployment prevents rollback'
   [[ -f "$previous_state" && -f "$previous_policy" ]] || block 'no last-known-good release is available'
   secure_directory "$state_root" 700 0
@@ -1639,11 +1879,75 @@ PY
   export DOCKER_HOST
   unset DOCKER_CONTEXT
   command -v docker >/dev/null || block 'docker is required for rollback isolation validation'
+  release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
+  if [[ -v 'rollback_policy[ROLLBACK_EXCLUSIVE_SERVICES]' || -v 'rollback_policy[ROLLBACK_STOP_TIMEOUT_SECONDS]' || -v 'rollback_policy[ROLLBACK_STOP_SIGNAL]' ]]; then
+    if ! grep -Fq 'ROLLBACK_EXCLUSIVE_SERVICES' "$releases/$core_ref/scripts/deployer-runtime.sh" || ! grep -Fq 'ROLLBACK_EXCLUSIVE_SERVICES' "$releases/$core_ref/scripts/install-deployer.sh" || ! grep -Fq 'ROLLBACK_EXCLUSIVE_SERVICES' "$releases/$core_ref/scripts/deployer_adapter.py"; then
+      block 'retained last-known-good core release does not support rollback exclusive-service policy keys'
+    fi
+  fi
+  if [[ -e "$active_policy" || -L "$active_policy" ]]; then
+    secure_file "$active_policy" 'active policy'
+    parse_file "$active_policy" incumbent_policy 'active policy' "$config_keys"
+    stop_json=$(python3 "$repo_root/scripts/deployer_adapter.py" validate-stop-policy --policy "$previous_policy" --incumbent-policy "$active_policy" 2>&1) || block "${stop_json#ERROR: }"
+  else
+    stop_json=$(python3 "$repo_root/scripts/deployer_adapter.py" validate-stop-policy --policy "$previous_policy" 2>&1) || block "${stop_json#ERROR: }"
+  fi
+  exclusive_services_csv=$(python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(",".join(d["services"]))' <<<"$stop_json")
   reject_mixed_role
-  begin_transaction
+  if [[ -n $exclusive_services_csv ]]; then
+    check_unit_boundary
+    local retained_units=$releases/$core_ref/deploy/deployer
+    systemd-analyze verify "${unit_names[@]/#/$retained_units/}" >/dev/null || die 'systemd unit verification failed before stop'
+    policy_adapter_operation "$previous_policy" validate 'last-known-good policy' || block 'last-known-good adapter validation failed before stop'
+  fi
+  if ((resume_rollback == 0)); then begin_transaction; fi
+  if [[ -f "$transaction_dir/state/active-policy.conf" ]]; then
+    incumbent_tx_policy=$transaction_dir/state/active-policy.conf
+  fi
+  if [[ -n $exclusive_services_csv ]]; then
+    secure_directory "$log_root" 700 1
+    local -a stop_cmd=(python3 "$repo_root/scripts/deployer_adapter.py" stop-exclusive --policy "$previous_policy" --journal "$transaction_dir/exclusive-stop.json" --audit-log "$log_root/audit.log")
+    ((resume_rollback == 0)) || stop_cmd+=(--reconcile)
+    [[ -z "$incumbent_tx_policy" ]] || stop_cmd+=(--incumbent-policy "$incumbent_tx_policy")
+    ((force_stop_timeout == 0)) || stop_cmd+=(--force-stop-timeout)
+    if [[ $testing != 1 ]]; then
+      stop_cmd=(systemd-inhibit --what=shutdown:sleep --mode=block --who=ci-fleet-deployer --why='transactional rollback stop is active' -- "${stop_cmd[@]}")
+    fi
+    stop_status=0
+    timeout --kill-after=5s 2850s "${stop_cmd[@]}" || stop_status=$?
+    sync_transaction_audit "$transaction_dir"
+    if ((stop_status == 3)) || { ((stop_status != 0)) && ! exclusive_stop_unresolved "$transaction_dir"; }; then
+      block 'rollback exclusive-service stop failed before signaling'
+    elif ((stop_status != 0)); then
+      failure_next=reconcile-exclusive-stop
+      die 'rollback exclusive-service stop timed out or could not be verified'
+    fi
+    local stop_status_out cur_esc cur_elapsed
+    stop_status_out=$(python3 "$repo_root/scripts/deployer_adapter.py" stop-status --journal "$transaction_dir/exclusive-stop.json" 2>/dev/null || true)
+    IFS=$'\t' read -r cur_esc cur_elapsed < <(python3 -c 'import json,sys
+try: d=json.loads(sys.stdin.read())
+except Exception: d={}
+val=float(d.get("total_elapsed_seconds",0.0))
+print(d.get("escalation","none"), f"{val:.3f}", sep="\t")' <<<"$stop_status_out")
+    if [[ $cur_esc == sigkill || $stop_escalation == sigkill ]]; then stop_escalation=sigkill; fi
+    stop_elapsed_s=$(python3 -c 'import sys; print(f"{float(sys.argv[1]) + float(sys.argv[2]):.3f}")' "$stop_elapsed_s" "$cur_elapsed")
+    if [[ $recovered_stop_escalation == sigkill || $recovered_stop_elapsed_s != 0.000 ]]; then
+      python3 - "$repo_root/scripts" "$transaction_dir/exclusive-stop.json" "$stop_escalation" "$stop_elapsed_s" <<'PY_STOP'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from deployer_adapter import durable_file
+journal = Path(sys.argv[2])
+data = json.loads(journal.read_text())
+data.update(escalation=sys.argv[3], total_elapsed_seconds=float(sys.argv[4]))
+durable_file(journal, json.dumps(data, sort_keys=True).encode())
+PY_STOP
+    fi
+  fi
+
   install -m 0600 "$previous_state" "$state_file.new"
   install -m 0600 "$previous_policy" "$active_policy.new"
-
   release_complete "$releases/$core_ref" || die 'last-known-good release is incomplete'
   unit_source=$releases/$core_ref/deploy/deployer
   ln -sfn "releases/$core_ref" "$install_root/.current.new"
@@ -1665,7 +1969,7 @@ PY
   # Run the adapter call under a shutdown inhibitor, like the deploy runtime,
   # so a normal shutdown cannot strand a partially applied adapter rollback
   # between core mutation and commit-marker publication.
-  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$rollback_commit_file" && ! rollback_commit_marker_safe "$rollback_commit_file"; then
+  if ! policy_adapter_operation "$active_policy" rollback 'last-known-good policy' "$rollback_commit_file" 1 "$incumbent_tx_policy" && ! rollback_commit_marker_safe "$rollback_commit_file"; then
     die 'application adapter rollback failed'
   fi
   # The rollback already replaced the activation pointer and units on possibly
@@ -1681,10 +1985,8 @@ PY
   sync -f "$state_file" "$active_policy" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$state_root" 2>/dev/null || die 'rolled-back host state is not durable'
   sync -f "$transaction_dir" 2>/dev/null || sync "$transaction_dir" 2>/dev/null || die 'application rollback commit marker is not durable'
-  finalize_committed_rollback
-  recovered_rollback=0
-  health=healthy
-  report CHANGED yes restore-host-policy-evidence-then-check no
+  finalize_committed_rollback || die 'could not finalize committed rollback'
+  report_committed_rollback
 }
 
 perform_drain() {
@@ -1788,7 +2090,7 @@ fi
 case "$mode" in
   check) acquire_check_lock; perform_check ;;
   install|upgrade|repair) acquire_lock
-    if ((recovered_rollback)); then health=healthy; report CHANGED yes restore-host-policy-evidence-then-check no; else perform_converge; fi ;;
+    if ((recovered_rollback)); then report_committed_rollback; else perform_converge; fi ;;
   rollback) acquire_lock; perform_rollback ;;
   drain) acquire_lock; perform_drain ;;
   resume) acquire_lock; perform_resume ;;

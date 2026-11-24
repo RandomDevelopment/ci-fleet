@@ -1411,7 +1411,9 @@ health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
 recovery=$(expect_success "$installer" --upgrade --config "$config")
 grep -Fq 'next=restore-host-policy-evidence-then-check' <<<"$recovery" || fail 'interrupted committed rollback recovery lacks the operator reconciliation action'
 [[ $(grep -Fxc deploy "$FAKE_ADAPTER_LOG" || true) == "$deploy_calls_before" ]] || fail 'convergence ran after committed rollback recovery'
-[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$health_calls_before" ]] || fail 'convergence health ran after committed rollback recovery'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == "$((health_calls_before + 1))" ]] || fail 'committed rollback recovery did not check health exactly once'
+grep -Fq 'digest=sha256:aaaaaaaa' <<<"$recovery" || fail 'committed rollback recovery did not report the active artifact'
+[[ $(tail -n 1 "$root/var/log/ci-fleet-deployer/audit.log") == *'action=rollback '* && $(tail -n 1 "$root/var/log/ci-fleet-deployer/audit.log") == *'health=healthy result=success' ]] || fail 'committed rollback recovery did not audit successful health'
 [[ ! -e "$recovery_transaction" ]] || fail 'committed rollback recovery retained its transaction'
 expect_success "$installer" --repair --config "$config" >/dev/null
 expect_success "$installer" --check --config "$config" >/dev/null
@@ -2707,6 +2709,299 @@ cat "$tmp/runtime.saved" >"$runtime"
 git -C "$repo_root" show "HEAD:scripts/deployer-runtime.sh" | cmp -s - "$runtime" || fail 'live checkout restoration diverged from HEAD'
 rm -f "$root/var/lib/ci-fleet-deployer/drained"
 
+# Exclusive-service rollback stop verification, timeout safe-state, escalation, and compatibility gates.
+expect_failure '--force-stop-timeout is only permitted with --rollback' "$installer" --check --force-stop-timeout --config "$config" >/dev/null
+expect_failure 'test Docker socket override is test-only' env -u CI_FLEET_DEPLOYER_TESTING -u CI_FLEET_DEPLOYER_ROOT -u CI_FLEET_DEPLOYER_EUID_OVERRIDE CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET=1 "$installer" --check --config "$config" >/dev/null
+
+# Invalid rollback stop policy settings fail closed during validation.
+cp "$config" "$tmp/config-stop-valid.saved"
+for bad_case in \
+  $'ROLLBACK_STOP_TIMEOUT_SECONDS requires ROLLBACK_EXCLUSIVE_SERVICES|ROLLBACK_STOP_TIMEOUT_SECONDS=30' \
+  $'ROLLBACK_STOP_SIGNAL requires ROLLBACK_EXCLUSIVE_SERVICES|ROLLBACK_STOP_SIGNAL=SIGTERM' \
+  $'ROLLBACK_STOP_SIGNAL must be a supported graceful signal|ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_SIGNAL=SIGKILL' \
+  $'ROLLBACK_STOP_TIMEOUT_SECONDS must be between 1 and 600|ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=601' \
+  $'rollback stop timeout budget exceeds 1800 seconds|ROLLBACK_EXCLUSIVE_SERVICES=a,b,c,d\nROLLBACK_STOP_TIMEOUT_SECONDS=600' \
+  $'invalid exclusive service name: BadService|ROLLBACK_EXCLUSIVE_SERVICES=BadService'
+do
+  expected_stop_err=${bad_case%%|*}
+  bad_stop=${bad_case#*|}
+  cat "$tmp/config-stop-valid.saved" >"$config"
+  printf '%s\n' "$bad_stop" >>"$config"
+  chmod 0600 "$config"
+  expect_failure "$expected_stop_err" "$installer" --check --config "$config" >/dev/null
+done
+cat "$tmp/config-stop-valid.saved" >"$config"; chmod 0600 "$config"
+
+# Retained-core compatibility: old LKG release without ROLLBACK_EXCLUSIVE_SERVICES support blocks.
+old_core=$(printf legacy-no-stop-support | sha1sum | cut -d' ' -f1)
+old_release=$root/opt/ci-fleet-deployer/releases/$old_core
+cp -a "$root/opt/ci-fleet-deployer/releases/$core_ref" "$old_release"
+sed -i 's/ROLLBACK_EXCLUSIVE_SERVICES/LEGACY_REMOVED_KEY/g' "$old_release/scripts/deployer-runtime.sh" "$old_release/scripts/install-deployer.sh"
+(cd "$old_release" && sha256sum scripts/install-deployer.sh scripts/deployer-runtime.sh scripts/deployer_adapter.py deploy/deployer/* | sha256sum | cut -d' ' -f1) >"$old_release/.ci-fleet-tree-sha256"
+chmod 0644 "$old_release/.ci-fleet-tree-sha256"
+cp "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$tmp/lkg-compat-policy.saved"
+cp "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$tmp/lkg-compat-state.saved"
+python3 - "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$root/var/lib/ci-fleet-deployer/last-known-good.json" "$old_core" <<'PY'
+import json, pathlib, re, sys
+p, s, core = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+p.write_text(re.sub(r'(?m)^CORE_REF=.*$', 'CORE_REF=' + core, p.read_text()) + 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\n')
+st = json.loads(s.read_text()); st['core_ref'] = core; s.write_text(json.dumps(st, indent=2, sort_keys=True) + '\n')
+PY
+chmod 0600 "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf" "$root/var/lib/ci-fleet-deployer/last-known-good.json"
+expect_failure 'retained last-known-good core release does not support rollback exclusive-service policy keys' "$installer" --rollback --config "$config" >/dev/null
+install -m 0600 "$tmp/lkg-compat-policy.saved" "$root/var/lib/ci-fleet-deployer/last-known-good-policy.conf"
+install -m 0600 "$tmp/lkg-compat-state.saved" "$root/var/lib/ci-fleet-deployer/last-known-good.json"
+rm -rf "$old_release"
+
+# End-to-end installer rollback with local fake Docker Unix-socket server.
+fake_docker_sock=$root/run/docker.sock
+fake_docker_state=$tmp/fake-docker-state.json
+cat >"$tmp/fake_docker_server.py" <<'PY'
+import http.server, json, os, socketserver, sys, urllib.parse
+from pathlib import Path
+
+sock_path, state_path = sys.argv[1], Path(sys.argv[2])
+if os.path.exists(sock_path):
+    os.unlink(sock_path)
+
+def load_state():
+    return json.loads(state_path.read_text())
+
+def save_state(st):
+    tmp = state_path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, state_path)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+    def do_GET(self):
+        st = load_state()
+        p = urllib.parse.urlsplit(self.path).path
+        if p == '/containers/json':
+            items = [{'Id': cid, 'Names': [c['Name']], 'Labels': c['Config']['Labels'], 'State': c['State']['Status']}
+                     for cid, c in st['containers'].items()]
+            data = json.dumps(items).encode(); self.send_response(200)
+        elif p.startswith('/containers/') and p.endswith('/json'):
+            cid = urllib.parse.unquote(p[len('/containers/'):-len('/json')])
+            c = st['containers'].get(cid)
+            if not c:
+                self.send_response(404); data = b'{}'
+            else:
+                st['events'].append(f'inspect:{cid}:{c["State"]["Status"]}')
+                save_state(st)
+                data = json.dumps(c).encode(); self.send_response(200)
+        else:
+            self.send_response(404); data = b'{}'
+        self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_POST(self):
+        st = load_state()
+        parsed = urllib.parse.urlsplit(self.path)
+        length = int(self.headers.get('Content-Length', '0'))
+        body = self.rfile.read(length) if length else b''
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) == 3 and parts[0] == 'containers':
+            cid, action = urllib.parse.unquote(parts[1]), parts[2]
+            c = st['containers'].get(cid)
+            if not c:
+                self.send_response(404); data = b'{}'
+            elif action == 'update':
+                payload = json.loads(body)
+                c['HostConfig']['RestartPolicy'] = payload['RestartPolicy']
+                st['events'].append(f'update:{cid}:{payload["RestartPolicy"]["Name"]}')
+                save_state(st); self.send_response(200); data = b'{}'
+            elif action == 'kill':
+                sig = urllib.parse.parse_qs(parsed.query).get('signal', ['SIGTERM'])[0]
+                st['events'].append(f'kill:{cid}:{sig}')
+                if not c.get('ignore_term') or sig == 'SIGKILL':
+                    c['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                save_state(st); self.send_response(204); data = b''
+            else:
+                self.send_response(404); data = b'{}'
+        else:
+            self.send_response(404); data = b'{}'
+        self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+
+class Server(socketserver.UnixStreamServer):
+    pass
+
+srv = Server(sock_path, Handler)
+os.chmod(sock_path, 0o600)
+print('ready', flush=True)
+srv.serve_forever()
+PY
+
+cat >"$tmp/docker-state-init.py" <<'PY'
+import json, sys
+mode, path, img_a, img_b = sys.argv[1:5]
+labels = {'io.randomdevelopment.ci-fleet.role': 'deployer', 'io.randomdevelopment.ci-fleet.identity': 'staging-deployer-01',
+          'io.randomdevelopment.ci-fleet.environment': 'staging', 'io.randomdevelopment.ci-fleet.target': 'example-staging'}
+containers = {
+    'cid-sched': {'Id': 'cid-sched', 'Name': '/ci-fleet-deploy-staging-deployer-01-scheduler',
+                  'Config': {'Labels': dict(labels), 'Image': img_b},
+                  'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                  'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 701},
+                  'ignore_term': mode == 'stuck'},
+    'cid-web': {'Id': 'cid-web', 'Name': '/ci-fleet-deploy-staging-deployer-01-web',
+                'Config': {'Labels': dict(labels), 'Image': img_b},
+                'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 702},
+                'ignore_term': False},
+}
+if mode == 'ambiguous':
+    containers['cid-sched-dup'] = {'Id': 'cid-sched-dup', 'Name': '/ci-fleet-deploy-staging-deployer-01-scheduler-dup',
+                                   'Config': {'Labels': dict(labels, **{'io.randomdevelopment.ci-fleet.service': 'scheduler'}), 'Image': img_b},
+                                   'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                                   'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 703},
+                                   'ignore_term': False}
+open(path, 'w').write(json.dumps({'containers': containers, 'events': []}))
+PY
+
+img_a='registry.example.invalid/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+img_b='registry.example.invalid/example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+python3 "$tmp/docker-state-init.py" ambiguous "$fake_docker_state" "$img_a" "$img_b"
+mkfifo -m 0600 "$tmp/fake-docker-ready"
+python3 "$tmp/fake_docker_server.py" "$fake_docker_sock" "$fake_docker_state" >"$tmp/fake-docker-ready" &
+fake_docker_pid=$!
+trap 'kill "$fake_docker_pid" 2>/dev/null || true; restore_live_checkout; rm -rf "$tmp"' EXIT
+timeout 15s grep -Fxq ready "$tmp/fake-docker-ready" || fail 'fake Docker Unix socket did not start'
+
+export CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET=1
+export FAKE_DOCKER_PS='cid-sched|deployer|staging-deployer-01|staging|example-staging'
+
+write_stop_config() {
+  write_evidence
+  write_config
+  printf 'ROLLBACK_EXCLUSIVE_SERVICES=scheduler\nROLLBACK_STOP_TIMEOUT_SECONDS=1\n' >>"$config"
+  chmod 0600 "$config"
+}
+deploy_stop_pair() {
+  image=$img_a; write_stop_config
+  expect_success "$installer" --upgrade --config "$config" >/dev/null
+  runtime_request
+  expect_success "$runtime" deploy >/dev/null
+  image=$img_b; write_stop_config
+  expect_success "$installer" --upgrade --config "$config" >/dev/null
+  runtime_request
+  expect_success "$runtime" deploy >/dev/null
+}
+
+# Deploy a -> upgrade/deploy b with ROLLBACK_EXCLUSIVE_SERVICES=scheduler and fake Docker socket.
+deploy_stop_pair
+
+# Unit drift must block before the exclusive stop changes Docker.
+mkdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+expect_failure 'unreviewed drop-in override' "$installer" --rollback --config "$config" >/dev/null
+rmdir "$root/etc/systemd/system/ci-fleet-deployer.service.d"
+python3 - "$fake_docker_state" <<'PY_VERIFY' || fail 'unit preflight changed Docker'
+import json, sys
+assert not json.load(open(sys.argv[1]))["events"]
+PY_VERIFY
+
+# Ambiguous identity fails pre-signal without invoking rollback adapter.
+rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
+expect_failure 'rollback exclusive-service stop failed before signaling' "$installer" --rollback --config "$config" >/dev/null
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'ambiguous identity invoked rollback adapter'
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'pre-signal failure mutated install-state'
+! compgen -G "$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.*" >/dev/null || fail 'pre-signal failure retained transaction'
+
+# Graceful stop verifies exit before adapter rollback, runs post-rollback health, preserves sibling, and audits.
+python3 "$tmp/docker-state-init.py" graceful "$fake_docker_state" "$img_a" "$img_b"
+: >"$root/var/log/ci-fleet-deployer/audit.log"; chmod 0600 "$root/var/log/ci-fleet-deployer/audit.log"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+rollback_out=$(expect_success "$installer" --rollback --config "$config")
+grep -Fq 'result=CHANGED' <<<"$rollback_out" || fail 'graceful rollback did not report CHANGED'
+grep -Fq 'health=healthy' <<<"$rollback_out" || fail 'graceful rollback did not report health=healthy'
+[[ $(grep -Fxc health "$FAKE_ADAPTER_LOG" || true) == $((health_calls_before + 1)) ]] || fail 'rollback did not run post-rollback health check'
+python3 - "$fake_docker_state" <<'PY' || fail 'graceful stop did not preserve sibling or enforce order'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st['containers']['cid-sched']['State']['Status'] == 'exited'
+assert st['containers']['cid-sched']['HostConfig']['RestartPolicy']['Name'] == 'no'
+assert st['containers']['cid-web']['State']['Running'] is True
+assert st['containers']['cid-web']['HostConfig']['RestartPolicy']['Name'] == 'always'
+assert st['events'].index('update:cid-sched:no') < st['events'].index('kill:cid-sched:SIGTERM') < st['events'].index('inspect:cid-sched:exited')
+PY
+grep -Eq 'action=rollback .*artifact=sha256:aaaa.*exclusive_services=scheduler stop_escalation=none .*health=healthy result=success' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'rollback success audit entry missing'
+if grep -Fq 'registry.example.invalid' "$root/var/log/ci-fleet-deployer/audit.log"; then fail 'rollback audit exposed private registry host'; fi
+
+# Rebuild a -> b for stuck timeout + reconciliation + escalation test.
+deploy_stop_pair
+
+# Stuck stop times out without SIGKILL, retains safe recovery state, and blocks other operations.
+python3 "$tmp/docker-state-init.py" stuck "$fake_docker_state" "$img_a" "$img_b"
+rollback_calls_before=$(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true)
+timeout_out=$(expect_failure 'rollback exclusive-service stop timed out' "$installer" --rollback --config "$config")
+grep -Fq 'next=reconcile-exclusive-stop' <<<"$timeout_out" || fail 'timeout report omitted reconcile-exclusive-stop next action'
+grep -Fq 'reason=timeout' <<<"$timeout_out" || fail 'timeout report omitted reason=timeout'
+grep -Fq 'service=scheduler' <<<"$timeout_out" || fail 'timeout report omitted service=scheduler'
+grep -Fq 'target=example-staging' <<<"$timeout_out" || fail 'timeout report omitted target'
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'stuck stop ran rollback adapter'
+grep -Fq 'sha256:bbbbbbbb' "$root/var/lib/ci-fleet-deployer/install-state.json" || fail 'stuck stop prematurely overwrote install-state'
+grep -Fq 'result=stop_failed reason=timeout' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'stuck stop was not audited'
+check_stuck=$(expect_failure 'unresolved exclusive-service stop' "$installer" --check --config "$config")
+grep -Fq 'next=reconcile-exclusive-stop' <<<"$check_stuck" || fail 'check with unresolved stop omitted next=reconcile-exclusive-stop'
+repair_stuck=$(expect_failure 'rollback exclusive-service stop requires reconciliation' "$installer" --repair --config "$config")
+grep -Fq 'next=reconcile-exclusive-stop' <<<"$repair_stuck" || fail 'repair with unresolved stop omitted next=reconcile-exclusive-stop'
+expect_failure 'interrupted installer transaction requires recovery' "$runtime" health >/dev/null
+
+# Repeated --rollback without escalation refuses without duplicating or re-signaling.
+retry_stuck=$(expect_failure 'rollback exclusive-service stop still unresolved' "$installer" --rollback --config "$config")
+grep -Fq 'next=reconcile-exclusive-stop' <<<"$retry_stuck" || fail 'repeated unresolved rollback omitted next=reconcile-exclusive-stop'
+[[ $(grep -Fxc rollback "$FAKE_ADAPTER_LOG" || true) == "$rollback_calls_before" ]] || fail 'repeated unresolved rollback ran adapter'
+
+# Explicit --force-stop-timeout escalates to SIGKILL, preserves escalation audit, and completes rollback.
+esc_out=$(expect_success "$installer" --rollback --force-stop-timeout --config "$config")
+grep -Fq 'result=CHANGED' <<<"$esc_out" || fail 'escalated rollback did not succeed'
+grep -Fq 'result=stop_escalated' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'escalation audit entry was lost during transaction restore'
+grep -Eq 'action=rollback .*exclusive_services=scheduler stop_escalation=sigkill .*health=healthy result=success' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'escalated rollback final audit entry missing'
+python3 - "$fake_docker_state" <<'PY' || fail 'escalated stop did not verify exit or touched sibling'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert 'kill:cid-sched:SIGKILL' in st['events']
+assert st['containers']['cid-sched']['State']['Status'] == 'exited'
+assert st['containers']['cid-web']['State']['Running'] is True
+PY
+
+# Post-rollback health failure reports health=unhealthy and audits unhealthy.
+deploy_stop_pair
+python3 "$tmp/docker-state-init.py" graceful "$fake_docker_state" "$img_a" "$img_b"
+health_calls_before=$(grep -Fxc health "$FAKE_ADAPTER_LOG" || true)
+unhealthy_out=$(FAKE_ADAPTER_FAIL_HEALTH_AFTER=$health_calls_before expect_failure 'rolled-back deployment health check failed' "$installer" --rollback --config "$config")
+grep -Fq 'health=unhealthy' <<<"$unhealthy_out" || fail 'unhealthy rollback report omitted health=unhealthy'
+grep -Fq 'health=unhealthy result=unhealthy' "$root/var/log/ci-fleet-deployer/audit.log" || fail 'unhealthy rollback was not audited'
+policy_root=$root/var/lib/ci-fleet-deployer
+grep -Fq 'sha256:bbbbbbbb' "$policy_root/deployed/current/policy.conf" || fail 'unhealthy rollback published a deployed snapshot'
+[[ -f "$policy_root/last-known-good-policy.conf" ]] || fail 'unhealthy rollback retired last-known-good policy'
+expect_success "$installer" --repair --config "$config" >/dev/null
+grep -Fq 'sha256:aaaaaaaa' "$policy_root/deployed/current/policy.conf" || fail 'healthy recovery did not publish the rollback snapshot'
+[[ ! -e "$policy_root/last-known-good-policy.conf" ]] || fail 'healthy recovery retained last-known-good policy'
+
+# Mid-stop crash (inflight exclusive-stop.json) blocks other ops and reconciles on --rollback.
+deploy_stop_pair
+python3 "$tmp/docker-state-init.py" graceful "$fake_docker_state" "$img_a" "$img_b"
+crash_tx=$root/opt/ci-fleet-deployer/.installer-transactions/.transaction.crashstop
+mkdir -m 0700 "$crash_tx" "$crash_tx/units" "$crash_tx/state"
+printf 'rollback\n' >"$crash_tx/kind"; chmod 0600 "$crash_tx/kind"
+snapshot_state "$crash_tx"
+cat >"$crash_tx/exclusive-stop.json" <<'JSON'
+{"schema_version":1,"status":"inflight","signaled":true,"adapter_dispatched":false,"environment":"staging","target":"example-staging","deployer_identity":"staging-deployer-01","service":"scheduler","container_id":"cid-sched"}
+JSON
+chmod 0600 "$crash_tx/exclusive-stop.json"
+expect_failure 'rollback exclusive-service stop requires reconciliation' "$installer" --repair --config "$config" >/dev/null
+sed -i 's/"inflight"/"verified"/' "$crash_tx/exclusive-stop.json"
+expect_failure 'exclusive service exited and replacement is pending' "$installer" --repair --config "$config" >/dev/null
+FAKE_SYSTEMD_VERIFY_EXIT=1 expect_failure 'systemd unit verification failed before stop' "$installer" --rollback --config "$config" >/dev/null
+[[ -f "$crash_tx/exclusive-stop.json" ]] || fail 'preflight failure discarded the pending replacement guard'
+expect_failure 'exclusive service exited and replacement is pending' "$installer" --repair --config "$config" >/dev/null
+expect_success "$installer" --rollback --config "$config" >/dev/null
+
+kill "$fake_docker_pid" 2>/dev/null || true
+wait "$fake_docker_pid" 2>/dev/null || true
+unset CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET FAKE_DOCKER_PS
+trap 'restore_live_checkout; rm -rf "$tmp"' EXIT
+expect_success "$installer" --repair --config "$config" >/dev/null
+
 grep -Fq 'DEPLOYER-HOST.md' "$repo_root/docs/README.md" || fail 'operator index does not link the deployer runbook'
 [[ -x "$repo_root/scripts/test-deployer-units.sh" ]] || fail 'real systemd unit verification is not wired'
 if ! python3 -I -B - "$repo_root" <<'PY_VALIDATION_TASK'
@@ -2730,7 +3025,7 @@ for scheduled in health cleanup; do
   grep -Fxq 'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_PTRACE' "$scheduled_unit" || fail 'scheduled adapter can bypass its mount namespace'
 done
 
-for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--resume' '--rollback' '--uninstall' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
+for phrase in '--check' '--install' '--upgrade' '--repair' '--drain' '--resume' '--rollback' '--uninstall' '--force-stop-timeout' 'ROLLBACK_EXCLUSIVE_SERVICES' 'ROLLBACK_STOP_TIMEOUT_SECONDS' 'ROLLBACK_STOP_SIGNAL' 'io.randomdevelopment.ci-fleet.service' 'manual-exact-head' 'github-environment' 'GitHub Free' 'PRODUCTION_AUTHORIZATION_EVIDENCE_PATH' 'CI_FLEET_DEPLOYER_ROLLBACK_COMMIT' 'application-owned' 'REPORT action='; do
   grep -Fq -- "$phrase" "$repo_root/docs/DEPLOYER-HOST.md" || fail "deployer runbook omits $phrase"
 done
 for unit in "$repo_root"/deploy/deployer/*; do

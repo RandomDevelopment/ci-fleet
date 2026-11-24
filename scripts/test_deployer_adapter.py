@@ -539,6 +539,16 @@ class Containment(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('run this mode as root', result.stderr)
 
+    def test_rollback_success_audit_is_idempotent_after_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audit = Path(directory) / 'audit.log'
+            fields = {'transaction': '.transaction.first', 'action': 'rollback', 'result': 'success'}
+            adapter.append_audit_record(audit, dict(fields, time='initial'), os.getuid(), once=True)
+            adapter.append_audit_record(audit, dict(fields, time='recovered'), os.getuid(), once=True)
+            adapter.append_audit_record(audit, dict(fields, transaction='.transaction.second'), os.getuid(), once=True)
+            self.assertEqual(len(audit.read_text().splitlines()), 2)
+            self.assertNotIn('time=recovered', audit.read_text())
+
     def test_rollback_recovery_requires_durable_completion_after_reboot(self):
         installer = Path(__file__).with_name('install-deployer.sh')
         functions = ''.join(subprocess.check_output(['sed', '-n', f'/^{name}() {{$/,/^}}$/p',
@@ -553,19 +563,29 @@ root_path() { printf '%s%s' "$fixture_root" "$1"; }
 reject_other_role_state() { return 0; }
 adapter_unit_inactive() { return 0; }
 rollback_commit_marker_uncommitted() { test ! -e "$1"; }
+rollback_commit_marker_safe() { test -f "$1"; }
 restore_transaction() { printf restored >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 finalize_committed_rollback() { printf finalized >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 python3() { command "$test_python" -c "$journal_probe" "$@"; }
+sync() {
+  if [[ $fail_transaction_sync == 1 && $2 == "$transaction_root/.transaction.rollback" ]]; then
+    return 1
+  fi
+  command sync "$@"
+}
 acquire_lock
 '''
         # Directory ancestry is covered separately; this fixture lives in /tmp.
         probe = "import sys; from unittest.mock import patch; import deployer_adapter as a; sys.argv=sys.argv[1:]; " \
-                "p=patch.object(a,'trusted_directory'); p.start(); raise SystemExit(a.main())"
+                "patch.object(a,'trusted_directory').start(); patch.object(a,'unit_inactive',return_value=True).start(); " \
+                "raise SystemExit(a.main())"
         for committed, volatile in ((False, False), (False, True), (True, False), (True, True)):
-            for state, uncertain, outcome in [('missing', False, None), ('inflight', False, None),
-                                              ('completed', True, 'committed' if committed else 'failed'),
-                                              ('completed', False, None),
-                                              ('completed', False, 'committed' if committed else 'failed')]:
+            cases = [('missing', False, None), ('inflight', False, None),
+                     ('completed', True, 'committed' if committed else 'failed'),
+                     ('completed', False, None), ('completed', False, 'committed' if committed else 'failed')]
+            if committed:
+                cases.extend([('health-inflight', False, None), ('sync-failed', False, 'committed')])
+            for state, uncertain, outcome in cases:
                 with self.subTest(committed=committed, volatile=volatile, state=state,
                                   uncertain=uncertain, outcome=outcome), \
                         tempfile.TemporaryDirectory() as directory:
@@ -581,6 +601,8 @@ acquire_lock
                     unit = 'ci-fleet-deployer-adapter-1-2.service'
                     adapter.durable_file(transaction / 'kind', b'rollback\n')
                     adapter.durable_file(transaction / 'adapter-unit', (unit + '\n').encode())
+                    if state == 'health-inflight':
+                        adapter.durable_file(transaction / 'rollback-health-unit', (unit + '\n').encode())
                     if volatile:
                         adapter.durable_file(lock / 'adapter-unit', (unit + '\n').encode())
                     if committed:
@@ -589,7 +611,8 @@ acquire_lock
                         journal = store / '.adapter-recovery' / unit
                         journal.mkdir(parents=True, mode=0o700)
                         adapter.durable_file(journal / 'status.json', json.dumps({
-                            'unit': unit, 'operation': 'rollback', 'status': state,
+                            'unit': unit, 'operation': 'health' if state == 'health-inflight' else 'rollback',
+                            'status': {'health-inflight': 'inflight', 'sync-failed': 'completed'}.get(state, state),
                             'exit_code': 1, 'rollback_outcome': outcome,
                             'rollback_marker': str(transaction / 'application-rollback-committed')}).encode())
                         if uncertain:
@@ -605,9 +628,16 @@ acquire_lock
                                                      active_operation=str(store / 'active-operation'),
                                                      releases=str(root / 'absent-releases'),
                                                      CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
+                                                     fail_transaction_sync='1' if state == 'sync-failed' else '0',
                                                      test_python=sys.executable, journal_probe=probe,
                                                      PYTHONPATH=str(installer.parent)))
-                    if state != 'completed' or uncertain or outcome is None:
+                    if state == 'sync-failed':
+                        self.assertEqual(result.returncode, 42, result.stderr)
+                        self.assertTrue((transaction / 'adapter-unit').exists())
+                        self.assertEqual((lock / 'adapter-unit').exists(), volatile)
+                        self.assertTrue(journal.exists())
+                        self.assertFalse(result_file.exists())
+                    elif state != 'health-inflight' and (state != 'completed' or uncertain or outcome is None):
                         self.assertEqual(result.returncode, 42, result.stderr)
                         self.assertIn('rollback adapter journal completion is unverified', result.stderr)
                         self.assertFalse(result_file.exists())
@@ -968,6 +998,851 @@ with patch.object(a.subprocess,'run',side_effect=application):
                 finally:
                     server.shutdown()
                     thread.join()
+
+
+class RollbackExclusiveStop(unittest.TestCase):
+    def setUp(self):
+        self.base_values = {
+            'ARTIFACT_IMAGE': 'registry.example.invalid/app@sha256:' + 'a' * 64,
+            'DEPLOYER_IDENTITY': 'example',
+            'ENVIRONMENT': 'staging',
+            'TARGET_ID': 'app',
+            'SOURCE_COMMIT': '1' * 40,
+            'DOCKER_SOCKET': '/run/rootless/docker.sock',
+            'CREDENTIAL_PROVIDER': 'file',
+            'CREDENTIAL_REF': '/etc/ci-fleet-deployer/credentials/application.credential',
+            'CREDENTIAL_SCOPE': 'staging',
+            'ADAPTER_PATH': '/etc/ci-fleet-deployer/adapters/app',
+            'ADAPTER_SHA256': '2' * 64,
+        }
+        self.labels = adapter.ownership_labels(self.base_values)
+
+    def _write_policy(self, path: Path, overrides: dict[str, str] | None = None) -> Path:
+        values = dict(self.base_values)
+        if overrides:
+            values.update(overrides)
+        adapter.durable_file(path, ''.join(f'{k}={v}\n' for k, v in values.items()).encode())
+        return path
+
+    def test_parse_rollback_stop_policy_validation_and_merge(self):
+        parsed = adapter.parse_rollback_stop_policy(
+            dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='scheduler', ROLLBACK_STOP_TIMEOUT_SECONDS='90', ROLLBACK_STOP_SIGNAL='SIGQUIT'),
+            dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='worker,scheduler', ROLLBACK_STOP_TIMEOUT_SECONDS='45', ROLLBACK_STOP_SIGNAL='SIGTERM'),
+        )
+        self.assertEqual(parsed, {'services': ['worker', 'scheduler'], 'timeout_seconds': 45, 'signal': 'SIGTERM'})
+        defaults = adapter.parse_rollback_stop_policy(dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'))
+        self.assertEqual(defaults, {'services': ['scheduler'], 'timeout_seconds': 120, 'signal': None})
+        empty = adapter.parse_rollback_stop_policy(self.base_values)
+        self.assertEqual(empty, {'services': [], 'timeout_seconds': 0, 'signal': None})
+        self.assertEqual(adapter.parse_rollback_stop_policy(
+            self.base_values, dict(self.base_values, DOCKER_SOCKET='/run/other/docker.sock'),
+        ), empty)
+
+        invalid_cases = [
+            {'ROLLBACK_EXCLUSIVE_SERVICES': ''},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler,'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'BadName'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler,scheduler'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': ','.join(f'svc-{i}' for i in range(33))},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'a' * 65},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'a' * 64, 'DEPLOYER_IDENTITY': 'x' * 55},
+            {'ROLLBACK_STOP_TIMEOUT_SECONDS': '30'},
+            {'ROLLBACK_STOP_SIGNAL': 'SIGTERM'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '0'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '601'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': 'abc'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'a,b,c,d', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '600'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_SIGNAL': 'SIGKILL'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_SIGNAL': '9'},
+            {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_SIGNAL': 'TERM'},
+        ]
+        for bad in invalid_cases:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                adapter.parse_rollback_stop_policy(dict(self.base_values, **bad))
+
+        with self.assertRaises(ValueError):
+            adapter.parse_rollback_stop_policy(
+                dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'),
+                dict(self.base_values, TARGET_ID='other', ROLLBACK_EXCLUSIVE_SERVICES='scheduler'),
+            )
+        with self.assertRaises(ValueError):
+            adapter.parse_rollback_stop_policy(
+                dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'),
+                dict(self.base_values, DOCKER_SOCKET='/run/other/docker.sock', ROLLBACK_EXCLUSIVE_SERVICES='scheduler'),
+            )
+        with self.assertRaises(ValueError):
+            adapter.parse_rollback_stop_policy(
+                dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='a,b', ROLLBACK_STOP_TIMEOUT_SECONDS='500'),
+                dict(self.base_values, ROLLBACK_EXCLUSIVE_SERVICES='c,d'),
+            )
+
+    def _fake_clock(self):
+        now = [0.0]
+        def mono():
+            return now[0]
+        def slp(dt):
+            now[0] += dt
+        return mono, slp
+
+    def _make_docker_mock(self, containers: dict[str, dict], *, on_kill=None, on_update=None):
+        calls = []
+        class MockDocker:
+            def inspect(self, kind, name):
+                assert kind == 'containers'
+                if name not in containers:
+                    raise ValueError('not found')
+                return copy.deepcopy(containers[name])
+
+            def request(self, method, path, body=b'', headers=None):
+                calls.append((method, path, body))
+                parsed = adapter.urllib.parse.urlsplit(path)
+                if method == 'GET' and parsed.path == '/containers/json':
+                    items = []
+                    for cid, info in containers.items():
+                        items.append({
+                            'Id': cid,
+                            'Names': [info['Name']],
+                            'Labels': dict(info['Config']['Labels']),
+                            'State': info['State']['Status'],
+                        })
+                    return 200, json.dumps(items).encode()
+                parts = parsed.path.strip('/').split('/')
+                if len(parts) >= 2 and parts[0] == 'containers':
+                    cid = adapter.urllib.parse.unquote(parts[1])
+                    action = parts[2] if len(parts) == 3 else 'json'
+                    if cid not in containers:
+                        return 404, b'{"message":"no such container"}'
+                    if method == 'GET' and action == 'json':
+                        return 200, json.dumps(containers[cid]).encode()
+                    if method == 'POST' and action == 'update':
+                        if on_update:
+                            res = on_update(cid, json.loads(body))
+                            if res is not None:
+                                return res
+                        containers[cid]['HostConfig']['RestartPolicy'] = json.loads(body)['RestartPolicy']
+                        return 200, b'{}'
+                    if method == 'POST' and action == 'kill':
+                        sig = adapter.urllib.parse.parse_qs(parsed.query).get('signal', ['SIGTERM'])[0]
+                        if on_kill:
+                            res = on_kill(cid, sig)
+                            if res is not None:
+                                return res
+                        return 204, b''
+                return 500, b'{}'
+        return MockDocker(), calls
+
+    def test_stop_exclusive_resolution_and_ambiguity_fails_pre_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lkg = self._write_policy(root / 'lkg.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
+            # Two containers matching the same exclusive service fails pre-signal.
+            containers = {
+                'cid1': {'Id': 'cid1', 'Name': '/ci-fleet-deploy-example-scheduler',
+                         'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                         'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                         'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 10}},
+                'cid2': {'Id': 'cid2', 'Name': '/ci-fleet-deploy-example-scheduler-alt',
+                         'Config': {'Labels': dict(self.labels, **{adapter.SERVICE_LABEL: 'scheduler'}), 'Image': self.base_values['ARTIFACT_IMAGE']},
+                         'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                         'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 11}},
+            }
+            backend, calls = self._make_docker_mock(containers)
+            journal = root / 'exclusive-stop.json'
+            mono, slp = self._fake_clock()
+            rc = adapter.stop_exclusive_services(lkg, journal, uid=os.getuid(), backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 3)
+            self.assertFalse(any(m == 'POST' for m, _, _ in calls))
+            jdata = json.loads(journal.read_text())
+            self.assertEqual((jdata['status'], jdata['signaled'], jdata['reason']), ('blocked', False, 'ambiguous_service_identity'))
+
+            # Conflicting name vs service label fails pre-signal.
+            containers = {
+                'cid1': {'Id': 'cid1', 'Name': '/ci-fleet-deploy-example-scheduler',
+                         'Config': {'Labels': dict(self.labels, **{adapter.SERVICE_LABEL: 'worker'}), 'Image': self.base_values['ARTIFACT_IMAGE']},
+                         'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                         'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 10}},
+            }
+            backend, calls = self._make_docker_mock(containers)
+            journal2 = root / 'exclusive-stop2.json'
+            rc = adapter.stop_exclusive_services(lkg, journal2, uid=os.getuid(), backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 3)
+            self.assertFalse(any(m == 'POST' for m, _, _ in calls))
+
+            # Unsupported StopSignal or Paused container fails pre-signal.
+            for bad_state, bad_sig in [({'Paused': True}, 'SIGTERM'), ({'Paused': False}, 'SIGKILL')]:
+                containers = {
+                    'cid1': {'Id': 'cid1', 'Name': '/ci-fleet-deploy-example-scheduler',
+                             'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE'], 'StopSignal': bad_sig},
+                             'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                             'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Pid': 10, **bad_state}},
+                }
+                backend, calls = self._make_docker_mock(containers)
+                journal3 = root / f'exclusive-{bad_sig}-{bad_state["Paused"]}.json'
+                rc = adapter.stop_exclusive_services(lkg, journal3, uid=os.getuid(), backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+                self.assertEqual(rc, 3)
+                self.assertFalse(any(m == 'POST' for m, _, _ in calls))
+
+            # Absent exclusive container succeeds.
+            backend, _ = self._make_docker_mock({})
+            journal4 = root / 'exclusive-empty.json'
+            rc = adapter.stop_exclusive_services(lkg, journal4, uid=os.getuid(), backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(journal4.read_text())['status'], 'verified')
+
+    def test_stop_exclusive_graceful_order_already_stopped_and_signals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lkg = self._write_policy(root / 'lkg.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '5'})
+            inc = self._write_policy(root / 'inc.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '5'})
+            containers = {
+                'cid-sched': {'Id': 'cid-sched', 'Name': '/ci-fleet-deploy-example-scheduler',
+                              'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE'], 'StopSignal': 'QUIT'},
+                              'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                              'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 42}},
+                'cid-sibling': {'Id': 'cid-sibling', 'Name': '/ci-fleet-deploy-example-web',
+                                'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                                'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 43}},
+            }
+            events = []
+            def on_update(cid, payload):
+                events.append(('update', cid, payload['RestartPolicy']['Name']))
+                return None
+            def on_kill(cid, sig):
+                events.append(('kill', cid, sig))
+                containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                return None
+            backend, calls = self._make_docker_mock(containers, on_kill=on_kill, on_update=on_update)
+            journal = root / 'exclusive-stop.json'
+            mono, slp = self._fake_clock()
+            rc = adapter.stop_exclusive_services(lkg, journal, incumbent_policy_path=inc, uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(events, [('update', 'cid-sched', 'no'), ('kill', 'cid-sched', 'SIGQUIT')])
+            self.assertFalse(any('/stop' in p for _, p, _ in calls))
+            self.assertEqual(containers['cid-sibling']['HostConfig']['RestartPolicy']['Name'], 'always')
+            self.assertTrue(containers['cid-sibling']['State']['Running'])
+            jdata = json.loads(journal.read_text())
+            self.assertEqual((jdata['status'], jdata['escalation']), ('verified', 'none'))
+
+            # Already-exited container with RestartPolicy=always is updated to no.
+            containers['cid-exited'] = {
+                'Id': 'cid-exited', 'Name': '/ci-fleet-deploy-example-worker',
+                'Config': {'Labels': dict(self.labels, **{adapter.SERVICE_LABEL: 'worker'}), 'Image': self.base_values['ARTIFACT_IMAGE']},
+                'HostConfig': {'RestartPolicy': {'Name': 'unless-stopped'}},
+                'State': {'Status': 'exited', 'Running': False, 'Restarting': False, 'Paused': False, 'Pid': 0},
+            }
+            lkg2 = self._write_policy(root / 'lkg2.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'worker', 'ROLLBACK_STOP_SIGNAL': 'SIGINT'})
+            events.clear()
+            backend2, _ = self._make_docker_mock(containers, on_kill=on_kill, on_update=on_update)
+            journal2 = root / 'exclusive-stop-exited.json'
+            rc = adapter.stop_exclusive_services(lkg2, journal2, uid=os.getuid(), backend_factory=lambda *_: backend2, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(events, [('update', 'cid-exited', 'no')])
+            self.assertEqual(containers['cid-exited']['HostConfig']['RestartPolicy']['Name'], 'no')
+
+    def test_stop_exclusive_timeout_unverified_escalation_and_reconcile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lkg = self._write_policy(root / 'lkg.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2'})
+            audit = root / 'audit.log'
+            containers = {
+                'cid-stuck': {'Id': 'cid-stuck', 'Name': '/ci-fleet-deploy-example-scheduler',
+                              'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                              'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                              'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 99}},
+            }
+            signals = []
+            def on_kill(cid, sig):
+                signals.append((cid, sig))
+                if sig == 'SIGKILL':
+                    containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                return None
+            backend, _ = self._make_docker_mock(containers, on_kill=on_kill)
+            journal = root / 'exclusive-stop.json'
+            mono, slp = self._fake_clock()
+
+            # Default timeout does not send SIGKILL, records timeout + audit, returns 4.
+            rc = adapter.stop_exclusive_services(lkg, journal, audit_log=audit, uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 4)
+            self.assertEqual(signals, [('cid-stuck', 'SIGTERM')])
+            jdata = json.loads(journal.read_text())
+            self.assertEqual((jdata['status'], jdata['signaled'], jdata['adapter_dispatched'], jdata['escalation']),
+                             ('timeout', True, False, 'none'))
+            self.assertIn('result=stop_failed reason=timeout', audit.read_text())
+
+            # Docker can reject signals during restart backoff. The helper still
+            # waits to the deadline and permits a verified explicit escalation.
+            crash = containers['cid-stuck']
+            crash['State'].update(Status='restarting', Restarting=True, Pid=0)
+            crash['HostConfig']['RestartPolicy']['Name'] = 'always'
+            crash_journal = root / 'crash-stop.json'
+            def signal_crash(cid, sig):
+                if sig != 'SIGKILL':
+                    return 409, b''
+                crash['State']['Restarting'] = False
+                return on_kill(cid, sig)
+            crash_backend, _ = self._make_docker_mock(containers, on_kill=signal_crash)
+            self.assertEqual(adapter.stop_exclusive_services(
+                lkg, crash_journal, uid=os.getuid(), backend_factory=lambda *_: crash_backend,
+                monotonic=mono, sleep=slp), 4)
+            self.assertEqual(json.loads(crash_journal.read_text())['reason'], 'timeout')
+            self.assertEqual(adapter.stop_exclusive_services(
+                lkg, crash_journal, reconcile=True, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: crash_backend, monotonic=mono, sleep=slp), 0)
+            crash['State'].update(Status='running', Running=True, Pid=99)
+
+            # Reconcile while still running without --force-stop-timeout refuses without re-signaling.
+            signals.clear()
+            rc = adapter.stop_exclusive_services(lkg, journal, reconcile=True, audit_log=audit, uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 4)
+            self.assertEqual(signals, [])
+
+            # Reconcile pre-signal failure retains signaled=True and timed_out_containers.
+            failing_inv = MagicMock()
+            failing_inv.request.side_effect = OSError('inventory unavailable')
+            rc_inv = adapter.stop_exclusive_services(lkg, journal, reconcile=True, audit_log=audit, uid=os.getuid(),
+                                                     backend_factory=lambda *_: failing_inv, monotonic=mono, sleep=slp)
+            self.assertEqual(rc_inv, 3)
+            j_inv = json.loads(journal.read_text())
+            self.assertTrue(j_inv['signaled'])
+            self.assertEqual(j_inv['timed_out_containers'], {'scheduler': 'cid-stuck'})
+            self.assertTrue(adapter.read_stop_status(journal, uid=os.getuid())[0])
+
+            # Reconcile after natural exit succeeds without --force-stop-timeout and without escalation.
+            containers['cid-stuck']['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+            rc_nat = adapter.stop_exclusive_services(lkg, journal, reconcile=True, audit_log=audit, uid=os.getuid(),
+                                                     backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc_nat, 0)
+            self.assertEqual(json.loads(journal.read_text())['escalation'], 'none')
+
+            # Reset running container -> timeout -> Reconcile with --force-stop-timeout escalates to SIGKILL.
+            containers['cid-stuck']['State'].update({'Status': 'running', 'Running': True, 'Pid': 99})
+            journal_esc = root / 'exclusive-stop-esc.json'
+            rc = adapter.stop_exclusive_services(lkg, journal_esc, audit_log=audit, uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 4)
+            signals.clear()
+            rc = adapter.stop_exclusive_services(lkg, journal_esc, reconcile=True, force_stop_timeout=True, audit_log=audit,
+                                                 uid=os.getuid(), backend_factory=lambda *_: backend, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(signals, [('cid-stuck', 'SIGKILL')])
+            self.assertEqual(json.loads(journal_esc.read_text())['escalation'], 'sigkill')
+            self.assertIn('result=stop_escalated', audit.read_text())
+
+            # Mid-stop Docker disconnect during kill returns exit 4 with docker_communication_failed and audit.
+            containers['cid-disc'] = {
+                'Id': 'cid-disc', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 100},
+            }
+            del containers['cid-stuck']
+            def on_kill_disconnect(cid, sig):
+                raise OSError('docker socket disconnected')
+            backend_disc, _ = self._make_docker_mock(containers, on_kill=on_kill_disconnect)
+            journal_disc = root / 'exclusive-stop-disconnect.json'
+            audit_disc = root / 'audit-disc.log'
+            rc_disc = adapter.stop_exclusive_services(lkg, journal_disc, audit_log=audit_disc, uid=os.getuid(),
+                                                      backend_factory=lambda *_: backend_disc, monotonic=mono, sleep=slp)
+            self.assertEqual(rc_disc, 4)
+            self.assertEqual(json.loads(journal_disc.read_text())['reason'], 'docker_communication_failed')
+            self.assertIn('result=stop_failed reason=docker_communication_failed', audit_disc.read_text())
+            del containers['cid-disc']
+
+            # Escalation where container still refuses to exit fails closed.
+            containers['cid-unkillable'] = {
+                'Id': 'cid-unkillable', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 101},
+            }
+            backend_unkillable, _ = self._make_docker_mock(containers)
+            journal2 = root / 'exclusive-stop-unkillable.json'
+            rc = adapter.stop_exclusive_services(lkg, journal2, force_stop_timeout=True, audit_log=audit,
+                                                 uid=os.getuid(), backend_factory=lambda *_: backend_unkillable, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 4)
+            self.assertEqual(json.loads(journal2.read_text())['reason'], 'forced_stop_exit_unverified')
+
+            # Interrupted inflight stop reconciles via graceful signal.
+            containers['cid-inflight'] = {
+                'Id': 'cid-inflight', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels, 'Image': self.base_values['ARTIFACT_IMAGE']},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 102},
+            }
+            del containers['cid-unkillable']
+            journal3 = root / 'exclusive-stop-inflight.json'
+            adapter.durable_file(journal3, json.dumps({
+                'schema_version': 1, 'status': 'inflight', 'signaled': True, 'adapter_dispatched': False,
+                'environment': 'staging', 'target': 'app', 'deployer_identity': 'example',
+                'service': 'scheduler', 'container_id': 'cid-inflight',
+            }).encode())
+            signals.clear()
+            def kill_graceful(cid, sig):
+                signals.append((cid, sig))
+                containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                return None
+            backend_inf, _ = self._make_docker_mock(containers, on_kill=kill_graceful)
+            rc = adapter.stop_exclusive_services(lkg, journal3, reconcile=True, uid=os.getuid(),
+                                                 backend_factory=lambda *_: backend_inf, monotonic=mono, sleep=slp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(signals, [('cid-inflight', 'SIGTERM')])
+
+    def test_exit_proof_requires_explicit_restart_policy_and_integer_pid(self):
+        info = {'State': {'Status': 'exited', 'Running': False, 'Restarting': False,
+                          'Paused': False, 'Pid': 0}, 'HostConfig': {}}
+        self.assertFalse(adapter.container_exited_and_non_restartable(info)[0])
+        info['HostConfig']['RestartPolicy'] = {'Name': 'no'}
+        info['State']['Pid'] = False
+        self.assertFalse(adapter.container_exited_and_non_restartable(info)[0])
+        info['State']['Pid'] = 0
+        self.assertTrue(adapter.container_exited_and_non_restartable(info)[0])
+
+    def test_late_marker_sync_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'commit'
+            monotonic, sleep = self._fake_clock()
+            with patch.object(adapter.time, 'monotonic', monotonic), \
+                 patch.object(adapter.os, 'fsync', side_effect=lambda _fd: sleep(31)):
+                with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                    adapter.durable_file(marker, b'committed\n', deadline=30)
+            self.assertFalse(marker.exists())
+
+    def test_removed_container_inventory_must_complete_before_stop_deadline(self):
+        monotonic, sleep = self._fake_clock()
+        backend = MagicMock()
+
+        def request(_method, path):
+            if "/containers/json?" in path:
+                sleep(2)
+                return 200, b"[]"
+            return 404, b"{}"
+
+        backend.request.side_effect = request
+        result = adapter._wait_container_exited(
+            backend, "removed", "ci-fleet-deploy-example-", "scheduler",
+            self.labels, 2, 0, monotonic, sleep,
+        )
+        self.assertEqual(result, (False, 2.0, "stop_deadline_unverified"))
+
+    def test_inventory_uses_top_level_labels_and_rejects_null_label_values(self):
+        backend = MagicMock()
+        row = {'Id': 'replacement', 'Names': ['/scheduler'], 'Labels': self.labels.copy(),
+               'Config': {'Labels': {}}}
+        backend.request.return_value = 200, json.dumps([row]).encode()
+        self.assertEqual(adapter.list_owned_containers(backend, self.labels), [
+            {key: row[key] for key in ('Id', 'Names', 'Labels')},
+        ])
+        row['Labels'][next(iter(self.labels))] = None
+        backend.request.return_value = 200, json.dumps([row]).encode()
+        with self.assertRaisesRegex(ValueError, 'invalid container inventory labels'):
+            adapter.list_owned_containers(backend, self.labels)
+
+    def test_final_inventory_must_arrive_before_stop_budget_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._write_policy(root / 'policy.conf', {'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
+            monotonic, sleep = self._fake_clock()
+            backend = MagicMock()
+
+            def late_inventory():
+                sleep(61)
+                return 200, b"[]"
+
+            def request(*_args):
+                if backend.request.call_count == 2:
+                    return late_inventory()
+                return 200, b"[]"
+
+            backend.request.side_effect = request
+            journal = root / 'stop.json'
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, journal, seconds=60, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertEqual(json.loads(journal.read_text())['reason'], 'stop_deadline_unverified')
+
+    def test_auto_removed_container_before_escalation_requires_fresh_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._write_policy(root / 'policy.conf', {
+                'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2',
+            })
+            monotonic, sleep = self._fake_clock()
+            containers = {'current': {
+                'Id': 'current', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 3},
+            }}
+            backend, calls = self._make_docker_mock(containers)
+            request = backend.request
+            inspect = backend.inspect
+
+            def remove_after_timeout():
+                if monotonic() >= 2:
+                    containers.pop('current', None)
+
+            def inspect_container(kind, name):
+                remove_after_timeout()
+                return inspect(kind, name)
+
+            def request_after_timeout(method, path, *args):
+                remove_after_timeout()
+                return request(method, path, *args)
+
+            backend.inspect = inspect_container
+            backend.request = request_after_timeout
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, root / 'stop.json', force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 0)
+            self.assertFalse(any('SIGKILL' in path for _, path, _ in calls))
+            containers['current'] = {
+                'Id': 'current', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 3},
+            }
+            monotonic, sleep = self._fake_clock()
+            def malformed_inventory(method, path, *args):
+                if monotonic() >= 2 and '/containers/json?' in path:
+                    return 200, b'[{"Id":"replacement","Names":["/ci-fleet-deploy-example-scheduler"],"Labels":null}]'
+                return request_after_timeout(method, path, *args)
+
+            backend.request = malformed_inventory
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, root / 'malformed.json', force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertFalse(any('SIGKILL' in path for _, path, _ in calls))
+
+    def test_late_graceful_signal_does_not_authorize_forced_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._write_policy(root / 'policy.conf', {
+                'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2',
+            })
+            monotonic, sleep = self._fake_clock()
+            journal = root / 'stop.json'
+            containers = {'current': {
+                'Id': 'current', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 3},
+            }}
+            signals = []
+
+            def late_sig(_cid, sig):
+                signals.append(sig)
+                sleep(2)
+                return 409, b"{}"
+
+            backend, _ = self._make_docker_mock(containers, on_kill=late_sig)
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, journal, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertEqual(signals, ['SIGTERM'])
+            self.assertEqual(json.loads(journal.read_text())['reason'], 'stop_deadline_unverified')
+
+            journal = root / 'incomplete-stop.json'
+            signals.clear()
+            def incomplete_state(cid, sig):
+                signals.append(sig)
+                containers[cid]['State'] = {'Status': 'running'}
+                return 204, b''
+
+            backend, _ = self._make_docker_mock(containers, on_kill=incomplete_state)
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, journal, force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 4)
+            self.assertEqual(signals, ['SIGTERM'])
+            self.assertEqual(json.loads(journal.read_text())['reason'], 'container_state_unverified')
+
+    def test_rollback_broker_guards_and_real_socket_ordering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lkg_img = self.base_values['ARTIFACT_IMAGE']
+            bad_img = lkg_img.replace('a' * 64, 'b' * 64)
+            net_name = 'ci-fleet-deploy-example-net'
+            containers = {
+                'old-sched': {'Id': 'old-sched', 'Name': '/ci-fleet-deploy-example-scheduler',
+                              'Config': {'Labels': self.labels, 'Image': bad_img},
+                              'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                              'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 50}},
+            }
+            containers['web'] = {
+                'Id': 'web', 'Name': '/ci-fleet-deploy-example-web',
+                'Config': {'Labels': self.labels, 'Image': bad_img},
+                'HostConfig': {'RestartPolicy': {'Name': 'always'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False,
+                          'Paused': False, 'Pid': 51, 'StartedAt': '2026-11-22T01:00:00Z'},
+            }
+            event_log = []
+            def on_update(cid, payload):
+                event_log.append(f'update:{cid}:{payload["RestartPolicy"]["Name"]}')
+                return None
+            def on_kill(cid, sig):
+                event_log.append(f'kill:{cid}:{sig}')
+                containers[cid]['State'].update({'Status': 'exited', 'Running': False, 'Pid': 0})
+                return None
+
+            # Serve over a real local Unix socket for full end-to-end HTTP verification.
+            sock_path = str(root / 'docker.sock')
+            class DockerHandler(adapter.http.server.BaseHTTPRequestHandler):
+                def log_message(self, *_):
+                    pass
+                def do_GET(self):
+                    p = adapter.urllib.parse.urlsplit(self.path).path
+                    if p == '/containers/json':
+                        items = [{'Id': cid, 'Names': [c['Name']], 'Labels': dict(c['Config']['Labels']), 'State': c['State']['Status']}
+                                 for cid, c in containers.items()]
+                        data = json.dumps(items).encode()
+                        self.send_response(200)
+                    elif p.startswith('/containers/') and p.endswith('/json'):
+                        cid = adapter.urllib.parse.unquote(p[len('/containers/'):-len('/json')])
+                        if cid not in containers:
+                            self.send_response(404); data = b'{}'
+                        else:
+                            event_log.append(f'inspect:{cid}:{containers[cid]["State"]["Status"]}')
+                            data = json.dumps(containers[cid]).encode()
+                            self.send_response(200)
+                    elif p.startswith('/networks/'):
+                        data = json.dumps({'Labels': self.server.labels, 'Driver': 'bridge', 'Internal': True}).encode()
+                        self.send_response(200)
+                    elif p.startswith('/images/') and p.endswith('/json'):
+                        data = json.dumps({'Id': 'sha256:' + 'a' * 64, 'Config': {'Volumes': None}}).encode()
+                        self.send_response(200)
+                    else:
+                        self.send_response(404); data = b'{}'
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    if data:
+                        self.wfile.write(data)
+                def do_POST(self):
+                    parsed = adapter.urllib.parse.urlsplit(self.path)
+                    length = int(self.headers.get('Content-Length', '0'))
+                    body = self.rfile.read(length) if length else b''
+                    if parsed.path == '/containers/create':
+                        name = adapter.urllib.parse.parse_qs(parsed.query)['name'][0]
+                        payload = json.loads(body)
+                        cid = 'new-' + name
+                        containers[cid] = {'Id': cid, 'Name': '/' + name, 'Image': 'sha256:' + 'a' * 64, 'Config': {'Labels': payload['Labels'], 'Image': payload['Image']},
+                                           'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                                           'State': {'Status': 'created', 'Running': False, 'Restarting': False, 'Paused': False, 'Pid': 0}}
+                        event_log.append(f'create:{cid}')
+                        data = json.dumps({'Id': cid}).encode()
+                        self.send_response(201)
+                    else:
+                        parts = parsed.path.strip('/').split('/')
+                        cid, action = adapter.urllib.parse.unquote(parts[1]), parts[2]
+                        if action == 'update':
+                            on_update(cid, json.loads(body))
+                            containers[cid]['HostConfig']['RestartPolicy'] = json.loads(body)['RestartPolicy']
+                            self.send_response(200); data = b'{}'
+                        elif action == 'kill':
+                            sig = adapter.urllib.parse.parse_qs(parsed.query).get('signal', ['SIGTERM'])[0]
+                            on_kill(cid, sig)
+                            self.send_response(204); data = b''
+                        elif action == 'start':
+                            event_log.append(f'start:{cid}')
+                            containers[cid]['State'].update({'Status': 'running', 'Running': True, 'Pid': 200, 'Health': {'Status': 'healthy'}})
+                            self.send_response(204); data = b''
+                        else:
+                            self.send_response(404); data = b'{}'
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    if data:
+                        self.wfile.write(data)
+
+            class LocalDocker(adapter.socketserver.UnixStreamServer):
+                labels = self.labels
+
+            with LocalDocker(sock_path, DockerHandler) as docker_srv:
+                dthread = threading.Thread(target=docker_srv.serve_forever, daemon=True)
+                dthread.start()
+                try:
+                    with patch.dict(os.environ, {'CI_FLEET_DEPLOYER_TESTING': '1', 'CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET': '1'}):
+                        lkg = self._write_policy(root / 'lkg.conf', {'DOCKER_SOCKET': sock_path, 'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler'})
+                        backend = adapter.TestingDockerBackend(sock_path, 30)
+                        marker = root / 'rollback-commit'
+                        policy = adapter.Policy(json.loads(json.dumps(dict(self.base_values, DOCKER_SOCKET=sock_path, ROLLBACK_EXCLUSIVE_SERVICES='scheduler'))), backend,
+                                                marker=marker, operation='rollback', exclusive_services=('scheduler',),
+                                                unit='ci-fleet-deployer-adapter-1-2.service')
+                        policy.capture_rollback_incumbents()
+                        proxy_sock = str(root / 'proxy.sock')
+                        with adapter.ProxyServer(proxy_sock, adapter.handler(policy)) as proxy, \
+                             patch.object(adapter, 'executor_peer', return_value=True):
+                            pthread = threading.Thread(target=proxy.serve_forever, daemon=True)
+                            pthread.start()
+                            try:
+                                # Broker blocks creating/starting replacement while old-sched is still running.
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                req_body = json.dumps({
+                                    'Image': lkg_img, 'Labels': dict(self.labels, **{adapter.SERVICE_LABEL: 'scheduler'}),
+                                    'HostConfig': {'CapDrop': ['ALL'], 'ReadonlyRootfs': True, 'SecurityOpt': ['no-new-privileges'],
+                                                   'CgroupnsMode': 'private', 'Memory': 104857600, 'NanoCpus': 1000000000,
+                                                   'PidsLimit': 32, 'NetworkMode': net_name},
+                                }).encode()
+                                conn.request('POST', '/containers/create?name=ci-fleet-deploy-example-scheduler-new', req_body)
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 403)
+
+                                # Broker blocks starting old broken-image container.
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', '/containers/old-sched/start')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 403)
+
+                                # Core stops old-sched and verifies exit before adapter starts replacement.
+                                journal = root / 'exclusive-stop.json'
+                                rc = adapter.stop_exclusive_services(lkg, journal, uid=os.getuid())
+                                self.assertEqual(rc, 0)
+
+                                # The stopped incumbent cannot satisfy commit readiness.
+                                with self.assertRaisesRegex(ValueError, 'scheduler is missing'):
+                                    policy.verify_rollback_commit()
+
+                                # Restartable stopped containers still block replacement.
+                                containers['old-sched']['HostConfig']['RestartPolicy']['Name'] = 'always'
+                                with self.assertRaisesRegex(ValueError, 'active or restartable'):
+                                    policy._require_no_active_service_container('scheduler')
+                                containers['old-sched']['HostConfig']['RestartPolicy']['Name'] = 'no'
+
+                                # Replacement create + start succeeds after exit verified.
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', '/containers/create?name=ci-fleet-deploy-example-scheduler-new', req_body)
+                                resp = conn.getresponse(); new_id = json.loads(resp.read())['Id']; conn.close()
+                                self.assertEqual(resp.status, 201)
+
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', f'/containers/{new_id}/start')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 204)
+
+                                # Unhealthy, restarting, or paused active container prevents rollback-commit.
+                                for bad_patch in (
+                                    {'Health': {'Status': 'unhealthy'}},
+                                    {'Health': {'Status': 'starting'}},
+                                    {'Health': {'Status': 'healthy'}, 'Restarting': True},
+                                    {'Health': {'Status': 'healthy'}, 'Restarting': False, 'Paused': True},
+                                ):
+                                    containers[new_id]['State'].update(bad_patch)
+                                    conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                    conn.request('POST', '/ci-fleet/rollback-commit', b'committed')
+                                    resp = conn.getresponse(); resp.read(); conn.close()
+                                    self.assertEqual(resp.status, 403)
+                                containers[new_id]['State'].update({'Restarting': False, 'Paused': False})
+
+                                replacement = containers[new_id]
+                                replacement['Image'] = 'sha256:' + 'b' * 64
+                                with self.assertRaisesRegex(ValueError, 'does not match approved artifact'):
+                                    policy.verify_rollback_commit()
+                                replacement['Image'] = 'sha256:' + 'a' * 64
+                                replacement['Config']['Healthcheck'] = {'Test': ['CMD', 'check']}
+                                replacement['State'].pop('Health')
+                                with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                    policy.verify_rollback_commit()
+                                replacement['State']['Health'] = {'Status': 'healthy'}
+
+                                # A durable successful adapter outcome can wait for
+                                # Docker health without dispatching the adapter again.
+                                store = root / 'recovery'
+                                journal_dir = store / policy.unit
+                                store.mkdir(mode=0o700)
+                                journal_dir.mkdir(mode=0o700)
+                                adapter.durable_file(journal_dir / 'policy.conf', lkg.read_bytes())
+                                policy.rollback_ready = journal_dir / 'rollback-ready.json'
+                                containers[new_id]['State']['Health']['Status'] = 'unhealthy'
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', '/ci-fleet/rollback-commit', b'committed')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 204)
+                                conn = adapter.UnixConnection(proxy_sock, rootless=False)
+                                conn.request('POST', f'/containers/{new_id}/kill?signal=SIGTERM')
+                                resp = conn.getresponse(); resp.read(); conn.close()
+                                self.assertEqual(resp.status, 403)
+                                with patch.object(adapter, 'Backend', return_value=backend), \
+                                     patch.object(adapter, 'trusted_directory'), \
+                                     patch.object(adapter, 'unit_inactive', return_value=True):
+                                    with self.assertRaisesRegex(ValueError, 'broker drain is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    adapter.durable_file(journal_dir / 'rollback-drained',
+                                                         adapter.hashlib.sha256(policy.rollback_ready.read_bytes()).hexdigest().encode())
+                                    with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertFalse(marker.exists())
+                                    containers[new_id]['State']['Health']['Status'] = 'healthy'
+                                    monotonic, sleep = self._fake_clock()
+                                    def verify_late(_policy):
+                                        sleep(31)
+                                    with patch.object(adapter.time, 'monotonic', monotonic), \
+                                         patch.object(adapter.Policy, 'verify_rollback_commit', verify_late):
+                                        with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                                            adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertFalse(marker.exists())
+                                    monotonic, sleep = self._fake_clock()
+                                    fsync = adapter.os.fsync
+
+                                    def slow_directory_sync(fd):
+                                        if marker.exists() and adapter.stat.S_ISDIR(adapter.os.fstat(fd).st_mode):
+                                            sleep(31)
+                                        fsync(fd)
+
+                                    with patch.object(adapter.time, 'monotonic', monotonic), \
+                                         patch.object(adapter.os, 'fsync', slow_directory_sync):
+                                        with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                                            adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertTrue(marker.exists())
+                                    self.assertTrue(marker.with_name(marker.name + '.pending').exists())
+                                    self.assertFalse(adapter.journal_complete(store, policy.unit, os.getuid()))
+                                    containers[new_id]['State']['Health']['Status'] = 'unhealthy'
+                                    with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    containers[new_id]['State']['Health']['Status'] = 'healthy'
+                                    monotonic, sleep = self._fake_clock()
+
+                                    def slow_status_sync(fd):
+                                        if (journal_dir / 'status.json').exists() and adapter.stat.S_ISDIR(adapter.os.fstat(fd).st_mode):
+                                            sleep(31)
+                                        fsync(fd)
+
+                                    with patch.object(adapter.time, 'monotonic', monotonic), \
+                                         patch.object(adapter.os, 'fsync', slow_status_sync):
+                                        with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                                            adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertFalse(adapter.journal_complete(store, policy.unit, os.getuid()))
+                                    self.assertTrue(adapter.complete_rollback_readiness(store, policy.unit, os.getuid()))
+                                    self.assertFalse(marker.with_name(marker.name + '.pending').exists())
+                                status = json.loads((journal_dir / 'status.json').read_text())
+                                self.assertEqual(status['verified_containers'], [new_id])
+                                self.assertEqual(containers['web']['Config']['Image'], bad_img)
+                                self.assertTrue(containers['web']['State']['Running'])
+
+                                # A later rollback ignores the retained, inert old container.
+                                self.assertEqual(adapter.stop_exclusive_services(
+                                    lkg, root / 'repeat-stop.json', uid=os.getuid()), 0)
+                            finally:
+                                proxy.shutdown()
+                                pthread.join()
+                    # Exact order proof: update -> kill -> exited inspect precedes create -> start.
+                    upd_idx = event_log.index('update:old-sched:no')
+                    kill_idx = event_log.index('kill:old-sched:SIGTERM')
+                    exit_idx = event_log.index('inspect:old-sched:exited')
+                    create_idx = event_log.index('create:new-ci-fleet-deploy-example-scheduler-new')
+                    start_idx = event_log.index('start:new-ci-fleet-deploy-example-scheduler-new')
+                    self.assertLess(upd_idx, kill_idx)
+                    self.assertLess(kill_idx, exit_idx)
+                    self.assertLess(exit_idx, create_idx)
+                    self.assertLess(create_idx, start_idx)
+                finally:
+                    docker_srv.shutdown()
+                    dthread.join()
 
 
 if __name__ == '__main__':
