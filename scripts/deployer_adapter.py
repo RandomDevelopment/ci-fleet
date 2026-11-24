@@ -97,13 +97,12 @@ def parse_rollback_stop_policy(values: dict[str, str], incumbent_values: dict[st
     if incumbent_values is not None:
         for key in ("ENVIRONMENT", "TARGET_ID", "DEPLOYER_IDENTITY"):
             require(incumbent_values.get(key) == values.get(key), f"incumbent policy {key} does not match rollback policy")
-        if incumbent_values.get("DOCKER_SOCKET") is not None or values.get("DOCKER_SOCKET") is not None:
-            require(incumbent_values.get("DOCKER_SOCKET") == values.get("DOCKER_SOCKET"),
-                    "incumbent policy DOCKER_SOCKET does not match rollback policy")
         inc_services, inc_timeout, inc_signal = _parse_single_stop_policy(incumbent_values)
         if inc_timeout is not None:
             require(len(inc_services) * inc_timeout <= MAX_ROLLBACK_STOP_TOTAL, "incumbent rollback stop timeout budget exceeds 1800 seconds")
         services = list(dict.fromkeys([*inc_services, *lkg_services]))
+        require(not services or incumbent_values.get("DOCKER_SOCKET") == values.get("DOCKER_SOCKET"),
+                "incumbent policy DOCKER_SOCKET does not match rollback policy")
         require(len(services) <= MAX_EXCLUSIVE_SERVICES, "combined exclusive services exceed maximum count")
         timeout = inc_timeout if inc_timeout is not None else (lkg_timeout if lkg_timeout is not None else (DEFAULT_ROLLBACK_STOP_TIMEOUT if services else 0))
         signal_name = inc_signal if inc_signal is not None else lkg_signal
@@ -457,11 +456,16 @@ def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict
     require(status == 200, "owned container inventory is unavailable")
     items = json.loads(body, object_pairs_hook=unique_object)
     require(isinstance(items, list), "invalid container inventory")
+    inventory = []
     for item in items:
         require(isinstance(item, dict) and isinstance(item.get("Id"), str) and bool(item["Id"])
                 and isinstance(item.get("Labels"), dict) and isinstance(item.get("Names"), list)
                 and all(isinstance(name, str) for name in item["Names"]), "invalid container inventory row")
-    return [item for item in items if container_owned(item, expected_labels)]
+        labels = item["Labels"]
+        require(all(isinstance(value, str) for value in labels.values()), "invalid container inventory labels")
+        if all(labels.get(key) == value for key, value in expected_labels.items()):
+            inventory.append({key: item[key] for key in ("Id", "Labels", "Names")})
+    return inventory
 
 
 class RollbackHealthStarting(ValueError):

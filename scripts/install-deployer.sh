@@ -1585,6 +1585,8 @@ retire_adapter_guard() {
   elif [[ $testing != 1 ]]; then
     python3 "$repo_root/scripts/deployer_adapter.py" journal-complete --store "$state_root/.adapter-recovery" "$unit" || return 1
   fi
+  # Persist the readiness pending-file removal before dropping the unit reference.
+  [[ -z $guard_transaction ]] || sync -f "$guard_transaction" 2>/dev/null || return 1
   local -a guards=("$adapter_guard")
   [[ -z $guard_transaction ]] || guards+=("$guard_transaction/adapter-unit")
   for guard in "${guards[@]}"; do

@@ -567,6 +567,12 @@ rollback_commit_marker_safe() { test -f "$1"; }
 restore_transaction() { printf restored >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 finalize_committed_rollback() { printf finalized >"$result_file"; rm -rf "$transaction_dir"; transaction_dir=; }
 python3() { command "$test_python" -c "$journal_probe" "$@"; }
+sync() {
+  if [[ $fail_transaction_sync == 1 && $2 == "$transaction_root/.transaction.rollback" ]]; then
+    return 1
+  fi
+  command sync "$@"
+}
 acquire_lock
 '''
         # Directory ancestry is covered separately; this fixture lives in /tmp.
@@ -578,7 +584,7 @@ acquire_lock
                      ('completed', True, 'committed' if committed else 'failed'),
                      ('completed', False, None), ('completed', False, 'committed' if committed else 'failed')]
             if committed:
-                cases.append(('health-inflight', False, None))
+                cases.extend([('health-inflight', False, None), ('sync-failed', False, 'committed')])
             for state, uncertain, outcome in cases:
                 with self.subTest(committed=committed, volatile=volatile, state=state,
                                   uncertain=uncertain, outcome=outcome), \
@@ -606,7 +612,7 @@ acquire_lock
                         journal.mkdir(parents=True, mode=0o700)
                         adapter.durable_file(journal / 'status.json', json.dumps({
                             'unit': unit, 'operation': 'health' if state == 'health-inflight' else 'rollback',
-                            'status': 'inflight' if state == 'health-inflight' else state,
+                            'status': {'health-inflight': 'inflight', 'sync-failed': 'completed'}.get(state, state),
                             'exit_code': 1, 'rollback_outcome': outcome,
                             'rollback_marker': str(transaction / 'application-rollback-committed')}).encode())
                         if uncertain:
@@ -622,9 +628,16 @@ acquire_lock
                                                      active_operation=str(store / 'active-operation'),
                                                      releases=str(root / 'absent-releases'),
                                                      CI_FLEET_DEPLOYER_TESTING='1', result_file=str(result_file),
+                                                     fail_transaction_sync='1' if state == 'sync-failed' else '0',
                                                      test_python=sys.executable, journal_probe=probe,
                                                      PYTHONPATH=str(installer.parent)))
-                    if state != 'health-inflight' and (state != 'completed' or uncertain or outcome is None):
+                    if state == 'sync-failed':
+                        self.assertEqual(result.returncode, 42, result.stderr)
+                        self.assertTrue((transaction / 'adapter-unit').exists())
+                        self.assertEqual((lock / 'adapter-unit').exists(), volatile)
+                        self.assertTrue(journal.exists())
+                        self.assertFalse(result_file.exists())
+                    elif state != 'health-inflight' and (state != 'completed' or uncertain or outcome is None):
                         self.assertEqual(result.returncode, 42, result.stderr)
                         self.assertIn('rollback adapter journal completion is unverified', result.stderr)
                         self.assertFalse(result_file.exists())
@@ -1021,6 +1034,9 @@ class RollbackExclusiveStop(unittest.TestCase):
         self.assertEqual(defaults, {'services': ['scheduler'], 'timeout_seconds': 120, 'signal': None})
         empty = adapter.parse_rollback_stop_policy(self.base_values)
         self.assertEqual(empty, {'services': [], 'timeout_seconds': 0, 'signal': None})
+        self.assertEqual(adapter.parse_rollback_stop_policy(
+            self.base_values, dict(self.base_values, DOCKER_SOCKET='/run/other/docker.sock'),
+        ), empty)
 
         invalid_cases = [
             {'ROLLBACK_EXCLUSIVE_SERVICES': ''},
@@ -1411,6 +1427,19 @@ class RollbackExclusiveStop(unittest.TestCase):
             self.labels, 2, 0, monotonic, sleep,
         )
         self.assertEqual(result, (False, 2.0, "stop_deadline_unverified"))
+
+    def test_inventory_uses_top_level_labels_and_rejects_null_label_values(self):
+        backend = MagicMock()
+        row = {'Id': 'replacement', 'Names': ['/scheduler'], 'Labels': self.labels.copy(),
+               'Config': {'Labels': {}}}
+        backend.request.return_value = 200, json.dumps([row]).encode()
+        self.assertEqual(adapter.list_owned_containers(backend, self.labels), [
+            {key: row[key] for key in ('Id', 'Names', 'Labels')},
+        ])
+        row['Labels'][next(iter(self.labels))] = None
+        backend.request.return_value = 200, json.dumps([row]).encode()
+        with self.assertRaisesRegex(ValueError, 'invalid container inventory labels'):
+            adapter.list_owned_containers(backend, self.labels)
 
     def test_final_inventory_must_arrive_before_stop_budget_expires(self):
         with tempfile.TemporaryDirectory() as directory:
