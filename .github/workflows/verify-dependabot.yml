@@ -2,7 +2,7 @@ name: Verify Dependabot artifact patch
 
 on:
   workflow_run:
-    workflows: [Build ci-fleet]
+    workflows: ['ci-fleet tests, image builds and cleanup']
     types: [completed]
 
 permissions:
