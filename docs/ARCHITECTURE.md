@@ -122,6 +122,48 @@ flowchart TD
 
 Project-controlled inputs must not allow an ordinary validation job to select a privileged runner group.
 
+## Application deployment path
+
+An operator starts deployment by submitting an approved request on the target
+host and starting the deployer service. A GitHub merge or passing CI run leaves
+that step pending. The current path requires a separately authorized staging
+target, including for previews. Production rollout is disabled.
+
+```mermaid
+flowchart TD
+    source["GitHub app repo (example-app)<br/>Full source commit SHA"]
+    ci["Ordinary CI (read-only)<br/>App tests on ephemeral runners<br/>managed by the fleet engine"]
+    release["Separate release runner<br/>App workflow builds the commit<br/>and publishes the image"]
+    image["Registry<br/>Immutable image digest"]
+    approval["Independent exact-target approval<br/>Binds environment, target, commit and image digest"]
+    operator["Operator submits the request<br/>and starts the deployer service"]
+    template["Public config template<br/>Schema and fictional examples"]
+    inventory["Private logical config<br/>Reviewed inventory and policy intent"]
+
+    source --> ci
+    ci -->|Tested commit| release
+    release --> image --> approval --> operator
+    template --> inventory
+    inventory -.->|Informs target selection| operator
+
+    subgraph target["Dedicated staging host (example-staging)"]
+        deployer["Host-local ci-fleet deployer<br/>Checks request, approval<br/>and checkpoint evidence"]
+        adapter["Pinned, app-owned adapter<br/>Contained service with<br/>a target-scoped credential"]
+        containers["Running app containers<br/>Approved image on<br/>dedicated rootless Docker"]
+        deployer --> adapter
+        adapter -->|Constrained Docker broker| containers
+    end
+
+    operator --> target
+```
+
+The controller's GitHub App key stays outside all job containers. Release
+publishing credentials stay in the release workflow. The private config records
+logical targets and required secret names. The deployer reads protected policy,
+credentials, and evidence on the target host. Its host and Docker daemon are
+dedicated to deployment. See the
+[secrets model](SECRETS.md) and [deployer runbook](DEPLOYER-HOST.md).
+
 ## Deployment shapes
 
 The same fleet interface should support:

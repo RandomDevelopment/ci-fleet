@@ -302,6 +302,10 @@ A cross-environment or cross-target in-place upgrade is rejected. Build a separa
 
 ## Submit an approved deployment
 
+See the [application deployment path](ARCHITECTURE.md#application-deployment-path)
+for the steps from a tested commit to a running application and the trust
+boundaries between them.
+
 Place one root-owned mode-`0600` request at `/var/lib/ci-fleet-deployer/request.conf`. It uses the same exact-head approval fields shown above. No secret values belong in the request. Before invoking the adapter, runtime revalidates host-role isolation and all protected approval, capability, checkpoint, and production evidence, then permanently consumes the stable `APPROVAL_ID`; changing the approval time, approver, policy, or other request fields cannot reuse it. Failed attempts require a new approval ID. The durable replay ledger lives at `/var/log/ci-fleet-deployer/consumed-requests`, outside application state cleanup. New markers use `approval-` followed by the SHA-256 of the approval ID. Runtime retains stable markers from either ledger location. Legacy markers that hash the entire request cannot establish which approval IDs were consumed, so runtime preserves them and refuses deployment pending operator reconciliation from trusted evidence or checkpoint recovery. Never delete a replay ledger to bypass that refusal. Recovery restores every consumed marker, including earlier attempts. After success it restores protected active core state, records the deployed policy as the application-compatible rollback point, and durably moves the request to `last-request.conf` before writing the success audit record.
 
 Then run on the deployer host; this changes the application target through its adapter:
