@@ -385,11 +385,12 @@ and the existing signed-evidence checks.
 | Compose validation, image builds, APT cache reuse/image-ID parity, inert runner and cleanup outcomes | Pinned `validate.sh --containers` |
 | Embedded schema, policy, multi-host and initializer checks | Pinned `validate-template.sh` |
 
-The engine workflow at `.github/workflows/build.yml` calls the full local
-entry point and preserves the `Build without registering a runner` check
-identity and the separate conventional-commit check. It replaces the retired
-`validate.yml` producer. Keep the retired workflow disabled; switching producers
-does not cancel its existing runs.
+The `ci-fleet tests, image builds and cleanup` workflow at
+`.github/workflows/build.yml` calls the full local entry point and reports
+`Run the full ci-fleet validation suite` as its required check. It also runs the
+separate conventional-commit check. It replaced the retired `validate.yml`
+producer. Keep the retired workflow disabled; switching producers does not
+cancel its existing runs.
 
 Before publishing the reviewed workflow change, set and read back
 `CI_FLEET_VALIDATION_RUNNER` for the approved disposable worker. A new producer
