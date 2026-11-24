@@ -59,8 +59,9 @@ git -C "$fixture_repo" add -A
 git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@invalid.example commit -qm 'test: model opaque runtime sources'
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
-export REAL_STAT
-REAL_STAT=$(command -v stat)
+# The installer passes only FAKE_* fixture variables into Compose.
+export FAKE_REAL_STAT
+FAKE_REAL_STAT=$(command -v stat)
 export REAL_TAR
 REAL_TAR=$(command -v tar)
 export REAL_GIT
@@ -503,7 +504,7 @@ if [[ -n "${FAKE_WRONG_SOURCE_INSTALLER_OWNER:-}" && "${1:-}" == -c && "${2:-}" 
   printf '99999\n'
   exit 0
 fi
-exec "$REAL_STAT" "$@"
+exec "$FAKE_REAL_STAT" "$@"
 EOF
 chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 
