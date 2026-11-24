@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+from datetime import datetime, timezone
 import errno
 import grp
 import hashlib
@@ -16,6 +18,7 @@ import pwd
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import socketserver
 import stat
@@ -32,9 +35,84 @@ PR_SET_DUMPABLE = 4
 MAX_RESPONSE = 32 * 1024 * 1024
 CONTAINER_LIMITS = {"Memory": 2 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 256}
 LABEL = "io.randomdevelopment.ci-fleet."
+SERVICE_LABEL = LABEL + "service"
+EXCLUSIVE_SERVICE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+GRACEFUL_STOP_SIGNALS = frozenset({"SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH"})
+DEFAULT_ROLLBACK_STOP_TIMEOUT = 120
+MAX_ROLLBACK_STOP_TIMEOUT = 600
+MAX_ROLLBACK_STOP_TOTAL = 1800
+MAX_EXCLUSIVE_SERVICES = 32
+FORCED_KILL_VERIFY_SECONDS = 30
 IMAGE = re.compile(r"^[a-z0-9][a-z0-9.:-]*/[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$")
 UNIT = re.compile(r"^ci-fleet-deployer-adapter-[0-9]+-[0-9]+\.service$")
 CHROMIUM_SECCOMP_V1_SHA256 = "f8f5cbe84f4135431d920e43e676b641d538ea24be76ddef4656a86015bac6e7"
+
+
+def normalize_graceful_signal(raw: object) -> str:
+    """Normalize a container StopSignal to a reviewed graceful SIG* name."""
+    if raw is None or raw == "":
+        return "SIGTERM"
+    require(isinstance(raw, str) and not raw.isdigit(), "unsupported stop signal")
+    name = raw.upper()
+    if not name.startswith("SIG"):
+        name = "SIG" + name
+    require(name in GRACEFUL_STOP_SIGNALS, f"unsupported stop signal: {raw}")
+    return name
+
+
+def _parse_single_stop_policy(values: dict[str, str]) -> tuple[list[str], int | None, str | None]:
+    raw_services = values.get("ROLLBACK_EXCLUSIVE_SERVICES")
+    if raw_services is None:
+        require("ROLLBACK_STOP_TIMEOUT_SECONDS" not in values, "ROLLBACK_STOP_TIMEOUT_SECONDS requires ROLLBACK_EXCLUSIVE_SERVICES")
+        require("ROLLBACK_STOP_SIGNAL" not in values, "ROLLBACK_STOP_SIGNAL requires ROLLBACK_EXCLUSIVE_SERVICES")
+        return [], None, None
+    require(bool(raw_services), "ROLLBACK_EXCLUSIVE_SERVICES must not be empty")
+    items = raw_services.split(",")
+    require(1 <= len(items) <= MAX_EXCLUSIVE_SERVICES, "ROLLBACK_EXCLUSIVE_SERVICES exceeds maximum count")
+    prefix = "ci-fleet-deploy-" + values.get("DEPLOYER_IDENTITY", "") + "-"
+    seen: set[str] = set()
+    for item in items:
+        require(bool(EXCLUSIVE_SERVICE.fullmatch(item)), f"invalid exclusive service name: {item}")
+        require(item not in seen, f"duplicate exclusive service name: {item}")
+        require(len(prefix + item) <= 128, f"exclusive service container name exceeds 128 characters: {item}")
+        seen.add(item)
+    timeout: int | None = None
+    if "ROLLBACK_STOP_TIMEOUT_SECONDS" in values:
+        raw_timeout = values["ROLLBACK_STOP_TIMEOUT_SECONDS"]
+        require(bool(re.fullmatch(r"[1-9][0-9]{0,2}", raw_timeout)), "ROLLBACK_STOP_TIMEOUT_SECONDS must be a positive integer")
+        timeout = int(raw_timeout)
+        require(1 <= timeout <= MAX_ROLLBACK_STOP_TIMEOUT, "ROLLBACK_STOP_TIMEOUT_SECONDS must be between 1 and 600")
+    signal_name: str | None = None
+    if "ROLLBACK_STOP_SIGNAL" in values:
+        signal_name = values["ROLLBACK_STOP_SIGNAL"]
+        require(signal_name in GRACEFUL_STOP_SIGNALS, "ROLLBACK_STOP_SIGNAL must be a supported graceful signal")
+    return items, timeout, signal_name
+
+
+def parse_rollback_stop_policy(values: dict[str, str], incumbent_values: dict[str, str] | None = None) -> dict:
+    """Validate and merge exclusive-service rollback policy fields from active and LKG policies."""
+    lkg_services, lkg_timeout, lkg_signal = _parse_single_stop_policy(values)
+    if lkg_timeout is not None:
+        require(len(lkg_services) * lkg_timeout <= MAX_ROLLBACK_STOP_TOTAL, "rollback stop timeout budget exceeds 1800 seconds")
+    if incumbent_values is not None:
+        for key in ("ENVIRONMENT", "TARGET_ID", "DEPLOYER_IDENTITY"):
+            require(incumbent_values.get(key) == values.get(key), f"incumbent policy {key} does not match rollback policy")
+        inc_services, inc_timeout, inc_signal = _parse_single_stop_policy(incumbent_values)
+        if inc_timeout is not None:
+            require(len(inc_services) * inc_timeout <= MAX_ROLLBACK_STOP_TOTAL, "incumbent rollback stop timeout budget exceeds 1800 seconds")
+        services = list(dict.fromkeys([*inc_services, *lkg_services]))
+        require(not services or incumbent_values.get("DOCKER_SOCKET") == values.get("DOCKER_SOCKET"),
+                "incumbent policy DOCKER_SOCKET does not match rollback policy")
+        require(len(services) <= MAX_EXCLUSIVE_SERVICES, "combined exclusive services exceed maximum count")
+        timeout = inc_timeout if inc_timeout is not None else (lkg_timeout if lkg_timeout is not None else (DEFAULT_ROLLBACK_STOP_TIMEOUT if services else 0))
+        signal_name = inc_signal if inc_signal is not None else lkg_signal
+    else:
+        services = lkg_services
+        timeout = lkg_timeout if lkg_timeout is not None else (DEFAULT_ROLLBACK_STOP_TIMEOUT if services else 0)
+        signal_name = lkg_signal
+    if services:
+        require(len(services) * timeout <= MAX_ROLLBACK_STOP_TOTAL, "combined rollback stop timeout budget exceeds 1800 seconds")
+    return {"services": services, "timeout_seconds": timeout, "signal": signal_name}
 
 
 def require(condition: bool, message: str) -> None:
@@ -200,38 +278,49 @@ def reject_rootful_workloads(backend_path: str, deadline: float | None = None) -
         connection.close()
 
 
-class Backend:
-    def __init__(self, path: str, seconds: int = 120):
-        self.deadline = time.monotonic() + seconds + 10
-        require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
-        self.path = path
-        startup_deadline = min(self.deadline, time.monotonic() + 30)
-        connection = UnixConnection(path, timeout=max(0.001, startup_deadline - time.monotonic()))
+class _DockerClient:
+    rootless = True
+    uid = None
+    gid = None
+    _hard_stop_deadline = False
+
+    @contextlib.contextmanager
+    def stop_request_alarm(self):
+        if not self._hard_stop_deadline:
+            yield
+            return
+
+        # Stop and readiness run in the helper's main thread.
+        def expired(_signum, _frame):
+            raise TimeoutError("Docker stop deadline elapsed")
+
+        previous_handler = signal.signal(signal.SIGALRM, expired)
         try:
-            connection.request("GET", "/info")
-            response = connection.getresponse()
-            value = decode(response.read(MAX_REQUEST + 1))
-            require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
-                    "a dedicated rootless Docker daemon is required")
-            self.uid, self.gid = connection.peer_uid, connection.peer_gid
-            reject_rootful_workloads(path, startup_deadline)
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Docker stop deadline elapsed")
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            yield
         finally:
-            connection.close()
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
     def request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> tuple[int, bytes]:
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Docker operation deadline elapsed")
-        connection = UnixConnection(self.path, timeout=remaining)
-        try:
-            connection.connect()
-            require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
-            connection.request(method, path, body, headers or {})
-            response = connection.getresponse()
-            result = response.read(MAX_RESPONSE + 1)
-            require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
-            return response.status, result
-        finally:
-            connection.close()
+        connection = UnixConnection(self.path, rootless=self.rootless, timeout=remaining)
+        with self.stop_request_alarm():
+            try:
+                connection.connect()
+                if self.rootless:
+                    require((connection.peer_uid, connection.peer_gid) == (self.uid, self.gid), "Docker daemon identity changed")
+                connection.request(method, path, body, headers or {})
+                response = connection.getresponse()
+                result = response.read(MAX_RESPONSE + 1)
+                require(len(result) <= MAX_RESPONSE, "Docker response exceeded the bound")
+                return response.status, result
+            finally:
+                connection.close()
 
     def inspect(self, kind: str, name: str) -> dict:
         suffix = "/json" if kind in ("containers", "images") else ""
@@ -240,19 +329,241 @@ class Backend:
         return decode(body)
 
 
+class Backend(_DockerClient):
+    def __init__(self, path: str, seconds: int = 120, *, deadline: float | None = None):
+        self.deadline = deadline if deadline is not None else time.monotonic() + seconds + 10
+        self._hard_stop_deadline = deadline is not None
+        require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
+        self.path = path
+        self.rootless = True
+        startup_deadline = min(self.deadline, time.monotonic() + 30)
+        connection = UnixConnection(path, timeout=max(0.001, startup_deadline - time.monotonic()))
+        with self.stop_request_alarm():
+            try:
+                connection.request("GET", "/info")
+                response = connection.getresponse()
+                value = decode(response.read(MAX_REQUEST + 1))
+                require(response.status == 200 and "name=rootless" in value.get("SecurityOptions", []),
+                        "a dedicated rootless Docker daemon is required")
+                self.uid, self.gid = connection.peer_uid, connection.peer_gid
+                reject_rootful_workloads(path, startup_deadline)
+            finally:
+                connection.close()
+
+class TestingDockerBackend(_DockerClient):
+    """Test-only Docker socket client for non-rootless local test/CI daemons."""
+
+    def __init__(self, path: str, seconds: int = 120):
+        require(os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1"
+                and os.environ.get("CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET") == "1",
+                "test Docker socket override is test-only")
+        self.deadline = time.monotonic() + seconds + 10
+        require(bool(re.fullmatch(r"/[A-Za-z0-9._/-]+", path)) and os.path.realpath(path) == path, "Docker socket must be canonical")
+        self.path = path
+        self.rootless = False
+
+
+def ownership_labels(values: dict[str, str]) -> dict[str, str]:
+    return {
+        LABEL + "role": "deployer",
+        LABEL + "identity": values["DEPLOYER_IDENTITY"],
+        LABEL + "environment": values["ENVIRONMENT"],
+        LABEL + "target": values["TARGET_ID"],
+    }
+
+
+def container_labels(entry: dict) -> dict | None:
+    config = entry.get("Config")
+    if isinstance(config, dict) and "Labels" in config:
+        labels = config.get("Labels")
+    else:
+        labels = entry.get("Labels")
+    return labels if isinstance(labels, dict) else None
+
+
+def container_owned(entry: dict, expected_labels: dict[str, str]) -> bool:
+    labels = container_labels(entry)
+    return labels is not None and all(labels.get(k) == v for k, v in expected_labels.items())
+
+
+def container_matches_service(entry: dict, prefix: str, service: str, expected_labels: dict[str, str]) -> tuple[bool, bool]:
+    """Return (matches, conflict) for an owned container relative to an exclusive service."""
+    if not container_owned(entry, expected_labels):
+        return False, False
+    labels = container_labels(entry) or {}
+    raw_names = entry.get("Names")
+    if isinstance(raw_names, list):
+        names = {n.lstrip("/") for n in raw_names if isinstance(n, str)}
+    elif isinstance(entry.get("Name"), str):
+        names = {entry["Name"].lstrip("/")}
+    else:
+        names = set()
+    name_matches = (prefix + service) in names
+    svc_label = labels.get(SERVICE_LABEL)
+    if svc_label is not None and not isinstance(svc_label, str):
+        return False, True
+    if name_matches and svc_label and svc_label != service:
+        return False, True
+    if svc_label == service or (not svc_label and name_matches):
+        return True, False
+    return False, False
+
+
+def container_exited_and_non_restartable(info: dict) -> tuple[bool, str]:
+    """Return (True, 'exited') only when Docker reports a non-running, non-restartable container."""
+    state = info.get("State")
+    host = info.get("HostConfig")
+    if not isinstance(state, dict) or not isinstance(host, dict):
+        return False, "container_state_unavailable"
+    restart_policy = host.get("RestartPolicy")
+    if not isinstance(restart_policy, dict) or restart_policy.get("Name") not in ("", "no"):
+        return False, "restart_policy_unverified"
+    status = state.get("Status")
+    if status not in ("exited", "dead", "created"):
+        return False, f"status_{status}"
+    if state.get("Running") is not False or state.get("Restarting") is not False or state.get("Paused") is not False or type(state.get("Pid")) is not int or state["Pid"] != 0:
+        return False, "container_still_active"
+    return True, "exited"
+
+
+def container_confirmed_active(info: dict) -> bool:
+    state = info.get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True or state.get("Paused") is not False:
+        return False
+    pid = state.get("Pid")
+    return type(pid) is int and (
+        state.get("Status") == "running" and state.get("Restarting") is False and pid > 0
+        or state.get("Status") == "restarting" and state.get("Restarting") is True and pid == 0
+    )
+
+
+def container_active(info: dict) -> bool:
+    state = info.get("State")
+    if not isinstance(state, dict):
+        return True
+    return not (
+        state.get("Status") in ("exited", "dead", "created")
+        and state.get("Running") is False
+        and state.get("Restarting") is False
+        and state.get("Paused") is False
+        and state.get("Pid") == 0
+    )
+
+
+def list_owned_containers(backend, expected_labels: dict[str, str]) -> list[dict]:
+    filters = json.dumps({"label": [f"{k}={v}" for k, v in expected_labels.items()]}, separators=(",", ":"))
+    status, body = backend.request("GET", "/containers/json?" + urllib.parse.urlencode({"all": "1", "filters": filters}))
+    require(status == 200, "owned container inventory is unavailable")
+    items = json.loads(body, object_pairs_hook=unique_object)
+    require(isinstance(items, list), "invalid container inventory")
+    inventory = []
+    for item in items:
+        require(isinstance(item, dict) and isinstance(item.get("Id"), str) and bool(item["Id"])
+                and isinstance(item.get("Labels"), dict) and isinstance(item.get("Names"), list)
+                and all(isinstance(name, str) for name in item["Names"]), "invalid container inventory row")
+        labels = item["Labels"]
+        require(all(isinstance(value, str) for value in labels.values()), "invalid container inventory labels")
+        if all(labels.get(key) == value for key, value in expected_labels.items()):
+            inventory.append({key: item[key] for key in ("Id", "Labels", "Names")})
+    return inventory
+
+
+class RollbackHealthStarting(ValueError):
+    pass
+
+
 class Policy:
-    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None, unit: str | None = None):
+    def __init__(self, values: dict[str, str], backend, credential: str = "", marker: Path | None = None, operation: str = "deploy", uncertain_marker: Path | None = None, artifact_store: Path | None = None, protected_images: set[str] | None = None, unit: str | None = None, exclusive_services: tuple[str, ...] | list[str] = ()):
         self.values, self.backend, self.credential, self.marker = values, backend, credential, marker
         self.operation, self.uncertain_marker, self.uncertain = operation, uncertain_marker, False
         self.rollback_outcome = None
         self.unit = unit
+        self.exclusive_services = tuple(exclusive_services)
+        self.required_rollback_services = _parse_single_stop_policy(values)[0] if operation == "rollback" else []
+        self.verified_containers: list[str] = []
+        self.rollback_ready: Path | None = None
+        self.rollback_incumbents: dict[str, str] = {}
+        self._exclusive_lock = threading.Lock()
+        self._image_id: str | None = None
         self.artifact_store = artifact_store
         self.protected_images = (protected_images or set()) | {values["ARTIFACT_IMAGE"]}
         self.image = values["ARTIFACT_IMAGE"]
         require(bool(IMAGE.fullmatch(self.image)), "approved artifact is not immutable")
-        self.labels = {LABEL + "role": "deployer", LABEL + "identity": values["DEPLOYER_IDENTITY"],
-                       LABEL + "environment": values["ENVIRONMENT"], LABEL + "target": values["TARGET_ID"]}
+        self.labels = ownership_labels(values)
         self.prefix = "ci-fleet-deploy-" + values["DEPLOYER_IDENTITY"] + "-"
+
+    def _container_matches_approved_image(self, info: dict) -> bool:
+        if self._image_id is None:
+            image_id = self.backend.inspect("images", self.image).get("Id", "")
+            require(isinstance(image_id, str) and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)),
+                    "approved rollback image ID is unavailable")
+            self._image_id = image_id
+        return info.get("Image") == self._image_id
+
+    def _require_no_active_service_container(self, service: str, ignore_id: str | None = None) -> None:
+        for item in list_owned_containers(self.backend, self.labels):
+            cid = item.get("Id")
+            require(isinstance(cid, str) and bool(cid), "invalid owned container identity")
+            if ignore_id and cid == ignore_id:
+                continue
+            matches, conflict = container_matches_service(item, self.prefix, service, self.labels)
+            require(not conflict, "ambiguous exclusive service identity")
+            if matches:
+                info = self.owned("containers", cid)
+                m2, c2 = container_matches_service(info, self.prefix, service, self.labels)
+                require(m2 and not c2 and info.get("Id") == cid, "exclusive service identity changed")
+                require(container_exited_and_non_restartable(info)[0],
+                        f"exclusive service {service} still has an active or restartable container")
+
+    def capture_rollback_incumbents(self) -> None:
+        for item in list_owned_containers(self.backend, self.labels):
+            info = self.owned("containers", item["Id"])
+            state = info.get("State") or {}
+            started_at = state.get("StartedAt")
+            if state.get("Status") == "running" and isinstance(started_at, str):
+                self.rollback_incumbents[item["Id"]] = started_at
+
+    def verify_rollback_commit(self) -> None:
+        if not self.exclusive_services:
+            return
+        active_counts = {svc: 0 for svc in self.exclusive_services}
+        verified_ids: list[str] = []
+        for item in list_owned_containers(self.backend, self.labels):
+            cid = item.get("Id")
+            require(isinstance(cid, str) and bool(cid), "invalid owned container identity")
+            info = self.owned("containers", cid)
+            require(info.get("Id") == cid, "rollback container identity changed during inspection")
+            active = container_active(info)
+            exclusive = False
+            for svc in self.exclusive_services:
+                matches, conflict = container_matches_service(info, self.prefix, svc, self.labels)
+                require(not conflict, "ambiguous exclusive service identity")
+                exclusive |= matches
+                if matches and not container_exited_and_non_restartable(info)[0]:
+                    require(active, f"exclusive service {svc} has a stopped restartable container")
+                    active_counts[svc] += 1
+                    require(active_counts[svc] <= 1, f"duplicate active container for exclusive service {svc}")
+            if active:
+                cstate = info.get("State") or {}
+                if (not exclusive and cid in self.rollback_incumbents
+                        and cstate.get("StartedAt") == self.rollback_incumbents[cid]):
+                    continue
+                require(self._container_matches_approved_image(info), "active rollback container does not match approved artifact")
+                require(cstate.get("Status") == "running" and cstate.get("Running") is True
+                        and cstate.get("Restarting") is False and cstate.get("Paused") is False
+                        and type(cstate.get("Pid")) is int and cstate["Pid"] > 0,
+                        "active rollback container is not running")
+                health = cstate.get("Health")
+                if isinstance(health, dict) and health.get("Status") == "starting":
+                    raise RollbackHealthStarting("Docker health check is starting")
+                check = (info.get("Config") or {}).get("Healthcheck") or {}
+                if health is not None or check.get("Test") not in (None, [], ["NONE"]):
+                    require(isinstance(health, dict) and health.get("Status") == "healthy",
+                            "active rollback container health is unverified")
+                verified_ids.append(cid)
+        for svc in self.required_rollback_services:
+            require(active_counts[svc] == 1, f"exclusive rollback service {svc} is missing")
+        self.verified_containers = verified_ids
 
     def artifacts(self) -> dict:
         if self.artifact_store is None or not self.artifact_store.exists():
@@ -434,7 +745,15 @@ class Policy:
         if method == "POST" and path == "/containers/create":
             require(set(query) == {"name"}, "a scoped container name is required")
             self.named(query["name"][0])
-            self.container(decode(body))
+            payload = decode(body)
+            self.container(payload)
+            if self.operation == "rollback" and self.exclusive_services:
+                candidate = {"Names": ["/" + query["name"][0]], "Labels": payload.get("Labels")}
+                for svc in self.exclusive_services:
+                    matches, conflict = container_matches_service(candidate, self.prefix, svc, self.labels)
+                    require(not conflict, "ambiguous exclusive service identity")
+                    if matches:
+                        self._require_no_active_service_container(svc)
             return path + "?" + urllib.parse.urlencode(query, doseq=True), body
         if method == "POST" and path in ("/networks/create", "/volumes/create"):
             require(not query, "create query arguments are forbidden")
@@ -453,12 +772,19 @@ class Policy:
         match = re.fullmatch(r"/(containers|networks|volumes)/([^/]+)(?:/(json|start|stop|restart|kill|wait|logs))?", path)
         require(match is not None, "Docker endpoint is outside the deployment contract")
         kind, identity, action = match.groups()
-        self.owned(kind, identity)
+        info = self.owned(kind, identity)
         allowed = ((method == "GET" and action in (None, "json", "logs"))
                    or (method == "DELETE" and action is None)
                    or (method == "POST" and kind == "containers" and action in ("start", "stop", "restart", "kill", "wait")))
         require(allowed and not body and set(query) <= {"t", "signal", "force", "v", "stdout", "stderr", "tail"},
                 "resource operation is outside the deployment contract")
+        if self.operation == "rollback" and self.exclusive_services and method == "POST" and kind == "containers" and action in ("start", "restart"):
+            require(self._container_matches_approved_image(info), "rollback container must use the approved last-known-good artifact")
+            for svc in self.exclusive_services:
+                matches, conflict = container_matches_service(info, self.prefix, svc, self.labels)
+                require(not conflict, "ambiguous exclusive service identity")
+                if matches:
+                    self._require_no_active_service_container(svc, ignore_id=info.get("Id"))
         return path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else ""), body
 
 
@@ -504,11 +830,23 @@ def handler(policy: Policy):
 
         def dispatch(self):
             mutation = False
+            lock = None
             try:
                 require(not self.headers.get("Transfer-Encoding"), "chunked requests are forbidden")
                 length = int(self.headers.get("Content-Length", "0"))
                 require(0 <= length <= MAX_REQUEST, "request exceeded the bound")
                 body = self.rfile.read(length)
+                req_norm = os.path.normpath(re.sub(r"^/v[0-9]+\.[0-9]+(?=/)", "",
+                                                   urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)))
+                exclusive_rollback = policy.operation == "rollback" and bool(policy.exclusive_services)
+                read_only_wait = exclusive_rollback and self.command == "POST" and re.fullmatch(r"/containers/[^/]+/wait", req_norm)
+                serialize_exclusive = exclusive_rollback and self.command in ("POST", "DELETE") and not read_only_wait
+                if serialize_exclusive:
+                    policy._exclusive_lock.acquire()
+                    lock = policy._exclusive_lock
+                    require(not policy.uncertain, "Docker mutation completion is unverified")
+                    require(policy.rollback_outcome is None or self.path == "/ci-fleet/rollback-commit",
+                            "rollback outcome has already been published")
                 if self.command == "POST" and self.path == "/ci-fleet/rollback-commit":
                     require(executor_peer(self.connection, policy.unit), "rollback outcome requires the executor")
                     require(policy.operation == "rollback" and policy.marker is not None
@@ -516,8 +854,17 @@ def handler(policy: Policy):
                     outcome = body.decode()
                     require(policy.rollback_outcome in (None, outcome), "rollback outcome conflicts")
                     if outcome == "committed":
-                        mutation = True
-                        durable_file(policy.marker, b"committed\n")
+                        if policy.rollback_ready is not None:
+                            mutation = True
+                            durable_file(policy.rollback_ready, json.dumps({
+                                "marker": str(policy.marker),
+                                "services": policy.exclusive_services,
+                                "incumbents": policy.rollback_incumbents,
+                            }, sort_keys=True).encode())
+                        else:
+                            policy.verify_rollback_commit()
+                            mutation = True
+                            durable_file(policy.marker, b"committed\n")
                     else:
                         require(not policy.marker.exists() and not policy.marker.is_symlink(),
                                 "failed rollback conflicts with its commit marker")
@@ -526,7 +873,7 @@ def handler(policy: Policy):
                 else:
                     path, body = policy.authorize(self.command, self.path, body)
                     headers = {"Content-Type": "application/json"}
-                    mutation = self.command not in ("GET", "HEAD")
+                    mutation = self.command not in ("GET", "HEAD") and not read_only_wait
                     status, response = policy.backend.request(self.command, path, body, headers)
                     if self.command == "POST" and path.startswith("/images/create?") and 200 <= status < 300:
                         progress = [decode(line) for line in response.splitlines() if line.strip()]
@@ -561,6 +908,9 @@ def handler(policy: Policy):
                     if policy.uncertain_marker is not None:
                         durable_file(policy.uncertain_marker, b"uncertain\n")
                 status, response = 403, b'{"message":"deployment Docker policy rejected the request"}'
+            finally:
+                if lock is not None:
+                    lock.release()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -571,7 +921,7 @@ def handler(policy: Policy):
     return Handler
 
 
-def durable_file(path: Path, body: bytes) -> None:
+def durable_file(path: Path, body: bytes, *, deadline: float | None = None) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -579,6 +929,8 @@ def durable_file(path: Path, body: bytes) -> None:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+        if deadline is not None:
+            require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -713,7 +1065,8 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
             marker = Path(marker)
             require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
             if outcome == "committed":
-                require(protected_file(marker, uid) == b"committed\n"
+                require(not os.path.lexists(marker.with_name(marker.name + ".pending"))
+                        and protected_file(marker, uid) == b"committed\n"
                         and stat.S_IMODE(marker.stat().st_mode) == 0o600, "rollback commit marker is unverified")
             else:
                 require(value.get("exit_code") != 0 and not marker.exists() and not marker.is_symlink(),
@@ -727,9 +1080,20 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
         return False
 
 
-def retire_journal(store: Path, unit: str, uid: int = 0) -> None:
-    require(journal_complete(store, unit, uid), "journal completion is unverified")
-    shutil.rmtree(store / unit)
+def retire_journal(store: Path, unit: str, uid: int = 0, *, inactive_health: bool = False) -> None:
+    journal = store / unit
+    if inactive_health:
+        require(bool(UNIT.fullmatch(unit)) and unit_inactive(unit), "health unit termination is unverified")
+        if not os.path.lexists(journal):
+            return
+        trusted_directory(journal, uid, 0o700)
+        status_path = journal / "status.json"
+        if os.path.lexists(status_path):
+            status = decode(protected_file(status_path, uid))
+            require(status.get("unit") == unit and status.get("operation") == "health", "health journal operation is unverified")
+    else:
+        require(journal_complete(store, unit, uid), "journal completion is unverified")
+    shutil.rmtree(journal)
     descriptor = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(descriptor)
@@ -847,10 +1211,657 @@ def sandbox_command(unit: str, seconds: int, proxy: Path, policy: Path, adapter:
     return command + ["/usr/bin/python3", "%d/executor", "execute", operation]
 
 
+def append_audit_record(audit_log: Path, fields: dict[str, str], uid: int = 0, *, once: bool = False) -> None:
+    parent = audit_log.parent
+    if not parent.exists() and not parent.is_symlink():
+        parent.mkdir(mode=0o700)
+    pmeta = parent.lstat()
+    require(parent.resolve() == parent and stat.S_ISDIR(pmeta.st_mode)
+            and pmeta.st_uid == uid and stat.S_IMODE(pmeta.st_mode) == 0o700,
+            "audit directory is unsafe")
+    parts = []
+    for k, v in fields.items():
+        val = str(v)
+        require(bool(k) and bool(val) and not any(c.isspace() for c in k) and not any(c.isspace() for c in val),
+                "invalid audit field")
+        parts.append(f"{k}={val}")
+    line = " ".join(parts) + "\n"
+    require(line.isascii() and len(line) <= 4096, "audit entry is invalid")
+    body = line.encode()
+    access = os.O_RDWR if once else os.O_WRONLY
+    descriptor = os.open(audit_log, access | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == uid and metadata.st_nlink == 1
+                and stat.S_IMODE(metadata.st_mode) == 0o600, "audit log is unsafe")
+        if once:
+            require("transaction" in fields and fields.get("result") == "success", "missing terminal audit identity")
+            transaction = f"transaction={fields['transaction']}".encode()
+            with os.fdopen(os.dup(descriptor), "rb") as prior:
+                for line in prior:
+                    if line.endswith(b"\n") and {transaction, b"result=success"}.issubset(line.split()):
+                        return
+        written = 0
+        while written < len(body):
+            count = os.write(descriptor, body[written:])
+            require(count > 0, "audit write failed")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _service_has_active_container(backend, prefix: str, service: str, expected_labels: dict[str, str]) -> bool:
+    for item in list_owned_containers(backend, expected_labels):
+        matches, conflict = container_matches_service(item, prefix, service, expected_labels)
+        if conflict:
+            return True
+        if matches:
+            info = backend.inspect("containers", item["Id"])
+            matches, conflict = container_matches_service(info, prefix, service, expected_labels)
+            if conflict or not matches or info.get("Id") != item["Id"] or not container_exited_and_non_restartable(info)[0]:
+                return True
+    return False
+
+def _wait_container_exited(backend, cid: str, prefix: str, service: str, expected_labels: dict[str, str],
+                           deadline: float, start: float, monotonic, sleep, retry_signal: str | None = None) -> tuple[bool, float, str]:
+    delay = 0.05
+    observed_active = False
+    quoted = urllib.parse.quote(cid, safe="")
+    while True:
+        now = monotonic()
+        if now >= deadline:
+            reason = "timeout" if observed_active else "stop_deadline_unverified"
+            return False, round(now - start, 3), reason
+        try:
+            status, body = backend.request("GET", f"/containers/{quoted}/json")
+        except TimeoutError:
+            return False, round(monotonic() - start, 3), "stop_deadline_unverified"
+        now = monotonic()
+        if now >= deadline:
+            return False, round(now - start, 3), "stop_deadline_unverified"
+        if status == 404:
+            active = _service_has_active_container(backend, prefix, service, expected_labels)
+            elapsed = round(monotonic() - start, 3)
+            if monotonic() >= deadline:
+                return False, elapsed, "stop_deadline_unverified"
+            return not active, elapsed, "unexpected_replacement_detected" if active else "removed"
+        if status != 200:
+            return False, round(monotonic() - start, 3), "container_inspect_failed"
+        info = decode(body)
+        matches, conflict = container_matches_service(info, prefix, service, expected_labels)
+        if conflict or not matches or info.get("Id") != cid:
+            return False, round(monotonic() - start, 3), "ownership_changed"
+        if (info.get("State") or {}).get("Paused") is True:
+            return False, round(monotonic() - start, 3), "container_paused"
+        exited, _ = container_exited_and_non_restartable(info)
+        observed_active = container_confirmed_active(info)
+        now = monotonic()
+        if now >= deadline:
+            return False, round(now - start, 3), "stop_deadline_unverified"
+        if exited:
+            return True, round(now - start, 3), "exited"
+        if not observed_active:
+            return False, round(now - start, 3), "container_state_unverified"
+        cstate = info.get("State") or {}
+        if retry_signal and cstate.get("Status") == "running":
+            signal_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": retry_signal}))
+            observed_active = False
+            if monotonic() >= deadline:
+                return False, round(monotonic() - start, 3), "stop_deadline_unverified"
+            if signal_status in (200, 204):
+                retry_signal = None
+            elif signal_status not in (404, 409):
+                return False, round(monotonic() - start, 3), "signal_delivery_failed"
+        sleep(max(0, min(delay, deadline - monotonic())))
+        delay = min(0.5, delay * 2)
+
+
+def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
+                            incumbent_policy_path: Path | None = None,
+                            reconcile: bool = False,
+                            force_stop_timeout: bool = False,
+                            audit_log: Path | None = None,
+                            seconds: int | None = None,
+                            uid: int | None = None,
+                            backend_factory=None,
+                            monotonic=time.monotonic,
+                            sleep=time.sleep) -> int:
+    """Stop declared exclusive services and verify exit before rollback replacement."""
+    if uid is None:
+        uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+    jdir = journal_path.parent
+    jmeta = jdir.lstat()
+    require(jdir.resolve() == jdir and stat.S_ISDIR(jmeta.st_mode)
+            and jmeta.st_uid == uid and stat.S_IMODE(jmeta.st_mode) == 0o700,
+            "stop journal directory is unsafe")
+    values = parse_policy(protected_file(policy_path, uid))
+    incumbent_values = parse_policy(protected_file(incumbent_policy_path, uid)) if incumbent_policy_path is not None else None
+    parsed = parse_rollback_stop_policy(values, incumbent_values)
+    services: list[str] = parsed["services"]
+    timeout_seconds: int = parsed["timeout_seconds"]
+    policy_signal: str | None = parsed["signal"]
+    environment = values["ENVIRONMENT"]
+    require(environment != "production", "production rollback is not authorized")
+    target = values["TARGET_ID"]
+    identity = values["DEPLOYER_IDENTITY"]
+    prefix = f"ci-fleet-deploy-{identity}-"
+    expected_labels = ownership_labels(values)
+    artifact_digest = values["ARTIFACT_IMAGE"].split("@", 1)[1] if "@" in values["ARTIFACT_IMAGE"] else values["ARTIFACT_IMAGE"]
+    source_commit = values.get("SOURCE_COMMIT", "none")
+
+    prior: dict = {}
+    if reconcile:
+        prior = decode(protected_file(journal_path, uid))
+        require(prior.get("environment") == environment and prior.get("target") == target
+                and prior.get("deployer_identity") == identity,
+                "stop journal identity does not match rollback target")
+    else:
+        require(not journal_path.exists() and not journal_path.is_symlink(), "stop journal already exists")
+
+    if not services:
+        durable_file(journal_path, json.dumps({
+            "schema_version": 1, "status": "verified", "signaled": False, "adapter_dispatched": False,
+            "environment": environment, "target": target, "deployer_identity": identity,
+            "services_state": [], "escalation": "none", "total_elapsed_seconds": 0.0,
+        }, sort_keys=True).encode())
+        return 0
+
+    budget = seconds if seconds is not None else max(
+        60, len(services) * timeout_seconds + (FORCED_KILL_VERIFY_SECONDS * len(services) if force_stop_timeout else 0) + 30
+    )
+    stop_deadline = monotonic() + budget
+    prior_timed_out: dict[str, str] = {}
+    if reconcile:
+        raw_timed_out = prior.get("timed_out_containers")
+        if isinstance(raw_timed_out, dict):
+            for k, v in raw_timed_out.items():
+                if isinstance(k, str) and isinstance(v, str) and k and v:
+                    prior_timed_out[k] = v
+        if prior.get("status") == "timeout" and prior.get("service") and prior.get("container_id"):
+            prior_timed_out[str(prior["service"])] = str(prior["container_id"])
+    prior_services = {
+        entry["service"]: entry
+        for entry in prior.get("services_state", [])
+        if isinstance(entry, dict) and entry.get("service")
+    }
+    state: dict = {
+        "schema_version": 1,
+        "status": "inflight",
+        "signaled": bool(prior.get("signaled")) if reconcile else False,
+        "adapter_dispatched": False,
+        "environment": environment,
+        "target": target,
+        "deployer_identity": identity,
+        "timeout_seconds": timeout_seconds,
+        "force_stop_timeout": force_stop_timeout,
+        "exclusive_services": services,
+        "services_state": [],
+        "timed_out_containers": dict(prior_timed_out),
+        "escalation": "sigkill" if prior.get("escalation") == "sigkill" else "none",
+        "total_elapsed_seconds": 0.0,
+    }
+
+    def emit_failure(reason: str, *, service: str | None = None, container_id: str = "none",
+                     signal_name: str = "none", elapsed: float = 0.0, escalation: str = "none",
+                     exit_code: int = 4, status_label: str = "unverified", write_audit: bool = False,
+                     extra: dict | None = None) -> int:
+        state["status"] = status_label
+        state["reason"] = reason
+        if service is not None:
+            state["service"] = service
+        if container_id != "none":
+            state["container_id"] = container_id
+        if status_label == "timeout" and service is not None and container_id != "none":
+            state["timed_out_containers"][service] = container_id
+        if extra:
+            state.update(extra)
+        durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
+        if (write_audit or state["signaled"]) and audit_log is not None:
+            append_audit_record(audit_log, {
+                "time": _utc_now(),
+                "action": "rollback",
+                "environment": environment,
+                "target": target,
+                "source": source_commit,
+                "artifact": artifact_digest,
+                "service": service or "none",
+                "container": container_id,
+                "signal": signal_name,
+                "timeout_seconds": str(timeout_seconds),
+                "elapsed_seconds": f"{elapsed:.3f}",
+                "escalation": escalation,
+                "result": "stop_failed",
+                "reason": reason,
+            }, uid)
+        print(
+            f"ERROR: rollback exclusive-service stop failed: environment={environment} target={target} "
+            f"service={service or 'none'} container={container_id} reason={reason} signal={signal_name} "
+            f"elapsed={elapsed:.3f}s timeout={timeout_seconds}s escalation={escalation}",
+            file=sys.stderr,
+        )
+        return exit_code
+
+    # Resolution phase: resolve every declared service before signaling anything.
+    try:
+        if backend_factory is None:
+            if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" and os.environ.get("CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET") == "1":
+                backend = TestingDockerBackend(values["DOCKER_SOCKET"], budget)
+            else:
+                backend = Backend(values["DOCKER_SOCKET"], budget)
+        else:
+            backend = backend_factory(values["DOCKER_SOCKET"], budget)
+    except (ValueError, KeyError, OSError, http.client.HTTPException):
+        return emit_failure("docker_backend_unavailable", exit_code=3, status_label="blocked")
+    try:
+        inventory = list_owned_containers(backend, expected_labels)
+    except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
+        return emit_failure("container_inventory_unavailable", exit_code=3, status_label="blocked")
+
+    resolved: list[tuple[str, str | None, dict | None, str]] = []
+    for svc in services:
+        candidates: list[tuple[str, str, dict, str]] = []
+        for item in inventory:
+            matches, conflict = container_matches_service(item, prefix, svc, expected_labels)
+            if conflict:
+                cid = item.get("Id") if isinstance(item.get("Id"), str) else "unknown"
+                return emit_failure("ambiguous_service_identity", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked", extra={"containers": [cid]})
+            if not matches:
+                continue
+            cid = item.get("Id")
+            if not isinstance(cid, str) or not cid:
+                return emit_failure("invalid_container_identity", service=svc, exit_code=3, status_label="blocked")
+            try:
+                info = backend.inspect("containers", cid)
+            except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                return emit_failure("container_inspect_failed", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked")
+            matches, conflict = container_matches_service(info, prefix, svc, expected_labels)
+            if conflict or not matches or info.get("Id") != cid:
+                return emit_failure("ambiguous_service_identity", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked")
+            if container_exited_and_non_restartable(info)[0]:
+                continue
+            cstate = info.get("State")
+            if not isinstance(cstate, dict):
+                return emit_failure("container_state_unavailable", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked")
+            if cstate.get("Paused") is True:
+                return emit_failure("container_paused", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked")
+            try:
+                sig = policy_signal if policy_signal is not None else normalize_graceful_signal((info.get("Config") or {}).get("StopSignal"))
+            except ValueError:
+                return emit_failure("unsupported_stop_signal", service=svc, container_id=cid,
+                                    exit_code=3, status_label="blocked")
+            candidates.append((svc, cid, info, sig))
+        if len(candidates) > 1:
+            cids = [candidate[1] for candidate in candidates]
+            return emit_failure("ambiguous_service_identity", service=svc, container_id=",".join(cids),
+                                exit_code=3, status_label="blocked", extra={"containers": cids})
+        if candidates:
+            resolved.append(candidates[0])
+        else:
+            resolved.append((svc, None, None, policy_signal or "SIGTERM"))
+
+    overall_start = monotonic()
+    operation_deadline = backend.deadline if isinstance(backend, _DockerClient) else None
+    for svc, cid, info, sig in resolved:
+        if cid is None or info is None:
+            state["timed_out_containers"].pop(svc, None)
+            state["services_state"].append({"service": svc, "action": "absent", "verified": True, "escalation": "none", "elapsed_seconds": 0.0})
+            continue
+        quoted = urllib.parse.quote(cid, safe="")
+        state.update({"status": "inflight", "signaled": True, "service": svc, "container_id": cid, "signal": sig})
+        durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
+
+        svc_start = monotonic()
+        svc_deadline = svc_start + timeout_seconds
+        # Disable auto-restart before signaling so Docker cannot relaunch on exit.
+        restart_policy = (info.get("HostConfig") or {}).get("RestartPolicy")
+        restart_name = restart_policy.get("Name", "") if isinstance(restart_policy, dict) else ""
+        if restart_name not in ("", "no"):
+            if operation_deadline is not None:
+                backend.deadline = min(operation_deadline, svc_deadline)
+                backend._hard_stop_deadline = True
+            try:
+                upd_status, _ = backend.request("POST", f"/containers/{quoted}/update",
+                                                json.dumps({"RestartPolicy": {"Name": "no", "MaximumRetryCount": 0}}).encode(),
+                                                {"Content-Type": "application/json"})
+                if not 200 <= upd_status < 300:
+                    return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
+                info = backend.inspect("containers", cid)
+            except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
+            finally:
+                if operation_deadline is not None:
+                    backend.deadline = operation_deadline
+                    backend._hard_stop_deadline = False
+            same_service, conflict = container_matches_service(info, prefix, svc, expected_labels)
+            if conflict or not same_service or info.get("Id") != cid:
+                return emit_failure("ownership_changed", service=svc, container_id=cid, signal_name=sig)
+            updated_rp = ((info.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name", "")
+            if updated_rp not in ("", "no"):
+                return emit_failure("restart_policy_update_failed", service=svc, container_id=cid, signal_name=sig)
+
+        exited, _ = container_exited_and_non_restartable(info)
+        active = container_confirmed_active(info)
+        if monotonic() >= svc_deadline:
+            return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
+        if exited:
+            prev_esc = prior_services.get(svc, {}).get("escalation", "none")
+            state["timed_out_containers"].pop(svc, None)
+            state["services_state"].append({"service": svc, "container_id": cid, "action": "already_stopped",
+                                            "verified": True, "escalation": prev_esc, "elapsed_seconds": 0.0})
+            continue
+
+        if reconcile and prior_timed_out.get(svc) == cid and not force_stop_timeout:
+            return emit_failure("still_running_after_stop_timeout", service=svc, container_id=cid,
+                                signal_name=sig, status_label="timeout")
+
+        svc_elapsed = 0.0
+        svc_escalation = "none"
+        skip_graceful = reconcile and prior_timed_out.get(svc) == cid and force_stop_timeout
+
+        if skip_graceful and not active:
+            return emit_failure("container_state_unverified", service=svc, container_id=cid, signal_name=sig)
+
+        if not skip_graceful:
+            if monotonic() >= svc_deadline:
+                return emit_failure("restart_policy_update_unverified", service=svc, container_id=cid, signal_name=sig)
+            if operation_deadline is not None:
+                backend.deadline = min(operation_deadline, svc_deadline)
+                backend._hard_stop_deadline = True
+            try:
+                k_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": sig}))
+                if monotonic() >= svc_deadline:
+                    return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
+                if k_status == 404:
+                    active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                    if monotonic() >= svc_deadline:
+                        return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
+                    if active:
+                        return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
+                    state["timed_out_containers"].pop(svc, None)
+                    state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
+                                                    "verified": True, "escalation": "none", "elapsed_seconds": 0.0})
+                    continue
+                if k_status not in (200, 204, 409):
+                    return emit_failure("signal_delivery_failed", service=svc, container_id=cid, signal_name=sig)
+
+                ok, svc_elapsed, wait_reason = _wait_container_exited(backend, cid, prefix, svc, expected_labels,
+                                                                      svc_deadline, svc_start, monotonic, sleep,
+                                                                      retry_signal=sig if k_status == 409 else None)
+            except TimeoutError:
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid,
+                                    signal_name=sig, elapsed=round(monotonic() - svc_start, 3))
+            except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                return emit_failure("docker_communication_failed", service=svc, container_id=cid, signal_name=sig,
+                                    elapsed=round(monotonic() - svc_start, 3), escalation=state["escalation"], write_audit=True)
+            finally:
+                if operation_deadline is not None:
+                    backend.deadline = operation_deadline
+                    backend._hard_stop_deadline = False
+            if ok:
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": wait_reason,
+                                                "signal": sig, "verified": True, "escalation": "none",
+                                                "elapsed_seconds": svc_elapsed})
+                continue
+            if wait_reason != "timeout":
+                return emit_failure(wait_reason, service=svc, container_id=cid, signal_name=sig,
+                                    elapsed=svc_elapsed, write_audit=True)
+            if not force_stop_timeout:
+                return emit_failure("timeout", service=svc, container_id=cid, signal_name=sig,
+                                    elapsed=svc_elapsed, status_label="timeout", write_audit=True)
+
+        # Refresh the exact container after other services may have consumed their stop budgets.
+        kill_start = monotonic()
+        kill_deadline = kill_start + FORCED_KILL_VERIFY_SECONDS
+        if operation_deadline is not None:
+            backend.deadline = min(operation_deadline, kill_deadline)
+            backend._hard_stop_deadline = True
+        try:
+            status, body = backend.request("GET", f"/containers/{quoted}/json")
+            if status == 404:
+                active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                require(monotonic() < kill_deadline, "escalation deadline elapsed")
+                if active:
+                    return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
+                                                "verified": True, "escalation": "none", "elapsed_seconds": svc_elapsed})
+                continue
+            require(status == 200, "escalation container could not be inspected")
+            fresh = decode(body)
+            matches, conflict = container_matches_service(fresh, prefix, svc, expected_labels)
+            host = fresh.get("HostConfig")
+            restart = host.get("RestartPolicy") if isinstance(host, dict) else None
+            require(matches and not conflict and fresh.get("Id") == cid
+                    and isinstance(restart, dict) and restart.get("Name") in ("", "no"),
+                    "escalation container identity or restart policy is unverified")
+            exited, _ = container_exited_and_non_restartable(fresh)
+            require(monotonic() < kill_deadline, "escalation deadline elapsed")
+            if exited:
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": "already_stopped",
+                                                "verified": True, "escalation": "none", "elapsed_seconds": svc_elapsed})
+                continue
+            require(container_confirmed_active(fresh), "escalation container state is unverified")
+        except (ValueError, OSError, http.client.HTTPException):
+            return emit_failure("escalation_state_unverified", service=svc, container_id=cid, signal_name=sig,
+                                elapsed=round(monotonic() - svc_start, 3))
+        finally:
+            if operation_deadline is not None:
+                backend.deadline = operation_deadline
+                backend._hard_stop_deadline = False
+
+        # Explicit operator-authorized SIGKILL escalation after graceful timeout.
+        print(
+            f"WARN: rollback exclusive-service stop timed out; applying authorized SIGKILL escalation: "
+            f"environment={environment} target={target} service={svc} container={cid} "
+            f"elapsed={svc_elapsed:.3f}s timeout={timeout_seconds}s",
+            file=sys.stderr,
+        )
+        state["escalation"] = "sigkill"
+        state["escalation_requested_at"] = _utc_now()
+        durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
+        if audit_log is not None:
+            append_audit_record(audit_log, {
+                "time": _utc_now(),
+                "action": "rollback",
+                "environment": environment,
+                "target": target,
+                "source": source_commit,
+                "artifact": artifact_digest,
+                "service": svc,
+                "container": cid,
+                "signal": "SIGKILL",
+                "timeout_seconds": str(timeout_seconds),
+                "elapsed_seconds": f"{svc_elapsed:.3f}",
+                "escalation": "sigkill",
+                "result": "stop_escalated",
+                "reason": "timeout",
+            }, uid)
+        if operation_deadline is not None:
+            backend.deadline = min(operation_deadline, kill_deadline)
+            backend._hard_stop_deadline = True
+        try:
+            if monotonic() >= kill_deadline:
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name=sig)
+            fk_status, _ = backend.request("POST", f"/containers/{quoted}/kill?" + urllib.parse.urlencode({"signal": "SIGKILL"}))
+            if monotonic() >= kill_deadline:
+                return emit_failure("stop_deadline_unverified", service=svc, container_id=cid, signal_name="SIGKILL", escalation="sigkill")
+            if fk_status == 404:
+                active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                if monotonic() >= kill_deadline:
+                    return emit_failure("stop_deadline_unverified", service=svc, container_id=cid,
+                                        signal_name="SIGKILL", escalation="sigkill")
+                if active:
+                    return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid,
+                                        signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
+                                                "signal": "SIGKILL", "verified": True, "escalation": "sigkill",
+                                                "elapsed_seconds": svc_elapsed})
+                continue
+            if fk_status not in (200, 204, 409):
+                return emit_failure("forced_stop_signal_failed", service=svc, container_id=cid,
+                                    signal_name="SIGKILL", elapsed=svc_elapsed, escalation="sigkill", write_audit=True)
+            ok, kill_elapsed, kill_reason = _wait_container_exited(backend, cid, prefix, svc, expected_labels,
+                                                                   kill_deadline, kill_start, monotonic, sleep,
+                                                                   retry_signal="SIGKILL" if fk_status == 409 else None)
+        except (ValueError, KeyError, OSError, json.JSONDecodeError, http.client.HTTPException):
+            return emit_failure("docker_communication_failed", service=svc, container_id=cid, signal_name="SIGKILL",
+                                elapsed=round(svc_elapsed + (monotonic() - kill_start), 3),
+                                escalation="sigkill", write_audit=True)
+        finally:
+            if operation_deadline is not None:
+                backend.deadline = operation_deadline
+                backend._hard_stop_deadline = False
+        total_svc = round(svc_elapsed + kill_elapsed, 3)
+        if not ok:
+            reason = "forced_stop_exit_unverified" if kill_reason == "timeout" else kill_reason
+            return emit_failure(reason, service=svc, container_id=cid, signal_name="SIGKILL",
+                                elapsed=total_svc, escalation="sigkill", write_audit=True)
+        svc_escalation = "sigkill"
+        state["timed_out_containers"].pop(svc, None)
+        state["services_state"].append({"service": svc, "container_id": cid, "action": kill_reason,
+                                        "signal": "SIGKILL", "verified": True, "escalation": svc_escalation,
+                                        "elapsed_seconds": total_svc})
+
+    # Final pre-dispatch inventory barrier across all declared exclusive services.
+    if operation_deadline is not None:
+        stop_deadline = min(stop_deadline, operation_deadline)
+        backend.deadline = stop_deadline
+        backend._hard_stop_deadline = True
+    try:
+        final_inventory = list_owned_containers(backend, expected_labels)
+    except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
+        return emit_failure("container_inventory_unavailable", escalation=state["escalation"])
+    for svc in services:
+        for item in final_inventory:
+            matches, conflict = container_matches_service(item, prefix, svc, expected_labels)
+            if conflict:
+                return emit_failure("ambiguous_service_identity", service=svc,
+                                    container_id=str(item.get("Id", "unknown")), escalation=state["escalation"])
+            if not matches:
+                continue
+            cid = item.get("Id")
+            if not isinstance(cid, str) or not cid:
+                return emit_failure("invalid_container_identity", service=svc, escalation=state["escalation"])
+            try:
+                info = backend.inspect("containers", cid)
+            except (ValueError, OSError, json.JSONDecodeError, http.client.HTTPException):
+                return emit_failure("container_inspect_failed", service=svc, container_id=cid,
+                                    escalation=state["escalation"])
+            exited, _ = container_exited_and_non_restartable(info)
+            matches, conflict = container_matches_service(info, prefix, svc, expected_labels)
+            if conflict or not matches or info.get("Id") != cid or not exited:
+                return emit_failure("unexpected_active_container", service=svc, container_id=cid,
+                                    escalation=state["escalation"])
+
+    if monotonic() >= stop_deadline:
+        return emit_failure("stop_deadline_unverified", escalation=state["escalation"])
+    total_elapsed = round(monotonic() - overall_start, 3)
+    state["status"] = "verified"
+    state["reason"] = "verified"
+    state["total_elapsed_seconds"] = total_elapsed
+    state.pop("service", None)
+    state.pop("container_id", None)
+    state.pop("signal", None)
+    durable_file(journal_path, json.dumps(state, sort_keys=True).encode())
+    print(
+        f"ROLLBACK_STOP_VERIFIED environment={environment} target={target} "
+        f"services={','.join(services)} escalation={state['escalation']} elapsed={total_elapsed:.3f}s",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def read_stop_status(journal_path: Path, uid: int | None = None) -> tuple[bool, dict]:
+    """Return (unresolved, fields) for an exclusive-stop journal."""
+    if uid is None:
+        uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
+    try:
+        data = decode(protected_file(journal_path, uid))
+        unresolved = bool(data.get("signaled") is True and data.get("status") != "verified")
+        return unresolved, data
+    except (ValueError, KeyError, OSError, json.JSONDecodeError):
+        return True, {"environment": "unknown", "target": "unknown", "service": "unknown",
+                      "container_id": "unknown", "reason": "corrupted_stop_journal"}
+
+
+def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
+    require(bool(UNIT.fullmatch(unit)), "invalid adapter unit")
+    journal = store / unit
+    trusted_directory(journal, uid, 0o700)
+    ready = journal / "rollback-ready.json"
+    if not ready.exists():
+        return False
+    require(unit_inactive(unit) and not os.path.lexists(journal / "docker-uncertain"),
+            "rollback adapter termination or mutation is unverified")
+    intent_bytes = protected_file(ready, uid)
+    drained = journal / "rollback-drained"
+    require(drained.exists() and protected_file(drained, uid) == hashlib.sha256(intent_bytes).hexdigest().encode(),
+            "rollback broker drain is unverified")
+    intent = decode(intent_bytes)
+    marker = Path(intent["marker"])
+    require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
+    values = parse_policy(protected_file(journal / "policy.conf", uid))
+    pending = marker.with_name(marker.name + ".pending")
+    if os.path.lexists(marker) and not os.path.lexists(pending):
+        require(protected_file(marker, uid) == b"committed\n", "rollback commit marker is unverified")
+        record = decode(protected_file(journal / "rollback-verified.json", uid))
+    else:
+        deadline = time.monotonic() + 30
+        backend = Backend(values["DOCKER_SOCKET"], deadline=deadline)
+        policy = Policy(values, backend, operation="rollback", exclusive_services=intent["services"])
+        policy.rollback_incumbents = intent["incumbents"]
+        while True:
+            try:
+                policy.verify_rollback_commit()
+                require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
+                break
+            except RollbackHealthStarting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.5, remaining))
+        record = {
+            "unit": unit, "operation": "rollback", "status": "completed", "exit_code": 0,
+            "rollback_outcome": "committed", "rollback_marker": str(marker),
+            "artifact_image": values["ARTIFACT_IMAGE"], "verified_containers": policy.verified_containers,
+        }
+        durable_file(journal / "rollback-verified.json", json.dumps(record).encode())
+        # A restart can only accept the commit after the timed directory sync succeeds.
+        durable_file(pending, b"pending\n", deadline=deadline)
+        durable_file(marker, b"committed\n", deadline=deadline)
+        durable_file(journal / "status.json", json.dumps(record).encode(), deadline=deadline)
+        require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
+        # The marker and status are durable. A pending file restored by a reboot only forces revalidation.
+        pending.unlink()
+        return True
+    durable_file(journal / "status.json", json.dumps(record).encode())
+    return True
+
+
 def run_adapter(args) -> int:
     require(args.operation in ("validate", "health", "cleanup", "deploy", "rollback") and 1 <= args.seconds <= 2700, "invalid adapter operation or deadline")
     uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
     values = parse_policy(protected_file(args.policy, uid))
+    incumbent_values = parse_policy(protected_file(args.incumbent_policy, uid)) if getattr(args, "incumbent_policy", None) else None
+    stop_policy = parse_rollback_stop_policy(values, incumbent_values) if args.operation == "rollback" else {"services": []}
     require(values.get("CREDENTIAL_PROVIDER") == "file", "materialize the external credential into an approved file first")
     credential = Path(values["CREDENTIAL_REF"])
     credential_bytes = protected_file(credential, uid)
@@ -891,7 +1902,11 @@ def run_adapter(args) -> int:
                 retained = parse_policy(protected_file(source.resolve(), uid))
                 protected_images.add(retained["ARTIFACT_IMAGE"])
         policy = Policy(values, backend, str(secret), args.marker, args.operation, journal / "docker-uncertain",
-                        args.store / "artifact-images.json", protected_images, args.unit)
+                        args.store / "artifact-images.json", protected_images, args.unit,
+                        exclusive_services=stop_policy["services"])
+        if policy.operation == "rollback" and policy.exclusive_services:
+            policy.capture_rollback_incumbents()
+            policy.rollback_ready = journal / "rollback-ready.json"
         proxy = stage / "docker.sock"
         with ProxyServer(str(proxy), handler(policy)) as server:
             proxy.chmod(0o666)
@@ -908,10 +1923,20 @@ def run_adapter(args) -> int:
     require(unit_inactive(args.unit), "adapter termination is unverified")
     require(args.operation != "rollback" or policy.rollback_outcome == "committed"
             or policy.rollback_outcome == "failed" and result != 0, "rollback outcome is unverified")
-    durable_file(journal / "status.json", json.dumps({"unit": args.unit, "operation": args.operation,
-                                                   "status": "completed", "exit_code": result,
-                                                   "rollback_outcome": policy.rollback_outcome,
-                                                   "rollback_marker": str(args.marker) if args.marker is not None else None}).encode())
+    if policy.rollback_ready is not None and policy.rollback_outcome == "committed":
+        intent_bytes = protected_file(policy.rollback_ready, uid)
+        durable_file(journal / "rollback-drained", hashlib.sha256(intent_bytes).hexdigest().encode())
+        require(complete_rollback_readiness(args.store, args.unit, uid), "rollback readiness is unverified")
+        return result
+    status_payload: dict = {
+        "unit": args.unit, "operation": args.operation, "status": "completed", "exit_code": result,
+        "rollback_outcome": policy.rollback_outcome,
+        "rollback_marker": str(args.marker) if args.marker is not None else None,
+    }
+    if args.operation == "rollback":
+        status_payload["artifact_image"] = values["ARTIFACT_IMAGE"]
+        status_payload["verified_containers"] = policy.verified_containers
+    durable_file(journal / "status.json", json.dumps(status_payload).encode())
     return result
 
 
@@ -928,11 +1953,33 @@ def main() -> int:
     retire = sub.add_parser("journal-retire")
     retire.add_argument("--store", type=Path, required=True)
     retire.add_argument("unit")
+    retire.add_argument("--inactive-health", action="store_true")
     complete = sub.add_parser("journal-complete")
     complete.add_argument("--store", type=Path, required=True)
     complete.add_argument("unit")
+    readiness = sub.add_parser("rollback-readiness")
+    readiness.add_argument("--store", type=Path, required=True)
+    readiness.add_argument("unit")
+    validate_stop = sub.add_parser("validate-stop-policy")
+    validate_stop.add_argument("--policy", type=Path, required=True)
+    validate_stop.add_argument("--incumbent-policy", type=Path)
+    stop_excl = sub.add_parser("stop-exclusive")
+    stop_excl.add_argument("--policy", type=Path, required=True)
+    stop_excl.add_argument("--incumbent-policy", type=Path)
+    stop_excl.add_argument("--journal", type=Path, required=True)
+    stop_excl.add_argument("--reconcile", action="store_true")
+    stop_excl.add_argument("--force-stop-timeout", action="store_true")
+    stop_excl.add_argument("--audit-log", type=Path)
+    stop_excl.add_argument("--seconds", type=int)
+    stop_status = sub.add_parser("stop-status")
+    stop_status.add_argument("--journal", type=Path, required=True)
+    audit_cmd = sub.add_parser("append-audit")
+    audit_cmd.add_argument("--audit-log", type=Path, required=True)
+    audit_cmd.add_argument("--once", action="store_true")
+    audit_cmd.add_argument("fields", nargs="+")
     run = sub.add_parser("run")
     run.add_argument("--policy", type=Path, required=True)
+    run.add_argument("--incumbent-policy", type=Path)
     run.add_argument("--adapter", type=Path, required=True)
     run.add_argument("--store", type=Path, required=True)
     run.add_argument("--runtime", type=Path, required=True)
@@ -944,18 +1991,60 @@ def main() -> int:
     run.add_argument("operation")
     args = parser.parse_args()
     try:
+        uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
         if args.command == "consumption":
-            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
             line = sys.stdin.buffer.read(4097).decode() if args.prepare else None
             consume_approval(args.store, line, uid)
             return 0
         if args.command == "journal-retire":
-            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
-            retire_journal(args.store, args.unit, uid)
+            retire_journal(args.store, args.unit, uid, inactive_health=args.inactive_health)
             return 0
+        if args.command == "rollback-readiness":
+            return 0 if complete_rollback_readiness(args.store, args.unit, uid) else 1
         if args.command == "journal-complete":
-            uid = os.getuid() if os.environ.get("CI_FLEET_DEPLOYER_TESTING") == "1" else 0
             return 0 if journal_complete(args.store, args.unit, uid) else 1
+        if args.command == "validate-stop-policy":
+            try:
+                values = parse_policy(protected_file(args.policy, uid))
+                inc = parse_policy(protected_file(args.incumbent_policy, uid)) if args.incumbent_policy else None
+                parsed = parse_rollback_stop_policy(values, inc)
+            except ValueError as error:
+                print(f"ERROR: {error}", file=sys.stderr)
+                return 1
+            print(json.dumps(parsed, sort_keys=True))
+            return 0
+        if args.command == "stop-exclusive":
+            return stop_exclusive_services(
+                args.policy, args.journal,
+                incumbent_policy_path=args.incumbent_policy,
+                reconcile=args.reconcile,
+                force_stop_timeout=args.force_stop_timeout,
+                audit_log=args.audit_log,
+                seconds=args.seconds,
+                uid=uid,
+            )
+        if args.command == "stop-status":
+            unresolved, data = read_stop_status(args.journal, uid)
+            print(json.dumps({
+                "unresolved": unresolved,
+                "replacement_pending": data.get("signaled") is True and data.get("status") == "verified",
+                "environment": data.get("environment", "unknown"),
+                "target": data.get("target", "unknown"),
+                "service": data.get("service", "none"),
+                "container_id": data.get("container_id", "none"),
+                "reason": data.get("reason", "unknown"),
+                "escalation": data.get("escalation", "none"),
+                "total_elapsed_seconds": data.get("total_elapsed_seconds", 0.0),
+            }, sort_keys=True))
+            return 0 if unresolved else 1
+        if args.command == "append-audit":
+            parsed_fields = {}
+            for item in args.fields:
+                key, sep, value = item.partition("=")
+                require(bool(sep) and bool(key) and bool(value), "invalid audit field")
+                parsed_fields[key] = value
+            append_audit_record(args.audit_log, parsed_fields, uid, once=args.once)
+            return 0
         if args.command == "execute":
             return execute_adapter(args.operation)
         if args.command == "check":
