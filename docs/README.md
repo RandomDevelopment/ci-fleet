@@ -4,12 +4,14 @@ Use this index to find ci-fleet concepts, requirements, examples, and step-by-st
 
 ## Start here
 
-New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a supported role and outcome or stop at an explicit product gate. For the current ordinary-CI path, follow the [Quickstart](QUICKSTART.md): what ci-fleet does, install one controller, connect one repository, run and verify one job. Everything below is reference.
+Operators can start with the task below. Agents use the [task-routing checklist](../AGENTS.md#route-the-task) to check scope and authority before following the same guides.
 
 | I want to… | Read |
 | --- | --- |
+| Run my first CI job | [First fleet job quickstart](QUICKSTART.md) |
+| Prepare my first staging deploy | [Deployer host runbook](DEPLOYER-HOST.md) for separately authorized staging. The [dedicated quickstart](https://github.com/RandomDevelopment/ci-fleet/issues/183) is pending. |
+| Upgrade an existing fleet | [Template upgrade guide by installed baseline](https://github.com/RandomDevelopment/ci-fleet-config-template/blob/main/docs/UPDATING.md#start-from-your-baseline) and [controller upgrade and rollback](DESIRED-STATE.md#check-upgrade-roll-back-and-remove) |
 | Choose a host role and complete or safely stop an operator workflow | [Operator workflows](OPERATOR-WORKFLOWS.md) |
-| Complete the beginner path end to end | [Quickstart](QUICKSTART.md) |
 | Understand the whole system | [Architecture](ARCHITECTURE.md) |
 | Understand how ephemeral runners are created | [Runner controller design](CONTROLLER-DESIGN.md) |
 | Decide whether it fits my infrastructure | [Architecture](ARCHITECTURE.md) and the root [README](../README.md) |
@@ -30,6 +32,8 @@ New operator? Use [Operator workflows](OPERATOR-WORKFLOWS.md) to select a suppor
 | Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
 | Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |
 | Review current priorities | [Roadmap](ROADMAP.md) |
+
+The public configuration template has its own [first-install README](https://github.com/RandomDevelopment/ci-fleet-config-template#install-your-first-ci-controller) and versioned upgrade guide. See the [template navigation update](https://github.com/RandomDevelopment/ci-fleet-config-template/pull/56).
 
 ## Concepts
 
