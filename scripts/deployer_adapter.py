@@ -1057,7 +1057,8 @@ def journal_complete(store: Path, unit: str, uid: int = 0) -> bool:
             marker = Path(marker)
             require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
             if outcome == "committed":
-                require(protected_file(marker, uid) == b"committed\n"
+                require(not os.path.lexists(marker.with_name(marker.name + ".pending"))
+                        and protected_file(marker, uid) == b"committed\n"
                         and stat.S_IMODE(marker.stat().st_mode) == 0o600, "rollback commit marker is unverified")
             else:
                 require(value.get("exit_code") != 0 and not marker.exists() and not marker.is_symlink(),
@@ -1622,7 +1623,18 @@ def stop_exclusive_services(policy_path: Path, journal_path: Path, *,
             backend.deadline = min(operation_deadline, kill_deadline)
             backend._hard_stop_deadline = True
         try:
-            fresh = backend.inspect("containers", cid)
+            status, body = backend.request("GET", f"/containers/{quoted}/json")
+            if status == 404:
+                active = _service_has_active_container(backend, prefix, svc, expected_labels)
+                require(monotonic() < kill_deadline, "escalation deadline elapsed")
+                if active:
+                    return emit_failure("unexpected_replacement_detected", service=svc, container_id=cid, signal_name=sig)
+                state["timed_out_containers"].pop(svc, None)
+                state["services_state"].append({"service": svc, "container_id": cid, "action": "removed",
+                                                "verified": True, "escalation": "none", "elapsed_seconds": svc_elapsed})
+                continue
+            require(status == 200, "escalation container could not be inspected")
+            fresh = decode(body)
             matches, conflict = container_matches_service(fresh, prefix, svc, expected_labels)
             host = fresh.get("HostConfig")
             restart = host.get("RestartPolicy") if isinstance(host, dict) else None
@@ -1792,7 +1804,8 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
     marker = Path(intent["marker"])
     require(marker.is_absolute() and marker.resolve() == marker, "rollback marker path is unsafe")
     values = parse_policy(protected_file(journal / "policy.conf", uid))
-    if os.path.lexists(marker):
+    pending = marker.with_name(marker.name + ".pending")
+    if os.path.lexists(marker) and not os.path.lexists(pending):
         require(protected_file(marker, uid) == b"committed\n", "rollback commit marker is unverified")
         record = decode(protected_file(journal / "rollback-verified.json", uid))
     else:
@@ -1816,7 +1829,16 @@ def complete_rollback_readiness(store: Path, unit: str, uid: int) -> bool:
             "artifact_image": values["ARTIFACT_IMAGE"], "verified_containers": policy.verified_containers,
         }
         durable_file(journal / "rollback-verified.json", json.dumps(record).encode())
+        # A restart can only accept the commit after the timed directory sync succeeds.
+        durable_file(pending, b"pending\n", deadline=deadline)
         durable_file(marker, b"committed\n", deadline=deadline)
+        require(time.monotonic() < deadline, "rollback readiness deadline elapsed")
+        pending.unlink()
+        directory = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     durable_file(journal / "status.json", json.dumps(record).encode())
     return True
 

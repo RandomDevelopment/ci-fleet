@@ -56,7 +56,7 @@ restore_transaction_backup() {
 }
 rollback_commit_marker_safe() {
   local marker=$1
-  [[ ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker" 2>/dev/null) == "$expected_uid:600" ]]
+  [[ ! -e "$marker.pending" && ! -L "$marker.pending" && ! -L "$marker" && -f "$marker" && $(stat -c '%u:%a' "$marker" 2>/dev/null) == "$expected_uid:600" ]]
 }
 rollback_commit_marker_uncommitted() {
   local marker=$1

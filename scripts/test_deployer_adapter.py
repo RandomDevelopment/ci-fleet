@@ -1412,6 +1412,43 @@ class RollbackExclusiveStop(unittest.TestCase):
         )
         self.assertEqual(result, (False, 2.0, "stop_deadline_unverified"))
 
+    def test_auto_removed_container_before_escalation_requires_fresh_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = self._write_policy(root / 'policy.conf', {
+                'ROLLBACK_EXCLUSIVE_SERVICES': 'scheduler', 'ROLLBACK_STOP_TIMEOUT_SECONDS': '2',
+            })
+            monotonic, sleep = self._fake_clock()
+            containers = {'current': {
+                'Id': 'current', 'Name': '/ci-fleet-deploy-example-scheduler',
+                'Config': {'Labels': self.labels},
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+                'State': {'Status': 'running', 'Running': True, 'Restarting': False, 'Paused': False, 'Pid': 3},
+            }}
+            backend, calls = self._make_docker_mock(containers)
+            request = backend.request
+            inspect = backend.inspect
+
+            def remove_after_timeout():
+                if monotonic() >= 2:
+                    containers.pop('current', None)
+
+            def inspect_container(kind, name):
+                remove_after_timeout()
+                return inspect(kind, name)
+
+            def request_after_timeout(method, path, *args):
+                remove_after_timeout()
+                return request(method, path, *args)
+
+            backend.inspect = inspect_container
+            backend.request = request_after_timeout
+            self.assertEqual(adapter.stop_exclusive_services(
+                policy, root / 'stop.json', force_stop_timeout=True, uid=os.getuid(),
+                backend_factory=lambda *_: backend, monotonic=monotonic, sleep=sleep,
+            ), 0)
+            self.assertFalse(any('SIGKILL' in path for _, path, _ in calls))
+
     def test_late_graceful_signal_does_not_authorize_forced_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1678,7 +1715,27 @@ class RollbackExclusiveStop(unittest.TestCase):
                                         with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
                                             adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
                                     self.assertFalse(marker.exists())
+                                    monotonic, sleep = self._fake_clock()
+                                    fsync = adapter.os.fsync
+
+                                    def slow_directory_sync(fd):
+                                        if marker.exists() and adapter.stat.S_ISDIR(adapter.os.fstat(fd).st_mode):
+                                            sleep(31)
+                                        fsync(fd)
+
+                                    with patch.object(adapter.time, 'monotonic', monotonic), \
+                                         patch.object(adapter.os, 'fsync', slow_directory_sync):
+                                        with self.assertRaisesRegex(ValueError, 'readiness deadline elapsed'):
+                                            adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    self.assertTrue(marker.exists())
+                                    self.assertTrue(marker.with_name(marker.name + '.pending').exists())
+                                    self.assertFalse(adapter.journal_complete(store, policy.unit, os.getuid()))
+                                    containers[new_id]['State']['Health']['Status'] = 'unhealthy'
+                                    with self.assertRaisesRegex(ValueError, 'health is unverified'):
+                                        adapter.complete_rollback_readiness(store, policy.unit, os.getuid())
+                                    containers[new_id]['State']['Health']['Status'] = 'healthy'
                                     self.assertTrue(adapter.complete_rollback_readiness(store, policy.unit, os.getuid()))
+                                    self.assertFalse(marker.with_name(marker.name + '.pending').exists())
                                 status = json.loads((journal_dir / 'status.json').read_text())
                                 self.assertEqual(status['verified_containers'], [new_id])
                                 self.assertEqual(containers['web']['Config']['Image'], bad_img)
