@@ -8,6 +8,18 @@ import (
 	"github.com/actions/scaleset/listener"
 )
 
+type diskAwareSession struct {
+	listener.Client
+	disk *diskAdmission
+}
+
+func (s diskAwareSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
+	if !s.disk.check() {
+		maxCapacity = 0
+	}
+	return s.Client.GetMessage(ctx, lastMessageID, maxCapacity)
+}
+
 func (s *Scaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -21,7 +33,7 @@ func (s *Scaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMess
 			// Finish an admitted batch through cleanup, as with the previous listener.
 			ctx = context.WithoutCancel(ctx)
 		}
-		if len(message.JobAvailableMessages) > 0 {
+		if len(message.JobAvailableMessages) > 0 && (s.disk == nil || s.disk.check()) {
 			if s.messageClient == nil {
 				return fmt.Errorf("job acquisition requires a message session")
 			}

@@ -87,6 +87,12 @@ services:
       - github_app_private_key
     volumes:
       - ${CI_FLEET_ROOT_PREFIX:-}/run/lock/ci-fleet:/run/ci-fleet/locks
+      - type: bind
+        source: ${CI_FLEET_ROOT_PREFIX:-}/var/lib/ci-fleet/disk-admission
+        target: /run/ci-fleet-disk-admission
+        read_only: true
+        bind:
+          create_host_path: false
     security_opt:
       - no-new-privileges:true
     deploy:

@@ -89,7 +89,8 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, scalesetClient: client, logger: logger, config: cfg, scaleSetID: set.ID}
+	disk := newDiskAdmission(cfg.FleetInstance)
+	scaler := &Scaler{disk: disk, runners: newRunnerState(), dockerClient: docker, scalesetClient: client, logger: logger, config: cfg, scaleSetID: set.ID}
 	hostname, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("get hostname: %w", err)
@@ -100,13 +101,14 @@ func run(ctx context.Context) error {
 	}
 	defer session.Close(context.Background())
 	scaler.messageClient = session
-	l, err := listener.New(session, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
+	l, err := listener.New(diskAwareSession{Client: session, disk: disk}, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
 	if err != nil {
 		return fmt.Errorf("create listener: %w", err)
 	}
 	if err := scaler.recoverRunners(ctx); err != nil {
 		return err
 	}
+	disk.check()
 	scaler.writeStatus()
 	statusTicker := time.NewTicker(time.Minute)
 	defer statusTicker.Stop()

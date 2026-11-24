@@ -43,6 +43,8 @@ validation_command python-compile python3 -m py_compile \
   scripts/test_cleanup_storage.py \
   scripts/test_proxy_memory.py \
   scripts/health.py \
+  scripts/disk_admission_sample.py \
+  scripts/test_disk_admission_sample.py \
   scripts/endpoint_snapshot.py \
   scripts/endpoint_snapshot_sources.py \
   scripts/endpoint_snapshot_store.py \

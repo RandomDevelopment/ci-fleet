@@ -327,6 +327,13 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        if grep -Fq 'target: /run/ci-fleet-disk-admission' "$compose_file"; then
+          export_dir=${CI_FLEET_ROOT_PREFIX:?}/var/lib/ci-fleet/disk-admission
+          if [[ -L "$export_dir" || ! -d "$export_dir" || $(stat -c '%u:%a' "$export_dir") != 0:700 ]]; then
+            printf 'disk admission export was not prepared before Compose startup\n' >&2
+            exit 49
+          fi
+        fi
         [[ -z ${FAKE_PROXY_STATE:-} ]] || : >"$FAKE_PROXY_STATE"
         controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$env_file")
         "$0" image inspect --format '{{.Id}}' "$controller_image" >/dev/null 2>&1 || {

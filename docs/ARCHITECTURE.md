@@ -165,6 +165,11 @@ restarts. Raw host-root clients outside this gate and asynchronous orchestrators
 are outside the ordinary fleet contract.
 See [Network reclamation](HOST-MAINTENANCE.md#network-reclamation).
 
+The host capacity service measures the Docker data root, runner workspace, and
+upload spool. The controller reads only the protected measurement export and
+uses it for [disk-pressure job admission](DISK-ADMISSION.md). Runner and project
+containers have no mount for that export.
+
 ## Update layers
 
 - Project runtime versions are controlled by project Dockerfiles.

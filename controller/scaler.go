@@ -23,6 +23,7 @@ import (
 const labelPrefix = "io.randomdevelopment.ci-fleet."
 
 type Scaler struct {
+	disk           *diskAdmission
 	runners        runnerState
 	dockerClient   *dockerclient.Client
 	scalesetClient interface {
@@ -42,6 +43,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	defer s.writeStatus()
 	current := s.runners.count()
 	target := min(s.config.MaxRunners, s.config.MinRunners+count)
+	if target > current && s.disk != nil && !s.disk.check() {
+		return current, nil
+	}
 	if target > current && s.config.DockerNetworksPerRunner > 0 {
 		available, err := s.availableNetworkRunnerSlots(ctx)
 		if err != nil {
@@ -66,6 +70,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		defer lock.Close()
 	}
 	for i := current; i < target; i++ {
+		if s.disk != nil && !s.disk.check() {
+			break
+		}
 		if _, err := s.startRunner(ctx); err != nil {
 			return s.runners.count(), fmt.Errorf("start runner: %w", err)
 		}
