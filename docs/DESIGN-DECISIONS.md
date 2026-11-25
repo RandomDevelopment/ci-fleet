@@ -57,6 +57,24 @@ Remove or narrow this capability when supported Chromium versions no longer need
 these additional calls, or when an equally functional profile with fewer permitted
 operations has passed the same review and real browser verification.
 
+## Host-local HTTP ingress for deployers
+
+The [deployer runbook](DEPLOYER-HOST.md#host-local-http-ingress) defines HTTP
+over a pathname Unix socket on a target-scoped volume. The operator exposes
+the volume only to an unprivileged host proxy through a read-only mount with
+`nosymfollow`. The workload keeps its internal bridge. Docker loopback
+publication can be ineffective on that bridge, and enabling a second network
+would change workload isolation. The volume design uses the existing broker
+permissions. Workload-controlled symlinks must fail at the mount boundary
+before the proxy can open a different host socket.
+
+The candidate and retained artifact use the same socket pathname and volume.
+Verified-stop rollback allows the retained artifact to claim the pathname after
+the incumbent exits. The proxy sees an outage during the stop and start.
+Stop the proxy and unmount the volume to remove the route. The disposable
+Docker proof covers the repository contract. Staging cutover requires separate
+acceptance on the intended dedicated rootless deployer. [Issue #194](https://github.com/RandomDevelopment/ci-fleet/issues/194)
+
 The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) has an explicit [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) under [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It is proposed while PR #126 is open and accepted after that reviewed PR merges into `main`. It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. Implementation remains planned; it adds no runtime, schema field, or host activation and preserves the decisions below.
 
 ## Managed controller desired state after the isolated proof
