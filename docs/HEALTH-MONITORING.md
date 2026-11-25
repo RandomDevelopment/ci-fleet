@@ -56,6 +56,14 @@ remove networks, cancel jobs, or change capacity in desired state.
 Frequent orphan reconciliation and consumer-label migrations remain later issue
 #81 work. Cleanup stays label-scoped and never uses blind Docker prune.
 
+## Disk admission
+
+Use the controller's local [disk admission status](DISK-ADMISSION.md#local-status)
+to see why it has stopped accepting work. The capacity timer measures the
+workspace, Docker storage, and upload spool while the controller is idle or
+busy. The admission thresholds are fixed in the engine. The health warning
+thresholds below still control host alerts.
+
 ## Threshold overrides and hooks
 
 Defaults are intentionally conservative: disk and inode warning/critical at 80/90%, available memory warning/critical at 15/8%, sustained swap use under five-minute memory pressure warning/critical at 25/50%, per-CPU fifteen-minute load warning/critical at 1.0/1.5, and controller restart warning at 3.

@@ -8,6 +8,15 @@ This repository defines a portable, public, self-hosted GitHub Actions CI fleet 
 
 The isolated proof of concept is approved and the project is in controlled migration. The accepted scope and remaining gates are recorded in `docs/DESIGN-DECISIONS.md`. Managed ordinary-CI controller lifecycle is permitted only through reviewed schema-v3 desired state; production deployment paths remain separately gated.
 
+## Route the task
+
+- [ ] Match the request to the guide and identify the evidence it calls for.
+  - [First CI job](docs/QUICKSTART.md). Look for the run ID, read-only job permissions, the intended ephemeral runner and scale set, and cleanup and controller health evidence.
+  - [First staging deploy](docs/STAGING-QUICKSTART.md). Look for exact-target approval matching the source commit and image digest, a recovery checkpoint, and the deployment audit and application health result. Production remains gated.
+  - [Existing-fleet upgrade](https://github.com/RandomDevelopment/ci-fleet-config-template/blob/main/docs/UPDATING.md#start-from-your-baseline). Identify the installed template, manager and engine baseline. For [controller upgrade and rollback](docs/DESIRED-STATE.md#check-upgrade-roll-back-and-remove), look for the reviewed configuration commit, a `CHECK_OK` report and the rollback checkpoint.
+- [ ] Start with read-only verification. Inspect the checkout, pinned revisions and existing reports or job metadata you are authorized to read. Record what you verified and what evidence is missing, without exposing credentials or private infrastructure details.
+- [ ] Stop before a write, credential access or use, or a live infrastructure action unless the task authorizes that specific action and target and the guide's prerequisites are met. This includes dispatching a job or running a host check that starts a service. Report the missing approval or prerequisite and the next safe step.
+
 ## Sources of truth
 
 - `docs/PROJECT-STANDARD.md`: mandatory rules for participating projects.

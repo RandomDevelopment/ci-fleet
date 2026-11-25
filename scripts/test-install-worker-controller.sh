@@ -59,8 +59,9 @@ git -C "$fixture_repo" add -A
 git -C "$fixture_repo" -c user.name=fixture -c user.email=fixture@invalid.example commit -qm 'test: model opaque runtime sources'
 fake_bin=$tmp/bin
 mkdir -p "$fake_bin"
-export REAL_STAT
-REAL_STAT=$(command -v stat)
+# The installer passes only FAKE_* fixture variables into Compose.
+export FAKE_REAL_STAT
+FAKE_REAL_STAT=$(command -v stat)
 export REAL_TAR
 REAL_TAR=$(command -v tar)
 export REAL_GIT
@@ -327,6 +328,13 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        if grep -Fq 'target: /run/ci-fleet-disk-admission' "$compose_file"; then
+          export_dir=${CI_FLEET_ROOT_PREFIX:?}/var/lib/ci-fleet/disk-admission
+          if [[ -L "$export_dir" || ! -d "$export_dir" || $(stat -c '%u:%a' "$export_dir") != 0:700 ]]; then
+            printf 'disk admission export was not prepared before Compose startup\n' >&2
+            exit 49
+          fi
+        fi
         [[ -z ${FAKE_PROXY_STATE:-} ]] || : >"$FAKE_PROXY_STATE"
         controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$env_file")
         "$0" image inspect --format '{{.Id}}' "$controller_image" >/dev/null 2>&1 || {
@@ -496,7 +504,7 @@ if [[ -n "${FAKE_WRONG_SOURCE_INSTALLER_OWNER:-}" && "${1:-}" == -c && "${2:-}" 
   printf '99999\n'
   exit 0
 fi
-exec "$REAL_STAT" "$@"
+exec "$FAKE_REAL_STAT" "$@"
 EOF
 chmod 700 "$fake_bin/docker" "$fake_bin/systemctl" "$fake_bin/stat"
 

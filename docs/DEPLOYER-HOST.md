@@ -2,6 +2,8 @@
 
 This runbook installs the generic ci-fleet deployer runtime on a dedicated Linux host. It does not deploy an application by itself. Application repositories retain their own deployment logic through the narrow adapter contract below.
 
+For a first authorized rollout and rollback exercise, use the [staging quickstart](STAGING-QUICKSTART.md).
+
 A deployer is a separate trust boundary. It must never register as an ordinary GitHub Actions runner, accept pull-request jobs, share a Docker daemon with CI workers, or run on the ordinary controller host. Staging and production require different hosts or equally isolated security boundaries, identities, credential scopes, state, approval evidence, and target policy.
 
 ## Capability and security model
@@ -110,7 +112,7 @@ a profile does not prove kernel or AppArmor compatibility. See the
 
 Core supplies `CI_FLEET_DEPLOYER_CONFIG` and optional `CI_FLEET_DEPLOYER_REQUEST` as private credential copies. `CREDENTIAL_REF` in that config names the adapter-readable application credential. To bind it into a container, use `CI_FLEET_DEPLOYER_CONTAINER_CREDENTIAL` as the source and a read-only destination below `/run/secrets/`. Core materializes a durable copy under `/var/lib/ci-fleet-deployer-container-credentials`, keyed by target, daemon identity and credential contents. Credential stores and bind sources reject access/default ACLs so inherited entries cannot grant another principal secret access. The directory and file remain root-owned; only the dedicated daemon group can traverse the entry and read its mode-0440 credential. Containers with a non-root image user can add numeric group zero in the rootless namespace. These sources survive adapter completion and reboot. Rotation creates a new immutable source and preserves earlier sources for existing containers and rollback. Before consuming approval, deployment validates credential references from both the deployed snapshot and retained last-known-good policy. Retain their protected credential files while either policy needs them. Uninstall retains them. An operator may retire a source only after proving no container or retained recovery point references it. External providers must materialize the approved credential into the protected host-local file before invocation; direct external-provider access is unsupported by the private-network sandbox.
 
-Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`. The adapter atomically writes this private runtime file as its final successful step. The executor publishes the marker through the broker into the root-owned installer journal only after a zero adapter exit. A nonzero or signal exit with a runtime marker is ambiguous and retains recovery state. The broker authenticates outcome publication by the socket peer PID against the transient unit's current main executor PID. The executor disables process dumping before launching the adapter, preventing same-UID access to its private descriptors and memory. The adapter never receives the installer journal path or direct write authority. Core stages the last-known-good core before dispatch and finalizes a committed rollback from the retained transaction after interruption.
+Rollback must be atomic from the adapter's perspective: nonzero restores the pre-call application state; zero means rollback health is already verified. For rollback only, core exports `CI_FLEET_DEPLOYER_ROLLBACK_COMMIT`. The adapter atomically writes this private runtime file as its final successful step. After a zero adapter exit, the executor submits the outcome through the broker. For exclusive services, core saves this outcome in its protected journal and publishes the rollback commit only after it verifies Docker readiness. A nonzero or signal exit with a runtime marker is ambiguous and retains recovery state. The broker authenticates outcome publication by the socket peer PID against the transient unit's current main executor PID. The executor disables process dumping before launching the adapter, preventing same-UID access to its private descriptors and memory. The adapter never receives the installer journal path or direct write authority. Core stages the last-known-good core before dispatch and finalizes a committed rollback from the retained transaction after interruption.
 
 ## Prepare host-local files
 
@@ -233,6 +235,20 @@ sudo install -o root -g root -m 0600 /dev/null \
 sudo chmod 0600 /etc/ci-fleet-deployer/deployer.conf
 ```
 
+Optional host-local keys enable verified pre-replacement shutdown during `--rollback` for singleton workloads such as schedulers:
+
+```text
+ROLLBACK_EXCLUSIVE_SERVICES=scheduler
+ROLLBACK_STOP_TIMEOUT_SECONDS=120
+ROLLBACK_STOP_SIGNAL=SIGTERM
+```
+
+`ROLLBACK_EXCLUSIVE_SERVICES` is a comma-separated list of 1 to 32 unique service identifiers (`^[a-z0-9][a-z0-9._-]{0,63}$`), where `ci-fleet-deploy-<DEPLOYER_IDENTITY>-<service>` is at most 128 characters. `ROLLBACK_STOP_TIMEOUT_SECONDS` is optional (`1` to `600`, default `120`), and the product of exclusive service count across active and last-known-good policies and timeout cannot exceed `1800` seconds. `ROLLBACK_STOP_SIGNAL` is optional (`SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, or `SIGWINCH`); `SIGKILL` is forbidden in policy. When `ROLLBACK_STOP_SIGNAL` is omitted, rollback reads the container's `StopSignal` if it is in the graceful allowlist, defaults to `SIGTERM` if empty, and rejects `SIGKILL` or unknown signals before signaling. An explicit active timeout or signal takes precedence over the retained value. If neither policy specifies a value, core uses the default described above. Upgrade and deploy validate the combined stop policy before changing the rollback point. Both timeout and signal keys require `ROLLBACK_EXCLUSIVE_SERVICES`.
+
+Core resolves each service only within the target's four ownership labels (`role=deployer`, `identity`, `environment`, `target`). A container matches `<service>` when its `io.randomdevelopment.ci-fleet.service` label equals `<service>`, or when that label is absent and its container name equals `ci-fleet-deploy-<DEPLOYER_IDENTITY>-<service>`. Multiple active or restartable matches, conflicting labels, or paused containers fail closed before signaling. Core allows retained containers that have exited with restart disabled. Sibling non-exclusive containers and persistent volumes remain untouched.
+
+Core commits supporting these keys reject unknown policy keys on older revisions. Upgrade to a supporting `CORE_REF` before adding `ROLLBACK_*` fields to `deployer.conf`, and keep both the active release and the retained last-known-good `CORE_REF` on supporting commits; `--rollback` blocks if a last-known-good policy declaring `ROLLBACK_*` points at an older core release without support.
+
 For an external secret manager, provision the protected credential file before invocation, keep `CREDENTIAL_PROVIDER=file`, and set `CREDENTIAL_REF` to its canonical path. For GitHub Environment approval, use `APPROVAL_PROVIDER=github-environment` and add `APPROVAL_CAPABILITY_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/github-capability.conf`. Production additionally requires `PRODUCTION_AUTHORIZATION_EVIDENCE_PATH=/etc/ci-fleet-deployer/evidence/production-authorization.conf`.
 
 ## Install, check, repair, upgrade, drain, and rollback
@@ -284,11 +300,18 @@ sudo ./scripts/install-deployer.sh \
   --resume --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
-Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active:
+Rollback changes the active core/application state but deliberately does not overwrite or depend on the operator-owned candidate evidence or registry preflight; it uses the retained last-known-good policy and local adapter. It refuses while a deployment is active. When `ROLLBACK_EXCLUSIVE_SERVICES` is configured on the active or last-known-good policy, `--rollback` stops each declared singleton before invoking `adapter rollback`. It sets `RestartPolicy=no`, sends the configured graceful signal without silent `SIGKILL`, and waits until Docker confirms the container has exited (`Running=false`, `Restarting=false`, `Paused=false`, `Pid=0`, `RestartPolicy=no`). During the adapter run, the broker prevents creating or starting overlapping exclusive containers, blocks starting containers with unapproved images, and requires one running replacement for each service declared by the last-known-good policy. Unchanged non-exclusive containers may keep their existing image. Containers started by the rollback must use the approved artifact. Core verifies the replacement’s Docker image ID. A configured Docker health check must report `healthy` before commit. The broker serializes Docker mutations and rejects further writes after the executor publishes the rollback outcome. Core waits up to 30 seconds for a starting health check and retains the successful adapter outcome if readiness is unverified. Once core records that the Docker broker finished processing requests, retry `--rollback` after checking Docker health to verify the existing workload without dispatching the adapter again. If broker completion is unverified, core blocks for operator recovery. If commit publication is interrupted or its directory sync exceeds the readiness deadline, recovery verifies Docker readiness again before accepting the commit. Core persists the pending-marker removal before discarding the adapter unit reference. Before retiring the committed rollback journal, core runs read-only `adapter health` and writes the rolled-back artifact, exclusive services, escalation state, and elapsed stop duration to `/var/log/ci-fleet-deployer/audit.log`. A failed or interrupted post-commit health check retains the journal so recovery can rerun the read-only probe. Core writes one successful audit entry per rollback transaction and publishes the deployed snapshot after application health passes.
 
 ```bash
 sudo ./scripts/install-deployer.sh \
   --rollback --config /etc/ci-fleet-deployer/deployer.conf
+```
+
+If graceful shutdown times out or exit cannot be verified after a stop begins, core reports the environment, target, service, container ID, and reason, logs `result=stop_failed` to `audit.log`, leaves `install-state.json`, `active-policy.conf`, and the `current` symlink at their pre-rollback state, and retains the rollback transaction. Subsequent checks, upgrades, repairs, drains, resumes, and runtime operations block while exit is unverified or a stopped service awaits its replacement. The per-service timeout includes disabling restart and requesting the graceful stop. The helper has a separate 2,850-second ceiling for all services, Docker inventory, and escalation. A timely observation of the same active container can establish an escalation-eligible timeout. A late Docker reply or uncertain I/O leaves exit unverified and does not authorize SIGKILL. Wait for the workload to exit and rerun `--rollback`, or explicitly authorize `SIGKILL` escalation after timeout (which audits `result=stop_escalated escalation=sigkill` before signaling and still verifies exit within 30 seconds):
+
+```bash
+sudo ./scripts/install-deployer.sh \
+  --rollback --force-stop-timeout --config /etc/ci-fleet-deployer/deployer.conf
 ```
 
 The report's next action is `restore-host-policy-evidence-then-check`. Restore the prior reviewed `deployer.conf`, exact-head approval evidence, and checkpoint evidence through the same protected operator process that created them; do not copy secrets through the shell. Then verify read-only:
@@ -301,6 +324,10 @@ sudo ./scripts/install-deployer.sh \
 A cross-environment or cross-target in-place upgrade is rejected. Build a separately isolated host with its own identity and credential scope instead.
 
 ## Submit an approved deployment
+
+See the [application deployment path](ARCHITECTURE.md#application-deployment-path)
+for the steps from a tested commit to a running application and the trust
+boundaries between them.
 
 Place one root-owned mode-`0600` request at `/var/lib/ci-fleet-deployer/request.conf`. It uses the same exact-head approval fields shown above. No secret values belong in the request. Before invoking the adapter, runtime revalidates host-role isolation and all protected approval, capability, checkpoint, and production evidence, then permanently consumes the stable `APPROVAL_ID`; changing the approval time, approver, policy, or other request fields cannot reuse it. Failed attempts require a new approval ID. The durable replay ledger lives at `/var/log/ci-fleet-deployer/consumed-requests`, outside application state cleanup. New markers use `approval-` followed by the SHA-256 of the approval ID. Runtime retains stable markers from either ledger location. Legacy markers that hash the entire request cannot establish which approval IDs were consumed, so runtime preserves them and refuses deployment pending operator reconciliation from trusted evidence or checkpoint recovery. Never delete a replay ledger to bypass that refusal. Recovery restores every consumed marker, including earlier attempts. After success it restores protected active core state, records the deployed policy as the application-compatible rollback point, and durably moves the request to `last-request.conf` before writing the success audit record.
 

@@ -5,8 +5,9 @@ engine `a56fad2c47bf6b3f80e839af69615a2b42fc1461`. This document adds no produce
 snapshot field, collector, UI, threshold, or host authorization. The proposed
 [#166](https://github.com/RandomDevelopment/ci-fleet/issues/166) admission producer
 and its enforcement guarantees require separate implementation and review.
-Update or supersede this base-pinned inventory when #166 is integrated; approval
-to implement a candidate does not establish acceptance or deployment.
+For the #166 implementation, see [disk-pressure job admission](DISK-ADMISSION.md).
+This base-pinned inventory records the earlier evidence and the boundaries of the
+existing snapshot and outbound report contracts.
 
 ## Reuse the existing evidence
 

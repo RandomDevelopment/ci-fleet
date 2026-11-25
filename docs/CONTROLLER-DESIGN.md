@@ -50,9 +50,11 @@ Before handling a completion, the controller logs its result, runner name and ID
 The pinned `actions/scaleset` 0.5.0 listener calls the controller's `Scale`
 handler for initial statistics, each message batch, and empty polls. The handler
 retains the latest assigned-job count so empty polls can replace exited runners
-while demand remains. It acquires available jobs before processing starts and
-completions, then reconciles capacity against the reported statistics. Reacquiring
-an already acquired job is a service no-op.
+while demand remains. With sufficient disk headroom, it acquires available
+jobs before processing starts and completions, then reconciles capacity against
+the reported statistics. Reacquiring an already acquired job is a service no-op.
+During a [disk admission block](DISK-ADMISSION.md), it advertises zero capacity,
+skips acquisition and runner creation, and continues processing callbacks.
 
 The listener acknowledges a batch only after the handler succeeds. An acquisition,
 callback, cleanup or acknowledgment failure stops the listener and leaves the

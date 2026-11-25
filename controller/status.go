@@ -15,12 +15,13 @@ var encodeControllerStatus = func(file *os.File, value controllerStatus) error {
 }
 
 type controllerStatus struct {
-	Controller      string `json:"controller"`
-	SoftwareVersion string `json:"software_version"`
-	Current         int    `json:"current"`
-	Busy            int    `json:"busy"`
-	Maximum         int    `json:"maximum"`
-	GeneratedAt     int64  `json:"generated_at"`
+	Controller      string              `json:"controller"`
+	SoftwareVersion string              `json:"software_version"`
+	Current         int                 `json:"current"`
+	Busy            int                 `json:"busy"`
+	Maximum         int                 `json:"maximum"`
+	GeneratedAt     int64               `json:"generated_at"`
+	DiskAdmission   diskAdmissionStatus `json:"disk_admission"`
 }
 
 func (s *Scaler) writeStatus() {
@@ -28,10 +29,13 @@ func (s *Scaler) writeStatus() {
 	defer statusWriteMu.Unlock()
 	current, busy := s.runners.counts()
 	softwareVersion := commitSHA
-	if softwareVersion == "unknown" { softwareVersion = version }
+	if softwareVersion == "unknown" {
+		softwareVersion = version
+	}
 	value := controllerStatus{
 		Controller: s.config.FleetInstance, SoftwareVersion: softwareVersion,
 		Current: current, Busy: busy, Maximum: s.config.MaxRunners, GeneratedAt: time.Now().Unix(),
+		DiskAdmission: s.disk.snapshot(),
 	}
 	directory := filepath.Dir(s.config.StatusFile)
 	if err := os.MkdirAll(directory, 0o755); err != nil {
@@ -48,9 +52,15 @@ func (s *Scaler) writeStatus() {
 	if err = temporary.Chmod(0o644); err == nil {
 		err = encodeControllerStatus(temporary, value)
 	}
-	if closeErr := temporary.Close(); err == nil { err = closeErr }
-	if err == nil { err = os.Rename(name, s.config.StatusFile) }
-	if err != nil { s.logger.Warn("write controller status", "error", err) }
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(name, s.config.StatusFile)
+	}
+	if err != nil {
+		s.logger.Warn("write controller status", "error", err)
+	}
 }
 
 func (s *Scaler) publishStatus(ctx context.Context, ticks <-chan time.Time) {
@@ -59,6 +69,7 @@ func (s *Scaler) publishStatus(ctx context.Context, ticks <-chan time.Time) {
 		case <-ctx.Done():
 			return
 		case <-ticks:
+			s.disk.check()
 			s.writeStatus()
 		}
 	}

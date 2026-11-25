@@ -12,7 +12,17 @@ project integration](docs/APT-CACHE.md).
 
 Use one shared pool of disposable CI workers across multiple trusted private repositories, Docker hosts, virtual machines, bare-metal computers, home labs, remote sites, or VPS providers. Projects bring their own Dockerized build and test environment; fleet hosts stay generic.
 
-> **Status:** Controlled migration. The isolated one-job pilot passed on 2026-07-15. Reviewed schema-v3 desired state now governs managed ordinary-CI controller lifecycle. Tester and deployer components remain under review, and production readiness remains gated. See [accepted design decisions](docs/DESIGN-DECISIONS.md).
+> **Status:** Controlled migration. The isolated one-job pilot passed on 2026-07-15. Reviewed schema-v3 desired state governs managed ordinary-CI controller lifecycle. The tester is under review. The experimental deployer supports separately authorized staging. Production remains gated. See [accepted design decisions](docs/DESIGN-DECISIONS.md).
+
+## Start here
+
+| Operator task | Guide |
+| --- | --- |
+| Run your first CI job | [First fleet job quickstart](docs/QUICKSTART.md) |
+| Prepare your first staging deploy | [First staging deployment quickstart](docs/STAGING-QUICKSTART.md) for separately authorized staging |
+| Upgrade an existing fleet | [Template upgrade guide by installed baseline](https://github.com/RandomDevelopment/ci-fleet-config-template/blob/main/docs/UPDATING.md#start-from-your-baseline) and [controller upgrade and rollback](docs/DESIRED-STATE.md#check-upgrade-roll-back-and-remove) |
+
+Agents start with the [task-routing checklist](AGENTS.md#route-the-task).
 
 Run the complete engine and embedded-configuration suites without Actions through
 [local validation](docs/LOCAL-VALIDATION.md). Signed local configuration evidence
@@ -156,7 +166,8 @@ Read-only validation, repository-writing releases, staging, production deploymen
 | Isolated one-job pilot | Completed on 2026-07-15, recorded in [Issue #7](https://github.com/RandomDevelopment/ci-fleet/issues/7) |
 | Schema-v3 worker-controller installer | Accepted for reviewed ordinary-CI lifecycle on isolated fleet hosts |
 | Downstream project migration | Requires per-project parallel validation, compliance, and rollback evidence |
-| Reusable tester and deployer components | Under review, not production-ready |
+| Tester host | Under review |
+| Dedicated deployer host | Experimental staging under separate authorization |
 | Production-ready release | Gated by migration evidence and separate privileged-delivery approval |
 
 The completed pilot proved read-only permissions, one-job ephemeral runner lifecycle, scoped cleanup, zero final job residue, controller health, and preservation of existing project runners. The current phase is controlled migration through reviewed schema-v3 desired state, as recorded in [accepted design decisions](docs/DESIGN-DECISIONS.md). Each project must complete [parallel validation](docs/MIGRATING-EXISTING-CI.md), the [compliance checklist](docs/COMPLIANCE-CHECKLIST.md), and rollback verification before cutover. The pilot does not authorize production deployment, privileged delivery on ordinary-CI workers, legacy-runner retirement, or unreviewed capacity increases.
