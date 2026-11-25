@@ -19,7 +19,7 @@ Use one shared pool of disposable CI workers across multiple trusted private rep
 | Operator task | Guide |
 | --- | --- |
 | Run your first CI job | [First fleet job quickstart](docs/QUICKSTART.md) |
-| Prepare your first staging deploy | [Deployer host runbook](docs/DEPLOYER-HOST.md) for separately authorized staging |
+| Prepare your first staging deploy | [First staging deployment quickstart](docs/STAGING-QUICKSTART.md) for separately authorized staging |
 | Upgrade an existing fleet | [Template upgrade guide by installed baseline](https://github.com/RandomDevelopment/ci-fleet-config-template/blob/main/docs/UPDATING.md#start-from-your-baseline) and [controller upgrade and rollback](docs/DESIRED-STATE.md#check-upgrade-roll-back-and-remove) |
 
 Agents start with the [task-routing checklist](AGENTS.md#route-the-task).

@@ -9,7 +9,7 @@ Operators can start with the task below. Agents use the [task-routing checklist]
 | I want to… | Read |
 | --- | --- |
 | Run my first CI job | [First fleet job quickstart](QUICKSTART.md) |
-| Prepare my first staging deploy | [Deployer host runbook](DEPLOYER-HOST.md) for separately authorized staging. The [dedicated quickstart](https://github.com/RandomDevelopment/ci-fleet/issues/183) is pending. |
+| Prepare my first staging deploy | [First staging deployment quickstart](STAGING-QUICKSTART.md) for separately authorized staging |
 | Upgrade an existing fleet | [Template upgrade guide by installed baseline](https://github.com/RandomDevelopment/ci-fleet-config-template/blob/main/docs/UPDATING.md#start-from-your-baseline) and [controller upgrade and rollback](DESIRED-STATE.md#check-upgrade-roll-back-and-remove) |
 | Choose a host role and complete or safely stop an operator workflow | [Operator workflows](OPERATOR-WORKFLOWS.md) |
 | Understand the whole system | [Architecture](ARCHITECTURE.md) |

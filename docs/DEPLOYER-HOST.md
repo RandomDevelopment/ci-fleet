@@ -2,6 +2,8 @@
 
 This runbook installs the generic ci-fleet deployer runtime on a dedicated Linux host. It does not deploy an application by itself. Application repositories retain their own deployment logic through the narrow adapter contract below.
 
+For a first authorized rollout and rollback exercise, use the [staging quickstart](STAGING-QUICKSTART.md).
+
 A deployer is a separate trust boundary. It must never register as an ordinary GitHub Actions runner, accept pull-request jobs, share a Docker daemon with CI workers, or run on the ordinary controller host. Staging and production require different hosts or equally isolated security boundaries, identities, credential scopes, state, approval evidence, and target policy.
 
 ## Capability and security model
