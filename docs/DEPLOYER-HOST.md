@@ -165,9 +165,11 @@ server {
 }
 ```
 
-During deployment, the adapter must stop the incumbent and verify it exited
-with restart disabled before the candidate removes a stale socket entry or
-binds at the same path.
+During deployment, the adapter must stop the incumbent and verify it exited.
+If the incumbent has a restart policy, remove the stopped container through
+the broker while retaining the socket volume. A stopped container with no
+restart policy may be retained. Only then may the candidate remove the stale
+socket entry or bind at the same path.
 Configure [verified-stop rollback](#install-check-repair-upgrade-drain-and-rollback)
 for the socket owner so core verifies the incumbent's exit before dispatching
 the retained adapter. Expect the upstream to be unavailable during the stop
