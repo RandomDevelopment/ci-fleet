@@ -228,10 +228,14 @@ def main():
         ))
         host_http(port, 200, b'candidate')
         unrelated = {'user': 65533, 'group': 65533, 'extra_groups': []}
-        for path, identity in ((socket_path, unrelated), (source / 'http.sock', unrelated),
-                               (source / 'http.sock', PROXY_ID)):
-            denied = subprocess.run([sys.executable, '-c', CONNECT, str(path)],
-                                    capture_output=True, timeout=5, **identity)
+        denied = subprocess.run([sys.executable, '-c', CONNECT, str(socket_path)],
+                                capture_output=True, timeout=5, **unrelated)
+        assert denied.returncode == 1 and b'PermissionError' in denied.stderr, denied.stderr
+        for identity in (unrelated, PROXY_ID):
+            denied = subprocess.run(
+                [sys.executable, '-c', 'import os,sys; os.stat(sys.argv[1])', str(source / 'http.sock')],
+                capture_output=True, timeout=5, **identity,
+            )
             assert denied.returncode == 1 and b'PermissionError' in denied.stderr, denied.stderr
         info = backend.inspect('containers', candidate)
         assert not info['HostConfig']['PortBindings'] and not info['NetworkSettings']['Ports']
