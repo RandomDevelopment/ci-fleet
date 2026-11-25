@@ -77,7 +77,93 @@ Every Docker resource must carry four labels from the active policy: `io.randomd
 
 Operations have no interactive input. Zero means success; nonzero means failure. Direct installer validation and health calls are limited to two minutes. Scheduled health allows four minutes for prerequisite checks, the two-minute adapter and verified teardown; rollback is limited to 45 minutes. The adapter must avoid child processes that outlive those bounds, redact logs, and never print credential contents, authorization headers, cookies, private endpoints, or secret-manager responses. Core validates immutable identifiers and approval evidence; it cannot validate application-specific correctness.
 
-The Docker API permits only the approved digest-pinned artifact, scoped internal bridge networks, local named volumes without driver options, and containers with positive limits capped at 2 GiB memory, two CPUs and 256 PIDs, private cgroups/namespaces, `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`. The opt-in Chromium profile below is the only custom seccomp capability. Host ports must bind loopback above port 1023. Build, exec, archive access, global pruning, arbitrary binds and alternate network attachments are rejected. Every image-declared volume destination must use a pre-created scoped labelled volume, so Docker cannot create anonymous volumes during container creation. The broker drops adapter-supplied registry authentication headers. Pulls use anonymous registry access; private artifacts must be preloaded by a separately authorized operator process. Adapters must use this contract rather than unrestricted Compose or host administration. Validation and health can only read; cleanup can only inspect and delete scoped resources.
+The Docker API permits only the approved digest-pinned artifact, scoped internal bridge networks, local named volumes without driver options, and containers with positive limits capped at 2 GiB memory, two CPUs and 256 PIDs, private cgroups/namespaces, `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`. The opt-in Chromium profile below is the only custom seccomp capability. The broker rejects public Docker binds and accepts explicit IPv4 loopback bindings above port 1023 for compatibility. Use the [Unix socket ingress contract](#host-local-http-ingress) for a host-local HTTP route. Build, exec, archive access, global pruning, arbitrary binds and alternate network attachments are rejected. Every image-declared volume destination must use a pre-created scoped labelled volume, so Docker cannot create anonymous volumes during container creation. The broker drops adapter-supplied registry authentication headers. Pulls use anonymous registry access; private artifacts must be preloaded by a separately authorized operator process. Adapters must use this contract rather than unrestricted Compose or host administration. Validation and health can only read; cleanup can only inspect and delete scoped resources.
+
+### Host-local HTTP ingress
+
+On Docker 26.1.5 a container on an internal bridge can pass its in-container
+HTTP check while `HostConfig.PortBindings` lists a loopback binding and
+`NetworkSettings.Ports` is empty. Docker skips programming external endpoint
+connectivity for internal networks. Use a host-local reverse proxy with a
+pathname Unix socket upstream on a scoped named volume. Keep the workload on
+its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https://github.com/moby/moby/blob/v26.1.5/libnetwork/endpoint.go#L609-L614)
+
+1. Provision one dedicated, labelled local volume with no driver options for
+   the exclusive HTTP service. Mount it read-write at a fixed, empty path such as
+   `/run/ingress` in the approved artifact. The application serves HTTP on
+   `/run/ingress/http.sock` and declares a Docker health check that makes an
+   HTTP request through that socket. Keep credentials and application data in
+   their own storage. Use the same volume, socket path and compatible file
+   permissions in the candidate and the last-known-good artifact.
+2. On the host, the authorized operator verifies the volume name, ownership
+   labels, local driver, empty options and canonical `Mountpoint` with
+   `docker volume inspect` against the dedicated daemon. Give the workload's
+   mapped UID write access to the volume directory. On rootless Docker, use
+   the host UID mapped from the actual container UID. Give the proxy worker
+   search access to that directory and permission to connect to the socket.
+   For example, use mode `0755` on the volume directory and `0666` on the
+   socket with the proxy-only parent directory below.
+3. The operator exposes only that volume directory to the proxy through a
+   read-only bind mount with `nosymfollow`. The workload controls the socket
+   filename, so the kernel must reject symlinks before the proxy connects.
+   Use a root-owned parent with search access for only the proxy's trusted
+   group. Keep all ancestors root-owned and outside the workload's control.
+   Run the proxy worker under a dedicated unprivileged identity without
+   Docker access, deployer credentials or access to the daemon's data root.
+   Start the proxy only after checking the mount source and flags. Require the
+   same checks on boot and stop the proxy before unmounting or replacing the
+   volume. Any missing flag, including `nosymfollow`, blocks activation.
+
+Example host mount for a fictional target. Set `volume_dir` to the verified
+volume `Mountpoint` and use the actual proxy worker's group in place of
+`example-proxy`. Run the mount commands as root.
+
+```bash
+route=/run/ci-fleet-ingress/example-staging
+install -d -o root -g example-proxy -m 0710 "$route"
+install -d -o root -g root -m 0755 "$route/upstream"
+mount --bind "$volume_dir" "$route/upstream"
+mount -o remount,bind,ro,nosuid,nodev,noexec,nosymfollow "$route/upstream"
+test "$volume_dir" -ef "$route/upstream"
+findmnt --mountpoint "$route/upstream" --output TARGET,SOURCE,VFS-OPTIONS
+```
+
+Set the host proxy upstream to the mounted socket and use a loopback listener
+for the host-local route. For example, in an nginx `http` block:
+
+```nginx
+upstream example_staging {
+    server unix:/run/ci-fleet-ingress/example-staging/upstream/http.sock;
+}
+server {
+    listen 127.0.0.1:18080;
+    location / {
+        proxy_pass http://example_staging;
+    }
+}
+```
+
+Configure [verified-stop rollback](#install-check-repair-upgrade-drain-and-rollback)
+for the socket owner. The stopped container may leave a stale socket pathname.
+The replacement removes that entry and binds at the same path after core
+verifies the incumbent has exited. Expect the upstream to be unavailable
+during the stop and start. Connect to the pathname again for new requests.
+Keep the mounted volume through deployment, rollback and ordinary adapter
+cleanup. During retirement, stop the route and unmount before removing the
+volume.
+
+The adapter checks the Docker health status through the broker. The host
+operator checks the separate ingress path with a request through the proxy's
+loopback listener. Before staging cutover, exercise both checks before and
+after verified-stop rollback on the intended dedicated rootless deployer.
+Verify the response identifies the expected artifact, the proxy cannot reach
+the stopped service or follow a symlink out of the volume, the proxy works
+with its intended UID and group, and the workload retains its internal bridge
+with no published ports. Record the daemon, kernel, proxy and reviewed
+revisions with the redacted results. The disposable Docker fixture below
+covers the routing and rollback contract. Dedicated rootless deployer
+acceptance for this ingress path remains open in
+[#194](https://github.com/RandomDevelopment/ci-fleet/issues/194).
 
 ### Pinned Chromium seccomp profile
 
@@ -417,6 +503,14 @@ bash scripts/test-deployer-units.sh
 ```
 
 The lifecycle suite includes replay-ledger regressions and uses an isolated alternate root with mocked Docker, systemd and network commands. The adapter tests exercise the broker's adversarial validation and protected recovery contracts. Unit tests validate systemd definitions and boot-time operation-lock preparation. Run shell syntax, ShellCheck, documentation-link and committed-secret validation too. Required hosted CI retains container and full repository verification; no required check is removed by this decision.
+
+Full local validation records the real Docker ingress case in the
+`container-build-and-cleanup` log. To isolate that case on a disposable Linux
+Docker host, run:
+
+```bash
+sudo unshare --mount --propagation private python3 scripts/test_deployer_ingress.py
+```
 
 Track adoption in [MMPriceFeed migration](https://github.com/RandomDevelopment/mmrss/issues/126), [TF2 Recommendation Engine migration](https://github.com/RandomDevelopment/TF2-Recommendation-Engine/issues/373), and [configuration-template adoption](https://github.com/RandomDevelopment/ci-fleet-config-template/issues/26). Application implementation PRs may use local disposable tests and required CI/review without waiting for a prepared-host end-to-end exercise. Keep existing deployment paths available until separately authorized cutover and rollback decisions are complete. The template's current logical inventory does not become executable deployment authority merely because the core merges.
 

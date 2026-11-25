@@ -32,6 +32,7 @@ validation_command python-compile python3 -m py_compile \
   scripts/apt_cache.py \
   scripts/test_apt_cache.py \
   scripts/test_apt_cache_e2e.py \
+  scripts/test_deployer_ingress.py \
   scripts/bootstrap-github-callback.py \
   scripts/fixtures/fake-bootstrap-curl.py \
   scripts/verify_config_approval.py \
@@ -137,6 +138,7 @@ case ${CI_FLEET_IMAGE_COMPARISON:-required} in
   *) printf 'invalid image comparison selection\n' >&2; exit 2 ;;
 esac
 validation_command apt-cache-e2e python3 scripts/test_apt_cache_e2e.py "${cache_args[@]}"
+validation_command deployer-ingress unshare --mount --propagation private python3 scripts/test_deployer_ingress.py
 validation_command cleanup-e2e bash scripts/test-cleanup-e2e.sh
 CI_FLEET_INSTANCE=${CI_FLEET_VALIDATION_ID:-validation} validation_command runner-cleanup scripts/cleanup.sh
 

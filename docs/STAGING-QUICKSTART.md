@@ -122,9 +122,11 @@ Verify on the host without changing app state. The request should move to
 `last-request.conf` and `/var/log/ci-fleet-deployer/audit.log` should record
 `result=success` for the expected environment, target, commit, digest,
 approval and checkpoint. Check that the application health probe identifies
-the baseline release. For `example-app`, read its loopback health endpoint
-defined by the adapter and confirm the release in the response. A successful
-service exit alone cannot establish application health. Stop on failed or
+the baseline release. For an HTTP application using
+[host-local ingress](DEPLOYER-HOST.md#host-local-http-ingress), also request
+the health endpoint through the reverse proxy's loopback listener and
+confirm the release in the response. A successful service exit alone cannot
+establish application health. Stop on failed or
 uncertain results and use the [recovery procedure](DEPLOYER-HOST.md#failure-recovery).
 Preserve the audit and replay ledger. A consumed approval ID cannot be reused.
 
@@ -155,7 +157,9 @@ sudo ./scripts/install-deployer.sh --rollback --config /etc/ci-fleet-deployer/de
 
 Expect `result=CHANGED`, `health=healthy` and a successful rollback audit for
 the baseline digest. Confirm the application's health response identifies the
-baseline again. Restore the baseline's operator-owned policy and evidence as
+baseline again. For host-local HTTP ingress, repeat the request through the
+same proxy listener and confirm the baseline there too. Restore the
+baseline's operator-owned policy and evidence as
 directed by `next=restore-host-policy-evidence-then-check`. That restoration
 writes host-local files. Rerun the step 3 check and the read-only unit checks.
 If rollback is unavailable, blocked, failed or uncertain, stop and follow the
