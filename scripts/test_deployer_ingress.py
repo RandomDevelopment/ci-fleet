@@ -164,6 +164,17 @@ def main():
         os.chown(parent, 0, PROXY_ID['group'])
         mountpoint = parent / 'upstream'
         mountpoint.mkdir()
+        run('mount', '--bind', str(parent), str(parent))
+        cleanup.callback(run, 'umount', str(parent))
+        run('mount', '--make-shared', str(parent))
+        try:
+            mount_ingress(source, mountpoint)
+        except ValueError as error:
+            assert 'proxy route must be private' in str(error)
+        else:
+            cleanup.callback(run, 'umount', str(mountpoint))
+            raise AssertionError('volume was mounted beneath a shared route')
+        run('mount', '--make-private', str(parent))
         (root / 'volumes').symlink_to(source.parent.parent, target_is_directory=True)
         try:
             mount_ingress(root / 'volumes' / volume / '_data', mountpoint)

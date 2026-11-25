@@ -22,6 +22,11 @@ def mount_ingress(source: Path, target: Path) -> None:
     mounted = subprocess.run(['mountpoint', '-q', '--', str(target)], check=False)
     if mounted.returncode != 32:
         raise ValueError('proxy mount target must be an unmounted directory')
+    parent_propagation = subprocess.check_output(
+        ['findmnt', '-n', '-o', 'PROPAGATION', '--target', str(target.parent)], text=True,
+    ).strip()
+    if parent_propagation != 'private':
+        raise ValueError('proxy route must be private before attaching the volume')
 
     # The rootless daemon can replace path components. Open each without
     # following symlinks and bind the pinned directory, never the original path.

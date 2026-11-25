@@ -107,8 +107,9 @@ its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https:
    `/proc/<pid>/`. In the matching row, the host ID is the outside start
    plus the container ID's offset from the inside start. Keep ownership
    inside that mapping and configure it through the image and daemon.
-   The original `Mountpoint` must sit below a protected ancestor such as a daemon-owned
-   mode-`0700` directory with no access ACLs outside the workload's mounts.
+   The original `Mountpoint` must sit below a protected ancestor such as a
+   daemon-owned mode-`0700` directory with no access ACLs outside the
+   workload's mounts.
    Verify that the proxy worker and an unrelated host account cannot
    traverse the original path. The proxy needs search and socket access
    through the separate mount below. A mode-`0666` socket relies on both
@@ -122,6 +123,8 @@ its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https:
    workload's control. Give search access on the route directory to only
    the dedicated unprivileged proxy group. Keep the proxy worker outside
    the daemon group and away from deployer credentials and the data root.
+   Make the route private before attaching the volume so the initial bind
+   cannot propagate to another mount namespace.
    Start the proxy only after the verified mount succeeds. Apply that
    ordering on boot and stop the proxy before unmounting or replacing the
    volume. If setup is interrupted, keep the proxy stopped and unmount
@@ -130,13 +133,18 @@ its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https:
 Example host mount for a fictional target. Set `volume_dir` to the verified
 volume `Mountpoint` and use the actual proxy worker's group in place of
 `example-proxy`. Run from the reviewed ci-fleet checkout as root with the
-proxy stopped.
+proxy stopped and any incomplete upstream mount removed.
 
 ```bash
 route=/run/ci-fleet-ingress/example-staging
-install -d -o root -g example-proxy -m 0710 "$route"
-install -d -o root -g root -m 0755 "$route/upstream"
-python3 -I scripts/deployer_ingress_mount.py "$volume_dir" "$route/upstream"
+install -d -o root -g example-proxy -m 0710 "$route" &&
+mkdir -p -m 0755 "$route/upstream" &&
+propagation=$(findmnt -n -o PROPAGATION --target "$route") &&
+if [ "$propagation" != private ]; then
+    mount --bind "$route" "$route" &&
+    mount --make-private "$route"
+fi &&
+python3 -I scripts/deployer_ingress_mount.py "$volume_dir" "$route/upstream" &&
 findmnt --mountpoint "$route/upstream" --output TARGET,SOURCE,VFS-OPTIONS,PROPAGATION
 ```
 
@@ -166,7 +174,7 @@ the retained adapter. Expect the upstream to be unavailable during the stop
 and start. Connect to the pathname again for new requests.
 Keep the mounted volume through deployment, rollback and ordinary adapter
 cleanup. During retirement, stop the route and unmount before removing the
-volume.
+volume. Unmount the route directory too if setup used a self-bind.
 
 The adapter checks the Docker health status through the broker. The host
 operator checks the separate ingress path with a request through the proxy's
