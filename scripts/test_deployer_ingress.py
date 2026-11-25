@@ -154,6 +154,8 @@ def main():
         response = api(deploy, 'POST', '/volumes/create', {'Name': volume, 'Labels': deploy.labels})
         cleanup.callback(docker, 'volume', 'rm', volume)
         source = Path(response['Mountpoint'])
+        assert source.name == '_data' and source.parent.name == volume
+        source.parent.chmod(0o700)
         os.chown(source, APP_UID, APP_UID)
         source.chmod(0o755)
         parent = root / 'proxy'
@@ -225,9 +227,12 @@ def main():
             CANDIDATE, 'candidate', bridge, Mounts=mounts, RestartPolicy={'Name': 'always'},
         ))
         host_http(port, 200, b'candidate')
-        denied = subprocess.run([sys.executable, '-c', CONNECT, str(socket_path)],
-                                user=65533, group=65533, extra_groups=[], capture_output=True, timeout=5)
-        assert denied.returncode == 1 and b'PermissionError' in denied.stderr, denied.stderr
+        unrelated = {'user': 65533, 'group': 65533, 'extra_groups': []}
+        for path, identity in ((socket_path, unrelated), (source / 'http.sock', unrelated),
+                               (source / 'http.sock', PROXY_ID)):
+            denied = subprocess.run([sys.executable, '-c', CONNECT, str(path)],
+                                    capture_output=True, timeout=5, **identity)
+            assert denied.returncode == 1 and b'PermissionError' in denied.stderr, denied.stderr
         info = backend.inspect('containers', candidate)
         assert not info['HostConfig']['PortBindings'] and not info['NetworkSettings']['Ports']
         assert set(info['NetworkSettings']['Networks']) == {bridge}

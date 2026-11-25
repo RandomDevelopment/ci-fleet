@@ -89,8 +89,9 @@ pathname Unix socket upstream on a scoped named volume. Keep the workload on
 its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https://github.com/moby/moby/blob/v26.1.5/libnetwork/endpoint.go#L609-L614)
 
 1. Provision one dedicated, labelled local volume with no driver options for
-   the exclusive HTTP service. Mount it read-write at a fixed, empty path such as
-   `/run/ingress` in the approved artifact. The application serves HTTP on
+   the exclusive HTTP service. Give only that service a writable mount at a
+   fixed, empty path such as `/run/ingress` in the approved artifact. The
+   application serves HTTP on
    `/run/ingress/http.sock` and declares a Docker health check that makes an
    HTTP request through that socket. Keep credentials and application data in
    their own storage. Use the same volume, socket path and compatible file
@@ -99,10 +100,13 @@ its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https:
    labels, local driver, empty options and canonical `Mountpoint` with
    `docker volume inspect` against the dedicated daemon. Give the workload's
    mapped UID write access to the volume directory. On rootless Docker, use
-   the host UID mapped from the actual container UID. Give the proxy worker
-   search access to that directory and permission to connect to the socket.
-   For example, use mode `0755` on the volume directory and `0666` on the
-   socket with the proxy-only parent directory below.
+   the host UID mapped from the actual container UID. The original
+   `Mountpoint` must sit below a protected ancestor such as a daemon-owned
+   mode-`0700` directory outside the workload's mounts. Verify that the
+   proxy worker and an unrelated host account cannot traverse the original
+   path. The proxy needs search and socket access through the separate
+   mount below. For example, use mode `0755` on the volume directory and
+   `0666` on the socket with both host paths protected as described.
 3. The operator exposes only that volume directory to the proxy through a
    read-only bind mount with `nosymfollow`. The workload controls the socket
    filename, so the kernel must reject symlinks before the proxy connects.
@@ -129,7 +133,9 @@ findmnt --mountpoint "$route/upstream" --output TARGET,SOURCE,VFS-OPTIONS
 ```
 
 Set the host proxy upstream to the mounted socket and use a loopback listener
-for the host-local route. For example, in an nginx `http` block:
+for the host-local route. Other local processes can reach a loopback TCP
+listener. Apply proxy or application authentication if those callers lack
+authorization. For example, in an nginx `http` block:
 
 ```nginx
 upstream example_staging {
@@ -143,11 +149,13 @@ server {
 }
 ```
 
+During deployment, the adapter must stop the incumbent and verify it exited
+with restart disabled before the candidate removes a stale socket entry or
+binds at the same path.
 Configure [verified-stop rollback](#install-check-repair-upgrade-drain-and-rollback)
-for the socket owner. The stopped container may leave a stale socket pathname.
-The replacement removes that entry and binds at the same path after core
-verifies the incumbent has exited. Expect the upstream to be unavailable
-during the stop and start. Connect to the pathname again for new requests.
+for the socket owner so core verifies the incumbent's exit before dispatching
+the retained adapter. Expect the upstream to be unavailable during the stop
+and start. Connect to the pathname again for new requests.
 Keep the mounted volume through deployment, rollback and ordinary adapter
 cleanup. During retirement, stop the route and unmount before removing the
 volume.
@@ -156,10 +164,11 @@ The adapter checks the Docker health status through the broker. The host
 operator checks the separate ingress path with a request through the proxy's
 loopback listener. Before staging cutover, exercise both checks before and
 after verified-stop rollback on the intended dedicated rootless deployer.
-Verify the response identifies the expected artifact, the proxy cannot reach
-the stopped service or follow a symlink out of the volume, the proxy works
-with its intended UID and group, and the workload retains its internal bridge
-with no published ports. Record the daemon, kernel, proxy and reviewed
+Verify the response identifies the expected artifact and the proxy works with
+its intended UID and group. Confirm that the proxy cannot reach the stopped
+service, follow a symlink out of the volume or bypass the mount through the
+original path. Check that the workload retains its internal bridge with no
+published ports. Record the daemon, kernel, proxy and reviewed
 revisions with the redacted results. The disposable Docker fixture below
 covers the routing and rollback contract. Dedicated rootless deployer
 acceptance for this ingress path remains open in
