@@ -222,7 +222,8 @@ def main():
             legacy = start_service(legacy_cleanup, deploy, deploy.prefix + 'legacy', legacy_body)
             info = backend.inspect('containers', legacy)
             assert info['HostConfig']['PortBindings'] == legacy_body['HostConfig']['PortBindings']
-            assert not info['NetworkSettings']['Ports'], 'internal bridge unexpectedly published a port'
+            ports = info['NetworkSettings']['Ports'] or {}
+            assert not any(ports.values()), f'internal bridge unexpectedly published a port: {ports}'
             with socket.socket() as client:
                 assert client.connect_ex(('127.0.0.1', old_port)) == errno.ECONNREFUSED
             legacy_address = info['NetworkSettings']['Networks'][bridge]['IPAddress']

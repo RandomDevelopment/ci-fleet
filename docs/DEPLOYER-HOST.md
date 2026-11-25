@@ -81,10 +81,11 @@ The Docker API permits only the approved digest-pinned artifact, scoped internal
 
 ### Host-local HTTP ingress
 
-On Docker 26.1.5 a container on an internal bridge can pass its in-container
-HTTP check while `HostConfig.PortBindings` lists a loopback binding and
-`NetworkSettings.Ports` is empty. Docker skips programming external endpoint
-connectivity for internal networks. Use a host-local reverse proxy with a
+On Docker 26.1.5 and 29.4.2 a container on an internal bridge can pass its
+in-container HTTP check while the host loopback connection is refused.
+`HostConfig.PortBindings` lists the requested binding on both versions.
+`NetworkSettings.Ports` is empty on 26.1.5 and lists the exposed port with a
+null binding on 29.4.2. Use a host-local reverse proxy with a
 pathname Unix socket upstream on a scoped named volume. Keep the workload on
 its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https://github.com/moby/moby/blob/v26.1.5/libnetwork/endpoint.go#L609-L614)
 
