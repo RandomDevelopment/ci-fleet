@@ -85,7 +85,12 @@ docker build "${apt_options[@]}" -t example-test .
 # Or use docker buildx build --load with the same options and your builder.
 ```
 
-For Compose, use a build secret. `/dev/null` supplies an empty file when disabled:
+For Compose, stage the APT configuration as a mode `0600` file in a private,
+run-owned working directory outside the build context. Stage an empty file
+when the cache is disabled. Run Compose from that directory, pass the
+project's Compose file with `-f` and set `CI_FLEET_APT_CONFIG` for the command
+to the staged file's absolute path. Buildx Bake permits file secrets under
+its working directory. Remove the staged file when the task ends.
 
 ```yaml
 services:
@@ -96,7 +101,7 @@ services:
         - ci_fleet_apt
 secrets:
   ci_fleet_apt:
-    file: ${CI_FLEET_APT_CONFIG:-/dev/null}
+    file: ${CI_FLEET_APT_CONFIG:?stage the APT config first}
 ```
 
 Use the project's existing task/shard adapter and run-owned Compose project.

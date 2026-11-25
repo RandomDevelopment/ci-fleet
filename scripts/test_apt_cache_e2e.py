@@ -133,7 +133,9 @@ def main():
             run("docker", "run", "-d", "--name", cache, tools_image)
             address = run("docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", cache)
             proxy = f"http://{address}:3142"
-            secret = temporary / "apt.conf"
+            compose_directory = temporary / "compose"
+            compose_directory.mkdir()
+            secret = compose_directory / "apt.conf"
             secret.write_text(apt_config(proxy))
             os.chmod(secret, 0o600)
             step = "cache readiness"
@@ -202,20 +204,22 @@ def main():
                 if path == "compose":
                     compose = dict(services={"test": dict(image=tag, build=dict(context="/context",
                                    args=dict(BASE_IMAGE=base_image), secrets=["ci_fleet_apt"]))},
-                                   secrets={"ci_fleet_apt": dict(file="/etc/apt/apt.conf.d/99-ci-fleet-cache")})
-                    compose_file = temporary / "compose.json"
+                                   secrets={"ci_fleet_apt": dict(file="apt.conf")})
+                    compose_file = compose_directory / "compose.json"
                     compose_file.write_text(json.dumps(compose))
-                    run("docker", "cp", str(compose_file), client + ":/compose.json")
-                    command = ["docker", "compose", "-p", prefix, "-f", "/compose.json", "build", "--no-cache"]
+                    # Bake permits the secret under its working directory, separate from the build context.
+                    run("docker", "cp", str(compose_directory), client + ":/compose-build")
+                    command = ["--workdir", "/compose-build", client, "docker", "compose", "-p", prefix,
+                               "-f", "compose.json", "build", "--no-cache"]
                 elif path == "buildx":
                     builders.append((client, prefix))
                     containers.append("buildx_buildkit_" + prefix + "0")
                     run("docker", "exec", client, "docker", "buildx", "create", "--name", prefix,
                         "--driver", "docker-container", "--driver-opt", "image=" + BUILDKIT)
-                    command = ["docker", "buildx", "build", "--builder", prefix, "--load", *args, "-t", tag, "/context"]
+                    command = [client, "docker", "buildx", "build", "--builder", prefix, "--load", *args, "-t", tag, "/context"]
                 else:
-                    command = ["docker", "build", *args, "-t", tag, "/context"]
-                measure(cache, path, lambda: run("docker", "exec", client, *command))
+                    command = [client, "docker", "build", *args, "-t", tag, "/context"]
+                measure(cache, path, lambda: run("docker", "exec", *command))
                 exported = temporary / (path + ".tar")
                 run("docker", "image", "save", "--output", str(exported), tag)
                 with exported.open("rb") as image:
