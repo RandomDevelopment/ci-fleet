@@ -90,46 +90,54 @@ its internal bridge and omit Docker port publishing. [Moby 26.1.5 source](https:
 
 1. Provision one dedicated, labelled local volume with no driver options for
    the exclusive HTTP service. Give only that service a writable mount at a
-   fixed, empty path such as `/run/ingress` in the approved artifact. The
-   application serves HTTP on
-   `/run/ingress/http.sock` and declares a Docker health check that makes an
-   HTTP request through that socket. Keep credentials and application data in
-   their own storage. Use the same volume, socket path and compatible file
-   permissions in the candidate and the last-known-good artifact.
+   fixed path such as `/run/ingress`. In the approved image, give the empty
+   mount directory mode `0755` and ownership by the service's numeric UID
+   and GID. Docker can copy the image directory's ownership and mode to the
+   empty volume on first use. Use the same non-root UID, GID, volume and
+   socket path in the candidate and the last-known-good artifact. The
+   application serves HTTP on `/run/ingress/http.sock` and declares a Docker
+   health check that makes an HTTP request through that socket. Keep
+   credentials and application data in their own storage.
 2. On the host, the authorized operator verifies the volume name, ownership
    labels, local driver, empty options and canonical `Mountpoint` with
-   `docker volume inspect` against the dedicated daemon. Give the workload's
-   mapped UID write access to the volume directory. On rootless Docker, use
-   the host UID mapped from the actual container UID. The original
-   `Mountpoint` must sit below a protected ancestor such as a daemon-owned
-   mode-`0700` directory outside the workload's mounts. Verify that the
-   proxy worker and an unrelated host account cannot traverse the original
-   path. The proxy needs search and socket access through the separate
-   mount below. For example, use mode `0755` on the volume directory and
-   `0666` on the socket with both host paths protected as described.
+   `docker volume inspect` against the dedicated daemon. Match the path to
+   `<data-root>/volumes/<scoped-volume>/_data` under the operator-approved
+   Docker data root. Verify ownership and mode after Docker initializes the
+   volume. Read the actual rootless daemon's `uid_map` and `gid_map` under
+   `/proc/<pid>/`. In the matching row, the host ID is the outside start
+   plus the container ID's offset from the inside start. Keep ownership
+   inside that mapping and configure it through the image and daemon.
+   The original `Mountpoint` must sit below a protected ancestor such as a daemon-owned
+   mode-`0700` directory with no access ACLs outside the workload's mounts.
+   Verify that the proxy worker and an unrelated host account cannot
+   traverse the original path. The proxy needs search and socket access
+   through the separate mount below. A mode-`0666` socket relies on both
+   host paths having these protections.
 3. The operator exposes only that volume directory to the proxy through a
-   read-only bind mount with `nosymfollow`. The workload controls the socket
-   filename, so the kernel must reject symlinks before the proxy connects.
-   Use a root-owned parent with search access for only the proxy's trusted
-   group. Keep all ancestors root-owned and outside the workload's control.
-   Run the proxy worker under a dedicated unprivileged identity without
-   Docker access, deployer credentials or access to the daemon's data root.
-   Start the proxy only after checking the mount source and flags. Require the
-   same checks on boot and stop the proxy before unmounting or replacing the
-   volume. Any missing flag, including `nosymfollow`, blocks activation.
+   private, read-only bind mount with `nosymfollow`. Use the mount helper
+   below. It opens each source directory without following symlinks and
+   binds the open directory, so a path swap cannot redirect the privileged
+   mount. The kernel also rejects symlinks at the socket filename during
+   proxy requests. Keep the target ancestors root-owned and outside the
+   workload's control. Give search access on the route directory to only
+   the dedicated unprivileged proxy group. Keep the proxy worker outside
+   the daemon group and away from deployer credentials and the data root.
+   Start the proxy only after the verified mount succeeds. Apply that
+   ordering on boot and stop the proxy before unmounting or replacing the
+   volume. If setup is interrupted, keep the proxy stopped and unmount
+   the incomplete route before retrying.
 
 Example host mount for a fictional target. Set `volume_dir` to the verified
 volume `Mountpoint` and use the actual proxy worker's group in place of
-`example-proxy`. Run the mount commands as root.
+`example-proxy`. Run from the reviewed ci-fleet checkout as root with the
+proxy stopped.
 
 ```bash
 route=/run/ci-fleet-ingress/example-staging
 install -d -o root -g example-proxy -m 0710 "$route"
 install -d -o root -g root -m 0755 "$route/upstream"
-mount --bind "$volume_dir" "$route/upstream"
-mount -o remount,bind,ro,nosuid,nodev,noexec,nosymfollow "$route/upstream"
-test "$volume_dir" -ef "$route/upstream"
-findmnt --mountpoint "$route/upstream" --output TARGET,SOURCE,VFS-OPTIONS
+python3 -I scripts/deployer_ingress_mount.py "$volume_dir" "$route/upstream"
+findmnt --mountpoint "$route/upstream" --output TARGET,SOURCE,VFS-OPTIONS,PROPAGATION
 ```
 
 Set the host proxy upstream to the mounted socket and use a loopback listener

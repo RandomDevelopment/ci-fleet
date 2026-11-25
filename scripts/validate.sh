@@ -32,6 +32,7 @@ validation_command python-compile python3 -m py_compile \
   scripts/apt_cache.py \
   scripts/test_apt_cache.py \
   scripts/test_apt_cache_e2e.py \
+  scripts/deployer_ingress_mount.py \
   scripts/test_deployer_ingress.py \
   scripts/bootstrap-github-callback.py \
   scripts/fixtures/fake-bootstrap-curl.py \

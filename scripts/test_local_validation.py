@@ -495,10 +495,17 @@ if args[:1] == ["logs"]:
             (scripts / "test_apt_cache_e2e.py").write_text(
                 "import os, sys\nsys.exit(int(os.environ['TEST_STAGE_STATUS']))\n")
             (scripts / "test_proxy_memory.py").write_text("")
+            (scripts / "test_deployer_ingress.py").write_text("")
             (scripts / "scan_committed_secrets.py").write_text("")
             for name in ("test-cleanup-e2e.sh", "cleanup.sh"):
                 path = scripts / name
                 path.write_text("#!/bin/bash\nexit 0\n"); path.chmod(0o755)
+            unshare = root / "unshare"
+            unshare.write_text(
+                '#!/bin/bash\n[[ "$*" == "--mount --propagation private python3 scripts/test_deployer_ingress.py" ]] || exit 1\n'
+                'shift 3\nexec "$@"\n'
+            )
+            unshare.chmod(0o755)
             docker = root / "docker"
             docker.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$TEST_DOCKER_LOG"

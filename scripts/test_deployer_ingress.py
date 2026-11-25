@@ -19,6 +19,7 @@ import time
 import uuid
 
 import deployer_adapter as adapter
+from deployer_ingress_mount import mount_ingress
 
 
 CANDIDATE = 'docker.io/library/python@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e'
@@ -59,12 +60,12 @@ GET_TCP = "import sys,urllib.request; assert urllib.request.urlopen(sys.argv[1],
 LOCAL_TCP = 'http://127.0.0.1:8080/health'
 
 
-def run(*args):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+def run(*args, timeout=60):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
 
 
-def docker(*args):
-    return run('docker', *args)
+def docker(*args, timeout=60):
+    return run('docker', *args, timeout=timeout)
 
 
 def api(policy, method, path, value=None):
@@ -132,7 +133,7 @@ def main():
     os.environ['DOCKER_HOST'] = 'unix://' + docker_socket
     for image in (CANDIDATE, RETAINED):
         if subprocess.run(['docker', 'image', 'inspect', image], capture_output=True, timeout=30).returncode:
-            docker('pull', image)
+            docker('pull', image, timeout=300)
     os.environ.update(CI_FLEET_DEPLOYER_TESTING='1', CI_FLEET_DEPLOYER_TEST_DOCKER_SOCKET='1')
     backend = adapter.TestingDockerBackend(docker_socket, 180)
     values = {'ARTIFACT_IMAGE': CANDIDATE, 'ENVIRONMENT': 'staging', 'TARGET_ID': 'fixture',
@@ -144,7 +145,7 @@ def main():
     bridge, outside, volume = (deploy.prefix + suffix for suffix in ('internal', 'outside', 'ingress'))
 
     with ExitStack() as cleanup:
-        root = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='fleet-ingress-', dir='/tmp')))
+        root = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='fleet-ingress-', dir='/run')))
         journal_dir = root / 'journal'
         journal_dir.mkdir(mode=0o700)
         root.chmod(0o711)
@@ -163,11 +164,16 @@ def main():
         os.chown(parent, 0, PROXY_ID['group'])
         mountpoint = parent / 'upstream'
         mountpoint.mkdir()
-        run('mount', '--bind', str(source), str(mountpoint))
+        (root / 'volumes').symlink_to(source.parent.parent, target_is_directory=True)
+        try:
+            mount_ingress(root / 'volumes' / volume / '_data', mountpoint)
+        except OSError as error:
+            assert error.errno in (errno.ELOOP, errno.ENOTDIR)
+        else:
+            cleanup.callback(run, 'umount', str(mountpoint))
+            raise AssertionError('volume bind followed a source path symlink')
+        mount_ingress(source, mountpoint)
         cleanup.callback(run, 'umount', str(mountpoint))
-        run('mount', '-o', 'remount,bind,ro,nosuid,nodev,noexec,nosymfollow', str(mountpoint))
-        flags = run('findmnt', '-n', '-o', 'VFS-OPTIONS', '--mountpoint', str(mountpoint)).split(',')
-        assert {'ro', 'nosuid', 'nodev', 'noexec', 'nosymfollow'} <= set(flags), flags
 
         def payload(image, revision, network, **host_options):
             probe = ['python', '-c', GET_TCP, LOCAL_TCP] if revision == 'legacy' else ['python', '-c', GET_UNIX]
