@@ -279,13 +279,26 @@ def _validate_exports(directory_fd: int, observer_gid: int) -> tuple[list[str], 
 
 
 def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int, *, _directory_fd: int | None = None) -> None:
+    _publish_export(base, snapshot, observer_gid, "endpoint.json", MAX_ENDPOINT_BYTES, _directory_fd)
+
+
+def publish_jobs(base: Path, snapshot: dict[str, Any], observer_gid: int, *, directory_fd: int) -> None:
+    _publish_export(base, snapshot, observer_gid, "jobs.json", MAX_JOB_BYTES, directory_fd)
+
+
+def encode_json(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False,
+                       allow_nan=False) + "\n").encode("utf-8")
+
+
+def _publish_export(base: Path, snapshot: dict[str, Any], observer_gid: int, name: str,
+                    limit: int, _directory_fd: int | None) -> None:
     _require(isinstance(snapshot, dict), "invalid_json")
     try:
-        value = (json.dumps(snapshot, separators=(",", ":"), sort_keys=True, ensure_ascii=False,
-                            allow_nan=False) + "\n").encode("utf-8")
+        value = encode_json(snapshot)
     except (UnicodeError, TypeError, ValueError, RecursionError):
         raise StoreError("invalid_json") from None
-    _require(len(value) <= MAX_ENDPOINT_BYTES, "too_large")
+    _require(len(value) <= limit, "too_large")
     directory_fd = _directory_fd
     temporary_fd = None
     try:
@@ -296,15 +309,16 @@ def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int, *,
             except BlockingIOError:
                 raise StoreError("busy") from None
         temporary, _ = _validate_exports(directory_fd, observer_gid)
-        for name in temporary:
-            os.unlink(name, dir_fd=directory_fd)
+        for abandoned in temporary:
+            os.unlink(abandoned, dir_fd=directory_fd)
         _, total = _validate_exports(directory_fd, observer_gid)
         _require(total + len(value) <= MAX_EXPORT_BYTES, "too_large")
-        temporary_fd = os.open("endpoint.json.tmp", os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        temporary_name = name + ".tmp"
+        temporary_fd = os.open(temporary_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                                | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
         os.fchmod(temporary_fd, 0o600)
         metadata = os.fstat(temporary_fd)
-        _regular(metadata, modes=(0o600,), max_bytes=MAX_ENDPOINT_BYTES, gid=INITIAL_GID)
+        _regular(metadata, modes=(0o600,), max_bytes=limit, gid=INITIAL_GID)
         _no_acl(temporary_fd, "unsafe_file")
         offset = 0
         while offset < len(value):
@@ -316,7 +330,7 @@ def publish_endpoint(base: Path, snapshot: dict[str, Any], observer_gid: int, *,
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
-        os.replace("endpoint.json.tmp", "endpoint.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         os.fsync(directory_fd)
     except OSError as error:
         raise _os_error(error) from None
@@ -340,3 +354,29 @@ def read_endpoint(base: Path, observer_gid: int, *, _directory_fd: int | None = 
     finally:
         if _directory_fd is None and directory_fd is not None:
             os.close(directory_fd)
+
+
+def read_jobs(base: Path, observer_gid: int, *, directory_fd: int | None = None,
+              cached: tuple | None = None) -> tuple[tuple, dict]:
+    fd = _open_exports(base, observer_gid) if directory_fd is None else directory_fd
+    try:
+        identity = jobs_identity(fd, observer_gid)
+        if cached is not None and cached[0] == identity:
+            return cached
+        value = _read_at(fd, "jobs.json", modes=(0o640,), max_bytes=MAX_JOB_BYTES, gid=observer_gid)
+        return identity, decode_json(value, max_bytes=MAX_JOB_BYTES)
+    except OSError as error:
+        raise _os_error(error) from None
+    finally:
+        if directory_fd is None:
+            os.close(fd)
+
+
+def jobs_identity(directory_fd: int, observer_gid: int) -> tuple:
+    try:
+        _validate_exports(directory_fd, observer_gid)
+        metadata = os.stat("jobs.json", dir_fd=directory_fd, follow_symlinks=False)
+        _regular(metadata, modes=(0o640,), max_bytes=MAX_JOB_BYTES, gid=observer_gid)
+        return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_ctime_ns
+    except OSError as error:
+        raise _os_error(error) from None

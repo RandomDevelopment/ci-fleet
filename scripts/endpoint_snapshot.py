@@ -14,8 +14,11 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from endpoint_jobs import AGE as JOB_MAX_AGE
+from endpoint_jobs import CURRENT_COVERAGE_GAPS
+from endpoint_jobs import allowance_clock, fingerprint, invalidate_allowance, publish_history, valid_summary, validate_projection
 from endpoint_snapshot_sources import CAPACITY_METRICS, CAPACITY_PERIOD, SourceError, capacity_aggregate, collect_documents
-from endpoint_snapshot_store import StoreError, publication_lock, publish_endpoint, read_endpoint
+from endpoint_snapshot_store import StoreError, publication_lock, publish_endpoint, read_endpoint, read_jobs
 
 MAX_BYTES = 65_536
 CONTROLLER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -46,8 +49,8 @@ RECONCILIATION = {"bootstrap", "converged", "drift", "failed", "invalid", "pendi
 STALE_AFTER = {"controller": 120, "enrollment_identity": 120, "enrollment_listener": 120,
                "runtime_revision": 120, "manager_revision": 120, "staged_manager_revision": 900,
                "image_verification": 120, "capacity": 120, "health": 900, "reconciliation": 900,
-               "enrollment_reporting": 900, "desired_engine_revision": 900, "transaction": 900}
-UNSUPPORTED_SOURCES = {"enrollment_owner_confirmation", "jobs"}
+               "enrollment_reporting": 900, "desired_engine_revision": 900, "transaction": 900, "jobs": 120}
+UNSUPPORTED_SOURCES = {"enrollment_owner_confirmation"}
 CONTROLLER_ENROLLMENT = {
     "enrollment_authentication": ("session_opened_at", "authenticated"),
     "enrollment_scale_set": ("matched_at", "matched"),
@@ -162,6 +165,11 @@ DATA_FIELDS = {
     "transaction": {"outcome": choice("rejected", "rollback_verified", "applied", "rollback_unverified"),
                     "phase": choice("pre_transaction"),
                     "reason": choice(*TRANSACTION_REASONS)},
+    "jobs": {"scale_set": token, "pending": lambda v: type(v) is bool,
+             "source_available": lambda v: type(v) is bool, "last_poll_at": integer,
+             "generation": lambda v: v is None or isinstance(v, str),
+             "export_fingerprint": lambda v: v is None or isinstance(v, str), "gaps": lambda v: isinstance(v, dict),
+             "demand": lambda v: isinstance(v, dict)},
     **{name: {} for name in UNSUPPORTED_SOURCES},
 }
 SOURCE_NAMES = set(DATA_FIELDS)
@@ -206,6 +214,7 @@ def validate_data(name: str, value: dict) -> None:
         "health": {"status", "checks", "desired_state"},
         "reconciliation": {"state"},
         "transaction": {"outcome"},
+        "jobs": set(DATA_FIELDS["jobs"]) - {"demand"},
     }.get(name, set(DATA_FIELDS[name]))
     if name == "installation":
         if value.get("record_state") == "absent":
@@ -660,6 +669,8 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
             raise SnapshotError("invalid_snapshot")
         if name not in FOUNDATION_SOURCES and source["data"] and source["availability"] != "available":
             raise SnapshotError("invalid_snapshot")
+        if name == "jobs" and source["availability"] == "available" and not valid_summary(source["data"], source["observed_at"]):
+            raise SnapshotError("invalid_snapshot")
         if name == "installation" and "installed_at" in source["data"]:
             timestamp(source["data"]["installed_at"], source["last_success_at"])
         if name == "reconciliation" and "last_success_at" in source["data"]:
@@ -700,6 +711,12 @@ def _validate_snapshot(value: Any, *, controller: str) -> None:
         if (health["data"]["desired_state"] != policy["data"]["policy_state"]
                 or health["last_success_at"] < policy["data"]["installed_at"]):
             raise SnapshotError("invalid_snapshot")
+    jobs = value["sources"]["jobs"]
+    if jobs["availability"] == "available" and (
+        policy["availability"] != "available" or policy["data"].get("record_state") != "installed"
+        or jobs["data"]["scale_set"] != policy["data"]["scale_set_name"]
+    ):
+        raise SnapshotError("invalid_snapshot")
     validate_new_sources(value["sources"])
     try:
         encoded = (json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode()
@@ -788,14 +805,18 @@ class SnapshotReader:
         if not isinstance(controller, str) or not CONTROLLER_ID.fullmatch(controller) or not isinstance(backend_bearer, str) or not BEARER.fullmatch(backend_bearer):
             raise SnapshotError("invalid_reader_configuration")
         self.base, self.observer_gid, self.controller, self._bearer = base, observer_gid, controller, backend_bearer
+        self._job_cache = None
 
-    def read(self, headers: Mapping[str, str], *, now: int | None = None) -> dict:
+    def _authenticate(self, headers: Mapping[str, str]) -> None:
         if not isinstance(headers, Mapping):
             raise SnapshotError("authentication_failed")
         authorization = [value for key, value in headers.items() if isinstance(key, str) and key.lower() == "authorization"]
         if (len(authorization) != 1 or not isinstance(authorization[0], str) or len(authorization[0]) != 50 or not authorization[0].isascii()
                 or not hmac.compare_digest(authorization[0], "Bearer " + self._bearer)):
             raise SnapshotError("authentication_failed")
+
+    def read(self, headers: Mapping[str, str], *, now: int | None = None) -> dict:
+        self._authenticate(headers)
         value = read_endpoint(self.base, self.observer_gid)
         validate_snapshot(value, controller=self.controller)
         for name in SOURCE_NAMES - value["sources"].keys():
@@ -818,6 +839,36 @@ class SnapshotReader:
         value["publisher_freshness"] = "unknown" if uncertain else "stale" if now - value["published_at"] > 120 else "current"
         return value
 
+    def read_job_history(self, headers: Mapping[str, str], *, now: int | None = None) -> dict:
+        self._authenticate(headers)
+        now = int(time.time()) if now is None else now
+        if not integer(now):
+            raise SnapshotError("invalid_argument")
+        cached = self._job_cache
+        try:
+            identity, history = read_jobs(self.base, self.observer_gid, cached=cached)
+            if cached is None or cached[0] != identity:
+                validate_projection(history, self.controller)
+        except StoreError:
+            self._job_cache = None
+            raise
+        self._job_cache = (identity, history)
+        try:
+            endpoint = self.read(headers, now=now)
+            source = endpoint["sources"]["jobs"]
+            data = source["data"]
+            current = (endpoint["publisher_freshness"] == source["freshness"] == "current"
+                       and data["generation"] == history["generation"] and data["scale_set"] == history["scale_set"]
+                       and data["export_fingerprint"] == fingerprint(identity)
+                       and not data["pending"] and data["source_available"]
+                       and 0 <= now - data["last_poll_at"] <= 120 and history["omitted_nonterminal"] == 0)
+        except (KeyError, StoreError, SnapshotError):
+            current = False
+        rows = [{**row, "current_activity": "unknown" if row["state"] == "running" and not current else row["state"]}
+                for row in history["records"] if row["last_observed_at"] > now - JOB_MAX_AGE]
+        return {**history, "gaps": dict(history["gaps"]), "records": rows,
+                "current_activity_verified": current and not (CURRENT_COVERAGE_GAPS & history["gaps"].keys())}
+
 
 def publish(controller: str, *, observer_gid: int, root: Path = Path("/"), now: int | None = None) -> dict:
     base = root / "var/lib/ci-fleet-observer"
@@ -835,7 +886,37 @@ def publish(controller: str, *, observer_gid: int, root: Path = Path("/"), now: 
                 raise
             previous = None
         documents, errors = collect_documents(controller, root=root)
-        value = build_snapshot(controller, documents, errors, now=int(time.time()) if now is None else now, previous=previous)
+        try:
+            value = build_snapshot(controller, documents, errors, now=int(time.time()) if now is None else now,
+                                   previous=previous)
+        except SnapshotError as error:
+            if error.code == "clock_uncertain":
+                invalidate_allowance(base, observer_gid)
+            raise
+        install = value["sources"]["installation"]["data"]
+        if install.get("record_state") == "installed":
+            def save_jobs_summary(summary: dict) -> None:
+                prior = value["sources"]["jobs"]
+                value["sources"]["jobs"] = evidence(summary, observed_at=value["published_at"])
+                try:
+                    validate_snapshot(value, controller=controller)
+                    publish_endpoint(base, value, observer_gid, _directory_fd=directory_fd)
+                except (StoreError, SnapshotError, OSError):
+                    value["sources"]["jobs"] = prior
+                    raise
+
+            try:
+                publish_history(
+                    base, observer_gid, directory_fd, controller, install["scale_set_name"], value["published_at"],
+                    lambda: allowance_clock(root) if value["clock_state"] != "uncertain" else None,
+                    (previous or {}).get("sources", {}).get("jobs", {}).get("data", {}), save_jobs_summary,
+                )
+                return value
+            except (StoreError, SnapshotError, OSError) as error:
+                if value["sources"]["jobs"]["data"].get("pending"):
+                    return value
+                value["sources"]["jobs"] = failure("unsupported" if getattr(error, "code", None) == "not_found"
+                                                    else "source_unavailable")
         publish_endpoint(base, value, observer_gid, _directory_fd=directory_fd)
         return value
 

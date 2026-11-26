@@ -48,6 +48,8 @@ validation_command python-compile python3 -m py_compile \
   scripts/disk_admission_sample.py \
   scripts/test_disk_admission_sample.py \
   scripts/endpoint_snapshot.py \
+  scripts/endpoint_jobs.py \
+  scripts/test_endpoint_jobs.py \
   scripts/endpoint_snapshot_sources.py \
   scripts/endpoint_snapshot_store.py \
   scripts/test_endpoint_snapshot.py \

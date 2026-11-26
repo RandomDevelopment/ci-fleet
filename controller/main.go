@@ -110,7 +110,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create listener: %w", err)
 	}
+	scaler.jobs = startJobObserver(ctx, jobPrivateDirectory, cfg.FleetInstance, set.Name, logger)
 	if err := scaler.recoverRunners(ctx); err != nil {
+		scaler.jobs.stop(false)
 		return err
 	}
 	disk.check()
@@ -119,7 +121,9 @@ func run(ctx context.Context) error {
 	defer statusTicker.Stop()
 	go scaler.publishStatus(ctx, statusTicker.C)
 	logger.Info("controller ready", "scaleSet", cfg.ScaleSetName, "minRunners", cfg.MinRunners, "maxRunners", cfg.MaxRunners)
-	if err := l.Run(ctx, scaler); err != nil && !errors.Is(err, context.Canceled) {
+	err = l.Run(ctx, scaler)
+	scaler.jobs.stop(ctx.Err() != nil && (err == nil || errors.Is(err, context.Canceled)))
+	if err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("listener: %w", err)
 	}
 	scaler.shutdown(context.WithoutCancel(ctx))

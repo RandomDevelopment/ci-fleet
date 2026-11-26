@@ -68,7 +68,10 @@ func TestLateEventsAfterRestartDoNotDiscardTheRestOfTheSDKBatch(t *testing.T) {
 	const live = "ci-fleet-example-89abcdef"
 	client := &lifecycleBatchClient{message: &scaleset.RunnerScaleSetMessage{
 		MessageID: 7, Statistics: &scaleset.RunnerScaleSetStatistic{},
-		JobStartedMessages:   []*scaleset.JobStarted{{RunnerName: gone}, {RunnerName: live}},
+		JobStartedMessages: []*scaleset.JobStarted{
+			{RunnerName: gone, JobMessageBase: scaleset.JobMessageBase{JobID: "opaque-gone"}},
+			{RunnerName: live, JobMessageBase: scaleset.JobMessageBase{JobID: "opaque-live"}},
+		},
 		JobCompletedMessages: []*scaleset.JobCompleted{{RunnerName: gone}, {RunnerName: gone}, {RunnerName: live}, {RunnerName: live}},
 	}}
 	var removed atomic.Bool
@@ -129,6 +132,7 @@ func TestLateEventsAfterRestartDoNotDiscardTheRestOfTheSDKBatch(t *testing.T) {
 	defer docker.Close()
 	scaler := &Scaler{runners: newRunnerState(), dockerClient: docker, logger: slog.New(slog.DiscardHandler),
 		config: Config{FleetInstance: "example", ScaleSetName: "docker-ci-example", MaxRunners: 1, StatusFile: t.TempDir() + "/status.json"}}
+	scaler.jobs = &jobObserver{batches: make(chan jobBatch, jobQueueSize)}
 	if err := scaler.recoverRunners(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +151,22 @@ func TestLateEventsAfterRestartDoNotDiscardTheRestOfTheSDKBatch(t *testing.T) {
 	}
 	if !removed.Load() || removals.Load() != 1 || scaler.runners.count() != 0 {
 		t.Fatalf("later completion or duplicate was mishandled: removed=%v removals=%d runners=%d", removed.Load(), removals.Load(), scaler.runners.count())
+	}
+	var observed bool
+	for len(scaler.jobs.batches) > 0 {
+		batch := <-scaler.jobs.batches
+		for _, event := range batch.events {
+			if event.record.JobID == "opaque-gone" {
+				observed = true
+				if event.record.State != "unknown" || event.record.Gap != "runner_activity_unverified" ||
+					len(batch.events) != len(client.message.JobStartedMessages)+len(client.message.JobCompletedMessages) {
+					t.Fatalf("late start acquired current activity or split its SDK batch: %+v", batch)
+				}
+			}
+		}
+	}
+	if !observed {
+		t.Fatal("observer discarded a valid late start")
 	}
 }
 

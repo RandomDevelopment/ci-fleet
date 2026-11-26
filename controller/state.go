@@ -58,6 +58,13 @@ func (r *runnerState) markBusy(name string) bool {
 	return true
 }
 
+func (r *runnerState) isBusy(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.busy[name]
+	return ok
+}
+
 func (r *runnerState) contains(name, expectedID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

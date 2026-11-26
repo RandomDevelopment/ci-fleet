@@ -56,7 +56,7 @@ The authenticated read response adds derived `freshness` to each source and `pub
 | Capacity | Uses the active pool's valid anonymous samples from the last seven days. Exports the latest included sample time, sample and runner-observation counts, and p50/p95 for approved CPU, memory, swap, root/Docker disk and inode metrics. An idle, empty or unreadable history supplies no current measurement. Individual samples and job associations stay private. |
 | Transaction | Uses the controlled pre-transaction rejection phase/reason, terminal verified rollback, or installer outcome preserved by reconciliation. The record must identify the controller and match the applied configuration. Convergence, legacy records without controller identity, and free-text messages alone supply no transaction proof. |
 
-Job history and `jobs.json` remain in #119. The installation engine field records applied policy. The controller's reported software revision, selected filesystem release, desired engine and verified image bindings each have their own source.
+The jobs source carries the generation, pending status, and listener and coverage evidence described below. The installation engine field records applied policy. The controller's reported software revision, selected filesystem release, desired engine and verified image bindings each have their own source.
 
 Health helpers can substitute zero counts or a configured engine revision after failed reads. The snapshot excludes those fallback values and uses existing health reports and capacity samples without rerunning their probes. The Docker status read has a 64 KiB output cap and a five-second deadline. Image verification has a separate five-second budget. The capacity history read is capped at 128 MiB and the sampler's 26,000-record limit. Its aggregation has a 15-second processing budget. The snapshot reports unavailable when the history exceeds those bounds.
 
@@ -77,12 +77,72 @@ The export directory permits only `endpoint.json`, `jobs.json`, and their fixed 
 
 The producer exclusively creates `endpoint.json.tmp` at mode `0600`, assigns its observer GID before setting mode `0640`, flushes the complete bounded payload, atomically replaces the final file, and flushes the directory. Failure before replacement preserves the incumbent export. Reads authenticate first, close descriptors after bounded reads, and cannot access private source stores through the consumer API.
 
+## Worker job history
+
+The existing authenticated scale-set listener feeds a bounded, nonblocking
+queue that admits up to 16 batches of up to 256 events each. The controller writes to an already prepared,
+root-owned `/var/lib/ci-fleet-observer/private` directory at mode `0700`.
+It keeps `records` and its small state files at mode `0600`. Each record
+occupies a checksummed 4 KiB slot. Changes rewrite individual slots. The
+5,000 slots and four capped state and staging names use less than 20 MiB of
+logical file space. A background sweep clears retained payloads after seven
+days even when the listener is idle. This directory is independent of the
+controller status file and anonymous capacity history.
+
+Before polling, the controller attempts to commit an open-session marker
+within its startup budget. A failed or delayed observer startup leaves CI
+available and the observation source unavailable. A verified listener
+shutdown clears the marker after the queue flushes. An interrupted session,
+invalid slot, full event queue, or retention cap leaves controlled evidence
+of the gap. Each restart ends the previous session's claim of current
+activity. A later session can prove jobs it observes directly. It cannot
+recover missing events. Runner exit leaves an unknown result, and a
+recovered runner can have an unknown job association.
+
+The privileged publication command uses the existing export lock. Run it on
+the observer's 30-second cadence when #122 prepares the service. The jobs
+source reports the listener's successful poll time and separately timestamps
+the publisher's check. The publisher verifies the private records file and
+the controller's lifetime writer lock before accepting listener liveness.
+The publisher checks the records file against the committed file identity and
+checks the populated-slot count when building a new projection. Counts report only `TotalAvailableJobs` and
+`TotalAssignedJobs` in statistics from this scale-set session, with the time
+the controller observed them. The scopes and counts have no effect on
+scheduling. The covered time range uses local observations. Queue,
+scale-set assignment, runner assignment and finish times come from the
+source when supplied. Start and completion observation times are local to
+the listener. Run URLs use the configured GitHub origin, currently
+`https://github.com`, and validated owner, repository and workflow run ID.
+The opaque job ID has no verified REST correlation.
+
+`jobs.json` caps the projection at 4 MiB. It orders nonterminal records
+first, then terminal records by source finish time when available or local
+completion time. It reports retained, exported and omitted counts, including
+omitted nonterminal records. The generation changes when records or coverage
+change. A boot-bound monotonic allowance and durable in-flight reservation
+enforce at least 60 seconds between full-write attempts. An uncertain
+allowance requires a fresh 60-second cooldown. Liveness-only publication keeps
+the previous job file.
+
+`SnapshotReader.read_job_history(headers)` authenticates before reading either
+export. It caches only the validated current generation. Running activity
+requires a matching generation, a clear pending flag, fresh publisher and
+listener evidence, and sufficient projection coverage. Otherwise the
+authenticated read shows unknown current activity while preserving terminal
+results and original observation times. The aggregate activity flag also
+accounts for retained coverage gaps and loss of nonterminal records. A
+directly observed running job can remain current while aggregate coverage is
+unknown. Missing summary evidence defaults
+to unknown activity. The API accepts only the fixed job file.
+
 ## Verification
 
 ```bash
 python3 scripts/test_endpoint_snapshot.py
 python3 scripts/test_endpoint_snapshot_sources.py
 python3 scripts/test_endpoint_snapshot_store.py
+python3 scripts/test_endpoint_jobs.py
+(cd controller && go test -v -run 'TestJob(History|Observer)')
 ```
 
-The focused tests cover source identity, timestamp provenance, missing or invalid evidence, redaction, unknown and stale states, authentication before file access, protected permissions and paths, interrupted publication, and bounded subprocess and file reads. The repository's [full validation](LOCAL-VALIDATION.md) records test durations and stage logs. Live runner and reconciliation continuity during observation failures still require #122 acceptance on an approved host.
+The job fixtures report allocated and logical bytes and elapsed write times in the test output. The focused tests cover source identity, timestamp provenance, missing or invalid evidence, redaction, unknown and stale states, authentication before file access, protected permissions and paths, interrupted publication, and bounded subprocess and file reads. The repository's [full validation](LOCAL-VALIDATION.md) records test durations and stage logs. Private-directory provisioning, the controller mount, publisher activation, and live runner and reconciliation continuity during observation failures require #122 acceptance on an approved host.
