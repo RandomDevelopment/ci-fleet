@@ -27,6 +27,7 @@ type Scaler struct {
 	disk           *diskAdmission
 	enrollment     *controllerEnrollment
 	listenerPollAt atomic.Int64
+	jobs           *jobObserver
 	runners        runnerState
 	dockerClient   *dockerclient.Client
 	scalesetClient interface {
@@ -230,7 +231,8 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 		// Docker can wake a not-running waiter while the container is restarting.
 		current, err := s.dockerClient.ContainerInspect(ctx, id)
 		// A not-found inspection already proves this exact container is retired.
-		if !errdefs.IsNotFound(err) {
+		gone := errdefs.IsNotFound(err)
+		if !gone {
 			if err != nil || current.State == nil {
 				s.logger.Warn("inspect exited runner", "runner", name, "error", err)
 				time.Sleep(time.Minute)
@@ -239,6 +241,9 @@ func (s *Scaler) watchRunner(ctx context.Context, name, id string) {
 			if current.State.Running || current.State.Restarting || current.State.Paused {
 				continue
 			}
+		}
+		s.jobs.runner(name, "exit")
+		if !gone {
 			if err := s.logAndRemove(ctx, name, id, false); err != nil {
 				s.logger.Warn("retry exited runner cleanup", "runner", name, "error", err)
 				time.Sleep(time.Minute)
@@ -289,6 +294,7 @@ func (s *Scaler) recoverRunners(ctx context.Context) error {
 			}
 			// A surviving runner may already have a job whose start event was acknowledged.
 			s.runners.addBusy(name, c.ID)
+			s.jobs.runner(name, "recover")
 			go s.watchRunner(context.WithoutCancel(ctx), name, c.ID)
 			s.logger.Info("recovered active runner", "runner", name, "containerID", c.ID)
 			continue

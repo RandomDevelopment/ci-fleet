@@ -140,3 +140,7 @@ The local full health result remains available for recovery, but only the status
 For dedicated-host packaging, one-time secret boundaries, activation,
 verification, upgrade, and rollback, see
 [Status receiver deployment](STATUS-RECEIVER-DEPLOYMENT.md).
+
+The [worker job history](ENDPOINT-SNAPSHOTS.md#worker-job-history) stays in the
+protected local observer store. Status-report v1 and anonymous capacity
+samples exclude job metadata.

@@ -31,6 +31,9 @@ func (s *Scaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMess
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.jobs != nil {
+		defer s.jobs.batch(message, time.Now().Unix(), s.listenerPollAt.Load(), s.runners.isBusy)
+	}
 	if message != nil {
 		if message.Statistics == nil {
 			return fmt.Errorf("scale-set message has no statistics")
