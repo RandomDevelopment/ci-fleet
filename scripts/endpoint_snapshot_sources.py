@@ -17,6 +17,7 @@ from typing import Any
 import endpoint_snapshot_store as store
 import health
 import managed_image_identity as images
+from desired_state import SAFE_IDENTIFIER
 
 
 MAX_SOURCE_BYTES = 64 * 1024
@@ -194,7 +195,7 @@ def _enrollment_identity(root: Path, rendered: dict) -> dict:
     path = Path(path)
     if (not path.is_absolute() or path.anchor != "/" or ".." in path.parts
             or not re.fullmatch(r"[A-Za-z0-9_./-]+", str(path))
-            or not re.fullmatch(r"[A-Za-z0-9_-]+", client)
+            or not SAFE_IDENTIFIER.fullmatch(client)
             or not re.fullmatch(r"[1-9][0-9]*", installation)):
         raise SourceError("source_invalid")
     try:

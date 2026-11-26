@@ -116,7 +116,7 @@ class SnapshotSourceTests(unittest.TestCase):
 
     def test_identity_checks_key_metadata_without_reading_it(self):
         key = self.write_path("etc/ci-fleet/secrets/test-key", b"fixture bytes", 0o600)
-        values = {"CI_FLEET_GITHUB_APP_CLIENT_ID": "example-client",
+        values = {"CI_FLEET_GITHUB_APP_CLIENT_ID": "Iv1.EXAMPLE",
                   "CI_FLEET_GITHUB_APP_INSTALLATION_ID": "123",
                   "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": "/etc/ci-fleet/secrets/test-key"}
         with patch.object(sources.store, "read_bytes", side_effect=AssertionError("key read")):
