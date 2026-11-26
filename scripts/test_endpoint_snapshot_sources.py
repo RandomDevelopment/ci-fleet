@@ -36,6 +36,11 @@ class SnapshotSourceTests(unittest.TestCase):
         self.write("rendered", b"CI_FLEET_INSTANCE=example-ci\n")
         self.write("health", {"schema_version": 1, "controller": "example-ci", "timestamp": 121})
         self.write("reconciliation", {"status": "failed", "checked_at": 122})
+        self.write_path("proc/stat", b"cpu 1 2 3 4\nbtime 100\n", 0o444)
+        self.write_path(sources.CAPACITY_PATH, b"", 0o600)
+        for base in ("opt/ci-fleet", "opt/ci-fleet/manager"):
+            marker = self.write_path(f"{base}/releases/{'a' * 40}/.ci-fleet-engine-ref", b"a" * 40 + b"\n", 0o644)
+            (self.root / base / "current").symlink_to(marker.parent)
 
     def stop_children(self) -> None:
         for child in self.children:
@@ -47,9 +52,12 @@ class SnapshotSourceTests(unittest.TestCase):
 
     def write(self, name: str, value) -> Path:
         relative, mode = sources.SOURCE_PATHS[name]
+        return self.write_path(relative, value if isinstance(value, bytes) else json.dumps(value).encode(), mode)
+
+    def write_path(self, relative: str, value: bytes, mode: int) -> Path:
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.write_bytes(value if isinstance(value, bytes) else json.dumps(value).encode())
+        path.write_bytes(value)
         path.chmod(mode)
         return path
 
@@ -86,13 +94,70 @@ class SnapshotSourceTests(unittest.TestCase):
         with self.reader(program) as launched:
             documents, errors = sources.collect_documents("example-ci", root=self.root)
         self.assertEqual(errors, {})
-        self.assertEqual(set(documents), set(sources.SOURCE_PATHS) | {"controller"})
+        self.assertEqual(documents["boot"], {"boot_at": 100})
+        self.assertEqual(documents["runtime_revision"]["revision"], "a" * 40)
+        self.assertEqual(documents["manager_revision"]["revision"], "a" * 40)
         self.assertEqual(documents["installation"]["controller"], "example-ci")
         self.assertEqual(documents["rendered"]["CI_FLEET_INSTANCE"], "example-ci")
         self.assertEqual(documents["health"]["timestamp"], 121)
         self.assertEqual(documents["reconciliation"]["checked_at"], 122)
         self.assertEqual(documents["controller"], CONTROLLER_STATUS)
         launched.assert_called_once()
+
+    def test_selection_rejects_noncanonical_pointer_and_wrong_marker(self):
+        release = self.root / "opt/ci-fleet/releases" / ("a" * 40)
+        (release / ".ci-fleet-engine-ref").write_bytes(b"b" * 40 + b"\n")
+        manager = self.root / "opt/ci-fleet/manager/current"
+        manager.unlink()
+        manager.symlink_to(release)
+        with self.reader("print('{}')"):
+            _, errors = sources.collect_documents("example-ci", root=self.root)
+        self.assertEqual(errors, {"runtime_revision": "revision_unverified", "manager_revision": "source_unsafe"})
+
+    def test_identity_checks_key_metadata_without_reading_it(self):
+        key = self.write_path("etc/ci-fleet/secrets/test-key", b"fixture bytes", 0o600)
+        values = {"CI_FLEET_GITHUB_APP_CLIENT_ID": "example-client",
+                  "CI_FLEET_GITHUB_APP_INSTALLATION_ID": "123",
+                  "CI_FLEET_GITHUB_APP_PRIVATE_KEY_FILE": "/etc/ci-fleet/secrets/test-key"}
+        with patch.object(sources.store, "read_bytes", side_effect=AssertionError("key read")):
+            self.assertEqual(sources._enrollment_identity(self.root, values)["state"], "present")
+            key.unlink()
+            self.assertEqual(sources._enrollment_identity(self.root, values)["state"], "absent")
+            key.symlink_to(self.root / "proc/stat")
+            with self.assertRaises(sources.store.StoreError) as caught:
+                sources._enrollment_identity(self.root, values)
+            self.assertEqual(caught.exception.code, "unsafe_file")
+
+    def test_measured_image_binding_requires_the_live_reviewed_objects(self):
+        engine = "a" * 40
+        daemon = {"id": "fixture-id", "root": "/fixture", "driver": "overlay2",
+                  "server_version": "29.0", "version": "29.0", "api_version": "1.52",
+                  "git_commit": "abc", "driver_status": [],
+                  "components": [{"name": "Engine", "version": "29.0", "details": {}}]}
+        inspection = {"Os": "linux", "Architecture": "amd64",
+                      "Config": {"Labels": {sources.images.REVISION_LABEL: engine}}}
+        binding = {"schema_version": 1, "mode": sources.images.CAPABILITY, "engine": engine,
+                   "architecture": "amd64", "daemon": daemon, "roles": {}}
+        values = {"CI_FLEET_ENGINE_REF": engine}
+        for name, digit in (("controller", "1"), ("runner", "2")):
+            identifier = "sha256:" + digit * 64
+            binding["roles"][name] = {
+                "config_digest": identifier, "runtime_image_id": identifier, "manifest_digest": None,
+                "config_size": 42, "source_revision": engine, "os": "linux", "architecture": "amd64",
+                "kind": "classic-config", "root_descriptor": None, "descriptors": {},
+            }
+            values[f"CI_FLEET_{name.upper()}_IMAGE_DIGEST"] = identifier
+            values[f"CI_FLEET_{name.upper()}_RUNTIME_IMAGE_ID"] = identifier
+        state = {"engine_ref": engine, "architecture": "amd64", "managed_image_bindings": binding}
+        with patch.object(sources.images, "Docker") as docker, patch.object(sources.time, "time", return_value=123):
+            docker.return_value.inspect.side_effect = lambda reference: {"Id": reference, **inspection}
+            docker.return_value.identity.return_value = daemon
+            self.assertEqual(sources._image_verification(state, values, 2),
+                             {"observed_at": 123, "revision": engine, "architecture": "amd64"})
+            docker.return_value.identity.return_value = {**daemon, "id": "replaced-daemon"}
+            with self.assertRaises(sources.SourceError) as caught:
+                sources._image_verification(state, values, 2)
+            self.assertEqual(caught.exception.code, "source_unavailable")
 
     def test_source_failures_are_independent_and_redacted(self) -> None:
         self.write("rendered", b"A=first\nA=second\n")

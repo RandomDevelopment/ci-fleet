@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -24,6 +25,8 @@ const labelPrefix = "io.randomdevelopment.ci-fleet."
 
 type Scaler struct {
 	disk           *diskAdmission
+	enrollment     *controllerEnrollment
+	listenerPollAt atomic.Int64
 	runners        runnerState
 	dockerClient   *dockerclient.Client
 	scalesetClient interface {

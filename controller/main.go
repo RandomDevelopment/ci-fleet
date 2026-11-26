@@ -61,6 +61,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	matchedAt := time.Now().Unix()
 	client.SetSystemInfo(systemInfo(set.ID))
 	stoppedNormally := false
 	defer func() {
@@ -101,7 +102,11 @@ func run(ctx context.Context) error {
 	}
 	defer session.Close(context.Background())
 	scaler.messageClient = session
-	l, err := listener.New(diskAwareSession{Client: session, disk: disk}, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
+	scaler.enrollment = &controllerEnrollment{
+		ConfigCommit: os.Getenv("CI_FLEET_CONFIG_REF"), ScaleSetName: set.Name, RoutingLabels: cfg.Labels,
+		MatchedAt: matchedAt, SessionOpenedAt: time.Now().Unix(),
+	}
+	l, err := listener.New(diskAwareSession{Client: session, disk: disk, pollAt: &scaler.listenerPollAt}, listener.Config{ScaleSetID: set.ID, MaxRunners: cfg.MaxRunners, Logger: logger.WithGroup("listener")})
 	if err != nil {
 		return fmt.Errorf("create listener: %w", err)
 	}

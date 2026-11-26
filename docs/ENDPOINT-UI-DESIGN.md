@@ -2,7 +2,7 @@
 
 Implementation status: planned. This ADR addresses [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It adds no supported command, schema field, service, listener, or engine capability.
 
-The [worker snapshot foundation](ENDPOINT-SNAPSHOTS.md) records the current #118 interfaces and their remaining evidence coverage. The UI and its host activation remain planned.
+The [worker snapshot contract](ENDPOINT-SNAPSHOTS.md) records the current #118 interfaces and which producers can supply each observation. The UI and its host activation remain planned.
 
 ## Acceptance record
 
