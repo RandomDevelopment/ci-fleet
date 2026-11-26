@@ -114,12 +114,47 @@ def _read_at(directory_fd: int, name: str, *, modes: tuple[int, ...], max_bytes:
 
 
 def read_bytes(path: Path, *, modes: tuple[int, ...] = (0o600,), max_bytes: int = MAX_ENDPOINT_BYTES,
-               gid: int | None = None) -> bytes:
+               gid: int | None = None, directory_mode: int | None = None) -> bytes:
     _require(type(max_bytes) is int and max_bytes > 0, "invalid_argument")
     directory_fd = None
     try:
         directory_fd = _open_directory(path.parent)
+        if directory_mode is not None:
+            metadata = os.fstat(directory_fd)
+            _require(metadata.st_uid == OWNER_UID and stat.S_IMODE(metadata.st_mode) == directory_mode, "unsafe_path")
+            _no_acl(directory_fd, "unsafe_path")
         return _read_at(directory_fd, path.name, modes=modes, max_bytes=max_bytes, gid=gid)
+    except OSError as error:
+        raise _os_error(error) from None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def check_file(path: Path, *, modes: tuple[int, ...], max_bytes: int) -> None:
+    """Check presence and metadata without opening the file."""
+    directory_fd = None
+    try:
+        directory_fd = _open_directory(path.parent)
+        metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        _regular(metadata, modes=modes, max_bytes=max_bytes)
+        _require(metadata.st_size > 0, "invalid_argument")
+    except OSError as error:
+        raise _os_error(error) from None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def read_selection(path: Path) -> str:
+    """Read an installer's selection pointer without following it."""
+    directory_fd = None
+    try:
+        directory_fd = _open_directory(path.parent)
+        metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        _require(stat.S_ISLNK(metadata.st_mode) and metadata.st_uid == OWNER_UID
+                 and metadata.st_nlink == 1, "unsafe_file")
+        return os.readlink(path.name, dir_fd=directory_fd)
     except OSError as error:
         raise _os_error(error) from None
     finally:

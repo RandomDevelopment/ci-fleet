@@ -1246,13 +1246,21 @@ def _local(args: argparse.Namespace) -> int:
     if environment.get("CI_FLEET_HEALTH_SUPPRESS_DELIVERY") != "1":
         if config_invalid:
             delivery = 1
+            reporting_state = "failed"
         elif values.get("CI_FLEET_HEALTH_STATUS_URL") or values.get("CI_FLEET_STATUS_REPORTING_REQUIRED") == "1":
             delivery = (
                 _send_status(values, build_status_report(snapshot, report, generated_at=now), now=now)
                 if values.get("CI_FLEET_HEALTH_STATUS_URL") else 1
             )
+            reporting_state = "failed" if delivery else "delivered"
         else:
+            reporting_state = "not_configured"
             delivery = _send_heartbeat(values, report)
+        report["status_reporting"] = {
+            "state": reporting_state,
+            "config_commit": values.get("CI_FLEET_CONFIG_REF"),
+            "observed_at": int(time.time()),
+        }
     if delivery:
         severity = "critical" if delivery == 2 else "warning"
         report["checks"].append({"id": "status_delivery", "status": severity})

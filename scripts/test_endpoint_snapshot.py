@@ -88,6 +88,144 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(next(c for c in value["sources"]["health"]["data"]["checks"] if c["id"] == "clock"), {"id": "clock", "status": "ok"})
         self.assertNotIn("metrics", value["sources"]["health"]["data"])
 
+    def test_observations_keep_producer_times_and_separate_revisions(self):
+        docs = documents()
+        docs["boot"] = {"boot_at": NOW - 500}
+        docs["runtime_revision"] = {"revision": "2" * 40, "observed_at": NOW - 1}
+        docs["manager_revision"] = {"revision": "4" * 40, "observed_at": NOW}
+        docs["controller"]["software_version"] = "2" * 40
+        docs["controller"]["enrollment"] = {
+            "scale_set_name": "example-ci-01-scale-set", "routing_labels": ["docker-ci"],
+            "config_commit": "1" * 40, "matched_at": NOW - 90,
+            "session_opened_at": NOW - 85, "polled_at": NOW - 60,
+        }
+        docs["reconciliation"] = {
+            "status": "pending", "desired_commit": "5" * 40, "applied_commit": "1" * 40,
+            "checked_at": NOW - 40, "controller": CONTROLLER,
+            "desired_engine": {"revision": "4" * 40, "config_commit": "5" * 40, "controller": CONTROLLER,
+                               "lookup": "default_branch", "observed_at": NOW - 45},
+        }
+        observed = self.build(docs)["sources"]
+        for name, revision in (("runtime_revision", "2"), ("manager_revision", "4"),
+                               ("staged_manager_revision", "4"), ("desired_engine_revision", "4")):
+            self.assertEqual(observed[name]["data"]["revision"], revision * 40)
+        self.assertEqual(observed["boot"]["observed_at"], NOW - 500)
+        self.assertEqual(observed["controller_session"]["observed_at"], NOW - 85)
+        self.assertEqual(observed["enrollment_scale_set"]["observed_at"], NOW - 90)
+        self.assertEqual(observed["enrollment_authentication"]["observed_at"], NOW - 85)
+        self.assertEqual(observed["enrollment_listener"]["observed_at"], NOW - 60)
+        self.assertEqual(observed["enrollment_reporting"]["availability"], "unsupported")
+        self.assertEqual(observed["enrollment_owner_confirmation"]["availability"], "unsupported")
+        docs["reconciliation"].update(status="converged", desired_commit="1" * 40, checked_at=NOW)
+        observed = self.build(docs)["sources"]
+        self.assertEqual(observed["desired_engine_revision"]["observed_at"], NOW - 45)
+        self.assertEqual(observed["desired_engine_revision"]["data"]["config_commit"], "5" * 40)
+        docs["controller"]["enrollment"]["config_commit"] = "9" * 40
+        self.assertEqual(self.build(docs)["sources"]["controller_session"]["error"], "revision_unverified")
+        docs["controller"]["enrollment"]["config_commit"] = "1" * 40
+
+        docs["health"]["status_reporting"] = {"state": "delivered", "config_commit": "1" * 40, "observed_at": NOW - 17}
+        docs["installation"]["status_reporting_configured"] = False
+        reporting = self.build(docs)["sources"]["enrollment_reporting"]
+        self.assertEqual((reporting["data"], reporting["observed_at"]),
+                         ({"state": "delivered", "config_commit": "1" * 40}, NOW - 17))
+        copied = self.build(docs)
+        copied["sources"]["enrollment_reporting"]["data"]["config_commit"] = "9" * 40
+        self.assert_snapshot_error(lambda: snapshot.validate_snapshot(copied, controller=CONTROLLER))
+        docs["health"]["status_reporting"]["config_commit"] = "5" * 40
+        self.assertEqual(self.build(docs)["sources"]["enrollment_reporting"]["error"], "revision_unverified")
+        docs["health"]["status_reporting"].update(state="not_configured", config_commit="1" * 40)
+        absent = self.build(docs)
+        self.assertEqual(absent["sources"]["enrollment_reporting"]["availability"], "not_configured")
+        unavailable = self.build(docs, {"health": "source_unavailable"})
+        unavailable["sources"]["enrollment_reporting"] = absent["sources"]["enrollment_reporting"]
+        self.assert_snapshot_error(lambda: snapshot.validate_snapshot(unavailable, controller=CONTROLLER))
+        docs["installation"].update(status_reporting_configured=True, status_reporting_required=True)
+        required = self.build(docs)
+        self.assertEqual(required["sources"]["enrollment_reporting"]["error"], "revision_unverified")
+        required["sources"]["enrollment_reporting"] = absent["sources"]["enrollment_reporting"]
+        self.assert_snapshot_error(lambda: snapshot.validate_snapshot(required, controller=CONTROLLER))
+
+        del docs["controller"]["enrollment"]["polled_at"]
+        observed = self.build(docs)["sources"]
+        self.assertEqual(observed["enrollment_listener"]["availability"], "unknown")
+        self.assertEqual(observed["controller_session"]["availability"], "available")
+        docs["boot"]["boot_at"] = NOW - 80
+        observed = self.build(docs)["sources"]
+        self.assertEqual(observed["controller_session"]["error"], "revision_unverified")
+        self.assertEqual(observed["controller"]["availability"], "available")
+
+    def test_capacity_uses_only_observed_anonymous_metrics_for_the_selected_pool(self):
+        docs = documents()
+        docs["rendered"]["CI_FLEET_POOL"] = "validation"
+        sample = {"timestamp": NOW - 5, "pool": "validation",
+                  "host": {"memory_used_bytes": 42, "swap_used_bytes": 0, "disk_used_bytes": {"root": 60, "other": 99},
+                           "inode_used": {}, "cpu_total_ticks": 20, "cpu_idle_ticks": 10},
+                  "runners": [{"cpu_percent": 250, "memory_used_bytes": 5, "memory_limit_bytes": 10}]}
+        lines = [sample, {**sample, "timestamp": NOW - 600, "pool": "different-pool"},
+                 {**sample, "timestamp": NOW - 30, "runners": []},
+                 {**sample, "timestamp": NOW - snapshot.CAPACITY_PERIOD - 1},
+                 {**sample, "timestamp": NOW, "runners": [{"job_id": 123}]}]
+        docs["capacity"] = {"history": ("malformed\n" + "".join(json.dumps(v) + "\n" for v in lines)).encode()}
+        capacity = self.build(docs)["sources"]["capacity"]
+        self.assertEqual(capacity["observed_at"], NOW - 5)
+        self.assertEqual(capacity["data"]["samples"], 1)
+        self.assertEqual(capacity["data"]["runner_observations"], 1)
+        metrics = capacity["data"]["metrics"]
+        self.assertEqual(metrics["host_swap_used_bytes"], {"p50": 0, "p95": 0})
+        self.assertEqual(metrics["runner_cpu_percent"], {"p50": 250, "p95": 250})
+        self.assertNotIn("host_cpu_percent", metrics)
+        self.assertNotIn("host_disk_used_bytes_other", metrics)
+        docs["capacity"]["history"] += (json.dumps({**sample, "timestamp": NOW + 1}) + "\n").encode()
+        uncertain = self.build(docs)
+        self.assertEqual(uncertain["clock_state"], "uncertain")
+        self.assertEqual(uncertain["sources"]["capacity"]["data"], {})
+
+    def test_capacity_aggregates_a_week_of_samples_from_24_active_runners(self):
+        docs = documents()
+        docs["rendered"]["CI_FLEET_POOL"] = "validation"
+        sample = {"timestamp": 0, "pool": "validation",
+                  "host": {"memory_used_bytes": 42, "swap_used_bytes": 0, "disk_used_bytes": {"root": 60},
+                           "inode_used": {}, "cpu_total_ticks": 20, "cpu_idle_ticks": 10},
+                  "runners": [{"cpu_percent": 250.5, "memory_used_bytes": 1073741824,
+                               "memory_limit_bytes": 2147483648}] * 24}
+        line = json.dumps(sample, separators=(",", ":")).encode()
+        prefix, suffix = line.split(b'"timestamp":0', 1)
+        count = snapshot.CAPACITY_PERIOD // 30
+        history = b"".join(prefix + b'"timestamp":' + str(NOW - index * 30).encode() + suffix + b"\n"
+                           for index in range(count))
+        self.assertGreater(len(history), 32 * 1024 * 1024)
+        docs["capacity"] = {"history": history}
+        capacity = self.build(docs)["sources"]["capacity"]
+        self.assertEqual(capacity["observed_at"], NOW)
+        self.assertEqual(capacity["data"]["samples"], count)
+        self.assertEqual(capacity["data"]["runner_observations"], count * 24)
+
+    def test_only_controlled_transaction_evidence_projects(self):
+        docs = documents()
+        doc = docs["reconciliation"]
+        doc.update(status="failed", desired_commit="4" * 40, message="rolled back successfully")
+        self.assertEqual(self.build(docs)["sources"]["transaction"]["availability"], "unknown")
+        doc.update(transaction_phase="pre_transaction", failure_reason="docker_disk_capacity")
+        self.assertEqual(self.build(docs)["sources"]["transaction"]["error"], "revision_unverified")
+        doc["controller"] = CONTROLLER
+        previous = self.build(docs)
+        self.assertEqual(previous["sources"]["transaction"]["data"], {
+            "outcome": "rejected", "phase": "pre_transaction", "reason": "docker_disk_capacity"})
+        loss = self.build(docs, {"reconciliation": "source_unavailable"}, previous=previous)
+        self.assertEqual(loss["sources"]["transaction"]["data"], {})
+        doc["applied_commit"] = "3" * 40
+        self.assertEqual(self.build(docs)["sources"]["transaction"]["error"], "revision_unverified")
+
+    def test_legacy_v1_incumbent_can_be_read_and_replaced(self):
+        previous = self.build()
+        previous["sources"].pop("boot")
+        previous["sources"].pop("controller_session")
+        for name in previous["sources"].keys() - snapshot.FOUNDATION_SOURCES:
+            previous["sources"][name] = snapshot.failure("unsupported")
+        snapshot.validate_snapshot(previous, controller=CONTROLLER)
+        self.assertEqual(set(self.build(previous=previous)["sources"]), snapshot.SOURCE_NAMES)
+
     def test_publisher_preserves_incumbent_during_clock_rollback(self):
         previous = self.build()
         with patch.object(snapshot, 'publication_lock'), \

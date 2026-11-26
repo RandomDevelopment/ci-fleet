@@ -54,9 +54,10 @@ func TestDiskBlockedPinnedListenerAcknowledgesOfferAndCompletesActiveJob(t *test
 		return m, nil
 	}
 	scaler := &Scaler{disk: disk, runners: newRunnerState(), dockerClient: docker, messageClient: client, logger: slog.New(slog.DiscardHandler), config: Config{MaxRunners: 2, StatusFile: t.TempDir() + "/status.json"}}
+	scaler.enrollment = &controllerEnrollment{ScaleSetName: "example-set", MatchedAt: 1, SessionOpenedAt: 2}
 	scaler.runners.addIdle("prior-assignment", "active-id")
 	scaler.runners.addIdle("prewarm", "idle-id")
-	l, err := listener.New(diskAwareSession{Client: client, disk: disk}, listener.Config{ScaleSetID: 42, MaxRunners: 2})
+	l, err := listener.New(diskAwareSession{Client: client, disk: disk, pollAt: &scaler.listenerPollAt}, listener.Config{ScaleSetID: 42, MaxRunners: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +77,11 @@ func TestDiskBlockedPinnedListenerAcknowledgesOfferAndCompletesActiveJob(t *test
 	var status controllerStatus
 	if err := json.Unmarshal(data, &status); err != nil {
 		t.Fatal(err)
+	}
+	if status.Enrollment == nil || status.Enrollment.MatchedAt != 1 || status.Enrollment.SessionOpenedAt != 2 ||
+		status.Enrollment.PolledAt <= status.Enrollment.SessionOpenedAt ||
+		status.Enrollment.PolledAt != scaler.listenerPollAt.Load() {
+		t.Fatalf("status did not retain the successful poll across listener failure: %+v", status.Enrollment)
 	}
 	if status.DiskAdmission.State != "low_disk" || status.DiskAdmission.Reason != "usage_percent" {
 		t.Fatalf("missing low-disk status: %+v", status.DiskAdmission)

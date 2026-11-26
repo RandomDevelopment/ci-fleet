@@ -431,7 +431,24 @@ if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == unverified ]];
   printf 'ERROR: network-policy rollback verification failed\\n' >&2
   exit 2
 fi
-if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} =~ ^(success|cleanup_failure)$ ]]; then
+if [[ ${1:-} == --upgrade && ${FAKE_SKIP_STATE_UPDATE:-0} != 1 ]] \
+  && [[ ${2:-} != --restore-last-known-good || ${FAKE_SKIP_ROLLBACK_STATE_UPDATE:-0} != 1 ]]; then
+  python3 - "$@" <<'PY'
+import json, os, pathlib, sys
+if os.environ.get("FAKE_INSTALLER_RESULT", "success") == "staged":
+    manager = pathlib.Path(os.environ["FAKE_MANAGER_DIRECTORY"])
+    release = manager / "releases" / ("e" * 40)
+    release.mkdir(parents=True)
+    (release / ".ci-fleet-engine-ref").write_text("e" * 40 + "\\n")
+    (manager / "current").symlink_to(release)
+else:
+    state_file = pathlib.Path(os.environ["CI_FLEET_REMOTE_STATE_FILE"])
+    state = json.loads(state_file.read_text())
+    state["config_ref"] = sys.argv[sys.argv.index("--ref") + 1]
+    state_file.write_text(json.dumps(state))
+PY
+fi
+if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} =~ ^(success|cleanup_failure|staged)$ ]]; then
   printf '{"schema_version":1,"outcome":"applied"}\\n' >&7
 fi
 if [[ ${1:-} == --upgrade && ${FAKE_INSTALLER_RESULT:-success} == cleanup_failure ]]; then
@@ -479,7 +496,9 @@ raise SystemExit({"healthy": 0, "maintenance": 0, "warning": 1, "unhealthy": 2}.
         self.assertEqual(git("init", "-q", str(self.config_repo)).returncode, 0)
         self.assertEqual(git("config", "user.name", "fixture", cwd=self.config_repo).returncode, 0)
         self.assertEqual(git("config", "user.email", "fixture@example.invalid", cwd=self.config_repo).returncode, 0)
-        (self.config_repo / "fleet.json").write_text("{}\n", encoding="utf-8")
+        (self.config_repo / "fleet.json").write_text(json.dumps({
+            "controllers": {"example-ci-01": {"engine_ref": "e" * 40}},
+        }), encoding="utf-8")
         self.assertEqual(git("add", "fleet.json", cwd=self.config_repo).returncode, 0)
         self.assertEqual(git("commit", "-q", "-m", "fixture", cwd=self.config_repo).returncode, 0)
         self.desired_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
@@ -510,6 +529,7 @@ exec {shlex.quote(real_git or 'git')} "$@"
             "CI_FLEET_TESTING": "1",
             "FAKE_HEALTH_OBSERVED_LKG": str(self.health_observed_lkg),
             "FAKE_INSTALLER_LOG": str(self.installer_log),
+            "FAKE_MANAGER_DIRECTORY": str(self.td / "opt/ci-fleet/manager"),
             "PATH": f"{fake_bin}:{self.env['PATH']}",
             "REMOTE_FIXTURE_REF": self.desired_ref,
             "REMOTE_FIXTURE_REPO": str(self.config_repo),
@@ -772,6 +792,7 @@ exec {shlex.quote(sys.executable)} "$@"
         self.assertFalse(self.installer_log.exists())
         self.assertEqual(self._lkg_ref(), self.prior_ref)
         self.assertEqual(self._reconcile_state()["status"], "invalid")
+        self.assertNotIn("desired_engine", self._reconcile_state())
         args = json.loads(log.read_text())
         self.assertIn(self.desired_ref, args)
         self.assertIn(git("rev-parse", "HEAD^{tree}", cwd=self.config_repo).stdout.strip(), args)
@@ -799,6 +820,47 @@ exec {shlex.quote(sys.executable)} "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(log.exists())
         self.assertEqual(self._installer_calls()[0]["args"][0], "--upgrade")
+        state = self._reconcile_state()
+        self.assertEqual(state["controller"], "example-ci-01")
+        self.assertEqual(state["desired_engine"]["revision"], "e" * 40)
+        self.assertEqual(state["desired_engine"]["lookup"], "default_branch")
+
+    def test_manager_only_staging_retains_installed_and_independently_desired_revisions(self):
+        before = self.state_file.read_bytes()
+        result = self._run("healthy", installer_result="staged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RECONCILE_STAGED", result.stdout)
+        self.assertNotIn("RECONCILE RECONCILED", result.stdout)
+        self.assertTrue((self.td / "opt/ci-fleet/manager/current").is_symlink())
+        self.assertEqual(self.state_file.read_bytes(), before)
+        self.assertEqual(self._lkg_ref(), self.prior_ref)
+        self.assertFalse(self.health_observed_lkg.exists())
+        state = self._reconcile_state()
+        self.assertEqual((state["status"], state["applied_commit"]), ("pending", self.prior_ref))
+        desired = state["desired_engine"]
+        self.assertEqual((desired["config_commit"], desired["revision"]), (self.desired_ref, "e" * 40))
+        self.assertNotIn("transaction_outcome", state)
+        self.assertIsNone(state["last_success_at"])
+
+        # An installed-only check may write a new reconciliation summary for a different commit.
+        with (self.config_repo / "fleet.json").open("w", encoding="utf-8") as handle:
+            json.dump({"controllers": {"example-ci-01": {"engine_ref": "f" * 40}}}, handle)
+        self.assertEqual(git("commit", "-qam", "installed-only fixture", cwd=self.config_repo).returncode, 0)
+        installed_ref = git("rev-parse", "HEAD", cwd=self.config_repo).stdout.strip()
+        self.env["REMOTE_FIXTURE_REF"] = installed_ref
+        self._write_installed_ref(installed_ref)
+        result = self._run("healthy", arguments=("--check-only", "--installed-ref"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._reconcile_state()["desired_commit"], installed_ref)
+        self.assertEqual(self._reconcile_state()["desired_engine"], desired)
+
+        state_file = Path(self.env["CI_FLEET_RECONCILE_STATE_DIR"]) / "state.json"
+        before = state_file.read_bytes()
+        self._write_executable(self.td / "bin/flock", "#!/bin/sh\nexit 1\n")
+        result = self._run("healthy", arguments=("--check-only", "--installed-ref"))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("timed out waiting", result.stderr)
+        self.assertEqual(state_file.read_bytes(), before)
 
     def test_state_aware_final_health_acceptance_advances_candidate_lkg(self):
         for desired_state, health in (
@@ -915,6 +977,7 @@ exec {shlex.quote(sys.executable)} "$@"
                 state = self._reconcile_state()
                 self.assertEqual(state["applied_commit"], self.prior_ref)
                 self.assertEqual(state["health"], "unknown")
+                self.assertNotIn("transaction_outcome", state)
                 self.assertIn("ROLLBACK_UNVERIFIED outcome=unknown", result.stdout)
                 self.assertNotIn("fixture-sensitive-value", json.dumps(state))
 
@@ -954,6 +1017,7 @@ exec {shlex.quote(sys.executable)} "$@"
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["desired_commit"], self.desired_ref)
         self.assertEqual(state["applied_commit"], self.desired_ref)
+        self.assertEqual(state["transaction_outcome"], "applied")
         self.assertEqual(self._lkg_ref(), self.prior_ref)
         self.assertIn("post-commit cleanup failed", state["message"])
         self.assertNotIn("ROLLBACK_UNVERIFIED", result.stdout + result.stderr)

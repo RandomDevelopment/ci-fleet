@@ -1119,6 +1119,18 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(health._send_status(legacy, report), 0)
                 self.assertEqual(health._send_heartbeat(legacy, report, opener=opener), 0)
                 self.assertIsNone(health._NoRedirect().redirect_request(None, None, 302, None, {}, None))
+                values["CI_FLEET_CONFIG_REF"] = "a" * 40
+                args = health.argparse.Namespace(monitoring_config=Path(directory) / "unused",
+                                                 output=Path(directory) / "health.json", json=False)
+                with patch.dict(os.environ, {}, clear=True), patch.object(health, "collect_snapshot", return_value=healthy_snapshot()), \
+                        patch.object(health, "load_monitoring_config", return_value=values), \
+                        patch.object(health, "_send_status", return_value=0) as send:
+                    self.assertEqual(health._local(args), 0)
+                    send.assert_called_once()
+                local = json.loads(args.output.read_text())
+                self.assertEqual(local["status_reporting"]["state"], "delivered")
+                self.assertEqual(local["status_reporting"]["config_commit"], "a" * 40)
+                self.assertGreaterEqual(local["status_reporting"]["observed_at"], local["timestamp"])
             finally:
                 if old is None:
                     os.environ.pop("CI_FLEET_TESTING", None)
@@ -1144,6 +1156,8 @@ class HealthTests(unittest.TestCase):
                 report = json.loads(output.read_text())
                 self.assertEqual(result, 1)
                 self.assertEqual(report["checks"][-1], {"id": "status_delivery", "status": "warning"})
+                self.assertEqual(report["status_reporting"]["state"], "failed")
+                self.assertGreaterEqual(report["status_reporting"]["observed_at"], report["timestamp"])
             finally:
                 setattr(health, "collect_snapshot", old_collect)
                 if old_required is None:

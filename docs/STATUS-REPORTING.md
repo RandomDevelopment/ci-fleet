@@ -96,6 +96,12 @@ configuration reference `/etc/ci-fleet/monitoring.env`; endpoint and key values
 remain outside Git. A required but missing or unsafe host-local configuration is
 reported as a redacted delivery warning and does not interrupt runner lifecycle.
 
+The local health report records the outcome and completion time of signed status
+delivery for the [worker snapshot](ENDPOINT-SNAPSHOTS.md), including optional
+reporting configured on the host. The collector marks signed reporting absent
+when it uses the legacy heartbeat path or has no destination. This evidence stays
+local. The signed status-report schema and sending cadence are unchanged.
+
 ## Threat model
 
 Protected assets are controller identity, status integrity, status confidentiality, controller credentials, private desired state, and runner/reconciliation availability.

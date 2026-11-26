@@ -102,11 +102,32 @@ require_commands() {
 
 # --- State persistence ---
 
+capture_desired_engine() {
+  [[ "$fetch_ref" == HEAD ]] || return 0
+  python3 - "$temp_dir/fleet.json" "$installed_controller" "$desired_commit" \
+    >"$temp_dir/desired-engine.json" 2>/dev/null <<'PY' || true
+import json, re, sys, time
+
+path, controller, config_commit = sys.argv[1:]
+with open(path, "rb") as handle:
+    raw = handle.read(1024 * 1024 + 1)
+if len(raw) <= 1024 * 1024:
+    ref = json.loads(raw)["controllers"][controller]["engine_ref"]
+    if isinstance(ref, str) and re.fullmatch(r"[0-9a-f]{40}", ref) and ref != "0" * 40:
+        json.dump({"controller": controller, "lookup": "default_branch", "config_commit": config_commit,
+                   "revision": ref, "observed_at": int(time.time())}, sys.stdout)
+PY
+}
+
 save_reconcile_state() {
   local status=${1:-} desired_commit=${2:-} applied_commit=${3:-} health=${4:-} message=${5:-} mark_success=${6:-false}
-  local transaction_phase=${7:-} failure_reason=${8:-} strict=${9:-false} write_status=0
+  local transaction_phase=${7:-} failure_reason=${8:-} strict=${9:-false} transaction_outcome=${10:-} write_status=0
+  local desired_evidence=$temp_dir/desired-engine.json
+  if [[ "$installed_ref" == true || "$accept_installed" == true || -n "$explicit_ref" ]]; then
+    desired_evidence=$reconcile_state_file
+  fi
   install -d -m 0700 "$reconcile_state_dir"
-  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" "$transaction_phase" "$failure_reason" <<'PY' 2>/dev/null || write_status=$?
+  python3 - "$reconcile_state_file" "$status" "$desired_commit" "$applied_commit" "$health" "$message" "$mark_success" "$transaction_phase" "$failure_reason" "${installed_controller:-}" "$desired_evidence" "$transaction_outcome" <<'PY' 2>/dev/null || write_status=$?
 import json, os, sys, tempfile
 
 path = sys.argv[1]
@@ -118,7 +139,8 @@ try:
     last_success_at = previous.get("last_success_at")
     if not isinstance(last_success_at, int) or last_success_at < 0:
         last_success_at = None
-except (OSError, ValueError, TypeError):
+except (OSError, ValueError, TypeError, RecursionError):
+    previous = {}
     last_success_at = None
 if sys.argv[7] == "true":
     last_success_at = now
@@ -133,6 +155,20 @@ state = {
     "transaction_phase": sys.argv[8],
     "failure_reason": sys.argv[9],
 }
+if sys.argv[10]:
+    state["controller"] = sys.argv[10]
+try:
+    if sys.argv[11] == path:
+        desired = previous.get("desired_engine")
+    else:
+        with open(sys.argv[11], encoding="utf-8") as handle:
+            desired = json.load(handle)
+    if isinstance(desired, dict) and desired.get("controller") == sys.argv[10]:
+        state["desired_engine"] = desired
+except (OSError, ValueError, RecursionError):
+    pass
+if sys.argv[12] in {"applied", "rollback_unverified"}:
+    state["transaction_outcome"] = sys.argv[12]
 fd, tmp = tempfile.mkstemp(prefix=".reconcile-state.", dir=os.path.dirname(path), text=True)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -177,8 +213,14 @@ load_installed_state() {
   fi
   local values
   if ! values=$(python3 - "$state_file" <<'PY'
-import json, sys
-state = json.load(open(sys.argv[1], encoding="utf-8"))
+import json, os, stat, sys
+descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(descriptor, encoding="utf-8") as handle:
+    metadata = os.fstat(handle.fileno())
+    owner = os.geteuid() if os.environ.get("CI_FLEET_TESTING") == "1" else 0
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != owner or metadata.st_nlink != 1:
+        raise ValueError("installed state metadata is unsafe")
+    state = json.load(handle)
 for key in ("config_repository", "config_ref", "controller", "controller_state"):
     print(state[key])
 PY
@@ -516,7 +558,10 @@ require_commands
 lock_file=${CI_FLEET_INSTALLER_LOCK:-/run/ci-fleet-installer.lock}
 install -d -m 0755 "$(dirname "$lock_file")"
 exec 9>"$lock_file"
-flock -w "$lock_wait_seconds" 9 || die "timed out waiting for another reconcile or installer"
+if ! flock -w "$lock_wait_seconds" 9; then
+  printf '%s\n' 'RECONCILE_ERROR: timed out waiting for another reconcile or installer' >&2
+  exit 2
+fi
 
 # Load installed state
 load_installed_state || die "no installed state found at $state_file"
@@ -613,6 +658,9 @@ if [[ "$desired_commit" == "$installed_config_ref" && -z "$explicit_ref" ]]; the
       --config-identity "$installed_config_repo" \
       --ref "$installed_config_ref" \
       --controller "$installed_controller" 2>"$temp_dir/drift_err"; then
+      if git -C "$local_pinned" show "$desired_commit:fleet.json" >"$temp_dir/fleet.json" 2>/dev/null; then
+        capture_desired_engine
+      fi
       health_status=healthy
       if [[ "$accept_installed" == true ]]; then
         save_reconcile_state 'reconciling' "$desired_commit" "$installed_config_ref" 'unknown' 'installed configuration checked; verifying health' false '' '' true \
@@ -663,6 +711,7 @@ if ! validate_config "$fetch_dir" "$desired_commit"; then
 fi
 
 note "VALIDATED commit=${desired_commit}"
+capture_desired_engine
 
 if [[ "$mode" == check-only ]]; then
   note "CHECK_ONLY would reconcile to ${desired_commit}"
@@ -701,18 +750,33 @@ git -C "$pinned_dir" checkout -q "$desired_commit"
 # Reconcile
 note "RECONCILING controller=${installed_controller} config_ref=${desired_commit}"
 save_reconcile_state 'reconciling' "$desired_commit" "$installed_config_ref" 'unknown' "reconciling to ${desired_commit}"
+incumbent_commit=$installed_config_ref
+incumbent_controller=$installed_controller
+incumbent_repo=$installed_config_repo
 upgrade_status=0
 if CI_FLEET_TRANSACTION_RESULT_FD=7 CI_FLEET_INSTALLER_LOCK_FD=9 "$installer" --upgrade \
   --config-repo "$pinned_dir" \
   --config-identity "$installed_config_repo" \
   --ref "$desired_commit" \
   --controller "$installed_controller" 2>"$temp_dir/upgrade_err"; then
-  note "RECONCILED controller=${installed_controller} config_ref=${desired_commit}"
-  [[ -z "$explicit_ref" || $(transaction_outcome) == applied ]] || die 'explicit recovery apply outcome unverified'
+  outcome=$(transaction_outcome)
+  [[ -z "$explicit_ref" || "$outcome" == applied ]] || die 'explicit recovery apply outcome unverified'
+  if ! load_installed_state || [[ "$installed_controller" != "$incumbent_controller" || "$installed_config_repo" != "$incumbent_repo" ]]; then
+    die 'installed state identity readback rejected' "$desired_commit"
+  fi
+  if [[ "$installed_config_ref" != "$desired_commit" ]]; then
+    if [[ -z "$explicit_ref" && "$outcome" == applied && "$installed_config_ref" == "$incumbent_commit" ]] \
+      && python3 -c 'import json,sys; raise SystemExit(json.load(open(sys.argv[1])).get("managed_images") is not None)' "$temp_dir/fleet.json" 2>/dev/null; then
+      save_reconcile_state 'pending' "$desired_commit" "$installed_config_ref" 'unknown' 'installer selected manager only'
+      note "RECONCILE_STAGED controller=${installed_controller} desired=${desired_commit} applied=${installed_config_ref}"
+      exit 0
+    fi
+    die 'installed configuration readback did not match the candidate' "$desired_commit" "$installed_config_ref"
+  fi
+  note "RECONCILED controller=${installed_controller} config_ref=${installed_config_ref}"
 
   # Run health check
   save_reconcile_state 'converged' "$desired_commit" "$desired_commit" 'unknown' "reconciled to ${desired_commit}; checking health"
-  load_installed_state || installed_controller_state=unknown
   if [[ -n "$explicit_ref" ]]; then
     [[ "$installed_config_ref" == "$desired_commit" && "$installed_controller_state" == drained ]] || die 'explicit recovery installed state readback rejected'
     python3 "$script_dir/explicit_recovery.py" "$temp_dir/recovery-candidate.json" "$temp_dir/recovery-candidate.json" \
@@ -780,7 +844,7 @@ PY
     fi
     exit 3
   fi
-  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true
+  save_reconcile_state 'converged' "$desired_commit" "$desired_commit" "$health_status" "reconciled to ${desired_commit}" true '' '' false "$outcome"
   note "RECONCILE_OK controller=${installed_controller} desired=${desired_commit} applied=${desired_commit} health=${health_status}"
   exit 0
 else
@@ -796,7 +860,7 @@ else
   fi
   [[ "$outcome" != rejected ]] || outcome=unknown
   if [[ "$outcome" == applied ]]; then
-    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" 'unknown' "reconcile failed after apply: ${upg_err:-unknown}"
+    save_reconcile_state 'failed' "$desired_commit" "$desired_commit" 'unknown' "reconcile failed after apply: ${upg_err:-unknown}" false '' '' false applied
     exit 3
   fi
   if [[ "$upgrade_status" == 20 && "$outcome" == rollback_verified ]]; then
@@ -806,7 +870,7 @@ else
     note "ROLLBACK_OK controller=${installed_controller} restored=${installed_config_ref}"
     exit 3
   fi
-  save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" 'unknown' "reconcile failed; installer rollback ${outcome}"
+  save_reconcile_state 'failed' "$desired_commit" "$installed_config_ref" 'unknown' "reconcile failed; installer rollback ${outcome}" false '' '' false "$outcome"
   note "ROLLBACK_UNVERIFIED outcome=${outcome}"
   exit 3
 fi

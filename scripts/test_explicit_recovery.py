@@ -41,19 +41,6 @@ class ExplicitRecovery(fixtures.TestRemoteReconcileTransaction):
                  "controller": "example-ci-01", "controller_state": "drained", "engine_ref": self.engine,
                  "engine_repository": "RandomDevelopment/ci-fleet"}
         self.state_file.write_text(json.dumps(state))
-        installer = self.root / "scripts/install-worker-controller.sh"
-        installer.write_text(installer.read_text().replace("exit 0\n", '''if [[ ${1:-} == --upgrade && ${FAKE_SKIP_STATE_UPDATE:-0} != 1 ]]; then
-  python3 - "$CI_FLEET_REMOTE_STATE_FILE" "$@" <<'PY'
-import json, sys
-path = sys.argv[1]
-value = json.load(open(path))
-value["config_ref"] = sys.argv[sys.argv.index("--ref") + 1]
-with open(path, "w") as handle:
-    json.dump(value, handle)
-PY
-fi
-exit 0
-'''))
         self.env["CI_FLEET_ROOT_PREFIX"] = str(self.td)
         runtime = self.td / "opt/ci-fleet/current"
         runtime.mkdir(parents=True)
@@ -500,9 +487,7 @@ exec {shlex.quote(real_python)} "$@"
         self.assertFalse(marker.exists())
 
     def test_rollback_cannot_claim_success_without_baseline_readback(self):
-        installer = self.root / "scripts/install-worker-controller.sh"
-        installer.write_text(installer.read_text().replace('${FAKE_SKIP_STATE_UPDATE:-0} != 1',
-                             '${FAKE_SKIP_STATE_UPDATE:-0} != 1 && ${2:-} != --restore-last-known-good'))
+        self.env["FAKE_SKIP_ROLLBACK_STATE_UPDATE"] = "1"
         self.env["FAKE_HEALTH_STATUS"] = "unhealthy"
         result = self.run_ref("--ref", self.candidate)
         self.assertNotEqual(result.returncode, 0)

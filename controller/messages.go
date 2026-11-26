@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -10,14 +12,19 @@ import (
 
 type diskAwareSession struct {
 	listener.Client
-	disk *diskAdmission
+	disk   *diskAdmission
+	pollAt *atomic.Int64
 }
 
 func (s diskAwareSession) GetMessage(ctx context.Context, lastMessageID, maxCapacity int) (*scaleset.RunnerScaleSetMessage, error) {
 	if !s.disk.check() {
 		maxCapacity = 0
 	}
-	return s.Client.GetMessage(ctx, lastMessageID, maxCapacity)
+	message, err := s.Client.GetMessage(ctx, lastMessageID, maxCapacity)
+	if err == nil && ctx.Err() == nil && s.pollAt != nil {
+		s.pollAt.Store(time.Now().Unix())
+	}
+	return message, err
 }
 
 func (s *Scaler) Scale(ctx context.Context, message *scaleset.RunnerScaleSetMessage) error {
