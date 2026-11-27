@@ -1833,7 +1833,7 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline remaining count old_release='' status identity container_id stopped paused=false pause_retried=false force_nonterminal=${1:-false}
+  local deadline remaining count old_release='' status identity container_id stopped paused=false pause_retried=false stop_retried=false force_nonterminal=${1:-false}
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
@@ -1896,7 +1896,10 @@ try_drain_current() {
         stopped=$(timeout --kill-after=1 "$remaining" docker inspect --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}' "$container_id" 2>/dev/null) || break
         case "$stopped" in
           'created no'|'exited no'|'dead no') status=; break ;;
-          'running no'|'restarting no') sleep 1 ;;
+          'running no'|'restarting no')
+            if [[ "$stop_retried" == true ]]; then sleep 1; fi
+            stop_retried=true
+            ;;
           *) break ;;
         esac
       done
