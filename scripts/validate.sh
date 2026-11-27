@@ -55,6 +55,9 @@ validation_command python-compile python3 -m py_compile \
   scripts/test_endpoint_snapshot.py \
   scripts/test_endpoint_snapshot_sources.py \
   scripts/test_endpoint_snapshot_store.py \
+  scripts/endpoint_ui.py \
+  scripts/endpoint_views.py \
+  scripts/test_endpoint_ui.py \
   scripts/status_auth.py \
   scripts/status_receiver.py \
   scripts/scan_committed_secrets.py \

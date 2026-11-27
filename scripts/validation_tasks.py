@@ -48,6 +48,7 @@ TASKS = [
     ('snapshot-sources', ['python3', 'scripts/test_endpoint_snapshot_sources.py'], False),
     ('snapshot-store', ['python3', 'scripts/test_endpoint_snapshot_store.py'], False),
     ('endpoint-jobs', ['python3', 'scripts/test_endpoint_jobs.py'], False),
+    ('endpoint-ui', ['python3', 'scripts/test_endpoint_ui.py'], False),
     ('status-receiver', ['python3', 'scripts/test_status_receiver.py'], False),
     ('quickstart', ['python3', 'scripts/test_quickstart.py'], False),
     ('github-bootstrap', ['scripts/test-bootstrap-github.sh'], True),

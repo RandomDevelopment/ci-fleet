@@ -1,8 +1,6 @@
 # Endpoint observation UI
 
-Implementation status: planned. This ADR addresses [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It adds no supported command, schema field, service, listener, or engine capability.
-
-The [worker snapshot contract](ENDPOINT-SNAPSHOTS.md) records the current #118 interfaces and which producers can supply each observation. The UI and its host activation remain planned.
+This ADR records the accepted design for [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). The [worker snapshot contract](ENDPOINT-SNAPSHOTS.md) records the producers and their evidence. The [worker views](WORKER-VIEWS.md) provide a repository HTTP application. Host activation and gateway integration remain in #122.
 
 ## Acceptance record
 

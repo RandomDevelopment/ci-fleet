@@ -40,7 +40,7 @@ For a distributed fleet, use a secret manager or encrypted configuration system 
 
 ### Planned endpoint observer access
 
-The [endpoint observation design](ENDPOINT-UI-DESIGN.md#access-on-port-80) introduces a separate backend read bearer only when its packaging and access gates are implemented and separately authorized. No observer credential or listener is supported by this design change alone.
+The [worker HTTP application](WORKER-VIEWS.md#repository-interface) checks the separate backend read bearer described in the [endpoint observation design](ENDPOINT-UI-DESIGN.md#access-on-port-80). Credential provisioning, gateway integration, and listener activation remain in #122.
 
 Provision 32 random bytes as 43 unpadded base64url ASCII characters without a trailing newline, in root-owned mode-`0600` files outside Git. The privileged installer reads the protected access references in `/etc/ci-fleet/observer/access.json`. Systemd `LoadCredential` supplies the observer's copy through its isolated credential directory; the observer does not read the private `/etc/ci-fleet` tree. Provision the gateway copy independently through its approved secret mechanism.
 

@@ -75,7 +75,7 @@ Stop the proxy and unmount the volume to remove the route. The disposable
 Docker proof covers the repository contract. Staging cutover requires separate
 acceptance on the intended dedicated rootless deployer. [Issue #194](https://github.com/RandomDevelopment/ci-fleet/issues/194)
 
-The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) has an explicit [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) under [issue #117](https://github.com/RandomDevelopment/ci-fleet/issues/117). It is proposed while PR #126 is open and accepted after that reviewed PR merges into `main`. It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. Implementation remains planned; it adds no runtime, schema field, or host activation and preserves the decisions below.
+The [endpoint observation UI ADR](ENDPOINT-UI-DESIGN.md) was accepted when PR #126 merged. It records port-80 access, local data contracts, retention, outage behavior, and a conditional management-access exception to the outbound-only worker model. The [worker views](WORKER-VIEWS.md) consume the protected exports. The schema and host activation are tracked in #122.
 
 ## Managed controller desired state after the isolated proof
 
