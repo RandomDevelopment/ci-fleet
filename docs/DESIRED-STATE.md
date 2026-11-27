@@ -266,6 +266,72 @@ Uninstall removes the controller, timers, rendered environment, and active insta
 
 No mode uses global Docker prune or removes unrelated workloads.
 
+### Upgrade a pre-proxy manager
+
+In [#113](https://github.com/RandomDevelopment/ci-fleet/issues/113), installed
+manager `791a15b8c474c6f1053237ff0b86b6b37cf0ac92` activated engine
+`312d22d712d5a5e87bdb14796bf2c40f33d53f92` with
+`compose ... up -d --no-deps controller`. The new controller entered a
+restart loop because the manager had skipped `docker-socket-proxy`. The
+candidate installer included dependency startup, but the installed manager
+was the installer executing the upgrade.
+
+Use a protected checkout at a reviewed engine commit that includes this
+transition procedure. Record the legacy reconcile timer's enabled and active
+states, then run `sudo systemctl disable --now ci-fleet-reconcile.timer` and
+suspend any external dispatcher before offering a new engine pin. Let any
+in-flight reconciliation finish. Retain the exact incumbent source and both local image objects for
+rollback. Record the installed configuration and engine SHAs, the manager
+revision, the running controller image ID, and its health.
+
+1. Follow the [image-free manager staging sequence](#managed-image-scalar-semantics-and-predecessor-evidence).
+   Integrate incumbent active evidence, then target pending evidence, then an
+   image-free configuration selecting the reviewed manager. Run
+   `--upgrade` for that exact configuration SHA using the installer from the
+   protected checkout. Require `MANAGER_STAGED`. Run `--check` from that
+   checkout with the same arguments and require `CHECK_STAGED`. Confirm the
+   manager pointer advanced and the incumbent runtime and installed
+   configuration still match the baseline.
+2. Integrate the reviewed managed image values for the selected engine in a
+   later configuration commit. Keep the active and pending evidence through
+   activation. Run `--upgrade` from
+   `/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh` with
+   that exact configuration SHA. This manager checkpoints the incumbent,
+   waits for active jobs to finish, and starts the controller through Compose's
+   healthy dependency condition. Startup uses verified local images and has a
+   60-second deadline.
+3. Require `CHECK_OK` for the new configuration. Confirm that
+   `/var/lib/ci-fleet/install-state.json` records the requested configuration
+   and engine SHAs and both release pointers select that engine. Inspect the
+   controller's OCI revision, actual image ID, and running state. Its image ID
+   must match `CI_FLEET_CONTROLLER_RUNTIME_IMAGE_ID` in the protected rendered
+   environment. Inspect `ci-fleet-docker-socket-proxy-1` for the same image ID
+   and healthy status. Require a fresh local health report with the
+   `docker_socket_proxy` check passing. Review any warnings, promote the
+   runtime evidence in its own commit, and restore the previous reconcile
+   schedule.
+
+If dependency startup or controller activation fails, keep reconciliation
+suspended and read the installer result. A verified rollback restores the
+incumbent installed state, actual controller image, and runtime release. It
+keeps the staged manager from the checkpoint. Verify those identities against
+the baseline, verify that the candidate proxy is absent, and read the fresh
+incumbent health report before retrying. If Docker keeps restarting the
+candidate, rollback disables its restart policy and stops that container
+without invoking graceful shutdown. It then waits for managed runners to finish.
+If rollback is unverified, keep the checkpoint and use the reviewed installer
+for recovery after checking that the checkpoint and both prior image objects
+are usable. Follow the host's reviewed reinstall procedure if recovery cannot
+be verified.
+
+For a host already stranded by the original failed transition, reconcile the
+actual image and restart state with installed metadata before choosing a
+recovery action. The 2026-10-11 comment on #113 records an operator workaround
+that verified the exact candidate Compose and image, started only the
+candidate proxy under the installer lock, verified proxy health, and retried
+reconciliation. That recorded recovery applies to the diagnosed host and
+requires separate review before reuse.
+
 ## Drift and reviewed updates
 
 `ci-fleet-drift.timer` checks the host every fifteen minutes against the exact configuration SHA recorded at installation. It detects host edits, missing or stale runtime and installer-manager releases, runtime-state mismatch, altered metadata, and missing maintenance timers without applying changes.

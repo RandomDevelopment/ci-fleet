@@ -303,7 +303,7 @@ install_release() {
   cp -a "$legacy_source/deploy" "$legacy_source/scripts" "$legacy_source/controller" "$legacy_source/runner" "$legacy_source/engine-capabilities.json" "$legacy_source/.ci-fleet-engine-ref" "$legacy_source/.ci-fleet-tree-sha256" "$2/"
 }
 restore_checkpoint
-grep -Fxq "$releases_dir/$legacy_ref|up -d --remove-orphans controller" "$temporary/compose-calls"
+grep -Fxq "$releases_dir/$legacy_ref|up -d --no-build --pull never --remove-orphans controller" "$temporary/compose-calls"
 [[ $(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE_DIGEST" {print $2}' "$rendered_env") == "$legacy_controller" ]]
 # A candidate revision, missing source, unsafe tree, or mismatched marker grants no fallback.
 rm -rf "$releases_dir/$legacy_ref"
