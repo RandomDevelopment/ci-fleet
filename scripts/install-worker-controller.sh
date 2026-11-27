@@ -1889,8 +1889,8 @@ try_drain_current() {
       fi
       # The process could resume during recovery. SIGTERM would force-remove its runners.
       deadline=$((SECONDS + shutdown_timeout))
-      while ((SECONDS < deadline)); do
-        timeout --kill-after=1 "$((deadline - SECONDS))" docker kill "$container_id" >/dev/null 2>&1 || true
+      while remaining=$((deadline - SECONDS)); ((remaining > 0)); do
+        timeout --kill-after=1 "$remaining" docker kill "$container_id" >/dev/null 2>&1 || true
         remaining=$((deadline - SECONDS))
         ((remaining > 0)) || break
         stopped=$(timeout --kill-after=1 "$remaining" docker inspect --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}' "$container_id" 2>/dev/null) || break
