@@ -81,8 +81,9 @@ roots. Installer fixtures that mutate Git history or reviewed files use their ow
 repository copies, preserving the candidate checkout and its Git metadata.
 They do not prove deployment on a real prepared host.
 
-Installer fixture preparation seeds its three hard-pinned historical engine inputs
-before installing synthetic Git transport: pre-health
+Installer fixture preparation seeds four historical engine commits before
+installing synthetic Git transport. The pre-proxy engine is
+`791a15b8c474c6f1053237ff0b86b6b37cf0ac92`. The other pins are pre-health
 `af9c0c13cd12866ce75dd6c43a4cda01915507e1`, pre-telemetry
 `8bd27a2e7451806a1e37f79a15eeb7c677a12c3e`, and pre-adapter
 `003de44f7e27d7bfe5bb753098efb6eb5f9712f1`. It prefers available original-source
@@ -90,8 +91,9 @@ objects; a missing object requires a canonical pinned fetch during that admitted
 preparation phase. It verifies each requested commit without changing the selected
 HEAD. Subsequent installed synthetic-engine fetches use only the prepared local
 fixture repository, retaining canonical origin metadata. There is no runtime
-network fallback. These historical inputs test compatibility refusals and removal;
-they are not rollout engine selections or evidence of native image acceptance.
+network fallback. The historical inputs cover the pre-proxy upgrade and
+rollback, compatibility refusals, and removal. The fixtures use simulated
+Docker and systemd and leave live fleets untouched.
 
 ## Complete engine command
 

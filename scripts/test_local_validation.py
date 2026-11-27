@@ -366,7 +366,7 @@ class RunnerTests(unittest.TestCase):
                     self.assertIsNotNone(helper)
                     setup = helper.group() + "\n" + setup
                     pins = re.findall(r"\b[0-9a-f]{40}\b", setup)
-                    self.assertEqual(len(pins), 3)
+                    self.assertEqual(len(pins), 4)
                     # Local orphan commits exercise real preparation without historical code or network.
                     for index, pin in enumerate(pins):
                         revision = git(source, "commit-tree", "HEAD^{tree}", "-m", f"test: historical input {index}")

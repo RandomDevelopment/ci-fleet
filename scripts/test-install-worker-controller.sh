@@ -206,8 +206,12 @@ case "${1:-}" in
     ;;
   kill)
     [[ $# == 2 && $2 == "$controller_id" && -f "$state.restart-disabled" ]] || exit 1
-    printf 'exited\n' >"$status_file"
     [[ -z ${FAKE_COMPOSE_LOG:-} ]] || printf 'killed|%s\n' "$2" >>"$FAKE_COMPOSE_LOG"
+    if [[ -n ${FAKE_RUNNER_ON_RESTART:-} && ! -e "$state.kill-retry" ]]; then
+      : >"$state.kill-retry"
+    else
+      printf 'exited\n' >"$status_file"
+    fi
     ;;
   ps)
     [[ -z "${FAKE_DOCKER_PS_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_DOCKER_PS_LOG"
@@ -347,6 +351,7 @@ case "${1:-}" in
     fi
     case "$command" in
       up)
+        [[ -z ${FAKE_RUNNER_ON_RESTART:-} || ! -f "$FAKE_RUNNER_ON_RESTART" ]] || exit 52
         if grep -Fq 'target: /run/ci-fleet-disk-admission' "$compose_file"; then
           export_dir=${CI_FLEET_ROOT_PREFIX:?}/var/lib/ci-fleet/disk-admission
           if [[ -L "$export_dir" || ! -d "$export_dir" || $(stat -c '%u:%a' "$export_dir") != 0:700 ]]; then
@@ -363,7 +368,8 @@ import yaml
 with open(sys.argv[1], encoding="utf-8") as source:
     services = yaml.safe_load(source)["services"]
 assert services["controller"]["depends_on"]["docker-socket-proxy"]["condition"] == "service_healthy"
-assert services["docker-socket-proxy"]["healthcheck"]["test"]
+healthcheck = services["docker-socket-proxy"]["healthcheck"]
+assert healthcheck["test"] and healthcheck["test"] != ["NONE"] and not healthcheck.get("disable")
 PY
             if [[ " $* " != *' --no-deps '* ]]; then
               if [[ ${FAKE_FAIL_PROXY_START:-0} == 1 ]]; then
@@ -1264,7 +1270,7 @@ PY
   done
   grep -Fq 'dependency docker-socket-proxy failed to start' "$legacy/proxy-start.log" || fail 'proxy failure did not reach dependency startup'
   grep -Fq 'container is restarting' "$legacy/controller-restart.log" || fail 'candidate failure did not reach the pause race'
-  grep -q '^killed|' "$FAKE_COMPOSE_LOG" || fail 'rollback did not fence the restarting controller'
+  [[ $(grep -c '^killed|' "$FAKE_COMPOSE_LOG") == 2 ]] || fail 'rollback did not retry the fence for the restarting controller'
   grep -Fxq 'runner-draining' "$FAKE_COMPOSE_LOG" || fail 'rollback skipped the active candidate runner'
   ! grep -Fxq 'runner-cancelled' "$FAKE_COMPOSE_LOG" || fail 'rollback cancelled a candidate runner'
   local -x FAKE_RUNNER_STATE_ONCE=$legacy/active-runner

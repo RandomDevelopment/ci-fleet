@@ -1833,7 +1833,7 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release='' status identity container_id stopped paused=false pause_retried=false force_nonterminal=${1:-false}
+  local deadline remaining count old_release='' status identity container_id stopped paused=false pause_retried=false force_nonterminal=${1:-false}
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
@@ -1888,13 +1888,19 @@ try_drain_current() {
         return 1
       fi
       # The process could resume during recovery. SIGTERM would force-remove its runners.
-      docker kill "$container_id" >/dev/null 2>&1 || true
-      stopped=$(docker inspect --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}' "$container_id" 2>/dev/null) || stopped=
-      case "$stopped" in
-        'created no'|'exited no'|'dead no') ;;
-        *) drain_error='could not verify the restarting controller stopped'; return 1 ;;
-      esac
-      status=
+      deadline=$((SECONDS + shutdown_timeout))
+      while ((SECONDS < deadline)); do
+        timeout --kill-after=1 "$((deadline - SECONDS))" docker kill "$container_id" >/dev/null 2>&1 || true
+        remaining=$((deadline - SECONDS))
+        ((remaining > 0)) || break
+        stopped=$(timeout --kill-after=1 "$remaining" docker inspect --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}' "$container_id" 2>/dev/null) || break
+        case "$stopped" in
+          'created no'|'exited no'|'dead no') status=; break ;;
+          'running no'|'restarting no') sleep 1 ;;
+          *) break ;;
+        esac
+      done
+      [[ -z "$status" ]] || { drain_error='could not verify the restarting controller stopped'; return 1; }
       ;;
     *)
       drain_error="cannot safely drain controller in non-terminal state: $status"
