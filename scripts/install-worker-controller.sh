@@ -191,7 +191,7 @@ trap cleanup_temporary EXIT
 
 require_commands() {
   local command docker_root disk_used os_id os_release os_version socket
-  local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp)
+  local -a required=(python3 docker install readlink systemctl stat awk grep date flock mktemp timeout)
   if [[ "$mode" != rollback && "$mode" != uninstall ]]; then required+=(git tar cmp); fi
   for command in "${required[@]}"; do
     command -v "$command" >/dev/null || die "$command is required"
@@ -563,7 +563,10 @@ PY
 compose() {
   local release=$1 env_file=$2 variable
   local -a clean_environment=(env -i "PATH=$PATH" "HOME=${HOME:-/root}")
+  local -a deadline=()
   shift 2
+  # Bound the dependency wait during Compose startup, including older Compose v2 releases.
+  if [[ "$1" == up ]]; then deadline=(timeout --kill-after=5s 60s); fi
   for variable in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG XDG_RUNTIME_DIR; do
     [[ ! -v $variable ]] || clean_environment+=("$variable=${!variable}")
   done
@@ -571,7 +574,7 @@ compose() {
     clean_environment+=("CI_FLEET_ROOT_PREFIX=$root_prefix")
     for variable in ${!FAKE_@}; do clean_environment+=("$variable=${!variable}"); done
   fi
-  "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
+  "${deadline[@]}" "${clean_environment[@]}" docker compose --project-name ci-fleet --env-file "$env_file" -f "$release/deploy/compose.yaml" "$@"
 }
 
 build_managed_images() {
@@ -1840,6 +1843,20 @@ try_drain_current() {
       return 1
     }
   fi
+  if [[ "$status" == running ]]; then
+    if [[ ! -f "$drain_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
+    if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+      paused=true
+    elif compose "$old_release" "$drain_env" pause controller >/dev/null; then
+      paused=true
+    elif [[ "$force_nonterminal" == true && $(controller_status) == restarting ]]; then
+      status=restarting
+    else
+      drain_error='could not pause the controller for drain'
+      return 1
+    fi
+  fi
   case "$status" in
     running|'') ;;
     exited|created|dead)
@@ -1862,21 +1879,13 @@ try_drain_current() {
       status=
       ;;
   esac
-  if [[ "$status" == running ]]; then
-    if [[ ! -f "$drain_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
-    if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
-      paused=true
-    elif compose "$old_release" "$drain_env" pause controller >/dev/null; then
-      paused=true
-    else
-      drain_error='could not pause the controller for drain'
-      return 1
-    fi
-  fi
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
   while :; do
-    count=$(managed_runner_count)
+    if ! count=$(managed_runner_count); then
+      if [[ "$paused" == true ]]; then compose "$old_release" "$drain_env" unpause controller >/dev/null || true; fi
+      drain_error='could not verify the managed runner count'
+      return 1
+    fi
     if [[ "$count" == 0 ]]; then break; fi
     if ((SECONDS >= deadline)); then
       if [[ "$paused" == true ]]; then compose "$old_release" "$drain_env" unpause controller >/dev/null || true; fi
@@ -2050,7 +2059,7 @@ PY
   mv -f "$staged_state" "$state_file"
   if [[ "$target_state" == active ]]; then
     prepare_disk_admission_export "$release_dir" || die 'disk admission export preparation failed'
-    compose "$release_dir" "$rendered_env" up -d --remove-orphans controller
+    compose "$release_dir" "$rendered_env" up -d --no-build --pull never --remove-orphans controller
     sleep "${CI_FLEET_STARTUP_WAIT_SECONDS:-2}"
     runtime_matches active || die 'controller did not remain running after activation'
   else
@@ -2259,7 +2268,7 @@ retag_checkpoint_image() {
 }
 
 restore_checkpoint() {
-  local target restored_state actual index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
+  local target restored_state actual count index runtime_target expected_owner=0 failed=0 checkpoint_release='' drain_env=$rendered_env drain_release='' restore_images=false new_format=false checkpoint_format='' current_temporary='' validated_current_target='' validated_manager_target=''
   local restore_controller_tag_after_start=false fresh_path identifier image_environment=$checkpoint_dir/ci-fleet.env
   local -a fresh_checkpoint_images=()
   local format_marker=$checkpoint_dir/format-version image_ids=$checkpoint_dir/image-ids.env
@@ -2594,11 +2603,11 @@ PY
       failed=1
     fi
     if [[ "$restored_state" == active && "$failed" == 0 ]]; then
-      if [[ $(managed_runner_count) != 0 ]]; then
+      if ! count=$(managed_runner_count) || [[ "$count" != 0 ]]; then
         failed=1
       else
         prepare_disk_admission_export "$release_dir" || failed=1
-        if ((failed == 0)); then compose "$release_dir" "$rendered_env" up -d --remove-orphans controller || failed=1; fi
+        if ((failed == 0)); then compose "$release_dir" "$rendered_env" up -d --no-build --pull never --remove-orphans controller || failed=1; fi
         if ((failed == 0)); then run_health_check "$release_dir" "$rendered_env" true || failed=1; fi
       fi
     fi

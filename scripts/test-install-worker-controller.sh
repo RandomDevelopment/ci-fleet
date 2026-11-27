@@ -36,6 +36,7 @@ git -C "$fixture_repo" fetch -q --no-tags "$repo_root" "$(git -C "$repo_root" re
 git -C "$fixture_repo" checkout -q --detach FETCH_HEAD
 git --no-optional-locks -c diff.autoRefreshIndex=false -C "$repo_root" diff --no-ext-diff --binary HEAD | git -C "$fixture_repo" apply --binary --allow-empty
 prepare_historical_engine_inputs "$repo_root" "$fixture_repo" \
+  791a15b8c474c6f1053237ff0b86b6b37cf0ac92 \
   af9c0c13cd12866ce75dd6c43a4cda01915507e1 \
   8bd27a2e7451806a1e37f79a15eeb7c677a12c3e \
   003de44f7e27d7bfe5bb753098efb6eb5f9712f1
@@ -190,6 +191,7 @@ case "${1:-}" in
     [[ $# == 4 && ${3:-} == /usr/local/bin/ci-fleet-controller && ${4:-} == --check-docker-socket-proxy ]] || exit 1
     [[ -f "$state" && ( -z "$paused_state" || ! -f "$paused_state" ) && ( -z "$status_file" || ! -f "$status_file" || $(<"$status_file") == running ) && ${FAKE_CONTROLLER_STATUS:-running} == running ]] || exit 1
     [[ ${FAKE_DOCKER_PROXY_UNAVAILABLE:-0} == 0 ]] || exit 1
+    [[ -z ${FAKE_PROXY_STATE:-} || -f "$FAKE_PROXY_STATE" && $(<"$FAKE_PROXY_STATE") == healthy ]] || exit 1
     ;;
   ps)
     [[ -z "${FAKE_DOCKER_PS_LOG:-}" ]] || printf '%s\n' "$*" >>"$FAKE_DOCKER_PS_LOG"
@@ -335,9 +337,23 @@ case "${1:-}" in
             exit 49
           fi
         fi
-        [[ -z ${FAKE_PROXY_STATE:-} ]] || : >"$FAKE_PROXY_STATE"
+        if [[ -n ${FAKE_PROXY_STATE:-} ]]; then
+          if grep -q '^  docker-socket-proxy:' "$compose_file"; then
+            if [[ " $* " != *' --no-deps '* ]]; then
+              if [[ ${FAKE_FAIL_PROXY_START:-0} == 1 ]]; then
+                printf 'unhealthy\n' >"$FAKE_PROXY_STATE"
+                printf 'dependency docker-socket-proxy failed to start\n' >&2
+                exit 50
+              fi
+              printf 'healthy\n' >"$FAKE_PROXY_STATE"
+            fi
+            [[ -f "$FAKE_PROXY_STATE" && $(<"$FAKE_PROXY_STATE") == healthy ]] || exit 50
+          elif [[ " $* " == *' --remove-orphans '* ]]; then
+            rm -f "$FAKE_PROXY_STATE"
+          fi
+        fi
         controller_image=$(awk -F= '$1 == "CI_FLEET_CONTROLLER_IMAGE" {print substr($0, index($0, "=") + 1)}' "$env_file")
-        "$0" image inspect --format '{{.Id}}' "$controller_image" >/dev/null 2>&1 || {
+        controller_image_id=$("$0" image inspect --format '{{.Id}}' "$controller_image" 2>/dev/null) || {
           printf 'configured controller image is unavailable: %s\n' "$controller_image" >&2
           exit 49
         }
@@ -352,9 +368,12 @@ case "${1:-}" in
           exit 42
         fi
         : >"$state"
+        if [[ -n ${FAKE_PROXY_STATE:-} && -n ${FAKE_COMPOSE_LOG:-} ]]; then
+          printf 'started|%s\n' "$controller_image_id" >>"$FAKE_COMPOSE_LOG"
+        fi
         [[ -z "$stopped_state" ]] || rm -f "$stopped_state"
         [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || "$0" image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$controller_image" >"$FAKE_CONTROLLER_PROVENANCE_FILE"
-        [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" || -z "${FAKE_CONTROLLER_IMAGE_ID_STATE:-}" ]] || cp "$FAKE_CONTROLLER_IMAGE_ID_STATE" "$FAKE_CONTROLLER_IMAGE_ID_FILE"
+        [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || printf '%s\n' "$controller_image_id" >"$FAKE_CONTROLLER_IMAGE_ID_FILE"
         [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || cp "$env_file" "$FAKE_CONTROLLER_ENV_FILE"
         if [[ -n ${FAKE_CONTROLLER_ENV_FILE:-} ]] && grep -Fq 'CI_FLEET_RUNNER_IMAGE: ${CI_FLEET_RUNNER_IMAGE_DIGEST:' "$compose_file"; then
           runner_digest=$(awk -F= '$1 == "CI_FLEET_RUNNER_IMAGE_DIGEST" {print $2}' "$env_file")
@@ -390,6 +409,13 @@ case "${1:-}" in
         [[ "$command" != down || -z ${FAKE_PROXY_STATE:-} ]] || rm -f "$FAKE_PROXY_STATE"
         rm -f "$state"; [[ -z "$status_file" ]] || rm -f "$status_file"; [[ -z "$paused_state" ]] || rm -f "$paused_state"; [[ -z "$stopped_state" ]] || rm -f "$stopped_state"; [[ -z "${FAKE_CONTROLLER_PROVENANCE_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_PROVENANCE_FILE"; [[ -z "${FAKE_CONTROLLER_IMAGE_ID_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_IMAGE_ID_FILE"; [[ -z "${FAKE_CONTROLLER_ENV_FILE:-}" ]] || rm -f "$FAKE_CONTROLLER_ENV_FILE" ;;
       pause)
+        if [[ -n ${FAKE_RESTART_DURING_PAUSE:-} && "$compose_file" == "$FAKE_RESTART_DURING_PAUSE" ]]; then
+          printf 'restarting\n' >"$status_file"
+        fi
+        if [[ -n "$status_file" && -f "$status_file" && $(<"$status_file") == restarting ]]; then
+          printf 'Error response from daemon: container is restarting\n' >&2
+          exit 42
+        fi
         if [[ -n "$paused_state" && -f "$paused_state" ]]; then
           printf 'Error response from daemon: container is already paused\n' >&2
           exit 42
@@ -813,7 +839,6 @@ grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$repo_root/scripts/install-worker-c
 grep -Fq 'sys.dont_write_bytecode = True' "$repo_root/scripts/health.py" || fail 'manual capacity reports may write Python bytecode into the immutable runtime release'
 grep -Fq '    command: ["--docker-socket-proxy"]' "$repo_root/deploy/compose.yaml" || fail 'controller Docker proxy dependency is missing'
 grep -Fq '      DOCKER_HOST: unix:///run/ci-fleet/locks/docker.sock' "$repo_root/deploy/compose.yaml" || fail 'controller bypasses the coordinated Docker endpoint'
-[[ $(grep -Fc 'up -d --remove-orphans controller' "$repo_root/scripts/install-worker-controller.sh") == 2 ]] || fail 'activation or rollback bypasses the Docker proxy dependency or retains a legacy proxy orphan'
 # shellcheck disable=SC2016 # Match the literal Compose interpolation.
 grep -Fq '      - ${CI_FLEET_ROOT_PREFIX:-}/run/lock/ci-fleet:/run/ci-fleet/locks' "$repo_root/deploy/compose.yaml" || fail 'Docker maintenance gate is not shared with the host'
 # shellcheck disable=SC2016 # Match the literal Compose interpolation.
@@ -1089,6 +1114,135 @@ expect_failure 'configuration approval rejected' "$installer" --upgrade "${base_
 rm "$root/etc/ci-fleet/config-review-required"
 unset FAKE_APPROVAL_LOG
 rm "$fake_bin/openssl" "$fake_bin/curl"
+
+# Install with the exact manager from #113, then stage the reviewed replacement.
+(
+  legacy_ref=791a15b8c474c6f1053237ff0b86b6b37cf0ac92
+  legacy=$tmp/legacy-transition
+  mkdir -p "$legacy/prior-images"
+  git -C "$repo_root" worktree add -qd "$legacy/source" "$legacy_ref"
+  export CI_FLEET_ROOT_PREFIX=$legacy/host CI_FLEET_DOCKER_ROOT=$legacy/host/var/lib/docker
+  cp -a "$root" "$CI_FLEET_ROOT_PREFIX"
+  sed -i "s|$root/|$CI_FLEET_ROOT_PREFIX/|" "$CI_FLEET_ROOT_PREFIX/etc/ci-fleet/host.env"
+  config_repo=$legacy/config
+  git init -q "$config_repo"
+  git -C "$config_repo" config user.name fixture
+  git -C "$config_repo" config user.email fixture@example.invalid
+  legacy_args=(--config-repo "$config_repo" --controller example-ci-01)
+  installed=$CI_FLEET_ROOT_PREFIX/opt/ci-fleet
+  state=$CI_FLEET_ROOT_PREFIX/var/lib/ci-fleet/install-state.json
+  health=$CI_FLEET_ROOT_PREFIX/var/lib/ci-fleet/health/latest.json
+  export FAKE_DOCKER_STATE=$legacy/running FAKE_PAUSED_STATE=$legacy/paused
+  export FAKE_CONTROLLER_STATUS_FILE=$legacy/status FAKE_CONTROLLER_ENV_FILE=$legacy/controller-env
+  export FAKE_CONTROLLER_PROVENANCE_FILE=$legacy/provenance FAKE_CONTROLLER_PROTOCOL_FILE=$legacy/protocol
+  export FAKE_CONTROLLER_IMAGE_ID_FILE=$legacy/live-image FAKE_AVAILABLE_IMAGE_IDS=$legacy/image-ids
+  export FAKE_PROXY_STATE=$legacy/proxy FAKE_COMPOSE_LOG=$legacy/compose
+  export FAKE_PRIOR_IMAGE_STATES=$legacy/prior-images
+  export FAKE_PRIOR_RUNNER_IMAGE=ci-fleet-runner:${legacy_ref:0:12}
+  export FAKE_PRIOR_CONTROLLER_IMAGE=ci-fleet-controller:${legacy_ref:0:12}
+  legacy_config=$(write_config active 1 1 "$legacy_ref" omit omit omit)
+  legacy_image=sha256:$(printf '7%.0s' {1..64})
+  expect_success env FAKE_ENGINE_REF="$legacy_ref" FAKE_RUNNER_IMAGE="$FAKE_PRIOR_RUNNER_IMAGE" \
+    FAKE_CONTROLLER_IMAGE="$FAKE_PRIOR_CONTROLLER_IMAGE" \
+    FAKE_RUNNER_IMAGE_STATE="$FAKE_PRIOR_IMAGE_STATES/runner-state" \
+    FAKE_CONTROLLER_IMAGE_STATE="$FAKE_PRIOR_IMAGE_STATES/controller-state" \
+    FAKE_RUNNER_IMAGE_ID_STATE="$FAKE_PRIOR_IMAGE_STATES/runner-id" \
+    FAKE_CONTROLLER_IMAGE_ID_STATE="$FAKE_PRIOR_IMAGE_STATES/controller-id" \
+    FAKE_CANDIDATE_RUNNER_IMAGE_ID="sha256:$(printf '8%.0s' {1..64})" \
+    FAKE_CANDIDATE_CONTROLLER_IMAGE_ID="$legacy_image" \
+    "$legacy/source/scripts/install-worker-controller.sh" --install "${legacy_args[@]}" --ref "$legacy_config" >/dev/null
+  cmp "$legacy/source/scripts/install-worker-controller.sh" "$installed/manager/current/scripts/install-worker-controller.sh"
+  grep -Eq '^up\|.* up -d --no-deps controller$' "$FAKE_COMPOSE_LOG" || fail 'historical manager did not execute its original activation'
+  [[ ! -e "$FAKE_PROXY_STATE" && $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$legacy_image" ]] || fail 'pre-proxy installation did not start the historical image without a proxy'
+  cp "$state" "$legacy/install-state.json"
+
+  # Retain incumbent capability evidence while introducing the new manager and images.
+  python3 - "$config_repo" "$engine_ref" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root, engine = Path(sys.argv[1]), sys.argv[2]
+evidence = json.loads((root / "engine-rollout-evidence.json").read_text())
+evidence["status_reporting_engine_capabilities"]["example-ci-01"]["engine_ref"] = engine
+(root / "next-engine-rollout-evidence.json").write_text(json.dumps(evidence))
+PY
+  git -C "$config_repo" add next-engine-rollout-evidence.json
+  git -C "$config_repo" commit -qm 'fixture review pending engine'
+  python3 - "$config_repo/fleet.json" "$engine_ref" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+fleet = json.loads(path.read_text())
+fleet["controllers"]["example-ci-01"]["engine_ref"] = sys.argv[2]
+path.write_text(json.dumps(fleet))
+PY
+  git -C "$config_repo" commit -qam 'fixture select reviewed manager'
+  stage_ref=$(git -C "$config_repo" rev-parse HEAD)
+  : >"$FAKE_COMPOSE_LOG"
+  staged=$(expect_success "$installer" --upgrade "${legacy_args[@]}" --ref "$stage_ref")
+  grep -Fq 'MANAGER_STAGED' <<<"$staged" || fail 'reviewed installer did not stage the dependency-aware manager'
+  checked=$(expect_success "$installer" --check "${legacy_args[@]}" --ref "$stage_ref")
+  grep -Fq 'CHECK_STAGED' <<<"$checked" || fail 'reviewed installer did not verify manager staging'
+  [[ $(readlink "$installed/current") == "$installed/releases/$legacy_ref" && $(readlink "$installed/manager/current") == "$installed/manager/releases/$engine_ref" ]] || fail 'manager staging did not preserve the legacy runtime'
+  ! grep -Eq '^(up|pause|stop)\|' "$FAKE_COMPOSE_LOG" || fail 'manager staging touched the legacy runtime'
+  cmp "$legacy/install-state.json" "$state"
+  python3 - "$config_repo/fleet.json" "$engine_ref" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+fleet = json.loads(path.read_text())
+fleet["managed_images"] = {sys.argv[2]: {"amd64": {"controller": "sha256:" + "3" * 64, "runner": "sha256:" + "4" * 64}}}
+path.write_text(json.dumps(fleet))
+PY
+  git -C "$config_repo" commit -qam 'fixture review image values'
+  candidate_ref=$(git -C "$config_repo" rev-parse HEAD)
+  # Use the staged installer exactly as reconciliation would, while Docker and
+  # systemd are simulated and the historical and candidate releases are real.
+  candidate=("$installed/manager/current/scripts/install-worker-controller.sh" --upgrade "${legacy_args[@]}" --ref "$candidate_ref")
+  export FAKE_RUNNER_IMAGE_STATE=$legacy/runner-state FAKE_CONTROLLER_IMAGE_STATE=$legacy/controller-state
+  export FAKE_RUNNER_IMAGE_ID_STATE=$legacy/runner-id FAKE_CONTROLLER_IMAGE_ID_STATE=$legacy/controller-id
+  for failure in proxy-start controller-restart; do
+    : >"$FAKE_COMPOSE_LOG"
+    result=$legacy/$failure.json
+    status=0
+    if [[ "$failure" == proxy-start ]]; then
+      injection=(FAKE_FAIL_PROXY_START=1)
+    else
+      injection=(FAKE_DOCKER_PROXY_UNAVAILABLE=1 "FAKE_RESTART_DURING_PAUSE=$installed/releases/$engine_ref/deploy/compose.yaml")
+    fi
+    env "${injection[@]}" CI_FLEET_TRANSACTION_RESULT_FD=7 "${candidate[@]}" 7>"$result" >"$legacy/$failure.log" 2>&1 || status=$?
+    [[ "$status" == 20 && $(<"$result") == '{"schema_version":1,"outcome":"rollback_verified"}' ]] \
+      || fail "$failure did not verify rollback: $(<"$legacy/$failure.log")"
+    cmp "$legacy/install-state.json" "$state"
+    [[ $(readlink "$installed/current") == "$installed/releases/$legacy_ref" && $(readlink "$installed/manager/current") == "$installed/manager/releases/$engine_ref" ]] \
+      || fail "$failure changed the restored runtime or manager pointer"
+    [[ -f "$FAKE_DOCKER_STATE" && ! -e "$FAKE_CONTROLLER_STATUS_FILE" && ! -e "$FAKE_PROXY_STATE" && $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$legacy_image" && $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$legacy_ref" ]] \
+      || fail "$failure did not restore the pre-proxy runtime image and services"
+    jq -e '.exit_code < 2' "$health" >/dev/null || fail "$failure did not restore a passing health report"
+    if [[ "$failure" == proxy-start ]]; then
+      ! grep -Fxq "started|$FAKE_CANDIDATE_CONTROLLER_IMAGE_ID" "$FAKE_COMPOSE_LOG" || fail 'controller started despite an unhealthy proxy'
+    fi
+  done
+  grep -Fq 'dependency docker-socket-proxy failed to start' "$legacy/proxy-start.log" || fail 'proxy failure did not reach dependency startup'
+  grep -Fq 'container is restarting' "$legacy/controller-restart.log" || fail 'candidate failure did not reach the pause race'
+  export FAKE_RUNNER_STATE_ONCE=$legacy/active-runner
+  : >"$FAKE_RUNNER_STATE_ONCE"
+  upgraded=$(expect_success "${candidate[@]}")
+  grep -Fq 'DRAIN_OK managed_runners=0' <<<"$upgraded" || fail 'transition did not drain the incumbent'
+  [[ ! -e "$FAKE_RUNNER_STATE_ONCE" ]] || fail 'transition left an active legacy runner'
+  checked=$(expect_success "$installed/manager/current/scripts/install-worker-controller.sh" --check "${legacy_args[@]}" --ref "$candidate_ref")
+  grep -Fq 'CHECK_OK' <<<"$checked" || fail 'candidate runtime did not pass its installed check'
+  [[ $(<"$FAKE_PROXY_STATE") == healthy && $(<"$FAKE_CONTROLLER_IMAGE_ID_FILE") == "$FAKE_CANDIDATE_CONTROLLER_IMAGE_ID" && $(<"$FAKE_CONTROLLER_PROVENANCE_FILE") == "$engine_ref" ]] \
+    || fail 'candidate runtime did not start with a ready proxy and the reviewed image'
+  jq -e --arg commit "$candidate_ref" --arg engine "$engine_ref" '.config_ref == $commit and .engine_ref == $engine' "$state" >/dev/null
+  jq -e '.exit_code < 2 and any(.checks[]; .id == "docker_socket_proxy" and .status == "ok")' "$health" >/dev/null
+  printf 'LEGACY_MANAGER_TRANSITION_OK\n'
+)
 
 export FAKE_PROXY_STATE=$tmp/fresh-socket-proxy
 export FAKE_DOCKER_PROXY_UNAVAILABLE=1
