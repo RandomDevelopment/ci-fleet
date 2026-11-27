@@ -27,7 +27,7 @@ Operators can start with the task below. Agents use the [task-routing checklist]
 | Configure automatic updates and cleanup | [Host maintenance](HOST-MAINTENANCE.md) and [reproducible managed images](MANAGED-IMAGES.md) |
 | Install or operate a dedicated deployment host | [Deployer host installation](DEPLOYER-HOST.md) |
 | Monitor hosts and detect missed reports | [Fleet health monitoring](HEALTH-MONITORING.md), [local capacity telemetry](CAPACITY-TELEMETRY.md), and [authenticated status reporting](STATUS-REPORTING.md) |
-| Review the planned endpoint web UI and its access/data contracts | [Endpoint observation UI design](ENDPOINT-UI-DESIGN.md), design only; no supported UI yet |
+| Inspect the worker UI and its evidence and access boundaries | [Read-only worker views](WORKER-VIEWS.md), [endpoint observation design](ENDPOINT-UI-DESIGN.md) |
 | Handle GitHub App, workflow, or deployment secrets | [Secrets model](SECRETS.md) and [security policy](../SECURITY.md) |
 | Review accepted implementation scope | [Design decisions](DESIGN-DECISIONS.md) |
 | Run private CI or deployment for a public project | [Public projects, private delivery, and private configuration](PUBLIC-PRIVATE-CONFIGURATION.md) |

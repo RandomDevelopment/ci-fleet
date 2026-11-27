@@ -807,7 +807,7 @@ class SnapshotReader:
         self.base, self.observer_gid, self.controller, self._bearer = base, observer_gid, controller, backend_bearer
         self._job_cache = None
 
-    def _authenticate(self, headers: Mapping[str, str]) -> None:
+    def authenticate(self, headers: Mapping[str, str]) -> None:
         if not isinstance(headers, Mapping):
             raise SnapshotError("authentication_failed")
         authorization = [value for key, value in headers.items() if isinstance(key, str) and key.lower() == "authorization"]
@@ -816,7 +816,7 @@ class SnapshotReader:
             raise SnapshotError("authentication_failed")
 
     def read(self, headers: Mapping[str, str], *, now: int | None = None) -> dict:
-        self._authenticate(headers)
+        self.authenticate(headers)
         value = read_endpoint(self.base, self.observer_gid)
         validate_snapshot(value, controller=self.controller)
         for name in SOURCE_NAMES - value["sources"].keys():
@@ -840,7 +840,7 @@ class SnapshotReader:
         return value
 
     def read_job_history(self, headers: Mapping[str, str], *, now: int | None = None) -> dict:
-        self._authenticate(headers)
+        self.authenticate(headers)
         now = int(time.time()) if now is None else now
         if not integer(now):
             raise SnapshotError("invalid_argument")
@@ -853,13 +853,19 @@ class SnapshotReader:
             self._job_cache = None
             raise
         self._job_cache = (identity, history)
+        export_fingerprint = fingerprint(identity)
+        activity_evidence = None
         try:
             endpoint = self.read(headers, now=now)
             source = endpoint["sources"]["jobs"]
             data = source["data"]
-            current = (endpoint["publisher_freshness"] == source["freshness"] == "current"
-                       and data["generation"] == history["generation"] and data["scale_set"] == history["scale_set"]
-                       and data["export_fingerprint"] == fingerprint(identity)
+            matches = (data.get("generation") == history["generation"] and data.get("scale_set") == history["scale_set"]
+                       and data.get("export_fingerprint") == export_fingerprint)
+            activity_evidence = {"published_at": endpoint["published_at"], "clock_state": endpoint["clock_state"],
+                                 "publisher_freshness": endpoint["publisher_freshness"],
+                                 "source": source, "generation_matches": matches}
+            current = (endpoint["publisher_freshness"] == source["freshness"] == "current" and matches
+                       and history["published_at"] <= now
                        and not data["pending"] and data["source_available"]
                        and 0 <= now - data["last_poll_at"] <= 120 and history["omitted_nonterminal"] == 0)
         except (KeyError, StoreError, SnapshotError):
@@ -867,6 +873,7 @@ class SnapshotReader:
         rows = [{**row, "current_activity": "unknown" if row["state"] == "running" and not current else row["state"]}
                 for row in history["records"] if row["last_observed_at"] > now - JOB_MAX_AGE]
         return {**history, "gaps": dict(history["gaps"]), "records": rows,
+                "export_fingerprint": export_fingerprint, "activity_evidence": activity_evidence,
                 "current_activity_verified": current and not (CURRENT_COVERAGE_GAPS & history["gaps"].keys())}
 
 

@@ -1,6 +1,6 @@
 # Worker snapshots
 
-This is the read-only worker snapshot contract for [#118](https://github.com/RandomDevelopment/ci-fleet/issues/118) under the accepted [endpoint UI design](ENDPOINT-UI-DESIGN.md). The repository provides one privileged publication command and an authenticated file reader. Browser delivery remains in #121. Packaging, service activation, and live-host acceptance remain in #122. Bootstrap still uses its temporary authenticated callback. Reconciliation captures the desired engine only after existing validation and the opt-in independent configuration-approval check.
+This is the read-only worker snapshot contract for [#118](https://github.com/RandomDevelopment/ci-fleet/issues/118) under the accepted [endpoint UI design](ENDPOINT-UI-DESIGN.md). The repository provides one privileged publication command and an authenticated file reader used by the [worker views](WORKER-VIEWS.md). Packaging, service activation, and live-host acceptance remain in #122. Bootstrap still uses its temporary authenticated callback. Reconciliation captures the desired engine only after existing validation and the opt-in independent configuration-approval check.
 
 ## Producer and consumer interfaces
 
@@ -16,7 +16,7 @@ sudo python3 scripts/endpoint_snapshot.py \
 
 This is a foundation interface, not an enrollment or installation procedure. Preparation, approved credentials, role admission, and service activation belong to #122. The command does not create directories, groups, units, credentials, or network rules. It prints only a controlled success/failure code and returns nonzero when publication fails. A future caller must isolate that failure from CI and reconciliation.
 
-`SnapshotReader` accepts a fixed export base, observer GID, expected controller identity, and an already provisioned backend bearer. Its `read(headers)` method authenticates before any filesystem access and ignores forwarded identity headers. The caller must supply the bearer through the separately approved credential mechanism; it must never derive configuration from browser input or reuse controller credentials. This PR adds no credential loader or HTTP listener. The transport must enforce the ADR's request and response limits and `Cache-Control: no-store`.
+`SnapshotReader` accepts a fixed export base, observer GID, expected controller identity, and an already provisioned backend bearer. Its `read(headers)` method authenticates before any filesystem access and ignores forwarded identity headers. The caller must supply the bearer through the separately approved credential mechanism. The worker HTTP application accepts a prepared loopback listener and applies the ADR's request and response limits and `Cache-Control: no-store`.
 
 ## Snapshot version 1
 
@@ -133,7 +133,9 @@ results and original observation times. The aggregate activity flag also
 accounts for retained coverage gaps and loss of nonterminal records. A
 directly observed running job can remain current while aggregate coverage is
 unknown. Missing summary evidence defaults
-to unknown activity. The API accepts only the fixed job file.
+to unknown activity. The authenticated read also returns the validated
+publication fingerprint for pagination and the endpoint evidence used to
+assess current activity. The API accepts only the fixed job file.
 
 ## Verification
 

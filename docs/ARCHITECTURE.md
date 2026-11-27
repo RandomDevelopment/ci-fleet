@@ -221,9 +221,9 @@ containers have no mount for that export.
 - Fleet updates use rolling replacement and an explicit rollback version.
 - Controller routing, capacity, lifecycle, and engine updates use reviewed full commits from private desired-state configuration; hosts never follow an unreviewed moving branch.
 
-## Planned endpoint observation
+## Endpoint observation
 
-The [endpoint observation UI design](ENDPOINT-UI-DESIGN.md) defines a future optional host service on loopback port 80, authenticated through an independently provisioned HTTPS gateway. Its [acceptance record](ENDPOINT-UI-DESIGN.md#acceptance-record) distinguishes the proposal from a reviewed decision. It keeps observation independent of Docker and preserves role, credential, configuration, and outbound-reporting boundaries. No endpoint UI or inbound listener is implemented by that design.
+The [endpoint observation UI design](ENDPOINT-UI-DESIGN.md) defines an optional host service on loopback port 80, authenticated through an independently provisioned HTTPS gateway. The [read-only worker views](WORKER-VIEWS.md) read protected exports independently of Docker. Host installation, listener activation, and gateway integration are tracked in #122.
 
 ## Project adoption
 
