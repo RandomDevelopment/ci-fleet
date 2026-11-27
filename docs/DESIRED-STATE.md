@@ -277,9 +277,10 @@ candidate installer included dependency startup, but the installed manager
 was the installer executing the upgrade.
 
 Use a protected checkout at a reviewed engine commit that includes this
-transition procedure. Suspend the legacy reconcile timer and any external
-dispatcher before offering a new engine pin. Let any in-flight reconciliation
-finish. Retain the exact incumbent source and both local image objects for
+transition procedure. Record the legacy reconcile timer's enabled and active
+states, then run `sudo systemctl disable --now ci-fleet-reconcile.timer` and
+suspend any external dispatcher before offering a new engine pin. Let any
+in-flight reconciliation finish. Retain the exact incumbent source and both local image objects for
 rollback. Record the installed configuration and engine SHAs, the manager
 revision, the running controller image ID, and its health.
 
@@ -297,7 +298,8 @@ revision, the running controller image ID, and its health.
    `/opt/ci-fleet/manager/current/scripts/install-worker-controller.sh` with
    that exact configuration SHA. This manager checkpoints the incumbent,
    waits for active jobs to finish, and starts the controller through Compose's
-   healthy dependency condition. Startup uses verified local images.
+   healthy dependency condition. Startup uses verified local images and has a
+   60-second deadline.
 3. Require `CHECK_OK` for the new configuration. Confirm that
    `/var/lib/ci-fleet/install-state.json` records the requested configuration
    and engine SHAs and both release pointers select that engine. Inspect the
@@ -314,8 +316,9 @@ suspended and read the installer result. A verified rollback restores the
 incumbent installed state, actual controller image, and runtime release. It
 keeps the staged manager from the checkpoint. Verify those identities against
 the baseline, verify that the candidate proxy is absent, and read the fresh
-incumbent health report before retrying. A restarting candidate can be stopped
-without a pause, and rollback still waits for the managed runners to finish.
+incumbent health report before retrying. If Docker keeps restarting the
+candidate, rollback disables its restart policy and stops that container
+without invoking graceful shutdown. It then waits for managed runners to finish.
 If rollback is unverified, keep the checkpoint and use the reviewed installer
 for recovery after checking that the checkpoint and both prior image objects
 are usable. Follow the host's reviewed reinstall procedure if recovery cannot

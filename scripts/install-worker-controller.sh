@@ -1833,7 +1833,7 @@ make_checkpoint() {
 }
 
 try_drain_current() {
-  local deadline count old_release='' status paused=false force_nonterminal=${1:-false}
+  local deadline count old_release='' status identity container_id stopped paused=false pause_retried=false force_nonterminal=${1:-false}
   local drain_env=${2:-$rendered_env} fallback_release=${3:-} shutdown_timeout=${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}
   drain_error=
   status=$(controller_status)
@@ -1843,20 +1843,26 @@ try_drain_current() {
       return 1
     }
   fi
-  if [[ "$status" == running ]]; then
+  if [[ "$status" == paused && "$force_nonterminal" == true ]]; then status=running; fi
+  while [[ "$status" == running ]]; do
     if [[ ! -f "$drain_env" ]]; then drain_error='cannot safely drain a running controller without its rendered environment'; return 1; fi
     if [[ -z "$old_release" || ! -f "$old_release/deploy/compose.yaml" ]]; then drain_error='cannot locate the running controller Compose release for safe adoption'; return 1; fi
-    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]]; then
+    if [[ $(docker inspect --format '{{.State.Paused}}' "$controller_container" 2>/dev/null || true) == true ]] \
+      || compose "$old_release" "$drain_env" pause controller >/dev/null; then
       paused=true
-    elif compose "$old_release" "$drain_env" pause controller >/dev/null; then
-      paused=true
-    elif [[ "$force_nonterminal" == true && $(controller_status) == restarting ]]; then
-      status=restarting
-    else
-      drain_error='could not pause the controller for drain'
-      return 1
+      break
     fi
-  fi
+    if [[ "$force_nonterminal" == true ]]; then
+      case "$(controller_status)" in
+        restarting) status=restarting; break ;;
+        running|paused)
+          if [[ "$pause_retried" == false ]]; then pause_retried=true; continue; fi
+          ;;
+      esac
+    fi
+    drain_error='could not pause the controller for drain'
+    return 1
+  done
   case "$status" in
     running|'') ;;
     exited|created|dead)
@@ -1865,18 +1871,34 @@ try_drain_current() {
       compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop restartable controller state: $status"; return 1; }
       status=
       ;;
-    *)
+    restarting)
       if [[ "$force_nonterminal" != true ]]; then
         drain_error="cannot safely drain controller in non-terminal state: $status"
         return 1
       fi
       [[ -f "$drain_env" ]] || { drain_error='cannot stop a non-terminal candidate without its rendered environment'; return 1; }
-      [[ -n "$old_release" ]] || { drain_error='cannot stop a non-terminal candidate without its runtime release'; return 1; }
-      if [[ "$status" == paused ]]; then
-        compose "$old_release" "$drain_env" unpause controller >/dev/null 2>&1 || { drain_error="failed to unpause non-terminal candidate state: $status"; return 1; }
+      identity=$(docker inspect --format '{{.Id}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}}' "$controller_container" 2>/dev/null) || {
+        drain_error='could not identify the restarting controller'
+        return 1
+      }
+      container_id=${identity%% *}
+      if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ || "$identity" != "$container_id ci-fleet controller" ]] \
+        || ! docker update --restart=no "$container_id" >/dev/null; then
+        drain_error='could not disable restart for the restarting controller'
+        return 1
       fi
-      compose "$old_release" "$drain_env" stop --timeout "$shutdown_timeout" controller >/dev/null 2>&1 || { drain_error="failed to stop non-terminal candidate state: $status"; return 1; }
+      # The process could resume during recovery. SIGTERM would force-remove its runners.
+      docker kill "$container_id" >/dev/null 2>&1 || true
+      stopped=$(docker inspect --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}' "$container_id" 2>/dev/null) || stopped=
+      case "$stopped" in
+        'created no'|'exited no'|'dead no') ;;
+        *) drain_error='could not verify the restarting controller stopped'; return 1 ;;
+      esac
       status=
+      ;;
+    *)
+      drain_error="cannot safely drain controller in non-terminal state: $status"
+      return 1
       ;;
   esac
   deadline=$((SECONDS + ${CI_FLEET_DRAIN_TIMEOUT_SECONDS:-300}))
