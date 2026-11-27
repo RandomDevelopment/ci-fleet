@@ -3913,6 +3913,7 @@ chmod 600 "$adopt_root/etc/ci-fleet/ci-fleet.env"
 
 export FAKE_COMPOSE_LOG=$tmp/adopt-compose.log
 : >"$FAKE_COMPOSE_LOG"
+: >"$FAKE_DOCKER_PS_LOG"
 export FAKE_RESTART_AFTER_UP=$tmp/adopt-restart-after-up
 : >"$FAKE_RESTART_AFTER_UP"
 cp "$adopt_root/etc/ci-fleet/ci-fleet.env" "$tmp/adopt-incumbent.env"
@@ -3931,7 +3932,9 @@ grep -Fxq "CI_FLEET_ENGINE_REF=$engine_ref" "$adopt_checkpoint_images" || fail '
 grep -Fxq "CI_FLEET_CONTROLLER_IMAGE_DIGEST=sha256:$controller_image_digest" "$adopt_checkpoint_images" || fail 'legacy checkpoint did not retain the installed controller image ID'
 grep -Fxq "CI_FLEET_RUNNER_IMAGE_DIGEST=sha256:$runner_image_digest" "$adopt_checkpoint_images" || fail 'legacy checkpoint did not retain the installed runner image ID'
 grep -Fxq 'CI_FLEET_HEALTH_DISK_WARN_PERCENT=75' "$adopt_root/etc/ci-fleet/monitoring.env" || fail 'rollback changed host-local monitoring configuration'
-grep -Fq "stop|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not drain the candidate with its rendered environment and identity'
+grep -Eq '^killed\|[a-f0-9]{64}$' "$FAKE_COMPOSE_LOG" || fail 'rollback did not fence the restarting adoption candidate'
+grep -Fq 'label=io.randomdevelopment.ci-fleet.instance=example-ci-01' "$FAKE_DOCKER_PS_LOG" || fail 'rollback did not drain runners for the candidate identity'
+grep -Fq "rm|$adopt_root/etc/ci-fleet/ci-fleet.env|example-ci-01" "$FAKE_COMPOSE_LOG" || fail 'rollback did not remove the stopped candidate using its rendered environment'
 grep -Fq 'CI_FLEET_INSTANCE=legacy-ci-01' "$adopt_root/etc/ci-fleet/ci-fleet.env" || fail 'failed adoption did not restore the installed controller identity'
 
 adopt_result_file=$adopt_root/transaction-result.json
